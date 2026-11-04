@@ -198,31 +198,14 @@ written down in [limitations.md](docs/limitations.md).
 ```mermaid
 flowchart TB
     host["Your C++ application<br/>hostClass · Class&lt;T&gt; · Context"]
+    typed["<b>Typed bytecode VM</b> + arm64 / x86-64 JIT<br/>C# · C · C++"]
+    dyn["<b>Dynamic bytecode VM</b><br/>TypeScript · JavaScript · Python"]
+    heap["<b>One heap, one Value</b> · refcounts + cycle collector<br/>on libcore: LocalHeap · SizeClassPool · ObjectArena · pages"]
 
-    subgraph frontends["Front ends"]
-        direction LR
-        cs["C#"] ~~~ cc["C"] ~~~ cpp["C++"] ~~~ ts["TypeScript"] ~~~ js["JavaScript"] ~~~ py["Python"]
-    end
-
-    subgraph engines["Engines"]
-        direction LR
-        typed["Typed bytecode VM<br/>+ arm64 / x86-64 JIT"]
-        dyn["Dynamic bytecode VM<br/>prototypes and closures"]
-    end
-
-    heap["One heap · one Value · refcounts + cycle collector"]
-    core["libcore<br/>LocalHeap · SizeClassPool · ObjectArena · number and Unicode conversion · pages"]
-
-    host --> frontends
-    cs --> typed
-    cc --> typed
-    cpp --> typed
-    ts --> dyn
-    js --> dyn
-    py --> dyn
+    host --> typed
+    host --> dyn
     typed --> heap
     dyn --> heap
-    heap --> core
 ```
 
 The machinery under the languages comes from [libcore](https://github.com/philipp-orlov/libcore), the foundation shared

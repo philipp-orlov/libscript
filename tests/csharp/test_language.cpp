@@ -421,3 +421,89 @@ TEST(nullHandling)
     CHECK_EQ(run("string s = null; return s?.Length ?? -1;").toInt(), -1);
     CHECK_EQ(run("string s = \"abc\"; return s?.Length ?? 0;").toInt(), 3);
 }
+
+namespace {
+bool compiles(const std::string& source)
+{
+    script::Context ctx;
+    return ctx.diagnose(source, "<t>.cs", nullptr, script::Language::CSharp).empty();
+}
+const char* const kReadOnly = R"(
+    struct P { public int X; }
+    class A {
+        public readonly int V = 1;
+        public static readonly int S = 2;
+        public readonly P Q;
+        public A() { V = 2; this.V = 3; Q.X = 4; V++; }
+        public A(A other) { BODY }
+        public void M() { M2 }
+        static void Set(out int x) { x = 1; }
+    }
+)";
+std::string readOnlyCase(const char* ctorBody, const char* methodBody)
+{
+    std::string source = kReadOnly;
+    source.replace(source.find("BODY"), 4, ctorBody);
+    source.replace(source.find("M2"), 2, methodBody);
+    return source;
+}
+}  // namespace
+
+TEST(readonlyFieldsAreAssignedInConstructorsOnly)
+{
+    CHECK(compiles(readOnlyCase("", "")));
+    CHECK(compiles(readOnlyCase("V = other.V;", "int y = V + S + Q.X;")));
+    CHECK(!compiles(readOnlyCase("", "V = 1;")));
+    CHECK(!compiles(readOnlyCase("", "this.V = 1;")));
+    CHECK(!compiles(readOnlyCase("", "V += 1;")));
+    CHECK(!compiles(readOnlyCase("", "V++;")));
+    CHECK(!compiles(readOnlyCase("", "S = 1;")));
+    CHECK(!compiles(readOnlyCase("", "Q.X = 1;")));
+    CHECK(!compiles(readOnlyCase("", "Set(out V);")));
+    CHECK(!compiles(readOnlyCase("other.V = 1;", "")));
+    CHECK(!compiles(readOnlyCase("S = 1;", "")));
+    CHECK(!compiles(readOnlyCase("System.Action a = () => { V = 1; };", "")));
+    CHECK(!compiles("class B { public readonly int V; } class C : B { public C() { V = 1; } }"));
+    CHECK(!compiles("class B { public readonly int V; } class C { void M(B b) { b.V = 1; } }"));
+    CHECK(compiles("class B { public static readonly int S; static B() { S = 1; } }"));
+    // Through a readonly reference only the reference is frozen.
+    CHECK(compiles("class R { public int X; } class B { readonly R r = new R(); void M() { r.X = 1; } }"));
+}
+
+TEST(aReadonlyFieldHasItsValueAtRunTime)
+{
+    script::Context ctx;
+    CHECK_EQ(ctx.eval("class A { public readonly int V = 1; public static readonly int S = 5; public A(int n) { V += n; } } return new A(2).V + A.S;",
+                      "<t>.cs", script::Language::CSharp).toInt(), 8);
+}
+
+TEST(implicitlyTypedArrays)
+{
+    script::Context ctx;
+    const auto run = [&ctx](const char* source) {
+        return ctx.eval(source, "<t>.cs", script::Language::CSharp).toString();
+    };
+    CHECK_EQ(run("var a = new[] { 1, 2, 3 }; return a[0] + a.Length;"), std::string("4"));
+    CHECK_EQ(run("var a = new[] { 1, 2.5 }; return a[0] + a[1];"), std::string("3.5"));
+    CHECK_EQ(run("var a = new[] { \"x\", null, \"y\" }; return a[2];"), std::string("y"));
+    CHECK_EQ(run("var a = new[] { (1, 2), (3, 4) }; int t = 0; foreach (var (x, y) in a) t += x * y; return t;"), std::string("14"));
+    CHECK_EQ(run("var a = new[] { new[] { 1 }, new[] { 2, 3 } }; return a[1][1];"), std::string("3"));
+    CHECK(!compiles("var a = new[] { 1, \"x\" };"));
+    CHECK(!compiles("var a = new[] { null };"));
+    CHECK(!compiles("var a = new[] { };"));
+}
+
+TEST(tuplesAsTypeArguments)
+{
+    script::Context ctx;
+    const auto run = [&ctx](const char* source) {
+        return ctx.eval(source, "<t>.cs", script::Language::CSharp).toString();
+    };
+    CHECK_EQ(run("using System.Collections.Generic; var l = new List<(int, string)>(); l.Add((1, \"a\")); var (n, s) = l[0]; return s + n;"), std::string("a1"));
+    CHECK_EQ(run("using System.Collections.Generic; var l = new List<(int a, int b)>(); l.Add((2, 3)); return l[0].a * l[0].b;"), std::string("6"));
+    CHECK_EQ(run("using System.Collections.Generic; var d = new Dictionary<string, (int, int)>(); d[\"k\"] = (1, 2); return d[\"k\"].Item2;"), std::string("2"));
+    CHECK_EQ(run("using System.Collections.Generic; var l = new List<(List<List<int>>, int)>(); return l.Count;"), std::string("0"));
+    // Still a comparison where it is one.
+    CHECK_EQ(run("int a = 1, b = 2; return a < (b) ? 1 : 0;"), std::string("1"));
+    CHECK_EQ(run("int a = 1, b = 2, c = 3; bool x = a < b, y = c > (a); return x && y;"), std::string("true"));
+}

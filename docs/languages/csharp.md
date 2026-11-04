@@ -104,6 +104,12 @@ try {
 }
 ```
 
+Arrays can leave out their element type when the elements settle it:
+`new[] { 1, 2.5 }` is a `double[]`, and `new[] { 1, "x" }` is an error. A `readonly`
+field takes a value in its declaration or in a constructor of its own type, through
+`this`; anywhere else, including `++` and a `ref` argument, is an error. Tuples work
+as type arguments: `new List<(int, string)>()`.
+
 `foreach` walks arrays, strings, `List<T>` and `Dictionary<K,V>`. A dictionary
 yields `KeyValuePair<K,V>`, in insertion order, and takes the deconstructing form:
 

@@ -634,6 +634,18 @@ var __name__ = "__main__";
         return out;
     };
 
+    // ---- reading a method without calling it: `f = obj.method` ----
+    py.bindRead = function (obj, name, value) {
+        // A class's own functions, an instance's own callable attribute and the class itself are plain values.
+        if (typeof obj === 'function' || name === 'constructor' ||
+            Object.prototype.hasOwnProperty.call(Object(obj), name))
+            return value;
+        var dispatched = py['m_' + name];
+        if (dispatched && (value !== undefined || isList(obj) || isStr(obj)))
+            return function (...args) { return dispatched(obj, ...args); };
+        return value === undefined ? value : value.bind(obj);
+    };
+
     // ---- method helpers: names whose meaning differs between the languages ----
     var pySort = function (list, args) {
         var kw = takeKw(args);

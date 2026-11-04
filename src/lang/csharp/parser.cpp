@@ -751,6 +751,13 @@ bool Parser::isTypeArgumentList(std::size_t at, std::size_t& end) const
                    t == Tok::LBracket || t == Tok::RBracket || typeKeyword(t) ||
                    identifierLike(t)) {
             // part of a type
+        } else if (t == Tok::LParen) {
+            // `List<(int, string)>`: a tuple type is one element of the list.
+            std::size_t after = 0;
+            if (!looksLikeType(i, after))
+                return false;
+            i = after;
+            continue;
         } else {
             return false;
         }
@@ -787,7 +794,7 @@ bool Parser::looksLikeType(std::size_t at, std::size_t& end) const
                        !typeKeyword(tokens_[j].type) && tokens_[j].type != Tok::Dot &&
                        tokens_[j].type != Tok::LBracket && tokens_[j].type != Tok::RBracket &&
                        tokens_[j].type != Tok::Lt && tokens_[j].type != Tok::Gt &&
-                       tokens_[j].type != Tok::Question) {
+                       tokens_[j].type != Tok::Shr && tokens_[j].type != Tok::Question) {
                 return false;
             }
         }
@@ -1911,6 +1918,26 @@ Expr* Parser::parseNewExpression()
         return node;
     }
 
+    const auto parseElements = [this](ArrayCreationExpr* node) {
+        node->hasInitializer = true;
+        expect(Tok::LBrace, "'{'");
+        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+            node->elements.push_back(parseExpression());
+            if (!match(Tok::Comma))
+                break;
+        }
+        expect(Tok::RBrace, "'}'");
+    };
+
+    // `new[] { ... }`: the checker finds the element type.
+    if (check(Tok::LBracket) && type(1) == Tok::RBracket) {
+        advance();
+        advance();
+        ArrayCreationExpr* node = newExpr<ArrayCreationExpr>(line, column);
+        parseElements(node);
+        return node;
+    }
+
     TypeRef* typeRef = parseType();
     if (typeRef->arrayRank > 0 || check(Tok::LBracket)) {
         ArrayCreationExpr* node = newExpr<ArrayCreationExpr>(line, column);
@@ -1918,14 +1945,7 @@ Expr* Parser::parseNewExpression()
         if (typeRef->arrayRank > 0) {
             // `new int[] { ... }`: the rank came from the type.
             --typeRef->arrayRank;
-            node->hasInitializer = true;
-            expect(Tok::LBrace, "'{'");
-            while (!check(Tok::RBrace) && !check(Tok::Eof)) {
-                node->elements.push_back(parseExpression());
-                if (!match(Tok::Comma))
-                    break;
-            }
-            expect(Tok::RBrace, "'}'");
+            parseElements(node);
             return node;
         }
         expect(Tok::LBracket, "'['");

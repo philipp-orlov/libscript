@@ -1570,6 +1570,7 @@ Parser::NodePtr Parser::trailers(NodePtr base)
             if (!is(Tok::Name))
                 fail("expected an attribute name");
             base = member(std::move(base), advance().text, at);
+            base->bindMethod = true;  // a call takes the receiver another way, and never reads this flag
             continue;
         }
         if (is(Tok::LParen)) {

@@ -290,3 +290,25 @@ TEST(modules)
     CHECK_EQ(text("import random\nrandom.seed(1)\nv = random.randint(1, 3)\nstr(1 <= v <= 3) + str(random.choice(['x']))"), "Truex");
     CHECK_EQ(text("import sys\nstr(len(sys.argv) >= 0)"), "True");
 }
+
+TEST(aMethodReadWithoutACallIsBound)
+{
+    script::Context ctx;
+    const auto run = [&ctx](const std::string& source) {
+        return ctx.eval(source, "<t>.py", script::Language::Python).toString();
+    };
+    CHECK_EQ(run("class A:\n    def __init__(self): self.v = 5\n    def f(self): return self.v\ng = A().f\ng()\n"), std::string("5"));
+    CHECK_EQ(run("w = [1, 2, 2]\nmax(w, key=w.count)\n"), std::string("2"));
+    CHECK_EQ(run("c = [1, 2, 2].count\nc(2)\n"), std::string("2"));
+    CHECK_EQ(run("u = 'abc'.upper\nu()\n"), std::string("ABC"));
+    CHECK_EQ(run("g = {'a': 1}.get\ng('a')\n"), std::string("1"));
+    CHECK_EQ(run("j = ','.join\nj(['a', 'b'])\n"), std::string("a,b"));
+    CHECK_EQ(run("l = [3, 1, 2]\ns = l.sort\ns()\nl[0]\n"), std::string("1"));
+    // Not methods, so nothing is bound: an instance's own callable, a class's function, a module's.
+    CHECK_EQ(run("def h(x): return x + 1\nclass B:\n    pass\nb = B()\nb.cb = h\nf = b.cb\nf(1)\n"), std::string("2"));
+    CHECK_EQ(run("import math\nfl = math.floor\nfl(2.5)\n"), std::string("2"));
+    // A class of its own that defines a name the built-ins dispatch on.
+    CHECK_EQ(run("class D:\n    def sort(self): return 9\ns2 = D().sort\ns2()\n"), std::string("9"));
+    // Data attributes read as ever.
+    CHECK_EQ(run("class E:\n    def __init__(self): self.count = 3\nE().count\n"), std::string("3"));
+}

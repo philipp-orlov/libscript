@@ -155,3 +155,10 @@ Python at the places programs notice, and says so where it does not.
 - **Strings are UTF-16**, as everywhere in the engine: `len("é")` is 1 but a
   character outside the basic plane counts as 2.
 - **`print(3.0)`** prints `3`, and `print(True)` prints `True`.
+
+## Bound methods
+
+Reading a method without calling it binds it, as Python says: `f = obj.method`,
+`key=words.count`, `map(text.count, items)`. The built-in types' methods bind the
+same way as your own classes'. An instance's own callable attribute and a function
+read from a class or a module stay plain values.

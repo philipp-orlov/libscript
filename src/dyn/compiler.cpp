@@ -1632,7 +1632,7 @@ private:
                 expr(*n.b);
                 emit(Op::GetElem);
             } else {
-                emitU(Op::GetProp, atomFor(n.text));
+                emitU(n.bindMethod ? Op::GetPropBound : Op::GetProp, atomFor(n.text));
             }
             return;
         }

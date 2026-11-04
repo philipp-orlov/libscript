@@ -253,7 +253,7 @@ TEST(foreachDeconstructs)
     CHECK_EQ(foreachCase(R"(int t = 0; foreach (var (_, v) in d) t += v; return t;)"), std::string("6"));
     CHECK_EQ(foreachCase(R"(string s = ""; foreach ((string k, int v) in d) s += k; return s;)"), std::string("bac"));
     // Any tuple sequence, and nested loops that each need their own hidden variable.
-    CHECK_EQ(foreachCase(R"((int, int)[] l = { (1, 2), (3, 4) };
+    CHECK_EQ(foreachCase(R"(var l = new List<(int, int)>(); l.Add((1, 2)); l.Add((3, 4));
                             int t = 0; foreach (var (a, b) in l) foreach (var (c, e) in l) t += a * c + b * e; return t;)"),
              std::string("52"));
 }

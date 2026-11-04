@@ -60,6 +60,8 @@ private:
         int loopDepth = 0;
     };
 
+    void checkNotReadOnly(const Expr* target);
+
     // ---- declaration passes ----
     /// The name of the copy method a record gets, which `with` calls.
     static constexpr const char* kRecordClone = "__clone";

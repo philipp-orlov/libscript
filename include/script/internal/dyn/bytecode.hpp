@@ -56,6 +56,7 @@ enum class Op : std::uint8_t
     GetProp,     // atom
     SetProp,     // atom
     GetPropDup,  // atom: obj -> func obj   (method calls keep the receiver)
+    GetPropBound,  // atom: GetProp, and a function read goes through `__py.bindRead` (Python's bound methods)
     GetElem,
     SetElem,
     GetElemDup,

@@ -1153,6 +1153,22 @@ Value execute(Runtime& rt, Frame& frame)
                         sp.push_back(getProperty(rt, base, key));
                         break;
                     }
+                    case Op::GetPropBound: {
+                        GCObject* key = code.atoms[operandAt(pc)].get();
+                        pc += 4;
+                        Value base = pop();
+                        Value read = getProperty(rt, base, key);
+                        // Data attributes pay for one tag check; only a method read as a value goes further,
+                        // or a Python method JavaScript has no spelling of, which reads as undefined.
+                        if (asFunction(read) || read.isUndefined()) {
+                            const Value py = getProperty(rt, detail::Access::make(Type::Object, rt.globalObject.get()), rt.intern(u"__py"));
+                            const Value hook = py.isObject() ? getProperty(rt, py, rt.intern(u"bindRead")) : Value::undefined();
+                            if (asFunction(hook))
+                                read = callValue(rt, hook, Value::undefined(), {base, detail::Access::make(Type::String, key), read});
+                        }
+                        sp.push_back(std::move(read));
+                        break;
+                    }
                     case Op::GetPropDup: {
                         GCObject* key = code.atoms[operandAt(pc)].get();
                         pc += 4;

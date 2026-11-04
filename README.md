@@ -60,7 +60,7 @@ int main()
             const [w, n] = Object.entries(seen).sort((a, b) => b[1] - a[1])[0];
             Host.Report("JavaScript", w, n);)"},
         {"top.py", R"(words = [Host.Word(i) for i in range(Host.Count())]
-top = max(words, key=lambda w: words.count(w))
+top = max(words, key=words.count)
 Host.Report("Python", top, words.count(top)))"},
         {"top.c", R"(#include <string.h>
             int main() { int top = 0, most = 0, size = Host.Count();

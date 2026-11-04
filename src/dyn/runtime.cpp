@@ -24,7 +24,7 @@ const char* opName(Op op) noexcept
         "Pop", "PopN", "Dup", "Dup2", "Swap", "Rot3",
         "GetLocal", "SetLocal", "GetCell", "SetCell", "NewCell", "RenewCell", "GetUpval",
         "SetUpval", "GetGlobal", "SetGlobal", "DefGlobal", "TypeofGlobal", "DeleteGlobal",
-        "GetProp", "SetProp", "GetPropDup", "GetElem", "SetElem", "GetElemDup", "DeleteProp",
+        "GetProp", "SetProp", "GetPropDup", "GetPropBound", "GetElem", "SetElem", "GetElemDup", "DeleteProp",
         "DeleteElem", "DefField", "DefGetter", "DefSetter", "DefElem", "DefMethod",
         "DefMethodElem", "ObjectRest", "ClassSetup", "SetProtoOf", "GetSuper", "SetSuper",
         "GetSuperElem",

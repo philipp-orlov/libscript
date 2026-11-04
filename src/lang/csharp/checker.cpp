@@ -1907,7 +1907,7 @@ bool Checker::bindArguments(MethodInfo* method, std::vector<Argument>& args, boo
             if (apply) {
                 if (!assignable(value)) {
                     errorAt(value, 1510, "a ref or out argument must be an assignable variable");
-                } else if (value->kind == ExprKind::Name) {
+                } else if (checkNotReadOnly(value), value->kind == ExprKind::Name) {
                     // Taking its address means the variable has to live in a
                     // box, the same way a captured one does.
                     auto* name = static_cast<NameExpr*>(value);
@@ -2894,8 +2894,32 @@ const TypeInfo* Checker::checkObjectCreationOf(ObjectCreationExpr* expr, const T
 const TypeInfo* Checker::checkArrayCreation(ArrayCreationExpr* expr)
 {
     const CoreTypes& core = types_.core();
-    const TypeInfo* element =
-        expr->type ? expr->type->element : resolve(expr->elementTypeRef);
+    const TypeInfo* element = nullptr;
+    if (expr->type) {
+        element = expr->type->element;
+    } else if (expr->elementTypeRef) {
+        element = resolve(expr->elementTypeRef);
+    } else {
+        // `new[] { ... }`: the one element type every other element converts to.
+        for (Expr* item : expr->elements)
+            checkExpr(item);
+        for (const Expr* candidate : expr->elements) {
+            const TypeInfo* type = candidate->type;
+            if (!type || type->kind == TypeKind::Null)
+                continue;
+            bool fits = true;
+            for (const Expr* item : expr->elements)
+                fits = fits && (item->type == type || types_.implicitlyConverts(item->type, type));
+            if (fits) {
+                element = type;
+                break;
+            }
+        }
+        if (!element) {
+            errorAt(expr, 826, "no best type found for the implicitly typed array");
+            return core.errorType;
+        }
+    }
     if (!element)
         element = core.objectType;
     if (expr->size)
@@ -2964,6 +2988,8 @@ const TypeInfo* Checker::checkUnary(UnaryExpr* expr)
             }
             if (!assignable(expr->operand))
                 errorAt(expr, 1059, "the operand must be a variable, a field or a property");
+            else
+                checkNotReadOnly(expr->operand);
             return operand;
     }
     return core.errorType;
@@ -3162,6 +3188,43 @@ const TypeInfo* Checker::checkBinary(BinaryExpr* expr)
     return promoted;
 }
 
+/// A readonly field takes a value in its declaration or in a constructor of its
+/// own type, through `this`, and nowhere else. A field of a struct held in a
+/// readonly field is part of that field's value.
+void Checker::checkNotReadOnly(const Expr* target)
+{
+    while (target) {
+        const FieldInfo* field = nullptr;
+        const Expr* receiver = nullptr;
+        if (target->kind == ExprKind::Name) {
+            field = static_cast<const NameExpr*>(target)->field;
+        } else if (target->kind == ExprKind::MemberAccess) {
+            const auto* member = static_cast<const MemberAccessExpr*>(target);
+            field = member->field;
+            receiver = member->target;
+        }
+        if (!field)
+            return;
+        if (field->isReadOnly) {
+            const MethodInfo* method = fn_ ? fn_->method : nullptr;
+            const bool inInitializer =
+                method && !fn_->lambda && fn_->owner == field->owner &&
+                (method->isConstructor() || method->name == ascii(".cctor")) &&
+                method->isStatic() == field->isStatic;
+            const bool throughThis = field->isStatic || !receiver || receiver->kind == ExprKind::This;
+            if (!inInitializer || !throughThis) {
+                errorAt(target, field->isStatic ? 198 : 191,
+                        "the readonly field '" + toUtf8(field->name) +
+                            "' can only be assigned in a constructor of its own type");
+                return;
+            }
+        }
+        if (!field->owner || !field->owner->isValueType())
+            return;
+        target = receiver;
+    }
+}
+
 bool Checker::assignable(Expr* expr) const
 {
     if (!expr)
@@ -3223,11 +3286,7 @@ const TypeInfo* Checker::checkAssignment(AssignmentExpr* expr)
             errorAt(expr, 131, "a const local cannot be assigned to");
     }
 
-    if (expr->target->kind == ExprKind::MemberAccess) {
-        const FieldInfo* field = static_cast<MemberAccessExpr*>(expr->target)->field;
-        if (field && field->isReadOnly && field->owner && field->owner->nativeKind == NativeKind::Tuple)
-            errorAt(expr, 8331, "'" + toUtf8(field->name) + "' is read-only");
-    }
+    checkNotReadOnly(expr->target);
 
     // An init-only property closes as soon as the object is built, so it can
     // only be assigned from inside its own type.

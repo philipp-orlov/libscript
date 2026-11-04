@@ -154,6 +154,7 @@ struct Node
     bool computed = false;
     bool isStatic = false;
     bool prefix = false;
+    bool bindMethod = false;  ///< a Member: reading a method makes a bound method, as Python says
     bool optional = false;  ///< `?.` member access or call, or `x?:` on a binding
     bool namedExpr = false; ///< FunctionExpr written `function name() {}`: the name binds inside
     bool readOnly = false;  ///< `readonly` property or `readonly T[]`

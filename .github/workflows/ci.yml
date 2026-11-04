@@ -1,0 +1,134 @@
+# Every push and pull request: release, address+undefined and thread sanitizer builds, the oldest supported compiler,
+# both code generators on their own hardware, the installed package, and a short soak.
+# libscript and libcore are checked out side by side, as locally.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: libscript
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/libcore
+          path: libcore
+          ref: main
+      - name: Configure
+        run: cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j2
+      - name: Nothing libcore provides is written again
+        run: cd libscript && ../libcore/buildkit/scripts/check_no_dups.sh include src tools tests bench examples
+
+  asan-ubsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: libscript
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/libcore
+          path: libcore
+          ref: main
+      - name: Configure
+        run: cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Debug -DSCRIPT_ENABLE_ASAN=ON -DSCRIPT_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build -j4
+      - name: Test
+        env:
+          # Tracking stack use after return makes the interpreters' large frames far too slow to test.
+          ASAN_OPTIONS: detect_stack_use_after_return=0
+        run: ctest --test-dir build --output-on-failure -j2
+
+  tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: libscript
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/libcore
+          path: libcore
+          ref: main
+      - name: Configure
+        run: cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Debug -DCORE_SANITIZE=thread -DSCRIPT_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build -j4
+      - name: Test
+        # setarch -R: ThreadSanitizer cannot lay out its shadow memory under the kernel's full address randomization.
+        # The suites that share a context between threads, or exercise the allocators and the collector.
+        run: setarch -R ctest --test-dir build --output-on-failure -j2 -R 'threads|gc|steady|polyglot|soak'
+
+  gcc9-cxx17:
+    # The oldest toolchain the family must build with (JetPack 5 ships GCC 9): no floating-point <charconv>.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: libscript
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/libcore
+          path: libcore
+          ref: main
+      - run: sudo apt-get update && sudo apt-get install -y g++-9
+      - run: cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-9
+      - run: cmake --build build -j4
+      - run: ctest --test-dir build --output-on-failure -j2
+
+  install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: libscript
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/libcore
+          path: libcore
+          ref: main
+      - name: Install libcore
+        run: |
+          cmake -S libcore -B build-core -DCMAKE_BUILD_TYPE=Release -DCORE_BUILD_TESTS=OFF
+          cmake --build build-core -j4
+          cmake --install build-core --prefix "$PWD/prefix"
+      - name: Build libscript against the installed libcore, and install it
+        run: |
+          cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Release -DSCRIPT_LIBCORE_DIR= -DCMAKE_PREFIX_PATH="$PWD/prefix" -DSCRIPT_BUILD_TESTS=OFF -DSCRIPT_BUILD_EXAMPLES=OFF
+          cmake --build build -j4
+          cmake --install build --prefix "$PWD/prefix"
+          test -f prefix/lib/cmake/script/scriptConfig.cmake
+          prefix/bin/libscript --lang js -e 'console.log(6 * 7)'
+
+  soak:
+    # Five minutes of every language at once: the resident size must have stopped growing by the end.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: libscript
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/libcore
+          path: libcore
+          ref: main
+      - run: cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Release -DSCRIPT_BUILD_TESTS=OFF -DSCRIPT_BUILD_EXAMPLES=OFF -DSCRIPT_BUILD_BENCHMARKS=ON
+      - run: cmake --build build -j4 --target bench_soak_mixed
+      - name: Soak
+        env:
+          SCRIPT_SOAK_SECONDS: 300
+        run: build/bench/bench_soak_mixed

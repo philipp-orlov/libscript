@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(libcore CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/script-targets.cmake")
+set_property(TARGET script::script APPEND PROPERTY INTERFACE_LINK_LIBRARIES core::mem core::sys core::base)
+check_required_components(script)

@@ -126,6 +126,8 @@ const char* kCSharp = R"(
             for (int i = 0; i < 100; i++) index["key " + i] = i;
             int total = 0;
             for (int i = 0; i < 100; i++) total += index["key " + i] + list[i].Value;
+            foreach (var entry in index) total += entry.Value;
+            foreach (var (key, value) in index) total += key.Length + value;
             var sb = new StringBuilder();
             for (int i = 0; i < 50; i++) sb.Append(i * 0.5).Append(',');
             var data = new int[64];

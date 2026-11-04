@@ -573,6 +573,45 @@ const TypeInfo* TypeTable::dictionaryOf(const TypeInfo* key, const TypeInfo* val
     return type;
 }
 
+const TypeInfo* TypeTable::keyValuePairOf(const TypeInfo* key, const TypeInfo* value)
+{
+    if (!key)
+        key = core_.objectType;
+    if (!value)
+        value = core_.objectType;
+    const String name = constructedName("System.Collections.Generic.KeyValuePair", {key, value});
+    const auto it = constructed_.find(name);
+    if (it != constructed_.end())
+        return it->second;
+
+    auto owned = std::make_unique<TypeInfo>();
+    TypeInfo* type = owned.get();
+    type->kind = TypeKind::Class;
+    type->nativeKind = NativeKind::Tuple;
+    type->base = core_.objectType;
+    type->isSealed = true;
+    type->typeArgs = {key, value};
+    type->fullName = name;
+    type->name = ascii("KeyValuePair");
+    type->instanceSlots = 2;
+    const char* const names[] = {"Key", "Value"};
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        FieldInfo field;
+        field.name = ascii(names[i]);
+        field.type = type->typeArgs[i];
+        field.owner = type;
+        field.slot = i;
+        field.access = Access::Public;
+        field.isReadOnly = true;
+        type->fields.push_back(std::move(field));
+    }
+    constructed_[name] = type;
+    index_[name] = type;
+    owned_.push_back(std::move(owned));
+    instantiateTuple(*this, type);
+    return type;
+}
+
 const TypeInfo* TypeTable::funcOf(const std::vector<const TypeInfo*>& params,
                                   const TypeInfo* result)
 {

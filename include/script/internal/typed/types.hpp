@@ -84,6 +84,10 @@ public:
     /// `List<T>`, `Dictionary<K,V>`: constructed on demand, methods included.
     const TypeInfo* listOf(const TypeInfo* element);
     const TypeInfo* dictionaryOf(const TypeInfo* key, const TypeInfo* value);
+    /// `KeyValuePair<K,V>`: what walking a dictionary yields. A tuple in every
+    /// way that matters -- deconstruction, patterns, value equality -- with
+    /// read-only `Key` and `Value` as its elements.
+    const TypeInfo* keyValuePairOf(const TypeInfo* key, const TypeInfo* value);
     /// `IEnumerable<T>`: the element type is what makes `foreach` and the
     /// query operators know what they are walking.
     const TypeInfo* enumerableOf(const TypeInfo* element);

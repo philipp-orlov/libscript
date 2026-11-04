@@ -265,6 +265,29 @@ void instantiateDictionary(TypeTable& table, TypeInfo* type)
                       },
                       nullptr);
 
+    // What `foreach` walks: the entries as they are when the loop starts, in
+    // insertion order. `$` keeps the name out of any program's reach.
+    const TypeInfo* pairType = table.keyValuePairOf(keyType, valueType);
+    const TypeInfo* pairList = table.listOf(pairType);
+    table.addMethod(type, "$Entries", pairList, {}, MethodAccessor,
+                    [pairType, pairList](CallInfo& call) {
+                        Runtime& rt = runtimeOf(call);
+                        auto* dict = asDict(call.thisValue());
+                        auto* result = rt.newCell<CSList>();
+                        Value handle = detail::Access::adopt(Type::Object, result);
+                        result->type = pairList;
+                        for (const CSDict::Entry& entry : dict->entries) {
+                            if (!entry.live)
+                                continue;
+                            Value pair = newInstanceOf(rt, pairType);
+                            auto* cell = static_cast<CSInstance*>(detail::Access::ptr(pair));
+                            cell->slots()[0] = entry.key;
+                            cell->slots()[1] = entry.value;
+                            result->add(pair);
+                        }
+                        return handle;
+                    });
+
     PropertyInfo count;
     count.name = ascii("Count");
     count.type = intType;

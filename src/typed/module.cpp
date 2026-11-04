@@ -395,6 +395,8 @@ const TypeInfo* resolveTypeName(Runtime& rt, StringView fullName)
         return rt.types->listOf(args[0]);
     if (head == u"System.Collections.Generic.Dictionary" && args.size() == 2)
         return rt.types->dictionaryOf(args[0], args[1]);
+    if (head == u"System.Collections.Generic.KeyValuePair" && args.size() == 2)
+        return rt.types->keyValuePairOf(args[0], args[1]);
     if (head == u"System.Func" && !args.empty()) {
         const TypeInfo* result = args.back();
         args.pop_back();

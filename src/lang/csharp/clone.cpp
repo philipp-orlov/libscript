@@ -351,6 +351,7 @@ public:
                     to->vars.push_back(std::move(copy));
                 }
                 to->deconstruction = deconstruction(from->deconstruction);
+                to->deconstructionValue = expr(from->deconstructionValue);
                 return to;
             }
             case StmtKind::Expression: {

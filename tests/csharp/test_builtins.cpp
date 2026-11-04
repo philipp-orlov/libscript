@@ -225,3 +225,85 @@ TEST(charHelpers)
     CHECK(run("return char.IsDigit('7') && char.IsLetter('x');").toBool());
     CHECK_EQ(text("return char.ToUpper('a').ToString();"), "A");
 }
+
+namespace {
+const char* const kCounts = R"(
+    using System.Collections.Generic;
+    var d = new Dictionary<string, int>();
+    d["b"] = 2; d["a"] = 1; d["c"] = 3; d["gone"] = 9;
+    d.Remove("gone");
+)";
+std::string foreachCase(const std::string& body)
+{
+    script::Context ctx;
+    return ctx.eval(std::string(kCounts) + body, "<t>.cs", script::Language::CSharp).toString();
+}
+}  // namespace
+
+TEST(foreachWalksADictionaryInInsertionOrder)
+{
+    CHECK_EQ(foreachCase(R"(string s = ""; foreach (var e in d) s += e.Key + e.Value; return s;)"), std::string("b2a1c3"));
+    CHECK_EQ(foreachCase(R"(string s = ""; foreach (KeyValuePair<string, int> e in d) s += e.Key; return s;)"), std::string("bac"));
+    CHECK_EQ(foreachCase(R"(string s = ""; foreach (var e in d) s += e.ToString(); return s;)"), std::string("[b, 2][a, 1][c, 3]"));
+}
+
+TEST(foreachDeconstructs)
+{
+    CHECK_EQ(foreachCase(R"(string s = ""; foreach (var (k, v) in d) s += k + v; return s;)"), std::string("b2a1c3"));
+    CHECK_EQ(foreachCase(R"(int t = 0; foreach (var (_, v) in d) t += v; return t;)"), std::string("6"));
+    CHECK_EQ(foreachCase(R"(string s = ""; foreach ((string k, int v) in d) s += k; return s;)"), std::string("bac"));
+    // Any tuple sequence, and nested loops that each need their own hidden variable.
+    CHECK_EQ(foreachCase(R"((int, int)[] l = { (1, 2), (3, 4) };
+                            int t = 0; foreach (var (a, b) in l) foreach (var (c, e) in l) t += a * c + b * e; return t;)"),
+             std::string("52"));
+}
+
+TEST(foreachOverADictionaryHasOrdinaryControlFlow)
+{
+    CHECK_EQ(foreachCase(R"(int t = 0; foreach (var e in d) { if (e.Key == "a") continue; if (e.Key == "c") break; t += e.Value; } return t;)"), std::string("2"));
+    CHECK_EQ(foreachCase(R"(int t = 0; var empty = new Dictionary<int, int>(); foreach (var e in empty) t++; return t;)"), std::string("0"));
+    CHECK_EQ(foreachCase(R"(var fs = new List<System.Func<int>>(); foreach (var e in d) fs.Add(() => e.Value);
+                            int t = 0; foreach (var f in fs) t = t * 10 + f(); return t;)"), std::string("213"));
+}
+
+TEST(foreachWalksTheEntriesAsTheyWereWhenItStarted)
+{
+    CHECK_EQ(foreachCase(R"(int n = 0; foreach (var e in d) { d.Remove(e.Key); d[e.Key + "x"] = 1; n++; } return n * 10 + d.Count;)"), std::string("33"));
+}
+
+TEST(aKeyValuePairIsReadOnlyAndTyped)
+{
+    script::Context ctx;
+    CHECK(!ctx.diagnose(std::string(kCounts) + "foreach (var e in d) e.Value = 1;", "<t>.cs", nullptr, script::Language::CSharp).empty());
+    CHECK(!ctx.diagnose(std::string(kCounts) + "foreach (KeyValuePair<int, int> e in d) { }", "<t>.cs", nullptr, script::Language::CSharp).empty());
+    CHECK(!ctx.diagnose(std::string(kCounts) + "foreach (var (a, b, c) in d) { }", "<t>.cs", nullptr, script::Language::CSharp).empty());
+    CHECK(!ctx.diagnose("foreach (var x in 5) { }", "<t>.cs", nullptr, script::Language::CSharp).empty());
+}
+
+TEST(aNullDictionaryThrowsInForeach)
+{
+    script::Context ctx;
+    CHECK_THROWS(ctx.eval("System.Collections.Generic.Dictionary<string, int> d = null; foreach (var e in d) { } return 1;", "<t>.cs", script::Language::CSharp),
+                 script::ErrorCode::NullReference);
+}
+
+TEST(foreachOverADictionarySurvivesAnImage)
+{
+    script::Context ctx;
+    const std::vector<std::uint8_t> image =
+        ctx.compile(std::string(kCounts) + R"(string s = ""; foreach (var (k, v) in d) s += k + v; return s;)", "<t>.cs",
+                    script::Language::CSharp).serialize();
+    script::Context other;
+    CHECK_EQ(other.run(other.load(image.data(), image.size())).toString(), std::string("b2a1c3"));
+}
+
+TEST(foreachOverADictionaryInAGenericMethod)
+{
+    script::Context ctx;
+    CHECK_EQ(ctx.eval(R"(
+        using System.Collections.Generic;
+        static class G { public static int Sum<K>(Dictionary<K, int> m) { int t = 0; foreach (var (_, v) in m) t += v; return t; } }
+        var d = new Dictionary<string, int>(); d["a"] = 4; d["b"] = 5;
+        return G.Sum(d);
+    )", "<t>.cs", script::Language::CSharp).toInt(), 9);
+}

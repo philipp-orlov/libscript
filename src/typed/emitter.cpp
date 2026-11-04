@@ -579,6 +579,8 @@ void Emitter::emitForEach(ForEachStmt* stmt)
     // Every supported sequence is indexable, so one shape of loop covers them
     // all: evaluate once, keep a cursor, read the element each time round.
     emitExpr(stmt->sequence);
+    if (stmt->over == ForEachStmt::Over::Dictionary)
+        emitCall(stmt->getEnumerator, 1, false, false);
     op(Op::StLoc, stmt->sequenceSlot);
     op(Op::LdcI4, 0);
     op(Op::StLoc, stmt->cursorSlot);

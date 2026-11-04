@@ -104,8 +104,19 @@ try {
 }
 ```
 
-`foreach` walks arrays, strings and `List<T>` (and `dictionary.Keys`, which is
-a `List<K>`).
+`foreach` walks arrays, strings, `List<T>` and `Dictionary<K,V>`. A dictionary
+yields `KeyValuePair<K,V>`, in insertion order, and takes the deconstructing form:
+
+```csharp
+foreach (var entry in counts) Console.WriteLine(entry.Key + ": " + entry.Value);
+foreach (var (word, count) in counts) total += count;
+```
+
+The loop walks the entries as they were when it started (as `dictionary.Keys` and
+`dictionary.Values` do), so changing the dictionary inside the loop does not throw
+`InvalidOperationException` the way it does on .NET, and the loop does not see the
+change. Each round allocates its `KeyValuePair` from the heap, which is a pool pop,
+not a struct on the stack.
 
 ## Expressions
 

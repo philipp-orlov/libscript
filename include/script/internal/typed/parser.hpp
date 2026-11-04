@@ -99,7 +99,7 @@ private:
     Stmt* parseTry();
     bool looksLikeLocalDecl() const;
     bool looksLikeLocalFunction() const;
-    bool looksLikeDeconstruction() const;
+    bool looksLikeDeconstruction(Tok follow = Tok::Assign) const;
     Deconstruction* parseDeconstructionTargets();
     Stmt* parseDeconstruction();
     /// True when a `case` label is the pre-pattern constant form.

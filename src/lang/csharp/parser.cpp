@@ -1092,7 +1092,7 @@ bool Parser::looksLikeLocalFunction() const
 }
 
 /// `var (a, b) = ...` or `(int a, var b) = ...`.
-bool Parser::looksLikeDeconstruction() const
+bool Parser::looksLikeDeconstruction(Tok follow) const
 {
     std::size_t i = pos_;
     if (i < tokens_.size() && tokens_[i].type == Tok::Var && i + 1 < tokens_.size() &&
@@ -1107,7 +1107,7 @@ bool Parser::looksLikeDeconstruction() const
             ++depth;
         } else if (tokens_[j].type == Tok::RParen) {
             if (--depth == 0)
-                return j + 1 < tokens_.size() && tokens_[j + 1].type == Tok::Assign;
+                return j + 1 < tokens_.size() && tokens_[j + 1].type == follow;
         } else if (depth == 0) {
             return false;
         }
@@ -1266,14 +1266,39 @@ Stmt* Parser::parseForEach()
     ForEachStmt* node = newStmt<ForEachStmt>(peek().line);
     advance();
     expect(Tok::LParen, "'('");
-    node->typeRef = parseType();
-    if (!identifierLike(type()))
-        fail("expected a variable name");
-    node->name = advance().text;
+    // `foreach (var (k, v) in pairs) body` is
+    // `foreach (var e in pairs) { var (k, v) = e; body }`, with an `e` no program can name.
+    Deconstruction* targets = nullptr;
+    if (looksLikeDeconstruction(Tok::In)) {
+        const std::uint32_t line = peek().line;
+        targets = parseDeconstructionTargets();
+        node->typeRef = arena_.make<TypeRef>();
+        node->typeRef->isVar = true;
+        node->typeRef->line = line;
+        node->name = ascii("$each" + std::to_string(pos_));
+    } else {
+        node->typeRef = parseType();
+        if (!identifierLike(type()))
+            fail("expected a variable name");
+        node->name = advance().text;
+    }
     expect(Tok::In, "'in'");
     node->sequence = parseExpression();
     expect(Tok::RParen, "')'");
-    node->body = parseStatement();
+    Stmt* const body = parseStatement();
+    if (!targets) {
+        node->body = body;
+        return node;
+    }
+    LocalDeclStmt* decl = newStmt<LocalDeclStmt>(node->line);
+    decl->deconstruction = targets;
+    NameExpr* each = newExpr<NameExpr>(node->line, 1);
+    each->name = node->name;
+    decl->deconstructionValue = each;
+    BlockStmt* block = newStmt<BlockStmt>(node->line);
+    block->statements.push_back(decl);
+    block->statements.push_back(body);
+    node->body = block;
     return node;
 }
 

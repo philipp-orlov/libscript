@@ -729,6 +729,8 @@ const TypeInfo* Checker::resolve(TypeRef* ref, bool reportErrors)
                 type = types_.listOf(args[0]);
             } else if (simple == u"Dictionary" && args.size() == 2) {
                 type = types_.dictionaryOf(args[0], args[1]);
+            } else if (simple == u"KeyValuePair" && args.size() == 2) {
+                type = types_.keyValuePairOf(args[0], args[1]);
             } else if (simple == u"Func" && !args.empty()) {
                 const TypeInfo* result = args.back();
                 args.pop_back();
@@ -1415,6 +1417,16 @@ void Checker::checkStatement(Stmt* stmt)
             auto* node = static_cast<ForEachStmt*>(stmt);
             const TypeInfo* sequence = checkExpr(node->sequence);
             const TypeInfo* element = core.errorType;
+            // A dictionary is walked through a list of its entries.
+            const TypeInfo* walked = sequence;
+            if (sequence->nativeKind == NativeKind::Dictionary) {
+                std::vector<MethodInfo*> entries;
+                sequence->collectMethods(ascii("$Entries"), entries);
+                if (!entries.empty()) {
+                    node->getEnumerator = entries[0];
+                    walked = entries[0]->returnType;
+                }
+            }
             if (sequence->kind == TypeKind::Array) {
                 node->over = ForEachStmt::Over::Array;
                 element = sequence->element;
@@ -1427,19 +1439,19 @@ void Checker::checkStatement(Stmt* stmt)
                 std::vector<MethodInfo*> chars;
                 sequence->collectMethods(ascii("get_Chars"), chars);
                 node->itemGetter = chars.empty() ? nullptr : chars[0];
-            } else if (sequence->nativeKind == NativeKind::List) {
-                node->over = ForEachStmt::Over::List;
-                element = sequence->typeArgs.empty() ? core.objectType : sequence->typeArgs[0];
+            } else if (walked->nativeKind == NativeKind::List) {
+                node->over = walked == sequence ? ForEachStmt::Over::List : ForEachStmt::Over::Dictionary;
+                element = walked->typeArgs.empty() ? core.objectType : walked->typeArgs[0];
                 std::vector<MethodInfo*> getters;
-                sequence->collectMethods(ascii("get_Item"), getters);
+                walked->collectMethods(ascii("get_Item"), getters);
                 node->itemGetter = getters.empty() ? nullptr : getters[0];
                 std::vector<MethodInfo*> counts;
-                sequence->collectMethods(ascii("get_Count"), counts);
+                walked->collectMethods(ascii("get_Count"), counts);
                 node->countGetter = counts.empty() ? nullptr : counts[0];
             } else if (sequence->kind != TypeKind::Error) {
                 error(stmt->line, 1, 1579,
                       "foreach cannot operate on '" + describe(sequence) +
-                          "'; it is not an array, a string or a List<T>");
+                          "'; it is not an array, a string, a List<T> or a Dictionary<K,V>");
             }
 
             pushScope();
@@ -1449,7 +1461,7 @@ void Checker::checkStatement(Stmt* stmt)
                 element->kind != TypeKind::Error)
                 error(stmt->line, 1, 30,
                       "cannot convert '" + describe(element) + "' to '" + describe(declared) + "'");
-            node->sequenceSlot = addTemporary(sequence);
+            node->sequenceSlot = addTemporary(walked);
             node->cursorSlot = addTemporary(core.intType);
             node->slot = declareLocal(node->name, declared, stmt->line);
             ++fn_->loopDepth;
@@ -3209,6 +3221,12 @@ const TypeInfo* Checker::checkAssignment(AssignmentExpr* expr)
             errorAt(expr, 131, "a const field cannot be assigned to");
         else if (name->symbol == SymbolKind::Local && name->isConstant)
             errorAt(expr, 131, "a const local cannot be assigned to");
+    }
+
+    if (expr->target->kind == ExprKind::MemberAccess) {
+        const FieldInfo* field = static_cast<MemberAccessExpr*>(expr->target)->field;
+        if (field && field->isReadOnly && field->owner && field->owner->nativeKind == NativeKind::Tuple)
+            errorAt(expr, 8331, "'" + toUtf8(field->name) + "' is read-only");
     }
 
     // An init-only property closes as soon as the object is built, so it can

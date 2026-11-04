@@ -34,14 +34,16 @@ void instantiateTuple(TypeTable& table, TypeInfo* type)
         params.push_back(table.param(toUtf8(type->fields[i].name).c_str(), type->typeArgs[i]));
     table.addMethod(type, ".ctor", core.voidType, std::move(params), MethodConstructor, newTuple);
 
-    // `(1, "a").ToString()` is `(1, a)`, which is what C# prints.
+    // `(1, "a").ToString()` is `(1, a)`, which is what C# prints; a
+    // `KeyValuePair` prints as `[1, a]`.
+    const bool isPair = type->name == u"KeyValuePair";
     table.addMethod(type, "ToString", core.stringType, {}, MethodVirtual | MethodOverride,
-                    [arity](CallInfo& call) {
+                    [arity, isPair](CallInfo& call) {
                         Runtime& rt = runtimeOf(call);
                         auto* cell =
                             static_cast<CSInstance*>(detail::Access::ptr(call.thisValue()));
                         String out;
-                        out.push_back(u'(');
+                        out.push_back(isPair ? u'[' : u'(');
                         for (std::uint32_t i = 0; i < arity; ++i) {
                             if (i) {
                                 out.push_back(u',');
@@ -49,7 +51,7 @@ void instantiateTuple(TypeTable& table, TypeInfo* type)
                             }
                             out += toStringValue(rt, cell->slots()[i]);
                         }
-                        out.push_back(u')');
+                        out.push_back(isPair ? u']' : u')');
                         return rt.str(out);
                     });
 

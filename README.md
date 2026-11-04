@@ -195,18 +195,9 @@ written down in [limitations.md](docs/limitations.md).
 
 ## 🔬 Under the hood
 
-```mermaid
-flowchart TB
-    host["Your C++ application<br/>hostClass · Class&lt;T&gt; · Context"]
-    typed["<b>Typed bytecode VM</b> + arm64 / x86-64 JIT<br/>C# · C · C++"]
-    dyn["<b>Dynamic bytecode VM</b><br/>TypeScript · JavaScript · Python"]
-    heap["<b>One heap, one Value</b> · refcounts + cycle collector<br/>on libcore: LocalHeap · SizeClassPool · ObjectArena · pages"]
-
-    host --> typed
-    host --> dyn
-    typed --> heap
-    dyn --> heap
-```
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="Your C++ application drives two engines: a typed bytecode VM with an arm64 and x86-64 JIT that runs C#, C and C++, and a dynamic bytecode VM that runs TypeScript, JavaScript and Python. Both share one heap with reference counts and a cycle collector, built on libcore." width="100%">
+</p>
 
 The machinery under the languages comes from [libcore](https://github.com/philipp-orlov/libcore), the foundation shared
 with libsql, librpc and the rest of the family, so none of it is written here a second time.

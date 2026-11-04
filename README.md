@@ -27,38 +27,118 @@ and on a heap built to still look the same after months of uptime. No .NET, no N
 ## ⚡ See it run
 
 ```cpp
+#include <cstdio>
+#include <string>
+#include <vector>
+
 #include "script/script.hpp"
 
 int main()
 {
     script::Context ctx;
 
-    // One binding. Every language sees it.
-    ctx.hostClass("Env").method("Greet", [](std::string name) { return "hello " + name; });
+    // One host API, bound once. Every language sees it, and the typed ones check calls against these C++ signatures.
+    const std::vector<std::string> words = {"the", "heap", "stays", "flat", "and", "the", "heap", "stays", "the", "same"};
+    ctx.hostClass("Host")
+        .method("Count", [&] { return int(words.size()); })
+        .method("Word", [&](int i) { return words.at(std::size_t(i)); })
+        .method("Report", [](std::string language, std::string word, int count) {
+            std::printf("%-11s most common word: %-6s x%d\n", language.c_str(), word.c_str(), count);
+        });
 
-    std::puts(ctx.eval("return Env.Greet(\"world\").ToUpper();", "hello.cs").toString().c_str());
-    std::puts(ctx.eval("Env.Greet('world').toUpperCase()", "hello.ts").toString().c_str());
-    std::puts(ctx.eval("Env.Greet('world').toUpperCase()", "hello.js").toString().c_str());
-    std::puts(ctx.eval("Env.Greet('world').upper()", "hello.py").toString().c_str());
-    ctx.eval("#include <stdio.h>\nint main() { puts(Env.Greet(\"world\")); return 0; }", "hello.c");
+    // The same job in each language's own idiom: find the most common word. The file name picks the language.
+    struct Program { const char* file; const char* source; };
+    const Program programs[] = {
+        {"top.cs", R"(
+            using System.Collections.Generic;
+            var counts = new Dictionary<string, int>();
+            string best = "";
+            for (int i = 0; i < Host.Count(); i++) {
+                string w = Host.Word(i);
+                counts[w] = counts.ContainsKey(w) ? counts[w] + 1 : 1;
+                if (best == "" || counts[w] > counts[best]) best = w;
+            }
+            Host.Report("C#", best, counts[best]);
+        )"},
+        {"top.ts", R"(
+            const counts = new Map<string, number>();
+            for (let i = 0; i < Host.Count(); i++) {
+                const w: string = Host.Word(i);
+                counts.set(w, (counts.get(w) ?? 0) + 1);
+            }
+            const [best, n] = [...counts].reduce((a, b) => (b[1] > a[1] ? b : a));
+            Host.Report("TypeScript", best, n);
+        )"},
+        {"top.js", R"(
+            const words = Array.from({ length: Host.Count() }, (_, i) => Host.Word(i));
+            const counts = words.reduce((c, w) => ({ ...c, [w]: (c[w] || 0) + 1 }), {});
+            const [best, n] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+            Host.Report("JavaScript", best, n);
+        )"},
+        {"top.py", R"(
+counts = {}
+for i in range(Host.Count()):
+    w = Host.Word(i)
+    counts[w] = counts.get(w, 0) + 1
+best = max(counts, key=lambda w: counts[w])
+Host.Report("Python", best, counts[best])
+)"},
+        {"top.c", R"(
+            #include <string.h>
+            int main() {
+                int n = Host.Count(), bestCount = 0;
+                const char* best = "";
+                for (int i = 0; i < n; i++) {
+                    int count = 0;
+                    for (int j = 0; j < n; j++)
+                        if (strcmp(Host.Word(i), Host.Word(j)) == 0) count++;
+                    if (count > bestCount) { bestCount = count; best = Host.Word(i); }
+                }
+                Host.Report("C", best, bestCount);
+                return 0;
+            }
+        )"},
+        {"top.cpp", R"(
+            #include <map>
+            #include <string>
+            int main() {
+                std::map<std::string, int> counts;
+                for (int i = 0; i < Host::Count(); i++)
+                    counts[Host::Word(i)]++;
+                std::string best;
+                int bestCount = 0;
+                for (auto& entry : counts)
+                    if (entry.second > bestCount) { best = entry.first; bestCount = entry.second; }
+                Host::Report("C++", best, bestCount);
+                return 0;
+            }
+        )"},
+    };
 
-    // Caught before anything runs: Greet takes a string, and the checkers know it from the C++ signature.
-    for (const script::Diagnostic& d : ctx.diagnose("Env.Greet(42);", "bad.cs"))
-        std::puts(d.toString().c_str());
-    for (const script::Diagnostic& d : ctx.diagnose("Env.Greet(42)", "bad.ts"))
-        std::puts(d.toString().c_str());
+    for (const Program& program : programs) {
+        script::Assembly assembly = ctx.compile(program.source, program.file);  // compile once ...
+        ctx.run(assembly);                                                      // ... run as often as you like
+    }
+
+    // A wrong call never runs: where the language has types, the C++ signature rejects it at compile time.
+    for (const char* file : {"bad.cs", "bad.ts"})
+        for (const script::Diagnostic& d : ctx.diagnose("Host.Report(\"x\", 42, 1);", file))
+            std::puts(d.toString().c_str());
 }
 ```
 
 ```text
-HELLO WORLD
-HELLO WORLD
-HELLO WORLD
-HELLO WORLD
-hello world
-bad.cs(1,11): error CS29: cannot implicitly convert 'int' to 'string'
-bad.ts(1): error: argument 1 type mismatch: '42' is not assignable to 'string'
+C#          most common word: the    x3
+TypeScript  most common word: the    x3
+JavaScript  most common word: the    x3
+Python      most common word: the    x3
+C           most common word: the    x3
+C++         most common word: the    x3
+bad.cs(1,18): error CS29: cannot implicitly convert 'int' to 'string'
+bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
 ```
+
+<sub>This is <a href="examples/polyglot/word_count.cpp"><code>examples/polyglot/word_count.cpp</code></a>, built and runnable as it stands.</sub>
 
 ## 🌐 Six languages, one context
 
@@ -305,6 +385,7 @@ Every example is one file and one executable. Start with
 | [examples/cpp/classes.cpp](examples/cpp/classes.cpp) | a class hierarchy with virtual dispatch, scripted against a host contract |
 | [examples/cpp/bindings.cpp](examples/cpp/bindings.cpp) | a wrapped C++ class, a borrowed host service, `std::vector` both ways |
 | [examples/cpp/sandbox.cpp](examples/cpp/sandbox.cpp) | limits, timeouts, exceptions crossing the boundary, no ambient authority |
+| [examples/polyglot/word_count.cpp](examples/polyglot/word_count.cpp) | the example at the top of this page: one host API, one job in all six languages, wrong calls rejected at compile time |
 | [examples/polyglot/shared_host.cpp](examples/polyglot/shared_host.cpp) | one Context, six languages, one set of host bindings; type errors caught in the typed languages; one C++ instance shared by all |
 | [examples/polyglot/rules_engine.cpp](examples/polyglot/rules_engine.cpp) | rules in six languages compiled once and run 120,000 times against host events, with a heap that stays put |
 

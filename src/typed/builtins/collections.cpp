@@ -41,8 +41,11 @@ void instantiateList(TypeTable& table, TypeInfo* type)
                     MethodConstructor, [newList](CallInfo& call) {
                         Value result = newList(call);
                         const std::int32_t capacity = call.arg(0).toInt();
-                        if (capacity > 0)
+                        if (capacity > 0) {
+                            // `new List<int>(int.MaxValue)` is 32 GiB of slots; refuse it under the memory limit.
+                            runtimeOf(call).ctx.reserve(std::size_t(capacity) * sizeof(Value));
                             asList(result)->items.reserve(std::size_t(capacity));
+                        }
                         return result;
                     });
 

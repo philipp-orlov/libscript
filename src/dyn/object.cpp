@@ -170,6 +170,8 @@ std::size_t DynArray::heapSize() const
 void DynArray::append(Value v)
 {
     const std::size_t before = elements.capacity();
+    if (elements.size() == before)  // the vector is about to double
+        reserveGrowth((before ? before : 4) * sizeof(Value));
     elements.push_back(std::move(v));
     chargeIfGrown(elements, before);
 }
@@ -177,6 +179,7 @@ void DynArray::append(Value v)
 void DynArray::appendAll(const Value* items, std::size_t count)
 {
     const std::size_t before = elements.capacity();
+    reserveFor(elements, elements.size() + count);
     elements.insert(elements.end(), items, items + count);
     chargeIfGrown(elements, before);
 }
@@ -184,6 +187,7 @@ void DynArray::appendAll(const Value* items, std::size_t count)
 void DynArray::resize(std::size_t n)
 {
     const std::size_t before = elements.capacity();
+    reserveFor(elements, n);
     elements.resize(n, Value::undefined());
     chargeIfGrown(elements, before);
     trimElements();

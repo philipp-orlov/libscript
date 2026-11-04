@@ -76,6 +76,7 @@ set(SCRIPT_CORE_SOURCES
     src/core/strings.cpp
     src/core/payload.cpp
     src/core/heap.cpp
+    src/core/stack_guard.cpp
     src/core/language.cpp
     src/core/api.cpp
 )

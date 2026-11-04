@@ -8,6 +8,7 @@
 
 #include "script/internal/dyn/parser.hpp"
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -237,6 +238,7 @@ Parser::Parser(std::string_view source, std::string sourceName, bool typescript)
     : lexer_(source, sourceName), name_(std::move(sourceName)), source_(source),
       typescript_(typescript)
 {
+    lookaheadLimit_ = 32 * source.size() + 100000;
     cur_ = lexer_.next(true);
 }
 
@@ -1369,6 +1371,9 @@ NodePtr Parser::expression()
 
 NodePtr Parser::assignment()
 {
+    NestingScope nest(exprDepth_);
+    if (nest.tooDeep())
+        fail("expression is nested too deeply");
     if (at(Tok::Yield))
         fail("generators are not supported");
     if (at(Tok::Await))
@@ -1430,7 +1435,10 @@ NodePtr Parser::conditional()
 NodePtr Parser::binary(int minPrecedence)
 {
     NodePtr left = unary();
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         // `as` and `satisfies` bind like a relational operator, and like one
         // they may not start a new line of their own.
         if (typescript_ && (at(Tok::As) || at(Tok::Satisfies)) && !cur_.newlineBefore) {
@@ -1464,6 +1472,9 @@ NodePtr Parser::binary(int minPrecedence)
 
 NodePtr Parser::unary()
 {
+    NestingScope nest(exprDepth_);
+    if (nest.tooDeep())
+        fail("expression is nested too deeply");
     const std::uint32_t line = cur_.line;
     switch (cur_.type) {
         case Tok::Bang:
@@ -1508,7 +1519,10 @@ NodePtr Parser::postfix()
 
 NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
 {
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         if (at(Tok::Dot)) {
             advance();
             NodePtr n = makeNode(NK::Member, base->line);
@@ -1606,6 +1620,8 @@ bool Parser::looksLikeArrow()
     int depth = 1;
     Token t = probe.next(true);
     while (t.type != Tok::Eof) {
+        if (++lookahead_ > lookaheadLimit_)
+            fail("source is too deeply parenthesised to parse");
         if (t.type == Tok::LParen) {
             ++depth;
         } else if (t.type == Tok::RParen) {

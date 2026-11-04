@@ -20,6 +20,8 @@
 //   methods count, then each method definition, bodies included
 //   refs    the type and method reference tables the instructions index
 //   literals the string constants `LdStr` indexes
+//   hash    u64, `base::hashBytes64` of every byte above; a flipped bit or a cut-off write is
+//           refused at load as `BadImage` instead of running as damaged bytecode
 //
 // A reference to something this assembly defines is an index; a reference to
 // anything else -- the core library, a host class, a `List<int>` -- is a name
@@ -41,7 +43,7 @@ namespace typed {
 struct Runtime;
 
 constexpr std::uint32_t kImageMagic = 0x4C495343u;  // "CSIL"
-constexpr std::uint32_t kImageVersion = 1;
+constexpr std::uint32_t kImageVersion = 2;  // 2: a 64-bit hash of everything before it ends the image
 
 std::vector<std::uint8_t> writeImage(const AssemblyImpl& assembly);
 std::shared_ptr<AssemblyImpl> readImage(Runtime& rt, const void* data, std::size_t bytes);

@@ -13,6 +13,7 @@
 // Everything here is structural. Nothing resolves a name, and no annotation
 // field is carried over -- a clone is exactly what the parser would have
 // produced.
+#include "script/internal/stack_guard.hpp"
 #include "script/internal/typed/ast.hpp"
 
 namespace script {
@@ -47,6 +48,7 @@ public:
 
     Expr* expr(const Expr* node)
     {
+        checkNativeStack();
         if (!node)
             return nullptr;
         switch (node->kind) {
@@ -327,6 +329,7 @@ public:
 
     Stmt* stmt(const Stmt* node)
     {
+        checkNativeStack();
         if (!node)
             return nullptr;
         switch (node->kind) {

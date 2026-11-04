@@ -37,6 +37,37 @@ options.check = script::CheckOptions::strict();       // TypeScript: strictNullC
 script::Context ctx(options);
 ```
 
+### Running code you did not write
+
+Source from outside is safe to compile and run -- it cannot reach the file system, the network or the host's memory --
+but nothing limits what it *costs* until the host says so. Out of the box a context has no memory ceiling and no time
+limit, so set both before running anything untrusted:
+
+```cpp
+options.memoryLimit = 64u << 20;                  // the ceiling for what the program holds, in bytes
+script::Context ctx(options);
+const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+ctx.setInterruptHandler([=] { return std::chrono::steady_clock::now() > deadline; });   // timeouts, cancellation
+```
+
+* **Memory.** `memoryLimit` is checked before a cell is made and before a container grows, so one huge request
+  (`new Array(1e9)`, `x.repeat(1e9)`, `new int[int.MaxValue]`, `a = a.concat(a)`) is refused with
+  `Error(OutOfMemory)` rather than allocated and then noticed. The figure counts what the heap holds; the process
+  also pays for the allocator's own overhead and for temporaries inside a builtin, so allow it some headroom.
+* **Time.** The handler is called about every 4096 instructions in the interpreters, every 1024 loop iterations in
+  native code, and inside builtins that loop over a size the program chose (`Array.from({length: n})`, `join`). It runs
+  on the thread that runs the program; keep it cheap, as it reads a clock in the usual case. A native host function
+  that blocks is not interrupted.
+* **Stack.** `stackLimit` counts script frames. The engine also looks at the thread's real stack, so a worker thread
+  with a small stack gets `Error(StackOverflow)` -- or a compile error for deeply nested source -- instead of a
+  crash. Budget about 1 MiB of native stack for the default limit of 512 frames in JavaScript, TypeScript and Python
+  (about 512 KiB in C#, C and C++), and keep 96 KiB free below that for the compiler.
+* **Source shape.** The front ends refuse source that nests expressions deeper than 500 levels, or chains more than
+  2000 operators or member accesses in one expression (`a + b + c + ...`, `a.b.c...`). `JSON.parse` and
+  `JSON.stringify` stop at 1000 levels, and `JSON.stringify` reports a cycle as a `TypeError`.
+* **Images** (`Assembly::serialize`, `Context::load`) are trusted input, but they carry a checksum: an image that was
+  cut short or damaged in storage is refused with `Error(BadImage)` instead of running as damaged bytecode.
+
 **A `Value` belongs to its context and must not outlive it.** Destroying a
 context invalidates every value from it. The one exception is a
 `script::Exception`, which may unwind out of the scope that owned the

@@ -150,6 +150,7 @@ private:
     /// Non-zero inside a type declaration, so `parseStatement` can refuse to
     /// swallow a member.
     int depth_ = 0;
+    std::size_t nest_ = 0;  ///< levels of nested statements, expressions, types and patterns being parsed
 };
 
 }  // namespace typed

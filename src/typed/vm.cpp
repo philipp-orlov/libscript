@@ -10,6 +10,7 @@
 #include "script/internal/typed/bytecode.hpp"
 #include "script/internal/typed/jit.hpp"
 #include "script/internal/typed/numconv.hpp"
+#include "script/internal/stack_guard.hpp"
 #include "script/internal/typed/types.hpp"
 
 namespace script {
@@ -53,7 +54,7 @@ const char* opName(Op op) noexcept
         CS_OP(CleU8); CS_OP(CgtI8); CS_OP(CgtU8); CS_OP(CgeI8); CS_OP(CgeU8);
         CS_OP(CeqR8); CS_OP(CneR8); CS_OP(CltR8); CS_OP(CleR8); CS_OP(CgtR8);
         CS_OP(CgeR8); CS_OP(CeqRef); CS_OP(CneRef); CS_OP(CeqStr); CS_OP(CneStr);
-        CS_OP(LogicalNot); CS_OP(IsNull); CS_OP(Concat); CS_OP(ToStr);
+        CS_OP(LogicalNot); CS_OP(IsNull); CS_OP(Concat); CS_OP(ToStr); CS_OP(ToStrU);
 #undef CS_OP
         case Op::OpCount: break;
     }
@@ -631,7 +632,7 @@ Value invoke(Runtime& rt, const MethodInfo* method, Value* args, std::uint32_t a
                        "'" + method->qualifiedName() + "' has no implementation");
         return invokeNative(rt, method, args, argc);
     }
-    if (rt.ctx.callDepth >= rt.ctx.options.stackLimit)
+    if (rt.ctx.callDepth >= rt.ctx.options.stackLimit || nativeStackLow())
         throwError(rt, ErrorCode::StackOverflow, "the call stack went too deep");
 
     // Already compiled? Then the frame is all the native code needs.
@@ -1213,10 +1214,15 @@ Value runFrame(Runtime& rt, Frame& frame)
                         stack.back() = Value(float(stack.back().toDouble()));
                         break;
                     case Op::ConvR8: stack.back() = Value(stack.back().toDouble()); break;
-                    case Op::ConvR8Un:
-                        stack.back() =
-                            Value(double(std::uint64_t(stack.back().toLong())));
+                    case Op::ConvR8Un: {
+                        // A uint is held as its 32 bits in an int slot. Widening it through toLong() sign-extends
+                        // it first, so (double)(uint)-1 came out as 1.8e19 instead of 4294967295.
+                        const Value& v = stack.back();
+                        const double widened = v.isInt() ? double(std::uint32_t(detail::Access::i4(v)))
+                                                         : double(std::uint64_t(v.toLong()));
+                        stack.back() = Value(widened);
                         break;
+                    }
                     case Op::ConvBool: stack.back() = Value(stack.back().toBool()); break;
 
                     // ---- arithmetic ----
@@ -1440,6 +1446,14 @@ Value runFrame(Runtime& rt, Frame& frame)
                     case Op::ToStr:
                         stack.back() = rt.str(toStringValue(rt, stack.back()));
                         break;
+                    case Op::ToStrU: {
+                        const Value& v = stack.back();
+                        const std::string text = v.type() == Type::Long
+                                                     ? std::to_string(std::uint64_t(v.toLong()))
+                                                     : std::to_string(std::uint32_t(v.toInt()));
+                        stack.back() = rt.str(text.c_str());
+                        break;
+                    }
 
                     case Op::OpCount: break;
                 }

@@ -10,6 +10,7 @@
 
 #include "script/error.hpp"
 #include "script/internal/c/libc.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -1557,6 +1558,9 @@ Parser::Stmt* Parser::embedded()
 
 void Parser::statement(std::vector<Stmt*>& out)
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     const std::uint32_t at = line();
     switch (type()) {
         case Tok::LBrace: out.push_back(block()); return;
@@ -1883,6 +1887,9 @@ bool isAssignable(const T::Expr* e) noexcept
 
 Parser::Typed Parser::assignment()
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     Typed left = conditional();
     BinaryOp op = BinaryOp::Add;
     bool compoundOp = true;
@@ -2049,7 +2056,10 @@ int precedenceOf(Tok t, BinaryOp& op) noexcept
 Parser::Typed Parser::binary(int minPrecedence)
 {
     Typed left = unary();
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         BinaryOp op = BinaryOp::Add;
         const int prec = precedenceOf(type(), op);
         if (prec == 0 || prec < minPrecedence)
@@ -2176,6 +2186,9 @@ Parser::Typed Parser::makeBinary(BinaryOp op, Typed left, Typed right, std::uint
 
 Parser::Typed Parser::unary()
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     const std::uint32_t at = line();
     const std::uint32_t col = column();
     switch (type()) {
@@ -2421,7 +2434,10 @@ int Parser::sizeOf(const CType& type) const
 
 Parser::Typed Parser::postfix(Typed base)
 {
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         const std::uint32_t at = line();
         const std::uint32_t col = column();
         switch (type()) {

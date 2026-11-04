@@ -427,6 +427,8 @@ void installLibc(Runtime& rt)
         if (name == "__repeat")
             return [](CallInfo& ci) {
                 const std::int64_t n = std::max<std::int64_t>(0, integerOf(ci.arg(0)));
+                // `std::string s(2000000000, 'a')` built the whole string before the memory limit saw it.
+                runtimeOf(ci).ctx.reserve(std::size_t(n) * sizeof(char16_t));
                 return runtimeOf(ci).str(String(std::size_t(n), char16_t(integerOf(ci.arg(1)))));
             };
         if (name == "__at")

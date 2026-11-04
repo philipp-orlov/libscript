@@ -17,6 +17,7 @@
 #include "script/internal/dyn/runtime.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/object.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -106,6 +107,7 @@ void forEachChild(const Node& n, F&& visit)
 /// refers to the function we are compiling.
 void collectNames(const Node& n, std::set<String>& out, bool inArrow)
 {
+    checkNativeStack();
     switch (n.kind) {
         case NK::Identifier:
             out.insert(n.text);
@@ -139,6 +141,7 @@ void collectNames(const Node& n, std::set<String>& out, bool inArrow)
 /// Names captured by functions nested inside `n`, not entering `n` itself.
 void collectCaptured(const Node& n, std::set<String>& out)
 {
+    checkNativeStack();
     if (n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr) {
         collectNames(n, out, n.kind == NK::ArrowExpr);
         return;
@@ -180,6 +183,7 @@ void collectHoisted(const Node& n, std::vector<String>& vars, std::vector<const 
 
 bool mentionsArguments(const Node& n)
 {
+    checkNativeStack();
     if (n.kind == NK::FunctionExpr)
         return false;
     if (n.kind == NK::Identifier && n.text == ascii("arguments"))
@@ -191,6 +195,7 @@ bool mentionsArguments(const Node& n)
 
 bool chainHasOptional(const Node& n)
 {
+    checkNativeStack();
     if (n.optional)
         return true;
     if ((n.kind == NK::Member || n.kind == NK::Call) && n.a)
@@ -660,6 +665,7 @@ private:
     // ---- statements ----
     void stmt(const Node& n)
     {
+        checkNativeStack();
         note(n.line);
         switch (n.kind) {
             case NK::Empty:
@@ -1192,6 +1198,7 @@ private:
     // ---- expressions ----
     void expr(const Node& n)
     {
+        checkNativeStack();
         note(n.line);
         switch (n.kind) {
             case NK::NumberLit:
@@ -1615,6 +1622,7 @@ private:
     /// optional chain.
     void chain(const Node& n, std::vector<std::size_t>& exits)
     {
+        checkNativeStack();
         if (n.kind == NK::Member) {
             if (n.a->kind == NK::SuperExpr) {
                 if (n.computed) {
@@ -1692,6 +1700,7 @@ private:
 
     void spine(const Node& n, std::vector<std::size_t>& exits)
     {
+        checkNativeStack();
         if (n.kind == NK::Member || n.kind == NK::Call)
             chain(n, exits);
         else
@@ -1862,6 +1871,7 @@ private:
     /// to be copied out of the class body.
     NodePtr cloneExpression(const Node& n)
     {
+        checkNativeStack();
         NodePtr copy = makeNode(n.kind, n.line);
         copy->op = n.op;
         copy->varKind = n.varKind;

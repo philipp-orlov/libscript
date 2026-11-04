@@ -208,6 +208,9 @@ enum class Op : std::uint8_t
     // ---- strings ----
     Concat,  // count: pop that many, push the joined string
     ToStr,   ///< `Object.ToString()` on the top of the stack
+    /// `ToStr` for a `uint` or a `ulong`. A value carries no unsignedness (a `uint` is an int slot, a `ulong` a long
+    /// one), so printing it with `ToStr` gave 4000000000u as -294967296; this one prints the bits as unsigned.
+    ToStrU,
 
     OpCount,
 };

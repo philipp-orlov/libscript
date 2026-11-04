@@ -29,6 +29,17 @@ String inspectValue(Runtime& rt, const Value& v, int depth);
 /// prototype so `for..of` and spread accept it.
 Value makeIterator(Runtime& rt, Vec<Value> items);
 
+/// For a builtin that loops over a size the program chose (`Array.from({length: n})`, `join`, a repeated string): call
+/// it with the iteration number on every pass. Every 1024th pass it checks that the temporaries the loop holds --
+/// `tempBytes`, not yet charged to any cell -- still fit under the memory limit, and hands the interrupt handler a
+/// chance to stop the loop. The cost on the other passes is one mask and compare.
+void checkLongLoopSlow(Runtime& rt, std::size_t tempBytes);
+inline void checkLongLoop(Runtime& rt, std::size_t iteration, std::size_t tempBytes)
+{
+    if ((iteration & 1023) == 0)
+        checkLongLoopSlow(rt, tempBytes);
+}
+
 /// JSON, shared with `Value::toJson` and `Context::parseJson`.
 Value jsonParse(Runtime& rt, StringView text);
 bool jsonStringify(Runtime& rt, const Value& value, const Value& replacer, StringView indent,

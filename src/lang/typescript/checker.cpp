@@ -21,6 +21,7 @@
 #include "script/internal/dyn/checker.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/parser.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -71,6 +72,7 @@ struct FunctionContext
 /// lets an early `return` narrow the statements that follow it.
 bool alwaysExits(const Node& n)
 {
+    checkNativeStack();
     switch (n.kind) {
         case NK::ReturnStmt:
         case NK::ThrowStmt:
@@ -195,6 +197,7 @@ private:
     /// The dotted path a narrowable expression denotes, or empty.
     static String pathOf(const Node& n)
     {
+        checkNativeStack();
         if (n.kind == NK::Identifier)
             return n.text;
         if (n.kind == NK::ThisExpr)
@@ -1403,6 +1406,7 @@ void Checker::checkStatements(const std::vector<NodePtr>& statements, bool ownSc
 
 void Checker::checkStatement(const Node& n)
 {
+    checkNativeStack();
     switch (n.kind) {
         case NK::Program:
         case NK::Block: checkStatements(n.list, true); return;
@@ -1631,6 +1635,7 @@ void Checker::checkStatement(const Node& n)
 
 const Ty* Checker::checkExpr(const Node& n, const Ty* contextual)
 {
+    checkNativeStack();
     switch (n.kind) {
         case NK::NumberLit:
         case NK::StringLit:
@@ -2137,6 +2142,7 @@ const Ty* Checker::checkCall(const Node& n, bool isNew)
 
 const Ty* Checker::typeOfPath(const Node& n)
 {
+    checkNativeStack();
     const String path = pathOf(n);
     if (path.empty())
         return nullptr;
@@ -2297,6 +2303,7 @@ void Checker::narrowByLiteral(const Node& subject, const Node& literal, bool equ
 
 void Checker::collectFacts(const Node& condition, bool whenTrue, Facts& out)
 {
+    checkNativeStack();
     switch (condition.kind) {
         case NK::Unary:
             if (condition.op == Tok::Bang && condition.a)

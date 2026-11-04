@@ -394,6 +394,15 @@ extern "C" int scriptJitPoll(Runtime* rt) noexcept
 {
     if (!rt || !rt->ctx.interrupt)
         return 0;
+    // Native code calls this at every loop back edge. The interpreter offers the handler a chance every 4096
+    // instructions; asking a host callback -- which usually reads a clock -- once per iteration made a tight loop
+    // spend most of its time in the handler.
+    constexpr std::uint32_t kPollInterval = 1024;
+    if (rt->ctx.interruptCountdown > 0) {
+        --rt->ctx.interruptCountdown;
+        return 0;
+    }
+    rt->ctx.interruptCountdown = kPollInterval - 1;
     try {
         if (!rt->ctx.interrupt())
             return 0;

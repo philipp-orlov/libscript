@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "script/internal/stack_guard.hpp"
 #include "script/internal/typed/object.hpp"
 #include "script/internal/typed/vm.hpp"
 
@@ -1321,6 +1322,7 @@ void Checker::checkBlock(BlockStmt* block)
 
 void Checker::checkStatement(Stmt* stmt)
 {
+    checkNativeStack();
     if (!stmt)
         return;
     const CoreTypes& core = types_.core();
@@ -1627,6 +1629,18 @@ Expr* Checker::coerce(Expr* expr, const TypeInfo* target, const char* context)
         return expr;
     const CoreTypes& core = types_.core();
 
+    // A uint or ulong joined to a string must keep its type: `convert` would retype the expression as a string in place,
+    // and the emitter could then no longer tell that its bits are to be printed as unsigned.
+    if (target == core.stringType && expr->type && std::string(context) == "concatenation" &&
+        (expr->type->kind == TypeKind::UInt || expr->type->kind == TypeKind::ULong)) {
+        ConvertExpr* node = arena_.make<ConvertExpr>();
+        node->line = expr->line;
+        node->column = expr->column;
+        node->operand = expr;
+        node->conv = ConvKind::ToStringCall;
+        node->type = target;
+        return node;
+    }
     // A lambda and a method group only get a type from the slot they go into.
     if (expr->kind == ExprKind::Lambda && target && target->kind == TypeKind::Delegate) {
         checkLambda(static_cast<LambdaExpr*>(expr), target);
@@ -2011,6 +2025,7 @@ int Checker::overloadScore(MethodInfo* method, const std::vector<Argument>& args
 
 const TypeInfo* Checker::checkExpr(Expr*& expr)
 {
+    checkNativeStack();
     const CoreTypes& core = types_.core();
     if (!expr)
         return core.errorType;
@@ -2243,6 +2258,7 @@ namespace {
 /// `a.b.c` as one dotted name, or empty if the expression is not a plain path.
 String dottedPath(const Expr* expr)
 {
+    checkNativeStack();
     if (expr->kind == ExprKind::Name)
         return static_cast<const NameExpr*>(expr)->name;
     if (expr->kind != ExprKind::MemberAccess)

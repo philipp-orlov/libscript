@@ -116,6 +116,7 @@ struct ContextImpl
     {
         maybeCollect();
         const std::size_t bytes = sizeof(T) + extra;
+        reserve(bytes);  // a cell that would not fit is refused before any memory is taken
         void* memory = heap.allocate(bytes);
         T* cell;
         try {
@@ -138,6 +139,16 @@ struct ContextImpl
     /// heap is still over its limit afterwards, so it may only be called where
     /// the interpreter can unwind: cell allocation and the instruction tick.
     void maybeCollect();
+    /// Refuse, with `Error(OutOfMemory)`, memory that would take the heap past `Options::memoryLimit`. Call it before
+    /// building anything whose size a program chooses -- a cell, an array of a given length, a joined string -- so the
+    /// limit holds for what is in flight and not only for what the cells already weigh. Collects cycles once before it
+    /// gives up. Free when no limit is set.
+    void reserve(std::size_t bytes)
+    {
+        if (options.memoryLimit && (bytes > options.memoryLimit || heapBytes + bytes > options.memoryLimit))
+            reserveSlow(bytes);
+    }
+    void reserveSlow(std::size_t bytes);
     void charge(std::size_t bytes) noexcept;
     /// A cell whose trailing storage was filled in after it was linked is
     /// bigger than it was charged for. Settle the difference, or the heap's

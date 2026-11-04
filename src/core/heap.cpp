@@ -32,6 +32,12 @@ void GCObject::chargeGrowth(std::size_t bytes) noexcept
     rt->charge(bytes);
 }
 
+void GCObject::reserveGrowth(std::size_t bytes)
+{
+    if (rt && bytes)
+        rt->reserve(bytes);
+}
+
 void incRef(GCObject* cell) noexcept
 {
     if (cell)
@@ -257,6 +263,15 @@ void ContextImpl::recharge(GCObject* cell) noexcept
         return;
     charge(now - cell->gcBytes);
     cell->gcBytes = std::uint32_t(now);
+}
+
+void ContextImpl::reserveSlow(std::size_t bytes)
+{
+    // Garbage in unreachable cycles may be what stands in the way.
+    if (!tearingDown && !destroying && bytes <= options.memoryLimit)
+        collectCycles();
+    if (bytes > options.memoryLimit || heapBytes + bytes > options.memoryLimit)
+        throw Error(ErrorCode::OutOfMemory, "the context exceeded its memory limit");
 }
 
 void ContextImpl::maybeCollect()

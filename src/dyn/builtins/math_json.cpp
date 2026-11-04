@@ -14,6 +14,7 @@
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -321,11 +322,15 @@ void installDate(Runtime& rt)
 
 // ------------------------------------------------------------------ JSON ---
 
+/// How deeply JSON text and values may nest. Both the parser and the writer recurse once per level.
+constexpr std::size_t kMaxJsonDepth = 1000;
+
 struct JsonParser
 {
     Runtime& rt;
     StringView text;
     std::size_t at = 0;
+    std::size_t depth = 0;
 
     [[noreturn]] void fail(const char* what)
     {
@@ -400,6 +405,9 @@ struct JsonParser
     }
     Value value()
     {
+        NestingScope nest(depth);
+        if (nest.tooDeep(kMaxJsonDepth))
+            throwError(rt, ErrorCode::RangeError, "JSON is nested too deeply");
         skip();
         if (at >= text.size())
             fail("unexpected end of input");
@@ -483,11 +491,14 @@ struct JsonParser
     }
 };
 
+/// The containers being written, outermost first. A container that is already on the path is a cycle.
+using JsonPath = Vec<const void*>;  // pooled, so writing JSON still makes no call to the general allocator
+
 bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const String& indent,
-                    const String& current, String& out);
+                    const String& current, String& out, JsonPath& path);
 
 bool stringifyEntry(Runtime& rt, const Value& holder, const Value& key, const Value& replacer,
-                    const String& indent, const String& current, String& out)
+                    const String& indent, const String& current, String& out, JsonPath& path)
 {
     Value item = holder.isUndefined() ? key : getProperty(rt, holder, toPropertyKey(rt, key).get());
     if (item.isObject()) {
@@ -497,11 +508,11 @@ bool stringifyEntry(Runtime& rt, const Value& holder, const Value& key, const Va
     }
     if (asFunction(replacer))
         item = callValue(rt, replacer, holder, {key, item});
-    return stringifyValue(rt, item, replacer, indent, current, out);
+    return stringifyValue(rt, item, replacer, indent, current, out, path);
 }
 
 bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const String& indent,
-                    const String& current, String& out)
+                    const String& current, String& out, JsonPath& path)
 {
     switch (v.type()) {
         case Type::Undefined:
@@ -531,6 +542,20 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
     if (asFunction(v))
         return false;
 
+    // A container inside itself would recurse until the stack ran out; say so the way JavaScript does. The path is
+    // also what bounds the depth of a legitimate, very deep value.
+    const void* const self = asArray(v) ? static_cast<const void*>(asArray(v)) : static_cast<const void*>(asObject(v));
+    if (std::find(path.begin(), path.end(), self) != path.end())
+        throwError(rt, ErrorCode::TypeError, "Converting circular structure to JSON");
+    if (path.size() >= kMaxJsonDepth || nativeStackLow())
+        throwError(rt, ErrorCode::RangeError, "JSON value is nested too deeply");
+    struct Open
+    {
+        JsonPath& path;
+        Open(JsonPath& p, const void* item) : path(p) { path.push_back(item); }
+        ~Open() { path.pop_back(); }
+    } open_(path, self);
+
     const String inner = current + indent;
     const String open = indent.empty() ? String() : ascii("\n") + inner;
     const String close = indent.empty() ? String() : ascii("\n") + current;
@@ -541,7 +566,7 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
             if (i)
                 out.push_back(u',');
             out += open;
-            if (!stringifyEntry(rt, v, Value(double(i)), replacer, indent, inner, out))
+            if (!stringifyEntry(rt, v, Value(double(i)), replacer, indent, inner, out, path))
                 out += ascii("null");
         }
         if (!arr->elements.empty())
@@ -555,7 +580,7 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
     bool first = true;
     for (const Value& key : ownKeys(rt, obj, true, false)) {
         String piece;
-        if (!stringifyEntry(rt, v, key, replacer, indent, inner, piece))
+        if (!stringifyEntry(rt, v, key, replacer, indent, inner, piece, path))
             continue;
         if (!first)
             out.push_back(u',');
@@ -588,7 +613,8 @@ Value jsonParse(Runtime& rt, StringView text)
 bool jsonStringify(Runtime& rt, const Value& value, const Value& replacer, StringView indent,
                    String& out)
 {
-    return stringifyEntry(rt, Value::undefined(), value, replacer, String(indent), String(), out);
+    JsonPath path;
+    return stringifyEntry(rt, Value::undefined(), value, replacer, String(indent), String(), out, path);
 }
 
 void installMathJson(Runtime& rt)

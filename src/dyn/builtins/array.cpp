@@ -11,6 +11,7 @@
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -139,8 +140,11 @@ void installArray(Runtime& rt)
             if (n < 0 || n != std::floor(n) || n > 4294967295.0)
                 ci.fail(ErrorCode::RangeError, "invalid array length");
             DynArray* a = rt2.newArray(std::size_t(n));
+            // Own the array first: resizing is refused with OutOfMemory when it does not fit, and an array nobody
+            // owns would never be freed.
+            Value result = detail::Access::adopt(Type::Object, a);
             a->resize(std::size_t(n));
-            return detail::Access::adopt(Type::Object, a);
+            return result;
         }
         return rt2.makeArray(ci.args());
     }, 1, proto);
@@ -158,8 +162,11 @@ void installArray(Runtime& rt)
             items = iterableToVector(rt2, source);
         } else if (!source.isNullish()) {
             const std::uint32_t n = lengthOf(rt2, source);
-            for (std::uint32_t i = 0; i < n; ++i)
+            for (std::uint32_t i = 0; i < n; ++i) {
+                // `{length: 1e9}` is a legal source; the loop must stop at the memory limit and at an interrupt.
+                checkLongLoop(rt2, i, items.size() * sizeof(Value) * 2);
                 items.push_back(getIndex(rt2, source, i));
+            }
         }
         if (asFunction(ci.arg(1))) {
             for (std::size_t i = 0; i < items.size(); ++i)
@@ -198,6 +205,7 @@ void installArray(Runtime& rt)
     rt.method(proto, "unshift", [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         const std::size_t before = a->elements.capacity();
+        a->reserveFor(a->elements, a->elements.size() + ci.args().size());
         a->elements.insert(a->elements.begin(), ci.args().begin(), ci.args().end());
         a->chargeIfGrown(a->elements, before);
         return Value(double(a->elements.size()));
@@ -249,8 +257,12 @@ void installArray(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         const Value comparator = ci.arg(0);
+        // A comparator is script and may shrink or grow the array while it is being sorted, which would leave the
+        // merge reading past the end of the elements. Sort a private copy and put it back when it is done.
+        rt2.ctx.reserve(a->elements.size() * sizeof(Value) * 2);
+        Vec<Value> work(a->elements.begin(), a->elements.end());
         if (asFunction(comparator)) {
-            mergeSort(a->elements, [&](const Value& x, const Value& y) {
+            mergeSort(work, [&](const Value& x, const Value& y) {
                 if (x.isUndefined())
                     return false;
                 if (y.isUndefined())
@@ -258,7 +270,7 @@ void installArray(Runtime& rt)
                 return toNumber(rt2, callValue(rt2, comparator, Value::undefined(), {x, y})) < 0;
             });
         } else {
-            mergeSort(a->elements, [&](const Value& x, const Value& y) {
+            mergeSort(work, [&](const Value& x, const Value& y) {
                 if (x.isUndefined())
                     return false;
                 if (y.isUndefined())
@@ -266,6 +278,9 @@ void installArray(Runtime& rt)
                 return toStringValue(rt2, x) < toStringValue(rt2, y);
             });
         }
+        const std::size_t before = a->elements.capacity();
+        a->elements = std::move(work);
+        a->chargeIfGrown(a->elements, before);
         return ci.thisValue();
     }, 1);
 
@@ -299,7 +314,12 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "concat", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
+        std::size_t total = thisArray(ci)->elements.size();
+        for (const Value& v : ci.args())
+            total += asArray(v) ? asArray(v)->elements.size() : 1;
+        rt2.ctx.reserve(total * sizeof(Value));  // `a = a.concat(a)` doubles; refuse it before the copy, not after
         Vec<Value> out = thisArray(ci)->elements;
+        out.reserve(total);
         for (const Value& v : ci.args()) {
             if (DynArray* other = asArray(v))
                 out.insert(out.end(), other->elements.begin(), other->elements.end());
@@ -316,11 +336,18 @@ void installArray(Runtime& rt)
             ci.arg(0).isUndefined() ? ascii(",") : toStringValue(rt2, ci.arg(0));
         String out;
         for (std::size_t i = 0; i < a->elements.size(); ++i) {
+            checkLongLoop(rt2, i, 0);
+            String piece;
+            if (!a->elements[i].isNullish())
+                piece = toStringValue(rt2, a->elements[i]);
+            // The text is built in a temporary the memory limit has not seen yet, and one piece can be megabytes,
+            // so the check is made on every pass rather than every thousandth.
+            rt2.ctx.reserve((out.size() + sep.size() + piece.size()) * sizeof(Char));
             if (i)
                 out += sep;
-            if (!a->elements[i].isNullish())
-                out += toStringValue(rt2, a->elements[i]);
+            out += piece;
         }
+        rt2.ctx.reserve(out.size() * sizeof(Char));
         return rt2.str(out);
     }, 1);
 
@@ -439,16 +466,26 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "flat", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const int depth = ci.arg(0).isUndefined() ? 1 : int(toNumber(rt2, ci.arg(0)));
+        // `flat(Infinity)` is the usual spelling of "all the way"; converting an infinity to int is undefined, so the
+        // depth is clamped as a number first.
+        const double requested = ci.arg(0).isUndefined() ? 1.0 : toNumber(rt2, ci.arg(0));
+        const std::size_t depth =
+            std::isnan(requested) || requested < 1 ? 0 : (requested > 1e9 ? std::size_t(1e9) : std::size_t(requested));
         Vec<Value> out;
-        std::function<void(const Vec<Value>&, int)> walk =
-            [&](const Vec<Value>& items, int left) {
+        std::size_t level = 0;
+        std::function<void(const Vec<Value>&, std::size_t)> walk =
+            [&](const Vec<Value>& items, std::size_t left) {
+                NestingScope nest(level);
+                if (nest.tooDeep(10000))
+                    throwError(rt2, ErrorCode::RangeError, "array is nested too deeply");
                 for (const Value& v : items) {
                     DynArray* nested = asArray(v);
                     if (nested && left > 0)
                         walk(nested->elements, left - 1);
-                    else
+                    else {
+                        checkLongLoop(rt2, out.size(), out.size() * sizeof(Value) * 2);
                         out.push_back(v);
+                    }
                 }
             };
         walk(thisArray(ci)->elements, depth);
@@ -489,6 +526,9 @@ void installArray(Runtime& rt)
         }
         for (; at < n; ++at) {
             const std::size_t i = reversed ? n - 1 - at : at;
+            // The callback may have shortened the array; an element that is gone is skipped, as in JavaScript.
+            if (i >= a->elements.size())
+                continue;
             acc = callValue(rt2, fn, Value::undefined(), {acc, a->elements[i], Value(double(i)),
                                                ci.thisValue()});
         }

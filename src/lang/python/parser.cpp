@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include "script/error.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -197,6 +198,9 @@ Parser::NodePtr Parser::parseModule()
 
 void Parser::statement(std::vector<NodePtr>& out)
 {
+    NestingScope nest(depth_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     switch (type()) {
         case Tok::If: out.push_back(ifStatement()); return;
         case Tok::While: out.push_back(whileStatement()); return;
@@ -1140,6 +1144,9 @@ Parser::NodePtr Parser::importStatement()
 
 Parser::NodePtr Parser::expression()
 {
+    NestingScope nest(depth_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     if (is(Tok::Lambda))
         return lambda();
     return ternary();
@@ -1303,6 +1310,9 @@ Parser::NodePtr Parser::andTest()
 
 Parser::NodePtr Parser::notTest()
 {
+    NestingScope nest(depth_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     if (is(Tok::Not)) {
         const std::uint32_t at = line();
         advance();
@@ -1451,7 +1461,10 @@ Parser::NodePtr Parser::shift()
 Parser::NodePtr Parser::arith()
 {
     NodePtr left = term();
+    std::size_t links = 0;
     while (is(Tok::Plus) || is(Tok::Minus)) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         const std::uint32_t at = line();
         const Tok op = advance().type;
         NodePtr right = term();
@@ -1472,7 +1485,10 @@ Parser::NodePtr Parser::arith()
 Parser::NodePtr Parser::term()
 {
     NodePtr left = factor();
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         const std::uint32_t at = line();
         switch (type()) {
             case Tok::Star: {
@@ -1527,6 +1543,9 @@ Parser::NodePtr Parser::term()
 
 Parser::NodePtr Parser::factor()
 {
+    NestingScope nest(depth_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     const std::uint32_t at = line();
     switch (type()) {
         case Tok::Minus: {
@@ -1564,7 +1583,10 @@ Parser::NodePtr Parser::primary()
 
 Parser::NodePtr Parser::trailers(NodePtr base)
 {
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         const std::uint32_t at = line();
         if (eat(Tok::Dot)) {
             if (!is(Tok::Name))

@@ -4,7 +4,11 @@
 #include "script/internal/typed/module.hpp"
 
 #include <cstring>
+#include <new>
+#include <stdexcept>
 #include <unordered_map>
+
+#include "base/hash.hpp"
 
 #include "script/internal/typed/runtime.hpp"
 #include "script/internal/typed/object.hpp"
@@ -346,6 +350,9 @@ std::vector<std::uint8_t> writeImage(const AssemblyImpl& assembly)
     }
     image.u32(std::uint32_t(body.bytes.size()));
     image.raw(body.bytes.data(), body.bytes.size());
+    // An image is kept in flash or sent over a link, and a bit that flips on the way would otherwise reach the
+    // interpreter as bytecode. The trailer lets the loader tell damage from a program.
+    image.u64(base::hashBytes64(image.bytes.data(), image.bytes.size()));
     return std::move(image.bytes);
 }
 
@@ -515,26 +522,61 @@ private:
 
 }  // namespace
 
+namespace {
+std::shared_ptr<AssemblyImpl> readImageChecked(Runtime& rt, const void* data, std::size_t bytes);
+}  // namespace
+
 std::shared_ptr<AssemblyImpl> readImage(Runtime& rt, const void* data, std::size_t bytes)
+{
+    // A count read from the image can ask for far more than the process has. That is a damaged image, and the
+    // caller should hear BadImage rather than a raw std::bad_alloc.
+    try {
+        return readImageChecked(rt, data, bytes);
+    } catch (const std::bad_alloc&) {
+        throw Error(ErrorCode::BadImage, "the assembly image asks for more memory than is available");
+    } catch (const std::length_error&) {
+        throw Error(ErrorCode::BadImage, "the assembly image holds a size that is out of range");
+    }
+}
+
+namespace {
+std::shared_ptr<AssemblyImpl> readImageChecked(Runtime& rt, const void* data, std::size_t bytes)
 {
     Reader header(static_cast<const std::uint8_t*>(data), bytes);
     if (header.u32() != kImageMagic)
         throw Error(ErrorCode::BadImage, "not a libscript assembly image");
     if (header.u32() != kImageVersion)
         throw Error(ErrorCode::BadImage, "the image was written by another version of libscript");
+    constexpr std::size_t kTrailer = sizeof(std::uint64_t);
+    if (bytes < 8 + kTrailer)
+        throw Error(ErrorCode::BadImage, "the assembly image is truncated");
+    std::uint64_t stored = 0;
+    std::memcpy(&stored, static_cast<const std::uint8_t*>(data) + bytes - kTrailer, kTrailer);
+    if (stored != base::hashBytes64(data, bytes - kTrailer))
+        throw Error(ErrorCode::BadImage, "the assembly image is damaged (its checksum does not match)");
+    // From here on the trailer is not part of what is read.
+    Reader outer(static_cast<const std::uint8_t*>(data) + 8, bytes - 8 - kTrailer);
 
-    const std::uint32_t stringCount = header.u32();
+    const std::uint32_t stringCount = outer.u32();
+    // Every string takes at least four bytes, so a count the image cannot hold is a lie, and reserving for it
+    // would be an allocation sized by whoever wrote the file.
+    if (stringCount > outer.remaining() / 4)
+        throw Error(ErrorCode::BadImage, "the assembly image is truncated");
     std::vector<String> strings;
     strings.reserve(stringCount);
     for (std::uint32_t i = 0; i < stringCount; ++i) {
-        const std::uint32_t length = header.u32();
+        const std::uint32_t length = outer.u32();
+        if (length > outer.remaining())
+            throw Error(ErrorCode::BadImage, "the assembly image is truncated");
         std::string utf8(length, '\0');
-        header.raw(&utf8[0], length);
+        outer.raw(&utf8[0], length);
         strings.push_back(fromUtf8(utf8));
     }
-    const std::uint32_t bodySize = header.u32();
+    const std::uint32_t bodySize = outer.u32();
+    if (bodySize > outer.remaining())
+        throw Error(ErrorCode::BadImage, "the assembly image is truncated");
     std::vector<std::uint8_t> bodyBytes(bodySize);
-    header.raw(bodyBytes.data(), bodySize);
+    outer.raw(bodyBytes.data(), bodySize);
 
     auto assembly = std::make_shared<AssemblyImpl>();
     assembly->rt = &rt;
@@ -543,6 +585,8 @@ std::shared_ptr<AssemblyImpl> readImage(Runtime& rt, const void* data, std::size
 
     const std::uint32_t typeCount = body.u32();
     const std::uint32_t methodCount = body.u32();
+    if (typeCount > body.remaining() || methodCount > body.remaining())
+        throw Error(ErrorCode::BadImage, "the assembly image is truncated");
     for (std::uint32_t i = 0; i < typeCount; ++i)
         assembly->types.push_back(std::make_unique<TypeInfo>());
     for (std::uint32_t i = 0; i < methodCount; ++i) {
@@ -697,6 +741,8 @@ std::shared_ptr<AssemblyImpl> readImage(Runtime& rt, const void* data, std::size
     assembly->sourceName = std::make_shared<const std::string>(toUtf8(r.name()));
     return assembly;
 }
+
+}  // namespace
 
 }  // namespace typed
 }  // namespace internal

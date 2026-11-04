@@ -157,6 +157,11 @@ public:
     void fcvtzsXD(Reg d, std::uint32_t n) { word(0x9E780000u | (n << 5) | d); }
     void fcvtzuXD(Reg d, std::uint32_t n) { word(0x9E790000u | (n << 5) | d); }
     void fcvtzsXS(Reg d, std::uint32_t n) { word(0x9E380000u | (n << 5) | d); }
+    void fmovXD(Reg d, std::uint32_t n) { word(0x9E660000u | (n << 5) | d); }  // fmov xd, dn
+    void fmovWS(Reg d, std::uint32_t n) { word(0x1E260000u | (n << 5) | d); }  // fmov wd, sn
+    void lsl1X(Reg d, Reg n) { word(0xD37FF800u | (n << 5) | d); }             // lsl xd, xn, #1
+    void lsl1W(Reg d, Reg n) { word(0x531F7800u | (n << 5) | d); }             // lsl wd, wn, #1
+    void cselX(Reg d, Reg n, Reg m, Cond cond) { word(0x9A800000u | (m << 16) | (cond << 12) | (n << 5) | d); }
     void fcvtSD(std::uint32_t d, std::uint32_t n) { word(0x1E624000u | (n << 5) | d); }
     void fcvtDS(std::uint32_t d, std::uint32_t n) { word(0x1E22C000u | (n << 5) | d); }
 
@@ -280,6 +285,27 @@ private:
         a_.movImm(X9, std::uint64_t(std::uint32_t(code)));
         a_.strW(X9, kRt, errorOffset_);
         exits_.push_back(a_.b());
+    }
+
+    /// After `fcvtzs`/`fcvtzu` of the floating-point register `fp` into `result`: make an infinity convert to 0, as the
+    /// interpreter does (its `toInt64` maps NaN and both infinities to 0 and saturates only finite values), instead of
+    /// the instruction's saturated value. Without this `(int)(1e300 * 1e300)` was 0 interpreted and -1 native, so a
+    /// method gave a different answer once it got hot. Branch-free: the sign bit is shifted out and what is left is
+    /// compared with the bits of an infinity.
+    void zeroIfInfinity(Reg result, std::uint32_t fp, bool single)
+    {
+        if (single) {
+            a_.fmovWS(X10, fp);
+            a_.lsl1W(X10, X10);
+            a_.movImm(X11, 0xFF000000u);
+            a_.cmpW(X10, X11);
+        } else {
+            a_.fmovXD(X10, fp);
+            a_.lsl1X(X10, X10);
+            a_.movImm(X11, 0xFFE0000000000000ull);
+            a_.cmpX(X10, X11);
+        }
+        a_.cselX(result, XZR, result, EQ);
     }
 
     /// The interrupt check at a loop back edge, matching the interpreter's
@@ -553,9 +579,11 @@ private:
                 if (from == Type::Double) {
                     loadStackD(0, at);
                     a_.fcvtzsXD(X9, 0);
+                    zeroIfInfinity(X9, 0, false);
                 } else if (from == Type::Float) {
                     loadStackS(0, at);
                     a_.fcvtzsXS(X9, 0);
+                    zeroIfInfinity(X9, 0, true);
                 } else {
                     loadStackX(X9, at);
                 }
@@ -579,9 +607,11 @@ private:
                         a_.fcvtzuXD(X9, 0);
                     else
                         a_.fcvtzsXD(X9, 0);
+                    zeroIfInfinity(X9, 0, false);
                 } else if (from == Type::Float) {
                     loadStackS(0, at);
                     a_.fcvtzsXS(X9, 0);
+                    zeroIfInfinity(X9, 0, true);
                 } else if (from == Type::Long) {
                     return true;  // already the right width
                 } else {

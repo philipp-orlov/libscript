@@ -16,7 +16,7 @@ function(script_test_suites group)
     endforeach()
 endfunction()
 
-script_test_suites(core value languages steady_state)
+script_test_suites(core value languages steady_state limits)
 if(SCRIPT_LANG_CSHARP)
     script_test_suites(csharp parser types language builtins binding module jit units modern gc soak)
 endif()

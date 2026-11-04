@@ -129,6 +129,12 @@ private:
     std::string name_;
     std::string_view source_;
     std::size_t depth_ = 0;  ///< guards against pathological nesting
+    std::size_t exprDepth_ = 0;  ///< the same for expressions
+    /// Tokens `looksLikeArrow` has scanned ahead so far, and the most it may scan in this source. Every `(` that
+    /// starts an expression is scanned to its closing `)`, so nested parentheses make the work grow with the product
+    /// of the nesting and the length; the cap keeps hostile input at a few times the length of the source.
+    std::size_t lookahead_ = 0;
+    std::size_t lookaheadLimit_ = 0;
     bool ambient_ = false;   ///< inside `declare`: bodies are not required
     bool noIn_ = false;      ///< parsing a for-in head: `in` ends the expression
     bool typescript_ = true; ///< accept the TypeScript syntax on top of JavaScript

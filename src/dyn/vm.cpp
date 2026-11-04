@@ -11,6 +11,7 @@
 #include "script/internal/dyn/vm.hpp"
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/stack_guard.hpp"
 
 namespace script {
 namespace internal {
@@ -20,6 +21,13 @@ namespace {
 constexpr std::uint32_t kRethrow = 0xffffffffu;
 constexpr std::uint32_t kInterruptInterval = 4096;
 }  // namespace
+
+void checkLongLoopSlow(Runtime& rt, std::size_t tempBytes)
+{
+    rt.ctx.reserve(tempBytes);
+    if (rt.ctx.interrupt && rt.ctx.interrupt())
+        throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
+}
 
 void Frame::begin(DynFunction* function, const FunctionCode* body, Value self,
                   DynFunction* target)
@@ -740,7 +748,9 @@ struct DepthGuard
     Runtime& rt;
     explicit DepthGuard(Runtime& r) : rt(r)
     {
-        if (++rt.ctx.callDepth > rt.ctx.options.stackLimit) {
+        // The depth limit is a count of frames; the thread's own stack may be smaller than the limit assumes (a worker
+        // thread with 256 KiB, say), so the real headroom is checked too.
+        if (++rt.ctx.callDepth > rt.ctx.options.stackLimit || nativeStackLow()) {
             --rt.ctx.callDepth;
             throwError(rt, ErrorCode::StackOverflow, "maximum call depth exceeded");
         }
@@ -912,8 +922,13 @@ Vec<Value> iterableToVector(Runtime& rt, const Value& iterable)
     Vec<Value> out;
     const Value iterator = getIterator(rt, iterable);
     Value item = Value::undefined();
-    while (iteratorStep(rt, iterator, item))
+    while (iteratorStep(rt, iterator, item)) {
+        // An iterator is script, and may never finish. Each step is a short call that does not run long enough to
+        // reach the interpreter's own poll, so this loop has to offer the interrupt handler and the memory limit its
+        // chance itself; the vector it fills is not charged to any cell yet.
+        checkLongLoop(rt, out.size(), out.size() * sizeof(Value) * 2);
         out.push_back(item);
+    }
     return out;
 }
 

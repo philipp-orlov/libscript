@@ -266,8 +266,12 @@ void installString(Runtime& rt)
         const std::int64_t n = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
         if (n < 0)
             ci.fail(ErrorCode::RangeError, "repeat count must not be negative");
-        if (s.size() * std::size_t(n) > (1u << 28))
+        if (s.empty() || n == 0)
+            return rt2.str(String());  // also keeps `''.repeat(2 ** 62)` from looping 2 ** 62 times doing nothing
+        // Divide rather than multiply: s.size() * n wraps around for a large n and would pass the check.
+        if (std::uint64_t(n) > (1u << 28) / s.size())
             ci.fail(ErrorCode::RangeError, "repeated string is too long");
+        rt2.ctx.reserve(s.size() * std::size_t(n) * sizeof(Char));
         String out;
         out.reserve(s.size() * std::size_t(n));
         for (std::int64_t i = 0; i < n; ++i)
@@ -280,11 +284,15 @@ void installString(Runtime& rt)
         const String s = thisString(ci);
         const std::size_t target =
             std::size_t(std::max<std::int64_t>(0, toIntegerOrInfinity(toNumber(rt2, ci.arg(0)))));
-        if (target <= s.size() || target > (1u << 26))
+        if (target <= s.size())
             return rt2.str(s);
         const String filler = ci.arg(1).isUndefined() ? ascii(" ") : toStringValue(rt2, ci.arg(1));
         if (filler.empty())
             return rt2.str(s);
+        // Handing back the unpadded string would let a program believe it got what it asked for.
+        if (target > (1u << 26))
+            ci.fail(ErrorCode::RangeError, "invalid string length");
+        rt2.ctx.reserve(target * sizeof(Char) * 2);
         String padding;
         while (padding.size() < target - s.size())
             padding += filler;

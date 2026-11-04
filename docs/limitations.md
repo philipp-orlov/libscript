@@ -39,6 +39,11 @@ program and then behaves differently from its language.
 * **An engine's first use pays for its runtime.** The C# type table, or the
   JavaScript intrinsics (about 230 objects), are built by the first compile in
   that language. Warm up before measuring.
+* **Source and data have depth limits.** Expressions may nest 500 levels and
+  chain 2000 operators or member accesses; JSON nests 1000 levels. The
+  front ends and the checkers also stop at the thread's real stack limit, so a
+  small thread stack lowers these. See "Running code you did not write" in
+  `embedding.md`.
 * **`OutOfMemory`, `StackOverflow` and `Interrupted` unwind to the host** and
   cannot be caught by any program; `stackLimit` counts frames of every engine
   together.
@@ -98,6 +103,21 @@ libscript implements a subset of C#.
 * **A record's equality covers its state** -- the positional parameters, fields
   and settable auto-properties. A computed property is not state and is left
   out, which is what C# does.
+* **`int.MinValue / -1` and `int.MinValue % -1` do not throw.** C# raises
+  `OverflowException`; here the quotient wraps to `int.MinValue` and the
+  remainder is 0, the same in the interpreter and in native code, on every
+  platform.
+* **Converting a `double` to an integer follows ECMAScript's rule, not .NET's.**
+  NaN and both infinities give 0. A finite value is converted to a 64-bit
+  `long` first, saturating at its range, and a narrower type keeps the low
+  bits of that: `(int)1e10` is 1410065408. The interpreter and
+  the arm64 back end agree on this (checked by differential fuzzing); the
+  x86-64 back end has not been brought in line and may give a different
+  result for an infinity or a value beyond 2^63.
+* **A `uint` or `ulong` prints as unsigned only while its static type is known.**
+  `u.ToString()`, `"a" + u`, `s += u` and `$"{u}"` are right. A value boxed to
+  `object` (an `object` variable, a `string.Format` argument) carries no
+  unsigned marker, so `o.ToString()` prints 4000000000u as -294967296.
 * **A slice copies.** `a[1..3]` allocates; there is no span.
 * **A `switch` compiles to a comparison chain**, not a jump table.
 * **Interface dispatch is a cached lookup**, not an interface table. The cache
@@ -119,9 +139,12 @@ libscript implements a subset of C#.
   all units.
 * Images load in dependency order too, and a missing dependency is
   `ErrorCode::BadImage`.
-* **An image is trusted input.** The loader validates structure, not type
-  safety; compile it yourself or receive it over a channel you trust.
-  Untrusted *source* is safe -- that is what the checker is for.
+* **An image is trusted input.** The loader validates structure and a
+  64-bit checksum, not type safety. The checksum catches an image that was cut
+  short or damaged in storage; it does not authenticate it, so compile the
+  image yourself or receive it over a channel you trust. Untrusted *source* is
+  safe -- that is what the checker is for. Images written before the checksum
+  existed (format version 1) are refused as `BadImage`; compile them again.
 
 ### Native code
 

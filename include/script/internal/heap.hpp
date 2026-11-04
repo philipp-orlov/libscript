@@ -86,6 +86,16 @@ struct GCObject
     /// charged at allocation, so a container that keeps growing afterwards has
     /// to say so or it would never move the collector.
     void chargeGrowth(std::size_t bytes) noexcept;
+    /// Refuse, with `Error(OutOfMemory)`, a growth of `bytes` that would take the heap past its limit. Say it before
+    /// the container grows; `chargeGrowth` settles the account afterwards.
+    void reserveGrowth(std::size_t bytes);
+    /// The same for a vector about to hold `wanted` elements, a no-op while its capacity already covers them.
+    template <class Vec>
+    void reserveFor(const Vec& v, std::size_t wanted)
+    {
+        if (wanted > v.capacity())
+            reserveGrowth((wanted - v.capacity()) * sizeof(typename Vec::value_type));
+    }
     /// Charge whatever `v` reallocated since its capacity was `before`.
     template <class Vec>
     void chargeIfGrown(const Vec& v, std::size_t before) noexcept

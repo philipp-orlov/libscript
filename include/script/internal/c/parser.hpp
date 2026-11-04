@@ -513,6 +513,7 @@ private:
     bool lastArgsBraced_ = false;
     int staticCounter_ = 0;
     std::size_t depth_ = 0;
+    std::size_t nest_ = 0;  ///< levels of nested statements and expressions being parsed
 };
 
 }  // namespace c

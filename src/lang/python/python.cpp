@@ -396,7 +396,13 @@ var __name__ = "__main__";
     py.mul = function (a, b) {
         if (isStr(a) && isNum(b)) return b > 0 ? a.repeat(b) : '';
         if (isNum(a) && isStr(b)) return a > 0 ? b.repeat(a) : '';
-        if (isList(a) && isNum(b)) { var out = []; for (var i = 0; i < b; i++) out = out.concat(a); return out; }
+        if (isList(a) && isNum(b)) {
+            // Append in place: `out = out.concat(a)` copies everything built so far on every pass, which makes
+            // `[0] * n` quadratic in n.
+            var out = [];
+            for (var i = 0; i < b; i++) for (var j = 0; j < a.length; j++) out.push(a[j]);
+            return out;
+        }
         if (isNum(a) && isList(b)) return py.mul(b, a);
         return a * b;
     };

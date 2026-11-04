@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "script/internal/stack_guard.hpp"
+
 #include "script/internal/typed/object.hpp"
 #include "script/internal/typed/types.hpp"
 #include "script/internal/typed/vm.hpp"
@@ -33,6 +35,26 @@ std::uint64_t bitsOfDouble(double d) noexcept
 bool isLong(const TypeInfo* type) noexcept
 {
     return type && (type->kind == TypeKind::Long || type->kind == TypeKind::ULong);
+}
+
+/// Which opcode turns a value of `type` into text. A `uint` and a `ulong` share their slot with the signed types, so
+/// only the static type can say that their bits are to be read as unsigned.
+Op toStringOp(const TypeInfo* type) noexcept
+{
+    return type && (type->kind == TypeKind::UInt || type->kind == TypeKind::ULong) ? Op::ToStrU : Op::ToStr;
+}
+
+/// The type an operand had before the checker boxed it for a string `+`, which is the type that says whether it is
+/// unsigned. Boxing emits nothing for a primitive, so looking through it changes no code.
+Op toStringOp(const Expr* operand) noexcept
+{
+    while (operand && operand->kind == ExprKind::Convert) {
+        const auto* convert = static_cast<const ConvertExpr*>(operand);
+        if (convert->conv != ConvKind::Boxing || !convert->operand)
+            break;
+        operand = convert->operand;
+    }
+    return operand ? toStringOp(operand->type) : Op::ToStr;
 }
 
 }  // namespace
@@ -375,6 +397,7 @@ void Emitter::emitStaticInitializers(TypeDecl* decl)
 
 void Emitter::emitStatement(Stmt* stmt)
 {
+    checkNativeStack();
     if (!stmt)
         return;
     line(stmt->line);
@@ -894,6 +917,7 @@ void Emitter::emitLoad(const Expr* expr)
 
 void Emitter::emitExpr(const Expr* expr)
 {
+    checkNativeStack();
     if (!expr) {
         op(Op::LdNull);
         return;
@@ -1106,6 +1130,11 @@ void Emitter::emitConvert(const ConvertExpr* expr)
     emitExpr(expr->operand);
     const TypeInfo* from = expr->operand->type;
     const TypeInfo* to = expr->type;
+    // Whatever the conversion is called, a uint or ulong turned into text must be printed as unsigned.
+    if (to && to->kind == TypeKind::String && toStringOp(expr->operand) == Op::ToStrU) {
+        op(Op::ToStrU);
+        return;
+    }
     switch (expr->conv) {
         case ConvKind::Numeric:
         case ConvKind::EnumToInt:
@@ -1138,7 +1167,7 @@ void Emitter::emitConvert(const ConvertExpr* expr)
             op(Op::Unbox, typeRef(to));
             return;
         case ConvKind::ToStringCall:
-            op(Op::ToStr);
+            op(toStringOp(from));
             return;
         case ConvKind::Reference:
             // A widening reference conversion is free; a narrowing one was
@@ -1152,7 +1181,7 @@ void Emitter::emitToString(const Expr* expr)
 {
     emitExpr(expr);
     if (!expr->type || expr->type->kind != TypeKind::String)
-        op(Op::ToStr);
+        op(toStringOp(expr));
 }
 
 void Emitter::emitInterpolated(const InterpolatedExpr* expr)
@@ -1759,6 +1788,16 @@ void Emitter::emitInvocation(const InvocationExpr* expr, bool keepValue)
     if (!method) {
         if (keepValue)
             op(Op::LdNull);
+        return;
+    }
+
+    // `u.ToString()` on a uint or ulong: the call would go to Object.ToString, which cannot tell the value is unsigned.
+    if (!expr->nullConditional && expr->receiver && expr->args.empty() && !method->isStatic() &&
+        method->name == u"ToString" && toStringOp(expr->receiver) == Op::ToStrU) {
+        emitExpr(expr->receiver);
+        op(Op::ToStrU);
+        if (!keepValue)
+            op(Op::Pop);
         return;
     }
 

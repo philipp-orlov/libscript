@@ -235,10 +235,12 @@ DynObject* Runtime::newObject(DynObject* proto)
 
 DynArray* Runtime::newArray(std::size_t reserve)
 {
+    const std::size_t room = std::min<std::size_t>(reserve, 1u << 20);
+    ctx.reserve(room * sizeof(Value));  // before the cell exists, so a refusal leaves nothing behind
     auto* a = newCell<DynArray>();
     a->proto.reset(arrayProto ? arrayProto.get() : objectProto.get());
     if (reserve) {
-        a->elements.reserve(std::min<std::size_t>(reserve, 1u << 20));
+        a->elements.reserve(room);
         a->chargeGrowth(a->elements.capacity() * sizeof(Value));
     }
     return a;

@@ -202,6 +202,7 @@ private:
     std::size_t pos_ = 0;
     std::string name_;
     int tempCounter_ = 0;
+    std::size_t depth_ = 0;  ///< levels of nested statements and expressions being parsed
 };
 
 }  // namespace python

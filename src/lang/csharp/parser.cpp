@@ -5,6 +5,8 @@
 
 #include <algorithm>
 
+#include "script/internal/stack_guard.hpp"
+
 namespace script {
 namespace internal {
 namespace typed {
@@ -834,6 +836,9 @@ bool Parser::looksLikeType(std::size_t at, std::size_t& end) const
 
 TypeRef* Parser::parseType()
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     TypeRef* ref = arena_.make<TypeRef>();
     ref->line = peek().line;
     ref->column = peek().column;
@@ -945,6 +950,9 @@ bool Parser::looksLikeLocalDecl() const
 
 Stmt* Parser::parseStatement()
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     const std::uint32_t line = peek().line;
     switch (type()) {
         case Tok::LBrace: return parseBlock();
@@ -1451,6 +1459,9 @@ Expr* Parser::parseExpression()
 
 Expr* Parser::parseAssignment()
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     if (looksLikeLambda())
         return parseLambda();
 
@@ -1501,7 +1512,10 @@ Expr* Parser::parseCoalesce()
 Expr* Parser::parseBinary(int precedence)
 {
     Expr* left = parseUnary();
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         const Tok t = type();
         const int power = precedenceOf(t);
         if (power < precedence)
@@ -1540,6 +1554,9 @@ Expr* Parser::parseBinary(int precedence)
 
 Expr* Parser::parseUnary()
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     const std::uint32_t line = peek().line;
     const std::uint32_t column = peek().column;
     switch (type()) {
@@ -2047,6 +2064,9 @@ Pattern* Parser::parseAndPattern()
 
 Pattern* Parser::parseUnaryPattern()
 {
+    NestingScope nest(nest_);
+    if (nest.tooDeep())
+        fail("source is nested too deeply");
     if (check(Tok::Not)) {
         Pattern* node = arena_.make<Pattern>();
         node->kind = PatternKind::Not;
@@ -2219,7 +2239,10 @@ void Parser::parsePatternTail(Pattern* node)
 
 Expr* Parser::parsePostfix(Expr* target)
 {
+    std::size_t links = 0;
     for (;;) {
+        if (++links > kMaxChainLength)
+            fail("expression is too long; split it into parts");
         const std::uint32_t line = peek().line;
         const std::uint32_t column = peek().column;
         if (check(Tok::Dot) || check(Tok::QuestionDot)) {

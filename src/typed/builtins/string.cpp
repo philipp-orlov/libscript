@@ -157,6 +157,8 @@ void installString(TypeTable& table)
                                 break;
                             }
                             out += text.substr(at, found - at);
+                            // Every match can add more than it removes, so the result may be far larger than the text.
+                            runtimeOf(call).ctx.reserve((out.size() + to.size()) * sizeof(Char) * 2);
                             out += to;
                             at = found + from.size();
                         }
@@ -198,18 +200,53 @@ void installString(TypeTable& table)
                     [](CallInfo& call) {
                         const StringView text = textOf(call.thisValue());
                         const std::int32_t width = call.arg(0).toInt();
-                        String out;
-                        for (std::size_t i = text.size(); i < std::size_t(std::max(width, 0)); ++i)
-                            out.push_back(u' ');
-                        return runtimeOf(call).str(out + String(text));
+                        const std::size_t target = std::size_t(std::max(width, 0));
+                        if (target <= text.size())
+                            return runtimeOf(call).str(text);
+                        // The padding is built in a temporary the memory limit cannot see, so ask first.
+                        runtimeOf(call).ctx.reserve(target * sizeof(Char) * 2);
+                        String out(target - text.size(), u' ');
+                        out.append(text);
+                        return runtimeOf(call).str(out);
                     });
     table.addMethod(stringType, "PadRight", self, {table.param("totalWidth", intType)}, 0,
                     [](CallInfo& call) {
                         const StringView text = textOf(call.thisValue());
                         const std::int32_t width = call.arg(0).toInt();
+                        const std::size_t target = std::size_t(std::max(width, 0));
+                        if (target <= text.size())
+                            return runtimeOf(call).str(text);
+                        runtimeOf(call).ctx.reserve(target * sizeof(Char) * 2);
                         String out(text);
-                        while (out.size() < std::size_t(std::max(width, 0)))
-                            out.push_back(u' ');
+                        out.append(target - text.size(), u' ');
+                        return runtimeOf(call).str(out);
+                    });
+    table.addMethod(stringType, "PadLeft", self,
+                    {table.param("totalWidth", intType), table.param("paddingChar", charType)}, 0,
+                    [](CallInfo& call) {
+                        const StringView text = textOf(call.thisValue());
+                        const std::int32_t width = call.arg(0).toInt();
+                        const Char fill = Char(call.arg(1).toInt());
+                        const std::size_t target = std::size_t(std::max(width, 0));
+                        if (target <= text.size())
+                            return runtimeOf(call).str(text);
+                        runtimeOf(call).ctx.reserve(target * sizeof(Char) * 2);
+                        String out(target - text.size(), fill);
+                        out.append(text);
+                        return runtimeOf(call).str(out);
+                    });
+    table.addMethod(stringType, "PadRight", self,
+                    {table.param("totalWidth", intType), table.param("paddingChar", charType)}, 0,
+                    [](CallInfo& call) {
+                        const StringView text = textOf(call.thisValue());
+                        const std::int32_t width = call.arg(0).toInt();
+                        const Char fill = Char(call.arg(1).toInt());
+                        const std::size_t target = std::size_t(std::max(width, 0));
+                        if (target <= text.size())
+                            return runtimeOf(call).str(text);
+                        runtimeOf(call).ctx.reserve(target * sizeof(Char) * 2);
+                        String out(text);
+                        out.append(target - text.size(), fill);
                         return runtimeOf(call).str(out);
                     });
     table.addMethod(stringType, "CompareTo", intType, {table.param("other", self)}, 0,
@@ -249,9 +286,11 @@ void installString(TypeTable& table)
                         auto* array = asArray(call.arg(1));
                         String out;
                         for (std::uint32_t i = 0; array && i < array->length; ++i) {
+                            const String piece = toStringValue(rt, array->get(i));
+                            rt.ctx.reserve((out.size() + separator.size() + piece.size()) * sizeof(Char) * 2);
                             if (i)
                                 out += separator;
-                            out += toStringValue(rt, array->get(i));
+                            out += piece;
                         }
                         return rt.str(out);
                     });
@@ -283,8 +322,11 @@ void installString(TypeTable& table)
                                 out.push_back(format[i]);
                                 continue;
                             }
-                            if (args && index < args->length)
-                                out += toStringValue(rt, args->get(index));
+                            if (args && index < args->length) {
+                                const String piece = toStringValue(rt, args->get(index));
+                                rt.ctx.reserve((out.size() + piece.size()) * sizeof(Char) * 2);
+                                out += piece;
+                            }
                             i = j;
                         }
                         return rt.str(out);

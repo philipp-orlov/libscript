@@ -18,6 +18,9 @@ namespace script {
 namespace internal {
 namespace dyn {
 
+extern "C" NativePair scriptJitCall5(Runtime* rt, const void* entry, std::uint64_t a0, std::uint64_t a1, std::uint64_t a2,
+                                     std::uint64_t a3, std::uint64_t a4);
+
 namespace {
 
 /// A value from its two registers, holding a count of its own.
@@ -679,13 +682,9 @@ Value enterNative(Runtime& rt, DynFunction* fn, const FunctionCode& code, const 
     Frame& marker = rt.acquireFrame(rt.frames.size());
     NativeRun run(rt, marker, true);
     armNativeRun(rt, reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)));
-    std::uint64_t ints[8] = {reinterpret_cast<std::uint64_t>(fn), std::uint64_t(thisValue.type()), payloadOf(thisValue),
-                             reinterpret_cast<std::uint64_t>(args), argc};
-    const double fps[8] = {};
-    std::uint64_t results[2] = {0, 0};
-    double fpResult = 0;
-    typed::scriptJitEnter(reinterpret_cast<typed::Runtime*>(&rt), code.jitEntry, ints, fps, nullptr, 0, nullptr, results,
-                          &fpResult);
+    const NativePair out = scriptJitCall5(&rt, code.jitEntry, reinterpret_cast<std::uint64_t>(fn), std::uint64_t(thisValue.type()),
+                                          payloadOf(thisValue), reinterpret_cast<std::uint64_t>(args), argc);
+    const std::uint64_t results[2] = {out.payload, out.tag};
     raisePending(rt);
     return resultValue(results);
 }
@@ -741,13 +740,10 @@ Value CallbackLoop::operator()(const Value& thisValue, std::initializer_list<Val
     // Each call starts with no native frames published, as a fresh run would.
     rt_.nativeTopFrame = nullptr;
     rt_.nativeTopPc = nullptr;
-    std::uint64_t ints[8] = {reinterpret_cast<std::uint64_t>(fn_), std::uint64_t(thisValue.type()), payloadOf(thisValue),
-                             reinterpret_cast<std::uint64_t>(args.begin()), args.size()};
-    const double fps[8] = {};
-    std::uint64_t results[2] = {0, 0};
-    double fpResult = 0;
-    typed::scriptJitEnter(reinterpret_cast<typed::Runtime*>(&rt_), fn_->code->jitEntry, ints, fps, nullptr, 0, nullptr, results,
-                          &fpResult);
+    const NativePair out =
+        scriptJitCall5(&rt_, entry, reinterpret_cast<std::uint64_t>(fn_), std::uint64_t(thisValue.type()), payloadOf(thisValue),
+                       reinterpret_cast<std::uint64_t>(args.begin()), args.size());
+    const std::uint64_t results[2] = {out.payload, out.tag};
     rt_.nativeKeepAlive = Value::undefined();
     Value result = resultValue(results);
     raisePending(rt_);

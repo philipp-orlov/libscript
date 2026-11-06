@@ -103,10 +103,12 @@ namespace {
 
 /// Merge sort: a user comparator may be inconsistent, and std::sort is allowed
 /// to run off the end of the range when it is.
-void mergeSort(Vec<Value>& v, const std::function<bool(const Value&, const Value&)>& less)
+template <class Less>
+void mergeSort(Vec<Value>& v, const Less& less)
 {
     if (v.size() < 2)
         return;
+    // Each pass moves every value once, from one buffer to the other, so no count changes on the way.
     Vec<Value> scratch(v.size());
     for (std::size_t width = 1; width < v.size(); width *= 2) {
         for (std::size_t start = 0; start < v.size(); start += 2 * width) {
@@ -116,9 +118,9 @@ void mergeSort(Vec<Value>& v, const std::function<bool(const Value&, const Value
             std::size_t b = mid;
             for (std::size_t out = start; out < end; ++out) {
                 if (a < mid && (b >= end || !less(v[b], v[a])))
-                    scratch[out] = v[a++];
+                    scratch[out] = std::move(v[a++]);
                 else
-                    scratch[out] = v[b++];
+                    scratch[out] = std::move(v[b++]);
             }
         }
         v.swap(scratch);

@@ -186,6 +186,30 @@ scriptJitEnter:
     pop %rbp
     ret
     .size scriptJitEnter, .-scriptJitEnter
+
+    // NativePair scriptJitCall5(rt, entry, a0, a1, a2, a3, a4): see the arm64 one.
+    .p2align 4
+    .globl scriptJitCall5
+    .type scriptJitCall5, @function
+scriptJitCall5:
+    push %rbp
+    mov %rsp, %rbp
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %r15
+    mov %rsi, %rax
+    mov %rdx, %rdi
+    mov %rcx, %rsi
+    mov %r8, %rdx
+    mov %r9, %rcx
+    mov 16(%rbp), %r8
+    xor %r10d, %r10d
+    call *%rax
+    add $8, %rsp
+    pop %r15
+    pop %rbp
+    ret
+    .size scriptJitCall5, .-scriptJitCall5
 )ASM");
 
 #endif

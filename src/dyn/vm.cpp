@@ -515,14 +515,14 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
     DynObject* obj = asObject(base);
     if (!site || !obj || !obj->shape || key->kind != CellKind::String)
         return getProperty(rt, base, key);
-    // An array answers `length` and its indices itself, and a string object its `length`, ahead of any table.
-    if (obj->cls == ObjClass::StringObject || obj->cls == ObjClass::Array) {
-        std::uint32_t index = 0;
-        if (key == rt.atom.length.get() || arrayIndexOf(static_cast<StringCell*>(key)->text(), index))
-            return getProperty(rt, base, key);
-    }
+    // An array answers `length` and its indices itself, and a string object its `length`, ahead of any table. Any other
+    // name is in the tables, an array's included: `Array.prototype` is one, and where `push` and `map` are.
+    std::uint32_t index = 0;
+    const bool answeredApart = key == rt.atom.length.get() || arrayIndexOf(static_cast<StringCell*>(key)->text(), index);
+    if ((obj->cls == ObjClass::StringObject || obj->cls == ObjClass::Array) && answeredApart)
+        return getProperty(rt, base, key);
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
-        if (cursor != obj && (cursor->cls == ObjClass::StringObject || cursor->cls == ObjClass::Array))
+        if (cursor != obj && answeredApart && (cursor->cls == ObjClass::StringObject || cursor->cls == ObjClass::Array))
             break;
         const Prop* p = cursor->findOwn(key);
         if (!p)

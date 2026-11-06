@@ -165,6 +165,28 @@ scriptJitEnter:
     ldp x29, x30, [sp], #48
     ret
     .size scriptJitEnter, .-scriptJitEnter
+
+    // NativePair scriptJitCall5(rt, entry, a0, a1, a2, a3, a4): five integer arguments and a pair back, which is all a
+    // dynamic language's function takes, without the tables scriptJitEnter reads them from.
+    .p2align 2
+    .globl scriptJitCall5
+    .type scriptJitCall5, %function
+scriptJitCall5:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x20, [sp, #16]
+    mov x20, x0
+    mov x16, x1
+    mov x0, x2
+    mov x1, x3
+    mov x2, x4
+    mov x3, x5
+    mov x4, x6
+    blr x16
+    ldr x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+    .size scriptJitCall5, .-scriptJitCall5
 )ASM");
 
 #endif

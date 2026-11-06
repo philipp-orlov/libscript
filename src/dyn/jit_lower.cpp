@@ -2130,14 +2130,24 @@ private:
     {
         Entry value = pop();
         secureWeak();
+        // The cell takes the value's count; what it held loses one, after, since releasing it could free the new value
+        // were they the same.
+        makeOwned(value);
         const std::int32_t tag = tagReg(value);
         const std::int32_t payload = payloadReg(value);
         const std::int32_t skip = newLabel();
-        // A cell that was never made drops the write, as in the interpreter. The helper takes a count of its own.
+        const std::int32_t done = newLabel();
+        // A cell that was never made drops the write, as in the interpreter.
         branchCmp(box, IrCond::Eq, 0, skip, 64);
-        coldCall(reinterpret_cast<void*>(&scriptDynStoreBox), {box, tag, payload}, -1, -1, false);
+        const std::int32_t oldTag = load(box, kBoxValueOffset, 1);
+        const std::int32_t old = load(box, kBoxValueOffset + kPayload, 8);
+        store(box, kBoxValueOffset, tag, 1);
+        store(box, kBoxValueOffset + kPayload, payload, 8);
+        decRefOf(old, oldTag, false);
+        inst(IrOp::Br).imm = done;
         inst(IrOp::Label).imm = skip;
         release(value);
+        inst(IrOp::Label).imm = done;
     }
 
     void getGlobal(GCObject* key)

@@ -46,6 +46,9 @@ constexpr std::int64_t kClsOffset = offsetof(DynObject, cls);
 constexpr std::int64_t kShapeOffset = offsetof(DynObject, shape);
 constexpr std::int64_t kPropsOffset = offsetof(DynObject, props);  // the first word of a vector is its data
 constexpr std::int64_t kFrozenOffset = offsetof(DynObject, frozen);
+constexpr std::int64_t kIsProtoOffset = offsetof(DynObject, isProto);
+constexpr std::int64_t kIndexOffset = offsetof(DynObject, index);
+constexpr std::int64_t kPropSetterOffset = offsetof(Prop, setter);
 constexpr std::int64_t kPropValueOffset = offsetof(Prop, value);
 constexpr std::int64_t kPropKeyOffset = offsetof(Prop, key);
 constexpr std::int64_t kPropAttrsOffset = offsetof(Prop, attrs);
@@ -2015,6 +2018,51 @@ private:
                 decRefOf(old, oldTag, false);
                 inst(IrOp::Br).imm = done;
             }
+        } else if (site && site->addTo && site->epoch == rt_.ctx.protoEpoch && site->addTo->count <= DynObject::kIndexThreshold) {
+            // A store that adds the property, in place while the table has room and no index: what `appendKnown` does.
+            guardShape(base, site->shape, slow);
+            guardEpoch(site->epoch, slow);
+            const std::int32_t isProto = load(base.r, kIsProtoOffset, 1);
+            branchCmp(isProto, IrCond::Ne, 0, slow);
+            const std::int32_t indexBegin = load(base.r, kIndexOffset, 8);
+            const std::int32_t indexEnd = load(base.r, kIndexOffset + 8, 8);
+            {
+                IrInst& test = inst(IrOp::BrCmp);
+                test.a = indexBegin;
+                test.b = indexEnd;
+                test.cond = IrCond::Ne;
+                test.width = 64;
+                test.target = slow;
+            }
+            const std::int32_t end = load(base.r, kPropsOffset + 8, 8);
+            const std::int32_t cap = load(base.r, kPropsOffset + 16, 8);
+            {
+                IrInst& test = inst(IrOp::BrCmp);
+                test.a = end;
+                test.b = cap;
+                test.cond = IrCond::Eq;
+                test.width = 64;
+                test.target = slow;
+            }
+            const std::int32_t key = ptrReg(code_.atoms[operand & kAtomMask].get());
+            incRefOf(key, -1, false);
+            store(end, kPropKeyOffset, key, 8);
+            store(end, kPropValueOffset, vt, 1);
+            store(end, kPropValueOffset + kPayload, vr, 8);
+            const std::int32_t undefinedTag = immReg(std::int64_t(Type::Undefined));
+            const std::int32_t zero = immReg(0);
+            store(end, kPropSetterOffset, undefinedTag, 1);
+            store(end, kPropSetterOffset + kPayload, zero, 8);
+            store(end, kPropAttrsOffset, immReg(PropDefault), 1);
+            const std::int32_t next = fn_.newVreg(false);
+            IrInst& add = inst(IrOp::Add);
+            add.d = next;
+            add.a = end;
+            add.hasImm = true;
+            add.imm = std::int64_t(sizeof(Prop));
+            add.width = 64;
+            store(base.r, kPropsOffset + 8, next, 8);
+            store(base.r, kShapeOffset, ptrReg(site->addTo), 8);
         } else if (site && !site->addTo) {
             // A write to a property the shape says is there and writable: what was there loses its count after.
             guardShape(base, site->shape, slow);

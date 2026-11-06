@@ -986,7 +986,11 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
 
     Value protoValue = getPropertyOfObject(rt, fn, rt.atom.prototype.get(), callee);
     DynObject* proto = asObject(protoValue);
-    DynObject* self = rt.newObject(proto ? proto : rt.objectProto.get());
+    if (!proto)
+        proto = rt.objectProto.get();
+    // Room for what objects made the same way have gone on to hold.
+    Shape* root = rt.rootShapeFor(proto);
+    DynObject* self = rt.newObjectSized(proto, root ? std::min<std::uint32_t>(root->expect, 32) : 0);
     const Value thisValue = detail::Access::adopt(Type::Object, self);
 
     const Value result = callInternal(rt, fn, thisValue, args, true, fn);

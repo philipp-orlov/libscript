@@ -300,7 +300,9 @@ void installFunction(Runtime& rt)
     rt.method(proto, "apply", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         ContextImpl::ArgBuffer buffer(rt2.ctx);
-        if (!ci.arg(1).isNullish()) {
+        if (DynArray* arr = asArray(ci.arg(1))) {
+            buffer.args.assign(arr->elements.begin(), arr->elements.end());
+        } else if (!ci.arg(1).isNullish()) {
             const Vec<Value> items = iterableToVector(rt2, ci.arg(1));
             buffer.args.assign(items.begin(), items.end());
         }

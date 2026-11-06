@@ -258,6 +258,7 @@ Shape* Runtime::rootShapeFor(DynObject* proto)
     if (!root && shapes.size() < kMaxShapes) {
         shapes.push_back(std::make_unique<Shape>());
         root = shapes.back().get();
+        root->root = root;
     }
     return root;
 }
@@ -276,6 +277,8 @@ Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
     next->key.reset(key);
     next->attrs = attrs;
     next->count = from->count + 1;
+    next->root = from->root;
+    next->root->expect = std::max(next->root->expect, next->count);
     from->transitions.push_back({key, attrs, next});
     return next;
 }
@@ -284,6 +287,17 @@ DynObject* Runtime::newObject(DynObject* proto)
 {
     auto* o = newCell<DynObject>();
     o->setProto(proto ? proto : objectProto.get());
+    return o;
+}
+
+DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
+{
+    auto* o = newCell<DynObject>();
+    o->setProto(proto ? proto : objectProto.get());
+    if (room) {
+        o->props.reserve(room);
+        o->chargeGrowth(o->props.capacity() * sizeof(Prop));
+    }
     return o;
 }
 

@@ -82,6 +82,10 @@ struct Shape
     Ref<GCObject> key;  ///< the property this one added, null for a root
     std::uint8_t attrs = 0;
     std::uint32_t count = 0;
+    /// Where this tree of shapes starts, and there, how many properties its objects have been seen to reach: a new one
+    /// takes its table at that size and grows no more.
+    Shape* root = nullptr;
+    std::uint32_t expect = 0;
     struct Transition
     {
         GCObject* key;

@@ -148,6 +148,8 @@ struct Runtime : EngineRuntime
     std::size_t runJobs();
 
     // ---- allocation helpers ----
+    /// `newObject` with room for this many properties already there.
+    DynObject* newObjectSized(DynObject* proto, std::uint32_t room);
     DynObject* newObject(DynObject* proto = nullptr);
 
     // ---- native code; see dyn/jit.hpp ----

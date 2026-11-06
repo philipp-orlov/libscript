@@ -1701,10 +1701,12 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
 
-                    case Op::NewObject:
-                        sp.push_back(
-                            detail::Access::adopt(Type::Object, rt.newObject(rt.objectProto.get())));
+                    case Op::NewObject: {
+                        const std::uint32_t room = operandAt(pc);
+                        pc += 4;
+                        sp.push_back(detail::Access::adopt(Type::Object, rt.newObjectSized(rt.objectProto.get(), room)));
                         break;
+                    }
                     case Op::NewArray: {
                         DynArray* arr = rt.newArray(operandAt(pc));
                         pc += 4;

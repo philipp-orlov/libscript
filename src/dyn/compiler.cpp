@@ -1377,7 +1377,8 @@ private:
 
     void objectLit(const Node& n)
     {
-        emit(Op::NewObject);
+        // How many properties to make room for.
+        emitU(Op::NewObject, std::uint32_t(std::min<std::size_t>(n.list.size(), 32)));
         for (const NodePtr& p : n.list) {
             if (p->propKind == PropKind::Spread) {
                 expr(*p->a);

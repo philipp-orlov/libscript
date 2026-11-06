@@ -269,9 +269,26 @@ NativePair scriptDynNew(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, const
     });
 }
 
-GCObject* scriptDynNewObject(Runtime* rt) noexcept
+GCObject* scriptDynNewObject(Runtime* rt, std::uint64_t room) noexcept
 {
-    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return rt->newObject(rt->objectProto.get()); });
+    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return rt->newObjectSized(rt->objectProto.get(), std::uint32_t(room)); });
+}
+
+GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
+{
+    auto* fn = static_cast<DynFunction*>(cell);
+    if (fn->fnKind != FnKind::Bytecode || fn->isArrow)
+        return nullptr;
+    const Prop* prototype = fn->findOwn(rt->atom.prototype.get());
+    if (!prototype || prototype->accessor())
+        return nullptr;
+    DynObject* proto = asObject(prototype->value);
+    if (!proto)
+        proto = rt->objectProto.get();
+    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* {
+        Shape* root = rt->rootShapeFor(proto);
+        return rt->newObjectSized(proto, root ? std::min<std::uint32_t>(root->expect, 32) : 0);
+    });
 }
 
 GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept

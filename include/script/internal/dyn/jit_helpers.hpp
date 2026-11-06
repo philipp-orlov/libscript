@@ -52,7 +52,9 @@ NativePair scriptDynCall(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std:
                          const Value* args, std::uint64_t argc) noexcept;
 NativePair scriptDynNew(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, const Value* args, std::uint64_t argc) noexcept;
 
-GCObject* scriptDynNewObject(Runtime* rt) noexcept;
+GCObject* scriptDynNewObject(Runtime* rt, std::uint64_t room) noexcept;
+/// The `this` of a `new` that can go straight to the constructor's native code; null when it has to go the long way.
+GCObject* scriptDynNewThis(Runtime* rt, GCObject* fn) noexcept;
 GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept;
 void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept;

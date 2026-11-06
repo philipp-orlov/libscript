@@ -136,6 +136,7 @@ int operandsOf(Op op) noexcept
         case Op::GetSuper:
         case Op::SetSuper:
         case Op::NewArray:
+        case Op::NewObject:
         case Op::Closure:
         case Op::Call:
         case Op::New:
@@ -1221,7 +1222,8 @@ private:
             case Op::NewObject: {
                 secureWeak();
                 const std::int32_t rt = rtReg();
-                const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynNewObject), {rt}, true);
+                const std::int32_t room = immReg(std::int64_t(operand()));
+                const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynNewObject), {rt, room}, true);
                 push(objectEntry(r));
                 return true;
             }
@@ -2354,17 +2356,71 @@ private:
         const std::int32_t count = immReg(std::int64_t(argc));
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t t = fn_.newVreg(false);
-        IrCall viaHelper;
-        viaHelper.kind = IrCallKind::Helper;
-        viaHelper.helper = reinterpret_cast<void*>(&scriptDynNew);
-        viaHelper.args = {rt, fnTag, fnPayload, area, count};
-        viaHelper.result = r;
-        viaHelper.resultTag = t;
-        viaHelper.site = site();
-        viaHelper.publishFrame = true;
-        viaHelper.exit = makeExit(0, held);
-        fn_.calls.push_back(std::move(viaHelper));
-        inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        // A constructor with native code gets its object here and is called directly.
+        branchCmp(fnTag, IrCond::Ne, std::int64_t(Type::Object), slow);
+        const std::int32_t kind = load(fnPayload, kCellKindOffset, 1);
+        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
+        const std::int32_t cls = load(fnPayload, kClsOffset, 1);
+        branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), slow);
+        const std::int32_t codePtr = load(fnPayload, kFnCodeOffset, 8);
+        branchCmp(codePtr, IrCond::Eq, 0, slow, 64);
+        const std::int32_t entry = load(codePtr, kCallEntryOffset, 8);
+        branchCmp(entry, IrCond::Eq, 0, slow, 64);
+        const std::int32_t self = fn_.newVreg(false);
+        coldCall(reinterpret_cast<void*>(&scriptDynNewThis), {rt, fnPayload}, self, -1, true, held);
+        branchCmp(self, IrCond::Eq, 0, slow, 64);
+        {
+            std::vector<Entry> heldWithSelf = held;
+            heldWithSelf.push_back(objectEntry(self));
+            const std::int32_t selfTag = immReg(std::int64_t(Type::Object));
+            IrCall direct;
+            direct.kind = IrCallKind::Indirect;
+            direct.delegate = entry;
+            direct.args = {fnPayload, selfTag, self, area, count};
+            direct.result = r;
+            direct.resultTag = t;
+            direct.site = site();
+            direct.publishFrame = false;
+            direct.exit = makeExit(0, heldWithSelf);
+            fn_.calls.push_back(std::move(direct));
+            inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
+        }
+        // What it returned counts only if that is an object.
+        const std::int32_t returned = newLabel();
+        branchCmp(t, IrCond::Eq, std::int64_t(Type::Object), returned);
+        release(taggedEntry(r, t, Own::Owned));
+        {
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = r;
+            mov.a = self;
+            IrInst& tag = inst(IrOp::MovImm);
+            tag.d = t;
+            tag.imm = std::int64_t(Type::Object);
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::Label).imm = returned;
+        release(objectEntry(self));
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        {
+            const std::int32_t rtSlow = rtReg();
+            IrCall viaHelper;
+            viaHelper.kind = IrCallKind::Helper;
+            viaHelper.helper = reinterpret_cast<void*>(&scriptDynNew);
+            viaHelper.args = {rtSlow, fnTag, fnPayload, area, count};
+            viaHelper.result = r;
+            viaHelper.resultTag = t;
+            viaHelper.site = site();
+            viaHelper.publishFrame = true;
+            viaHelper.exit = makeExit(0, held);
+            fn_.calls.push_back(std::move(viaHelper));
+            inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
         for (const Entry& arg : args)
             release(arg);
         release(callee);

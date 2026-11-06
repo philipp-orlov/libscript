@@ -352,6 +352,8 @@ struct FunctionCode
     mutable std::vector<std::uint32_t> jitNumberLocals;
     /// Those of them kept as int32s, which entering part way through converts to.
     mutable std::vector<std::uint32_t> jitIntLocals;
+    /// The current native code takes `this` to be an object, which entering it part way through has to check.
+    mutable bool jitThisIsObject = false;
     /// Where native code has bailed: what it is compiled to next assumes nothing there.
     mutable std::vector<std::uint32_t> jitBailedAt;
     /// What each call site has called while interpreted, for native code to put in its place: by the instruction's pc,

@@ -847,6 +847,14 @@ bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& resul
         code.jitHotness = 0;
         return false;
     };
+    if (code.jitThisIsObject) {
+        const Value& self = frame.thisValue;
+        const bool nullish = code.sloppyThis && self.isNullish();
+        if (!nullish && !asObject(self)) {
+            code.jitBailedAt.push_back(0);
+            return discard();
+        }
+    }
     const std::uint32_t params = std::uint32_t(std::max(code.arity, 0));
     for (std::uint32_t slot : code.jitNumberLocals) {
         // Not yet written is fine, for a local: nothing reads one of these before a number is stored. A parameter has been.

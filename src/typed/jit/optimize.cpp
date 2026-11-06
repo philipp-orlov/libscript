@@ -901,9 +901,68 @@ public:
         }
         fn_.code.swap(out);
         renameCopies();
+        for (bool changed = true; changed;)
+            changed = removeDead();
     }
 
 private:
+    /// What computes a value nothing reads, and has no other effect, goes.
+    bool removeDead()
+    {
+        count();
+        const auto removable = [](const IrInst& in) {
+            switch (in.op) {
+                case IrOp::Mov:
+                case IrOp::MovImm:
+                case IrOp::MovRuntime:
+                case IrOp::FMovImm:
+                case IrOp::BitsToFp:
+                case IrOp::FpToBits:
+                case IrOp::Add:
+                case IrOp::Sub:
+                case IrOp::Mul:
+                case IrOp::And:
+                case IrOp::Or:
+                case IrOp::Xor:
+                case IrOp::Shl:
+                case IrOp::Sar:
+                case IrOp::Shr:
+                case IrOp::Sext8:
+                case IrOp::Sext16:
+                case IrOp::Sext32:
+                case IrOp::Zext8:
+                case IrOp::Zext16:
+                case IrOp::Zext32:
+                case IrOp::FAdd:
+                case IrOp::FSub:
+                case IrOp::FMul:
+                case IrOp::FDiv:
+                case IrOp::IntToFp:
+                case IrOp::FpToIntRaw:
+                case IrOp::FpToInt32Js:
+                case IrOp::Cset:
+                case IrOp::FCset:
+                case IrOp::Load:
+                case IrOp::LoadIdx:
+                case IrOp::FrameAddr: return true;
+                default: return false;
+            }
+        };
+        std::vector<IrInst> out;
+        out.reserve(fn_.code.size());
+        bool any = false;
+        for (const IrInst& in : fn_.code) {
+            if (in.d >= 0 && uses_[std::size_t(in.d)] == 0 && !pinned_[std::size_t(in.d)] && removable(in)) {
+                any = true;
+                continue;
+            }
+            out.push_back(in);
+        }
+        if (any)
+            fn_.code.swap(out);
+        return any;
+    }
+
     /// `t = x` where each is written exactly once: `x` is already there wherever `t` is used, so `t` becomes `x`.
     void renameCopies()
     {

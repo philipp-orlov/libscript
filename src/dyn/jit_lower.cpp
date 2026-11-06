@@ -462,6 +462,17 @@ public:
             mov.a = box;
         }
 
+        // `this` is an object in any function that reads it, as a rule, and it does not change: asked once, here.
+        code_.jitThisIsObject = false;
+        if (betHere() && readsThis()) {
+            const std::int32_t bail = newLabel();
+            branchCmp(thisTag_, IrCond::Ne, std::int64_t(Type::Object), bail);
+            const std::int32_t kind = load(thisReg_, kCellKindOffset, 1, false, kAliasHeader);
+            branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), bail);
+            emitBail(bail, {});
+            thisIsCell_ = true;
+            code_.jitThisIsObject = true;
+        }
         walk();
         code_.jitNumberLocals.clear();
         code_.jitIntLocals.clear();
@@ -511,8 +522,12 @@ public:
             normalizeThis();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
         const std::uint32_t slots = code_.numLocals;
-        if (startShape_)
+        if (startShape_) {
             learnShape(thisReg_, startShape_);
+            thisIsCell_ = true;
+        } else if (parent_->thisIsCell_ && self.r == parent_->thisReg_ && self.rep == Rep::Tagged && !self.isConst) {
+            thisIsCell_ = true;
+        }
         localReg_.assign(slots, -1);
         localTag_.assign(slots, -1);
         localOwned_.assign(slots, 0);
@@ -663,15 +678,17 @@ public:
             return false;
         const Mark before = mark();
         const std::int32_t at = site();
-        if (!callee.hasKnownTag)
-            branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
-        const std::int32_t want = ptrReg(fn);
-        IrInst& same = inst(IrOp::BrCmp);
-        same.a = callee.r;
-        same.b = want;
-        same.cond = IrCond::Ne;
-        same.width = 64;
-        same.target = generic;
+        if (!callee.pinned) {
+            if (!callee.hasKnownTag)
+                branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+            const std::int32_t want = ptrReg(fn);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = callee.r;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = generic;
+        }
         const std::vector<std::uint8_t> none(fn->code->numLocals + 1, 1);
         try {
             Lowering inner(*this, *fn->code, none, held, at);
@@ -1890,7 +1907,14 @@ private:
                     push(taggedEntry(r, t, Own::Immortal));
                     return true;
                 }
-                push(taggedEntry(thisReg_, thisTag_, Own::Immortal));
+                {
+                    Entry self = taggedEntry(thisReg_, thisTag_, Own::Immortal);
+                    if (thisIsCell_) {
+                        self.hasKnownTag = true;
+                        self.known = Type::Object;
+                    }
+                    push(self);
+                }
                 return true;
             }
             case Op::PushCallee: {
@@ -2806,6 +2830,20 @@ private:
         return ptrReg(found);
     }
 
+    bool assignsGlobal(const GCObject* key)
+    {
+        if (!globalsScanned_) {
+            globalsScanned_ = true;
+            for (std::uint32_t pc = 0; pc < code_.code.size();) {
+                const Op op = Op(code_.code[pc]);
+                if (op == Op::SetGlobal)
+                    assignedGlobals_.push_back(code_.atoms[readOperand(code_.code, pc + 1)].get());
+                pc += 1 + std::uint32_t(operandsOf(op)) * 4;
+            }
+        }
+        return std::find(assignedGlobals_.begin(), assignedGlobals_.end(), key) != assignedGlobals_.end();
+    }
+
     void getGlobal(GCObject* key)
     {
         secureWeak();
@@ -2815,6 +2853,27 @@ private:
         const std::int32_t done = newLabel();
         DynObject* global = rt_.globalObject.get();
         const Prop* found = global->findOwn(key);
+        // A global holding a number, which nothing here assigns, is taken to be a constant, and treated as one from here on.
+        if (found && !found->accessor() && found->value.isDouble() && betHere() && !assignsGlobal(key)) {
+            const std::int32_t bail = newLabel();
+            const std::int32_t slot = globalSlot(found, bail);
+            const std::int32_t lt = load(slot, kPropValueOffset, 1);
+            branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
+            const std::int32_t lr = load(slot, kPropValueOffset + kPayload, 8);
+            const double value = detail::Access::r8(found->value);
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &value, sizeof bits);
+            const std::int32_t want = immReg(std::int64_t(bits));
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = lr;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = bail;
+            emitBail(bail, {});
+            push(constDouble(value));
+            return;
+        }
         // Where the property was when this was compiled, while the global object's table has not changed since.
         if (found && !found->accessor()) {
             const std::int32_t slot = globalSlot(found, slow);
@@ -2879,6 +2938,8 @@ private:
     /// The shape of a value that has to be a `DynObject`: anything else goes to `slow`.
     std::int32_t shapeOf(const Entry& base, std::int32_t slow)
     {
+        if (thisIsCell_ && base.r == thisReg_ && !base.isConst)
+            return loadHeader(base.r, kShapeOffset);
         if (!base.hasKnownTag)
             branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
         else if (base.known != Type::Object)
@@ -4892,6 +4953,8 @@ private:
         const Entry a = pop();
         secureWeakFor(a, b);
         const std::int32_t d = fn_.newVreg(false);
+        if (intCompare(a, b, op == Op::Lt ? IrCond::Lt : op == Op::Le ? IrCond::Le : op == Op::Gt ? IrCond::Gt : IrCond::Ge, d))
+            return;
         if (isKnownNumber(a) && isKnownNumber(b)) {
             const std::int32_t x = doubleReg(a);
             const std::int32_t y = doubleReg(b);
@@ -4944,6 +5007,30 @@ private:
         push(boolEntry(d));
     }
 
+    /// Two int32s, or one and a constant, compared as what they are.
+    bool intCompare(Entry a, Entry b, IrCond cond, std::int32_t d)
+    {
+        if (!isIntLike(a) || !isIntLike(b) || (a.isConst && b.isConst))
+            return false;
+        if (a.isConst) {
+            std::swap(a, b);
+            cond = cond == IrCond::Lt ? IrCond::Gt : cond == IrCond::Le ? IrCond::Ge : cond == IrCond::Gt ? IrCond::Lt : cond == IrCond::Ge ? IrCond::Le : cond;
+        }
+        IrInst& in = inst(IrOp::Cset);
+        in.d = d;
+        in.a = a.r;
+        in.cond = cond;
+        in.width = 32;
+        if (b.isConst) {
+            in.hasImm = true;
+            in.imm = std::int64_t(b.number);
+        } else {
+            in.b = b.r;
+        }
+        push(boolEntry(d));
+        return true;
+    }
+
     void equality(Op op)
     {
         const Entry b = pop();
@@ -4952,6 +5039,8 @@ private:
         const bool strict = op == Op::StrictEq || op == Op::StrictNe;
         const bool wantEqual = op == Op::StrictEq || op == Op::Eq;
         std::int32_t d = fn_.newVreg(false);
+        if (intCompare(a, b, wantEqual ? IrCond::Eq : IrCond::Ne, d))
+            return;
         if (isKnownNumber(a) && isKnownNumber(b)) {
             const std::int32_t x = doubleReg(a);
             const std::int32_t y = doubleReg(b);
@@ -5181,6 +5270,10 @@ private:
     bool epochKnown_ = false;
     std::vector<std::int32_t> knownArrays_;
     bool intWork_ = false;
+    bool globalsScanned_ = false;
+    std::vector<const GCObject*> assignedGlobals_;
+    /// `this` has been checked to be a `DynObject`.
+    bool thisIsCell_ = false;
     /// Inlined as a constructor: the shape `this` starts with.
     const Shape* startShape_ = nullptr;
 };

@@ -6,7 +6,7 @@
 // Every cell is one allocation with this header in front. Lifetime is
 // reference counted, which reclaims the common acyclic case the moment the
 // last handle goes away; cycles are found by `ContextImpl::collectCycles`,
-// which walks the `gcNext` chain of all live cells.
+// which asks the allocator for the cells it has: no cell carries a list of them.
 #pragma once
 
 #include <cstdint>
@@ -64,9 +64,11 @@ struct GCObject
     /// size class, which is why this is not a 16-bit field.
     std::uint32_t cellBytes = 0;
     std::uint32_t gcBytes = 0;  ///< what this cell was last charged to the heap
-    internal::ContextImpl* rt = nullptr;
-    GCObject* gcNext = nullptr;
-    GCObject* gcPrev = nullptr;
+    union
+    {
+        internal::ContextImpl* rt = nullptr;
+        GCObject* pendingNext;  ///< past `unlink`, on the list of cells waiting to be destroyed
+    };
     // Last and small on purpose: a derived class's first members move into the padding after these, which takes 8 bytes
     // off a string, an instance and an array -- a good part of a small object.
     CellKind kind = CellKind::Object;

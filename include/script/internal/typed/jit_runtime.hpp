@@ -41,7 +41,7 @@ inline constexpr std::int64_t kTypeVtableOffset = offsetof(TypeInfo, vtable);
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
-static_assert(sizeof(CSInstance) == 64 && sizeof(CSArray) == 64 && sizeof(StringCell) == 64,
+static_assert(sizeof(CSInstance) == 48 && sizeof(CSArray) == 48 && sizeof(StringCell) == 48,
               "the small cells should fill the padding of their header");
 inline constexpr std::int64_t instanceSlotOffset(std::uint32_t slot) noexcept
 {

@@ -81,7 +81,6 @@ struct ContextImpl
     std::shared_ptr<const bool> alive = std::make_shared<const bool>(true);
 
     // ---- heap ----
-    GCObject* heapHead = nullptr;
     std::uint64_t heapBytes = 0;
     std::uint64_t totalAllocated = 0;
     std::uint64_t liveObjects = 0;
@@ -97,7 +96,7 @@ struct ContextImpl
 
     mem::LocalHeap heap{payloadHeapOptions()};
     /// Cells whose refcount hit zero while another cell was being destroyed.
-    /// Threaded through `gcNext`, so unwinding a deep object graph is a loop
+    /// Threaded through `pendingNext`, so unwinding a deep object graph is a loop
     /// rather than a recursion deep enough to overflow the C++ stack.
     GCObject* pendingFree = nullptr;
     bool destroying = false;
@@ -138,17 +137,20 @@ struct ContextImpl
     void linkKnown(GCObject* cell, std::uint32_t bytes) noexcept
     {
         cell->rt = this;
-        cell->gcNext = heapHead;
-        cell->gcPrev = nullptr;
-        if (heapHead)
-            heapHead->gcPrev = cell;
-        heapHead = cell;
         cell->gcBytes = bytes;
+        if (bytes > mem::LocalHeap::kMaxSmall) [[unlikely]]
+            noteLarge(cell);
         heapBytes += bytes;
         totalAllocated += bytes;
         ++liveObjects;
     }
     void unlink(GCObject* cell) noexcept;
+    /// Every cell there is, in no useful order. Nothing may be allocated or freed until it is done with.
+    void allCells(GcList& out) const;
+    /// Cells too big for the blocks `heap` can enumerate, each knowing its place here by its `gcRef`.
+    GcList largeCells;
+    void noteLarge(GCObject* cell);
+    void forgetLarge(GCObject* cell) noexcept;
     /// Break unreachable reference cycles. Everything else is freed eagerly.
     void collectCycles();
     /// Collect if either budget has been passed. Throws `OutOfMemory` when the

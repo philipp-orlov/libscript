@@ -46,7 +46,7 @@ void GCObject::reserveGrowth(std::size_t bytes)
 /// Freeing one cell releases its children, which may free them too. Doing that
 /// recursively overflows the stack on a long list or a deep tree, so only the
 /// outermost call actually destroys: nested releases park their cell on a
-/// worklist threaded through `gcNext` and the outer loop drains it.
+/// worklist threaded through `pendingNext` and the outer loop drains it.
 void destroyUnreferenced(GCObject* cell) noexcept
 {
     internal::ContextImpl* rt = cell->rt;
@@ -59,7 +59,7 @@ void destroyUnreferenced(GCObject* cell) noexcept
         return;  // the teardown loop owns every remaining cell
     if (rt->destroying) {
         rt->unlink(cell);
-        cell->gcNext = rt->pendingFree;
+        cell->pendingNext = rt->pendingFree;
         rt->pendingFree = cell;
         return;
     }
@@ -69,8 +69,8 @@ void destroyUnreferenced(GCObject* cell) noexcept
     rt->destroyCell(cell);
     while (rt->pendingFree) {
         GCObject* next = rt->pendingFree;
-        rt->pendingFree = next->gcNext;
-        next->gcNext = nullptr;
+        rt->pendingFree = next->pendingNext;
+        next->rt = nullptr;
         rt->destroyCell(next);
     }
     rt->destroying = false;
@@ -189,18 +189,13 @@ ContextImpl::~ContextImpl()
     // the embedder forgot. Pin it all first: cutting one cell's edges can free
     // another, and that would invalidate the list we are walking.
     GcList all;
-    for (GCObject* cell = heapHead; cell; cell = cell->gcNext) {
+    allCells(all);
+    for (GCObject* cell : all)
         ++cell->rc;
-        all.push_back(cell);
-    }
     for (GCObject* cell : all)
         cell->clearReferences();
-    heapHead = nullptr;
     pendingFree = nullptr;
-    for (GCObject* cell : all) {
-        cell->gcNext = nullptr;
-        cell->gcPrev = nullptr;
-    }
+    largeCells.clear();
     for (GCObject* cell : all)
         destroyCell(cell);
     stringTable.clear();
@@ -233,7 +228,7 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
                 continue;
             }
             unlink(child);
-            child->gcNext = pendingFree;
+            child->pendingNext = pendingFree;
             pendingFree = child;
         }
     } else if (cell->kind == CellKind::Array) {
@@ -256,14 +251,11 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
 void ContextImpl::link(GCObject* cell) noexcept
 {
     cell->rt = this;
-    cell->gcNext = heapHead;
-    cell->gcPrev = nullptr;
-    if (heapHead)
-        heapHead->gcPrev = cell;
-    heapHead = cell;
     cell->gcBytes = std::uint32_t(cell->heapSize());
     heapBytes += cell->gcBytes;
     totalAllocated += cell->gcBytes;
+    if (cell->cellBytes > mem::LocalHeap::kMaxSmall)
+        noteLarge(cell);
     if (cell->kind == CellKind::String)
         ++liveStrings;
     else
@@ -272,20 +264,40 @@ void ContextImpl::link(GCObject* cell) noexcept
 
 void ContextImpl::unlink(GCObject* cell) noexcept
 {
-    if (cell->gcPrev)
-        cell->gcPrev->gcNext = cell->gcNext;
-    else if (heapHead == cell)
-        heapHead = cell->gcNext;
-    if (cell->gcNext)
-        cell->gcNext->gcPrev = cell->gcPrev;
-    cell->gcNext = nullptr;
-    cell->gcPrev = nullptr;
+    if (cell->cellBytes > mem::LocalHeap::kMaxSmall)
+        forgetLarge(cell);
     heapBytes -= std::min<std::uint64_t>(heapBytes, cell->gcBytes);
     if (cell->kind == CellKind::String)
         --liveStrings;
     else
         --liveObjects;
     cell->rt = nullptr;
+}
+
+void ContextImpl::noteLarge(GCObject* cell)
+{
+    cell->gcRef = std::int32_t(largeCells.size());
+    largeCells.push_back(cell);
+}
+
+void ContextImpl::forgetLarge(GCObject* cell) noexcept
+{
+    GCObject* last = largeCells.back();
+    largeCells[std::size_t(cell->gcRef)] = last;
+    last->gcRef = cell->gcRef;
+    largeCells.pop_back();
+}
+
+void ContextImpl::allCells(GcList& out) const
+{
+    out.reserve(liveObjects + liveStrings);
+    heap.forEachSlot(
+        [](void* list, void* slot) {
+            auto* cell = static_cast<GCObject*>(slot);
+            static_cast<GcList*>(list)->push_back(cell);
+        },
+        &out);
+    out.insert(out.end(), largeCells.begin(), largeCells.end());
 }
 
 void ContextImpl::charge(std::size_t bytes) noexcept
@@ -337,12 +349,15 @@ void ContextImpl::collectCycles()
     ++gcRuns;
     GcList kids;
 
+    GcList all;
+    allCells(all);
+
     // 1. Assume every reference is internal, then subtract the ones we can see.
-    for (GCObject* cell = heapHead; cell; cell = cell->gcNext) {
+    for (GCObject* cell : all) {
         cell->gcRef = std::int32_t(cell->rc);
         cell->gcColor = 0;
     }
-    for (GCObject* cell = heapHead; cell; cell = cell->gcNext) {
+    for (GCObject* cell : all) {
         kids.clear();
         cell->children(kids);
         for (GCObject* kid : kids) {
@@ -353,7 +368,7 @@ void ContextImpl::collectCycles()
 
     // 2. Whatever still has a reference is reachable from outside the heap.
     GcList work;
-    for (GCObject* cell = heapHead; cell; cell = cell->gcNext) {
+    for (GCObject* cell : all) {
         if (cell->gcRef > 0 && !cell->gcColor) {
             cell->gcColor = 1;
             work.push_back(cell);
@@ -372,10 +387,14 @@ void ContextImpl::collectCycles()
         }
     }
 
+    // `gcRef` was scratch until here; freeing a big cell below needs its place back.
+    for (std::size_t i = 0; i < largeCells.size(); ++i)
+        largeCells[i]->gcRef = std::int32_t(i);
+
     // 3. The rest is a cycle nothing can reach. Pin it, cut its edges, release.
     GcList garbage;
     std::uint64_t bytes = 0;
-    for (GCObject* cell = heapHead; cell; cell = cell->gcNext) {
+    for (GCObject* cell : all) {
         cell->gcBytes = std::uint32_t(cell->heapSize());
         bytes += cell->gcBytes;
         if (!cell->gcColor) {
@@ -385,6 +404,7 @@ void ContextImpl::collectCycles()
     }
     heapBytes = bytes;
     gcFreed += garbage.size();
+    GcList().swap(all);
     for (GCObject* cell : garbage)
         cell->clearReferences();
     for (GCObject* cell : garbage)

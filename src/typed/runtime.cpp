@@ -98,7 +98,9 @@ void Runtime::unloadUnusedUnits() noexcept
     };
     for (const Frame* frame : frames)
         keepMethod(frame->method);
-    for (const GCObject* cell = ctx.heapHead; cell; cell = cell->gcNext) {
+    GcList cells;
+    ctx.allCells(cells);
+    for (const GCObject* cell : cells) {
         keepType(typeOfCell(cell));
         if (cell->kind == CellKind::Delegate)
             keepMethod(static_cast<const CSDelegate*>(cell)->method);

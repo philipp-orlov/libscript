@@ -222,8 +222,6 @@ struct Box : GCObject
     std::size_t heapSize() const override { return sizeof(*this); }
 };
 
-static_assert(offsetof(detail::GCObject, rc) == detail::kCellCountOffset);
-
 /// Set on a cell that wraps a C++ instance registered through `Class<T>`.
 struct NativeSlot
 {

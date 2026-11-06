@@ -22,6 +22,11 @@ namespace script {
 
 namespace detail {
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+static_assert(offsetof(GCObject, rc) == kCellCountOffset, "value.hpp counts at this offset");
+#pragma GCC diagnostic pop
+
 GCObject::~GCObject() = default;
 
 void GCObject::chargeGrowth(std::size_t bytes) noexcept

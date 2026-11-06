@@ -573,8 +573,6 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
 /// `holder[key]`: an element or a data property read where it is, anything else the long way.
 Value entryOf(Runtime& rt, const Value& holder, const Value& key)
 {
-    if (holder.isUndefined())
-        return key;
     if (DynArray* arr = asArray(holder)) {
         if (key.isNumber()) {
             const double d = numberOf(key);
@@ -593,13 +591,15 @@ Value entryOf(Runtime& rt, const Value& holder, const Value& key)
 bool stringifyItem(Runtime& rt, const Value& holder, const Value& key, Value item, const Value& replacer,
                    const String& indent, const String& current, String& out, JsonPath& path)
 {
+    // What a program sees of an element's index is a string, as with any other key.
+    const auto named = [&]() { return key.isNumber() ? rt.str(numberToString(numberOf(key))) : key; };
     if (item.isObject()) {
         const Value toJson = getProperty(rt, item, rt.atom.toJSON.get());
         if (asFunction(toJson))
-            item = callValue(rt, toJson, item, {key});
+            item = callValue(rt, toJson, item, {named()});
     }
     if (asFunction(replacer))
-        item = callValue(rt, replacer, holder, {key, item});
+        item = callValue(rt, replacer, holder, {named(), item});
     return stringifyValue(rt, item, replacer, indent, current, out, path);
 }
 
@@ -686,7 +686,7 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
             if (i)
                 out.push_back(u',');
             out += open;
-            const Value key(double(i));
+            const Value key{double(i)};
             const Value item = i < arr->elements.size() ? arr->elements[i] : entryOf(rt, v, key);
             if (!stringifyItem(rt, v, key, item, replacer, indent, inner, out, path))
                 out += ascii("null");
@@ -738,7 +738,15 @@ bool jsonStringify(Runtime& rt, const Value& value, const Value& replacer, Strin
                    String& out)
 {
     JsonPath path;
-    return stringifyEntry(rt, Value::undefined(), value, replacer, String(indent), String(), out, path);
+    // The value is the one property of an object that only a replacer gets to see.
+    Value holder = Value::undefined();
+    const Value key = rt.str(String());
+    if (asFunction(replacer)) {
+        DynObject* wrapper = rt.newObject(rt.objectProto.get());
+        holder = detail::Access::adopt(Type::Object, wrapper);
+        wrapper->putOwn(rt.intern(String()), value);
+    }
+    return stringifyItem(rt, holder, key, value, replacer, String(indent), String(), out, path);
 }
 
 void installMathJson(Runtime& rt)

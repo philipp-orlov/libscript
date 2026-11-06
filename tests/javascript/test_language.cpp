@@ -654,6 +654,18 @@ true true false false false true false true false false true false false true tr
 0)JS"));
 }
 
+TEST(jsonSeesElementsAndKeysAsItShould)
+{
+    CHECK_EQ(run("var seen = []; JSON.stringify([5, {toJSON: function (k) { seen.push(typeof k + k); return 1; }}],"
+                 " function (k, v) { seen.push(typeof k + ':' + k); return v; }); seen.join()"),
+             std::string("string:,string:0,string1,string:1"));
+    CHECK_EQ(run("JSON.stringify({a: 1, b: undefined, c: function () {}, d: [undefined, 2], e: {f: -3, g: 1.5}})"),
+             std::string("{\"a\":1,\"d\":[null,2],\"e\":{\"f\":-3,\"g\":1.5}}"));
+    CHECK_EQ(run("var r = []; ['01', '-', '1.', '1e', '-01', '.5'].forEach(function (t) { try { JSON.parse(t); r.push('ok'); }"
+                 " catch (e) { r.push(e.name); } }); r.join() + JSON.parse('[0,-0.5,1e2,12]').join()"),
+             std::string("SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError0,-0.5,100,12"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

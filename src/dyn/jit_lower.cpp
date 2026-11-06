@@ -321,7 +321,35 @@ public:
             mov.a = box;
         }
 
+        // Parameters only ever given numbers, and never assigned: checked once here, numbers in a register from then on.
+        numberParam_.assign(slots, 0);
+        code_.jitNumberParams = 0;
+        if (betHere()) {
+            const std::int32_t bail = newLabel();
+            std::uint32_t mask = 0;
+            for (std::uint32_t slot = 0; slot < std::min<std::uint32_t>(arity, 32) && slot < slots; ++slot) {
+                if ((code_.argsNotNumber >> slot) & 1 || assigned_[slot] || isNumberLocal(slot) ||
+                    slot == code_.argumentsSlot || (code_.hasRest && slot == arity))
+                    continue;
+                if (std::find(code_.boxedParams.begin(), code_.boxedParams.end(), slot) != code_.boxedParams.end())
+                    continue;
+                branchCmp(localTag_[slot], IrCond::Ne, std::int64_t(Type::Double), bail);
+                mask |= 1u << slot;
+            }
+            if (mask) {
+                emitBail(bail, {});
+                for (std::uint32_t slot = 0; slot < 32 && slot < slots; ++slot)
+                    numberParam_[slot] = (mask >> slot) & 1;
+            }
+            code_.jitNumberParams = mask;
+        }
+
         walk();
+        code_.jitNumberLocals.clear();
+        for (std::uint32_t slot = 0; slot < slots; ++slot) {
+            if (isNumberLocal(slot))
+                code_.jitNumberLocals.push_back(slot);
+        }
     }
 
 private:
@@ -883,6 +911,69 @@ private:
         inst(IrOp::Label).imm = newLabel();
     }
 
+    /// Arithmetic and comparisons on operands of unknown type: numbers is the guess, checked once here, so what follows is
+    /// the code for numbers alone. An operand known to be something else, a string above all, makes no guess.
+    void expectNumbers(Op op)
+    {
+        std::size_t n = 0;
+        switch (op) {
+            case Op::Add:
+            case Op::Sub:
+            case Op::Mul:
+            case Op::Div:
+            case Op::Mod:
+            case Op::BitAnd:
+            case Op::BitOr:
+            case Op::BitXor:
+            case Op::Shl:
+            case Op::Shr:
+            case Op::UShr:
+            case Op::Lt:
+            case Op::Le:
+            case Op::Gt:
+            case Op::Ge: n = 2; break;
+            case Op::Neg:
+            case Op::Pos:
+            case Op::BitNot:
+            case Op::Inc:
+            case Op::Dec:
+            case Op::ToNumber: n = 1; break;
+            default: return;
+        }
+        if (stack_.size() < n)
+            return;
+        bool any = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            const Entry& e = top(i);
+            if (e.rep == Rep::Tagged && (e.hasKnownTag || e.isConst) && e.known != Type::Double)
+                return;
+            any = any || (e.rep == Rep::Tagged && !e.isConst && !e.hasKnownTag);
+        }
+        if (!any)
+            return;
+        const std::int32_t bail = newLabel();
+        for (std::size_t i = 0; i < n; ++i) {
+            const Entry& e = top(i);
+            if (e.rep == Rep::Tagged && !e.isConst && !e.hasKnownTag)
+                branchCmp(e.t, IrCond::Ne, std::int64_t(Type::Double), bail);
+        }
+        emitBail(bail, {});
+        for (std::size_t i = 0; i < n; ++i) {
+            Entry& e = top(i);
+            if (e.rep != Rep::Tagged || e.isConst || e.hasKnownTag)
+                continue;
+            // A number holds no count, and a read of a local is a copy from here on, since the local may change first.
+            const std::int32_t bits = fn_.newVreg(false);
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = bits;
+            mov.a = e.r;
+            e = taggedEntry(bits, -1, Own::None);
+            e.hasKnownTag = true;
+            e.known = Type::Double;
+            e.nonNull = true;
+        }
+    }
+
     /// Bails to `bail` unless `base` is an object of `shape`, which is known from then on.
     void expectShape(const Entry& base, const Shape* shape, std::int32_t bail)
     {
@@ -890,6 +981,11 @@ private:
             return;
         guardShape(base, shape, bail);
         learnShape(base.r, shape);
+    }
+    /// Whether to assume what the interpreter has seen at this instruction: not where that has already been wrong.
+    bool betHere() const
+    {
+        return speculate_ && std::find(code_.jitBailedAt.begin(), code_.jitBailedAt.end(), pc_) == code_.jitBailedAt.end();
     }
     void expectEpoch(std::uint64_t epoch, std::int32_t bail)
     {
@@ -1000,6 +1096,8 @@ private:
                     addOsrEntry(pc);
             }
             fallsIn = true;
+            if (betHere())
+                expectNumbers(op);
             // A comparison of numbers followed by a branch on it fuses.
             if ((op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge) && next < c.size() && labels_[next] < 0 &&
                 stack_.size() == 2 && isKnownNumber(top(0)) && isKnownNumber(top(1))) {
@@ -1010,6 +1108,16 @@ private:
                     pc = next + 5;
                     continue;
                 }
+            }
+            // `x = e;` as a statement: the copy the expression's value would be is never made.
+            if (op == Op::Dup && next + 6 <= c.size() && Op(c[next]) == Op::SetLocal && Op(c[next + 5]) == Op::Pop &&
+                labels_[next] < 0 && labels_[next + 5] < 0) {
+                // Not the `PushUndefined; SetLocal` of a declaration, which `storeLocal` treats as one.
+                previousOp_ = Op::Dup;
+                storeLocal(readOperand(c, next + 1));
+                previousOp_ = Op::Pop;
+                pc = next + 6;
+                continue;
             }
             // These change an object under construction behind the back of what `fresh` says about it.
             switch (op) {
@@ -1277,6 +1385,13 @@ private:
                 if (isNumberLocal(slot)) {
                     Entry e = doubleEntry(localReg_[slot]);
                     e.local = std::int32_t(slot);
+                    push(e);
+                } else if (numberParam_[slot]) {
+                    // Its payload register, which an entry part way through fills in too.
+                    Entry e = taggedEntry(localReg_[slot], -1, Own::None);
+                    e.hasKnownTag = true;
+                    e.known = Type::Double;
+                    e.nonNull = true;
                     push(e);
                 } else {
                     Entry e = taggedEntry(localReg_[slot], localTag_[slot], Own::Local);
@@ -2148,8 +2263,10 @@ private:
             getterProp(base, site, operand, keepBase);
             return;
         }
-        const bool bet = speculate_ && usable && !site->getter && !site->addTo && !site->moreCount &&
+        const bool bet = betHere() && usable && !site->getter && !site->addTo && !site->moreCount &&
                          base.rep == Rep::Tagged && !base.isConst;
+        const bool polyBet = !bet && betHere() && site && !site->getter && !site->addTo && site->moreCount &&
+                             base.rep == Rep::Tagged && !base.isConst;
         Entry result;
         if (bet) {
             // One shape seen: guard it, or what is known of it, and leave the rest to the interpreter.
@@ -2170,6 +2287,36 @@ private:
                 result = taggedEntry(load(props, at + kPropValueOffset + kPayload, 8), lt, Own::Weak);
             }
             emitBail(bail, {base});
+        } else if (polyBet) {
+            // A few shapes seen: one case each, and none of them the interpreter's.
+            const std::int32_t bail = newLabel();
+            const bool number = site->saw == PropertySite::kSawNumber;
+            const std::int32_t d = number ? fn_.newVreg(true) : -1;
+            for (const ShapeCase& c : dispatchShapes(base, site, bail)) {
+                inst(IrOp::Label).imm = c.label;
+                const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
+                const std::int32_t props = load(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset, 8);
+                const std::int32_t lt = load(props, at + kPropValueOffset, 1);
+                if (number) {
+                    branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
+                    const std::int32_t v = load(props, at + kPropValueOffset + kPayload, 8, true);
+                    IrInst& md = inst(IrOp::Mov);
+                    md.d = d;
+                    md.a = v;
+                } else {
+                    const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+                    IrInst& mt = inst(IrOp::Mov);
+                    mt.d = t;
+                    mt.a = lt;
+                    IrInst& mr = inst(IrOp::Mov);
+                    mr.d = r;
+                    mr.a = lr;
+                }
+                inst(IrOp::Br).imm = done;
+            }
+            emitBail(bail, {base});
+            inst(IrOp::Label).imm = done;
+            result = number ? doubleEntry(d) : taggedEntry(r, t, Own::Weak);
         } else if (site && !site->getter && !site->addTo && site->moreCount) {
             for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
                 inst(IrOp::Label).imm = c.label;
@@ -2205,7 +2352,7 @@ private:
         } else {
             inst(IrOp::Br).imm = slow;
         }
-        if (!bet) {
+        if (!bet && !polyBet) {
             inst(IrOp::ColdBegin);
             inst(IrOp::Label).imm = slow;
             const std::int32_t rt = rtReg();
@@ -2317,7 +2464,7 @@ private:
         const PropertySite* site = siteAt(operand);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
-        const bool bet = speculate_ && site && !site->moreCount && base.rep == Rep::Tagged && !base.isConst &&
+        const bool bet = betHere() && site && !site->moreCount && base.rep == Rep::Tagged && !base.isConst &&
                          (!site->addTo || (site->epoch == rt_.ctx.protoEpoch && site->addTo->count <= DynObject::kIndexThreshold));
         if (bet) {
             const std::int32_t bail = newLabel();
@@ -2474,6 +2621,7 @@ private:
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
+        const bool bet = betHere();
         guardArray(base, slow);
         const std::int32_t i = arrayIndex(key, slow);
         const std::int32_t data = load(base.r, kElementsOffset, 8);
@@ -2508,14 +2656,19 @@ private:
         lr.b = scaled;
         lr.imm = kPayload;
         lr.width = 8;
-        inst(IrOp::ColdBegin);
-        inst(IrOp::Label).imm = slow;
-        const std::int32_t rt = rtReg();
-        coldCall(reinterpret_cast<void*>(&scriptDynGetElem), {rt, tagReg(base), base.r, tagReg(key), payloadReg(key)}, r, t, true,
-                 {base, key});
-        inst(IrOp::Br).imm = done;
-        inst(IrOp::ColdEnd);
-        inst(IrOp::Label).imm = done;
+        if (bet) {
+            // An index into an array it has; anything else, the interpreter does.
+            emitBail(slow, {base, key});
+        } else {
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = slow;
+            const std::int32_t rt = rtReg();
+            coldCall(reinterpret_cast<void*>(&scriptDynGetElem), {rt, tagReg(base), base.r, tagReg(key), payloadReg(key)}, r,
+                     t, true, {base, key});
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
+        }
         Entry result = taggedEntry(r, t, Own::Weak);
         if (base.own == Own::Owned || key.own == Own::Owned) {
             makeOwned(result);
@@ -2600,18 +2753,22 @@ private:
         store(slot, 0, vt, 1);
         store(slot, kPayload, vr, 8);
         decRefOf(old, oldTag, false);
-        inst(IrOp::ColdBegin);
-        inst(IrOp::Label).imm = slow;
-        {
-            const std::int32_t rt = rtReg();
-            coldCall(reinterpret_cast<void*>(&scriptDynSetElem), {rt, tagReg(base), base.r, tagReg(key), payloadReg(key), vt, vr}, -1,
-                     -1, true, {base, key, value});
-            if (value.own == Own::Owned && !value.isConst)
-                decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
+        if (betHere()) {
+            emitBail(slow, {base, key, value});
+        } else {
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = slow;
+            {
+                const std::int32_t rt = rtReg();
+                coldCall(reinterpret_cast<void*>(&scriptDynSetElem),
+                         {rt, tagReg(base), base.r, tagReg(key), payloadReg(key), vt, vr}, -1, -1, true, {base, key, value});
+                if (value.own == Own::Owned && !value.isConst)
+                    decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
+            }
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
         }
-        inst(IrOp::Br).imm = done;
-        inst(IrOp::ColdEnd);
-        inst(IrOp::Label).imm = done;
         release(key);
         release(base);
         if (value.rep != Rep::Tagged) {
@@ -3697,6 +3854,8 @@ private:
     std::vector<Join> joins_;
     std::vector<Entry> stack_;
     std::set<std::int32_t> nonNullLocals_;
+    /// Parameters only ever given numbers, by slot.
+    std::vector<std::uint8_t> numberParam_;
     /// Whether code may assume what the interpreter has seen so far, and hand the call back to it when that stops being so.
     bool speculate_ = false;
     /// Objects whose shape is known here, by the register holding them: a guard that dominates, with nothing since that

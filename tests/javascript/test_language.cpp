@@ -489,6 +489,21 @@ TEST(nativeCodeHandsBackWhatItDidNotExpect)
                  " for (var i = 0; i < 600; i++) r += f({x: 1, y: 0});"
                  " try { f({x: 5, y: 1, z: 0}); } catch (e) { r = r + e.message; } r"),
              std::string("600y5"));
+    // A parameter only ever given numbers is taken to be one, on entry and on entering a loop part way through.
+    CHECK_EQ(run("function k(n, m) { var s = 0; for (var i = 0; i < n; i++) s += m; return s; }"
+                 " k(5000, 1) + ':' + k(3, 'a') + ':' + k(4000, 2) + ':' + k(2) + ':' + k(5000, 1)"),
+             std::string("5000:0aaa:8000:NaN:5000"));
+    CHECK_EQ(run("function g(n, m) { var s = ''; for (var i = 0; i < n; i++) s = s + m; return s.length; }"
+                 " var r = 0; for (var j = 0; j < 20; j++) r += g(2, 1); r + ':' + g(5000, 'ab') + ':' + g(3000, 7)"),
+             std::string("40:10000:3000"));
+    CHECK_EQ(run("function h(a, b) { return a < b ? a - b : b * a; } var r = 0; for (var i = 0; i < 3000; i++) r += h(i, 50);"
+                 " r + ':' + h('b', 'a') + ':' + h('2', 3) + ':' + h({valueOf: function() { return 9; }}, 4)"),
+             std::string("224862475:NaN:-1:36"));
+    // A local native code keeps as a number, which the interpreter makes a string after a bail, then enters the loop.
+    CHECK_EQ(run("var out = []; function run(a, b) { var v = 0; v += (7 - {x: b, y: 870}) ? 5 : {x: 1, y: v};"
+                 " for (var k = 0; k < 500; k++) out.push(Math.sqrt(String(v).length)); return a; }"
+                 " for (var i = 0; i < 300; i++) run(i, i * 2); out.length + ':' + out.every(function(x) { return x === 4; })"),
+             std::string("150000:true"));
     CHECK_EQ(run("'use strict'; function A() { this.n = 1; } A.prototype.inc = function(k) { this.n += k.d; return this; };"
                  " var a = new A(); for (var i = 0; i < 3000; i++) a.inc(i < 2500 ? {d: 1} : {e: 0, d: 2}); a.n"),
              std::string("3501"));

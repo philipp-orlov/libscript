@@ -903,6 +903,16 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
         compileNative(rt, code))
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
 #endif
+#if SCRIPT_ENABLE_DYN_JIT
+    // What native code compiled later may take the parameters to be.
+    if (code.argsNotNumber != ~0u) {
+        const std::size_t arity = std::min<std::size_t>(std::size_t(std::max(code.arity, 0)), 32);
+        for (std::size_t i = 0; i < arity; ++i) {
+            if (i >= args.size() || !args[i].isDouble())
+                code.argsNotNumber |= 1u << i;
+        }
+    }
+#endif
     Frame& frame = rt.acquireFrame(rt.frames.size());
     frame.begin(fn, &code, thisValue, newTarget);
     rt.frames.push_back(&frame);

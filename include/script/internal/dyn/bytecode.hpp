@@ -305,6 +305,15 @@ struct FunctionCode
     /// Times native code has been thrown away for bailing too often. Past `kJitSpeculations`, nothing is assumed.
     mutable std::uint8_t jitGeneration = 0;
     static constexpr std::uint8_t kJitSpeculations = 2;
+    /// Parameters, of the first 32, that some interpreted call has been given something other than a number for.
+    mutable std::uint32_t argsNotNumber = 0;
+    /// Parameters the current native code takes to be numbers, which entering it part way through has to check.
+    mutable std::uint32_t jitNumberParams = 0;
+    /// Locals the current native code keeps as bare numbers. A store the interpreter made after a bail may have put
+    /// anything there, which entering part way through has to check.
+    mutable std::vector<std::uint32_t> jitNumberLocals;
+    /// Where native code has bailed: what it is compiled to next assumes nothing there.
+    mutable std::vector<std::uint32_t> jitBailedAt;
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;

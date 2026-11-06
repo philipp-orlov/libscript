@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // What native code for the dynamic languages calls, and how it is entered.
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -212,6 +213,8 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
     // Code that keeps bailing is thrown away; what it is compiled to next assumes what the interpreter learns meanwhile,
     // and after a few rounds of that, nothing.
     constexpr std::uint32_t kBailLimit = 8;
+    if (std::find(code->jitBailedAt.begin(), code->jitBailedAt.end(), pc) == code->jitBailedAt.end())
+        code->jitBailedAt.push_back(pc);
     if (++code->jitBails > kBailLimit && code->jitEntry) {
         code->jitEntry = nullptr;
         code->jitCallEntry = nullptr;
@@ -763,6 +766,27 @@ bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& resul
     }
     if (!entry)
         return false;
+    // Parameters or locals the code takes to be numbers that are not, which the interpreter can have made so after a bail:
+    // this code is no good for the call, nor for the next. What it is compiled to next knows where the bail was.
+    const auto discard = [&code]() {
+        code.jitEntry = nullptr;
+        code.jitCallEntry = nullptr;
+        code.jitCode = nullptr;
+        code.jitHotness = 0;
+        return false;
+    };
+    for (std::uint32_t slot = 0; slot < 32 && slot < frame.locals.size(); ++slot) {
+        if ((code.jitNumberParams >> slot) & 1 && !frame.locals[slot].isDouble()) {
+            code.argsNotNumber |= 1u << slot;
+            return discard();
+        }
+    }
+    for (std::uint32_t slot : code.jitNumberLocals) {
+        // Not yet written is fine: nothing reads one of these before a number is stored.
+        const Type type = slot < frame.locals.size() ? frame.locals[slot].type() : Type::Undefined;
+        if (type != Type::Double && type != Type::Undefined)
+            return discard();
+    }
 
     // Native code reads a picture of the frame: the counts of what it will own move with the values, and those slots must
     // read as empty here from now on.

@@ -570,6 +570,11 @@ using JsonPath = Vec<const void*>;  // pooled, so writing JSON still makes no ca
 bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const String& indent,
                     const String& current, String& out, JsonPath& path);
 
+bool isIndexKey(StringView text) noexcept
+{
+    return !text.empty() && text[0] >= u'0' && text[0] <= u'9';
+}
+
 /// `holder[key]`: an element or a data property read where it is, anything else the long way.
 Value entryOf(Runtime& rt, const Value& holder, const Value& key)
 {
@@ -700,6 +705,43 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
     DynObject* obj = asObject(v);
     out.push_back(u'{');
     bool first = true;
+    // A small plain object of plain properties: its keys as they are now, on the stack, which is all the order takes.
+    constexpr std::size_t kFewKeys = 32;
+    bool plain = obj->cls == ObjClass::Plain && obj->props.size() <= kFewKeys;
+    if (plain) {
+        for (const Prop& p : obj->props)
+            plain = plain && !p.accessor() && p.key->kind == CellKind::String && (p.attrs & PropEnumerable) != 0 &&
+                    !isIndexKey(static_cast<StringCell*>(p.key.get())->text());
+    }
+    if (plain) {
+        Value keys[kFewKeys];
+        const std::size_t count = obj->props.size();
+        for (std::size_t i = 0; i < count; ++i)
+            keys[i] = detail::Access::make(Type::String, obj->props[i].key.get());
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::size_t mark = out.size();
+            if (!first)
+                out.push_back(u',');
+            out += open;
+            appendJsonQuoted(asString(keys[i])->text(), out);
+            out.push_back(u':');
+            if (!indent.empty())
+                out.push_back(u' ');
+            // Where it was, unless something run since has moved it.
+            const Value item = i < obj->props.size() && obj->props[i].key.get() == detail::Access::ptr(keys[i]) && !obj->props[i].accessor()
+                                   ? obj->props[i].value
+                                   : entryOf(rt, v, keys[i]);
+            if (!stringifyItem(rt, v, keys[i], item, replacer, indent, inner, out, path)) {
+                out.resize(mark);
+                continue;
+            }
+            first = false;
+        }
+        if (!first)
+            out += close;
+        out.push_back(u'}');
+        return true;
+    }
     for (const Value& key : ownKeys(rt, obj, true, false)) {
         // Written in place, and taken back when the value turns out to be one JSON leaves out.
         const std::size_t mark = out.size();
@@ -738,6 +780,14 @@ bool jsonStringify(Runtime& rt, const Value& value, const Value& replacer, Strin
                    String& out)
 {
     JsonPath path;
+    // The next one is likely to be the size of the last.
+    out.reserve(rt.jsonSizeSeen);
+    struct Remember
+    {
+        Runtime& rt;
+        String& out;
+        ~Remember() { rt.jsonSizeSeen = std::min<std::size_t>(out.size(), std::size_t(1) << 24); }
+    } remember{rt, out};
     // The value is the one property of an object that only a replacer gets to see.
     Value holder = Value::undefined();
     const Value key = rt.str(String());
@@ -762,6 +812,11 @@ void installMathJson(Runtime& rt)
 
     rt.method(json, "parse", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
+        if (ci.arg(0).isString()) {
+            // Held by the arguments for as long as this runs: nothing the parser does runs any of the program's code.
+            const Value text = ci.arg(0);
+            return jsonParse(rt2, asString(text)->text());
+        }
         return jsonParse(rt2, toStringValue(rt2, ci.arg(0)));
     }, 2);
 

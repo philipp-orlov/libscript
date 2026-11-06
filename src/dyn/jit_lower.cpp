@@ -683,7 +683,7 @@ public:
     bool inlineCall(const Entry& callee, const Entry& self, const std::vector<Entry>& args, const std::vector<Entry>& held,
                     std::int32_t r, std::int32_t t, std::int32_t generic, std::int32_t done)
     {
-        if (depth_ >= 2 || callee.rep != Rep::Tagged || callee.isConst)
+        if (depth_ >= 3 || callee.rep != Rep::Tagged || callee.isConst)
             return false;
         if (!callee.hint)
             return inlineSeen(callee, self, args, held, r, t, generic, done);
@@ -693,13 +693,13 @@ public:
         const auto* fn = static_cast<const DynFunction*>(target);
         if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isClassConstructor || !inlinable(*fn->code))
             return false;
-        // A recursive function goes in once more: half its calls become branches, and the copy calls itself for real.
+        // A recursive function goes in twice more: most of its calls become branches, and the last copy calls itself for real.
         std::uint32_t copies = 0;
         for (const Lowering* up = this; up; up = up->parent_) {
             if (&up->code_ == fn->code.get())
                 ++copies;
         }
-        if (copies > 1)
+        if (copies > 2)
             return false;
         const Mark before = mark();
         const std::int32_t at = site();

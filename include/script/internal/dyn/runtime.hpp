@@ -115,6 +115,7 @@ struct Runtime : EngineRuntime
     Ref<DynObject> globalObject;
     /// Changes whenever the global object's table moves, loses a property or changes one's attributes: while it stays,
     /// a global is where native code last saw it, and the same kind of property.
+    std::size_t jsonSizeSeen = 0;
     std::uint64_t globalEpoch = 0;
     /// Where native code that is bailing leaves its registers, for as long as it takes to read them.
     std::uint64_t bailRegs[64] = {};

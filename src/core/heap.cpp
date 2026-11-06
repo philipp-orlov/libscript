@@ -404,7 +404,6 @@ void ContextImpl::collectCycles()
     sweepStrings();
     trimBuffers();
     heap.trim();
-    payload_cache::flushThisThread();
     payloadPool().trim();
 }
 

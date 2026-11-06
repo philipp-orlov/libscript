@@ -828,14 +828,30 @@ bool instanceOf(Runtime& rt, const Value& object, const Value& ctor)
     DynFunction* fn = asFunction(ctor);
     if (!fn)
         throwError(rt, ErrorCode::TypeError, "the right side of 'instanceof' is not callable");
-    Value custom = getPropertyOfObject(rt, fn, rt.sym.hasInstance.get(), ctor);
-    if (asFunction(custom))
-        return toBoolean(callValue(rt, custom, ctor, {object}));
+    // A function straight off Function.prototype, with nothing on that chain defining `Symbol.hasInstance` since the
+    // prototypes last changed, has no custom test to call.
+    bool plain = false;
+    if (fn->proto.get() == rt.functionProto.get() && !fn->findOwn(rt.sym.hasInstance.get())) {
+        if (rt.hasInstanceAbsentAt != rt.ctx.protoEpoch) {
+            bool found = false;
+            for (DynObject* cursor = rt.functionProto.get(); cursor && !found; cursor = cursor->proto.get())
+                found = cursor->findOwn(rt.sym.hasInstance.get()) != nullptr;
+            if (!found)
+                rt.hasInstanceAbsentAt = rt.ctx.protoEpoch;
+        }
+        plain = rt.hasInstanceAbsentAt == rt.ctx.protoEpoch;
+    }
+    if (!plain) {
+        Value custom = getPropertyOfObject(rt, fn, rt.sym.hasInstance.get(), ctor);
+        if (asFunction(custom))
+            return toBoolean(callValue(rt, custom, ctor, {object}));
+    }
     DynObject* obj = asObject(object);
     DynObject* start = obj ? obj->proto.get() : hostProtoOf(rt, object);
     if (!start)
         return false;
-    Value proto = getPropertyOfObject(rt, fn, rt.atom.prototype.get(), ctor);
+    const Prop* own = plain ? fn->findOwn(rt.atom.prototype.get()) : nullptr;
+    Value proto = own && !own->accessor() ? own->value : getPropertyOfObject(rt, fn, rt.atom.prototype.get(), ctor);
     DynObject* target = asObject(proto);
     if (!target)
         throwError(rt, ErrorCode::TypeError, "the constructor has no object prototype");

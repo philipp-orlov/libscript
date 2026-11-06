@@ -1754,6 +1754,8 @@ void Context::collectGarbage()
 {
     Lock lock(*this);
     impl_->collectCycles();
+    // Asked for by the host: hand back what this thread keeps for the next small buffers too.
+    internal::payload_cache::flushThisThread();
 }
 
 Context::Stats Context::stats() const

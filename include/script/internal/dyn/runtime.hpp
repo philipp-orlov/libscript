@@ -115,6 +115,9 @@ struct Runtime : EngineRuntime
         IntrinsicCount
     };
     Ref<GCObject> intrinsics[IntrinsicCount];
+    /// `protoEpoch` when no `Symbol.hasInstance` was found from `Function.prototype` up, so `instanceof` on a plain
+    /// function can skip looking; anything else when that is not known.
+    std::uint64_t hasInstanceAbsentAt = ~std::uint64_t(0);
     /// One-character strings below 128, made on first use.
     Ref<GCObject> asciiChars[128];
     Ref<DynObject> objectProto, functionProto, arrayProto, stringProto, numberProto, booleanProto,

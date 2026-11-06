@@ -182,6 +182,26 @@ struct Handler
     HandlerKind kind = HandlerKind::Catch;
 };
 
+struct Shape;
+struct DynObject;
+
+/// What one property access in the code has seen: an inline cache, for the last shape only.
+struct PropertySite
+{
+    Shape* shape = nullptr;     ///< the receiver's shape this is about; null for nothing learned
+    DynObject* holder = nullptr;  ///< where the property is when not on the receiver
+    Shape* addTo = nullptr;     ///< a store that adds the property: the shape it leads to
+    std::uint64_t epoch = 0;    ///< `protoEpoch` when `holder` or `addTo` was worked out
+    std::uint32_t index = 0;    ///< position in the property table
+    std::uint32_t misses = 0;
+};
+
+/// A property operand: the atom in the low bits, the site above them. A function with more sites than fit shares the last
+/// one as "no site".
+inline constexpr std::uint32_t kSiteShift = 20;
+inline constexpr std::uint32_t kAtomMask = (1u << kSiteShift) - 1;
+inline constexpr std::uint32_t kNoSite = 0xFFFu;
+
 /// One compiled function. Immutable once the compiler is done, shared by every
 /// closure made from it.
 struct FunctionCode
@@ -211,9 +231,10 @@ struct FunctionCode
     static constexpr std::uint32_t kNoSlot = 0xffffffffu;
 
     std::vector<std::uint8_t> code;
-    /// By code offset: where the property a `GetProp` or `SetProp` found last time sat in the object's table, plus one;
-    /// 0 for not yet or too far along. A byte each, made the first time the function reads a property.
-    mutable std::vector<std::uint8_t> siteCache;
+    /// What each property access has learned; made the first time the function touches a property. The operand of a
+    /// `GetProp`, `GetPropDup` or `SetProp` packs its atom and its site: see `kSiteShift`.
+    mutable Vec<PropertySite> sites;
+    std::uint32_t siteCount = 0;
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;

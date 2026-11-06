@@ -147,6 +147,16 @@ struct Runtime : EngineRuntime
 
     // ---- allocation helpers ----
     DynObject* newObject(DynObject* proto = nullptr);
+
+    // ---- shapes ----
+    /// The shape an empty object with this prototype has. Null when there are too many shapes already.
+    Shape* rootShapeFor(DynObject* proto);
+    /// The shape after adding this property to `from`; null means it stops having one.
+    Shape* shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs);
+    /// How many shapes a runtime keeps; past this a new layout simply has no shape, and works by name.
+    static constexpr std::size_t kMaxShapes = 1u << 16;
+    std::vector<std::unique_ptr<Shape>> shapes;
+    Shape* nullProtoRoot = nullptr;
     DynArray* newArray(std::size_t reserve = 0);
     DynFunction* newFunction();
     Value makeArray(Vec<Value> items);

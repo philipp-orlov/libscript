@@ -29,7 +29,7 @@ DynMap* newCollection(Runtime& rt, ObjClass cls, DynObject* proto)
 {
     auto* m = rt.newCell<DynMap>();
     m->cls = cls;
-    m->proto.reset(proto);
+    m->setProto(proto);
     return m;
 }
 

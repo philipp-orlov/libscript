@@ -68,12 +68,46 @@ enum class ObjClass : std::uint8_t
     Promise,
 };
 
+/// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.
+/// A site that has seen one shape knows where a property is on every object of that shape without looking.
+///
+/// A shape says everything about an object's layout or nothing: an object that does something unusual -- deletes a
+/// property, changes attributes, gets a new prototype, grows past `kMaxProperties` -- drops to no shape at all and is simply
+/// looked up by name from then on. Shapes live as long as their runtime, and `Runtime::newShape` caps how many there are.
+struct Shape
+{
+    static constexpr std::uint32_t kMaxProperties = 128;
+    static constexpr std::size_t kMaxTransitions = 32;
+
+    Ref<GCObject> key;  ///< the property this one added, null for a root
+    std::uint8_t attrs = 0;
+    std::uint32_t count = 0;
+    struct Transition
+    {
+        GCObject* key;
+        std::uint8_t attrs;
+        Shape* to;
+    };
+    Vec<Transition> transitions;
+};
+
 struct DynObject : GCObject
 {
     ObjClass cls = ObjClass::Plain;
     bool extensible = true;
     bool frozen = false;
+    /// Something's prototype: changing which properties this has invalidates what sites know about objects beyond it.
+    bool isProto = false;
+    Shape* shape = nullptr;
+    /// The shape an object with this one as its prototype starts from.
+    Shape* childRoot = nullptr;
     Ref<DynObject> proto;
+    /// Sets `proto`, keeping what shapes and sites know right. Every change of prototype goes through here.
+    void setProto(DynObject* next);
+    /// The layout is about to change in a way no shape describes.
+    void dropShape() noexcept;
+    /// Append a property known to be missing, moving to `next`, the shape that says so.
+    void appendKnown(GCObject* key, Value value, Shape* next);
     Vec<Prop> props;
     /// Open-addressed map from key pointer to `props` index plus one, sized to
     /// a power of two. Built lazily -- small objects are faster to scan -- and

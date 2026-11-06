@@ -159,7 +159,7 @@ void installObject(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         DynObject* out = rt2.newObject(asObject(ci.arg(0)));
         if (ci.arg(0).isNull())
-            out->proto.reset();
+            out->setProto(nullptr);
         Value result = detail::Access::adopt(Type::Object, out);
         if (DynObject* descriptors = asObject(ci.arg(1))) {
             for (const Value& k : ownKeys(rt2, descriptors, true, true)) {
@@ -188,7 +188,7 @@ void installObject(Runtime& rt)
             }
             if (next != self->proto.get() && !self->extensible)
                 ci.fail(ErrorCode::TypeError, "the object is not extensible");
-            self->proto.reset(next);
+            self->setProto(next);
         }
         return ci.arg(0);
     }, 2);
@@ -251,6 +251,7 @@ void installObject(Runtime& rt)
         if (DynObject* self = asObject(ci.arg(0))) {
             self->frozen = true;
             self->extensible = false;
+            self->dropShape();
             for (Prop& p : self->props)
                 p.attrs = std::uint8_t(p.attrs & ~(PropWritable | PropConfigurable));
         }
@@ -263,8 +264,10 @@ void installObject(Runtime& rt)
     }, 1);
 
     rt.method(ctor, "preventExtensions", [](CallInfo& ci) {
-        if (DynObject* self = asObject(ci.arg(0)))
+        if (DynObject* self = asObject(ci.arg(0))) {
             self->extensible = false;
+            self->dropShape();
+        }
         return ci.arg(0);
     }, 1);
 
@@ -420,7 +423,7 @@ void installErrors(Runtime& rt)
             return self;
         }, 1, proto);
         if (parentCtor)
-            ctor->proto.reset(parentCtor);
+            ctor->setProto(parentCtor);
         rt.errorProtos[int(code)] = Ref<DynObject>(proto);
         return std::make_pair(proto, ctor);
     };

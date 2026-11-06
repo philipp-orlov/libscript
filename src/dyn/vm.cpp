@@ -335,23 +335,6 @@ bool arrayElementKey(DynArray* arr, GCObject* key, std::uint32_t& index)
 
 }  // namespace
 
-namespace {
-
-/// An object whose named properties are exactly its property table, which is what the per-site cache relies on. An
-/// array answers `length` and indices itself and a string object answers `length`, ahead of any own property.
-inline DynObject* cacheableObject(const Value& v) noexcept
-{
-    DynObject* obj = asObject(v);
-    return obj && obj->cls != ObjClass::Array && obj->cls != ObjClass::StringObject ? obj : nullptr;
-}
-
-inline void rememberSite(std::uint8_t& site, std::size_t index) noexcept
-{
-    site = index < 255 ? std::uint8_t(index + 1) : 0;
-}
-
-}  // namespace
-
 Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Value& receiver)
 {
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
@@ -506,6 +489,121 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
         return;
     obj->putOwn(key, v);
 }
+
+// --------------------------------------------------------- inline caches ---
+
+namespace {
+
+/// The site of an access, the first access to a property in this function making the table.
+inline PropertySite* siteOf(const FunctionCode& code, std::uint32_t site) noexcept
+{
+    if (site == kNoSite)
+        return nullptr;
+    if (code.sites.empty())
+        code.sites.assign(code.siteCount, PropertySite());
+    return &code.sites[site];
+}
+
+/// A read that missed: do it the long way and teach the site, when what it finds will stay where it is.
+Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, PropertySite* site)
+{
+    DynObject* obj = asObject(base);
+    if (!site || !obj || !obj->shape || key->kind != CellKind::String)
+        return getProperty(rt, base, key);
+    // An array answers `length` and its indices itself, and a string object its `length`, ahead of any table.
+    if (obj->cls == ObjClass::StringObject || obj->cls == ObjClass::Array) {
+        std::uint32_t index = 0;
+        if (key == rt.atom.length.get() || arrayIndexOf(static_cast<StringCell*>(key)->text(), index))
+            return getProperty(rt, base, key);
+    }
+    for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+        if (cursor != obj && (cursor->cls == ObjClass::StringObject || cursor->cls == ObjClass::Array))
+            break;
+        const Prop* p = cursor->findOwn(key);
+        if (!p)
+            continue;
+        if (p->accessor())
+            break;
+        site->shape = obj->shape;
+        site->holder = cursor == obj ? nullptr : cursor;
+        site->addTo = nullptr;
+        site->index = std::uint32_t(p - cursor->props.data());
+        site->epoch = rt.ctx.protoEpoch;
+        return p->value;
+    }
+    ++site->misses;
+    return getProperty(rt, base, key);
+}
+
+/// `base.key`, with what the site knows.
+inline Value getPropertySite(Runtime& rt, const FunctionCode& code, const Value& base, GCObject* key, std::uint32_t siteIndex)
+{
+    PropertySite* site = siteOf(code, siteIndex);
+    if (site && base.type() == Type::Object && detail::Access::ptr(base)->kind == CellKind::Object) {
+        auto* obj = static_cast<DynObject*>(detail::Access::ptr(base));
+        if (obj->shape && obj->shape == site->shape) {
+            if (!site->holder)
+                return obj->props[site->index].value;
+            if (site->epoch == rt.ctx.protoEpoch)
+                return site->holder->props[site->index].value;
+        }
+    }
+    return getPropertyLearning(rt, base, key, site);
+}
+
+void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Value& v, PropertySite* site)
+{
+    DynObject* obj = asObject(base);
+    Shape* const before = obj ? obj->shape : nullptr;
+    if (!site || !before || key->kind != CellKind::String || obj->cls == ObjClass::Array ||
+        obj->cls == ObjClass::StringObject) {
+        setProperty(rt, base, key, v);
+        return;
+    }
+    if (const Prop* own = obj->findOwn(key)) {
+        if ((own->attrs & (PropAccessor | PropWritable)) == PropWritable) {
+            site->shape = before;
+            site->holder = nullptr;
+            site->addTo = nullptr;
+            site->index = std::uint32_t(own - obj->props.data());
+        }
+        setProperty(rt, base, key, v);
+        return;
+    }
+    const std::size_t count = obj->props.size();
+    setProperty(rt, base, key, v);
+    // It went on the end of the table, with the plain attributes: the same will happen for this shape as long as nothing
+    // on the prototype chain changes, since nothing there has a setter for it now.
+    if (obj->shape && obj->shape != before && obj->props.size() == count + 1 && obj->props.back().attrs == PropDefault) {
+        site->shape = before;
+        site->holder = nullptr;
+        site->addTo = obj->shape;
+        site->epoch = rt.ctx.protoEpoch;
+    }
+}
+
+/// `base.key = v`, with what the site knows.
+inline void setPropertySite(Runtime& rt, const FunctionCode& code, const Value& base, GCObject* key, const Value& v,
+                            std::uint32_t siteIndex)
+{
+    PropertySite* site = siteOf(code, siteIndex);
+    if (site && base.type() == Type::Object && detail::Access::ptr(base)->kind == CellKind::Object) {
+        auto* obj = static_cast<DynObject*>(detail::Access::ptr(base));
+        if (obj->shape && obj->shape == site->shape) {
+            if (!site->addTo) {
+                obj->props[site->index].value = v;
+                return;
+            }
+            if (site->epoch == rt.ctx.protoEpoch) {
+                obj->appendKnown(key, v, site->addTo);
+                return;
+            }
+        }
+    }
+    setPropertyLearning(rt, base, key, v, site);
+}
+
+}  // namespace
 
 bool hasProperty(Runtime& rt, const Value& base, GCObject* key)
 {
@@ -1218,33 +1316,15 @@ Value execute(Runtime& rt, Frame& frame)
                     }
 
                     case Op::GetProp: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        const std::uint32_t site = pc;
+                        const std::uint32_t operand = operandAt(pc);
                         pc += 4;
-                        if (DynObject* fast = cacheableObject(sp.back())) {
-                            if (code.siteCache.empty())
-                                code.siteCache.assign(code.code.size(), 0);
-                            const std::size_t at = std::size_t(code.siteCache[site]) - 1;
-                            if (at < fast->props.size() && fast->props[at].key.get() == key && !fast->props[at].accessor()) {
-                                Value r = fast->props[at].value;
-                                sp.back() = std::move(r);
-                                break;
-                            }
-                            if (const Prop* own = fast->findOwn(key)) {
-                                if (!own->accessor()) {
-                                    rememberSite(code.siteCache[site], std::size_t(own - fast->props.data()));
-                                    Value r = own->value;
-                                    sp.back() = std::move(r);
-                                    break;
-                                }
-                            }
-                        }
-                        Value base = pop();
-                        sp.push_back(getProperty(rt, base, key));
+                        Value r = getPropertySite(rt, code, sp.back(), code.atoms[operand & kAtomMask].get(),
+                                                  operand >> kSiteShift);
+                        sp.back() = std::move(r);
                         break;
                     }
                     case Op::GetPropBound: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
+                        GCObject* key = code.atoms[operandAt(pc) & kAtomMask].get();
                         pc += 4;
                         Value base = pop();
                         Value read = getProperty(rt, base, key);
@@ -1260,38 +1340,23 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::GetPropDup: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
+                        const std::uint32_t operand = operandAt(pc);
                         pc += 4;
-                        Value base = sp.back();
-                        sp.back() = getProperty(rt, base, key);
-                        sp.push_back(std::move(base));
+                        Value fn = getPropertySite(rt, code, sp.back(), code.atoms[operand & kAtomMask].get(),
+                                                   operand >> kSiteShift);
+                        sp.push_back(std::move(fn));
+                        std::swap(sp[sp.size() - 1], sp[sp.size() - 2]);
                         break;
                     }
                     case Op::SetProp: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        const std::uint32_t site = pc;
+                        const std::uint32_t operand = operandAt(pc);
                         pc += 4;
-                        {
-                            const std::size_t n = sp.size();
-                            if (DynObject* fast = cacheableObject(sp[n - 2])) {
-                                if (code.siteCache.empty())
-                                    code.siteCache.assign(code.code.size(), 0);
-                                const std::size_t at = std::size_t(code.siteCache[site]) - 1;
-                                Prop* own = at < fast->props.size() && fast->props[at].key.get() == key ? &fast->props[at] : fast->findOwn(key);
-                                if (own && (own->attrs & (PropAccessor | PropWritable)) == PropWritable && !fast->frozen) {
-                                    rememberSite(code.siteCache[site], std::size_t(own - fast->props.data()));
-                                    own->value = sp[n - 1];
-                                    Value v = std::move(sp[n - 1]);
-                                    sp.resize(n - 2);
-                                    sp.push_back(std::move(v));
-                                    break;
-                                }
-                            }
-                        }
-                        Value v = pop();
-                        Value base = pop();
-                        setProperty(rt, base, key, v);
-                        sp.push_back(std::move(v));
+                        const std::size_t n = sp.size();
+                        setPropertySite(rt, code, sp[n - 2], code.atoms[operand & kAtomMask].get(), sp[n - 1],
+                                        operand >> kSiteShift);
+                        // Leaves the value, as an assignment expression does.
+                        std::swap(sp[n - 2], sp[n - 1]);
+                        sp.pop_back();
                         break;
                     }
                     case Op::GetElem: {
@@ -1455,7 +1520,7 @@ Value execute(Runtime& rt, Frame& frame)
                     case Op::SetProtoOf: {
                         Value proto = pop();
                         if (DynObject* target = asObject(sp.back()))
-                            target->proto.reset(asObject(proto));
+                            target->setProto(asObject(proto));
                         break;
                     }
 
@@ -1538,7 +1603,7 @@ Value execute(Runtime& rt, Frame& frame)
                         ctor->isClassConstructor = true;
                         ctor->isDerivedConstructor = hasSuper;
                         if (super)
-                            ctor->proto.reset(super);
+                            ctor->setProto(super);
                         sp.push_back(std::move(ctorValue));
                         break;
                     }

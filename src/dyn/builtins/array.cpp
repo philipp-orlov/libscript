@@ -138,7 +138,7 @@ void installArray(Runtime& rt)
     rt.arrayIteratorProto.reset(rt.newObject(iterProto), true);
 
     auto* protoArray = rt.newCell<DynArray>();
-    protoArray->proto.reset(rt.objectProto.get());
+    protoArray->setProto(rt.objectProto.get());
     rt.arrayProto.reset(protoArray, true);
     DynObject* proto = protoArray;
 

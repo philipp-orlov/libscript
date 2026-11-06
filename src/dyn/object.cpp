@@ -50,12 +50,51 @@ Prop* DynObject::findOwn(GCObject* key) noexcept
     }
 }
 
+void DynObject::setProto(DynObject* next)
+{
+    if (next)
+        next->isProto = true;
+    if (isProto && rt)
+        ++rt->protoEpoch;
+    proto.reset(next);
+    // With nothing in it yet, it can start from what that prototype's other children start from.
+    Runtime* engine = rt ? rt->dynIfAny() : nullptr;
+    shape = engine && props.empty() ? engine->rootShapeFor(next) : nullptr;
+}
+
+void DynObject::dropShape() noexcept
+{
+    shape = nullptr;
+    if (isProto && rt)
+        ++rt->protoEpoch;
+}
+
+void DynObject::appendKnown(GCObject* key, Value value, Shape* next)
+{
+    const std::size_t before = props.capacity();
+    props.emplace_back();
+    Prop& p = props.back();
+    p.key.reset(key);
+    p.value = std::move(value);
+    chargeIfGrown(props, before);
+    if (props.size() > kIndexThreshold && index.size() < props.size() * 2)
+        reindex();
+    else if (!index.empty())
+        indexInsert(std::uint32_t(props.size() - 1));
+    shape = next;
+    if (isProto)
+        ++rt->protoEpoch;
+}
+
 Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
 {
     if (Prop* existing = findOwn(key)) {
         existing->value = std::move(value);
         existing->setter = Value::undefined();
-        existing->attrs = attrs;
+        if (existing->attrs != attrs) {
+            existing->attrs = attrs;
+            dropShape();
+        }
         return *existing;
     }
     const std::size_t before = props.capacity();
@@ -70,6 +109,12 @@ Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
         reindex();
     else if (!index.empty())
         indexInsert(std::uint32_t(props.size() - 1));
+    if (shape) {
+        Runtime* engine = rt ? rt->dynIfAny() : nullptr;
+        shape = engine ? engine->shapeAfter(shape, key, attrs) : nullptr;
+    }
+    if (isProto && rt)
+        ++rt->protoEpoch;
     return p;
 }
 
@@ -81,6 +126,7 @@ bool DynObject::deleteOwn(GCObject* key)
         if (!(props[i].attrs & PropConfigurable))
             return false;
         props.erase(props.begin() + std::ptrdiff_t(i));
+        dropShape();
         reindex();
         trim();
         return true;
@@ -131,6 +177,7 @@ void DynObject::children(GcList& out) const
 
 void DynObject::clearReferences()
 {
+    shape = nullptr;
     proto.reset();
     props.clear();
     props.shrink_to_fit();

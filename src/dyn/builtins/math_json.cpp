@@ -288,7 +288,7 @@ void installDate(Runtime& rt)
             return rt2.str(ascii("Date(") + numberToString(millis) + ascii(")"));
         auto* d = rt2.newCell<DynWrapper>();
         d->cls = ObjClass::Date;
-        d->proto.reset(rt2.dateProto.get());
+        d->setProto(rt2.dateProto.get());
         d->primitive = Value(millis);
         return detail::Access::adopt(Type::Object, d);
     }, 7, proto);

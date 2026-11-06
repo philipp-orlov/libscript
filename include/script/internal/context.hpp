@@ -201,6 +201,9 @@ struct ContextImpl
     Box* newBox(Value v);
 
     // ---- shared vm state ----
+    /// Moves whenever an object something inherits from changes what it has: what a site learned about a property found
+    /// on a prototype holds for as long as this does not move.
+    std::uint64_t protoEpoch = 0;
     /// Call depth across both engines, so `stackLimit` holds however the
     /// languages nest.
     std::size_t callDepth = 0;

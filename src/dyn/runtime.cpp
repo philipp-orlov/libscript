@@ -117,7 +117,7 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     // DynFunction: `asFunction` casts on `cls`, so a plain object tagged as a function would be read past its end.
     {
         auto* callable = newCell<DynFunction>();
-        callable->proto.reset(objectProto.get());
+        callable->setProto(objectProto.get());
         callable->fnKind = FnKind::Native;
         callable->native = [](CallInfo&) { return Value::undefined(); };
         functionProto.reset(callable, true);
@@ -190,6 +190,8 @@ void Runtime::releaseRoots() noexcept
         }
     }
     programs.clear();
+    shapes.clear();
+    nullProtoRoot = nullptr;
     jobs.clear();
     unhandled.clear();
     hostBindings.clear();
@@ -234,10 +236,38 @@ void Runtime::afterCollect() noexcept
 
 // ----------------------------------------------------------- allocation ---
 
+Shape* Runtime::rootShapeFor(DynObject* proto)
+{
+    Shape*& root = proto ? proto->childRoot : nullProtoRoot;
+    if (!root && shapes.size() < kMaxShapes) {
+        shapes.push_back(std::make_unique<Shape>());
+        root = shapes.back().get();
+    }
+    return root;
+}
+
+Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
+{
+    for (const Shape::Transition& t : from->transitions) {
+        if (t.key == key && t.attrs == attrs)
+            return t.to;
+    }
+    if (from->count >= Shape::kMaxProperties || from->transitions.size() >= Shape::kMaxTransitions ||
+        shapes.size() >= kMaxShapes)
+        return nullptr;
+    shapes.push_back(std::make_unique<Shape>());
+    Shape* next = shapes.back().get();
+    next->key.reset(key);
+    next->attrs = attrs;
+    next->count = from->count + 1;
+    from->transitions.push_back({key, attrs, next});
+    return next;
+}
+
 DynObject* Runtime::newObject(DynObject* proto)
 {
     auto* o = newCell<DynObject>();
-    o->proto.reset(proto ? proto : objectProto.get());
+    o->setProto(proto ? proto : objectProto.get());
     return o;
 }
 
@@ -246,7 +276,7 @@ DynArray* Runtime::newArray(std::size_t reserve)
     const std::size_t room = std::min<std::size_t>(reserve, 1u << 20);
     ctx.reserve(room * sizeof(Value));  // before the cell exists, so a refusal leaves nothing behind
     auto* a = newCell<DynArray>();
-    a->proto.reset(arrayProto ? arrayProto.get() : objectProto.get());
+    a->setProto(arrayProto ? arrayProto.get() : objectProto.get());
     if (reserve) {
         a->elements.reserve(room);
         a->chargeGrowth(a->elements.capacity() * sizeof(Value));
@@ -257,7 +287,7 @@ DynArray* Runtime::newArray(std::size_t reserve)
 DynFunction* Runtime::newFunction()
 {
     auto* f = newCell<DynFunction>();
-    f->proto.reset(functionProto ? functionProto.get() : objectProto.get());
+    f->setProto(functionProto ? functionProto.get() : objectProto.get());
     return f;
 }
 

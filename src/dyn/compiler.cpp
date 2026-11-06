@@ -353,6 +353,16 @@ private:
         return std::uint32_t(atoms.size() - 1);
     }
     std::uint32_t atomFor(StringView name) { return atomIndex(rt_.intern(name)); }
+    /// The operand of an instruction with an inline cache.
+    std::uint32_t siteOperand(StringView name)
+    {
+        const std::uint32_t atom = atomFor(name);
+        if (atom > kAtomMask)
+            throw Error(ErrorCode::CompileError, "a function refers to too many property names");
+        std::uint32_t& count = fn_->code->siteCount;
+        const std::uint32_t site = count < kNoSite ? count++ : kNoSite;
+        return atom | (site << kSiteShift);
+    }
 
     [[noreturn]] void fail(std::uint32_t line, const std::string& message)
     {
@@ -854,7 +864,7 @@ private:
                     emit(Op::SetElem);
                 } else {
                     emit(Op::Swap);
-                    emitU(Op::SetProp, atomFor(target.text));
+                    emitU(Op::SetProp, siteOperand(target.text));
                 }
                 return;
             }
@@ -928,7 +938,7 @@ private:
                     expr(*p->a);
                     emit(Op::GetElem);
                 } else {
-                    emitU(Op::GetProp, atomFor(p->text));
+                    emitU(Op::GetProp, siteOperand(p->text));
                 }
                 destructure(*p->b, kind, declaring);
             }
@@ -1507,7 +1517,7 @@ private:
             emit(Op::GetElem);
         } else {
             emit(Op::Dup);
-            emitU(Op::GetProp, atomFor(target.text));
+            emitU(Op::GetProp, siteOperand(target.text));
         }
         emit(Op::ToNumber);
         if (!n.prefix) {
@@ -1522,7 +1532,7 @@ private:
         if (target.computed)
             emit(Op::SetElem);
         else
-            emitU(Op::SetProp, atomFor(target.text));
+            emitU(Op::SetProp, siteOperand(target.text));
         emit(Op::Pop);
         emitU(Op::GetLocal, slot);
     }
@@ -1561,7 +1571,7 @@ private:
                 emit(Op::SetElem);
             } else {
                 expr(*n.b);
-                emitU(Op::SetProp, atomFor(target.text));
+                emitU(Op::SetProp, siteOperand(target.text));
             }
             return;
         }
@@ -1599,10 +1609,10 @@ private:
             emit(Op::SetElem);
         } else {
             emit(Op::Dup);
-            emitU(Op::GetProp, atomFor(target.text));
+            emitU(Op::GetProp, siteOperand(target.text));
             expr(*n.b);
             emit(op);
-            emitU(Op::SetProp, atomFor(target.text));
+            emitU(Op::SetProp, siteOperand(target.text));
         }
     }
 
@@ -1624,7 +1634,7 @@ private:
             emit(Op::Pop);
         } else {
             emit(Op::Swap);
-            emitU(Op::SetProp, atomFor(target.text));
+            emitU(Op::SetProp, siteOperand(target.text));
             emit(Op::Pop);
         }
     }
@@ -1670,7 +1680,7 @@ private:
                 expr(*n.b);
                 emit(Op::GetElem);
             } else {
-                emitU(n.bindMethod ? Op::GetPropBound : Op::GetProp, atomFor(n.text));
+                emitU(n.bindMethod ? Op::GetPropBound : Op::GetProp, siteOperand(n.text));
             }
             return;
         }
@@ -1701,7 +1711,7 @@ private:
                 expr(*callee.b);
                 emit(Op::GetElemDup);
             } else {
-                emitU(Op::GetPropDup, atomFor(callee.text));
+                emitU(Op::GetPropDup, siteOperand(callee.text));
             }
             receiverPushed = true;
         } else {
@@ -1878,7 +1888,7 @@ private:
 
             emit(Op::Dup);
             if (!m->isStatic)
-                emitU(Op::GetProp, atomFor(ascii("prototype")));
+                emitU(Op::GetProp, siteOperand(ascii("prototype")));
             if (m->computed) {
                 if (m->propKind != PropKind::Method)
                     fail(m->line, "computed accessor names are not supported");

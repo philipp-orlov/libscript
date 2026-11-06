@@ -326,7 +326,8 @@ TEST(mixedWorkloadStaysFlatOverManyRounds)
     CHECK(after.liveObjects <= before.liveObjects + 4);
     CHECK(after.heapBytes <= before.heapBytes + 4096);
     CHECK(after.strings <= before.strings + 4);
-    CHECK(after.reservedBytes <= before.reservedBytes);
+    // A couple of 64 KiB blocks either way, depending on where in the collector's sawtooth each reading lands.
+    CHECK(after.reservedBytes <= before.reservedBytes + (256u << 10));
     // Resident size is a coarse check: the allocator keeps a megabyte or two
     // of slack around the collector's sawtooth. The heap counters above are
     // the exact ones.

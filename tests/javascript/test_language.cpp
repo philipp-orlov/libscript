@@ -721,6 +721,40 @@ true
 700)JS"));
 }
 
+TEST(argumentsForwardedWithoutAnArrayAreStillArguments)
+{
+    // Expected values are from JavaScriptCore.
+    CHECK_EQ(run(R"JS(var out=[];
+function tgt(a,b,c){return [this.v,a,b,c,arguments.length].join();}
+var o={v:1,f:function(){return tgt.apply(this,arguments);},g:function(){return this.h.apply(this,arguments);},h:function(a){return 'h'+a+arguments.length;}};
+var r;for(var i=0;i<500;i++){r=o.f(i,2);r=o.g(i);}out.push(r,o.f(),o.f(1,2,3,4));
+function viaOther(){return Math.max.apply(null,arguments);}for(var i=0;i<500;i++)r=viaOther(i,2,9);out.push(r);
+function notApply(f){return f(1,arguments);}
+out.push(notApply(function(a,b){return a+':'+b.length+':'+b[0].name;}));
+for(var i=0;i<500;i++)r=notApply(function(a,b){return a+':'+b.length;});out.push(r);
+var ap=Function.prototype.apply;function sw(){return this.m.apply(this,arguments);}var s={m:function(){return arguments.length;}};
+for(var i=0;i<500;i++)r=sw.call(s,1,2);out.push(r);
+s.m={apply:function(t,a){return 'custom'+a.length+a[1];}};out.push(sw.call(s,1,2));
+function th(){return thrower.apply(this,arguments);}function thrower(a){if(a>400)throw new Error('e'+a);return a;}
+for(var i=398;i<403;i++){try{r=th(i);}catch(e){r=e.message;}out.push(r);}
+function bindy(){var f=function(){return arguments.length;};return f.apply(null,arguments);}for(var i=0;i<500;i++)r=bindy(1,2,3);out.push(r);
+out.join('\n'))JS"),
+             std::string(R"JS(h4991
+1,,,,0
+1,1,2,3,4
+499
+1:1:
+1:1
+2
+custom22
+398
+399
+400
+e401
+e402
+3)JS"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

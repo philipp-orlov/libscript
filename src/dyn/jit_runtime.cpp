@@ -339,7 +339,9 @@ NativePair scriptDynBail(Runtime* rt, const DeoptInfo* info, const char* frame) 
         slot[0] = v.tagAt >= 0 ? std::uint8_t(word(v.tagAt)) : v.tag;
         slot[1] = v.owned;
         std::uint64_t payload = v.bits;
-        if (v.form != DeoptValue::Constant) {
+        if (v.form == DeoptValue::Arguments) {
+            payload = reinterpret_cast<std::uint64_t>(scriptDynArgsArray(rt, reinterpret_cast<const Value*>(word(v.payloadAt)), word(std::int32_t(v.bits)), 0));
+        } else if (v.form != DeoptValue::Constant) {
             payload = word(v.payloadAt);
             if (v.form == DeoptValue::Int32 || v.form == DeoptValue::Int64) {
                 const double d = v.form == DeoptValue::Int32 ? double(std::int32_t(payload)) : double(std::int64_t(payload));

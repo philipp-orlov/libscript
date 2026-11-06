@@ -272,6 +272,7 @@ struct DeoptValue
         Int32,     ///< a number held as an int32
         Int64,     ///< a number held as an integer in 64 bits
         Constant,  ///< `bits`
+        Arguments, ///< an `arguments` array to make: from the array at `payloadAt`, of the length at place `bits`
     };
     Form form = Bits;
     std::uint8_t tag = 0;   ///< when `tagAt` is negative

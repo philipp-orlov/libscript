@@ -125,6 +125,8 @@ struct Entry
     std::int32_t local = -1;
     /// The object this was when the code was compiled, when that is known: a hint, never relied on unguarded.
     const GCObject* hint = nullptr;
+    /// `arguments`, not made: the call this is about to be an argument of says what it comes to.
+    bool lazyArgs = false;
     /// The value is `hint`, checked, and the code keeps it alive: it needs no count to be held.
     bool pinned = false;
     /// An object literal under construction, which nothing else can see yet: its shape so far and the room in its table.
@@ -246,6 +248,9 @@ public:
         thisReg_ = fn_.newVreg(false);
         const std::int32_t args = fn_.newVreg(false);
         const std::int32_t argc = fn_.newVreg(false);
+        argsReg_ = args;
+        argcReg_ = argc;
+        argsLazy_ = speculate_ && onlyForwardsArguments();
         fn_.params = {fnReg_, thisTag_, thisReg_, args, argc};
         fn_.osrArguments = {fnReg_, thisTag_, thisReg_};
         // A parameter guessed wrong is found out before anything has happened: the call starts over, some other way.
@@ -429,7 +434,7 @@ public:
                 decRefOf(r, -1, false);
             }
         }
-        if (code_.argumentsSlot != FunctionCode::kNoSlot) {
+        if (code_.argumentsSlot != FunctionCode::kNoSlot && !argsLazy_) {
             const std::int32_t rt = rtReg();
             const std::int32_t from = immReg(0);
             const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynArgsArray), {rt, args, argc, from}, true);
@@ -571,6 +576,26 @@ public:
             cellOwned_[slot] = 1;
         }
         walk();
+    }
+
+    /// `arguments` read nowhere but as the last argument of a call, in a function with no loop to enter part way through.
+    bool onlyForwardsArguments() const
+    {
+        if (code_.argumentsSlot == FunctionCode::kNoSlot || code_.argumentsBoxed)
+            return false;
+        for (std::uint32_t pc = 0; pc < code_.code.size();) {
+            const Op op = Op(code_.code[pc]);
+            const std::uint32_t next = pc + 1 + std::uint32_t(operandsOf(op)) * 4;
+            if (isBranch(op) && readOperand(code_.code, pc + 1) <= pc)
+                return false;
+            if (op == Op::SetLocal && readOperand(code_.code, pc + 1) == code_.argumentsSlot)
+                return false;
+            if (op == Op::GetLocal && readOperand(code_.code, pc + 1) == code_.argumentsSlot &&
+                (next >= code_.code.size() || Op(code_.code[next]) != Op::Call))
+                return false;
+            pc = next;
+        }
+        return true;
     }
 
     bool readsThis() const
@@ -1340,7 +1365,14 @@ private:
         info->values.reserve(2 * locals + info->stack);
         for (std::uint32_t slot = 0; slot < locals; ++slot) {
             DeoptValue v;
-            if (isNumberLocal(slot)) {
+            if (argsLazy_ && slot == code_.argumentsSlot) {
+                v.form = DeoptValue::Arguments;
+                v.tag = std::uint8_t(Type::Object);
+                v.owned = 1;
+                v.tagAt = -1;
+                v.payloadAt = at(argsReg_);
+                v.bits = std::uint64_t(at(argcReg_));
+            } else if (isNumberLocal(slot)) {
                 v.tag = std::uint8_t(Type::Double);
                 v.form = isIntLocal(slot) ? DeoptValue::Int64 : DeoptValue::FpBits;
                 v.payloadAt = at(localReg_[slot]);
@@ -1359,7 +1391,13 @@ private:
         }
         const auto put = [&](const Entry& e) {
             DeoptValue v;
-            if (e.rep != Rep::Tagged) {
+            if (e.lazyArgs) {
+                v.form = DeoptValue::Arguments;
+                v.tag = std::uint8_t(Type::Object);
+                v.owned = 1;
+                v.payloadAt = at(argsReg_);
+                v.bits = std::uint64_t(at(argcReg_));
+            } else if (e.rep != Rep::Tagged) {
                 v.tag = std::uint8_t(Type::Double);
                 if (e.isConst) {
                     v.form = DeoptValue::Constant;
@@ -1967,6 +2005,12 @@ private:
             }
             case Op::GetLocal: {
                 const std::uint32_t slot = operand();
+                if (argsLazy_ && slot == code_.argumentsSlot) {
+                    Entry e = constTagged(Type::Undefined);
+                    e.lazyArgs = true;
+                    push(e);
+                    return true;
+                }
                 if (isNumberLocal(slot)) {
                     Entry e = isIntLocal(slot) ? intEntry(localReg_[slot], true) : doubleEntry(localReg_[slot]);
                     e.local = std::int32_t(slot);
@@ -3749,12 +3793,21 @@ private:
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t generic = newLabel();
         const std::int32_t finished = newLabel();
-        bool inlined = intrinsic(callee, self, args, r, t, generic);
-        if (!inlined)
+        const bool lazy = !args.empty() && args.back().lazyArgs;
+        bool inlined = lazy ? forwardArguments(callee, self, args, r, t, generic, held) : intrinsic(callee, self, args, r, t, generic);
+        if (!inlined && !lazy)
             inlined = inlineCall(callee, self, args, held, r, t, generic, finished);
         if (inlined) {
             inst(IrOp::Br).imm = finished;
             inst(IrOp::Label).imm = generic;
+        }
+        // Anything but the call it was kept for wants the array after all.
+        Entry made;
+        if (lazy) {
+            const std::int32_t array = callCold(reinterpret_cast<void*>(&scriptDynArgsArray), {rtReg(), argsReg_, argcReg_, immReg(0)}, true);
+            made = objectEntry(array);
+            args.back() = made;
+            held.push_back(made);
         }
         const std::int32_t area = layOutArgs(args);
         const std::int32_t selfTag = tagReg(self);
@@ -3763,6 +3816,10 @@ private:
         const std::int32_t fnPayload = payloadReg(callee);
         const std::int32_t count = immReg(std::int64_t(argc));
         invoke(fnTag, fnPayload, selfTag, selfPayload, area, count, r, t, held, known);
+        if (lazy) {
+            release(made);
+            args.back() = constTagged(Type::Undefined);
+        }
         if (inlined)
             inst(IrOp::Label).imm = finished;
         for (const Entry& arg : args)
@@ -3770,6 +3827,27 @@ private:
         release(self);
         release(callee);
         push(taggedEntry(r, t, Own::Owned));
+    }
+
+    /// `f.apply(x, arguments)`: `f` called on this call's own arguments as they are, with no array between. True with the
+    /// call emitted, its way out for anything else being `generic`.
+    bool forwardArguments(const Entry& callee, const Entry& self, const std::vector<Entry>& args, std::int32_t r, std::int32_t t,
+                          std::int32_t generic, const std::vector<Entry>& held)
+    {
+        GCObject* apply = rt_.intrinsics[Runtime::FunctionApply].get();
+        if (callee.hint != apply || callee.rep != Rep::Tagged || callee.isConst || args.size() != 2)
+            return false;
+        if (!callee.hasKnownTag)
+            branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+        const std::int32_t want = ptrReg(apply);
+        IrInst& same = inst(IrOp::BrCmp);
+        same.a = callee.r;
+        same.b = want;
+        same.cond = IrCond::Ne;
+        same.width = 64;
+        same.target = generic;
+        invoke(tagReg(self), payloadReg(self), tagReg(args[0]), payloadReg(args[0]), argsReg_, argcReg_, r, t, held);
+        return true;
     }
 
     /// The function a pinned callee is.
@@ -5270,6 +5348,9 @@ private:
     bool epochKnown_ = false;
     std::vector<std::int32_t> knownArrays_;
     bool intWork_ = false;
+    bool argsLazy_ = false;
+    std::int32_t argsReg_ = -1;
+    std::int32_t argcReg_ = -1;
     bool globalsScanned_ = false;
     std::vector<const GCObject*> assignedGlobals_;
     /// `this` has been checked to be a `DynObject`.

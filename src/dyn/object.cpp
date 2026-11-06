@@ -430,6 +430,8 @@ std::size_t hashValue(const Value& v) noexcept
                 return 0x7ff80000;
             std::uint64_t bits = 0;
             std::memcpy(&bits, &d, sizeof bits);
+            // Whole numbers differ in the top of the mantissa only, and the table goes by the low bits.
+            bits *= 0x9E3779B97F4A7C15ull;
             return std::size_t(bits ^ (bits >> 32));
         }
         case Type::String:

@@ -102,6 +102,8 @@ struct Entry
     double number = 0;    ///< constant double or int
     std::uint64_t bits = 0;  ///< constant payload
     std::int32_t local = -1;
+    /// The object this was when the code was compiled, when that is known: a hint, never relied on unguarded.
+    const GCObject* hint = nullptr;
 };
 
 /// How many 32-bit operands follow an opcode.
@@ -1406,6 +1408,16 @@ private:
                 push(taggedEntry(r, t, Own::Owned));
                 return true;
             }
+            case Op::GetSuper: {
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t k = ptrReg(code_.atoms[operand()].get());
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynGetSuper), {rt, fnReg_, thisTag_, thisReg_, k}, r, t, true);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
             case Op::Closure: closure(operand()); return true;
             case Op::Call: call(operand()); return true;
             case Op::New: construct(operand()); return true;
@@ -1811,11 +1823,15 @@ private:
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;
-        push(taggedEntry(r, t, Own::Weak));
+        Entry result = taggedEntry(r, t, Own::Weak);
+        if (found && !found->accessor() && found->value.isObject())
+            result.hint = detail::Access::ptr(found->value);
+        push(result);
     }
 
     /// Guards that the value is a `DynObject` with this shape: anything else goes to `slow`.
-    void guardShape(const Entry& base, const Shape* shape, std::int32_t slow)
+    /// The shape of a value that has to be a `DynObject`: anything else goes to `slow`.
+    std::int32_t shapeOf(const Entry& base, std::int32_t slow)
     {
         if (!base.hasKnownTag)
             branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
@@ -1823,7 +1839,33 @@ private:
             inst(IrOp::Br).imm = slow;
         const std::int32_t kind = load(base.r, kCellKindOffset, 1);
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t have = load(base.r, kShapeOffset, 8);
+        return load(base.r, kShapeOffset, 8);
+    }
+
+    /// Branches to one label per shape the site knows a plain own property for, or to `slow`; gives each label's index.
+    std::vector<std::pair<std::int32_t, std::uint32_t>> dispatchShapes(const Entry& base, const PropertySite* site, std::int32_t slow)
+    {
+        const std::int32_t have = shapeOf(base, slow);
+        std::vector<std::pair<std::int32_t, std::uint32_t>> cases;
+        cases.push_back({newLabel(), site->index});
+        for (std::uint8_t i = 0; i < site->moreCount; ++i)
+            cases.push_back({newLabel(), site->moreIndex[i]});
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            const std::int32_t want = ptrReg(i == 0 ? site->shape : site->moreShape[i - 1]);
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = have;
+            test.b = want;
+            test.cond = IrCond::Eq;
+            test.width = 64;
+            test.target = cases[i].first;
+        }
+        inst(IrOp::Br).imm = slow;
+        return cases;
+    }
+
+    void guardShape(const Entry& base, const Shape* shape, std::int32_t slow)
+    {
+        const std::int32_t have = shapeOf(base, slow);
         const std::int32_t want = ptrReg(shape);
         IrInst& test = inst(IrOp::BrCmp);
         test.a = have;
@@ -1875,7 +1917,26 @@ private:
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
         const bool usable = site && (!site->holder || site->epoch == rt_.ctx.protoEpoch);
-        if (usable) {
+        if (usable && site->getter) {
+            getterProp(base, site, operand, keepBase);
+            return;
+        }
+        if (usable && site->moreCount) {
+            for (const auto& [label, index] : dispatchShapes(base, site, slow)) {
+                inst(IrOp::Label).imm = label;
+                const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
+                const std::int32_t props = load(base.r, kPropsOffset, 8);
+                const std::int32_t lt = load(props, at + kPropValueOffset, 1);
+                const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+                IrInst& mt = inst(IrOp::Mov);
+                mt.d = t;
+                mt.a = lt;
+                IrInst& mr = inst(IrOp::Mov);
+                mr.d = r;
+                mr.a = lr;
+                inst(IrOp::Br).imm = done;
+            }
+        } else if (usable) {
             guardShape(base, site->shape, slow);
             std::int32_t holder = base.r;
             if (site->holder) {
@@ -1905,6 +1966,12 @@ private:
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;
         Entry result = taggedEntry(r, t, Own::Weak);
+        if (usable && !site->holder && !site->moreCount && base.hint) {
+            const auto* known = static_cast<const DynObject*>(base.hint);
+            if (known->kind == CellKind::Object && known->shape == site->shape && site->index < known->props.size() &&
+                known->props[site->index].value.isObject())
+                result.hint = detail::Access::ptr(known->props[site->index].value);
+        }
         if (keepBase) {
             // func obj: the function under the receiver.
             push(result);
@@ -1936,7 +2003,19 @@ private:
         const PropertySite* site = siteAt(operand);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
-        if (site && !site->addTo) {
+        if (site && !site->addTo && site->moreCount) {
+            for (const auto& [label, index] : dispatchShapes(base, site, slow)) {
+                inst(IrOp::Label).imm = label;
+                const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
+                const std::int32_t props = load(base.r, kPropsOffset, 8);
+                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
+                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
+                store(props, at + kPropValueOffset, vt, 1);
+                store(props, at + kPropValueOffset + kPayload, vr, 8);
+                decRefOf(old, oldTag, false);
+                inst(IrOp::Br).imm = done;
+            }
+        } else if (site && !site->addTo) {
             // A write to a property the shape says is there and writable: what was there loses its count after.
             guardShape(base, site->shape, slow);
             const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
@@ -1999,11 +2078,16 @@ private:
         if (isKnownNumber(key)) {
             fp = doubleReg(key);
         } else {
-            branchCmp(key.t, IrCond::Ne, std::int64_t(Type::Double), slow);
+            // A key whose tag is known and not a number has nothing to test: it goes the long way.
+            if (key.hasKnownTag || key.isConst || key.rep != Rep::Tagged)
+                inst(IrOp::Br).imm = slow;
+            else
+                branchCmp(key.t, IrCond::Ne, std::int64_t(Type::Double), slow);
+            const std::int32_t keyBits = payloadReg(key);
             fp = fn_.newVreg(true);
             IrInst& bits = inst(IrOp::BitsToFp);
             bits.d = fp;
-            bits.a = key.r;
+            bits.a = keyBits;
             bits.width = 64;
         }
         const std::int32_t i = fn_.newVreg(false);
@@ -2277,15 +2361,35 @@ private:
         held.push_back(self);
         held.push_back(callee);
 
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        const std::int32_t generic = newLabel();
+        const std::int32_t finished = newLabel();
+        const bool inlined = argc == 1 && mathInline(callee, args[0], r, t, generic);
+        if (inlined) {
+            inst(IrOp::Br).imm = finished;
+            inst(IrOp::Label).imm = generic;
+        }
         const std::int32_t area = layOutArgs(args);
         const std::int32_t selfTag = tagReg(self);
         const std::int32_t selfPayload = payloadReg(self);
         const std::int32_t fnTag = tagReg(callee);
         const std::int32_t fnPayload = payloadReg(callee);
         const std::int32_t count = immReg(std::int64_t(argc));
+        invoke(fnTag, fnPayload, selfTag, selfPayload, area, count, r, t, held);
+        if (inlined)
+            inst(IrOp::Label).imm = finished;
+        for (const Entry& arg : args)
+            release(arg);
+        release(self);
+        release(callee);
+        push(taggedEntry(r, t, Own::Owned));
+    }
 
-        const std::int32_t r = fn_.newVreg(false);
-        const std::int32_t t = fn_.newVreg(false);
+    /// Calls a function value: straight into its native code when it has some, through the runtime otherwise.
+    void invoke(std::int32_t fnTag, std::int32_t fnPayload, std::int32_t selfTag, std::int32_t selfPayload, std::int32_t area,
+                std::int32_t count, std::int32_t r, std::int32_t t, const std::vector<Entry>& held)
+    {
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
         // A function compiled to native code is called directly; anything else takes the long way.
@@ -2330,11 +2434,88 @@ private:
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;
-        for (const Entry& arg : args)
-            release(arg);
-        release(self);
-        release(callee);
-        push(taggedEntry(r, t, Own::Owned));
+    }
+
+    /// `Math.sqrt(x)` and its kind, computed in place when the callee is the built-in it was when compiled and the
+    /// argument a number. Anything else goes to `generic`.
+    bool mathInline(const Entry& callee, const Entry& arg, std::int32_t r, std::int32_t t, std::int32_t generic)
+    {
+        static constexpr IrOp kOps[] = {IrOp::FSqrt, IrOp::FAbs, IrOp::FFloor, IrOp::FCeil, IrOp::FTrunc};
+        if (!callee.hint || callee.rep != Rep::Tagged || callee.isConst)
+            return false;
+        int which = -1;
+        for (int i = 0; i < 5; ++i) {
+            if (rt_.mathInline[i].get() == callee.hint)
+                which = i;
+        }
+        if (which < 0)
+            return false;
+        if (!callee.hasKnownTag)
+            branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+        const std::int32_t want = ptrReg(callee.hint);
+        IrInst& same = inst(IrOp::BrCmp);
+        same.a = callee.r;
+        same.b = want;
+        same.cond = IrCond::Ne;
+        same.width = 64;
+        same.target = generic;
+        if (!isKnownNumber(arg))
+            branchCmp(tagReg(arg), IrCond::Ne, std::int64_t(Type::Double), generic);
+        const std::int32_t x = doubleReg(arg);
+        const std::int32_t d = fn_.newVreg(true);
+        IrInst& op = inst(kOps[which]);
+        op.d = d;
+        op.a = x;
+        op.width = 64;
+        IrInst& bits = inst(IrOp::FpToBits);
+        bits.d = r;
+        bits.a = d;
+        bits.width = 64;
+        IrInst& tag = inst(IrOp::MovImm);
+        tag.d = t;
+        tag.imm = std::int64_t(Type::Double);
+        return true;
+    }
+
+    /// A read the site says goes to a getter on the prototype chain: called with the receiver, the result owned.
+    void getterProp(Entry base, const PropertySite* site, std::uint32_t operand, bool keepBase)
+    {
+        if (base.own == Own::Weak)
+            makeOwned(base);
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        guardShape(base, site->shape, slow);
+        guardEpoch(site->epoch, slow);
+        const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
+        const std::int32_t props = load(ptrReg(site->holder), kPropsOffset, 8);
+        const std::int32_t ft = load(props, at + kPropValueOffset, 1);
+        const std::int32_t fr = load(props, at + kPropValueOffset + kPayload, 8);
+        // The getter keeps a count of its own while it runs: it could take itself off the prototype.
+        incRefOf(fr, ft, false);
+        Entry getter = taggedEntry(fr, ft, Own::Owned);
+        std::vector<Entry> none;
+        const std::int32_t area = layOutArgs(none);
+        invoke(ft, fr, tagReg(base), base.r, area, immReg(0), r, t, {base, getter});
+        decRefOf(fr, ft, false);
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        const std::int32_t rt = rtReg();
+        coldCall(reinterpret_cast<void*>(&scriptDynGetProp), {rt, ptrReg(&code_), tagReg(base), base.r, immReg(std::int64_t(operand))},
+                 r, t, true, {base});
+        incRefOf(r, t, false);
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        Entry result = taggedEntry(r, t, Own::Owned);
+        push(result);
+        // func obj, for a method call: the function under the receiver.
+        if (keepBase)
+            push(base);
+        else
+            release(base);
     }
 
     void construct(std::uint32_t argc)

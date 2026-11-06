@@ -198,6 +198,33 @@ struct PropertySite
     std::uint64_t epoch = 0;    ///< `protoEpoch` when `holder` or `addTo` was worked out
     std::uint32_t index = 0;    ///< position in the property table
     std::uint32_t misses = 0;
+    /// The property is a getter, to call with the receiver; `holder` and `index` say where it is.
+    bool getter = false;
+    /// Further receiver shapes a plain own-property read or write has met, each with where the property is in that one.
+    static constexpr std::uint8_t kMoreShapes = 3;
+    std::uint8_t moreCount = 0;
+    Shape* moreShape[kMoreShapes] = {};
+    std::uint32_t moreIndex[kMoreShapes] = {};
+
+    /// A plain own property, in one of the shapes beyond the first: its position, or -1.
+    std::int64_t moreAt(const Shape* s) const noexcept
+    {
+        for (std::uint8_t i = 0; i < moreCount; ++i) {
+            if (moreShape[i] == s)
+                return moreIndex[i];
+        }
+        return -1;
+    }
+    bool plainOwn() const noexcept { return shape && !holder && !addTo && !getter; }
+    /// Learn one more shape for a plain own property, while there is room.
+    void addShape(Shape* s, std::uint32_t at) noexcept
+    {
+        if (s == shape || moreAt(s) >= 0 || moreCount == kMoreShapes)
+            return;
+        moreShape[moreCount] = s;
+        moreIndex[moreCount] = at;
+        ++moreCount;
+    }
 };
 
 /// A property operand: the atom in the low bits, the site above them. A function with more sites than fit shares the last

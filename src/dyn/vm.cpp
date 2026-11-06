@@ -526,13 +526,32 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
         const Prop* p = cursor->findOwn(key);
         if (!p)
             continue;
-        if (p->accessor())
-            break;
+        const std::uint32_t at = std::uint32_t(p - cursor->props.data());
+        if (p->accessor()) {
+            // A getter that is a function, called with the receiver each time; the property itself stays put.
+            if (!p->value.isObject() || cursor == obj)
+                break;
+            site->shape = obj->shape;
+            site->holder = cursor;
+            site->addTo = nullptr;
+            site->getter = true;
+            site->index = at;
+            site->epoch = rt.ctx.protoEpoch;
+            site->moreCount = 0;
+            const Value getter = p->value;
+            return callValue(rt, getter, base, {});
+        }
+        if (cursor == obj && site->plainOwn()) {
+            site->addShape(obj->shape, at);
+            return p->value;
+        }
         site->shape = obj->shape;
         site->holder = cursor == obj ? nullptr : cursor;
         site->addTo = nullptr;
-        site->index = std::uint32_t(p - cursor->props.data());
+        site->getter = false;
+        site->index = at;
         site->epoch = rt.ctx.protoEpoch;
+        site->moreCount = 0;
         return p->value;
     }
     ++site->misses;
@@ -548,8 +567,17 @@ inline Value getPropertySite(Runtime& rt, const FunctionCode& code, const Value&
         if (obj->shape && obj->shape == site->shape) {
             if (!site->holder)
                 return obj->props[site->index].value;
-            if (site->epoch == rt.ctx.protoEpoch)
+            if (site->epoch == rt.ctx.protoEpoch) {
+                if (site->getter) {
+                    const Value getter = site->holder->props[site->index].value;
+                    return callValue(rt, getter, base, {});
+                }
                 return site->holder->props[site->index].value;
+            }
+        } else if (obj->shape && site->moreCount) {
+            const std::int64_t at = site->moreAt(obj->shape);
+            if (at >= 0)
+                return obj->props[std::size_t(at)].value;
         }
     }
     return getPropertyLearning(rt, base, key, site);
@@ -566,6 +594,13 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
     }
     if (const Prop* own = obj->findOwn(key)) {
         if ((own->attrs & (PropAccessor | PropWritable)) == PropWritable) {
+            if (site->plainOwn()) {
+                site->addShape(before, std::uint32_t(own - obj->props.data()));
+                setProperty(rt, base, key, v);
+                return;
+            }
+            site->getter = false;
+            site->moreCount = 0;
             site->shape = before;
             site->holder = nullptr;
             site->addTo = nullptr;
@@ -581,6 +616,8 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
     if (obj->shape && obj->shape != before && obj->props.size() == count + 1 && obj->props.back().attrs == PropDefault) {
         site->shape = before;
         site->holder = nullptr;
+        site->getter = false;
+        site->moreCount = 0;
         site->addTo = obj->shape;
         site->epoch = rt.ctx.protoEpoch;
     }
@@ -600,6 +637,12 @@ inline void setPropertySite(Runtime& rt, const FunctionCode& code, const Value& 
             }
             if (site->epoch == rt.ctx.protoEpoch) {
                 obj->appendKnown(key, v, site->addTo);
+                return;
+            }
+        } else if (obj->shape && site->moreCount) {
+            const std::int64_t at = site->moreAt(obj->shape);
+            if (at >= 0) {
+                obj->props[std::size_t(at)].value = v;
                 return;
             }
         }

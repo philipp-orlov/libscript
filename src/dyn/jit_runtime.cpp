@@ -464,6 +464,17 @@ NativePair scriptDynForInNext(Runtime* rt, GCObject* keys, std::int64_t indexTag
     return take(array->elements[at]);
 }
 
+NativePair scriptDynGetSuper(Runtime* rt, GCObject* fn, std::int64_t thisTag, std::uint64_t self, GCObject* key) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        DynObject* home = static_cast<DynFunction*>(fn)->homeObject.get();
+        DynObject* base = home ? home->proto.get() : nullptr;
+        if (!base)
+            throwError(*rt, ErrorCode::TypeError, "'super' has no base object");
+        return take(getPropertyOfObject(*rt, base, key, valueOf(thisTag, self)));
+    });
+}
+
 NativePair scriptDynToObject(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(toObject(*rt, valueOf(tag, payload))); });

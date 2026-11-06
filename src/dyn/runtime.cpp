@@ -159,6 +159,30 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     sym.hasInstance.reset(wellKnown("Symbol.hasInstance"), true);
 
     installBuiltins(*this);
+    // What was built before this runtime could hand out shapes gets them now, so sites can learn reads from Math, JSON,
+    // the constructors and their prototypes.
+    for (const Prop& p : globalObject->props) {
+        DynObject* o = p.accessor() ? nullptr : asObject(p.value);
+        if (!o)
+            continue;
+        giveShape(o);
+        if (const Prop* proto = o->findOwn(atom.prototype.get()); proto && !proto->accessor())
+            if (DynObject* po = asObject(proto->value))
+                giveShape(po);
+    }
+}
+
+void Runtime::giveShape(DynObject* o)
+{
+    if (o->shape)
+        return;
+    Shape* s = rootShapeFor(o->proto.get());
+    for (const Prop& p : o->props) {
+        if (!s)
+            return;
+        s = shapeAfter(s, p.key.get(), p.attrs);
+    }
+    o->shape = s;
 }
 
 Runtime::~Runtime() = default;

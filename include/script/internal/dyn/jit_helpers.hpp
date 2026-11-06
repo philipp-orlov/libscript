@@ -83,6 +83,7 @@ GCObject* scriptDynForInKeys(Runtime* rt, std::int64_t tag, std::uint64_t payloa
 /// The tag says the keys ran out.
 inline constexpr std::int64_t kForInDone = -1;
 NativePair scriptDynForInNext(Runtime* rt, GCObject* keys, std::int64_t indexTag, std::uint64_t index) noexcept;
+NativePair scriptDynGetSuper(Runtime* rt, GCObject* fn, std::int64_t thisTag, std::uint64_t self, GCObject* key) noexcept;
 NativePair scriptDynToObject(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 
 }  // extern "C"

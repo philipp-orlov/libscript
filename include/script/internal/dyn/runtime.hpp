@@ -100,6 +100,9 @@ struct Runtime : EngineRuntime
 
     // ---- intrinsics ----
     Ref<DynObject> globalObject;
+    /// The Math functions native code computes inline, held so the ones it compares a callee against stay alive:
+    /// sqrt, abs, floor, ceil, trunc.
+    Ref<GCObject> mathInline[5];
     Ref<DynObject> objectProto, functionProto, arrayProto, stringProto, numberProto, booleanProto,
         symbolProto, errorProto, dateProto, mapProto, setProto, promiseProto, iteratorProto,
         arrayIteratorProto;
@@ -148,6 +151,8 @@ struct Runtime : EngineRuntime
     std::size_t runJobs();
 
     // ---- allocation helpers ----
+    /// A shape for an object made without one, when its properties fit.
+    void giveShape(DynObject* o);
     /// `newObject` with room for this many properties already there.
     DynObject* newObjectSized(DynObject* proto, std::uint32_t room);
     DynObject* newObject(DynObject* proto = nullptr);

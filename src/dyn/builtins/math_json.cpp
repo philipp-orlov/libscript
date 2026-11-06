@@ -194,6 +194,9 @@ void installMath(Runtime& rt)
     unary("ceil", [](double d) { return std::ceil(d); });
     unary("trunc", [](double d) { return std::trunc(d); });
     unary("sqrt", [](double d) { return std::sqrt(d); });
+    const char* inlined[] = {"sqrt", "abs", "floor", "ceil", "trunc"};
+    for (int i = 0; i < 5; ++i)
+        rt.mathInline[i].reset(detail::Access::ptr(math->findOwn(rt.intern(inlined[i]))->value));
     unary("cbrt", [](double d) { return std::cbrt(d); });
     unary("exp", [](double d) { return std::exp(d); });
     unary("expm1", [](double d) { return std::expm1(d); });

@@ -98,11 +98,11 @@ compiler that leans on what the interpreter has learnt, with no speculation it w
 * **Numbers** live unboxed in locals that are never seen to hold anything else; a store of anything else lowers the
   function again with that local tagged. A `var` declared without a value counts as unwritten, so it does not lose this.
 * **Calls** to a function with native code go straight to it; `new` gets its object inline and calls the constructor the
-  same way. Built-ins that call back into script -- `forEach`, `map`, `filter`, `reduce`, `sort` -- enter compiled
+  same way, and `f.apply(thisArg, arguments)` passes the array's elements without copying them. Built-ins that call back into script -- `forEach`, `map`, `filter`, `reduce`, `sort` -- enter compiled
   callbacks directly too (`CallbackLoop`).
 * **Built-ins done in place**, when the callee is still the built-in it was when compiled: `Math.sqrt`, `abs`, `floor`,
   `ceil`, `trunc`, `Array.prototype.push` and `pop`, `String.prototype.charCodeAt`, `String.fromCharCode`, and the
-  `length` of an array or a string.
+  `length` of an array or a string. Object literals lay their plain keys straight into the table.
 * **Strings**: `s += x` on a local that nothing else holds grows the string in its own cell, with room to spare.
 
 It refuses a function with exception handlers or a `finally`, which keeps running in the interpreter. `--dump-native` lists what it skipped. Every hot function of the eight Octane benchmarks that run compiles.
@@ -113,24 +113,24 @@ Measured the same way as the table above, against JavaScriptCore running identic
 | --- | ---: | ---: | ---: | ---: |
 | `int_loop` | 3.550 | 0.118 | 0.056 | 1.043 |
 | `float_mandel` | 0.479 | 0.029 | 0.015 | 0.100 |
-| `fib_calls` | 2.147 | 0.117 | 0.057 | 0.633 |
+| `fib_calls` | 2.147 | 0.123 | 0.057 | 0.633 |
 | `prop_rw` | 1.394 | 0.053 | 0.021 | 0.259 |
-| `method_call` | 1.217 | 0.078 | 0.062 | 1.072 |
+| `method_call` | 1.217 | 0.077 | 0.062 | 1.072 |
 | `poly_prop` | 2.114 | 0.093 | 0.025 | 0.767 |
 | `closure` | 1.609 | 0.098 | 0.028 | 0.540 |
 | `nbody` | 4.140 | 0.164 | 0.040 | 0.820 |
-| `sieve_array` | 8.778 | 0.166 | 0.063 | 0.298 |
-| `array_push_hof` | 0.241 | 0.082 | 0.025 | 0.159 |
-| `sort_cmp` | 0.585 | 0.159 | 0.077 | 0.178 |
-| `alloc_small` | 1.154 | 0.323 | 0.098 | 0.398 |
-| `tree_gc` | 2.816 | 0.503 | 0.108 | 0.849 |
+| `sieve_array` | 8.778 | 0.163 | 0.063 | 0.298 |
+| `array_push_hof` | 0.241 | 0.081 | 0.025 | 0.159 |
+| `sort_cmp` | 0.585 | 0.157 | 0.077 | 0.178 |
+| `alloc_small` | 1.154 | 0.222 | 0.098 | 0.398 |
+| `tree_gc` | 2.816 | 0.472 | 0.108 | 0.849 |
 | `string_ops` | 0.965 | 0.106 | 0.052 | 0.345 |
-| `json_rt` | 0.233 | 0.203 | 0.103 | 0.105 |
-| `map_dict` | 0.968 | 0.585 | 0.412 | 0.553 |
+| `json_rt` | 0.233 | 0.205 | 0.103 | 0.105 |
+| `map_dict` | 0.968 | 0.580 | 0.412 | 0.553 |
 
-That is 2.5x JSC's time overall and 0.34x the time of JSC with its JIT off; JSC's optimizing tiers are still ahead on
-every kernel. On Octane the gap is 16x (it was 125x before any native code), with `raytrace` and `earley-boyer` furthest
-behind, at 46x and 39x.
+That is 2.4x JSC's time overall and 0.33x the time of JSC with its JIT off; JSC's optimizing tiers are still ahead on
+every kernel. On Octane the gap is 14x (it was 125x before any native code), with `earley-boyer` and `raytrace` furthest
+behind, at 32x and 27x.
 
 `tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several
 thresholds.

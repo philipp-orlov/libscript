@@ -360,6 +360,174 @@ public:
         }
     }
 
+    /// A callee inlined at a call in `parent`: nothing assumed, so nothing to bail, and no number locals.
+    Lowering(const Lowering& parent, const FunctionCode& callee, const std::vector<std::uint8_t>& none,
+             const std::vector<Entry>& held, std::int32_t site)
+        : rt_(parent.rt_), code_(callee), fn_(parent.fn_), notNumber_(none), notInt_(none)
+    {
+        parent_ = &parent;
+        parentHeld_ = &held;
+        parentSite_ = site;
+        depth_ = parent.depth_ + 1;
+    }
+
+    /// The body with `self` as this and `args` as the parameters, all borrowed from the caller, whose result ends up in
+    /// `r` and `t` with a count of its own, and which then goes to `done`.
+    void runInline(const DynFunction* target, const Entry& self, const std::vector<Entry>& args, std::int32_t r,
+                   std::int32_t t, std::int32_t done)
+    {
+        speculate_ = parent_->speculate_ && (2 * code_.numLocals + code_.maxStack) * 16 < 4000;
+        prepare();
+        inlineDone_ = done;
+        inlineR_ = r;
+        inlineT_ = t;
+        fnReg_ = ptrReg(target);
+        thisTag_ = tagReg(self);
+        thisReg_ = payloadReg(self);
+        const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
+        const std::uint32_t slots = code_.numLocals;
+        localReg_.assign(slots, -1);
+        localTag_.assign(slots, -1);
+        localOwned_.assign(slots, 0);
+        cellReg_.assign(slots, -1);
+        cellOwned_.assign(slots, 0);
+        numberParam_.assign(slots, 0);
+        for (std::uint32_t slot = 0; slot < slots; ++slot) {
+            localReg_[slot] = fn_.newVreg(false);
+            localTag_[slot] = fn_.newVreg(false);
+            std::int32_t tag = -1, payload = -1;
+            if (slot < arity && slot < args.size()) {
+                tag = tagReg(args[slot]);
+                payload = payloadReg(args[slot]);
+            }
+            if (tag < 0) {
+                IrInst& t0 = inst(IrOp::MovImm);
+                t0.d = localTag_[slot];
+                t0.imm = std::int64_t(Type::Undefined);
+                IrInst& p0 = inst(IrOp::MovImm);
+                p0.d = localReg_[slot];
+                p0.imm = 0;
+                localOwned_[slot] = 1;
+                continue;
+            }
+            IrInst& mt = inst(IrOp::Mov);
+            mt.d = localTag_[slot];
+            mt.a = tag;
+            IrInst& mp = inst(IrOp::Mov);
+            mp.d = localReg_[slot];
+            mp.a = payload;
+            if (assigned_[slot]) {
+                incRefOf(localReg_[slot], localTag_[slot], false);
+                localOwned_[slot] = 1;
+            }
+        }
+        for (std::uint32_t slot = 0; slot < slots; ++slot) {
+            cellReg_[slot] = fn_.newVreg(false);
+            IrInst& none = inst(IrOp::MovImm);
+            none.d = cellReg_[slot];
+            none.imm = 0;
+            cellOwned_[slot] = 1;
+        }
+        walk();
+    }
+
+    /// Small enough, simple enough, and loop-free: what a call may do in place of calling.
+    static bool inlinable(const FunctionCode& c)
+    {
+        if (c.code.size() > 160 || !c.handlers.empty() || c.hasRest || c.argumentsSlot != FunctionCode::kNoSlot ||
+            c.isClassConstructor || c.isDerivedConstructor || c.numLocals > 8 || !c.boxedParams.empty())
+            return false;
+        bool returns = false;
+        for (std::uint32_t pc = 0; pc < c.code.size();) {
+            const Op op = Op(c.code[pc]);
+            switch (op) {
+                case Op::Closure:
+                case Op::GetUpval:
+                case Op::SetUpval:
+                case Op::GetCell:
+                case Op::SetCell:
+                case Op::NewCell:
+                case Op::RenewCell:
+                case Op::PushCallee:
+                case Op::GetSuper:
+                case Op::SetSuper:
+                case Op::CallSuper:
+                case Op::New:
+                case Op::JumpSub:
+                case Op::ForInStart:
+                case Op::ForInNext:
+                case Op::IterNext: return false;
+                case Op::Return:
+                case Op::ReturnUndefined: returns = true; break;
+                default: break;
+            }
+            if (isBranch(op) && readOperand(c.code, pc + 1) <= pc)
+                return false;
+            pc += 1 + std::uint32_t(operandsOf(op)) * 4;
+        }
+        return returns;
+    }
+
+    /// Where an inlined lowering refused, everything it emitted goes.
+    struct Mark
+    {
+        std::size_t code, calls, exits, sites, vregs;
+        std::int32_t labels;
+    };
+    Mark mark() const
+    {
+        return {fn_.code.size(), fn_.calls.size(), fn_.exits.size(), fn_.sites.size(), fn_.vregIsFp.size(), fn_.labelCount};
+    }
+    void rollBack(const Mark& m)
+    {
+        fn_.code.resize(m.code);
+        fn_.calls.resize(m.calls);
+        fn_.exits.resize(m.exits);
+        fn_.sites.resize(m.sites);
+        fn_.vregIsFp.resize(m.vregs);
+        fn_.labelCount = m.labels;
+    }
+
+    /// The callee's body in place of the call, when the callee is the function it was when this was compiled and that
+    /// one is `inlinable`; anything else goes to `generic`. True when the body is there, ending in a branch to `done`.
+    bool inlineCall(const Entry& callee, const Entry& self, const std::vector<Entry>& args, const std::vector<Entry>& held,
+                    std::int32_t r, std::int32_t t, std::int32_t generic, std::int32_t done)
+    {
+        if (depth_ >= 2 || !callee.hint || callee.rep != Rep::Tagged || callee.isConst)
+            return false;
+        const auto* target = static_cast<const DynObject*>(callee.hint);
+        if (target->kind != CellKind::Object || target->cls != ObjClass::Function)
+            return false;
+        const auto* fn = static_cast<const DynFunction*>(target);
+        if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isClassConstructor || !inlinable(*fn->code))
+            return false;
+        for (const Lowering* up = this; up; up = up->parent_) {
+            if (&up->code_ == fn->code.get())
+                return false;
+        }
+        const Mark before = mark();
+        const std::int32_t at = site();
+        if (!callee.hasKnownTag)
+            branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+        const std::int32_t want = ptrReg(fn);
+        IrInst& same = inst(IrOp::BrCmp);
+        same.a = callee.r;
+        same.b = want;
+        same.cond = IrCond::Ne;
+        same.width = 64;
+        same.target = generic;
+        const std::vector<std::uint8_t> none(fn->code->numLocals + 1, 1);
+        try {
+            Lowering inner(*this, *fn->code, none, held, at);
+            inner.runInline(fn, self, args, r, t, done);
+        } catch (const Refuse&) {
+            rollBack(before);
+            return false;
+        }
+        ++fn_.inlinedMethods;
+        return true;
+    }
+
 private:
     // ---- small things ----
     IrInst& inst(IrOp op)
@@ -476,7 +644,9 @@ private:
         IrSite entry;
         entry.method = &code_;
         entry.pc = pc_;
-        if (!fn_.sites.empty() && fn_.sites.back().pc == pc_)
+        entry.parent = parentSite_;
+        if (!fn_.sites.empty() && fn_.sites.back().pc == pc_ && fn_.sites.back().method == &code_ &&
+            fn_.sites.back().parent == parentSite_)
             return std::int32_t(fn_.sites.size()) - 1;
         fn_.sites.push_back(entry);
         return std::int32_t(fn_.sites.size()) - 1;
@@ -847,9 +1017,36 @@ private:
             add(e);
         for (const Entry& e : popped)
             add(e);
+        // Code inlined into a caller unwinds the caller's frame too.
+        if (parent_)
+            parent_->addCleanup(exit, *parentHeld_);
         fn_.maxCleanup = std::max(fn_.maxCleanup, std::uint32_t(exit.cleanup.size() + exit.cleanupTagged.size()));
         fn_.exits.push_back(std::move(exit));
         return std::int32_t(fn_.exits.size()) - 1;
+    }
+    /// What this frame owns, and `held` besides, for an exit taken from code inlined into it.
+    void addCleanup(IrExit& exit, const std::vector<Entry>& held) const
+    {
+        const auto add = [&exit](const Entry& e) {
+            if (e.own != Own::Owned || e.isConst || e.rep != Rep::Tagged)
+                return;
+            if (e.hasKnownTag)
+                exit.cleanup.push_back(e.r);
+            else
+                exit.cleanupTagged.push_back({e.r, e.t});
+        };
+        for (std::size_t slot = 0; slot < localReg_.size(); ++slot) {
+            if (localOwned_[slot] && localTag_[slot] >= 0)
+                exit.cleanupTagged.push_back({localReg_[slot], localTag_[slot]});
+            if (cellOwned_[slot] && cellReg_[slot] >= 0)
+                exit.cleanup.push_back(cellReg_[slot]);
+        }
+        for (const Entry& e : stack_)
+            add(e);
+        for (const Entry& e : held)
+            add(e);
+        if (parent_)
+            parent_->addCleanup(exit, *parentHeld_);
     }
 
     // ---- bailing out ----
@@ -869,6 +1066,8 @@ private:
         addr.d = header;
         addr.imm = 0;
         store(header, 0, immReg(std::int64_t(pc_) | (std::int64_t(count) << 32)), 8);
+        // The function whose native code this is, which bailing too often throws away: the outermost one.
+        store(header, 8, ptrReg(&outermost()), 8);
         const std::int32_t area = fn_.newVreg(false);
         IrInst& values = inst(IrOp::FrameAddr);
         values.d = area;
@@ -918,6 +1117,10 @@ private:
         const std::int32_t t = fn_.newVreg(false);
         IrExit exit;
         exit.site = site();
+        // Inlined, the interpreter finishes this call alone, and the caller's frame is still ours to unwind.
+        if (parent_)
+            parent_->addCleanup(exit, *parentHeld_);
+        fn_.maxCleanup = std::max(fn_.maxCleanup, std::uint32_t(exit.cleanup.size() + exit.cleanupTagged.size()));
         fn_.exits.push_back(std::move(exit));
         IrCall call;
         call.kind = IrCallKind::Helper;
@@ -931,9 +1134,20 @@ private:
         call.exit = std::int32_t(fn_.exits.size()) - 1;
         fn_.calls.push_back(std::move(call));
         inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
-        IrInst& ret = inst(IrOp::Ret);
-        ret.a = r;
-        ret.b = t;
+        if (inlineDone_ >= 0) {
+            // What the call came to, for the caller to carry on with in native code.
+            IrInst& movTag = inst(IrOp::Mov);
+            movTag.d = inlineT_;
+            movTag.a = t;
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = inlineR_;
+            mov.a = r;
+            inst(IrOp::Br).imm = inlineDone_;
+        } else {
+            IrInst& ret = inst(IrOp::Ret);
+            ret.a = r;
+            ret.b = t;
+        }
         inst(IrOp::ColdEnd);
         // The fast path carries on from here, and nothing worked out in the block above is there for it.
         inst(IrOp::Label).imm = newLabel();
@@ -1010,6 +1224,8 @@ private:
         guardShape(base, shape, bail);
         learnShape(base.r, shape);
     }
+    const FunctionCode& outermost() const noexcept { return parent_ ? parent_->outermost() : code_; }
+
     /// Whether to assume what the interpreter has seen at this instruction: not where that has already been wrong.
     bool betHere() const
     {
@@ -1318,12 +1534,46 @@ private:
         const std::int32_t d = fn_.newVreg(false);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
+        // An object or a symbol is true, undefined and null false, a boolean itself; a number is neither zero nor NaN.
+        // A string and a host's kinds of number ask the helper.
+        static_assert(Type::Undefined < Type::Null && Type::Null < Type::Bool && Type::Symbol < Type::Object, "tag order");
+        IrInst& one = inst(IrOp::MovImm);
+        one.d = d;
+        one.imm = 1;
+        branchCmp(tag, IrCond::Hs, std::int64_t(Type::Symbol), done);
+        IrInst& zero = inst(IrOp::MovImm);
+        zero.d = d;
+        zero.imm = 0;
+        branchCmp(tag, IrCond::Ls, std::int64_t(Type::Null), done);
         IrInst& mov = inst(IrOp::Mov);
         mov.d = d;
         mov.a = e.r;
         branchCmp(tag, IrCond::Ne, std::int64_t(Type::Bool), slow);
         inst(IrOp::ColdBegin);
         inst(IrOp::Label).imm = slow;
+        {
+            const std::int32_t helper = newLabel();
+            branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), helper);
+            const std::int32_t fp = fn_.newVreg(true);
+            IrInst& bits = inst(IrOp::BitsToFp);
+            bits.d = fp;
+            bits.a = e.r;
+            bits.width = 64;
+            const std::int32_t abs = fn_.newVreg(true);
+            IrInst& fabs = inst(IrOp::FAbs);
+            fabs.d = abs;
+            fabs.a = fp;
+            fabs.width = 64;
+            const std::int32_t fzero = fpImm(0.0);
+            IrInst& gt = inst(IrOp::FCset);
+            gt.d = d;
+            gt.a = abs;
+            gt.b = fzero;
+            gt.cond = IrCond::FGt;
+            gt.width = 64;
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::Label).imm = helper;
+        }
         coldCall(reinterpret_cast<void*>(&scriptDynToBoolean), {tag, e.r}, d, -1, false);
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);
@@ -1798,6 +2048,17 @@ private:
                     release(dropped);
                 }
                 releaseLocals(keep);
+                if (inlineDone_ >= 0) {
+                    // Inlined: the caller carries on with the value, and its count.
+                    IrInst& movTag = inst(IrOp::Mov);
+                    movTag.d = inlineT_;
+                    movTag.a = tag;
+                    IrInst& mov = inst(IrOp::Mov);
+                    mov.d = inlineR_;
+                    mov.a = payload;
+                    inst(IrOp::Br).imm = inlineDone_;
+                    return false;
+                }
                 IrInst& ret = inst(IrOp::Ret);
                 ret.a = payload;
                 ret.b = tag;
@@ -2933,7 +3194,9 @@ private:
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t generic = newLabel();
         const std::int32_t finished = newLabel();
-        const bool inlined = intrinsic(callee, self, args, r, t, generic);
+        bool inlined = intrinsic(callee, self, args, r, t, generic);
+        if (!inlined)
+            inlined = inlineCall(callee, self, args, held, r, t, generic, finished);
         if (inlined) {
             inst(IrOp::Br).imm = finished;
             inst(IrOp::Label).imm = generic;
@@ -4028,7 +4291,8 @@ private:
         // Two objects are equal, loosely or strictly, when they are the same object.
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
-        branchCmp(ta, IrCond::Ne, std::int64_t(Type::Object), slow);
+        const std::int32_t notObject = newLabel();
+        branchCmp(ta, IrCond::Ne, std::int64_t(Type::Object), notObject);
         branchCmp(tb, IrCond::Ne, std::int64_t(Type::Object), slow);
         {
             IrInst& same = inst(IrOp::Cset);
@@ -4040,6 +4304,64 @@ private:
         }
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = notObject;
+        {
+            // The same tag, of a kind its bits answer for: numbers by value, booleans by their byte, undefined and null
+            // always. Anything else -- strings, mixed kinds -- the helper.
+            IrInst& sameTag = inst(IrOp::BrCmp);
+            sameTag.a = ta;
+            sameTag.b = tb;
+            sameTag.cond = IrCond::Ne;
+            sameTag.width = 32;
+            sameTag.target = slow;
+            const std::int32_t notDouble = newLabel();
+            branchCmp(ta, IrCond::Ne, std::int64_t(Type::Double), notDouble);
+            const std::int32_t x = fn_.newVreg(true);
+            IrInst& bx = inst(IrOp::BitsToFp);
+            bx.d = x;
+            bx.a = pa;
+            bx.width = 64;
+            const std::int32_t y = fn_.newVreg(true);
+            IrInst& by = inst(IrOp::BitsToFp);
+            by.d = y;
+            by.a = pb;
+            by.width = 64;
+            IrInst& cmp = inst(IrOp::FCset);
+            cmp.d = d;
+            cmp.a = x;
+            cmp.b = y;
+            cmp.cond = wantEqual ? IrCond::FEq : IrCond::FNe;
+            cmp.width = 64;
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::Label).imm = notDouble;
+            const std::int32_t notBool = newLabel();
+            branchCmp(ta, IrCond::Ne, std::int64_t(Type::Bool), notBool);
+            const auto low = [&](std::int32_t v) {
+                const std::int32_t out = fn_.newVreg(false);
+                IrInst& in = inst(IrOp::And);
+                in.d = out;
+                in.a = v;
+                in.hasImm = true;
+                in.imm = 0xff;
+                in.width = 32;
+                return out;
+            };
+            const std::int32_t la = low(pa);
+            const std::int32_t lb = low(pb);
+            IrInst& eq = inst(IrOp::Cset);
+            eq.d = d;
+            eq.a = la;
+            eq.b = lb;
+            eq.cond = wantEqual ? IrCond::Eq : IrCond::Ne;
+            eq.width = 32;
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::Label).imm = notBool;
+            branchCmp(ta, IrCond::Hi, std::int64_t(Type::Null), slow);
+            IrInst& always = inst(IrOp::MovImm);
+            always.d = d;
+            always.imm = wantEqual ? 1 : 0;
+            inst(IrOp::Br).imm = done;
+        }
         inst(IrOp::Label).imm = slow;
         const std::int32_t answer = fn_.newVreg(false);
         if (strict) {
@@ -4087,6 +4409,13 @@ private:
     std::set<std::int32_t> nonNullLocals_;
     /// Parameters only ever given numbers, by slot.
     std::vector<std::uint8_t> numberParam_;
+    // ---- inlining ----
+    /// The lowering this one is inlined into, what that one holds for the call, and where its result goes.
+    const Lowering* parent_ = nullptr;
+    const std::vector<Entry>* parentHeld_ = nullptr;
+    std::int32_t parentSite_ = -1;
+    std::int32_t inlineDone_ = -1, inlineR_ = -1, inlineT_ = -1;
+    int depth_ = 0;
     /// Whether code may assume what the interpreter has seen so far, and hand the call back to it when that stops being so.
     bool speculate_ = false;
     /// Objects whose shape is known here, by the register holding them: a guard that dominates, with nothing since that

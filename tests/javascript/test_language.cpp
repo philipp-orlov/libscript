@@ -521,6 +521,33 @@ TEST(nativeCodeHandsBackWhatItDidNotExpect)
              std::string("3501"));
 }
 
+TEST(smallMethodsRunInPlaceOfTheirCalls)
+{
+    // A small method of a known receiver is inlined where it is called, behind a check that it is still that method.
+    CHECK_EQ(run("function P(x) { this.x = x; } P.prototype.get = function() { return this.x; };"
+                 " function sum(list) { var t = 0; for (var i = 0; i < list.length; i++) t += list[i].get(); return t; }"
+                 " var xs = []; for (var i = 0; i < 500; i++) xs.push(new P(i)); var r = 0; for (var k = 0; k < 20; k++)"
+                 " r += sum(xs); xs[7] = {get: function() { return 'a'; }}; var q = new P(1); q.y = 2; xs[8] = q;"
+                 " r + ':' + sum(xs).slice(0, 8)"),
+             std::string("2495000:21a19101"));
+    // The method replaced, its field turning into a string, a getter in its place: each the interpreter's, or the call's.
+    CHECK_EQ(run("function P(x) { this.x = x; } P.prototype.get = function() { return this.x * 2; };"
+                 " function f(p) { return p.get(); } var r = 0; for (var i = 0; i < 600; i++) r += f(new P(i));"
+                 " var s = r + ':' + f(new P('3')); P.prototype.get = function() { return -1; };"
+                 " s + ':' + f(new P(4)) + ':' + f({get: function() { return 9; }})"),
+             std::string("359400:6:-1:9"));
+    // Missing arguments read as undefined, an assigned parameter is the callee's own, and two levels nest.
+    CHECK_EQ(run("var o = { a: function(x, y) { y = y || 10; return x + y; }, b: function(x) { return this.a(x) * 2; } };"
+                 " function f(i) { return o.b(i); } var r = 0; for (var i = 0; i < 600; i++) r += f(i); r"),
+             std::string("371400"));
+    // An exception from inlined code unwinds the caller too, and the trace names both.
+    CHECK_EQ(run("function P() { this.n = 0; } P.prototype.check = function check(v) { if (v > 500) throw new Error('big ' + v);"
+                 " return v; }; function outer(p, v) { return p.check(v) + 1; } var p = new P(), r = 0;"
+                 " try { for (var i = 0; i < 1000; i++) r += outer(p, i); } catch (e) {"
+                 " r = r + ':' + e.message + ':' + (e.stack.indexOf('check') >= 0) + (e.stack.indexOf('outer') >= 0); } r"),
+             std::string("125751:big 501:truetrue"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

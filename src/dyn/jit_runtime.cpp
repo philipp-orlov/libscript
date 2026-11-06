@@ -212,20 +212,25 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
     std::memcpy(&where, header, sizeof where);
     const auto pc = std::uint32_t(where);
     const auto stackCount = std::uint32_t(where >> 32);
+    const FunctionCode* outer = nullptr;
+    std::memcpy(&outer, header + 8, sizeof outer);
+    if (!outer)
+        outer = code;
     std::uint8_t* values = header + 16;
     // Code that keeps bailing is thrown away; what it is compiled to next assumes what the interpreter learns meanwhile,
-    // and after a few rounds of that, nothing.
+    // and after a few rounds of that, nothing. The bail is the instruction's, in whichever function it is, but the code
+    // to throw away is that of the function it was compiled into.
     constexpr std::uint32_t kBailLimit = 8;
     if (std::find(code->jitBailedAt.begin(), code->jitBailedAt.end(), pc) == code->jitBailedAt.end())
         code->jitBailedAt.push_back(pc);
-    if (++code->jitBails > kBailLimit && code->jitEntry) {
-        code->jitEntry = nullptr;
-        code->jitCallEntry = nullptr;
-        code->jitCode = nullptr;
-        code->jitHotness = 0;
-        code->jitBails = 0;
-        if (code->jitGeneration < FunctionCode::kJitSpeculations)
-            ++code->jitGeneration;
+    if (++outer->jitBails > kBailLimit && outer->jitEntry) {
+        outer->jitEntry = nullptr;
+        outer->jitCallEntry = nullptr;
+        outer->jitCode = nullptr;
+        outer->jitHotness = 0;
+        outer->jitBails = 0;
+        if (outer->jitGeneration < FunctionCode::kJitSpeculations)
+            ++outer->jitGeneration;
     }
     struct State
     {
@@ -865,7 +870,9 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
     rt.jitCodes.push_back(compiled);
     ++rt.jitCompiled;
     if (rt.ctx.options.jit.dumpCode)
-        rt.ctx.write(fromUtf8("jit: " + code.name + " (" + std::to_string(compiled->codeBytes) + " bytes)\n" +
+        rt.ctx.write(fromUtf8("jit: " + code.name + " (" + std::to_string(compiled->codeBytes) + " bytes) at " +
+                              std::to_string(reinterpret_cast<std::uintptr_t>(compiled->codeStart)) + " line " +
+                              std::to_string(code.lineAt(0)) + " inlined " + std::to_string(fn.inlinedMethods) + "\n" +
                               rt.jitBackend->dump(compiled)),
                      false);
     if (!code.isClassConstructor)
@@ -899,7 +906,8 @@ std::string describeNativeFrames(const Runtime& rt, void* topFrame, const void* 
         }
         if (site < 0 && !code->sourceSites.empty())
             site = 0;
-        if (site >= 0 && shown < 16) {
+        // A site in code inlined into a caller names the caller's call as its parent: one line for each.
+        while (site >= 0 && std::size_t(site) < code->sourceSites.size() && shown < 16) {
             const typed::NativeCode::SourceSite& where = code->sourceSites[std::size_t(site)];
             const auto* function = static_cast<const FunctionCode*>(where.method);
             out += "    at ";
@@ -908,6 +916,7 @@ std::string describeNativeFrames(const Runtime& rt, void* topFrame, const void* 
             out += function->sourceName ? *function->sourceName : std::string("<unknown>");
             out += ":" + std::to_string(function->lineAt(where.pc)) + ")\n";
             ++shown;
+            site = where.parent;
         }
         return true;
     };

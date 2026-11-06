@@ -636,7 +636,8 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
     setProperty(rt, base, key, v);
     // It went on the end of the table, with the plain attributes: the same will happen for this shape as long as nothing
     // on the prototype chain changes, since nothing there has a setter for it now.
-    if (obj->shape && obj->shape != before && obj->props.size() == count + 1 && obj->props.back().attrs == PropDefault) {
+    if (obj->shape && obj->shape != before && obj->props.size() == count + 1 && obj->props.back().key.get() == key &&
+        obj->props.back().attrs == PropDefault) {
         site->shape = before;
         site->holder = nullptr;
         site->getter = false;

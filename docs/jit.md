@@ -1,8 +1,8 @@
 # Native code generation
 
-The typed engine -- the machine C#, C and C++ run on -- compiles to machine code by default once a method gets hot. On arm64
-that is an optimizing compiler; x86-64 still has the older template generator (`src/typed/jit/jit_x64.cpp`), which covers
-arithmetic over primitive locals and leaves the rest to the interpreter. The dynamic engine has neither yet.
+The typed engine -- the machine C#, C and C++ run on -- compiles to machine code by default once a method gets hot, on arm64
+and on x86-64 with the System V convention. The tables below were measured on arm64. The x86-64 back end has only been run
+under qemu here, where it passes the same tests and the same fuzzing; its speed has not been measured.
 
 ## Asking for it
 
@@ -67,7 +67,8 @@ A method goes through three, each in a file of its own under `src/typed/jit/`, p
   iteration takes one branch; copies disappear.
 * **`regalloc.cpp`.** Linear scan. Each value has one location for its whole life, and what goes to memory when registers
   run out is what is touched least per instruction, weighted by loop depth.
-* **`jit_arm64.cpp`, the machine.** IR in, words out. `jit_stubs_arm64.cpp` is the assembly at the edge of native code.
+* **`jit_arm64.cpp` and `jit_x64.cpp`, the machine.** IR in, bytes out. `jit_stubs_arm64.cpp` and `jit_stubs_x64.cpp` are the
+  assembly at the edge of native code.
 
 A program's methods are compiled together with everything they call directly, so those calls are plain branches.
 
@@ -101,7 +102,7 @@ interpreter.
 
 ## The native calling convention
 
-Only generated code and the stubs use it:
+Only generated code and the stubs use it. On arm64 (`jit_x64.cpp` opens with what it does instead):
 
 * integer and reference arguments in `x0`-`x7`, floats in `d0`-`d7`, the rest in stack words, in order with `this` first; a
   result in `x0` or `d0`;

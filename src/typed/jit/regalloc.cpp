@@ -333,32 +333,33 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     // An incoming parameter gets its own register's value handed over at entry with no move if nothing stands in the
     // way; the same goes for an argument computed right before the call that takes it.
     {
+        const auto argReg = [](const std::vector<std::int32_t>& regsOf, std::int32_t index) {
+            return std::size_t(index) < regsOf.size() ? regsOf[std::size_t(index)] : -1;
+        };
         std::int32_t nextInt = 0, nextFp = 0;
         for (std::int32_t p : fn.params) {
-            if (fn.vregIsFp[std::size_t(p)]) {
-                if (nextFp < 8)
-                    intervals[std::size_t(p)].hint = nextFp;
-                ++nextFp;
-            } else {
-                if (nextInt < 8)
-                    intervals[std::size_t(p)].hint = nextInt;
-                ++nextInt;
-            }
+            if (fn.vregIsFp[std::size_t(p)])
+                intervals[std::size_t(p)].hint = argReg(regs.fpArgs, nextFp++);
+            else
+                intervals[std::size_t(p)].hint = argReg(regs.intArgs, nextInt++);
         }
         for (const IrCall& call : fn.calls) {
             std::int32_t intArg = 0, fpArg = 0;
             for (std::int32_t arg : call.args) {
+                Interval& iv = intervals[std::size_t(arg)];
                 if (fn.vregIsFp[std::size_t(arg)]) {
-                    if (fpArg < 8 && intervals[std::size_t(arg)].hint < 0)
-                        intervals[std::size_t(arg)].hint = fpArg;
-                    ++fpArg;
+                    const std::int32_t r = argReg(regs.fpArgs, fpArg++);
+                    if (iv.hint < 0)
+                        iv.hint = r;
                 } else {
-                    if (intArg < 8 && intervals[std::size_t(arg)].hint < 0)
-                        intervals[std::size_t(arg)].hint = intArg;
-                    ++intArg;
+                    const std::int32_t r = argReg(regs.intArgs, intArg++);
+                    if (iv.hint < 0)
+                        iv.hint = r;
                 }
             }
-            if (call.result >= 0 && intervals[std::size_t(call.result)].hint < 0)
+            if (call.result >= 0 && intervals[std::size_t(call.result)].hint < 0 && !fn.vregIsFp[std::size_t(call.result)])
+                intervals[std::size_t(call.result)].hint = regs.intResult;
+            if (call.result >= 0 && intervals[std::size_t(call.result)].hint < 0 && fn.vregIsFp[std::size_t(call.result)])
                 intervals[std::size_t(call.result)].hint = 0;
         }
     }

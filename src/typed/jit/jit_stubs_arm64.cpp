@@ -6,7 +6,8 @@
 
 #if defined(SCRIPT_ARCH_ARM64)
 
-// The stubs. `saved` in the bridge is x0-x7 then d0-d7. A jump back out needs x14 and x15 as they came.
+// The stubs. `saved` in the bridge is x0-x7, then d0-d7, then the two result words. A jump back out needs x14 and x15 as
+// they came.
 __asm__(R"ASM(
     .text
     .p2align 2
@@ -20,7 +21,7 @@ scriptJitLazyStub:
 scriptJitLazyDelegateStub:
     mov x17, x14
 1:
-    stp x29, x30, [sp, #-176]!
+    stp x29, x30, [sp, #-192]!
     mov x29, sp
     stp x0, x1, [sp, #16]
     stp x2, x3, [sp, #32]
@@ -30,16 +31,20 @@ scriptJitLazyDelegateStub:
     stp d2, d3, [sp, #96]
     stp d4, d5, [sp, #112]
     stp d6, d7, [sp, #128]
-    stp x14, x15, [sp, #144]
+    stp xzr, xzr, [sp, #144]
+    stp x14, x15, [sp, #160]
     mov x0, x20
     mov x1, x15
     add x2, sp, #16
-    add x3, sp, #176
+    add x3, sp, #192
     mov x4, x17
     mov x5, x29
     bl scriptJitBridge
     mov x16, x0
     ldp x0, x1, [sp, #16]
+    cbnz x16, 5f
+    ldp x0, x1, [sp, #144]
+5:
     ldp x2, x3, [sp, #32]
     ldp x4, x5, [sp, #48]
     ldp x6, x7, [sp, #64]
@@ -47,8 +52,8 @@ scriptJitLazyDelegateStub:
     ldp d2, d3, [sp, #96]
     ldp d4, d5, [sp, #112]
     ldp d6, d7, [sp, #128]
-    ldp x14, x15, [sp, #144]
-    ldp x29, x30, [sp], #176
+    ldp x14, x15, [sp, #160]
+    ldp x29, x30, [sp], #192
     cbz x16, 2f
     br x16
 2:
@@ -101,18 +106,6 @@ scriptJitLazyDelegateStub:
     ldp d28, d29, [sp, #304]
     ldp x29, x30, [sp], #336
     .endm
-
-    // x16: a cell whose count reached zero.
-    .p2align 2
-    .globl scriptJitDecRefStub
-    .type scriptJitDecRefStub, %function
-scriptJitDecRefStub:
-    SAVE_ALL
-    mov x0, x16
-    bl _ZN6script6detail19destroyUnreferencedEPNS0_8GCObjectE
-    RESTORE_ALL
-    ret
-    .size scriptJitDecRefStub, .-scriptJitDecRefStub
 
     // Answers in x16: nonzero means stop.
     .p2align 2

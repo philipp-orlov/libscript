@@ -262,6 +262,10 @@ struct RegisterSet
     std::vector<std::int32_t> intCalleeSaved;
     std::vector<std::int32_t> fpCallerSaved;
     std::vector<std::int32_t> fpCalleeSaved;
+    /// The argument registers in order, and the one a result comes back in; -1 where the allocator cannot use it.
+    std::vector<std::int32_t> intArgs;
+    std::vector<std::int32_t> fpArgs;
+    std::int32_t intResult = 0;
 };
 
 /// Assign a location to every virtual register, by linear scan over the code.

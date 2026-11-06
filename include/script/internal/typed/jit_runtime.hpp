@@ -116,15 +116,15 @@ void scriptJitLazyStub();
 void scriptJitLazyDelegateStub();
 /// Keeps every register live across the call: reached from a cold path, where a caller-saved register still holds a
 /// value of the hot path.
-void scriptJitDecRefStub();
 void scriptJitPollStub();
 /// Enter native code from C++. `delegate` is what a lambda reads its captures from.
 void scriptJitEnter(Runtime* rt, void* entry, const std::uint64_t* ints, const double* fps,
                     const std::uint64_t* stackArgs, std::uint64_t stackCount, const void* delegate,
                     std::uint64_t* intResults, double* fpResult);
 
-/// What the lazy stubs call. `saved` holds x0-x7 then d0-d7. Returns where to jump instead, or null when the call has
-/// been made and the result left in `saved`.
+/// What the lazy stubs call. `saved` holds the integer argument registers, then the eight floating point ones, then two
+/// words a result goes in; a floating point result goes in the first floating point one. Returns where to jump instead, or
+/// null when the call has been made.
 void* scriptJitBridge(Runtime* rt, MethodInfo* method, std::uint64_t* saved, std::uint64_t* stackArgs,
                       CSDelegate* delegate, void* frame) noexcept;
 

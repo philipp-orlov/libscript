@@ -493,13 +493,11 @@ void scriptJitFinallyRethrow(Runtime* rt, std::int64_t continuation) noexcept
 
 }  // extern "C"
 
-#if !defined(SCRIPT_ARCH_ARM64)
-// No optimizing back end on this architecture yet, so nothing calls these. They exist because the tier's C++ is compiled
-// everywhere: it is what will drive the next back end.
+#if !defined(SCRIPT_ARCH_ARM64) && !(defined(SCRIPT_ARCH_X64) && !defined(_WIN32))
+// No back end on this machine, so nothing calls these.
 extern "C" {
 void scriptJitLazyStub() {}
 void scriptJitLazyDelegateStub() {}
-void scriptJitDecRefStub() {}
 void scriptJitPollStub() {}
 void scriptJitEnter(Runtime*, void*, const std::uint64_t*, const double*, const std::uint64_t*, std::uint64_t,
                     const void*, std::uint64_t*, double*)
@@ -512,7 +510,11 @@ void scriptJitEnter(Runtime*, void*, const std::uint64_t*, const double*, const 
 
 namespace {
 
+#if defined(SCRIPT_ARCH_X64)
+constexpr std::size_t kIntRegs = 6;
+#else
 constexpr std::size_t kIntRegs = 8;
+#endif
 constexpr std::size_t kFpRegs = 8;
 
 /// Assigns arguments to registers and stack words in the native convention.
@@ -637,6 +639,7 @@ bool isFpParam(const TypeInfo* type, bool byRef) noexcept
 /// A returned value, in the place native code expects it.
 void writeResult(const Value& result, const TypeInfo* type, bool constructorResult, std::uint64_t* ints, double* fps)
 {
+    // `ints` here is the two result words.
     if (constructorResult) {
         GCObject* cell = detail::Access::ptr(result);
         if (cell)
@@ -718,7 +721,7 @@ extern "C" void* scriptJitBridge(Runtime* rt, MethodInfo* method, std::uint64_t*
             }
             Value self = detail::Access::make(Type::Delegate, delegate);
             const Value result = invokeDelegate(*rt, self, args.data(), std::uint32_t(argc));
-            writeResult(result, signature->returnType, false, ints, fps);
+            writeResult(result, signature->returnType, false, saved + kIntRegs + kFpRegs, fps);
         } catch (...) {
             recordCurrent(*rt);
         }
@@ -751,7 +754,7 @@ extern "C" void* scriptJitBridge(Runtime* rt, MethodInfo* method, std::uint64_t*
             args.push_back(readArg(abi, param.type, isByRef(param)));
         // `invoke` may run an interpreter that grows `args` of a nested level, never this one.
         const Value result = invoke(*rt, method, args.data(), std::uint32_t(args.size()));
-        writeResult(result, method->returnType, nativeConstructor, ints, fps);
+        writeResult(result, method->returnType, nativeConstructor, saved + kIntRegs + kFpRegs, fps);
     } catch (...) {
         recordCurrent(*rt);
     }

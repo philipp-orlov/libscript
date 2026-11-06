@@ -229,8 +229,10 @@ if(SCRIPT_ENGINE_TYPED AND SCRIPT_ENABLE_JIT)
         src/typed/jit/jit_runtime.cpp
         src/typed/jit/jit_arm64.cpp
         src/typed/jit/jit_stubs_arm64.cpp
-        src/typed/jit/jit_x64.cpp)
-    set_source_files_properties(src/typed/jit/jit_stubs_arm64.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+        src/typed/jit/jit_x64.cpp
+        src/typed/jit/jit_stubs_x64.cpp)
+    set_source_files_properties(src/typed/jit/jit_stubs_arm64.cpp src/typed/jit/jit_stubs_x64.cpp
+                                PROPERTIES COMPILE_OPTIONS "-fno-lto")
 endif()
 
 # ---- the generated configuration header ---------------------------------------

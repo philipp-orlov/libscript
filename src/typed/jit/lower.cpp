@@ -2260,7 +2260,6 @@ private:
             conv.a = source;
             conv.srcWidth = from == Cls::F32 ? 32 : 64;
             conv.width = 64;
-            conv.isUnsigned = op == Op::ConvU8;
         } else if (from == Cls::I64) {
             a.type = to;
             a.vreg = source;

@@ -102,28 +102,6 @@ struct NativeCode
 /// unavailable instead of generating nonsense.
 ValueLayout valueLayout() noexcept;
 
-/// The evaluation stack depth at every instruction, and whether the method is
-/// one the code generators handle at all.
-///
-/// Depth is a static property of a body the emitter produced -- control flow
-/// is structured, so every path into an instruction arrives at the same stack
-/// height -- which is what lets generated code address stack slots by constant
-/// offset instead of keeping a stack pointer.
-struct BodyPlan
-{
-    std::vector<std::int32_t> depth;  ///< by bytecode offset; -1 means unreachable
-    /// The runtime tag of every live evaluation stack entry, at each
-    /// instruction. The opcodes are typed, so this is exact -- which is what
-    /// lets a conversion pick its instruction at compile time instead of
-    /// testing a tag at run time.
-    std::vector<std::vector<Type>> stack;
-    std::uint32_t maxDepth = 0;
-};
-
-/// True when `method` is inside the subset the back ends compile. `reason`
-/// receives the first thing that ruled it out.
-bool planBody(const MethodInfo& method, BodyPlan& plan, std::string* reason);
-
 /// Called from generated code at every loop back edge. Returns non-zero when
 /// execution must stop, having recorded why in `Runtime::nativeError`.
 /// Never throws: a C++ exception crossing a generated frame would need unwind

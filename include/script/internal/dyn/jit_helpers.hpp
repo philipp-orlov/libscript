@@ -54,6 +54,9 @@ void scriptDynSetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std:
                       std::int64_t valueTag, std::uint64_t value) noexcept;
 void scriptDynSetGlobal(Runtime* rt, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept;
 
+/// Native code whose parameters were not what it takes them to be: learn that, and do the call some other way.
+NativePair scriptDynEntryMiss(Runtime* rt, const FunctionCode* code, DynFunction* fn, std::int64_t thisTag,
+                              std::uint64_t self, const Value* args, std::uint64_t argc) noexcept;
 NativePair scriptDynCall(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std::int64_t thisTag, std::uint64_t self,
                          const Value* args, std::uint64_t argc) noexcept;
 NativePair scriptDynNew(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, const Value* args, std::uint64_t argc) noexcept;

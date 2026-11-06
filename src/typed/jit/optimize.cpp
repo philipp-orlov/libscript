@@ -505,6 +505,14 @@ private:
             case IrOp::Zext8:
             case IrOp::Zext16:
             case IrOp::Zext32:
+            case IrOp::BitsToFp:
+            case IrOp::FpToBits:
+            case IrOp::IntToFp:
+            case IrOp::FpToIntRaw:
+            case IrOp::FpToInt32Js:
+            case IrOp::FAdd:
+            case IrOp::FSub:
+            case IrOp::FMul:
             case IrOp::Load:
             case IrOp::LoadIdx:
             case IrOp::Cset: return true;
@@ -514,7 +522,8 @@ private:
     static bool sameInst(const IrInst& a, const IrInst& b) noexcept
     {
         return a.op == b.op && a.a == b.a && a.b == b.b && a.c == b.c && a.imm == b.imm && a.width == b.width &&
-               a.scale == b.scale && a.hasImm == b.hasImm && a.isSigned == b.isSigned && a.cond == b.cond;
+               a.scale == b.scale && a.hasImm == b.hasImm && a.isSigned == b.isSigned && a.cond == b.cond &&
+               a.srcWidth == b.srcWidth && a.isUnsigned == b.isUnsigned;
     }
     const IrInst* findSame(const IrInst& in) const noexcept
     {

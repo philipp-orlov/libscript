@@ -909,8 +909,13 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
     if (code.argsNotNumber != ~0u) {
         const std::size_t arity = std::min<std::size_t>(std::size_t(std::max(code.arity, 0)), 32);
         for (std::size_t i = 0; i < arity; ++i) {
-            if (i >= args.size() || !args[i].isDouble())
+            if (i >= args.size() || !args[i].isDouble()) {
                 code.argsNotNumber |= 1u << i;
+            } else {
+                const double d = detail::Access::r8(args[i]);
+                if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d)))
+                    code.argsNotInt |= 1u << i;
+            }
         }
     }
 #endif

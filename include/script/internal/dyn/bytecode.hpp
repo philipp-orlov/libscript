@@ -302,13 +302,14 @@ struct FunctionCode
     mutable std::uint32_t jitHotness = 0;
     /// Times native code has handed a call back to the interpreter part way through, since it was last compiled.
     mutable std::uint32_t jitBails = 0;
-    /// Times native code has been thrown away for bailing too often. Past `kJitSpeculations`, nothing is assumed.
+    /// Times native code has been thrown away for bailing too often. Past what `jitMayGuess` allows, nothing is assumed.
     mutable std::uint8_t jitGeneration = 0;
-    static constexpr std::uint8_t kJitSpeculations = 2;
+    /// A compile costs what the function's size does, and each teaches one more place not to guess.
+    bool jitMayGuess() const noexcept { return jitGeneration < (code.size() < 1024 ? 12u : 3u); }
     /// Parameters, of the first 32, that some interpreted call has been given something other than a number for.
     mutable std::uint32_t argsNotNumber = 0;
-    /// Parameters the current native code takes to be numbers, which entering it part way through has to check.
-    mutable std::uint32_t jitNumberParams = 0;
+    /// Of those, the ones given a number that is not an int32.
+    mutable std::uint32_t argsNotInt = 0;
     /// Locals the current native code keeps as bare numbers. A store the interpreter made after a bail may have put
     /// anything there, which entering part way through has to check.
     mutable std::vector<std::uint32_t> jitNumberLocals;

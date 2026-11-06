@@ -227,9 +227,10 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
         outer->jitEntry = nullptr;
         outer->jitCallEntry = nullptr;
         outer->jitCode = nullptr;
-        outer->jitHotness = 0;
+        // It was hot a moment ago, and what it just learnt is no more use the longer it waits.
+        outer->jitHotness = rt->ctx.options.jit.threshold - std::min<std::uint32_t>(rt->ctx.options.jit.threshold, 16);
         outer->jitBails = 0;
-        if (outer->jitGeneration < FunctionCode::kJitSpeculations)
+        if (outer->jitGeneration < 255)
             ++outer->jitGeneration;
     }
     struct State
@@ -311,6 +312,32 @@ void scriptDynSetGlobal(Runtime* rt, GCObject* key, std::int64_t tag, std::uint6
     guarded(*rt, SCRIPT_HERE, [&]() -> int {
         setGlobalForNative(*rt, key, valueOf(tag, payload));
         return 0;
+    });
+}
+
+NativePair scriptDynEntryMiss(Runtime* rt, const FunctionCode* code, DynFunction* fn, std::int64_t thisTag,
+                              std::uint64_t self, const Value* args, std::uint64_t argc) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        const std::uint32_t arity = std::uint32_t(std::min(std::max(code->arity, 0), 32));
+        for (std::uint32_t i = 0; i < arity; ++i) {
+            if (i >= argc || !args[i].isDouble()) {
+                code->argsNotNumber |= 1u << i;
+                continue;
+            }
+            const double d = detail::Access::r8(args[i]);
+            if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d)))
+                code->argsNotInt |= 1u << i;
+        }
+        // What the code assumed is known now to be wrong, and the next compile knows better. The profile only ever
+        // grows, so this happens at most twice for each parameter.
+        code->jitEntry = nullptr;
+        code->jitCallEntry = nullptr;
+        code->jitCode = nullptr;
+        code->jitHotness = rt->ctx.options.jit.threshold - std::min<std::uint32_t>(rt->ctx.options.jit.threshold, 16);
+        ContextImpl::ArgBuffer buffer(rt->ctx);
+        buffer.args.assign(args, args + argc);
+        return take(callValue(*rt, detail::Access::make(Type::Object, fn), valueOf(thisTag, self), buffer.args));
     });
 }
 
@@ -776,24 +803,25 @@ bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& resul
         code.jitHotness = 0;
         return false;
     };
-    for (std::uint32_t slot = 0; slot < 32 && slot < frame.locals.size(); ++slot) {
-        if ((code.jitNumberParams >> slot) & 1 && !frame.locals[slot].isDouble()) {
-            code.argsNotNumber |= 1u << slot;
+    const std::uint32_t params = std::uint32_t(std::max(code.arity, 0));
+    for (std::uint32_t slot : code.jitNumberLocals) {
+        // Not yet written is fine, for a local: nothing reads one of these before a number is stored. A parameter has been.
+        const Type type = slot < frame.locals.size() ? frame.locals[slot].type() : Type::Undefined;
+        if (type != Type::Double && (type != Type::Undefined || slot < params)) {
+            if (slot < params && slot < 32)
+                code.argsNotNumber |= 1u << slot;
             return discard();
         }
-    }
-    for (std::uint32_t slot : code.jitNumberLocals) {
-        // Not yet written is fine: nothing reads one of these before a number is stored.
-        const Type type = slot < frame.locals.size() ? frame.locals[slot].type() : Type::Undefined;
-        if (type != Type::Double && type != Type::Undefined)
-            return discard();
     }
     for (std::uint32_t slot : code.jitIntLocals) {
         if (slot >= frame.locals.size() || !frame.locals[slot].isDouble())
             continue;
         const double d = detail::Access::r8(frame.locals[slot]);
-        if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d)))
+        if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d))) {
+            if (slot < params && slot < 32)
+                code.argsNotInt |= 1u << slot;
             return discard();
+        }
     }
 
     // Native code reads a picture of the frame: the counts of what it will own move with the values, and those slots must

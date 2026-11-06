@@ -34,6 +34,10 @@ namespace typed {
 namespace {
 
 #if defined(SCRIPT_ARCH_ARM64)
+#if defined(__linux__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 
 // ----------------------------------------------------------- encodings ---
 
@@ -151,6 +155,7 @@ public:
     void ucvtfDW(std::uint32_t d, Reg n) { word(0x1E630000u | (n << 5) | d); }
     void scvtfSX(std::uint32_t d, Reg n) { word(0x9E220000u | (n << 5) | d); }
     void scvtfSW(std::uint32_t d, Reg n) { word(0x1E220000u | (n << 5) | d); }
+    void fjcvtzs(Reg d, std::uint32_t n) { word(0x1E7E0000u | (n << 5) | d); }
     void fcvtzsXD(Reg d, std::uint32_t n) { word(0x9E780000u | (n << 5) | d); }
     void fcvtzuXD(Reg d, std::uint32_t n) { word(0x9E790000u | (n << 5) | d); }
     void fcvtzsXS(Reg d, std::uint32_t n) { word(0x9E380000u | (n << 5) | d); }
@@ -1884,6 +1889,13 @@ private:
                 commit(in.d, d);
                 return;
             }
+            case IrOp::FpToInt32Js: {
+                const std::uint32_t a = useFp(in.a, kFpScratchA);
+                const Reg d = def(in.d, X16);
+                a_.fjcvtzs(d, a);
+                commit(in.d, d);
+                return;
+            }
             case IrOp::FpToIntRaw: {
                 const std::uint32_t a = useFp(in.a, kFpScratchA);
                 const Reg d = def(in.d, X16);
@@ -1944,6 +1956,15 @@ public:
 
     const char* name() const noexcept override { return "arm64"; }
 
+    bool hasJsToInt32() const noexcept override
+    {
+#if defined(__linux__)
+        static const bool has = (getauxval(AT_HWCAP) & HWCAP_JSCVT) != 0;
+        return has;
+#else
+        return false;
+#endif
+    }
     bool available() const noexcept override
     {
 #if SCRIPT_ENABLE_JIT

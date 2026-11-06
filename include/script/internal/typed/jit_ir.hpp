@@ -81,6 +81,7 @@ enum class IrOp : std::uint8_t
 
     FrameAddr,   // d = the address of byte imm of this frame's memory area (see `frameAreaBytes`)
     FpToIntRaw,  // d (64 bits) = a (a double) truncated by the plain machine instruction, whatever it does out of range
+    FpToInt32Js, // d = ToInt32 of a (a double), by the machine: only for a back end that says `hasJsToInt32`
     /// Everything between these two is laid out after the method: code a hot path branches to and rarely takes. It goes
     /// where it is in the IR for everything but the machine code, so the values live across it stay in their registers.
     ColdBegin,

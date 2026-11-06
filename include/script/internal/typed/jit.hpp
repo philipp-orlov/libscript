@@ -180,6 +180,8 @@ public:
     /// False when this build has no generator for the host, or the host lacks
     /// something the generator needs.
     virtual bool available() const noexcept = 0;
+    /// Whether the machine converts a double to an int32 the way JavaScript does in one instruction.
+    virtual bool hasJsToInt32() const noexcept { return false; }
     /// Whether this method is within the subset the back end handles. A back
     /// end is free to refuse anything; `reason` says why, for the dump.
     virtual bool supports(const MethodInfo& method, std::string* reason) const = 0;

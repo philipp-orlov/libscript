@@ -89,6 +89,9 @@ enum class Rep : std::uint8_t
 {
     Double,
     Int32,
+    /// An integer in 64 bits, of a size `mag` says, which a double holds exactly: it needs no overflow check until it is
+    /// used as something other than the operand of more of the same, or of a bitwise operator, whose low word is enough.
+    Exact,
     Tagged,
 };
 
@@ -111,6 +114,9 @@ struct Entry
     bool nonNull = false;
     /// An int32 whose register holds it sign-extended to 64 bits, not just in its low half.
     bool wide = false;
+    /// Int32 or Exact: its magnitude is below 2^mag, and when `atLeastZero` it is not negative.
+    std::uint8_t mag = 31;
+    bool atLeastZero = false;
     std::int32_t r = -1;  ///< the double, the int, or the payload
     std::int32_t t = -1;  ///< the tag
     double number = 0;    ///< constant double or int
@@ -214,10 +220,26 @@ public:
         if (!code_.handlers.empty())
             refuse("the function has exception handlers");
         // What a bail writes out has to be in reach of the frame pointer's short offsets.
-        speculate_ = code_.jitGeneration < FunctionCode::kJitSpeculations && !code_.isClassConstructor &&
+        speculate_ = code_.jitMayGuess() && !code_.isClassConstructor &&
                      (2 * code_.numLocals + code_.maxStack) * 16 < 4000;
         prepare();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
+        // An int32 parameter costs a conversion on the way in, and pays it back in a loop or where it meets what wants ints.
+        for (std::uint32_t pc = 0; pc < code_.code.size();) {
+            const Op op = Op(code_.code[pc]);
+            if (op == Op::GetElem || op == Op::SetElem || op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor || op == Op::Shl ||
+                op == Op::Shr || op == Op::UShr || (isBranch(op) && readOperand(code_.code, pc + 1) <= pc))
+                intWork_ = true;
+            pc += 1 + std::uint32_t(operandsOf(op)) * 4;
+        }
+        // Parameters only ever given numbers are number locals like any other, checked on the way in.
+        numberParam_.assign(code_.numLocals, 0);
+        for (std::uint32_t slot = 0; speculate_ && slot < std::min<std::uint32_t>(arity, 32) && slot < code_.numLocals; ++slot) {
+            if ((code_.argsNotNumber >> slot) & 1 ||
+                std::find(code_.boxedParams.begin(), code_.boxedParams.end(), slot) != code_.boxedParams.end())
+                continue;
+            numberParam_[slot] = 1;
+        }
 
         // fn, this, args, argc.
         fnReg_ = fn_.newVreg(false);
@@ -227,6 +249,31 @@ public:
         const std::int32_t argc = fn_.newVreg(false);
         fn_.params = {fnReg_, thisTag_, thisReg_, args, argc};
         fn_.osrArguments = {fnReg_, thisTag_, thisReg_};
+        // A parameter guessed wrong is found out before anything has happened: the call starts over, some other way.
+        const std::int32_t entryThisTag = thisTag_;
+        const std::int32_t entryThis = thisReg_;
+        const std::int32_t entryMiss = newLabel();
+        bool checksEntry = false;
+        const auto checkParam = [&](std::uint32_t slot) {
+            checksEntry = true;
+            IrInst& given = inst(IrOp::BrCmp);
+            given.a = argc;
+            given.cond = IrCond::Ls;
+            given.hasImm = true;
+            given.imm = std::int64_t(slot);
+            given.width = 64;
+            given.target = entryMiss;
+            const std::int32_t tag = load(args, std::int64_t(slot) * 16, 1);
+            branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), entryMiss);
+        };
+        // Its register is made below, with the other locals'.
+        std::vector<std::uint32_t> numberParams;
+        for (std::uint32_t slot = 0; slot < numberParam_.size(); ++slot) {
+            if (numberParam_[slot] && isNumberLocal(slot)) {
+                checkParam(slot);
+                numberParams.push_back(slot);
+            }
+        }
         // Non-strict: nullish `this` reads as the global object, so it might as well be that from the start. Entering at
         // a loop does the same before it gets here.
         if (code_.sloppyThis && readsThis())
@@ -245,6 +292,78 @@ public:
             }
             localReg_[slot] = fn_.newVreg(false);
             localTag_[slot] = fn_.newVreg(false);
+        }
+        for (std::uint32_t slot : numberParams) {
+            if (isIntLocal(slot)) {
+                const std::int32_t bits = load(args, std::int64_t(slot) * 16 + kPayload, 8);
+                {
+                    // Minus zero is the one number the comparison below takes for an int32 that is not.
+                    const std::int32_t minusZero = immReg(std::numeric_limits<std::int64_t>::min());
+                    IrInst& test = inst(IrOp::BrCmp);
+                    test.a = bits;
+                    test.b = minusZero;
+                    test.cond = IrCond::Eq;
+                    test.width = 64;
+                    test.target = entryMiss;
+                }
+                const std::int32_t fp = fn_.newVreg(true);
+                IrInst& asFp = inst(IrOp::BitsToFp);
+                asFp.d = fp;
+                asFp.a = bits;
+                const std::int32_t raw = fn_.newVreg(false);
+                IrInst& conv = inst(IrOp::FpToIntRaw);
+                conv.d = raw;
+                conv.a = fp;
+                IrInst& ext = inst(IrOp::Sext32);
+                ext.d = localReg_[slot];
+                ext.a = raw;
+                const std::int32_t back = fn_.newVreg(true);
+                IrInst& to = inst(IrOp::IntToFp);
+                to.d = back;
+                to.a = localReg_[slot];
+                to.srcWidth = 32;
+                to.width = 64;
+                const std::int32_t same = newLabel();
+                IrInst& eq = inst(IrOp::BrFCmp);
+                eq.a = fp;
+                eq.b = back;
+                eq.cond = IrCond::FEq;
+                eq.width = 64;
+                eq.target = same;
+                inst(IrOp::Br).imm = entryMiss;
+                inst(IrOp::Label).imm = same;
+            } else {
+                IrInst& payload = inst(IrOp::Load);
+                payload.d = localReg_[slot];
+                payload.a = args;
+                payload.imm = std::int64_t(slot) * 16 + kPayload;
+                payload.width = 8;
+            }
+        }
+        if (checksEntry) {
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = entryMiss;
+            const std::int32_t r = fn_.newVreg(false);
+            const std::int32_t t = fn_.newVreg(false);
+            IrExit exit;
+            exit.site = site();
+            fn_.exits.push_back(std::move(exit));
+            IrCall call;
+            call.kind = IrCallKind::Helper;
+            call.helper = reinterpret_cast<void*>(&scriptDynEntryMiss);
+            call.args = {rtReg(), ptrReg(&code_), fnReg_, entryThisTag, entryThis, args, argc};
+            call.result = r;
+            call.resultTag = t;
+            call.cold = true;
+            call.publishFrame = true;
+            call.site = site();
+            call.exit = std::int32_t(fn_.exits.size()) - 1;
+            fn_.calls.push_back(std::move(call));
+            inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
+            IrInst& ret = inst(IrOp::Ret);
+            ret.a = r;
+            ret.b = t;
+            inst(IrOp::ColdEnd);
         }
 
         // Parameters: a borrowed argument, or undefined. One the body assigns gets a count, as any local holds.
@@ -342,29 +461,6 @@ public:
             IrInst& mov = inst(IrOp::Mov);
             mov.d = cellReg_[slot];
             mov.a = box;
-        }
-
-        // Parameters only ever given numbers, and never assigned: checked once here, numbers in a register from then on.
-        numberParam_.assign(slots, 0);
-        code_.jitNumberParams = 0;
-        if (betHere()) {
-            const std::int32_t bail = newLabel();
-            std::uint32_t mask = 0;
-            for (std::uint32_t slot = 0; slot < std::min<std::uint32_t>(arity, 32) && slot < slots; ++slot) {
-                if ((code_.argsNotNumber >> slot) & 1 || assigned_[slot] || isNumberLocal(slot) ||
-                    slot == code_.argumentsSlot || (code_.hasRest && slot == arity))
-                    continue;
-                if (std::find(code_.boxedParams.begin(), code_.boxedParams.end(), slot) != code_.boxedParams.end())
-                    continue;
-                branchCmp(localTag_[slot], IrCond::Ne, std::int64_t(Type::Double), bail);
-                mask |= 1u << slot;
-            }
-            if (mask) {
-                emitBail(bail, {});
-                for (std::uint32_t slot = 0; slot < 32 && slot < slots; ++slot)
-                    numberParam_[slot] = (mask >> slot) & 1;
-            }
-            code_.jitNumberParams = mask;
         }
 
         walk();
@@ -600,12 +696,17 @@ private:
     {
         inst(IrOp::Label).imm = label;
         nonNullLocals_.clear();
-        forgetFacts();
+        forgetAtLabel();
     }
     void forgetFacts()
     {
         shapeFacts_.clear();
         epochKnown_ = false;
+    }
+    void forgetAtLabel()
+    {
+        forgetFacts();
+        knownArrays_.clear();
     }
     const Shape* knownShape(std::int32_t vreg) const noexcept
     {
@@ -622,6 +723,7 @@ private:
     }
     void forgetShape(std::int32_t vreg)
     {
+        knownArrays_.erase(std::remove(knownArrays_.begin(), knownArrays_.end(), vreg), knownArrays_.end());
         for (std::size_t i = 0; i < shapeFacts_.size(); ++i) {
             if (shapeFacts_[i].vreg == vreg) {
                 shapeFacts_[i] = shapeFacts_.back();
@@ -768,11 +870,18 @@ private:
 
     /// A number local guessed to hold only int32 values, in a general register; anything else stored to it bails, or
     /// when that is known at compile time, makes it a double local.
-    bool isIntLocal(std::uint32_t slot) const noexcept { return speculate_ && !notInt_[slot] && isNumberLocal(slot); }
+    bool isIntLocal(std::uint32_t slot) const noexcept
+    {
+        if (!speculate_ || notInt_[slot] || !isNumberLocal(slot))
+            return false;
+        return slot >= std::uint32_t(std::max(code_.arity, 0)) || (intWork_ && !((code_.argsNotInt >> slot) & 1));
+    }
 
     bool isNumberLocal(std::uint32_t slot) const noexcept
     {
-        if (slot < std::uint32_t(std::max(code_.arity, 0)) || notNumber_[slot])
+        if (notNumber_[slot])
+            return false;
+        if (slot < std::uint32_t(std::max(code_.arity, 0)) && !(slot < numberParam_.size() && numberParam_[slot]))
             return false;
         // What the entry sequence fills in is an object.
         if (code_.hasRest && slot == std::uint32_t(code_.arity))
@@ -893,12 +1002,12 @@ private:
             return fpImm(e.number);
         if (e.rep == Rep::Double)
             return e.r;
-        if (e.rep == Rep::Int32) {
+        if (e.rep == Rep::Int32 || e.rep == Rep::Exact) {
             const std::int32_t d = fn_.newVreg(true);
             IrInst& in = inst(IrOp::IntToFp);
             in.d = d;
             in.a = e.r;
-            in.srcWidth = 32;
+            in.srcWidth = e.rep == Rep::Exact ? 64 : 32;
             in.width = 64;
             return d;
         }
@@ -944,6 +1053,12 @@ private:
     std::int32_t int32OfDouble(std::int32_t fp)
     {
         const std::int32_t raw = fn_.newVreg(false);
+        if (rt_.jitBackend->hasJsToInt32()) {
+            IrInst& conv = inst(IrOp::FpToInt32Js);
+            conv.d = raw;
+            conv.a = fp;
+            return raw;
+        }
         IrInst& conv = inst(IrOp::FpToIntRaw);
         conv.d = raw;
         conv.a = fp;
@@ -992,6 +1107,8 @@ private:
 
     std::int32_t toInt32Reg(const Entry& e)
     {
+        if (e.rep == Rep::Exact)
+            return e.r;
         if (e.rep == Rep::Int32) {
             if (e.isConst)
                 return immReg(std::int64_t(std::int32_t(e.number)));
@@ -1457,6 +1574,7 @@ private:
                     break;
                 default: break;
             }
+            settleExact(op, pc);
             if (!lowerOne(op, pc))
                 fallsIn = false;
             previousOp_ = op;
@@ -1761,13 +1879,6 @@ private:
                 if (isNumberLocal(slot)) {
                     Entry e = isIntLocal(slot) ? intEntry(localReg_[slot], true) : doubleEntry(localReg_[slot]);
                     e.local = std::int32_t(slot);
-                    push(e);
-                } else if (numberParam_[slot]) {
-                    // Its payload register, which an entry part way through fills in too.
-                    Entry e = taggedEntry(localReg_[slot], -1, Own::None);
-                    e.hasKnownTag = true;
-                    e.known = Type::Double;
-                    e.nonNull = true;
                     push(e);
                 } else {
                     Entry e = taggedEntry(localReg_[slot], localTag_[slot], Own::Local);
@@ -2699,10 +2810,13 @@ private:
     void getProp(std::uint32_t operand, bool keepBase)
     {
         Entry base = pop();
-        secureWeak();
-        // The receiver stays on the stack past the next slow path, whose result is what a weak one might be reading.
-        if (keepBase && base.own == Own::Weak)
-            makeOwned(base);
+        // Anything but a read the interpreter takes over from when it is not what was guessed can run a getter, which
+        // could change what a borrowed entry reads; and the receiver stays on the stack past that.
+        const auto secure = [&] {
+            secureWeak();
+            if (keepBase && base.own == Own::Weak)
+                makeOwned(base);
+        };
         // The operand could be a primitive with no tag register to compare: bits and a tag it is, here on.
         if (base.rep != Rep::Tagged || base.isConst) {
             const std::int32_t tag = tagReg(base);
@@ -2711,16 +2825,20 @@ private:
             base = taggedEntry(payload, tag, own == Own::None ? Own::None : own);
         }
         if (!keepBase && code_.atoms[operand & kAtomMask].get() == rt_.atom.length.get()) {
+            secure();
             lengthProp(base, operand);
             return;
         }
         const PropertySite* site = siteAt(operand);
+        if (!site && stringMethod(base, operand, keepBase))
+            return;
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
         const bool usable = site && (!site->holder || site->epoch == rt_.ctx.protoEpoch);
         if (usable && site->getter) {
+            secure();
             getterProp(base, site, operand, keepBase);
             return;
         }
@@ -2728,6 +2846,8 @@ private:
                          base.rep == Rep::Tagged && !base.isConst;
         const bool polyBet = !bet && betHere() && site && !site->getter && !site->addTo && site->moreCount &&
                              base.rep == Rep::Tagged && !base.isConst;
+        if (!bet && !polyBet)
+            secure();
         Entry result;
         if (bet) {
             // One shape seen: guard it, or what is known of it, and leave the rest to the interpreter.
@@ -2861,6 +2981,42 @@ private:
         } else {
             push(result);
         }
+    }
+
+    /// `s.charCodeAt` and its kind on a string, at a site that has seen no object: the method read from where it is on
+    /// `String.prototype`, while no prototype's table has changed, or the interpreter carries on. False when this is no
+    /// place for the guess.
+    bool stringMethod(const Entry& base, std::uint32_t operand, bool keepBase)
+    {
+        if (!betHere() || base.rep != Rep::Tagged || (base.hasKnownTag && base.known != Type::String))
+            return false;
+        DynObject* proto = rt_.stringProto.get();
+        GCObject* key = code_.atoms[operand & kAtomMask].get();
+        const Prop* found = proto ? proto->findOwn(key) : nullptr;
+        if (!found || found->accessor())
+            return false;
+        const std::uint32_t index = std::uint32_t(found - proto->props.data());
+        const std::int32_t bail = newLabel();
+        if (!base.hasKnownTag)
+            branchCmp(base.t, IrCond::Ne, std::int64_t(Type::String), bail);
+        expectEpoch(rt_.ctx.protoEpoch, bail);
+        const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
+        const std::int32_t props = loadHeader(ptrReg(proto), kPropsOffset);
+        const std::int32_t lt = load(props, at + kPropValueOffset, 1);
+        const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+        emitBail(bail, {base});
+        Entry result = taggedEntry(lr, lt, Own::Weak);
+        if (found->value.isObject())
+            result.hint = detail::Access::ptr(found->value);
+        // The prototype is held by the runtime for as long as the code runs: what it holds is borrowed from there.
+        if (keepBase) {
+            push(result);
+            push(base);
+            return true;
+        }
+        push(result);
+        release(base);
+        return true;
     }
 
     /// A store that adds the property, in place while the table has room and no index: what `appendKnown` does. The
@@ -3070,7 +3226,9 @@ private:
     {
         Entry key = pop();
         Entry base = pop();
-        secureWeak();
+        // Where the interpreter takes over rather than the code carrying on from a getter, nothing can have changed.
+        if (!betHere())
+            secureWeak();
         if (base.rep != Rep::Tagged || base.isConst) {
             const std::int32_t tag = tagReg(base);
             const std::int32_t payload = payloadReg(base);
@@ -3141,6 +3299,13 @@ private:
 
     void guardArray(const Entry& base, std::int32_t slow)
     {
+        // What an object is does not change, so one check holds until the register holds something else.
+        if (!base.isConst && std::find(knownArrays_.begin(), knownArrays_.end(), base.r) != knownArrays_.end())
+            return;
+        const auto learn = [&] {
+            if (!base.isConst && base.local >= 0)
+                knownArrays_.push_back(base.r);
+        };
         if (!base.hasKnownTag)
             branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
         else if (base.known != Type::Object)
@@ -3149,6 +3314,7 @@ private:
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
         const std::int32_t cls = load(base.r, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Array), slow);
+        learn();
     }
 
     void setElem()
@@ -3964,7 +4130,7 @@ private:
     {
         if (e.isConst)
             return immReg(std::int64_t(std::int32_t(e.number)));
-        if (e.wide)
+        if (e.wide || e.rep == Rep::Exact)
             return e.r;
         const std::int32_t d = fn_.newVreg(false);
         IrInst& in = inst(IrOp::Sext32);
@@ -4033,10 +4199,112 @@ private:
         test.width = 64;
         test.target = bail;
     }
+    static std::uint8_t bitLength(std::uint64_t v) noexcept { return v ? std::uint8_t(64 - __builtin_clzll(v)) : 0; }
+    static std::uint8_t magOf(const Entry& e) noexcept
+    {
+        return e.isConst ? bitLength(std::uint64_t(std::fabs(e.number))) : e.mag;
+    }
+    static bool notNegative(const Entry& e) noexcept { return e.isConst ? e.number >= 0 : e.atLeastZero; }
+    /// `+`, `-` and `*` of integers small enough that the answer is exact in 64 bits and in a double: there is nothing to
+    /// check, for now, and what uses it decides what it needs to be. False, with nothing emitted, when it is not that.
+    bool exactArithmetic(Op op, const Entry& a, const Entry& b)
+    {
+        if ((op != Op::Add && op != Op::Sub && op != Op::Mul) || (a.isConst && b.isConst))
+            return false;
+        if ((a.rep != Rep::Exact && !isIntLike(a)) || (b.rep != Rep::Exact && !isIntLike(b)))
+            return false;
+        const unsigned mag = op == Op::Mul ? unsigned(magOf(a)) + magOf(b) : std::max(magOf(a), magOf(b)) + 1u;
+        if (mag > 52)
+            return false;
+        // Zero times a negative is minus zero, which no integer is.
+        const bool noMinusZero = op != Op::Mul || (notNegative(a) && notNegative(b)) || (a.isConst && a.number > 0) ||
+                                 (b.isConst && b.number > 0);
+        if (!noMinusZero && !betHere())
+            return false;
+        const std::int32_t x = wideInt(a);
+        const bool imm = b.isConst && op != Op::Mul;
+        const std::int32_t y = imm ? -1 : wideInt(b);
+        const std::int32_t d = fn_.newVreg(false);
+        IrInst& in = inst(op == Op::Add ? IrOp::Add : op == Op::Sub ? IrOp::Sub : IrOp::Mul);
+        in.d = d;
+        in.a = x;
+        in.b = y;
+        in.width = 64;
+        if (imm) {
+            in.hasImm = true;
+            in.imm = std::int64_t(std::int32_t(b.number));
+        }
+        if (!noMinusZero) {
+            const std::int32_t bail = newLabel();
+            const std::int32_t skip = newLabel();
+            branchCmp(d, IrCond::Ne, 0, skip, 64);
+            const std::int32_t either = fn_.newVreg(false);
+            IrInst& orr = inst(IrOp::Or);
+            orr.d = either;
+            orr.a = x;
+            orr.b = y;
+            orr.width = 64;
+            branchCmp(either, IrCond::Lt, 0, bail, 64);
+            inst(IrOp::Label).imm = skip;
+            emitBail(bail, {a, b});
+        }
+        Entry e;
+        e.rep = Rep::Exact;
+        e.r = d;
+        e.mag = std::uint8_t(mag);
+        e.atLeastZero = op != Op::Sub && notNegative(a) && notNegative(b);
+        push(e);
+        return true;
+    }
+    /// What is about to use the stack as something other than the operands of arithmetic gets the integers it holds as
+    /// int32s, the guess, or else as doubles.
+    void settleExact(Op op, std::uint32_t pc)
+    {
+        switch (op) {
+            case Op::Add:
+            case Op::Sub:
+            case Op::Mul:
+            case Op::BitAnd:
+            case Op::BitOr:
+            case Op::BitXor:
+            case Op::BitNot:
+            case Op::Shl:
+            case Op::Shr:
+            case Op::UShr:
+            case Op::GetLocal:
+            case Op::PushConst:
+            case Op::Pop: return;
+            default: break;
+        }
+        bool wantsDouble = false;
+        if (op == Op::SetLocal) {
+            const std::uint32_t slot = readOperand(code_.code, pc + 1);
+            wantsDouble = isNumberLocal(slot) && !isIntLocal(slot);
+        }
+        for (std::size_t i = 0; i < stack_.size(); ++i) {
+            if (stack_[i].rep != Rep::Exact)
+                continue;
+            if (wantsDouble || !betHere()) {
+                const std::int32_t d = doubleReg(stack_[i]);
+                stack_[i] = doubleEntry(d);
+                continue;
+            }
+            const std::int32_t bail = newLabel();
+            if (stack_[i].mag > 31)
+                expectInt32(stack_[i].r, bail);
+            emitBail(bail, {});
+            stack_[i].rep = Rep::Int32;
+            stack_[i].wide = true;
+            stack_[i].mag = std::min<std::uint8_t>(stack_[i].mag, 31);
+        }
+    }
+
     /// `a + b`, `a - b`, `a * b` and `a % b` of int32s as an int32, where that is what the answer is; where it is not, the
     /// interpreter does it. False, with nothing emitted, when this is no place for the guess.
     bool intArithmetic(Op op, const Entry& a, const Entry& b)
     {
+        if (exactArithmetic(op, a, b))
+            return true;
         if (!betHere() || !isIntLike(a) || !isIntLike(b) || (a.isConst && b.isConst))
             return false;
         if (op == Op::Mod && !(b.isConst ? b.number >= 1 : true))
@@ -4051,7 +4319,10 @@ private:
             if (b.isConst) {
                 remainderByConstant(x, std::uint32_t(b.number), d);
                 emitBail(bail, {a, b});
-                push(intEntry(d, true));
+                Entry e = intEntry(d, true);
+                e.mag = bitLength(std::uint64_t(b.number));
+                e.atLeastZero = true;
+                push(e);
                 return true;
             }
             if (b.isConst) {
@@ -4245,6 +4516,18 @@ private:
     {
         const Entry b = pop();
         const Entry a = pop();
+        // `x | 0` on an integer of more than 32 bits: its low word.
+        if (a.rep == Rep::Exact && b.isConst && b.rep != Rep::Tagged && b.number == 0 && (op == Op::BitOr || op == Op::BitXor)) {
+            const std::int32_t d = fn_.newVreg(false);
+            IrInst& ext = inst(IrOp::Sext32);
+            ext.d = d;
+            ext.a = a.r;
+            Entry e = intEntry(d, true);
+            e.mag = std::min<std::uint8_t>(a.mag, 31);
+            e.atLeastZero = a.atLeastZero && a.mag <= 31;
+            push(e);
+            return;
+        }
         // `x | 0` and its kind on an int32: x itself.
         if (a.rep == Rep::Int32 && b.isConst && b.rep != Rep::Tagged) {
             const bool zero = b.number == 0;
@@ -4280,19 +4563,28 @@ private:
         }
         release(b);
         release(a);
+        const std::uint32_t count = isImm ? std::uint32_t(std::int32_t(b.number)) & 31 : 0;
         if (op == Op::UShr) {
-            // A uint32, which only a double holds in general.
-            const std::int32_t fp = fn_.newVreg(true);
-            IrInst& to = inst(IrOp::IntToFp);
-            to.d = fp;
-            to.a = d;
-            to.srcWidth = 32;
-            to.width = 64;
-            to.isUnsigned = true;
-            push(doubleEntry(fp));
+            // A uint32, in the 64 bits a 32-bit operation leaves it zero-extended in.
+            Entry e;
+            e.rep = Rep::Exact;
+            e.r = d;
+            e.mag = std::uint8_t(32 - count);
+            e.atLeastZero = true;
+            push(e);
             return;
         }
-        push(intEntry(d));
+        Entry e = intEntry(d);
+        if (op == Op::BitAnd && isImm && b.number >= 0) {
+            // Only the bits of a mask of at most 31: zero-extended and sign-extended are the same.
+            e.wide = true;
+            e.mag = bitLength(std::uint64_t(b.number));
+            e.atLeastZero = true;
+        } else if (op == Op::Shr && isImm) {
+            e.mag = std::uint8_t(31 - count);
+            e.atLeastZero = notNegative(a) && a.rep == Rep::Int32;
+        }
+        push(e);
     }
 
     void relational(Op op)
@@ -4588,6 +4880,8 @@ private:
     std::vector<ShapeFact> shapeFacts_;
     /// `protoEpoch` is known to be what the code was compiled against.
     bool epochKnown_ = false;
+    std::vector<std::int32_t> knownArrays_;
+    bool intWork_ = false;
 };
 
 /// Which locals may be read before anything was written to them, along some path. Those start as `undefined`, so they are no
@@ -4603,6 +4897,9 @@ std::vector<std::uint8_t> readsBeforeWrite(const FunctionCode& code)
     std::vector<std::vector<std::uint8_t>> at(c.size() + 1);
     std::vector<std::uint32_t> work{0};
     at[0].assign(slots, 0);
+    // A parameter has its argument, which is what entering the code checks.
+    for (std::size_t slot = 0; slot < slots && slot < std::size_t(std::max(code.arity, 0)); ++slot)
+        at[0][slot] = 1;
     while (!work.empty()) {
         std::uint32_t pc = work.back();
         work.pop_back();

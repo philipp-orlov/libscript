@@ -348,6 +348,110 @@ void scriptDynIterClose(Runtime* rt, std::int64_t tag, std::uint64_t payload) no
     });
 }
 
+GCObject* scriptDynArgsArray(Runtime* rt, const Value* args, std::uint64_t argc, std::uint64_t from) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* {
+        DynArray* out = rt->newArray(argc > from ? std::size_t(argc - from) : 0);
+        Value handle = detail::Access::adopt(Type::Object, out);
+        for (std::uint64_t i = from; i < argc; ++i)
+            out->append(args[i]);
+        detail::incRef(out);
+        return out;
+    });
+}
+
+std::int32_t scriptDynInstanceOf(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> std::int32_t { return instanceOf(*rt, valueOf(ta, a), valueOf(tb, b)) ? 1 : 0; });
+}
+
+std::int32_t scriptDynIn(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> std::int32_t {
+        Ref<GCObject> key = toPropertyKey(*rt, valueOf(ta, a));
+        return hasProperty(*rt, valueOf(tb, b), key.get()) ? 1 : 0;
+    });
+}
+
+std::int32_t scriptDynDeleteProp(Runtime* rt, std::int64_t tag, std::uint64_t payload, GCObject* key) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> std::int32_t { return deleteProperty(*rt, valueOf(tag, payload), key) ? 1 : 0; });
+}
+
+std::int32_t scriptDynDeleteElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t keyTag, std::uint64_t key) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> std::int32_t {
+        Ref<GCObject> k = toPropertyKey(*rt, valueOf(keyTag, key));
+        return deleteProperty(*rt, valueOf(tag, payload), k.get()) ? 1 : 0;
+    });
+}
+
+void scriptDynDefGlobal(Runtime* rt, GCObject* key, std::uint64_t attrs) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        if (!rt->globalObject->findOwn(key))
+            rt->globalObject->putOwn(key, Value::undefined(), std::uint8_t(attrs));
+        return 0;
+    });
+}
+
+NativePair scriptDynTypeofGlobal(Runtime* rt, GCObject* key) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        const Value g = detail::Access::make(Type::Object, rt->globalObject.get());
+        if (!hasProperty(*rt, g, key))
+            return take(rt->str("undefined"));
+        return take(rt->str(typeOfName(getProperty(*rt, g, key))));
+    });
+}
+
+void scriptDynDefMember(Runtime* rt, std::int64_t mode, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        defineMemberForNative(*rt, int(mode), static_cast<DynObject*>(object), key, valueOf(tag, payload));
+        return 0;
+    });
+}
+
+void scriptDynDefElem(Runtime* rt, std::int64_t mode, GCObject* object, std::int64_t keyTag, std::uint64_t key, std::int64_t tag,
+                      std::uint64_t payload) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        Ref<GCObject> k = toPropertyKey(*rt, valueOf(keyTag, key));
+        defineMemberForNative(*rt, mode == 0 ? 3 : 0, static_cast<DynObject*>(object), k.get(), valueOf(tag, payload));
+        return 0;
+    });
+}
+
+void scriptDynClassSetup(Runtime* rt, std::int64_t hasSuper, std::int64_t superTag, std::uint64_t super, std::int64_t ctorTag,
+                         std::uint64_t ctor) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        classSetupForNative(*rt, hasSuper != 0, valueOf(superTag, super), valueOf(ctorTag, ctor));
+        return 0;
+    });
+}
+
+GCObject* scriptDynForInKeys(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return forInKeysForNative(*rt, valueOf(tag, payload)); });
+}
+
+NativePair scriptDynForInNext(Runtime* rt, GCObject* keys, std::int64_t indexTag, std::uint64_t index) noexcept
+{
+    (void)rt;
+    auto* array = static_cast<DynArray*>(keys);
+    const std::size_t at = std::size_t(numberOf(valueOf(indexTag, index)));
+    if (at >= array->elements.size())
+        return {0, std::uint64_t(kForInDone)};
+    return take(array->elements[at]);
+}
+
+NativePair scriptDynToObject(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(toObject(*rt, valueOf(tag, payload))); });
+}
+
 NativePair scriptDynGlobalThis(Runtime* rt) noexcept
 {
     return take(detail::Access::make(Type::Object, rt->globalObject.get()));

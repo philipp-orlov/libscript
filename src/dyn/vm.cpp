@@ -1131,6 +1131,70 @@ void throwValueForNative(Runtime& rt, const Value& v)
     throwValue(rt, v);
 }
 
+void classSetupForNative(Runtime& rt, bool hasSuper, const Value& superValue, const Value& ctorValue)
+{
+    DynFunction* ctor = asFunction(ctorValue);
+    DynFunction* super = asFunction(superValue);
+    if (hasSuper && !super && !superValue.isNull())
+        throwError(rt, ErrorCode::TypeError, "a class can only extend a constructor or null");
+    DynObject* protoParent = super ? asObject(getPropertyOfObject(rt, super, rt.atom.prototype.get(), superValue))
+                                   : (hasSuper ? nullptr : rt.objectProto.get());
+    DynObject* proto = rt.newObject(protoParent);
+    Value protoValue = detail::Access::adopt(Type::Object, proto);
+    proto->putOwn(rt.atom.constructor.get(), ctorValue, PropWritable | PropConfigurable);
+    ctor->putOwn(rt.atom.prototype.get(), protoValue, 0);
+    ctor->homeObject.reset(proto);
+    ctor->isClassConstructor = true;
+    ctor->isDerivedConstructor = hasSuper;
+    if (super)
+        ctor->setProto(super);
+}
+
+void defineMemberForNative(Runtime& rt, int mode, DynObject* target, GCObject* key, const Value& v)
+{
+    (void)rt;
+    if (mode == 3) {
+        target->putOwn(key, v);
+        return;
+    }
+    if (DynFunction* m = asFunction(v))
+        m->homeObject.reset(target);
+    if (mode == 0) {
+        target->putOwn(key, v, PropWritable | PropConfigurable);
+        return;
+    }
+    Prop* existing = target->findOwn(key);
+    if (!existing || !existing->accessor())
+        existing = &target->putOwn(key, Value::undefined(), PropEnumerable | PropConfigurable | PropAccessor);
+    if (mode == 1)
+        existing->value = v;
+    else
+        existing->setter = v;
+}
+
+DynArray* forInKeysForNative(Runtime& rt, const Value& src)
+{
+    DynArray* keys = rt.newArray();
+    Value keysValue = detail::Access::adopt(Type::Object, keys);
+    if (DynObject* obj = asObject(src)) {
+        GcList seen;
+        for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+            for (const Value& k : ownKeys(rt, cursor, true, false)) {
+                GCObject* atom = rt.intern(asString(k)->text());
+                if (std::find(seen.begin(), seen.end(), atom) != seen.end())
+                    continue;
+                seen.push_back(atom);
+                keys->append(k);
+            }
+        }
+    } else if (StringCell* s = asString(src)) {
+        for (std::uint32_t i = 0; i < s->text().size(); ++i)
+            keys->append(rt.str(numberToString(i)));
+    }
+    detail::incRef(keys);
+    return keys;
+}
+
 // ---------------------------------------------------------- dispatch ---
 
 namespace {

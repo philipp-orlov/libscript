@@ -62,7 +62,7 @@ class Gen:
 
     def stmt(self, s, ind, loop):
         p = '    ' * ind
-        k = self.r.randint(0, 19)
+        k = self.r.randint(0, 26)
         self.depth += 1
         deep = self.depth > 3
         try:
@@ -119,6 +119,31 @@ class Gen:
                 return [f"{p}let {v} = {e}; const c{v} = () => {v}; log(c{v}());"]
             if k == 18:
                 return [f"{p}gt = {self.expr(s)}; log(gt);"]
+            if k == 19:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}var o{v} = {{ a: {e}, b: 2, 'c d': 3 }};", f"{p}for (var {v} in o{v}) {{ log({v}); log(o{v}[{v}]); }}"]
+            if k == 20:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}var {v} = function (x, ...rest) {{ log(rest.length); return rest.length ? rest[0] : x; }};",
+                        f"{p}log({v}({e})); log({v}(1, {e}, 3));"]
+            if k == 21:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}var {v} = function () {{ log(arguments.length); return arguments[1]; }};",
+                        f"{p}log({v}({e})); log({v}(1, {e}, 3));"]
+            if k == 22:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}var {v} = new C({e}, 2);", f"{p}log({v} instanceof C); log('x' in {v}); log(delete {v}.x); log('x' in {v}); log({v}.x);"]
+            if k == 23:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}var {v} = {{ n: {e}, get g() {{ return this.n; }}, set g(w) {{ this.n = w; }}, m() {{ return this.n; }}, ['k' + 1]: 7 }};",
+                        f"{p}log({v}.g); {v}.g = 5; log({v}.m()); log({v}.k1);"]
+            if k == 24:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}class {v} extends C {{ constructor(q) {{ super(q, 1); }} get w() {{ return this.y; }} m(v) {{ return super.m(v); }} }}",
+                        f"{p}log(new {v}({e}).m(3)); log(new {v}(1).w);"]
+            if k == 25:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}var {v} = [1, {e}]; {v}[0] += 2; {v}['x'] = {e}; log({v}[0]); log(typeof nope{v}); log(typeof {v});"]
             return [f"{p}log({self.expr(s)});"]
         finally:
             self.depth -= 1

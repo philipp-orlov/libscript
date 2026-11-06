@@ -65,6 +65,23 @@ NativePair scriptDynGetIterator(Runtime* rt, std::int64_t tag, std::uint64_t pay
 std::int32_t scriptDynIterNext(Runtime* rt, std::int64_t tag, std::uint64_t payload, NativePair* out) noexcept;
 void scriptDynIterClose(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 NativePair scriptDynGlobalThis(Runtime* rt) noexcept;
+GCObject* scriptDynArgsArray(Runtime* rt, const Value* args, std::uint64_t argc, std::uint64_t from) noexcept;
+std::int32_t scriptDynInstanceOf(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept;
+std::int32_t scriptDynIn(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept;
+std::int32_t scriptDynDeleteProp(Runtime* rt, std::int64_t tag, std::uint64_t payload, GCObject* key) noexcept;
+std::int32_t scriptDynDeleteElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t keyTag, std::uint64_t key) noexcept;
+void scriptDynDefGlobal(Runtime* rt, GCObject* key, std::uint64_t attrs) noexcept;
+NativePair scriptDynTypeofGlobal(Runtime* rt, GCObject* key) noexcept;
+void scriptDynDefMember(Runtime* rt, std::int64_t mode, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept;
+void scriptDynDefElem(Runtime* rt, std::int64_t mode, GCObject* object, std::int64_t keyTag, std::uint64_t key, std::int64_t tag,
+                      std::uint64_t payload) noexcept;
+void scriptDynClassSetup(Runtime* rt, std::int64_t hasSuper, std::int64_t superTag, std::uint64_t super, std::int64_t ctorTag,
+                         std::uint64_t ctor) noexcept;
+GCObject* scriptDynForInKeys(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
+/// The tag says the keys ran out.
+inline constexpr std::int64_t kForInDone = -1;
+NativePair scriptDynForInNext(Runtime* rt, GCObject* keys, std::int64_t indexTag, std::uint64_t index) noexcept;
+NativePair scriptDynToObject(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 
 }  // extern "C"
 
@@ -76,6 +93,9 @@ void setGlobalForNative(Runtime& rt, GCObject* key, const Value& v);
 Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, DynFunction* parent,
                            Box* const* boxes);
 [[noreturn]] void throwValueForNative(Runtime& rt, const Value& v);
+void classSetupForNative(Runtime& rt, bool hasSuper, const Value& superValue, const Value& ctorValue);
+void defineMemberForNative(Runtime& rt, int mode, DynObject* target, GCObject* key, const Value& v);
+DynArray* forInKeysForNative(Runtime& rt, const Value& src);
 
 }  // namespace dyn
 }  // namespace internal

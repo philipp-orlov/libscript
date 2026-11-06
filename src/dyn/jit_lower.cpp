@@ -181,8 +181,6 @@ public:
     {
         if (!code_.handlers.empty())
             refuse("the function has exception handlers");
-        if (code_.hasRest || code_.argumentsSlot != FunctionCode::kNoSlot)
-            refuse("the function reads its arguments as an array");
         prepare();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
 
@@ -255,6 +253,47 @@ public:
             none.d = cellReg_[slot];
             none.imm = 0;
             cellOwned_[slot] = 1;
+        }
+        // `arguments` and a rest parameter are arrays made at entry, from the arguments as they came.
+        if (code_.hasRest) {
+            const std::int32_t rt = rtReg();
+            const std::int32_t from = immReg(std::int64_t(code_.arity));
+            const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynArgsArray), {rt, args, argc, from}, true);
+            const std::uint32_t slot = std::uint32_t(code_.arity);
+            if (slot < slots) {
+                IrInst& mov = inst(IrOp::Mov);
+                mov.d = localReg_[slot];
+                mov.a = r;
+                IrInst& tag = inst(IrOp::MovImm);
+                tag.d = localTag_[slot];
+                tag.imm = std::int64_t(Type::Object);
+                localOwned_[slot] = 1;
+            } else {
+                decRefOf(r, -1, false);
+            }
+        }
+        if (code_.argumentsSlot != FunctionCode::kNoSlot) {
+            const std::int32_t rt = rtReg();
+            const std::int32_t from = immReg(0);
+            const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynArgsArray), {rt, args, argc, from}, true);
+            const std::uint32_t slot = code_.argumentsSlot;
+            if (code_.argumentsBoxed) {
+                const std::int32_t rt2 = rtReg();
+                const std::int32_t tag = immReg(std::int64_t(Type::Object));
+                const std::int32_t box = callCold(reinterpret_cast<void*>(&scriptDynNewBox), {rt2, tag, r}, true);
+                decRefOf(r, -1, false);
+                IrInst& mov = inst(IrOp::Mov);
+                mov.d = cellReg_[slot];
+                mov.a = box;
+            } else {
+                IrInst& mov = inst(IrOp::Mov);
+                mov.d = localReg_[slot];
+                mov.a = r;
+                IrInst& tag = inst(IrOp::MovImm);
+                tag.d = localTag_[slot];
+                tag.imm = std::int64_t(Type::Object);
+                localOwned_[slot] = 1;
+            }
         }
         for (std::uint32_t slot : code_.boxedParams) {
             if (slot >= slots || isNumberLocal(slot))
@@ -405,7 +444,12 @@ private:
 
     bool isNumberLocal(std::uint32_t slot) const noexcept
     {
-        return slot >= std::uint32_t(std::max(code_.arity, 0)) && !notNumber_[slot];
+        if (slot < std::uint32_t(std::max(code_.arity, 0)) || notNumber_[slot])
+            return false;
+        // What the entry sequence fills in is an object.
+        if (code_.hasRest && slot == std::uint32_t(code_.arity))
+            return false;
+        return slot != code_.argumentsSlot;
     }
 
     // ---- entries ----
@@ -1199,6 +1243,167 @@ private:
                 release(value);
                 return true;
             }
+            case Op::GetElemDup: {
+                // base key -> value base
+                Entry key = pop();
+                Entry base = pop();
+                secureWeak();
+                makeOwned(base);
+                const std::int32_t rt = rtReg();
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynGetElem), {rt, tagReg(base), payloadReg(base), tagReg(key), payloadReg(key)}, r,
+                         t, true, {base, key});
+                release(key);
+                push(taggedEntry(r, t, Own::Weak));
+                push(base);
+                return true;
+            }
+            case Op::InstanceOf: {
+                Entry ctor = pop();
+                Entry obj = pop();
+                binaryPredicate(reinterpret_cast<void*>(&scriptDynInstanceOf), obj, ctor);
+                return true;
+            }
+            case Op::In: {
+                Entry container = pop();
+                Entry key = pop();
+                binaryPredicate(reinterpret_cast<void*>(&scriptDynIn), key, container);
+                return true;
+            }
+            case Op::DeleteProp: {
+                Entry base = pop();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t k = ptrReg(code_.atoms[operand()].get());
+                const std::int32_t d = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynDeleteProp), {rt, tagReg(base), payloadReg(base), k}, d, -1, true, {base});
+                release(base);
+                push(boolEntry(d));
+                return true;
+            }
+            case Op::DeleteElem: {
+                Entry key = pop();
+                Entry base = pop();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t d = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynDeleteElem), {rt, tagReg(base), payloadReg(base), tagReg(key), payloadReg(key)}, d,
+                         -1, true, {base, key});
+                release(key);
+                release(base);
+                push(boolEntry(d));
+                return true;
+            }
+            case Op::DefGlobal: {
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t k = ptrReg(code_.atoms[operand()].get());
+                const std::int32_t attrs = immReg(std::int64_t(readOperand(c, pc + 5)));
+                coldCall(reinterpret_cast<void*>(&scriptDynDefGlobal), {rt, k, attrs}, -1, -1, true);
+                return true;
+            }
+            case Op::TypeofGlobal: {
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t k = ptrReg(code_.atoms[operand()].get());
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynTypeofGlobal), {rt, k}, r, t, true);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
+            case Op::DefMethod:
+            case Op::DefGetter:
+            case Op::DefSetter: {
+                Entry value = pop();
+                const Entry& object = top();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t k = ptrReg(code_.atoms[operand()].get());
+                const std::int32_t mode = immReg(op == Op::DefMethod ? 0 : op == Op::DefGetter ? 1 : 2);
+                coldCall(reinterpret_cast<void*>(&scriptDynDefMember), {rt, mode, object.r, k, tagReg(value), payloadReg(value)}, -1, -1, true,
+                         {value});
+                release(value);
+                return true;
+            }
+            case Op::DefElem:
+            case Op::DefMethodElem: {
+                Entry value = pop();
+                Entry key = pop();
+                const Entry& object = top();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t mode = immReg(op == Op::DefElem ? 0 : 1);
+                coldCall(reinterpret_cast<void*>(&scriptDynDefElem), {rt, mode, object.r, tagReg(key), payloadReg(key), tagReg(value), payloadReg(value)},
+                         -1, -1, true, {value, key});
+                release(value);
+                release(key);
+                return true;
+            }
+            case Op::ClassSetup: {
+                // ctor [super] -> ctor
+                Entry ctor = pop();
+                const bool hasSuper = operand() != 0;
+                Entry super = hasSuper ? pop() : constTagged(Type::Undefined);
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                coldCall(reinterpret_cast<void*>(&scriptDynClassSetup),
+                         {rt, immReg(hasSuper ? 1 : 0), tagReg(super), payloadReg(super), tagReg(ctor), payloadReg(ctor)}, -1, -1, true, {ctor, super});
+                release(super);
+                makeOwned(ctor);
+                push(ctor);
+                return true;
+            }
+            case Op::ForInStart: {
+                Entry src = pop();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t keys = callCold(reinterpret_cast<void*>(&scriptDynForInKeys), {rt, tagReg(src), payloadReg(src)}, true, {src});
+                release(src);
+                push(objectEntry(keys));
+                push(constDouble(0));
+                return true;
+            }
+            case Op::ForInNext: {
+                // keys index -> keys index key, or on to the target at the end.
+                const std::uint32_t target = operand();
+                secureWeak();
+                flowTo(target);
+                const std::int32_t rt = rtReg();
+                const Entry& keys = top(1);
+                const Entry& index = top(0);
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynForInNext), {rt, keys.r, tagReg(index), payloadReg(index)}, r, t, true);
+                branchCmp(t, IrCond::Eq, kForInDone, labels_[target]);
+                Entry stepped = pop();
+                const std::int32_t current = doubleReg(stepped);
+                const std::int32_t one = doubleReg(constDouble(1));
+                const std::int32_t next = fn_.newVreg(true);
+                IrInst& add = inst(IrOp::FAdd);
+                add.d = next;
+                add.a = current;
+                add.b = one;
+                release(stepped);
+                Entry advanced = constDouble(0);
+                advanced.isConst = false;
+                advanced.r = next;
+                push(advanced);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
+            case Op::ToObject: {
+                Entry a = pop();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynToObject), {rt, tagReg(a), payloadReg(a)}, r, t, true, {a});
+                release(a);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
             case Op::Closure: closure(operand()); return true;
             case Op::Call: call(operand()); return true;
             case Op::New: construct(operand()); return true;
@@ -1441,6 +1646,17 @@ private:
             default: break;
         }
         refuse(std::string(opName(op)) + " is not compiled yet");
+    }
+
+    void binaryPredicate(void* helper, Entry& a, Entry& b)
+    {
+        secureWeak();
+        const std::int32_t rt = rtReg();
+        const std::int32_t d = fn_.newVreg(false);
+        coldCall(helper, {rt, tagReg(a), payloadReg(a), tagReg(b), payloadReg(b)}, d, -1, true, {a, b});
+        release(b);
+        release(a);
+        push(boolEntry(d));
     }
 
     void releaseLocals(std::int32_t keep)

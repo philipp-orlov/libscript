@@ -681,6 +681,46 @@ o.join(' '))JS"),
              std::string("true:false true:true false:false false:false false:false false:false false:false false:false false:false false:false false:true true:false true:false false:false true false"));
 }
 
+TEST(constructorsRunInPlaceAsTheyWouldAnywhere)
+{
+    // Expected values are from JavaScriptCore.
+    CHECK_EQ(run(R"JS(var out=[];
+function P(a,b){this.a=a;this.b=b;}
+P.prototype.sum=function(){return this.a+this.b;};
+function R(x){this.x=x;return {other:x};}
+function Q(x){this.x=x;return 5;}
+function Nope(x){if(x>600)throw new Error('big'+x);this.x=x;}
+function Self(){this.me=this;this.n=1;}
+function Few(a,b,c){this.a=a;this.b=b;this.c=c;}
+function Cond(f){if(f)this.y=1;else this.z=2;this.w=3;}
+function run(i){var p=new P(i,2),r=new R(i),q=new Q(i),s=new Self(),f=new Few(i),c=new Cond(i%2);
+ return p.sum()+':'+r.other+':'+r.x+':'+q.x+':'+s.me.n+':'+f.a+':'+f.c+':'+Object.keys(c).join('')+':'+(p instanceof P)+':'+(p.constructor===P);}
+var r;for(var i=0;i<800;i++)r=run(i);out.push(r);
+for(var i=590;i<610;i++){try{var n=new Nope(i);r=n.x;}catch(e){r=e.message;}}out.push(r);
+var oldProto=P.prototype;
+P.prototype={sum:function(){return -1;}};out.push(new P(1,2).sum());out.push(run(1));
+P.prototype=oldProto;out.push(new P(1,2).sum());
+P.prototype=3;var w=new P(1,2);out.push(Object.getPrototypeOf(w)===Object.prototype);
+P=function(){this.k=9;};out.push(new P().k);
+function G(v){this.v=v;} Object.defineProperty(G.prototype,'v',{set:function(x){this._v=x+1;},get:function(){return this._v;}});
+for(var i=0;i<600;i++){r=new G(i).v;}out.push(r);
+function H(v){this.v=v;} for(var i=0;i<600;i++){r=new H(i).v;} Object.defineProperty(H.prototype,'v',{set:function(x){this._v=x*2;},get:function(){return this._v;}});out.push(new H(4).v);
+function F2(v){this.v=v;} for(var i=0;i<600;i++){r=new F2(i);} Object.freeze(F2.prototype); out.push(new F2(4).v);
+var total=0;function Cnt(){total++;this.a=total;}for(var i=0;i<700;i++){new Cnt();}out.push(total);
+out.join('\n'))JS"),
+             std::string(R"JS(801:799:undefined:799:1:799:undefined:yw:true:true
+big609
+-1
+-1:1:undefined:1:1:1:undefined:yw:true:false
+3
+true
+9
+600
+8
+4
+700)JS"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

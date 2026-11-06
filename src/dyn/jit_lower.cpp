@@ -513,6 +513,8 @@ public:
             normalizeThis();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
         const std::uint32_t slots = code_.numLocals;
+        if (startShape_)
+            learnShape(thisReg_, startShape_);
         localReg_.assign(slots, -1);
         localTag_.assign(slots, -1);
         localOwned_.assign(slots, 0);
@@ -4089,6 +4091,8 @@ private:
             makeOwned(callee);
         std::vector<Entry> held = args;
         held.push_back(callee);
+        if (constructInPlace(callee, args, held))
+            return;
         const std::int32_t area = layOutArgs(args);
         const std::int32_t rt = rtReg();
         const std::int32_t fnTag = tagReg(callee);
@@ -4166,6 +4170,111 @@ private:
             release(arg);
         release(callee);
         push(taggedEntry(r, t, Own::Owned));
+    }
+
+    /// `new F(...)` for the plain function F is known to be, small enough to go in place of the call: its object is made
+    /// here, of a shape known from the start, and its body writes the fields of that. False, with nothing emitted, when it
+    /// is not that.
+    bool constructInPlace(const Entry& callee, const std::vector<Entry>& args, const std::vector<Entry>& held)
+    {
+        if (!callee.pinned || depth_ >= 2)
+            return false;
+        auto* fn = const_cast<DynFunction*>(static_cast<const DynFunction*>(callee.hint));
+        if (fn->isArrow || !fn->shape || fn->code->isDerivedConstructor || !inlinable(*fn->code))
+            return false;
+        std::uint32_t copies = 0;
+        for (const Lowering* up = this; up; up = up->parent_) {
+            if (&up->code_ == fn->code.get())
+                ++copies;
+        }
+        const Prop* prototype = fn->findOwn(rt_.atom.prototype.get());
+        if (copies > 1 || !prototype || prototype->accessor() || !prototype->value.isObject())
+            return false;
+        auto* proto = static_cast<DynObject*>(detail::Access::ptr(prototype->value));
+        Shape* root = rt_.rootShapeFor(proto);
+        if (!root)
+            return false;
+        const std::int64_t at = std::int64_t(prototype - fn->props.data()) * std::int64_t(sizeof(Prop));
+        const Mark before = mark();
+        const std::int32_t siteHere = site();
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const std::int32_t finished = newLabel();
+        guardShape(callee, fn->shape, slow);
+        const std::int32_t props = loadHeader(callee.r, kPropsOffset);
+        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1);
+        branchCmp(protoTag, IrCond::Ne, std::int64_t(Type::Object), slow);
+        const std::int32_t protoNow = load(props, at + kPropValueOffset + kPayload, 8);
+        // Its objects then start from the shape that prototype's do. It stays alive, or something else could come to be
+        // at that address.
+        keepAlive(proto);
+        {
+            const std::int32_t want = ptrReg(proto);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = protoNow;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = slow;
+        }
+        const std::int32_t self = fn_.newVreg(false);
+        coldCall(reinterpret_cast<void*>(&scriptDynNewOf), {rtReg(), protoNow, immReg(std::int64_t(std::min<std::uint32_t>(root->expect, 32)))},
+                 self, -1, true, held);
+        const std::vector<std::uint8_t> none(fn->code->numLocals + 1, 1);
+        std::vector<Entry> heldWithSelf = held;
+        heldWithSelf.push_back(objectEntry(self));
+        try {
+            Lowering inner(*this, *fn->code, none, heldWithSelf, siteHere);
+            inner.startShape_ = root;
+            inner.runInline(callee.r, objectEntry(self), args, r, t, finished);
+        } catch (const Refuse&) {
+            rollBack(before);
+            return false;
+        }
+        ++fn_.inlinedMethods;
+        inst(IrOp::Label).imm = finished;
+        forgetFacts();
+        // What it returned counts only if that is an object.
+        const std::int32_t returned = newLabel();
+        branchCmp(t, IrCond::Eq, std::int64_t(Type::Object), returned);
+        release(taggedEntry(r, t, Own::Owned));
+        {
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = r;
+            mov.a = self;
+            IrInst& tag = inst(IrOp::MovImm);
+            tag.d = t;
+            tag.imm = std::int64_t(Type::Object);
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::Label).imm = returned;
+        release(objectEntry(self));
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        {
+            const std::int32_t area = layOutArgs(const_cast<std::vector<Entry>&>(args));
+            IrCall viaHelper;
+            viaHelper.kind = IrCallKind::Helper;
+            viaHelper.helper = reinterpret_cast<void*>(&scriptDynNew);
+            viaHelper.args = {rtReg(), immReg(std::int64_t(Type::Object)), callee.r, area, immReg(std::int64_t(args.size()))};
+            viaHelper.result = r;
+            viaHelper.resultTag = t;
+            viaHelper.site = site();
+            viaHelper.publishFrame = true;
+            viaHelper.exit = makeExit(0, held);
+            fn_.calls.push_back(std::move(viaHelper));
+            inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        for (const Entry& arg : args)
+            release(arg);
+        push(taggedEntry(r, t, Own::Owned));
+        return true;
     }
 
     /// `local = local + x`: the left operand borrows a local nothing else on the stack borrows, which holds a count of
@@ -5014,6 +5123,8 @@ private:
     bool epochKnown_ = false;
     std::vector<std::int32_t> knownArrays_;
     bool intWork_ = false;
+    /// Inlined as a constructor: the shape `this` starts with.
+    const Shape* startShape_ = nullptr;
 };
 
 /// Which locals may be read before anything was written to them, along some path. Those start as `undefined`, so they are no

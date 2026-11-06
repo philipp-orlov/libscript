@@ -57,6 +57,8 @@ void scriptDynSetGlobal(Runtime* rt, GCObject* key, std::int64_t tag, std::uint6
 /// Native code whose parameters were not what it takes them to be: learn that, and do the call some other way.
 NativePair scriptDynEntryMiss(Runtime* rt, const FunctionCode* code, DynFunction* fn, std::int64_t thisTag,
                               std::uint64_t self, const Value* args, std::uint64_t argc) noexcept;
+/// An object with this prototype and room for this many properties in its cell.
+GCObject* scriptDynNewOf(Runtime* rt, GCObject* proto, std::uint64_t room) noexcept;
 NativePair scriptDynCall(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std::int64_t thisTag, std::uint64_t self,
                          const Value* args, std::uint64_t argc) noexcept;
 NativePair scriptDynNew(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, const Value* args, std::uint64_t argc) noexcept;

@@ -365,6 +365,11 @@ GCObject* scriptDynNewObject(Runtime* rt, std::uint64_t room) noexcept
     return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return rt->newObjectSized(rt->objectProto.get(), std::uint32_t(room)); });
 }
 
+GCObject* scriptDynNewOf(Runtime* rt, GCObject* proto, std::uint64_t room) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return rt->newObjectSized(static_cast<DynObject*>(proto), std::uint32_t(room)); });
+}
+
 GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
 {
     auto* fn = static_cast<DynFunction*>(cell);

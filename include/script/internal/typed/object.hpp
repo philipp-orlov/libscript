@@ -73,7 +73,18 @@ enum class ElemStore : std::uint8_t
 };
 
 ElemStore elemStoreOf(const TypeInfo* elementType) noexcept;
-std::size_t elemStoreWidth(ElemStore s) noexcept;
+inline std::size_t elemStoreWidth(ElemStore s) noexcept
+{
+    switch (s) {
+        case ElemStore::I1: return 1;
+        case ElemStore::I2: return 2;
+        case ElemStore::I4:
+        case ElemStore::R4: return 4;
+        case ElemStore::I8:
+        case ElemStore::R8: return 8;
+        default: return sizeof(Value);
+    }
+}
 
 struct CSArray : GCObject
 {

@@ -127,6 +127,29 @@ extern "C" {
 
 GCObject* scriptJitNewInstance(Runtime* rt, const TypeInfo* type) noexcept
 {
+    // The common case in one frame: a type whose fresh bytes are known, no collection due and no limit to check.
+    ContextImpl& ctx = rt->ctx;
+    if (type && !type->instanceImage.empty() && !ctx.options.memoryLimit && ctx.heapBytes < ctx.nextGcBytes &&
+        ctx.liveObjects + ctx.liveStrings < ctx.nextGcCells) {
+        const std::size_t bytes = type->instanceImage.size() * 8;
+        void* memory = nullptr;
+        try {
+            memory = ctx.heap.allocate(bytes);
+        } catch (...) {
+            memory = nullptr;  // the long way below reports it
+        }
+        if (memory) {
+            auto* out = static_cast<std::uint64_t*>(memory);
+            const std::uint64_t* image = type->instanceImage.data();
+            for (std::size_t i = 0; i < bytes / 8; i += 2) {
+                out[i] = image[i];
+                out[i + 1] = image[i + 1];
+            }
+            auto* cell = static_cast<GCObject*>(memory);
+            ctx.linkKnown(cell, std::uint32_t(bytes));
+            return cell;
+        }
+    }
     return guarded(*rt, __builtin_return_address(0), [&]() -> GCObject* { return rt->newInstance(type); });
 }
 
@@ -948,7 +971,8 @@ bool tryOnStackReplacement(Runtime& rt, Frame& frame, std::uint32_t pc, Value& r
     // slots must read as empty from now on.
     const std::size_t pictureBytes = frame.slots.size() * sizeof(Value);
     void* picture = __builtin_alloca(pictureBytes);
-    std::memcpy(picture, static_cast<const void*>(frame.slots.data()), pictureBytes);
+    if (pictureBytes)
+        std::memcpy(picture, static_cast<const void*>(frame.slots.data()), pictureBytes);
     for (std::uint32_t slot : entry->ownedSlots) {
         if (slot < frame.slots.size())
             detail::Access::retag(frame.slots[slot], Type::Null);

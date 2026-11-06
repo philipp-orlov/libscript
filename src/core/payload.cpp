@@ -53,6 +53,31 @@ struct Flusher
 
 }  // namespace
 
+void* take(std::size_t bytes)
+{
+    const std::size_t bin = (bytes + kGranule - 1) / kGranule;
+    Cache& c = t_cache;
+    if (void* p = c.head[bin]) {
+        c.head[bin] = *static_cast<void**>(p);
+        --c.count[bin];
+        return p;
+    }
+    return refill(bin * kGranule);
+}
+
+void give(void* p, std::size_t bytes) noexcept
+{
+    const std::size_t bin = (bytes + kGranule - 1) / kGranule;
+    Cache& c = t_cache;
+    if (c.registered && c.count[bin] < (bin <= 16 ? 32 : 8)) {
+        *static_cast<void**>(p) = c.head[bin];
+        c.head[bin] = p;
+        ++c.count[bin];
+        return;
+    }
+    spill(p, bin * kGranule);
+}
+
 void* refill(std::size_t bytes)
 {
     Cache& c = t_cache;
@@ -63,6 +88,16 @@ void* refill(std::size_t bytes)
         c.registered = true;
     }
     return mem::PoolAllocator<char, &payloadPool>().allocate(bytes);
+}
+
+void* takeLarge(std::size_t bytes)
+{
+    return mem::PoolAllocator<char, &payloadPool>().allocate(bytes);
+}
+
+void giveLarge(void* p, std::size_t bytes) noexcept
+{
+    mem::PoolAllocator<char, &payloadPool>().deallocate(static_cast<char*>(p), bytes);
 }
 
 void spill(void* p, std::size_t bytes) noexcept

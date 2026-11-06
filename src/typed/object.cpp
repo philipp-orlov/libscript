@@ -138,19 +138,6 @@ ElemStore elemStoreOf(const TypeInfo* elementType) noexcept
     }
 }
 
-std::size_t elemStoreWidth(ElemStore s) noexcept
-{
-    switch (s) {
-        case ElemStore::I1: return 1;
-        case ElemStore::I2: return 2;
-        case ElemStore::I4: return 4;
-        case ElemStore::I8: return 8;
-        case ElemStore::R4: return 4;
-        case ElemStore::R8: return 8;
-        default: return sizeof(Value);
-    }
-}
-
 void CSArray::initElements() noexcept
 {
     if (store == ElemStore::Ref) {
@@ -159,8 +146,18 @@ void CSArray::initElements() noexcept
             new (first + i) Value();
         return;
     }
-    std::memset(data(), 0, std::size_t(length) * elemStoreWidth(store));
+    const std::size_t bytes = std::size_t(length) * elemStoreWidth(store);
+    if (bytes <= 64) {
+        // The cell is carved in 16-byte granules after a header that is a multiple of 16, so whole words fit.
+        auto* words = static_cast<std::uint64_t*>(data());
+        for (std::size_t i = 0; i < (bytes + 7) / 8; ++i)
+            words[i] = 0;
+        return;
+    }
+    std::memset(data(), 0, bytes);
 }
+
+static_assert(sizeof(CSArray) % 16 == 0, "initElements clears whole words after the header");
 
 CSArray::~CSArray()
 {

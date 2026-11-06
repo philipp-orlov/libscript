@@ -228,6 +228,10 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
         Value* slots = instance->slots();
         const std::uint32_t count = instance->count;
         const bool inTeardown = tearingDown;
+        // A dying tree is far from the cache: ask for every child before the first one is needed.
+        for (std::uint32_t i = 0; i < count; ++i)
+            if (GCObject* child = detail::Access::ptr(slots[i]))
+                __builtin_prefetch(child, 1);
         for (std::uint32_t i = 0; i < count; ++i) {
             GCObject* child = detail::Access::ptr(slots[i]);
             if (!child || --child->rc != 0 || inTeardown)
@@ -240,8 +244,12 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
             child->gcNext = pendingFree;
             pendingFree = child;
         }
-    } else if (cell->kind == CellKind::Array)
-        static_cast<typed::CSArray*>(cell)->typed::CSArray::~CSArray();
+    } else if (cell->kind == CellKind::Array) {
+        // An array of numbers holds nothing to release, and `~GCObject` does nothing.
+        auto* array = static_cast<typed::CSArray*>(cell);
+        if (array->store == typed::ElemStore::Ref)
+            array->typed::CSArray::~CSArray();
+    }
     else
         cell->~GCObject();
 #else

@@ -66,29 +66,12 @@ extern thread_local Cache t_cache;
 void* refill(std::size_t bytes);
 void spill(void* p, std::size_t bytes) noexcept;
 
-inline void* take(std::size_t bytes)
-{
-    const std::size_t bin = (bytes + kGranule - 1) / kGranule;
-    Cache& c = t_cache;
-    if (void* p = c.head[bin]) {
-        c.head[bin] = *static_cast<void**>(p);
-        --c.count[bin];
-        return p;
-    }
-    return refill(bin * kGranule);
-}
-inline void give(void* p, std::size_t bytes) noexcept
-{
-    const std::size_t bin = (bytes + kGranule - 1) / kGranule;
-    Cache& c = t_cache;
-    if (c.registered && c.count[bin] < (bin <= 16 ? 32 : 8)) {
-        *static_cast<void**>(p) = c.head[bin];
-        c.head[bin] = p;
-        ++c.count[bin];
-        return;
-    }
-    spill(p, bin * kGranule);
-}
+/// Out of line on purpose: every vector destructor calls these, and some of those run deep in recursion.
+void* take(std::size_t bytes);
+void give(void* p, std::size_t bytes) noexcept;
+/// Past the cache: straight to `payloadPool`, or the OS beyond its classes.
+void* takeLarge(std::size_t bytes);
+void giveLarge(void* p, std::size_t bytes) noexcept;
 }  // namespace payload_cache
 
 /// `mem::PoolAllocator` over `payloadPool`, with the thread's small cache in front.
@@ -110,17 +93,19 @@ public:
     {}
     T* allocate(std::size_t n)
     {
-        if (n <= payload_cache::kMaxBytes / sizeof(T) && n)
-            return static_cast<T*>(payload_cache::take(n * sizeof(T)));
-        return mem::PoolAllocator<T, &payloadPool>().allocate(n);
+        static_assert(alignof(T) <= 16, "the cache hands out 16-byte granules");
+        if (n <= payload_cache::kMaxBytes / sizeof(T))
+            return static_cast<T*>(n ? payload_cache::take(n * sizeof(T)) : payload_cache::takeLarge(0));
+        if (n > ~std::size_t{0} / sizeof(T))
+            throw std::bad_alloc();
+        return static_cast<T*>(payload_cache::takeLarge(n * sizeof(T)));
     }
     void deallocate(T* p, std::size_t n) noexcept
     {
-        if (n <= payload_cache::kMaxBytes / sizeof(T) && n) {
+        if (n && n <= payload_cache::kMaxBytes / sizeof(T))
             payload_cache::give(p, n * sizeof(T));
-            return;
-        }
-        mem::PoolAllocator<T, &payloadPool>().deallocate(p, n);
+        else
+            payload_cache::giveLarge(p, n * sizeof(T));
     }
     friend bool operator==(const PoolAlloc&, const PoolAlloc&) noexcept { return true; }
     friend bool operator!=(const PoolAlloc&, const PoolAlloc&) noexcept { return false; }

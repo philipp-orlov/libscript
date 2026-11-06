@@ -3212,7 +3212,8 @@ private:
             push(boolEntry(d));
             return;
         }
-        // Strictly against a number: anything not tagged a number is unequal, a number compares as a double.
+        // Strictly against a number: a double compares inline; any other tag -- a host's integer is a number too -- goes
+        // to the helper.
         if (strict && isKnownNumber(a) != isKnownNumber(b)) {
             const Entry& number = isKnownNumber(a) ? a : b;
             const Entry& other = isKnownNumber(a) ? b : a;
@@ -3220,10 +3221,8 @@ private:
             const std::int32_t tag = tagReg(other);
             const std::int32_t payload = payloadReg(other);
             const std::int32_t done = newLabel();
-            IrInst& none = inst(IrOp::MovImm);
-            none.d = d;
-            none.imm = wantEqual ? 0 : 1;
-            branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), done);
+            const std::int32_t slow = newLabel();
+            branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), slow);
             const std::int32_t y = fn_.newVreg(true);
             IrInst& bits = inst(IrOp::BitsToFp);
             bits.d = y;
@@ -3235,6 +3234,23 @@ private:
             in.b = y;
             in.cond = wantEqual ? IrCond::FEq : IrCond::FNe;
             in.width = 64;
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = slow;
+            {
+                const std::int32_t nt = tagReg(number);
+                const std::int32_t np = payloadReg(number);
+                const std::int32_t same = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynStrictEquals), {tag, payload, nt, np}, same, -1, false);
+                IrInst& set = inst(IrOp::Xor);
+                set.d = d;
+                set.a = same;
+                set.hasImm = true;
+                set.imm = wantEqual ? 0 : 1;
+                set.width = 32;
+            }
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
             inst(IrOp::Label).imm = done;
             release(other);
             release(number);

@@ -854,6 +854,7 @@ private:
             }
             pc_ = pc;
             if (labels_[pc] >= 0) {
+                previousOp_ = Op::Nop;
                 enterJoin(pc, fallsIn);
                 if (loopHead[pc] && stack_.empty())
                     addOsrEntry(pc);
@@ -865,12 +866,14 @@ private:
                 const Op after = Op(c[next]);
                 if (after == Op::JumpIfFalse || after == Op::JumpIfTrue) {
                     fusedCompare(op, after == Op::JumpIfTrue, readOperand(c, next + 1), pc);
+                    previousOp_ = Op::Nop;
                     pc = next + 5;
                     continue;
                 }
             }
             if (!lowerOne(op, pc))
                 fallsIn = false;
+            previousOp_ = op;
             pc = next;
         }
     }
@@ -1694,6 +1697,10 @@ private:
         Entry value = pop();
         copyOutReaders(slot);
         if (isNumberLocal(slot)) {
+            // Nothing reads the slot before a number is written to it: see `readsBeforeWrite`.
+            if (previousOp_ == Op::PushUndefined && value.isConst && value.rep == Rep::Tagged && value.hasKnownTag &&
+                value.known == Type::Undefined)
+                return;
             if (!isKnownNumber(value))
                 throw LowerAgain{slot};
             const std::int32_t from = doubleReg(value);
@@ -3266,6 +3273,8 @@ private:
     const std::vector<std::uint8_t>& notNumber_;
     std::uint32_t pc_ = 0;
     std::int32_t fnReg_ = -1, thisTag_ = -1, thisReg_ = -1;
+    /// The instruction lowered just before this one, in straight-line order; `Nop` after a label.
+    Op previousOp_ = Op::Nop;
     std::vector<std::int32_t> localReg_, localTag_, cellReg_;
     std::vector<std::uint8_t> localOwned_, cellOwned_, assigned_, reachable_;
     std::vector<std::int32_t> labels_;
@@ -3291,6 +3300,7 @@ std::vector<std::uint8_t> readsBeforeWrite(const FunctionCode& code)
         std::uint32_t pc = work.back();
         work.pop_back();
         std::vector<std::uint8_t> state = at[pc];
+        Op previous = Op::Nop;
         while (pc < c.size()) {
             const Op op = Op(c[pc]);
             const std::uint32_t next = pc + 1 + std::uint32_t(operandsOf(op)) * 4;
@@ -3299,10 +3309,13 @@ std::vector<std::uint8_t> readsBeforeWrite(const FunctionCode& code)
                 if (slot < slots && !state[slot])
                     out[slot] = 1;
             } else if (op == Op::SetLocal) {
+                // Storing `undefined` -- a hoisted `var` above all -- leaves the slot as good as unwritten: a read after it
+                // sees what a read before any write would, and a number local skips the store.
                 const std::uint32_t slot = readOperand(c, pc + 1);
                 if (slot < slots)
-                    state[slot] = 1;
+                    state[slot] = previous == Op::PushUndefined ? 0 : 1;
             }
+            previous = op;
             const auto flow = [&](std::uint32_t target) {
                 std::vector<std::uint8_t>& known = at[target];
                 if (known.empty()) {

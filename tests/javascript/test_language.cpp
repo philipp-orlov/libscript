@@ -410,3 +410,17 @@ TEST(appendingToAStringLeavesEveryOtherHolderAlone)
                  " return s.length; } var r; for (var j = 0; j < 400; j++) r = f(); r"),
              std::string("124"));
 }
+
+TEST(aVarReadBeforeItsFirstNumberIsUndefined)
+{
+    // Native code keeps such a local as a bare number once nothing can read it before a number is stored.
+    CHECK_EQ(run("function f(n) { var s; var r = typeof s; for (var i = 0; i < n; i++) s = i; return r + s; }"
+                 " var r; for (var j = 0; j < 400; j++) r = f(3); r"),
+             std::string("undefined2"));
+    CHECK_EQ(run("function f(n) { var s = 5; s = undefined; var r = String(s); for (var i = 0; i < n; i++) s = i; return r + s; }"
+                 " var r; for (var j = 0; j < 400; j++) r = f(3); r"),
+             std::string("undefined2"));
+    CHECK_EQ(run("function f(n) { var s = 1; if (n > 5) s = undefined; return String(s); }"
+                 " var r = ''; for (var j = 0; j < 400; j++) r = f(j % 10); r"),
+             std::string("undefined"));
+}

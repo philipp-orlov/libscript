@@ -49,8 +49,82 @@ inline mem::LocalHeap::Options payloadHeapOptions()
     options.large = &payloadPool();
     return options;
 }
+/// A few freed small buffers per size, kept by each thread in front of `payloadPool`: a property table or an element
+/// buffer made and dropped in a loop then costs a pop and a push. Bounded, and handed back when the thread ends.
+namespace payload_cache {
+inline constexpr std::size_t kGranule = 16;
+inline constexpr std::size_t kMaxBytes = 1024;
+inline constexpr std::size_t kBins = kMaxBytes / kGranule + 1;
+struct Cache
+{
+    void* head[kBins];
+    std::uint8_t count[kBins];
+    bool registered;
+    bool dead;
+};
+extern thread_local Cache t_cache;
+void* refill(std::size_t bytes);
+void spill(void* p, std::size_t bytes) noexcept;
+
+inline void* take(std::size_t bytes)
+{
+    const std::size_t bin = (bytes + kGranule - 1) / kGranule;
+    Cache& c = t_cache;
+    if (void* p = c.head[bin]) {
+        c.head[bin] = *static_cast<void**>(p);
+        --c.count[bin];
+        return p;
+    }
+    return refill(bin * kGranule);
+}
+inline void give(void* p, std::size_t bytes) noexcept
+{
+    const std::size_t bin = (bytes + kGranule - 1) / kGranule;
+    Cache& c = t_cache;
+    if (c.registered && c.count[bin] < (bin <= 16 ? 32 : 8)) {
+        *static_cast<void**>(p) = c.head[bin];
+        c.head[bin] = p;
+        ++c.count[bin];
+        return;
+    }
+    spill(p, bin * kGranule);
+}
+}  // namespace payload_cache
+
+/// `mem::PoolAllocator` over `payloadPool`, with the thread's small cache in front.
 template <class T>
-using PoolAlloc = mem::PoolAllocator<T, &payloadPool>;
+class PoolAlloc
+{
+public:
+    using value_type = T;
+    using is_always_equal = std::true_type;
+    using propagate_on_container_move_assignment = std::true_type;
+    template <class U>
+    struct rebind
+    {
+        using other = PoolAlloc<U>;
+    };
+    PoolAlloc() noexcept = default;
+    template <class U>
+    PoolAlloc(const PoolAlloc<U>&) noexcept
+    {}
+    T* allocate(std::size_t n)
+    {
+        if (n <= payload_cache::kMaxBytes / sizeof(T) && n)
+            return static_cast<T*>(payload_cache::take(n * sizeof(T)));
+        return mem::PoolAllocator<T, &payloadPool>().allocate(n);
+    }
+    void deallocate(T* p, std::size_t n) noexcept
+    {
+        if (n <= payload_cache::kMaxBytes / sizeof(T) && n) {
+            payload_cache::give(p, n * sizeof(T));
+            return;
+        }
+        mem::PoolAllocator<T, &payloadPool>().deallocate(p, n);
+    }
+    friend bool operator==(const PoolAlloc&, const PoolAlloc&) noexcept { return true; }
+    friend bool operator!=(const PoolAlloc&, const PoolAlloc&) noexcept { return false; }
+};
 /// A vector whose buffer comes from `payloadPool`. The kind every cell uses.
 template <class T>
 using Vec = std::vector<T, PoolAlloc<T>>;

@@ -24,5 +24,53 @@ mem::SizeClassPool& payloadPool()
     return *pool;
 }
 
+namespace payload_cache {
+
+thread_local Cache t_cache;
+
+namespace {
+
+void flush(Cache& c) noexcept
+{
+    for (std::size_t bin = 0; bin < kBins; ++bin) {
+        while (void* p = c.head[bin]) {
+            c.head[bin] = *static_cast<void**>(p);
+            mem::PoolAllocator<char, &payloadPool>().deallocate(static_cast<char*>(p), bin * kGranule);
+        }
+        c.count[bin] = 0;
+    }
+}
+
+struct Flusher
+{
+    ~Flusher()
+    {
+        t_cache.dead = true;
+        t_cache.registered = false;
+        flush(t_cache);
+    }
+};
+
+}  // namespace
+
+void* refill(std::size_t bytes)
+{
+    Cache& c = t_cache;
+    if (!c.registered && !c.dead) {
+        // Only now does the thread get something to run at its end; the cache itself needs no constructor.
+        static thread_local Flusher flusher;
+        (void)flusher;
+        c.registered = true;
+    }
+    return mem::PoolAllocator<char, &payloadPool>().allocate(bytes);
+}
+
+void spill(void* p, std::size_t bytes) noexcept
+{
+    mem::PoolAllocator<char, &payloadPool>().deallocate(static_cast<char*>(p), bytes);
+}
+
+}  // namespace payload_cache
+
 }  // namespace internal
 }  // namespace script

@@ -45,6 +45,10 @@ Value enterNative(Runtime& rt, DynFunction* fn, const FunctionCode& code, const 
                   std::size_t argc);
 /// At a loop head with an empty stack: carry on in native code, if there is an entry for here.
 bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result);
+/// Carry on with a call in the interpreter from `pc`, the frame filled in by `fill`: where native code that assumed too
+/// much hands over.
+Value resumeInterpreter(Runtime& rt, DynFunction* fn, const FunctionCode& code, const Value& thisValue, std::uint32_t pc,
+                        void (*fill)(Frame&, void*), void* state);
 /// "    at ..." lines for a run of native frames.
 std::string describeNativeFrames(const Runtime& rt, void* topFrame, const void* topPc, int& shown);
 

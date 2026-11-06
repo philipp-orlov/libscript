@@ -36,6 +36,12 @@ NativePair scriptDynToPropertyKeyOp(Runtime* rt, std::int64_t tag, std::uint64_t
 
 /// These four borrow: what they return stays alive until the next one returns, which is how their slow path can join a fast
 /// path that only reads.
+/// Native code that assumed something no longer true: the interpreter takes the call over. `header` holds the pc to
+/// carry on from in its low half and how many stack entries there are in its high one; after 16 bytes come the locals,
+/// the cells and the stack entries, 16 bytes each: the tag in the first byte, in the second whether the count goes with
+/// it, the payload in the second word.
+NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* fn, std::int64_t thisTag,
+                           std::uint64_t thisPayload, std::uint8_t* header) noexcept;
 NativePair scriptDynGetProp(Runtime* rt, const FunctionCode* code, std::int64_t tag, std::uint64_t payload,
                             std::uint32_t operand) noexcept;
 NativePair scriptDynGetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t keyTag,

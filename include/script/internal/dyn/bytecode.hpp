@@ -198,6 +198,11 @@ struct PropertySite
     std::uint64_t epoch = 0;    ///< `protoEpoch` when `holder` or `addTo` was worked out
     std::uint32_t index = 0;    ///< position in the property table
     std::uint32_t misses = 0;
+    /// What kinds of value reads through this site have given: `kSawNumber`, `kSawOther`.
+    std::uint8_t saw = 0;
+    static constexpr std::uint8_t kSawNumber = 1;
+    static constexpr std::uint8_t kSawOther = 2;
+    void see(const Value& v) noexcept { saw |= v.type() == Type::Double ? kSawNumber : kSawOther; }
     /// The property is a getter, to call with the receiver; `holder` and `index` say where it is.
     bool getter = false;
     /// Further receiver shapes a plain read or write has met, each with where the property is in that one: on the
@@ -295,6 +300,11 @@ struct FunctionCode
     mutable typed::NativeCode* jitCode = nullptr;
     mutable bool jitRefused = false;
     mutable std::uint32_t jitHotness = 0;
+    /// Times native code has handed a call back to the interpreter part way through, since it was last compiled.
+    mutable std::uint32_t jitBails = 0;
+    /// Times native code has been thrown away for bailing too often. Past `kJitSpeculations`, nothing is assumed.
+    mutable std::uint8_t jitGeneration = 0;
+    static constexpr std::uint8_t kJitSpeculations = 2;
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;

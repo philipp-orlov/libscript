@@ -194,7 +194,7 @@ def run(tool, env, path):
     e = dict(os.environ)
     e.update(env)
     try:
-        p = subprocess.run([tool] + (['--interpret'] if env.get('X_INTERP') else []) + [path], capture_output=True, text=True, timeout=30, env=e)
+        p = subprocess.run([tool] + (['--interpret'] if env.get('X_INTERP') else []) + [path], capture_output=True, text=True, errors="replace", timeout=30, env=e)
     except subprocess.TimeoutExpired:
         return 'timeout', ''
     return p.returncode, p.stdout + p.stderr

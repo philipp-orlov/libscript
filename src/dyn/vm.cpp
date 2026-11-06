@@ -566,10 +566,8 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
     return getProperty(rt, base, key);
 }
 
-/// `base.key`, with what the site knows.
-inline Value getPropertySite(Runtime& rt, const FunctionCode& code, const Value& base, GCObject* key, std::uint32_t siteIndex)
+inline Value getPropertySiteOnce(Runtime& rt, const Value& base, GCObject* key, PropertySite* site)
 {
-    PropertySite* site = siteOf(code, siteIndex);
     if (site && base.type() == Type::Object && detail::Access::ptr(base)->kind == CellKind::Object) {
         auto* obj = static_cast<DynObject*>(detail::Access::ptr(base));
         if (obj->shape && obj->shape == site->shape) {
@@ -595,6 +593,16 @@ inline Value getPropertySite(Runtime& rt, const FunctionCode& code, const Value&
         }
     }
     return getPropertyLearning(rt, base, key, site);
+}
+
+/// `base.key`, with what the site knows; the site remembers what kind of value it was, for native code to count on.
+inline Value getPropertySite(Runtime& rt, const FunctionCode& code, const Value& base, GCObject* key, std::uint32_t siteIndex)
+{
+    PropertySite* site = siteOf(code, siteIndex);
+    Value v = getPropertySiteOnce(rt, base, key, site);
+    if (site)
+        site->see(v);
+    return v;
 }
 
 void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Value& v, PropertySite* site)
@@ -1320,7 +1328,8 @@ Value execute(Runtime& rt, Frame& frame)
 {
     const FunctionCode& code = *frame.code;
     const std::uint8_t* c = code.code.data();
-    std::uint32_t pc = 0;
+    // Zero for a fresh call; part way through for one native code handed back.
+    std::uint32_t pc = frame.pc;
     std::uint32_t ticks = 0;
     Vec<Value>& sp = frame.stack;
 #if SCRIPT_ENABLE_DYN_JIT
@@ -2244,6 +2253,27 @@ Value execute(Runtime& rt, Frame& frame)
 }
 
 }  // namespace
+
+Value resumeInterpreter(Runtime& rt, DynFunction* fn, const FunctionCode& code, const Value& thisValue, std::uint32_t pc,
+                        void (*fill)(Frame&, void*), void* state)
+{
+    Frame& frame = rt.acquireFrame(rt.frames.size());
+    frame.begin(fn, &code, thisValue, nullptr);
+    rt.frames.push_back(&frame);
+    struct PopFrame
+    {
+        Runtime* rt;
+        Frame* frame;
+        ~PopFrame()
+        {
+            rt->frames.pop_back();
+            frame->end();
+        }
+    } popper{&rt, &frame};
+    fill(frame, state);
+    frame.pc = pc;
+    return execute(rt, frame);
+}
 
 // ------------------------------------------------------------ promises ---
 

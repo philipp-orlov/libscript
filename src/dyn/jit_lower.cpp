@@ -194,6 +194,9 @@ public:
     {
         if (!code_.handlers.empty())
             refuse("the function has exception handlers");
+        // What a bail writes out has to be in reach of the frame pointer's short offsets.
+        speculate_ = code_.jitGeneration < FunctionCode::kJitSpeculations && !code_.isClassConstructor &&
+                     (2 * code_.numLocals + code_.maxStack) * 16 < 4000;
         prepare();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
 
@@ -334,6 +337,35 @@ private:
     {
         inst(IrOp::Label).imm = label;
         nonNullLocals_.clear();
+        forgetFacts();
+    }
+    void forgetFacts()
+    {
+        shapeFacts_.clear();
+        epochKnown_ = false;
+    }
+    const Shape* knownShape(std::int32_t vreg) const noexcept
+    {
+        for (const ShapeFact& f : shapeFacts_) {
+            if (f.vreg == vreg)
+                return f.shape;
+        }
+        return nullptr;
+    }
+    void learnShape(std::int32_t vreg, const Shape* shape)
+    {
+        forgetShape(vreg);
+        shapeFacts_.push_back({vreg, shape});
+    }
+    void forgetShape(std::int32_t vreg)
+    {
+        for (std::size_t i = 0; i < shapeFacts_.size(); ++i) {
+            if (shapeFacts_[i].vreg == vreg) {
+                shapeFacts_[i] = shapeFacts_.back();
+                shapeFacts_.pop_back();
+                return;
+            }
+        }
     }
     std::int32_t rtReg()
     {
@@ -764,6 +796,109 @@ private:
         return std::int32_t(fn_.exits.size()) - 1;
     }
 
+    // ---- bailing out ----
+    /// The block `label` names gives the call to the interpreter, which runs the instruction at `pc_` again with `popped`
+    /// back where they were on its stack: everything the frame holds goes with it, so nothing is released here. Only for
+    /// code that has done nothing yet that the instruction would do over.
+    void emitBail(std::int32_t label, const std::vector<Entry>& popped)
+    {
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = label;
+        const std::uint32_t locals = std::uint32_t(localReg_.size());
+        const std::uint32_t count = std::uint32_t(stack_.size() + popped.size());
+        fn_.frameAreaBytes = std::max(fn_.frameAreaBytes, (2 * locals + count) * 16 + 32);
+        // A header with where to carry on and how deep the stack is, then the values.
+        const std::int32_t header = fn_.newVreg(false);
+        IrInst& addr = inst(IrOp::FrameAddr);
+        addr.d = header;
+        addr.imm = 0;
+        store(header, 0, immReg(std::int64_t(pc_) | (std::int64_t(count) << 32)), 8);
+        const std::int32_t area = fn_.newVreg(false);
+        IrInst& values = inst(IrOp::FrameAddr);
+        values.d = area;
+        values.imm = 16;
+        const auto byte = [&](std::uint32_t at, std::uint8_t value) {
+            IrInst& in = inst(IrOp::StoreTag);
+            in.a = area;
+            in.tag = Type(value);
+            in.imm = std::int64_t(at);
+        };
+        for (std::uint32_t slot = 0; slot < locals; ++slot) {
+            const std::uint32_t at = slot * 16;
+            if (isNumberLocal(slot)) {
+                byte(at, std::uint8_t(Type::Double));
+                store(area, at + kPayload, localReg_[slot], 8);
+                continue;
+            }
+            store(area, at, localTag_[slot], 1);
+            byte(at + 1, localOwned_[slot]);
+            store(area, at + kPayload, localReg_[slot], 8);
+        }
+        for (std::uint32_t slot = 0; slot < locals; ++slot) {
+            const std::uint32_t at = (locals + slot) * 16;
+            byte(at + 1, cellOwned_[slot]);
+            store(area, at + kPayload, cellReg_[slot], 8);
+        }
+        std::uint32_t i = 2 * locals;
+        const auto put = [&](const Entry& e) {
+            const std::uint32_t at = i++ * 16;
+            if (e.rep != Rep::Tagged) {
+                byte(at, std::uint8_t(Type::Double));
+                store(area, at + kPayload, e.rep == Rep::Double && !e.isConst ? e.r : payloadReg(e), 8);
+                return;
+            }
+            if (e.hasKnownTag || e.isConst)
+                byte(at, std::uint8_t(e.known));
+            else
+                store(area, at, e.t, 1);
+            byte(at + 1, e.own == Own::Owned && !e.isConst ? 1 : 0);
+            store(area, at + kPayload, payloadReg(e), 8);
+        };
+        for (const Entry& e : stack_)
+            put(e);
+        for (const Entry& e : popped)
+            put(e);
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        IrExit exit;
+        exit.site = site();
+        fn_.exits.push_back(std::move(exit));
+        IrCall call;
+        call.kind = IrCallKind::Helper;
+        call.helper = reinterpret_cast<void*>(&scriptDynResume);
+        call.args = {rtReg(), ptrReg(&code_), fnReg_, thisTag_, thisReg_, header};
+        call.result = r;
+        call.resultTag = t;
+        call.cold = true;
+        call.publishFrame = true;
+        call.site = site();
+        call.exit = std::int32_t(fn_.exits.size()) - 1;
+        fn_.calls.push_back(std::move(call));
+        inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
+        IrInst& ret = inst(IrOp::Ret);
+        ret.a = r;
+        ret.b = t;
+        inst(IrOp::ColdEnd);
+        // The fast path carries on from here, and nothing worked out in the block above is there for it.
+        inst(IrOp::Label).imm = newLabel();
+    }
+
+    /// Bails to `bail` unless `base` is an object of `shape`, which is known from then on.
+    void expectShape(const Entry& base, const Shape* shape, std::int32_t bail)
+    {
+        if (knownShape(base.r) == shape)
+            return;
+        guardShape(base, shape, bail);
+        learnShape(base.r, shape);
+    }
+    void expectEpoch(std::uint64_t epoch, std::int32_t bail)
+    {
+        if (epochKnown_)
+            return;
+        guardEpoch(epoch, bail);
+        epochKnown_ = true;
+    }
+
     // ---- calling helpers ----
     /// A helper that keeps the caller's registers: it costs saving what is live, and nothing when it is not reached.
     std::int32_t callCold(void* helper, std::vector<std::int32_t> args, bool hasResult, const std::vector<Entry>& popped = {},
@@ -784,6 +919,7 @@ private:
         call.resultTag = resultTag;
         call.cold = true;
         if (canRaise) {
+            forgetFacts();
             call.publishFrame = true;
             call.site = site();
             call.exit = makeExit(0, popped);
@@ -1750,6 +1886,7 @@ private:
     {
         Entry value = pop();
         copyOutReaders(slot);
+        forgetShape(localReg_[slot]);
         if (isNumberLocal(slot)) {
             // Nothing reads the slot before a number is written to it: see `readsBeforeWrite`.
             if (previousOp_ == Op::PushUndefined && value.isConst && value.rep == Rep::Tagged && value.hasKnownTag &&
@@ -2011,7 +2148,29 @@ private:
             getterProp(base, site, operand, keepBase);
             return;
         }
-        if (site && !site->getter && !site->addTo && site->moreCount) {
+        const bool bet = speculate_ && usable && !site->getter && !site->addTo && !site->moreCount &&
+                         base.rep == Rep::Tagged && !base.isConst;
+        Entry result;
+        if (bet) {
+            // One shape seen: guard it, or what is known of it, and leave the rest to the interpreter.
+            const std::int32_t bail = newLabel();
+            expectShape(base, site->shape, bail);
+            std::int32_t holder = base.r;
+            if (site->holder) {
+                expectEpoch(site->epoch, bail);
+                holder = ptrReg(site->holder);
+            }
+            const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
+            const std::int32_t props = load(holder, kPropsOffset, 8);
+            const std::int32_t lt = load(props, at + kPropValueOffset, 1);
+            if (site->saw == PropertySite::kSawNumber) {
+                branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
+                result = doubleEntry(load(props, at + kPropValueOffset + kPayload, 8, true));
+            } else {
+                result = taggedEntry(load(props, at + kPropValueOffset + kPayload, 8), lt, Own::Weak);
+            }
+            emitBail(bail, {base});
+        } else if (site && !site->getter && !site->addTo && site->moreCount) {
             for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
                 inst(IrOp::Label).imm = c.label;
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
@@ -2046,16 +2205,18 @@ private:
         } else {
             inst(IrOp::Br).imm = slow;
         }
-        inst(IrOp::ColdBegin);
-        inst(IrOp::Label).imm = slow;
-        const std::int32_t rt = rtReg();
-        const std::int32_t self = ptrReg(&code_);
-        const std::int32_t op = immReg(std::int64_t(operand));
-        coldCall(reinterpret_cast<void*>(&scriptDynGetProp), {rt, self, tagReg(base), base.r, op}, r, t, true, {base});
-        inst(IrOp::Br).imm = done;
-        inst(IrOp::ColdEnd);
-        inst(IrOp::Label).imm = done;
-        Entry result = taggedEntry(r, t, Own::Weak);
+        if (!bet) {
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = slow;
+            const std::int32_t rt = rtReg();
+            const std::int32_t self = ptrReg(&code_);
+            const std::int32_t op = immReg(std::int64_t(operand));
+            coldCall(reinterpret_cast<void*>(&scriptDynGetProp), {rt, self, tagReg(base), base.r, op}, r, t, true, {base});
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
+            result = taggedEntry(r, t, Own::Weak);
+        }
         // What the callee is likely to be, for a built-in done in place: guarded where it is used, so a guess is fine.
         if (usable && site->holder && !site->getter && site->index < site->holder->props.size() &&
             site->holder->props[site->index].value.isObject())
@@ -2092,6 +2253,54 @@ private:
         }
     }
 
+    /// A store that adds the property, in place while the table has room and no index: what `appendKnown` does. The
+    /// shape and the epoch are checked already.
+    void appendInPlace(const Entry& base, const PropertySite* site, std::uint32_t operand, std::int32_t vt, std::int32_t vr,
+                       std::int32_t slow)
+    {
+        const std::int32_t isProto = load(base.r, kIsProtoOffset, 1);
+        branchCmp(isProto, IrCond::Ne, 0, slow);
+        const std::int32_t indexBegin = load(base.r, kIndexOffset, 8);
+        const std::int32_t indexEnd = load(base.r, kIndexOffset + 8, 8);
+        {
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = indexBegin;
+            test.b = indexEnd;
+            test.cond = IrCond::Ne;
+            test.width = 64;
+            test.target = slow;
+        }
+        const std::int32_t end = load(base.r, kPropsOffset + 8, 8);
+        const std::int32_t cap = load(base.r, kPropsOffset + 16, 8);
+        {
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = end;
+            test.b = cap;
+            test.cond = IrCond::Eq;
+            test.width = 64;
+            test.target = slow;
+        }
+        const std::int32_t key = ptrReg(code_.atoms[operand & kAtomMask].get());
+        incRefOf(key, -1, false);
+        store(end, kPropKeyOffset, key, 8);
+        store(end, kPropValueOffset, vt, 1);
+        store(end, kPropValueOffset + kPayload, vr, 8);
+        const std::int32_t undefinedTag = immReg(std::int64_t(Type::Undefined));
+        const std::int32_t zero = immReg(0);
+        store(end, kPropSetterOffset, undefinedTag, 1);
+        store(end, kPropSetterOffset + kPayload, zero, 8);
+        store(end, kPropAttrsOffset, immReg(PropDefault), 1);
+        const std::int32_t next = fn_.newVreg(false);
+        IrInst& add = inst(IrOp::Add);
+        add.d = next;
+        add.a = end;
+        add.hasImm = true;
+        add.imm = std::int64_t(sizeof(Prop));
+        add.width = 64;
+        store(base.r, kPropsOffset + 8, next, 8);
+        store(base.r, kShapeOffset, ptrReg(site->addTo), 8);
+    }
+
     void setProp(std::uint32_t operand)
     {
         Entry value = pop();
@@ -2108,7 +2317,35 @@ private:
         const PropertySite* site = siteAt(operand);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
-        if (site && !site->addTo && site->moreCount) {
+        const bool bet = speculate_ && site && !site->moreCount && base.rep == Rep::Tagged && !base.isConst &&
+                         (!site->addTo || (site->epoch == rt_.ctx.protoEpoch && site->addTo->count <= DynObject::kIndexThreshold));
+        if (bet) {
+            const std::int32_t bail = newLabel();
+            expectShape(base, site->shape, bail);
+            if (site->addTo) {
+                expectEpoch(site->epoch, bail);
+                appendInPlace(base, site, operand, vt, vr, bail);
+            } else {
+                const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
+                const std::int32_t props = load(base.r, kPropsOffset, 8);
+                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
+                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
+                store(props, at + kPropValueOffset, vt, 1);
+                store(props, at + kPropValueOffset + kPayload, vr, 8);
+                decRefOf(old, oldTag, false);
+            }
+            emitBail(bail, {base, value});
+            // What the old value's release did cannot touch a shape: releasing never runs code.
+            if (site->addTo) {
+                for (std::size_t i = shapeFacts_.size(); i-- > 0;) {
+                    if (shapeFacts_[i].shape == site->shape) {
+                        shapeFacts_[i] = shapeFacts_.back();
+                        shapeFacts_.pop_back();
+                    }
+                }
+                learnShape(base.r, site->addTo);
+            }
+        } else if (site && !site->addTo && site->moreCount) {
             for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
                 inst(IrOp::Label).imm = c.label;
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
@@ -2121,50 +2358,9 @@ private:
                 inst(IrOp::Br).imm = done;
             }
         } else if (site && site->addTo && site->epoch == rt_.ctx.protoEpoch && site->addTo->count <= DynObject::kIndexThreshold) {
-            // A store that adds the property, in place while the table has room and no index: what `appendKnown` does.
             guardShape(base, site->shape, slow);
             guardEpoch(site->epoch, slow);
-            const std::int32_t isProto = load(base.r, kIsProtoOffset, 1);
-            branchCmp(isProto, IrCond::Ne, 0, slow);
-            const std::int32_t indexBegin = load(base.r, kIndexOffset, 8);
-            const std::int32_t indexEnd = load(base.r, kIndexOffset + 8, 8);
-            {
-                IrInst& test = inst(IrOp::BrCmp);
-                test.a = indexBegin;
-                test.b = indexEnd;
-                test.cond = IrCond::Ne;
-                test.width = 64;
-                test.target = slow;
-            }
-            const std::int32_t end = load(base.r, kPropsOffset + 8, 8);
-            const std::int32_t cap = load(base.r, kPropsOffset + 16, 8);
-            {
-                IrInst& test = inst(IrOp::BrCmp);
-                test.a = end;
-                test.b = cap;
-                test.cond = IrCond::Eq;
-                test.width = 64;
-                test.target = slow;
-            }
-            const std::int32_t key = ptrReg(code_.atoms[operand & kAtomMask].get());
-            incRefOf(key, -1, false);
-            store(end, kPropKeyOffset, key, 8);
-            store(end, kPropValueOffset, vt, 1);
-            store(end, kPropValueOffset + kPayload, vr, 8);
-            const std::int32_t undefinedTag = immReg(std::int64_t(Type::Undefined));
-            const std::int32_t zero = immReg(0);
-            store(end, kPropSetterOffset, undefinedTag, 1);
-            store(end, kPropSetterOffset + kPayload, zero, 8);
-            store(end, kPropAttrsOffset, immReg(PropDefault), 1);
-            const std::int32_t next = fn_.newVreg(false);
-            IrInst& add = inst(IrOp::Add);
-            add.d = next;
-            add.a = end;
-            add.hasImm = true;
-            add.imm = std::int64_t(sizeof(Prop));
-            add.width = 64;
-            store(base.r, kPropsOffset + 8, next, 8);
-            store(base.r, kShapeOffset, ptrReg(site->addTo), 8);
+            appendInPlace(base, site, operand, vt, vr, slow);
         } else if (site && !site->addTo) {
             // A write to a property the shape says is there and writable: what was there loses its count after.
             guardShape(base, site->shape, slow);
@@ -2178,21 +2374,23 @@ private:
         } else {
             inst(IrOp::Br).imm = slow;
         }
-        inst(IrOp::ColdBegin);
-        inst(IrOp::Label).imm = slow;
-        {
-            const std::int32_t rt = rtReg();
-            const std::int32_t self = ptrReg(&code_);
-            const std::int32_t op = immReg(std::int64_t(operand));
-            coldCall(reinterpret_cast<void*>(&scriptDynSetProp), {rt, self, tagReg(base), base.r, op, vt, vr}, -1, -1, true,
-                     {base, value});
-            // The helper took its own count, so the one made above goes.
-            if (value.own == Own::Owned && !value.isConst)
-                decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
+        if (!bet) {
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = slow;
+            {
+                const std::int32_t rt = rtReg();
+                const std::int32_t self = ptrReg(&code_);
+                const std::int32_t op = immReg(std::int64_t(operand));
+                coldCall(reinterpret_cast<void*>(&scriptDynSetProp), {rt, self, tagReg(base), base.r, op, vt, vr}, -1, -1,
+                         true, {base, value});
+                // The helper took its own count, so the one made above goes.
+                if (value.own == Own::Owned && !value.isConst)
+                    decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
+            }
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
         }
-        inst(IrOp::Br).imm = done;
-        inst(IrOp::ColdEnd);
-        inst(IrOp::Label).imm = done;
         release(base);
         // The value of the assignment expression, read back without a count of its own: the field holds one.
         if (value.rep != Rep::Tagged) {
@@ -2562,6 +2760,7 @@ private:
             direct.site = site();
             direct.publishFrame = false;
             direct.exit = makeExit(0, held);
+            forgetFacts();
             fn_.calls.push_back(std::move(direct));
             inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
         }
@@ -2986,6 +3185,7 @@ private:
             direct.site = site();
             direct.publishFrame = false;
             direct.exit = makeExit(0, heldWithSelf);
+            forgetFacts();
             fn_.calls.push_back(std::move(direct));
             inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
         }
@@ -3497,6 +3697,18 @@ private:
     std::vector<Join> joins_;
     std::vector<Entry> stack_;
     std::set<std::int32_t> nonNullLocals_;
+    /// Whether code may assume what the interpreter has seen so far, and hand the call back to it when that stops being so.
+    bool speculate_ = false;
+    /// Objects whose shape is known here, by the register holding them: a guard that dominates, with nothing since that
+    /// could have changed a shape. Forgotten at joins and at anything that can run arbitrary code.
+    struct ShapeFact
+    {
+        std::int32_t vreg;
+        const Shape* shape;
+    };
+    std::vector<ShapeFact> shapeFacts_;
+    /// `protoEpoch` is known to be what the code was compiled against.
+    bool epochKnown_ = false;
 };
 
 /// Which locals may be read before anything was written to them, along some path. Those start as `undefined`, so they are no

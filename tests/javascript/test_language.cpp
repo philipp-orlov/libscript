@@ -459,6 +459,41 @@ TEST(objectLiteralsKeepTheirKeysInOrder)
              std::string("23"));
 }
 
+TEST(nativeCodeHandsBackWhatItDidNotExpect)
+{
+    // Native code assumes the one shape a site has seen and that a field holding numbers keeps doing so; when that stops
+    // being true the interpreter carries on from the same instruction, with every local and stack entry as it was.
+    CHECK_EQ(run("function f(o) { return o.x + 1; } var r = 0; for (var i = 0; i < 600; i++) r += f({x: i});"
+                 " r + ':' + f({y: 1, x: 5}) + ':' + f({x: 'a'}) + ':' + f({get x() { return 7; }})"),
+             std::string("180300:6:a1:8"));
+    CHECK_EQ(run("function f(o, a, b) { var s = 'k'; var n = a * 2; return n + (b + o.x * (a - o.y)) + s; }"
+                 " var r; for (var i = 0; i < 600; i++) r = f({x: 2, y: 1}, 3, 4); r + ':' + f({x: 2, y: 'z'}, 3, 4)"
+                 " + ':' + f({y: 1, x: 2}, 3, 4)"),
+             std::string("14k:NaNk:14k"));
+    CHECK_EQ(run("function sum(list) { var t = 0; for (var i = 0; i < list.length; i++) t += list[i].v; return t; }"
+                 " var xs = []; for (var i = 0; i < 3000; i++) xs.push(i % 1000 == 999 ? {w: 0, v: 1} : {v: 1});"
+                 " var r = 0; for (var k = 0; k < 20; k++) r += sum(xs); r"),
+             std::string("60000"));
+    CHECK_EQ(run("function f(o) { var g = function() { return o.x; }; return o.x + g(); }"
+                 " var r = ''; for (var i = 0; i < 2000; i++) r = f(i % 3 ? {x: 1} : {z: 0, x: 2}); r"),
+             std::string("2"));
+    CHECK_EQ(run("function P() {} P.prototype.get = function() { return this.a + this.b; };"
+                 " function f(p) { return p.get(); } var r = 0; for (var i = 0; i < 600; i++) { var p = new P(); p.a = 1; p.b = 2;"
+                 " r += f(p); } var q = new P(); q.b = 2; q.a = 1; r + ':' + f(q) + ':' + P.prototype.get.call({a: 'x', b: 1})"),
+             std::string("1800:3:x1"));
+    CHECK_EQ(run("function B(x) { this.x = x; this.y = x * 2; } var r = 0; for (var i = 0; i < 600; i++) r += new B(i).y;"
+                 " Object.defineProperty(B.prototype, 'y', { set: function(v) { this.z = v + 1; }, get: function() {"
+                 " return this.z; } }); r + ':' + new B(3).y"),
+             std::string("359400:7"));
+    CHECK_EQ(run("function f(o) { var t = o.x; if (o.y) throw new Error('y' + t); return t; } var r = 0;"
+                 " for (var i = 0; i < 600; i++) r += f({x: 1, y: 0});"
+                 " try { f({x: 5, y: 1, z: 0}); } catch (e) { r = r + e.message; } r"),
+             std::string("600y5"));
+    CHECK_EQ(run("'use strict'; function A() { this.n = 1; } A.prototype.inc = function(k) { this.n += k.d; return this; };"
+                 " var a = new A(); for (var i = 0; i < 3000; i++) a.inc(i < 2500 ? {d: 1} : {e: 0, d: 2}); a.n"),
+             std::string("3501"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

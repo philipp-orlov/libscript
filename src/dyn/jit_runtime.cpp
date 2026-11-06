@@ -201,6 +201,59 @@ NativePair scriptDynToPropertyKeyOp(Runtime* rt, std::int64_t tag, std::uint64_t
     });
 }
 
+NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* fn, std::int64_t thisTag,
+                           std::uint64_t thisPayload, std::uint8_t* header) noexcept
+{
+    std::uint64_t where = 0;
+    std::memcpy(&where, header, sizeof where);
+    const auto pc = std::uint32_t(where);
+    const auto stackCount = std::uint32_t(where >> 32);
+    std::uint8_t* values = header + 16;
+    // Code that keeps bailing is thrown away; what it is compiled to next assumes what the interpreter learns meanwhile,
+    // and after a few rounds of that, nothing.
+    constexpr std::uint32_t kBailLimit = 8;
+    if (++code->jitBails > kBailLimit && code->jitEntry) {
+        code->jitEntry = nullptr;
+        code->jitCallEntry = nullptr;
+        code->jitCode = nullptr;
+        code->jitHotness = 0;
+        code->jitBails = 0;
+        if (code->jitGeneration < FunctionCode::kJitSpeculations)
+            ++code->jitGeneration;
+    }
+    struct State
+    {
+        std::uint8_t* values;
+        std::uint32_t locals;
+        std::uint32_t stack;
+    } state{values, code->numLocals, stackCount};
+    const auto fill = [](Frame& frame, void* raw) {
+        const State& in = *static_cast<const State*>(raw);
+        const auto at = [&in](std::uint32_t i) -> Value {
+            const std::uint8_t* slot = in.values + std::size_t(i) * 16;
+            std::uint64_t payload = 0;
+            std::memcpy(&payload, slot + 8, sizeof payload);
+            const Type type = Type(slot[0]);
+            if (type >= Type::String && slot[1])
+                return detail::Access::adopt(type, reinterpret_cast<GCObject*>(payload));
+            return valueOf(std::int64_t(type), payload);
+        };
+        for (std::uint32_t i = 0; i < in.locals; ++i)
+            frame.locals[i] = at(i);
+        for (std::uint32_t i = 0; i < in.locals; ++i) {
+            const std::uint8_t* slot = in.values + std::size_t(in.locals + i) * 16;
+            std::uint64_t payload = 0;
+            std::memcpy(&payload, slot + 8, sizeof payload);
+            frame.cells[i].reset(reinterpret_cast<Box*>(payload), slot[1] != 0);
+        }
+        for (std::uint32_t i = 0; i < in.stack; ++i)
+            frame.stack.push_back(at(2 * in.locals + i));
+    };
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        return take(resumeInterpreter(*rt, fn, *code, valueOf(thisTag, thisPayload), pc, fill, &state));
+    });
+}
+
 NativePair scriptDynGetProp(Runtime* rt, const FunctionCode* code, std::int64_t tag, std::uint64_t payload,
                             std::uint32_t operand) noexcept
 {

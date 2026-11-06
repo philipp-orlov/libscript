@@ -113,7 +113,15 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
 {
     objectProto.reset(newCell<DynObject>(), true);
 
-    functionProto.reset(newObject(objectProto.get()), true);
+    // Function.prototype is itself callable (it returns undefined) but is not a constructor. It has to be a real
+    // DynFunction: `asFunction` casts on `cls`, so a plain object tagged as a function would be read past its end.
+    {
+        auto* callable = newCell<DynFunction>();
+        callable->proto.reset(objectProto.get());
+        callable->fnKind = FnKind::Native;
+        callable->native = [](CallInfo&) { return Value::undefined(); };
+        functionProto.reset(callable, true);
+    }
     globalObject.reset(newObject(objectProto.get()), true);
 
     atom.length.reset(intern("length"));

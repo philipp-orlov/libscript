@@ -280,12 +280,18 @@ std::string Runtime::captureStack() const
         if (!frame || !frame->method)
             continue;
         out += "   at " + frame->method->qualifiedName();
-        if (frame->line) {
+        std::uint32_t lineOfFrame = 0;
+        for (const auto& entry : frame->method->body.lines) {
+            if (entry.offset > frame->opPc)
+                break;
+            lineOfFrame = entry.line;
+        }
+        if (lineOfFrame) {
             const std::string& file =
                 frame->method->assembly && frame->method->assembly->sourceName
                     ? *frame->method->assembly->sourceName
                     : std::string("<assembly>");
-            out += " (" + file + ":" + std::to_string(frame->line) + ")";
+            out += " (" + file + ":" + std::to_string(lineOfFrame) + ")";
         }
         out += "\n";
     }
@@ -836,6 +842,20 @@ void leave(Frame& frame, std::uint32_t target)
     frame.pc = chain.front();
 }
 
+namespace {
+/// `opArity` as a table, because the dispatch loop asks once per instruction.
+struct ArityTable
+{
+    std::uint8_t arity[256];
+    ArityTable() noexcept
+    {
+        for (int i = 0; i < 256; ++i)
+            arity[i] = i < int(Op::OpCount) ? std::uint8_t(opArity(Op(i))) : 0;
+    }
+};
+const ArityTable kArity;
+}  // namespace
+
 Value runFrame(Runtime& rt, Frame& frame)
 {
     const MethodInfo& method = *frame.method;
@@ -845,7 +865,6 @@ Value runFrame(Runtime& rt, Frame& frame)
     Vec<Value>& slots = frame.slots;
     AssemblyImpl* assembly = method.assembly;
 
-    std::size_t lineIndex = 0;
     std::uint32_t ticks = 0;
 
     for (;;) {
@@ -855,12 +874,7 @@ Value runFrame(Runtime& rt, Frame& frame)
                 const Op op = Op(code[pc]);
                 const std::uint8_t* const operands = code + pc + 1;
                 frame.opPc = pc;
-                frame.pc = pc + 1 + std::uint32_t(opArity(op)) * 4;
-
-                // Line tracking is for stack traces; it costs one compare.
-                while (lineIndex < method.body.lines.size() &&
-                       method.body.lines[lineIndex].offset <= pc)
-                    frame.line = method.body.lines[lineIndex++].line;
+                frame.pc = pc + 1 + std::uint32_t(kArity.arity[std::uint8_t(op)]) * 4;
 
                 switch (op) {
                     case Op::Nop: break;

@@ -132,3 +132,38 @@ jobs:
         env:
           SCRIPT_SOAK_SECONDS: 300
         run: build/bench/bench_soak_mixed
+
+  # Conformance and speed, so that progress and regressions are visible. Reported, not enforced: test262 moves on its own.
+  conformance:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: libscript
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/libcore
+          path: libcore
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: tc39/test262
+          path: test262
+      - name: Configure
+        run: cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Release -DSCRIPT_PROFILE=Performance -DSCRIPT_BUILD_TESTS=OFF -DSCRIPT_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build -j4
+      - name: test262
+        env:
+          LS: build/tools/libscript
+          T262: test262
+        run: python3 libscript/tools/run_test262.py libscript test262.jsonl
+      - name: Kernels
+        run: |
+          for f in libscript/bench/kernels/cs/*.cs libscript/bench/kernels/js/*.js; do
+            /usr/bin/time -f "$f %es %MKB" build/tools/libscript "$f" >/dev/null
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test262
+          path: test262.jsonl

@@ -27,6 +27,15 @@ DynArray* thisArray(CallInfo& ci)
     return arr;
 }
 
+/// `this` for a method that changes the array.
+DynArray* thisMutableArray(CallInfo& ci)
+{
+    DynArray* arr = thisArray(ci);
+    if (arr->frozen)
+        ci.fail(ErrorCode::TypeError, "the array is frozen");
+    return arr;
+}
+
 std::int64_t clampIndex(double raw, std::size_t length)
 {
     if (std::isnan(raw))
@@ -139,6 +148,8 @@ void installArray(Runtime& rt)
             const double n = numberOf(ci.arg(0));
             if (n < 0 || n != std::floor(n) || n > 4294967295.0)
                 ci.fail(ErrorCode::RangeError, "invalid array length");
+            if (!rt2.ctx.options.memoryLimit && n > double(kMaxDenseArrayLength))
+                ci.fail(ErrorCode::RangeError, "arrays are dense; this length is too large");
             DynArray* a = rt2.newArray(std::size_t(n));
             // Own the array first: resizing is refused with OutOfMemory when it does not fit, and an array nobody
             // owns would never be freed.
@@ -177,13 +188,13 @@ void installArray(Runtime& rt)
 
     // ---- mutation ----
     rt.method(proto, "push", [](CallInfo& ci) {
-        DynArray* a = thisArray(ci);
+        DynArray* a = thisMutableArray(ci);
         a->appendAll(ci.args().data(), ci.args().size());
         return Value(double(a->elements.size()));
     }, 1);
 
     rt.method(proto, "pop", [](CallInfo& ci) {
-        DynArray* a = thisArray(ci);
+        DynArray* a = thisMutableArray(ci);
         if (a->elements.empty())
             return Value::undefined();
         Value v = a->elements.back();
@@ -193,7 +204,7 @@ void installArray(Runtime& rt)
     }, 0);
 
     rt.method(proto, "shift", [](CallInfo& ci) {
-        DynArray* a = thisArray(ci);
+        DynArray* a = thisMutableArray(ci);
         if (a->elements.empty())
             return Value::undefined();
         Value v = a->elements.front();
@@ -203,7 +214,7 @@ void installArray(Runtime& rt)
     }, 0);
 
     rt.method(proto, "unshift", [](CallInfo& ci) {
-        DynArray* a = thisArray(ci);
+        DynArray* a = thisMutableArray(ci);
         const std::size_t before = a->elements.capacity();
         a->reserveFor(a->elements, a->elements.size() + ci.args().size());
         a->elements.insert(a->elements.begin(), ci.args().begin(), ci.args().end());
@@ -213,7 +224,7 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "splice", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        DynArray* a = thisArray(ci);
+        DynArray* a = thisMutableArray(ci);
         const std::size_t n = a->elements.size();
         const std::size_t start = std::size_t(clampIndex(toNumber(rt2, ci.arg(0)), n));
         std::size_t remove = n - start;
@@ -236,13 +247,16 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "reverse", [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
+        // One element or none: nothing is written, so a frozen array has nothing to object to.
+        if (a->frozen && a->elements.size() > 1)
+            ci.fail(ErrorCode::TypeError, "the array is frozen");
         std::reverse(a->elements.begin(), a->elements.end());
         return ci.thisValue();
     }, 0);
 
     rt.method(proto, "fill", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        DynArray* a = thisArray(ci);
+        DynArray* a = thisMutableArray(ci);
         const std::size_t n = a->elements.size();
         const std::size_t from =
             ci.size() > 1 ? std::size_t(clampIndex(toNumber(rt2, ci.arg(1)), n)) : 0;
@@ -255,7 +269,7 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "sort", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        DynArray* a = thisArray(ci);
+        DynArray* a = thisMutableArray(ci);
         const Value comparator = ci.arg(0);
         // A comparator is script and may shrink or grow the array while it is being sorted, which would leave the
         // merge reading past the end of the elements. Sort a private copy and put it back when it is done.

@@ -104,6 +104,10 @@ private:
     void indexInsert(std::uint32_t at) noexcept;
 };
 
+/// Arrays are dense, so a length is memory. Past this a request is refused with a `RangeError` rather than left to fail
+/// in the allocator, which would end the process. A context with a memory limit has that limit to answer instead.
+inline constexpr std::size_t kMaxDenseArrayLength = std::size_t(1) << 28;
+
 struct DynArray : DynObject
 {
     Vec<Value> elements;

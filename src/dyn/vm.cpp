@@ -246,6 +246,8 @@ String toStringValue(Runtime& rt, const Value& v)
 
 std::int32_t toInt32(double d) noexcept
 {
+    if (d >= -2147483648.0 && d <= 2147483647.0)
+        return std::int32_t(d);
     if (!std::isfinite(d) || d == 0)
         return 0;
     const double m = std::fmod(std::trunc(d), 4294967296.0);
@@ -329,6 +331,23 @@ bool arrayElementKey(DynArray* arr, GCObject* key, std::uint32_t& index)
     if (key->kind != CellKind::String)
         return false;
     return arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < arr->elements.size();
+}
+
+}  // namespace
+
+namespace {
+
+/// An object whose named properties are exactly its property table, which is what the per-site cache relies on. An
+/// array answers `length` and indices itself and a string object answers `length`, ahead of any own property.
+inline DynObject* cacheableObject(const Value& v) noexcept
+{
+    DynObject* obj = asObject(v);
+    return obj && obj->cls != ObjClass::Array && obj->cls != ObjClass::StringObject ? obj : nullptr;
+}
+
+inline void rememberSite(std::uint8_t& site, std::size_t index) noexcept
+{
+    site = index < 255 ? std::uint8_t(index + 1) : 0;
 }
 
 }  // namespace
@@ -459,12 +478,18 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
             const double n = toNumber(rt, v);
             if (n < 0 || n != std::floor(n) || n > 4294967295.0)
                 throwError(rt, ErrorCode::RangeError, "invalid array length");
+            if (obj->frozen)
+                return;
+            if (!rt.ctx.options.memoryLimit && n > double(kMaxDenseArrayLength))
+                throwError(rt, ErrorCode::RangeError, "arrays are dense; this length is too large");
             arr->resize(std::size_t(n));
             return;
         }
         if (key->kind == CellKind::String) {
             std::uint32_t index = 0;
             if (arrayIndexOf(static_cast<StringCell*>(key)->text(), index)) {
+                if (obj->frozen || (index >= arr->elements.size() && !obj->extensible))
+                    return;
                 if (index >= arr->elements.size()) {
                     if (index > arr->elements.size() + (1u << 22))
                         throwError(rt, ErrorCode::RangeError,
@@ -803,6 +828,8 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
         return constructValue(rt, detail::Access::make(Type::Object, fn->boundTarget.get()), args);
     if (fn->isArrow)
         throwError(rt, ErrorCode::TypeError, "an arrow function is not a constructor");
+    if (fn == rt.functionProto.get())
+        throwError(rt, ErrorCode::TypeError, "Function.prototype is not a constructor");
 
     Value protoValue = getPropertyOfObject(rt, fn, rt.atom.prototype.get(), callee);
     DynObject* proto = asObject(protoValue);
@@ -982,8 +1009,34 @@ Value execute(Runtime& rt, Frame& frame)
             sp.resize(sp.size() - argc);
         }
     };
+    auto fastIndex = [](const Value& base, const Value& key, DynArray*& arr, std::uint32_t& index) {
+        if (key.type() != Type::Double)
+            return false;
+        DynObject* obj = asObject(base);
+        if (!obj || obj->cls != ObjClass::Array)
+            return false;
+        const double d = detail::Access::r8(key);
+        if (!(d >= 0 && d < 4294967295.0))
+            return false;
+        index = std::uint32_t(d);
+        if (double(index) != d)
+            return false;
+        arr = static_cast<DynArray*>(obj);
+        return index < arr->elements.size();
+    };
     /// Pop two operands, convert both to numbers left to right, push `f(a, b)`.
-    auto numeric = [&](double (*f)(double, double)) {
+    auto numeric = [&](auto f) {
+        {
+            const std::size_t n = sp.size();
+            Value& fa = sp[n - 2];
+            Value& fb = sp[n - 1];
+            if (fa.type() == Type::Double && fb.type() == Type::Double) {
+                const double r = f(detail::Access::r8(fa), detail::Access::r8(fb));
+                sp.pop_back();
+                fa = Value(r);
+                return;
+            }
+        }
         Value b = pop();
         Value a = pop();
         const double x = toNumber(rt, a);
@@ -1024,7 +1077,10 @@ Value execute(Runtime& rt, Frame& frame)
                         pc += 4;
                         break;
                     case Op::PushThis:
-                        sp.push_back(frame.thisValue);
+                        if (code.sloppyThis && frame.thisValue.isNullish())
+                            sp.push_back(detail::Access::make(Type::Object, rt.globalObject.get()));
+                        else
+                            sp.push_back(frame.thisValue);
                         break;
                     case Op::PushCallee:
                         sp.push_back(frame.fn ? detail::Access::make(Type::Object, frame.fn)
@@ -1163,7 +1219,26 @@ Value execute(Runtime& rt, Frame& frame)
 
                     case Op::GetProp: {
                         GCObject* key = code.atoms[operandAt(pc)].get();
+                        const std::uint32_t site = pc;
                         pc += 4;
+                        if (DynObject* fast = cacheableObject(sp.back())) {
+                            if (code.siteCache.empty())
+                                code.siteCache.assign(code.code.size(), 0);
+                            const std::size_t at = std::size_t(code.siteCache[site]) - 1;
+                            if (at < fast->props.size() && fast->props[at].key.get() == key && !fast->props[at].accessor()) {
+                                Value r = fast->props[at].value;
+                                sp.back() = std::move(r);
+                                break;
+                            }
+                            if (const Prop* own = fast->findOwn(key)) {
+                                if (!own->accessor()) {
+                                    rememberSite(code.siteCache[site], std::size_t(own - fast->props.data()));
+                                    Value r = own->value;
+                                    sp.back() = std::move(r);
+                                    break;
+                                }
+                            }
+                        }
                         Value base = pop();
                         sp.push_back(getProperty(rt, base, key));
                         break;
@@ -1194,7 +1269,25 @@ Value execute(Runtime& rt, Frame& frame)
                     }
                     case Op::SetProp: {
                         GCObject* key = code.atoms[operandAt(pc)].get();
+                        const std::uint32_t site = pc;
                         pc += 4;
+                        {
+                            const std::size_t n = sp.size();
+                            if (DynObject* fast = cacheableObject(sp[n - 2])) {
+                                if (code.siteCache.empty())
+                                    code.siteCache.assign(code.code.size(), 0);
+                                const std::size_t at = std::size_t(code.siteCache[site]) - 1;
+                                Prop* own = at < fast->props.size() && fast->props[at].key.get() == key ? &fast->props[at] : fast->findOwn(key);
+                                if (own && (own->attrs & (PropAccessor | PropWritable)) == PropWritable && !fast->frozen) {
+                                    rememberSite(code.siteCache[site], std::size_t(own - fast->props.data()));
+                                    own->value = sp[n - 1];
+                                    Value v = std::move(sp[n - 1]);
+                                    sp.resize(n - 2);
+                                    sp.push_back(std::move(v));
+                                    break;
+                                }
+                            }
+                        }
                         Value v = pop();
                         Value base = pop();
                         setProperty(rt, base, key, v);
@@ -1202,12 +1295,35 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::GetElem: {
+                        {
+                            DynArray* arr = nullptr;
+                            std::uint32_t index = 0;
+                            const std::size_t n = sp.size();
+                            if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
+                                Value r = arr->elements[index];
+                                sp.pop_back();
+                                sp.back() = std::move(r);
+                                break;
+                            }
+                        }
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
                         sp.push_back(getProperty(rt, base, key.get()));
                         break;
                     }
                     case Op::GetElemDup: {
+                        {
+                            DynArray* arr = nullptr;
+                            std::uint32_t index = 0;
+                            const std::size_t n = sp.size();
+                            if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
+                                Value r = arr->elements[index];
+                                Value base = sp[n - 2];
+                                sp[n - 2] = std::move(r);
+                                sp[n - 1] = std::move(base);
+                                break;
+                            }
+                        }
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = sp.back();
                         sp.back() = getProperty(rt, base, key.get());
@@ -1215,6 +1331,19 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::SetElem: {
+                        {
+                            DynArray* arr = nullptr;
+                            std::uint32_t index = 0;
+                            const std::size_t n = sp.size();
+                            // With an own property in the table, "0" may be there with attributes of its own.
+                            if (fastIndex(sp[n - 3], sp[n - 2], arr, index) && !arr->frozen && arr->props.empty()) {
+                                arr->elements[index] = sp[n - 1];
+                                Value v = std::move(sp[n - 1]);
+                                sp.resize(n - 3);
+                                sp.push_back(std::move(v));
+                                break;
+                            }
+                        }
                         Value v = pop();
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
@@ -1440,7 +1569,12 @@ Value execute(Runtime& rt, Frame& frame)
                                                 ? asFunction(detail::Access::make(
                                                       Type::Object, frame.fn->proto.get()))
                                                 : nullptr;
-                        if (!super)
+                        // Inside an arrow function the running function is the arrow, whose prototype is
+                        // Function.prototype; `this` is not this frame's either. A class that extends null has no
+                        // constructor to call at all.
+                        if (frame.fn->isArrow)
+                            throwError(rt, ErrorCode::TypeError, "super() inside an arrow function is not supported");
+                        if (!super || super == rt.functionProto.get())
                             throwError(rt, ErrorCode::TypeError,
                                        "'super' is only valid in a derived constructor");
                         callInternal(rt, super, frame.thisValue, args, true, super);
@@ -1458,6 +1592,12 @@ Value execute(Runtime& rt, Frame& frame)
                     case Op::JumpIfFalse: {
                         const std::uint32_t target = operandAt(pc);
                         pc += 4;
+                        if (sp.back().type() == Type::Bool) {
+                            if (!detail::Access::boolean(sp.back()))
+                                pc = target;
+                            sp.pop_back();
+                            break;
+                        }
                         if (!toBoolean(pop()))
                             pc = target;
                         break;
@@ -1465,6 +1605,12 @@ Value execute(Runtime& rt, Frame& frame)
                     case Op::JumpIfTrue: {
                         const std::uint32_t target = operandAt(pc);
                         pc += 4;
+                        if (sp.back().type() == Type::Bool) {
+                            if (detail::Access::boolean(sp.back()))
+                                pc = target;
+                            sp.pop_back();
+                            break;
+                        }
                         if (toBoolean(pop()))
                             pc = target;
                         break;
@@ -1595,6 +1741,17 @@ Value execute(Runtime& rt, Frame& frame)
                     }
 
                     case Op::Add: {
+                        {
+                            const std::size_t n = sp.size();
+                            Value& fa = sp[n - 2];
+                            Value& fb = sp[n - 1];
+                            if (fa.type() == Type::Double && fb.type() == Type::Double) {
+                                const double r = detail::Access::r8(fa) + detail::Access::r8(fb);
+                                sp.pop_back();
+                                fa = Value(r);
+                                break;
+                            }
+                        }
                         Value b = pop();
                         Value a = pop();
                         if (a.isNumber() && b.isNumber())
@@ -1613,7 +1770,14 @@ Value execute(Runtime& rt, Frame& frame)
                         numeric([](double a, double b) { return a / b; });
                         break;
                     case Op::Mod:
-                        numeric([](double a, double b) { return std::fmod(a, b); });
+                        numeric([](double a, double b) {
+                            if (a > 0 && b > 0 && a <= 2147483647.0 && b <= 2147483647.0) {
+                                const std::int32_t ia = std::int32_t(a), ib = std::int32_t(b);
+                                if (double(ia) == a && double(ib) == b)
+                                    return double(ia % ib);
+                            }
+                            return std::fmod(a, b);
+                        });
                         break;
                     case Op::Pow:
                         numeric([](double a, double b) { return std::pow(a, b); });
@@ -1702,6 +1866,18 @@ Value execute(Runtime& rt, Frame& frame)
                     case Op::Le:
                     case Op::Gt:
                     case Op::Ge: {
+                        {
+                            const std::size_t n = sp.size();
+                            Value& fa = sp[n - 2];
+                            Value& fb = sp[n - 1];
+                            if (fa.type() == Type::Double && fb.type() == Type::Double) {
+                                const double x = detail::Access::r8(fa), y = detail::Access::r8(fb);
+                                const bool res = op == Op::Lt ? x < y : op == Op::Le ? x <= y : op == Op::Gt ? x > y : x >= y;
+                                sp.pop_back();
+                                fa = Value(res);
+                                break;
+                            }
+                        }
                         Value b = pop();
                         Value a = pop();
                         const int r = compare(rt, a, b);

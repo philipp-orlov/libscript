@@ -230,6 +230,32 @@ Op shortCircuitJump(Tok op) noexcept
 class Compiler
 {
 public:
+    void setSloppyThis(bool sloppy) noexcept { sloppyThis_ = sloppy; }
+
+    /// Marks a region of source as strict for as long as the object lives.
+    struct StrictScope
+    {
+        Compiler& compiler;
+        bool active;
+        StrictScope(Compiler& c, bool strict) : compiler(c), active(strict) { compiler.strictDepth_ += active ? 1 : 0; }
+        ~StrictScope() { compiler.strictDepth_ -= active ? 1 : 0; }
+        StrictScope(const StrictScope&) = delete;
+        StrictScope& operator=(const StrictScope&) = delete;
+    };
+
+    /// Whether a function body or a program opens with a "use strict" directive.
+    static bool hasUseStrict(const Node& body)
+    {
+        for (const NodePtr& s : body.list) {
+            if (s->kind != NK::ExprStatement || !s->a || s->a->kind != NK::StringLit)
+                return false;
+            if (s->a->text == ascii("use strict"))
+                return true;
+        }
+        return false;
+    }
+
+
     Compiler(Runtime& rt, std::string sourceName)
         : rt_(rt), sourceName_(std::make_shared<std::string>(std::move(sourceName)))
     {}
@@ -242,6 +268,8 @@ public:
         fs.code->sourceName = sourceName_;
         fs.isGlobal = true;
         fn_ = &fs;
+        const StrictScope strictProgram(*this, hasUseStrict(node));
+        fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
 
         collectCaptured(node, fs.captured);
         fs.completionSlot = hiddenSlot();
@@ -536,6 +564,8 @@ private:
         fs.code->isClassConstructor = node.propKind == PropKind::Constructor;
         fs.code->isDerivedConstructor = node.isStatic;  // set by compileClass
         fs.code->arity = int(node.list.size());
+        const StrictScope strictBody(*this, node.d && hasUseStrict(*node.d));
+        fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
 
         collectCaptured(*node.d, fs.captured);
         for (const NodePtr& p : node.list)
@@ -1740,6 +1770,7 @@ private:
     // ---- classes ----
     void classExpr(const Node& n)
     {
+        const StrictScope strictBody(*this, true);
         const bool derived = n.a != nullptr;
         if (derived)
             expr(*n.a);
@@ -1899,14 +1930,17 @@ private:
     Runtime& rt_;
     std::shared_ptr<const std::string> sourceName_;
     FnState* fn_ = nullptr;
+    bool sloppyThis_ = false;
+    int strictDepth_ = 0;  ///< how many enclosing scopes are strict: a directive, or a class body
 };
 
 }  // namespace
 
 std::shared_ptr<FunctionCode> compileProgram(Runtime& rt, const Node& program,
-                                             const std::string& sourceName)
+                                             const std::string& sourceName, bool sloppyThis)
 {
     Compiler compiler(rt, sourceName);
+    compiler.setSloppyThis(sloppyThis);
     return compiler.program(program);
 }
 

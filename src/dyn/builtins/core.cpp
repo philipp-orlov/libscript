@@ -178,8 +178,18 @@ void installObject(Runtime& rt)
     }, 1);
 
     rt.method(ctor, "setPrototypeOf", [](CallInfo& ci) {
-        if (DynObject* self = asObject(ci.arg(0)))
-            self->proto.reset(asObject(ci.arg(1)));
+        if (DynObject* self = asObject(ci.arg(0))) {
+            DynObject* next = asObject(ci.arg(1));
+            // Every lookup walks this chain without polling, so a cycle would hang the host beyond the reach of the
+            // interrupt handler. The chain is acyclic by construction, which keeps the walk from needing a check.
+            for (DynObject* cursor = next; cursor; cursor = cursor->proto.get()) {
+                if (cursor == self)
+                    ci.fail(ErrorCode::TypeError, "cyclic prototype chain");
+            }
+            if (next != self->proto.get() && !self->extensible)
+                ci.fail(ErrorCode::TypeError, "the object is not extensible");
+            self->proto.reset(next);
+        }
         return ci.arg(0);
     }, 2);
 
@@ -276,7 +286,6 @@ void installObject(Runtime& rt)
 void installFunction(Runtime& rt)
 {
     DynObject* proto = rt.functionProto.get();
-    proto->cls = ObjClass::Function;
 
     rt.method(proto, "call", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);

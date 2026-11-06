@@ -21,6 +21,30 @@ option(SCRIPT_LANG_C "C: statically typed, on the typed engine" ON)
 option(SCRIPT_LANG_CPP "C++: the C front end's dialect with classes and the standard containers, on the typed engine" ON)
 option(SCRIPT_ENABLE_JIT "Compile the arm64 and x86-64 code generators for the typed engine" ON)
 
+# ---- how big ------------------------------------------------------------------
+# One switch for the trade between a small embeddable binary and top speed; each feature it decides stays an option of
+# its own, so a build can pick differently.
+#   Compact      the interpreters only: the smallest code, no executable pages, compact bytecode and nothing else.
+#   Standard     adds the native code generators, the default.
+#   Performance  adds link-time optimization, and whatever else is too big for an embedded build.
+set(SCRIPT_PROFILE "Standard" CACHE STRING "Compact, Standard or Performance")
+set_property(CACHE SCRIPT_PROFILE PROPERTY STRINGS Compact Standard Performance)
+if(NOT SCRIPT_PROFILE MATCHES "^(Compact|Standard|Performance)$")
+    message(FATAL_ERROR "SCRIPT_PROFILE must be Compact, Standard or Performance, not '${SCRIPT_PROFILE}'")
+endif()
+if(SCRIPT_PROFILE STREQUAL "Compact")
+    set(SCRIPT_ENABLE_JIT OFF CACHE BOOL "" FORCE)
+endif()
+set(SCRIPT_LTO_DEFAULT OFF)
+if(SCRIPT_PROFILE STREQUAL "Performance")
+    set(SCRIPT_LTO_DEFAULT ON)
+endif()
+option(SCRIPT_ENABLE_LTO "Link-time optimization of the library and the tools" ${SCRIPT_LTO_DEFAULT})
+# Profile-guided optimization, in two builds: configure with SCRIPT_PGO=generate, run tools/pgo-train.sh, then
+# reconfigure the same tree with SCRIPT_PGO=use.
+set(SCRIPT_PGO "" CACHE STRING "Empty, generate or use")
+set(SCRIPT_PGO_DIR "${CMAKE_BINARY_DIR}/pgo-data" CACHE PATH "Where profile data is written and read")
+
 include(cmake/ScriptLanguage.cmake)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -66,6 +90,18 @@ endfunction()
 # Whole functions and data can be dropped at link time, for anyone linking the archive with --gc-sections.
 if(NOT MSVC)
     add_compile_options(-ffunction-sections -fdata-sections)
+endif()
+
+if(SCRIPT_ENABLE_LTO AND NOT MSVC)
+    add_compile_options(-flto=auto -fno-fat-lto-objects)
+    add_link_options(-flto=auto)
+endif()
+if(SCRIPT_PGO STREQUAL "generate" AND NOT MSVC)
+    add_compile_options(-fprofile-generate -fprofile-update=single "-fprofile-dir=${SCRIPT_PGO_DIR}")
+    add_link_options(-fprofile-generate)
+elseif(SCRIPT_PGO STREQUAL "use" AND NOT MSVC)
+    add_compile_options(-fprofile-use -fprofile-correction -Wno-missing-profile "-fprofile-dir=${SCRIPT_PGO_DIR}")
+    add_link_options(-fprofile-use)
 endif()
 
 # ---- the engines and the languages ------------------------------------------
@@ -234,7 +270,7 @@ set_target_properties(script PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-message(STATUS "libscript: languages ${SCRIPT_LANGUAGE_NAMES}; typed engine ${SCRIPT_ENGINE_TYPED}; dynamic engine ${SCRIPT_ENGINE_DYNAMIC}; jit ${SCRIPT_ENABLE_JIT}")
+message(STATUS "libscript: languages ${SCRIPT_LANGUAGE_NAMES}; typed engine ${SCRIPT_ENGINE_TYPED}; dynamic engine ${SCRIPT_ENGINE_DYNAMIC}; profile ${SCRIPT_PROFILE}; jit ${SCRIPT_ENABLE_JIT}; lto ${SCRIPT_ENABLE_LTO}")
 
 # ---- the rest ----------------------------------------------------------------
 include(GNUInstallDirs)

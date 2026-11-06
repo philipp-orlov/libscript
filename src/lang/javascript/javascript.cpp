@@ -29,7 +29,7 @@ std::shared_ptr<CompiledUnit> compileJavaScript(ContextImpl& ctx, std::string_vi
     auto unit = std::make_shared<Program>();
     unit->language = Language::JavaScript;
     unit->name = std::string(name);
-    unit->code = compileProgram(rt, *program, std::string(name));
+    unit->code = compileProgram(rt, *program, std::string(name), /*sloppyThis=*/true);
     rt.adoptProgram(unit);
     return unit;
 }

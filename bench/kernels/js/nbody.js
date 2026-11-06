@@ -1,0 +1,4 @@
+function B(x,y,z,vx,vy,vz,m){this.x=x;this.y=y;this.z=z;this.vx=vx;this.vy=vy;this.vz=vz;this.m=m;}
+function adv(bs,dt){var n=bs.length;for(var i=0;i<n;i++){var a=bs[i];for(var j=i+1;j<n;j++){var b=bs[j];var dx=a.x-b.x,dy=a.y-b.y,dz=a.z-b.z;var d2=dx*dx+dy*dy+dz*dz;var mag=dt/(d2*Math.sqrt(d2));a.vx-=dx*b.m*mag;a.vy-=dy*b.m*mag;a.vz-=dz*b.m*mag;b.vx+=dx*a.m*mag;b.vy+=dy*a.m*mag;b.vz+=dz*a.m*mag;}}for(var i=0;i<n;i++){var c=bs[i];c.x+=dt*c.vx;c.y+=dt*c.vy;c.z+=dt*c.vz;}}
+function kernel(steps){var bs=[new B(0,0,0,0,0,0,39.47),new B(4.84,-1.16,-0.10,0.606,2.81,-0.02,0.037),new B(8.34,4.12,-0.4,-1.01,1.82,0.008,0.011),new B(12.89,-15.11,-0.22,1.08,0.868,-0.01,0.0017),new B(15.37,-25.9,0.179,0.979,0.594,-0.034,0.002)];for(var s=0;s<steps;s++)adv(bs,0.01);return Math.round(bs[0].x*1e6);}
+console.log(kernel(500000));

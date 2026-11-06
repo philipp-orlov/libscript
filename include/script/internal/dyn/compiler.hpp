@@ -18,9 +18,10 @@ struct Runtime;
 
 /// Compile a whole program. The result is a zero-argument function whose
 /// `var` and function declarations target the global object and whose value is
-/// the completion value of the last expression statement.
+/// the completion value of the last expression statement. `sloppyThis` is JavaScript's non-strict rule for `this` in a
+/// plain call, for code that no "use strict" directive or class body covers.
 std::shared_ptr<FunctionCode> compileProgram(Runtime& rt, const Node& program,
-                                             const std::string& sourceName);
+                                             const std::string& sourceName, bool sloppyThis = false);
 
 }  // namespace dyn
 }  // namespace internal

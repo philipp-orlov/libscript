@@ -205,10 +205,15 @@ struct FunctionCode
     /// Slot holding the `arguments` array, or `kNoSlot` when unused.
     std::uint32_t argumentsSlot = 0xffffffffu;
     bool argumentsBoxed = false;
+    /// Non-strict JavaScript: a plain call's `this` reads as the global object.
+    bool sloppyThis = false;
 
     static constexpr std::uint32_t kNoSlot = 0xffffffffu;
 
     std::vector<std::uint8_t> code;
+    /// By code offset: where the property a `GetProp` or `SetProp` found last time sat in the object's table, plus one;
+    /// 0 for not yet or too far along. A byte each, made the first time the function reads a property.
+    mutable std::vector<std::uint8_t> siteCache;
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;

@@ -316,3 +316,79 @@ TEST(evalKeepsGlobalStateBetweenCalls)
     ctx.eval("add(2); add(3)");
     CHECK_EQ(ctx.eval("total").toDouble(), 5.0);
 }
+
+// ---- found by the comparison with JavaScriptCore; each of these used to hang or crash the host ----
+
+namespace {
+
+std::string messageOf(const char* source)
+{
+    js::Context ctx;
+    try {
+        ctx.eval(source, "<test>");
+    } catch (const js::Exception& e) {
+        return e.what();
+    }
+    return "<no exception>";
+}
+
+}  // namespace
+
+TEST(aPrototypeCycleIsRefused)
+{
+    CHECK(messageOf("var a = {}, b = Object.create(a); Object.setPrototypeOf(a, b); a.nope").find("cyclic") !=
+          std::string::npos);
+    CHECK(messageOf("var a = {}; Object.setPrototypeOf(a, a)").find("cyclic") != std::string::npos);
+    CHECK_EQ(num("var a = {x: 1}, b = {}; Object.setPrototypeOf(b, a); b.x"), 1.0);
+}
+
+TEST(functionPrototypeIsCallableButNotAConstructor)
+{
+    CHECK(messageOf("new Function.prototype").find("not a constructor") != std::string::npos);
+    CHECK_EQ(run("String(Function.prototype())"), "undefined");
+    CHECK_EQ(run("typeof Function.prototype"), "function");
+}
+
+TEST(superCallsWithNothingToCallAreErrors)
+{
+    CHECK(messageOf("class C extends null { constructor() { super(); } } new C()").find("super") != std::string::npos);
+    CHECK(messageOf("class A {} class B extends A { constructor() { var f = () => super(); f(); } } new B()")
+              .find("super") != std::string::npos);
+}
+
+TEST(aHugeArrayLengthIsARangeError)
+{
+    CHECK(messageOf("var x = []; x.length = 4294967295").find("dense") != std::string::npos);
+    CHECK(messageOf("new Array(4294967295)").find("dense") != std::string::npos);
+}
+
+TEST(frozenArraysStayFrozen)
+{
+    CHECK_EQ(num("var a = Object.freeze([1, 2]); a[0] = 9; a[0]"), 1.0);
+    CHECK_EQ(num("var a = Object.freeze([1, 2]); a[5] = 9; a.length = 0; a.length"), 2.0);
+    for (const char* mutation : {"a.push(3)", "a.pop()", "a.shift()", "a.unshift(0)", "a.splice(0, 1)", "a.reverse()",
+                                 "a.fill(0)", "a.sort()"}) {
+        const std::string source = std::string("var a = Object.freeze([1, 2]); ") + mutation;
+        CHECK(messageOf(source.c_str()).find("frozen") != std::string::npos);
+    }
+}
+
+TEST(thisInAPlainCallFollowsStrictness)
+{
+    CHECK_EQ(run("function f() { return this; } String(f() === globalThis)"), "true");
+    CHECK_EQ(run("function f() { 'use strict'; return this; } String(f())"), "undefined");
+    CHECK_EQ(run("'use strict'; function f() { return this; } String(f())"), "undefined");
+    CHECK_EQ(run("class K { m() { return this; } } var m = new K().m; String(m())"), "undefined");
+    CHECK_EQ(run("function f() { return () => this; } String(f()() === globalThis)"), "true");
+}
+
+TEST(aPropertyCacheSeesThroughNeitherShapesNorArrays)
+{
+    // One site, several shapes: the remembered index must never answer for the wrong key.
+    CHECK_EQ(num("function get(o) { return o.x; } get({x: 1}); get({y: 5, x: 2}); get({x: 3}) + get({z: 0, x: 4})"), 7.0);
+    // An array's `length` is not a table entry, even when it shares a site with an object that has one.
+    CHECK_EQ(num("function len(o) { return o.length; } len({length: 7}); len([1, 2, 3])"), 3.0);
+    CHECK_EQ(num("function set(o, v) { o.length = v; } var a = [1, 2, 3]; set({length: 0}, 1); set(a, 1); a.length"), 1.0);
+    // Writes respect read-only properties and frozen objects on the fast path too.
+    CHECK_EQ(num("function set(o) { o.x = 9; } var a = {x: 1}; set(a); var b = Object.freeze({x: 1}); set(b); b.x"), 1.0);
+}

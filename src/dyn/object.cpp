@@ -29,7 +29,7 @@ SymbolCell::~SymbolCell()
 
 Prop* DynObject::findOwn(GCObject* key) noexcept
 {
-    if (index.empty()) {
+    if (!rare || rare->index.empty()) {
         for (Prop& p : props) {
             if (p.key.get() == key)
                 return &p;
@@ -37,6 +37,7 @@ Prop* DynObject::findOwn(GCObject* key) noexcept
         return nullptr;
     }
     // The table always keeps at least one empty slot, so the probe terminates.
+    const Vec<std::uint32_t>& index = rare->index;
     const std::size_t mask = index.size() - 1;
     std::size_t slot = hashPointer(key) & mask;
     for (;;) {
@@ -87,9 +88,9 @@ void DynObject::appendKnown(GCObject* key, Value value, Shape* next)
     if (props.capacity() != before)
         tableChanged();
     chargeIfGrown(props, before);
-    if (props.size() > kIndexThreshold && index.size() < props.size() * 2)
+    if (props.size() > kIndexThreshold && (!rare || rare->index.size() < props.size() * 2))
         reindex();
-    else if (!index.empty())
+    else if (rare && !rare->index.empty())
         indexInsert(std::uint32_t(props.size() - 1));
     shape = next;
     if (isProto)
@@ -117,9 +118,9 @@ Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
         tableChanged();
     chargeIfGrown(props, before);
 
-    if (props.size() > kIndexThreshold && index.size() < props.size() * 2)
+    if (props.size() > kIndexThreshold && (!rare || rare->index.size() < props.size() * 2))
         reindex();
-    else if (!index.empty())
+    else if (rare && !rare->index.empty())
         indexInsert(std::uint32_t(props.size() - 1));
     if (shape) {
         Runtime* engine = rt ? rt->dynIfAny() : nullptr;
@@ -149,6 +150,7 @@ bool DynObject::deleteOwn(GCObject* key)
 
 void DynObject::indexInsert(std::uint32_t at) noexcept
 {
+    Vec<std::uint32_t>& index = rare->index;
     const std::size_t mask = index.size() - 1;
     std::size_t slot = hashPointer(props[at].key.get()) & mask;
     while (index[slot])
@@ -159,11 +161,13 @@ void DynObject::indexInsert(std::uint32_t at) noexcept
 void DynObject::reindex()
 {
     if (props.size() <= kIndexThreshold) {
-        index.clear();
-        index.shrink_to_fit();
+        if (rare) {
+            rare->index.clear();
+            rare->index.shrink_to_fit();
+        }
         return;
     }
-    index.assign(tableSizeFor(props.size() * 2), 0);
+    rareOf().index.assign(tableSizeFor(props.size() * 2), 0);
     for (std::uint32_t i = 0; i < props.size(); ++i)
         indexInsert(i);
 }
@@ -187,8 +191,8 @@ void DynObject::children(GcList& out) const
         if (GCObject* v = detail::Access::ptr(p.value))
             out.push_back(v);
     }
-    if (setters) {
-        for (const auto& [key, fn] : *setters) {
+    if (rare && rare->setters) {
+        for (const auto& [key, fn] : *rare->setters) {
             if (GCObject* s = detail::Access::ptr(fn))
                 out.push_back(s);
         }
@@ -197,24 +201,25 @@ void DynObject::children(GcList& out) const
 
 void DynObject::setSetter(const Prop& p, Value fn)
 {
-    if (!setters) {
+    if (!rare || !rare->setters) {
         if (fn.isUndefined())
             return;
-        setters = std::make_unique<Vec<std::pair<Ref<GCObject>, Value>>>();
+        rareOf().setters = std::make_unique<Vec<std::pair<Ref<GCObject>, Value>>>();
     }
-    for (std::size_t i = 0; i < setters->size(); ++i) {
-        if ((*setters)[i].first.get() != p.key.get())
+    auto& setters = *rare->setters;
+    for (std::size_t i = 0; i < setters.size(); ++i) {
+        if (setters[i].first.get() != p.key.get())
             continue;
         if (fn.isUndefined()) {
-            (*setters)[i] = std::move(setters->back());
-            setters->pop_back();
+            setters[i] = std::move(setters.back());
+            setters.pop_back();
         } else {
-            (*setters)[i].second = std::move(fn);
+            setters[i].second = std::move(fn);
         }
         return;
     }
     if (!fn.isUndefined())
-        setters->push_back({Ref<GCObject>(p.key.get()), std::move(fn)});
+        setters.push_back({Ref<GCObject>(p.key.get()), std::move(fn)});
 }
 
 void DynObject::clearReferences()
@@ -223,9 +228,11 @@ void DynObject::clearReferences()
     proto.reset();
     props.clear();
     props.shrink_to_fit();
-    index.clear();
-    index.shrink_to_fit();
-    setters.reset();
+    if (rare) {
+        rare->index.clear();
+        rare->index.shrink_to_fit();
+        rare->setters.reset();
+    }
 }
 
 std::size_t DynObject::heapSize() const
@@ -234,7 +241,7 @@ std::size_t DynObject::heapSize() const
     const std::size_t cell = kind == CellKind::Object && cls == ObjClass::Plain && cellBytes > sizeof(*this)
                                  ? cellBytes
                                  : sizeof(*this);
-    return cell + props.heapCapacity() * sizeof(Prop) + index.capacity() * sizeof(std::uint32_t);
+    return cell + props.heapCapacity() * sizeof(Prop) + (rare ? rare->index.capacity() * sizeof(std::uint32_t) : 0);
 }
 
 // -------------------------------------------------------------- arrays ---

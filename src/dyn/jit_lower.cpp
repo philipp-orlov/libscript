@@ -52,7 +52,7 @@ constexpr std::int64_t kExtensibleOffset = offsetof(DynObject, extensible);
 constexpr std::int64_t kRcOffset = offsetof(GCObject, rc);
 constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
 constexpr std::int64_t kStringCharsOffset = sizeof(StringCell);
-constexpr std::int64_t kIndexOffset = offsetof(DynObject, index);
+constexpr std::int64_t kRareOffset = offsetof(DynObject, rare);
 constexpr std::int64_t kPropValueOffset = offsetof(Prop, value);
 constexpr std::int64_t kPropKeyOffset = offsetof(Prop, key);
 constexpr std::int64_t kPropAttrsOffset = offsetof(Prop, attrs);
@@ -3074,16 +3074,9 @@ private:
     {
         const std::int32_t isProto = load(base.r, kIsProtoOffset, 1, false, kAliasHeader);
         branchCmp(isProto, IrCond::Ne, 0, slow);
-        const std::int32_t indexBegin = load(base.r, kIndexOffset, 8, false, kAliasHeader);
-        const std::int32_t indexEnd = load(base.r, kIndexOffset + 8, 8, false, kAliasHeader);
-        {
-            IrInst& test = inst(IrOp::BrCmp);
-            test.a = indexBegin;
-            test.b = indexEnd;
-            test.cond = IrCond::Ne;
-            test.width = 64;
-            test.target = slow;
-        }
+        // No index to keep up, nor anything else out of the ordinary.
+        const std::int32_t rare = load(base.r, kRareOffset, 8, false, kAliasHeader);
+        branchCmp(rare, IrCond::Ne, 0, slow, 64);
         const std::int32_t end = loadHeader(base.r, kPropsOffset + 8);
         const std::int32_t cap = loadHeader(base.r, kPropsOffset + 16);
         {

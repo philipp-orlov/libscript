@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -118,7 +119,7 @@ public:
     /// Start out in `count` slots at `room`, which belong to the owner and are never freed from here.
     void adopt(Prop* room, std::size_t count) noexcept
     {
-        begin_ = end_ = inline_ = room;
+        begin_ = end_ = room;
         cap_ = room + count;
     }
 
@@ -136,7 +137,7 @@ public:
     Prop& back() noexcept { return end_[-1]; }
     const Prop& back() const noexcept { return end_[-1]; }
     /// Slots allocated apart from the owner.
-    std::size_t heapCapacity() const noexcept { return begin_ != inline_ ? capacity() : 0; }
+    std::size_t heapCapacity() const noexcept { return inCell() ? 0 : capacity(); }
 
     Prop& emplace_back()
     {
@@ -162,7 +163,7 @@ public:
     }
     void shrink_to_fit()
     {
-        if (begin_ == inline_ || end_ == cap_)
+        if (inCell() || end_ == cap_)
             return;
         if (empty()) {
             release();
@@ -200,14 +201,15 @@ private:
     }
     void release() noexcept
     {
-        if (begin_ && begin_ != inline_)
+        if (begin_ && !inCell())
             PoolAlloc<Prop>().deallocate(begin_, capacity());
     }
 
     Prop* begin_ = nullptr;
     Prop* end_ = nullptr;
     Prop* cap_ = nullptr;
-    Prop* inline_ = nullptr;
+    /// Whether the slots are still the ones in the owner's cell.
+    bool inCell() const noexcept;
 };
 
 enum class ObjClass : std::uint8_t
@@ -273,9 +275,9 @@ struct DynObject : GCObject
     bool frozen = false;
     /// Something's prototype: changing which properties this has invalidates what sites know about objects beyond it.
     bool isProto = false;
+    /// The properties started out in the cell, past the end of this.
+    bool propsInCell = false;
     Shape* shape = nullptr;
-    /// The shape an object with this one as its prototype starts from.
-    Shape* childRoot = nullptr;
     PinRef<DynObject> proto;
     /// Sets `proto`, keeping what shapes and sites know right. Every change of prototype goes through here.
     void setProto(DynObject* next);
@@ -286,17 +288,30 @@ struct DynObject : GCObject
     /// Append a property known to be missing, moving to `next`, the shape that says so.
     void appendKnown(GCObject* key, Value value, Shape* next);
     PropVec props;
-    /// Open-addressed map from key pointer to `props` index plus one, sized to
-    /// a power of two. Built lazily -- small objects are faster to scan -- and
-    /// flat, so a property table is one allocation rather than one per entry.
-    Vec<std::uint32_t> index;
-    std::unique_ptr<NativeSlot> nativeSlot;
-    /// The setters of accessor properties that have one, by key: few objects have any.
-    std::unique_ptr<Vec<std::pair<Ref<GCObject>, Value>>> setters;
+    /// What few objects need, kept apart so that the many do not carry it.
+    struct Rare
+    {
+        /// Open-addressed map from key pointer to `props` index plus one, sized to
+        /// a power of two. Built lazily -- small objects are faster to scan -- and
+        /// flat, so a property table is one allocation rather than one per entry.
+        Vec<std::uint32_t> index;
+        std::unique_ptr<NativeSlot> nativeSlot;
+        /// The setters of accessor properties that have one, by key.
+        std::unique_ptr<Vec<std::pair<Ref<GCObject>, Value>>> setters;
+        /// The shape an object with this one as its prototype starts from.
+        Shape* childRoot = nullptr;
+    };
+    std::unique_ptr<Rare> rare;
+    Rare& rareOf()
+    {
+        if (!rare)
+            rare = std::make_unique<Rare>();
+        return *rare;
+    }
     Value setterOf(const Prop& p) const noexcept
     {
-        if (setters) {
-            for (const auto& [key, fn] : *setters) {
+        if (rare && rare->setters) {
+            for (const auto& [key, fn] : *rare->setters) {
                 if (key.get() == p.key.get())
                     return fn;
             }
@@ -332,6 +347,19 @@ private:
 /// Arrays are dense, so a length is memory. Past this a request is refused with a `RangeError` rather than left to fail
 /// in the allocator, which would end the process. A context with a memory limit has that limit to answer instead.
 inline constexpr std::size_t kMaxDenseArrayLength = std::size_t(1) << 28;
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+inline bool PropVec::inCell() const noexcept
+{
+    const auto* owner = reinterpret_cast<const DynObject*>(reinterpret_cast<const char*>(this) - offsetof(DynObject, props));
+    return owner->propsInCell && begin_ == reinterpret_cast<const Prop*>(owner + 1);
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 struct DynArray : DynObject
 {

@@ -376,7 +376,7 @@ bool Value::isNative() const noexcept
         return true;
 #if SCRIPT_ENGINE_DYNAMIC
     if (dyn::DynObject* o = dyn::asObject(*this))
-        return o->nativeSlot != nullptr;
+        return o->rare && o->rare->nativeSlot != nullptr;
 #endif
     return false;
 }
@@ -1046,8 +1046,8 @@ void* Value::nativeHandle(const void* typeKey) const noexcept
     }
 #if SCRIPT_ENGINE_DYNAMIC
     if (dyn::DynObject* obj = dyn::asObject(*this)) {
-        if (obj->nativeSlot && obj->nativeSlot->typeKey == typeKey)
-            return obj->nativeSlot->data;
+        if (obj->rare && obj->rare->nativeSlot && obj->rare->nativeSlot->typeKey == typeKey)
+            return obj->rare->nativeSlot->data;
     }
 #endif
     (void)typeKey;

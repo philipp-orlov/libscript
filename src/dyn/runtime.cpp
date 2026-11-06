@@ -286,7 +286,7 @@ void Runtime::afterCollect() noexcept
 
 Shape* Runtime::rootShapeFor(DynObject* proto)
 {
-    Shape*& root = proto ? proto->childRoot : nullProtoRoot;
+    Shape*& root = proto ? proto->rareOf().childRoot : nullProtoRoot;
     if (!root && shapes.size() < kMaxShapes) {
         shapes.push_back(std::make_unique<Shape>());
         root = shapes.back().get();
@@ -339,12 +339,14 @@ DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
     ctx.reserve(bytes);
     auto* o = new (ctx.heap.allocate(bytes)) DynObject();
     o->cellBytes = std::uint32_t(bytes);
-    if (room)
+    if (room) {
+        o->propsInCell = true;
         o->props.adopt(reinterpret_cast<Prop*>(o + 1), room);
+    }
     ctx.linkKnown(o, std::uint32_t(bytes));
     if (!proto->isProto)
         proto->isProto = true;
-    Shape* root = proto->childRoot ? proto->childRoot : rootShapeFor(proto);
+    Shape* root = proto->rare && proto->rare->childRoot ? proto->rare->childRoot : rootShapeFor(proto);
     // A prototype of this many objects is here to stay, and counting it is a cost of each of them.
     constexpr std::uint32_t kPinAfter = 1024;
     if (!proto->pinned && root && ++root->births > kPinAfter)
@@ -432,11 +434,12 @@ DynFunction* Runtime::makeConstructor(const char* name, NativeFunction fn, int a
 void attachNativeSlot(DynObject& obj, const void* typeKey, void* instance,
                       Context::Finalizer finalizer, void* owner)
 {
-    obj.nativeSlot = std::make_unique<NativeSlot>();
-    obj.nativeSlot->typeKey = typeKey;
-    obj.nativeSlot->data = instance;
-    obj.nativeSlot->owner = owner;
-    obj.nativeSlot->finalizer = finalizer;
+    std::unique_ptr<NativeSlot>& slot = obj.rareOf().nativeSlot;
+    slot = std::make_unique<NativeSlot>();
+    slot->typeKey = typeKey;
+    slot->data = instance;
+    slot->owner = owner;
+    slot->finalizer = finalizer;
 }
 
 namespace {

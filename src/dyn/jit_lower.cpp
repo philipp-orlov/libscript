@@ -3212,6 +3212,35 @@ private:
             push(boolEntry(d));
             return;
         }
+        // Strictly against a number: anything not tagged a number is unequal, a number compares as a double.
+        if (strict && isKnownNumber(a) != isKnownNumber(b)) {
+            const Entry& number = isKnownNumber(a) ? a : b;
+            const Entry& other = isKnownNumber(a) ? b : a;
+            const std::int32_t x = doubleReg(number);
+            const std::int32_t tag = tagReg(other);
+            const std::int32_t payload = payloadReg(other);
+            const std::int32_t done = newLabel();
+            IrInst& none = inst(IrOp::MovImm);
+            none.d = d;
+            none.imm = wantEqual ? 0 : 1;
+            branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), done);
+            const std::int32_t y = fn_.newVreg(true);
+            IrInst& bits = inst(IrOp::BitsToFp);
+            bits.d = y;
+            bits.a = payload;
+            bits.width = 64;
+            IrInst& in = inst(IrOp::FCset);
+            in.d = d;
+            in.a = x;
+            in.b = y;
+            in.cond = wantEqual ? IrCond::FEq : IrCond::FNe;
+            in.width = 64;
+            inst(IrOp::Label).imm = done;
+            release(other);
+            release(number);
+            push(boolEntry(d));
+            return;
+        }
         // Against undefined or null, only the tags matter.
         const auto isNullish = [](const Entry& e) {
             return e.isConst && e.rep == Rep::Tagged && (e.known == Type::Undefined || e.known == Type::Null);

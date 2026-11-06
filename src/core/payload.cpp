@@ -39,6 +39,7 @@ void flush(Cache& c) noexcept
         }
         c.count[bin] = 0;
     }
+    c.bytes = 0;
 }
 
 struct Flusher
@@ -60,6 +61,7 @@ void* take(std::size_t bytes)
     if (void* p = c.head[bin]) {
         c.head[bin] = *static_cast<void**>(p);
         --c.count[bin];
+        c.bytes -= bin * kGranule;
         return p;
     }
     return refill(bin * kGranule);
@@ -69,10 +71,11 @@ void give(void* p, std::size_t bytes) noexcept
 {
     const std::size_t bin = (bytes + kGranule - 1) / kGranule;
     Cache& c = t_cache;
-    if (c.registered && c.count[bin] < (bin <= 16 ? 32 : 8)) {
+    if (c.registered && c.bytes + bin * kGranule <= kBudget) {
         *static_cast<void**>(p) = c.head[bin];
         c.head[bin] = p;
         ++c.count[bin];
+        c.bytes += bin * kGranule;
         return;
     }
     spill(p, bin * kGranule);
@@ -88,6 +91,11 @@ void* refill(std::size_t bytes)
         c.registered = true;
     }
     return mem::PoolAllocator<char, &payloadPool>().allocate(bytes);
+}
+
+void flushThisThread() noexcept
+{
+    flush(t_cache);
 }
 
 void* takeLarge(std::size_t bytes)

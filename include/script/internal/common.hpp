@@ -55,10 +55,14 @@ namespace payload_cache {
 inline constexpr std::size_t kGranule = 16;
 inline constexpr std::size_t kMaxBytes = 1024;
 inline constexpr std::size_t kBins = kMaxBytes / kGranule + 1;
+/// Enough for a few thousand small tables: a structure is often freed whole and then built again.
+inline constexpr std::size_t kBudget = std::size_t(512) << 10;
 struct Cache
 {
     void* head[kBins];
-    std::uint8_t count[kBins];
+    std::uint32_t count[kBins];
+    /// What all the bins hold together; a thread keeps no more than `kBudget`.
+    std::size_t bytes;
     bool registered;
     bool dead;
 };
@@ -71,6 +75,8 @@ void* take(std::size_t bytes);
 void give(void* p, std::size_t bytes) noexcept;
 /// Past the cache: straight to `payloadPool`, or the OS beyond its classes.
 void* takeLarge(std::size_t bytes);
+/// Hand what this thread's cache holds back to `payloadPool`, as a trim does.
+void flushThisThread() noexcept;
 void giveLarge(void* p, std::size_t bytes) noexcept;
 }  // namespace payload_cache
 

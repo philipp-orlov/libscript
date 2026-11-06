@@ -107,6 +107,8 @@ struct Runtime : EngineRuntime
     std::uint32_t nativeError = 0;
     /// The exception behind `nativeError`, when one was made: the trampoline raises it unchanged.
     std::exception_ptr nativePending;
+    /// Exceptions waiting for the `finally` they are passing through to end.
+    std::vector<std::exception_ptr> finallyPending;
     /// Nonzero when a back edge has to ask `scriptJitPoll`. Without an interrupt handler a loop only reads this.
     std::uint32_t pollFlag = 0;
     /// The stack address below which native code raises `StackOverflow` instead of making a frame.

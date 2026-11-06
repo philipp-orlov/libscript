@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "script/internal/typed/metadata.hpp"
@@ -35,6 +36,7 @@ enum class IrOp : std::uint8_t
     Label,    // imm: label id
     Mov,      // d = a, in the register class of d (both integer or both floating point)
     MovImm,   // d = imm
+    MovRuntime, // d = the runtime pointer
     FMovImm,  // d = the floating point constant whose bits are imm; width says which size
     BitsToFp, // d (fp) = bits of a (int)
     FpToBits, // d (int) = bits of a (fp)
@@ -66,6 +68,9 @@ enum class IrOp : std::uint8_t
 
     IncRef,      // a may be null when isNullable
     DecRef,      // a may be null when isNullable
+    IncRefTagged,  // a is a value whose tag is b: a count only if the tag says reference
+    DecRefTagged,
+    TagOfNullable, // d = tag, or Null when a is zero
     Poll,        // a loop back edge: stop at exit `target` if an interrupt is asked for
 
     Call,        // calls[imm]
@@ -140,6 +145,7 @@ struct IrCall
     void* helper = nullptr;
     std::vector<std::int32_t> args;
     std::int32_t result = -1;
+    std::int32_t resultTag = -1;  ///< `object` comes back as a payload and a tag
     std::int32_t delegate = -1;
     std::int32_t exit = -1;   ///< where to go when the call raised; -1 when it cannot raise
     std::int32_t site = -1;   ///< index in `sites`
@@ -150,7 +156,22 @@ struct IrCall
 /// `ErrorCode::None`-like zero, the error already pending travels on), and the method returns to its caller.
 struct IrExit
 {
+    /// A field a loop keeps in a register, which has to be back in memory before anyone can look.
+    struct WriteBack
+    {
+        std::int32_t base;
+        std::int64_t offset;
+        std::int32_t vreg;
+        std::uint8_t width;
+    };
+    std::vector<WriteBack> writeBacks;
     std::vector<std::int32_t> cleanup;
+    /// `object` values: (payload, tag).
+    std::vector<std::pair<std::int32_t, std::int32_t>> cleanupTagged;
+    /// The index a bounds failure says it was given.
+    std::int32_t indexVreg = -1;
+    /// Where to carry on when a handler in this method may take the exception; -1 means return to the caller.
+    std::int32_t handlerLabel = -1;
     std::uint32_t code = 0;
     std::int32_t site = -1;
 };
@@ -166,6 +187,7 @@ struct IrOsrEntry
         std::uint32_t slot;
         std::uint8_t bytes;  ///< 4 or 8 of the payload
         bool owned;          ///< the count moves from the interpreter's frame to the native one
+        std::int32_t tagVreg = -1;  ///< `object`: its tag goes here
     };
     std::vector<Slot> slots;
 };
@@ -178,6 +200,8 @@ struct IrFunction
     std::vector<IrExit> exits;
     std::vector<IrSite> sites;
     std::vector<IrOsrEntry> osrEntries;
+    /// What an on-stack replacement has to set to zero, having no such thing in the interpreter's frame to read.
+    std::vector<std::int32_t> osrZero;
     std::vector<std::uint8_t> vregIsFp;
     std::int32_t labelCount = 0;
 
@@ -200,6 +224,14 @@ struct IrFunction
     std::uint64_t usedIntRegs = 0;
     std::uint64_t usedFpRegs = 0;
     bool makesCalls = false;
+    /// For a `DecRef` whose `target` is the index here: the caller-saved registers live across it, which its cold path
+    /// has to keep.
+    struct LiveRegs
+    {
+        std::uint64_t ints = 0;
+        std::uint64_t fps = 0;
+    };
+    std::vector<LiveRegs> liveAtRelease;
 
     std::int32_t newVreg(bool fp)
     {
@@ -219,6 +251,9 @@ struct Runtime;
 /// Whether the optimizing tier can handle `method` and, when it can, its IR. `reason` receives what ruled it out.
 /// `osr` adds an entry at every loop head with an empty evaluation stack.
 bool lowerMethod(Runtime& rt, const MethodInfo& method, IrFunction& out, bool osr, std::string* reason);
+
+/// Move what does not change in a loop out of it.
+void optimizeLoops(IrFunction& fn);
 
 /// Which machine registers the allocator may use. Numbers are the back end's.
 struct RegisterSet

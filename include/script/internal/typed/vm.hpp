@@ -49,6 +49,8 @@ struct Frame
     /// This frame stands for a run of native frames, which `captureStack` finds by walking from `nativeInnerFrame`. It
     /// remembers what the runtime's top was when the run began.
     bool nativeRun = false;
+    /// On-stack replacement took this frame's handlers with it.
+    bool handledNatively = false;
     void* savedTopFrame = nullptr;
     const void* savedTopPc = nullptr;
 

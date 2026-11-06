@@ -125,9 +125,10 @@ struct JitOptions
         Eager,    ///< compile every method when its assembly is loaded
     };
 
-    Mode mode = Mode::Off;
+    /// Tiered wherever there is a code generator: the interpreter's answer and native code's are the same, only faster.
+    Mode mode = Mode::Tiered;
     /// Calls (or loop back-edges) before a method is handed to the back end.
-    std::uint32_t threshold = 2000;
+    std::uint32_t threshold = 200;
     /// Cap on the code cache, in bytes; 0 means unbounded.
     std::size_t codeCacheLimit = 8u << 20;
     /// Write the generated code to the print handler, for debugging.

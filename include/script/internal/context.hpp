@@ -132,13 +132,35 @@ struct ContextImpl
     void destroyCell(GCObject* cell) noexcept;
 
     void link(GCObject* cell) noexcept;
+    /// `link` for a cell whose size the caller knows and which is not a string: no virtual call.
+    void linkKnown(GCObject* cell, std::uint32_t bytes) noexcept
+    {
+        cell->rt = this;
+        cell->gcNext = heapHead;
+        cell->gcPrev = nullptr;
+        if (heapHead)
+            heapHead->gcPrev = cell;
+        heapHead = cell;
+        cell->gcBytes = bytes;
+        heapBytes += bytes;
+        totalAllocated += bytes;
+        ++liveObjects;
+    }
     void unlink(GCObject* cell) noexcept;
     /// Break unreachable reference cycles. Everything else is freed eagerly.
     void collectCycles();
     /// Collect if either budget has been passed. Throws `OutOfMemory` when the
     /// heap is still over its limit afterwards, so it may only be called where
     /// the interpreter can unwind: cell allocation and the instruction tick.
-    void maybeCollect();
+    void maybeCollect()
+    {
+        // Nothing here for a program whose garbage reference counting already took care of.
+        if (heapBytes < nextGcBytes && liveObjects + liveStrings < nextGcCells &&
+            !(options.memoryLimit && heapBytes > options.memoryLimit))
+            return;
+        collectIfDue();
+    }
+    void collectIfDue();
     /// Refuse, with `Error(OutOfMemory)`, memory that would take the heap past `Options::memoryLimit`. Call it before
     /// building anything whose size a program chooses -- a cell, an array of a given length, a joined string -- so the
     /// limit holds for what is in flight and not only for what the cells already weigh. Collects cycles once before it

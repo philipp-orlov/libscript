@@ -236,24 +236,35 @@ void computeSlotTags(const TypeInfo& type)
 CSInstance* Runtime::newInstance(const TypeInfo* type)
 {
     const std::uint32_t slots = type ? type->instanceSlots : 0;
-    auto* cell = newCellSized<CSInstance>(slots * sizeof(Value));
+    const std::size_t bytes = CSInstance::bytesFor(slots);
+    ctx.maybeCollect();
+    ctx.reserve(bytes);
+    auto* cell = new (ctx.heap.allocate(bytes)) CSInstance();
+    cell->cellBytes = std::uint32_t(bytes);
     cell->type = type;
-    cell->initSlots(slots);
-    if (type && slots) {
+    cell->count = slots;
+    if (slots) {
         if (type->slotTags.size() != slots)
             computeSlotTags(*type);
         Value* first = cell->slots();
-        for (std::uint32_t i = 0; i < slots; ++i)
-            detail::Access::retag(first[i], type->slotTags[i]);
+        const Type* tags = type->slotTags.data();
+        for (std::uint32_t i = 0; i < slots; ++i) {
+            new (first + i) Value();
+            detail::Access::retag(first[i], tags[i]);
+        }
     }
-    recharge(cell);
+    ctx.linkKnown(cell, std::uint32_t(bytes));
     return cell;
 }
 
 CSArray* Runtime::newArray(const TypeInfo* elementType, std::uint32_t length)
 {
     const ElemStore store = elemStoreOf(elementType);
-    auto* cell = newCellSized<CSArray>(std::size_t(length) * elemStoreWidth(store));
+    const std::size_t bytes = CSArray::bytesFor(store, length);
+    ctx.maybeCollect();
+    ctx.reserve(bytes);
+    auto* cell = new (ctx.heap.allocate(bytes)) CSArray();
+    cell->cellBytes = std::uint32_t(bytes);
     cell->elemType = elementType;
     cell->length = length;
     cell->store = store;
@@ -261,7 +272,7 @@ CSArray* Runtime::newArray(const TypeInfo* elementType, std::uint32_t length)
     if (cell->elemKind == TypeKind::Enum && elementType->underlying)
         cell->elemKind = elementType->underlying->kind;
     cell->initElements();
-    recharge(cell);
+    ctx.linkKnown(cell, std::uint32_t(bytes));
     return cell;
 }
 

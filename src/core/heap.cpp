@@ -212,7 +212,17 @@ ContextImpl::~ContextImpl()
 void ContextImpl::destroyCell(GCObject* cell) noexcept
 {
     const std::uint32_t bytes = cell->cellBytes;
+    // The two kinds a program makes by the million get out of the virtual call.
+#if SCRIPT_ENGINE_TYPED
+    if (cell->kind == CellKind::Instance)
+        static_cast<typed::CSInstance*>(cell)->typed::CSInstance::~CSInstance();
+    else if (cell->kind == CellKind::Array)
+        static_cast<typed::CSArray*>(cell)->typed::CSArray::~CSArray();
+    else
+        cell->~GCObject();
+#else
     cell->~GCObject();
+#endif
     if (bytes)
         heap.deallocate(cell, bytes);
     else
@@ -278,7 +288,7 @@ void ContextImpl::reserveSlow(std::size_t bytes)
         throw Error(ErrorCode::OutOfMemory, "the context exceeded its memory limit");
 }
 
-void ContextImpl::maybeCollect()
+void ContextImpl::collectIfDue()
 {
     if (tearingDown || destroying)
         return;

@@ -44,8 +44,10 @@ void usage()
     std::puts("  --stats            print heap statistics when the program ends");
     std::puts("  --strict           TypeScript: strictNullChecks and noImplicitAny");
     std::puts("  --no-check         TypeScript: skip type checking");
-    std::puts("  --jit              C#: compile a method to native code once it gets hot");
+    std::puts("  --interpret        C#: no native code at all");
+    std::puts("  --jit              C#: compile a method to native code once it gets hot (the default)");
     std::puts("  --native           C#: compile every method it can up front");
+    std::puts("  --dump-native      with --jit or --native: print the machine code of what gets compiled");
     std::puts("  --stack <n>        maximum call depth (default 512)");
     std::puts("  --memory <mb>      heap ceiling in megabytes");
     std::puts("  --version          print the library version");
@@ -191,8 +193,16 @@ int main(int argc, char** argv)
             options.check.enabled = false;
             continue;
         }
+        if (arg == "--interpret") {
+            options.jit.mode = script::JitOptions::Mode::Off;
+            continue;
+        }
         if (arg == "--jit") {
             options.jit.mode = script::JitOptions::Mode::Tiered;
+            continue;
+        }
+        if (arg == "--dump-native") {
+            options.jit.dumpCode = true;
             continue;
         }
         if (arg == "--native") {

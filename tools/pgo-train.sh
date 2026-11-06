@@ -7,3 +7,7 @@ root=$(dirname "$0")/..
 for f in "$root"/bench/kernels/js/*.js "$root"/bench/kernels/cs/*.cs; do
     "$tool" "$f" >/dev/null
 done
+# What native code leans on: the helpers it calls and the stubs it goes through.
+for f in "$root"/bench/kernels/cs/*.cs "$root"/bench/kernels/c/*.c; do
+    "$tool" --native "$f" >/dev/null
+done

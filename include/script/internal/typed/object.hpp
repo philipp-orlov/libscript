@@ -33,8 +33,8 @@ struct Runtime;
 /// searches for anything.
 struct CSInstance : GCObject
 {
-    const TypeInfo* type = nullptr;
     std::uint32_t count = 0;
+    const TypeInfo* type = nullptr;
 
     CSInstance() { kind = CellKind::Instance; }
     ~CSInstance() override;
@@ -77,12 +77,12 @@ std::size_t elemStoreWidth(ElemStore s) noexcept;
 
 struct CSArray : GCObject
 {
-    const TypeInfo* elemType = nullptr;
-    std::uint32_t length = 0;
     ElemStore store = ElemStore::Ref;
     /// Cached from `elemType`, because every element access needs it and the
     /// indirection is the whole cost of a raw array read.
     TypeKind elemKind = TypeKind::Object;
+    std::uint32_t length = 0;
+    const TypeInfo* elemType = nullptr;
 
     CSArray() { kind = CellKind::Array; }
     ~CSArray() override;

@@ -41,6 +41,8 @@ inline constexpr std::int64_t kTypeVtableOffset = offsetof(TypeInfo, vtable);
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
+static_assert(sizeof(CSInstance) == 64 && sizeof(CSArray) == 64 && sizeof(StringCell) == 64,
+              "the small cells should fill the padding of their header");
 inline constexpr std::int64_t instanceSlotOffset(std::uint32_t slot) noexcept
 {
     return std::int64_t(sizeof(CSInstance)) + std::int64_t(slot) * 16;
@@ -58,13 +60,16 @@ GCObject* scriptJitNewDelegate(Runtime* rt, const TypeInfo* type, const MethodIn
                                GCObject* box3) noexcept;
 
 // ---- values ----
-/// `*slot = cell`, with the count already taken and the tag read off the cell.
-void scriptJitStoreValue(Value* slot, GCObject* cell) noexcept;
-void scriptJitCast(Runtime* rt, GCObject* cell, const TypeInfo* to) noexcept;
-std::int32_t scriptJitIsInstance(Runtime* rt, GCObject* cell, const TypeInfo* to) noexcept;
+/// `*slot = value`, with the count already taken.
+void scriptJitStoreTagged(Value* slot, std::int64_t tag, std::uint64_t payload) noexcept;
+std::int64_t scriptJitTagOf(GCObject* cell) noexcept;
+void scriptJitCast(Runtime* rt, std::int64_t tag, std::uint64_t payload, const TypeInfo* to) noexcept;
+/// `(int)someObject`: the bits of the value as `to`.
+std::uint64_t scriptJitUnbox(Runtime* rt, std::int64_t tag, std::uint64_t payload, const TypeInfo* to) noexcept;
+std::int32_t scriptJitIsInstance(Runtime* rt, std::int64_t tag, std::uint64_t payload, const TypeInfo* to) noexcept;
+std::int32_t scriptJitValueEquals(std::int64_t tagA, std::uint64_t a, std::int64_t tagB, std::uint64_t b) noexcept;
 const MethodInfo* scriptJitResolveInterface(Runtime* rt, GCObject* receiver, const MethodInfo* declared) noexcept;
 std::int32_t scriptJitStringEquals(GCObject* a, GCObject* b) noexcept;
-std::int32_t scriptJitRefEquals(GCObject* a, GCObject* b) noexcept;
 double scriptJitFmod(double a, double b) noexcept;
 float scriptJitFmodf(float a, float b) noexcept;
 std::int64_t scriptJitAddOvf(Runtime* rt, std::int64_t a, std::int64_t b) noexcept;
@@ -77,11 +82,33 @@ GCObject* scriptJitConcat(Runtime* rt, std::int64_t count, std::int64_t tag0, st
 GCObject* scriptJitToString(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 GCObject* scriptJitToStringUnsigned(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 
+// ---- the collections; a value that comes back is its payload bits, and holds a count if it has one ----
+std::int32_t scriptJitListCount(Runtime* rt, CSList* list) noexcept;
+std::uint64_t scriptJitListGet(Runtime* rt, CSList* list, std::int32_t index) noexcept;
+void scriptJitListSet(Runtime* rt, CSList* list, std::int32_t index, std::int64_t tag, std::uint64_t payload) noexcept;
+void scriptJitListAdd(Runtime* rt, CSList* list, std::int64_t tag, std::uint64_t payload) noexcept;
+std::int32_t scriptJitDictCount(Runtime* rt, CSDict* dict) noexcept;
+std::uint64_t scriptJitDictGet(Runtime* rt, CSDict* dict, std::int64_t keyTag, std::uint64_t key) noexcept;
+void scriptJitDictSet(Runtime* rt, CSDict* dict, std::int64_t keyTag, std::uint64_t key, std::int64_t valueTag,
+                      std::uint64_t value) noexcept;
+std::int32_t scriptJitDictContains(Runtime* rt, CSDict* dict, std::int64_t keyTag, std::uint64_t key) noexcept;
+void scriptJitBuilderAppendChar(Runtime* rt, CSBuilder* builder, std::uint64_t ch) noexcept;
+void scriptJitBuilderAppendString(Runtime* rt, CSBuilder* builder, GCObject* text) noexcept;
+
 // ---- raising ----
 void scriptJitThrow(Runtime* rt, GCObject* exception) noexcept;
-void scriptJitRaise(Runtime* rt, std::uint32_t code) noexcept;
+/// `index` is what a bounds failure was given; anything else ignores it.
+void scriptJitRaise(Runtime* rt, std::uint32_t code, std::int32_t index) noexcept;
 /// Release `count` possibly null cells: what a method held when an exception went through it.
 void scriptJitCleanup(GCObject** cells, std::uint64_t count) noexcept;
+/// With an error pending: the exception, holding a count and no longer pending, if a handler for `type` (null for any)
+/// may take it. The engine's own limits, an interrupt above all, are no program's to catch.
+GCObject* scriptJitCatch(Runtime* rt, const TypeInfo* type) noexcept;
+/// With an error pending, on the way into a `finally`: put it aside and return its number, or 0 if it must not stop for
+/// a `finally`.
+std::int32_t scriptJitFinallyEnter(Runtime* rt) noexcept;
+/// `continuation` is what `scriptJitFinallyEnter` gave, negated: make that error pending again.
+void scriptJitFinallyRethrow(Runtime* rt, std::int64_t continuation) noexcept;
 
 // ---- the boundary ----
 /// Stubs, in assembly: every method's entry starts as one.
@@ -94,7 +121,7 @@ void scriptJitPollStub();
 /// Enter native code from C++. `delegate` is what a lambda reads its captures from.
 void scriptJitEnter(Runtime* rt, void* entry, const std::uint64_t* ints, const double* fps,
                     const std::uint64_t* stackArgs, std::uint64_t stackCount, const void* delegate,
-                    std::uint64_t* intResult, double* fpResult);
+                    std::uint64_t* intResults, double* fpResult);
 
 /// What the lazy stubs call. `saved` holds x0-x7 then d0-d7. Returns where to jump instead, or null when the call has
 /// been made and the result left in `saved`.

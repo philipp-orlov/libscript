@@ -31,6 +31,8 @@ void visitOperands(const IrFunction& fn, const IrInst& in, Use use, Def def)
             use(call.delegate);
         if (call.result >= 0)
             def(call.result);
+        if (call.resultTag >= 0)
+            def(call.resultTag);
         return;
     }
     if (in.a >= 0)
@@ -162,6 +164,17 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         } else if (last.op != IrOp::Ret && b + 1 < blocks.size()) {
             block.successors.push_back(std::int32_t(b + 1));
         }
+        // An instruction that can raise may end up at a handler.
+        for (std::int32_t i = block.first; i <= block.last; ++i) {
+            const IrInst& in = fn.code[std::size_t(i)];
+            std::int32_t e = -1;
+            if (in.op == IrOp::Call)
+                e = fn.calls[std::size_t(in.imm)].exit;
+            else if (in.op == IrOp::ExitCmp || in.op == IrOp::Poll)
+                e = in.target;
+            if (e >= 0 && fn.exits[std::size_t(e)].handlerLabel >= 0)
+                toLabel(fn.exits[std::size_t(e)].handlerLabel);
+        }
     }
 
     // An exit reads what it has to release, after the instruction that takes it.
@@ -187,9 +200,21 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
                 },
                 [](std::int32_t) {});
             if (const IrExit* exit = exitOf(in)) {
-                for (std::int32_t v : exit->cleanup) {
+                const auto read = [&](std::int32_t v) {
                     if (!block.def.test(std::size_t(v)))
                         block.use.set(std::size_t(v));
+                };
+                for (std::int32_t v : exit->cleanup)
+                    read(v);
+                for (const auto& tagged : exit->cleanupTagged) {
+                    read(tagged.first);
+                    read(tagged.second);
+                }
+                if (exit->indexVreg >= 0)
+                    read(exit->indexVreg);
+                for (const IrExit::WriteBack& back : exit->writeBacks) {
+                    read(back.base);
+                    read(back.vreg);
                 }
             }
             visitOperands(fn, in, [](std::int32_t) {}, [&](std::int32_t v) { block.def.set(std::size_t(v)); });
@@ -258,23 +283,43 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             if (const IrExit* exit = exitOf(in)) {
                 for (std::int32_t v : exit->cleanup)
                     extend(v, i * 2 + 1 + (in.op == IrOp::Call ? 1 : 0));
+                for (const auto& tagged : exit->cleanupTagged) {
+                    extend(tagged.first, i * 2 + 1 + (in.op == IrOp::Call ? 1 : 0));
+                    extend(tagged.second, i * 2 + 1 + (in.op == IrOp::Call ? 1 : 0));
+                }
+                if (exit->indexVreg >= 0)
+                    extend(exit->indexVreg, i * 2 + 1);
+                for (const IrExit::WriteBack& back : exit->writeBacks) {
+                    extend(back.base, i * 2 + 1);
+                    extend(back.vreg, i * 2 + 1);
+                }
             }
             if (in.op == IrOp::Call)
                 callPositions.push_back(i * 2);
+            // Raising on the way to a handler in this method calls the runtime, and the handler carries on after it.
+            else if (in.op == IrOp::ExitCmp && fn.exits[std::size_t(in.target)].handlerLabel >= 0)
+                callPositions.push_back(i * 2);
         }
     }
-    fn.makesCalls = !callPositions.empty();
+    fn.makesCalls = false;
+    for (const IrInst& in : fn.code)
+        fn.makesCalls = fn.makesCalls || in.op == IrOp::Call;
     // What arrives at entry is live from before the first instruction.
     for (std::int32_t p : fn.params)
         extend(p, -1);
     for (std::int32_t c : fn.captures)
         extend(c, -1);
+    for (std::int32_t z : fn.osrZero)
+        extend(z, -1);
     // Entering at a loop head writes only what is live there; anything else may share a register with something that is.
     for (IrOsrEntry& entry : fn.osrEntries) {
         const std::int32_t at = labelAt[std::size_t(entry.label)];
         const BitSet& live = blocks[std::size_t(blockOfInst[std::size_t(at)])].liveIn;
         entry.slots.erase(std::remove_if(entry.slots.begin(), entry.slots.end(),
-                                         [&](const IrOsrEntry::Slot& s) { return !live.test(std::size_t(s.vreg)); }),
+                                         [&](const IrOsrEntry::Slot& s) {
+                                             return !live.test(std::size_t(s.vreg)) &&
+                                                    (s.tagVreg < 0 || !live.test(std::size_t(s.tagVreg)));
+                                         }),
                           entry.slots.end());
     }
 
@@ -419,16 +464,42 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         (fp ? fn.usedFpRegs : fn.usedIntRegs) |= std::uint64_t(1) << chosen;
     }
     fn.spillSlots = spillSlots;
+
+    // What a release's cold path has to keep: registers of values live past it. Callee-saved ones keep themselves.
+    std::uint64_t callerInt = 0, callerFp = 0;
+    for (std::int32_t r : regs.intCallerSaved)
+        callerInt |= std::uint64_t(1) << r;
+    for (std::int32_t r : regs.fpCallerSaved)
+        callerFp |= std::uint64_t(1) << r;
+    fn.liveAtRelease.clear();
+    for (std::size_t i = 0; i < count; ++i) {
+        IrInst& in = fn.code[i];
+        if (in.op != IrOp::DecRef && in.op != IrOp::DecRefTagged)
+            continue;
+        IrFunction::LiveRegs live;
+        const std::int32_t pos = std::int32_t(i) * 2;
+        for (const Interval* iv : order) {
+            const std::int32_t loc = fn.location[std::size_t(iv->vreg)];
+            if (loc < 0 || iv->start > pos || iv->end <= pos)
+                continue;
+            if (fn.vregIsFp[std::size_t(iv->vreg)])
+                live.fps |= (std::uint64_t(1) << loc) & callerFp;
+            else
+                live.ints |= (std::uint64_t(1) << loc) & callerInt;
+        }
+        in.target = std::int32_t(fn.liveAtRelease.size());
+        fn.liveAtRelease.push_back(live);
+    }
 }
 
 std::string dumpIr(const IrFunction& fn)
 {
     static const char* const kNames[] = {
-        "label", "mov", "movi", "fmovi", "bits2fp", "fp2bits", "add", "sub", "mul", "and", "or", "xor", "shl", "sar",
+        "label", "mov", "movi", "movrt", "fmovi", "bits2fp", "fp2bits", "add", "sub", "mul", "and", "or", "xor", "shl", "sar",
         "shr", "sdiv", "udiv", "srem", "urem", "neg", "not", "sext8", "sext16", "sext32", "zext8", "zext16", "zext32",
         "fadd", "fsub", "fmul", "fdiv", "fneg", "fsqrt", "fabs", "ffloor", "fceil", "ftrunc", "fround", "fconv", "i2f",
         "f2i", "cset", "fcset", "br", "brcmp", "brfcmp", "exitcmp", "load", "loadidx", "store", "storeidx", "storetag",
-        "storetagidx", "incref", "decref", "poll", "call", "ret", "trap", "osr"};
+        "storetagidx", "incref", "decref", "increft", "decreft", "tagof", "poll", "call", "ret", "trap", "osr"};
     std::string out;
     char line[160];
     for (std::size_t i = 0; i < fn.code.size(); ++i) {

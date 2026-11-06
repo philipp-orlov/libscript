@@ -244,6 +244,7 @@ void Frame::begin(const MethodInfo* target)
     pc = 0;
     line = 0;
     unwinding = false;
+    handledNatively = false;
     exception = Value();
     stack.clear();
     pending.clear();
@@ -1520,7 +1521,7 @@ Value runFrame(Runtime& rt, Frame& frame)
             // The engine's own limits are not the program's to catch: a
             // `catch (Exception)` around an infinite loop would otherwise
             // swallow the interrupt that was trying to stop it.
-            if (raised.code() == ErrorCode::Interrupted ||
+            if (frame.handledNatively || raised.code() == ErrorCode::Interrupted ||
                 raised.code() == ErrorCode::StackOverflow ||
                 raised.code() == ErrorCode::OutOfMemory ||
                 !dispatch(rt, frame, raised.value()))
@@ -1528,6 +1529,8 @@ Value runFrame(Runtime& rt, Frame& frame)
         } catch (Error& raised) {
             // An engine-level failure the program can still catch, e.g. a
             // memory limit; give it the same treatment.
+            if (frame.handledNatively)
+                throw;
             Value exception = rt.makeException(raised.code(), fromUtf8(raised.what()));
             if (!dispatch(rt, frame, exception))
                 throw;

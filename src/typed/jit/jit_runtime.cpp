@@ -58,6 +58,11 @@ Value valueOfBits(std::int64_t tag, std::uint64_t payload) noexcept
             std::memcpy(&d, &payload, sizeof d);
             return Value(d);
         }
+        case std::int64_t(Type::String):
+        case std::int64_t(Type::Object):
+        case std::int64_t(Type::Array):
+        case std::int64_t(Type::Delegate):
+            return payload ? detail::Access::make(Type(tag), reinterpret_cast<GCObject*>(payload)) : Value();
         default: return Value();
     }
 }
@@ -70,6 +75,31 @@ GCObject* releaseCell(Value& v) noexcept
         detail::incRef(cell);
     v = Value();
     return cell;
+}
+
+/// A boxed number as the static type it is being unboxed to.
+std::uint64_t bitsOfBoxed(const Value& v, const TypeInfo* to) noexcept
+{
+    TypeKind kind = to ? to->kind : TypeKind::Int;
+    if (kind == TypeKind::Enum && to->underlying)
+        kind = to->underlying->kind;
+    if (kind == TypeKind::Bool)
+        return v.toBool() ? 1 : 0;
+    if (kind == TypeKind::Long || kind == TypeKind::ULong)
+        return std::uint64_t(v.toLong());
+    if (kind == TypeKind::Float) {
+        const float f = float(v.toDouble());
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &f, sizeof bits);
+        return bits;
+    }
+    if (kind == TypeKind::Double) {
+        const double d = v.toDouble();
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &d, sizeof bits);
+        return bits;
+    }
+    return std::uint64_t(std::uint32_t(v.toInt()));
 }
 
 void recordCurrent(Runtime& rt) noexcept
@@ -103,8 +133,9 @@ GCObject* scriptJitNewInstance(Runtime* rt, const TypeInfo* type) noexcept
 GCObject* scriptJitNewArray(Runtime* rt, const TypeInfo* element, std::int32_t length) noexcept
 {
     return guarded(*rt, __builtin_return_address(0), [&]() -> GCObject* {
-        Value v = newArrayOf(*rt, element, length);
-        return releaseCell(v);
+        if (length < 0)
+            throwError(*rt, ErrorCode::ArgumentOutOfRange, "the array length cannot be negative");
+        return rt->newArray(element, std::uint32_t(length));
     });
 }
 
@@ -139,22 +170,37 @@ GCObject* scriptJitNewDelegate(Runtime* rt, const TypeInfo* type, const MethodIn
     });
 }
 
-void scriptJitStoreValue(Value* slot, GCObject* cell) noexcept
+void scriptJitStoreTagged(Value* slot, std::int64_t tag, std::uint64_t payload) noexcept
 {
-    *slot = detail::Access::adopt(tagOfCell(cell), cell);
+    if (tag >= std::int64_t(Type::String)) {
+        auto* cell = reinterpret_cast<GCObject*>(payload);
+        *slot = cell ? detail::Access::adopt(Type(tag), cell) : Value();
+        return;
+    }
+    *slot = valueOfBits(tag, payload);
 }
 
-void scriptJitCast(Runtime* rt, GCObject* cell, const TypeInfo* to) noexcept
+std::int64_t scriptJitTagOf(GCObject* cell) noexcept
+{
+    return std::int64_t(tagOfCell(cell));
+}
+
+void scriptJitCast(Runtime* rt, std::int64_t tag, std::uint64_t payload, const TypeInfo* to) noexcept
 {
     guarded(*rt, __builtin_return_address(0), [&]() -> int {
-        castTo(*rt, valueOfCell(cell), to);
+        castTo(*rt, valueOfBits(tag, payload), to);
         return 0;
     });
 }
 
-std::int32_t scriptJitIsInstance(Runtime* rt, GCObject* cell, const TypeInfo* to) noexcept
+std::int32_t scriptJitIsInstance(Runtime* rt, std::int64_t tag, std::uint64_t payload, const TypeInfo* to) noexcept
 {
-    return isInstanceOf(*rt, valueOfCell(cell), to) ? 1 : 0;
+    return isInstanceOf(*rt, valueOfBits(tag, payload), to) ? 1 : 0;
+}
+
+std::int32_t scriptJitValueEquals(std::int64_t tagA, std::uint64_t a, std::int64_t tagB, std::uint64_t b) noexcept
+{
+    return valueEquals(valueOfBits(tagA, a), valueOfBits(tagB, b)) ? 1 : 0;
 }
 
 const MethodInfo* scriptJitResolveInterface(Runtime* rt, GCObject* receiver, const MethodInfo* declared) noexcept
@@ -172,11 +218,6 @@ std::int32_t scriptJitStringEquals(GCObject* a, GCObject* b) noexcept
     return static_cast<StringCell*>(a)->text() == static_cast<StringCell*>(b)->text() ? 1 : 0;
 }
 
-std::int32_t scriptJitRefEquals(GCObject* a, GCObject* b) noexcept
-{
-    return valueEquals(valueOfCell(a), valueOfCell(b)) ? 1 : 0;
-}
-
 double scriptJitFmod(double a, double b) noexcept
 {
     return std::fmod(a, b);
@@ -191,7 +232,7 @@ std::int64_t scriptJitAddOvf(Runtime* rt, std::int64_t a, std::int64_t b) noexce
 {
     std::int64_t out = 0;
     if (__builtin_add_overflow(a, b, &out))
-        scriptJitRaise(rt, std::uint32_t(ErrorCode::Overflow));
+        scriptJitRaise(rt, std::uint32_t(ErrorCode::Overflow), 0);
     return out;
 }
 
@@ -199,7 +240,7 @@ std::int64_t scriptJitSubOvf(Runtime* rt, std::int64_t a, std::int64_t b) noexce
 {
     std::int64_t out = 0;
     if (__builtin_sub_overflow(a, b, &out))
-        scriptJitRaise(rt, std::uint32_t(ErrorCode::Overflow));
+        scriptJitRaise(rt, std::uint32_t(ErrorCode::Overflow), 0);
     return out;
 }
 
@@ -207,7 +248,7 @@ std::int64_t scriptJitMulOvf(Runtime* rt, std::int64_t a, std::int64_t b) noexce
 {
     std::int64_t out = 0;
     if (__builtin_mul_overflow(a, b, &out))
-        scriptJitRaise(rt, std::uint32_t(ErrorCode::Overflow));
+        scriptJitRaise(rt, std::uint32_t(ErrorCode::Overflow), 0);
     return out;
 }
 
@@ -240,6 +281,116 @@ GCObject* scriptJitToStringUnsigned(Runtime* rt, std::int64_t tag, std::uint64_t
     });
 }
 
+namespace {
+
+/// A value as native code receives it: the payload, with a count of its own if it is a reference.
+std::uint64_t ownedBits(const Value& v) noexcept
+{
+    if (GCObject* cell = detail::Access::ptr(v)) {
+        detail::incRef(cell);
+        return reinterpret_cast<std::uint64_t>(cell);
+    }
+    return std::uint64_t(detail::Access::i8(v));
+}
+
+}  // namespace
+
+std::int32_t scriptJitListCount(Runtime*, CSList* list) noexcept
+{
+    return std::int32_t(list->items.size());
+}
+
+std::uint64_t scriptJitUnbox(Runtime* rt, std::int64_t tag, std::uint64_t payload, const TypeInfo* to) noexcept
+{
+    return guarded(*rt, __builtin_return_address(0), [&]() -> std::uint64_t {
+        const Value v = valueOfBits(tag, payload);
+        if (!v.isNumber() && !v.isBool() && !v.isChar())
+            throwError(*rt, ErrorCode::InvalidCast, "the boxed value is not a '" + rt->types->describe(to) + "'");
+        return bitsOfBoxed(v, to);
+    });
+}
+
+std::uint64_t scriptJitListGet(Runtime* rt, CSList* list, std::int32_t index) noexcept
+{
+    if (index < 0 || std::size_t(index) >= list->items.size()) {
+        return guarded(*rt, __builtin_return_address(0), [&]() -> std::uint64_t {
+            throwError(*rt, ErrorCode::ArgumentOutOfRange, "index is out of range");
+        });
+    }
+    return ownedBits(list->items[std::size_t(index)]);
+}
+
+void scriptJitListSet(Runtime* rt, CSList* list, std::int32_t index, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    if (index < 0 || std::size_t(index) >= list->items.size()) {
+        guarded(*rt, __builtin_return_address(0), [&]() -> int {
+            throwError(*rt, ErrorCode::ArgumentOutOfRange, "index is out of range");
+        });
+        return;
+    }
+    list->items[std::size_t(index)] = valueOfBits(tag, payload);
+}
+
+void scriptJitListAdd(Runtime* rt, CSList* list, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    guarded(*rt, __builtin_return_address(0), [&]() -> int {
+        list->add(valueOfBits(tag, payload));
+        return 0;
+    });
+}
+
+std::int32_t scriptJitDictCount(Runtime*, CSDict* dict) noexcept
+{
+    return std::int32_t(dict->liveCount);
+}
+
+std::uint64_t scriptJitDictGet(Runtime* rt, CSDict* dict, std::int64_t keyTag, std::uint64_t key) noexcept
+{
+    const Value k = valueOfBits(keyTag, key);
+    CSDict::Entry* entry = dict->find(k);
+    if (!entry) {
+        return guarded(*rt, __builtin_return_address(0), [&]() -> std::uint64_t {
+            throwError(*rt, ErrorCode::KeyNotFound, "the given key was not present in the dictionary");
+        });
+    }
+    return ownedBits(entry->value);
+}
+
+void scriptJitDictSet(Runtime* rt, CSDict* dict, std::int64_t keyTag, std::uint64_t key, std::int64_t valueTag,
+                      std::uint64_t value) noexcept
+{
+    guarded(*rt, __builtin_return_address(0), [&]() -> int {
+        dict->put(valueOfBits(keyTag, key), valueOfBits(valueTag, value));
+        return 0;
+    });
+}
+
+std::int32_t scriptJitDictContains(Runtime*, CSDict* dict, std::int64_t keyTag, std::uint64_t key) noexcept
+{
+    return dict->find(valueOfBits(keyTag, key)) ? 1 : 0;
+}
+
+void scriptJitBuilderAppendChar(Runtime* rt, CSBuilder* builder, std::uint64_t ch) noexcept
+{
+    guarded(*rt, __builtin_return_address(0), [&]() -> int {
+        const std::size_t before = builder->buf.capacity();
+        builder->buf.push_back(Char(ch));
+        builder->chargeIfGrown(builder->buf, before);
+        return 0;
+    });
+}
+
+void scriptJitBuilderAppendString(Runtime* rt, CSBuilder* builder, GCObject* text) noexcept
+{
+    guarded(*rt, __builtin_return_address(0), [&]() -> int {
+        const std::size_t before = builder->buf.capacity();
+        if (text)
+            builder->buf += static_cast<StringCell*>(text)->text();
+        builder->chargeIfGrown(builder->buf, before);
+        return 0;
+    });
+}
+
 void scriptJitThrow(Runtime* rt, GCObject* exception) noexcept
 {
     guarded(*rt, __builtin_return_address(0), [&]() -> int {
@@ -249,7 +400,7 @@ void scriptJitThrow(Runtime* rt, GCObject* exception) noexcept
     });
 }
 
-void scriptJitRaise(Runtime* rt, std::uint32_t code) noexcept
+void scriptJitRaise(Runtime* rt, std::uint32_t code, std::int32_t index) noexcept
 {
     guarded(*rt, __builtin_return_address(0), [&]() -> int {
         const ErrorCode raised = ErrorCode(code);
@@ -262,6 +413,8 @@ void scriptJitRaise(Runtime* rt, std::uint32_t code) noexcept
             case ErrorCode::StackOverflow: message = "the call stack went too deep"; break;
             default: break;
         }
+        if (raised == ErrorCode::IndexOutOfRange)
+            throwError(*rt, raised, "index " + std::to_string(index) + " is outside the bounds of the array");
         throwError(*rt, raised, message);
     });
 }
@@ -270,6 +423,72 @@ void scriptJitCleanup(GCObject** cells, std::uint64_t count) noexcept
 {
     for (std::uint64_t i = 0; i < count; ++i)
         detail::decRef(cells[i]);
+}
+
+namespace {
+
+/// The exception behind the pending error, if it is one a handler may see. Null when it is not.
+bool pendingValue(Runtime& rt, Value& out) noexcept
+{
+    if (!rt.nativePending)
+        return false;
+    try {
+        std::rethrow_exception(rt.nativePending);
+    } catch (const Exception& raised) {
+        const ErrorCode code = raised.code();
+        if (code == ErrorCode::Interrupted || code == ErrorCode::StackOverflow || code == ErrorCode::OutOfMemory)
+            return false;
+        out = raised.value();
+        return true;
+    } catch (const Error& raised) {
+        if (raised.code() == ErrorCode::Interrupted || raised.code() == ErrorCode::StackOverflow ||
+            raised.code() == ErrorCode::OutOfMemory)
+            return false;
+        try {
+            out = rt.makeException(raised.code(), fromUtf8(raised.what()));
+            return true;
+        } catch (...) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+}
+
+}  // namespace
+
+GCObject* scriptJitCatch(Runtime* rt, const TypeInfo* type) noexcept
+{
+    Value exception;
+    if (rt->nativeError == 0 || !pendingValue(*rt, exception))
+        return nullptr;
+    if (type && !isInstanceOf(*rt, exception, type))
+        return nullptr;
+    rt->nativeError = 0;
+    rt->nativePending = nullptr;
+    return releaseCell(exception);
+}
+
+std::int32_t scriptJitFinallyEnter(Runtime* rt) noexcept
+{
+    Value exception;
+    if (rt->nativeError == 0 || !pendingValue(*rt, exception))
+        return 0;
+    rt->finallyPending.push_back(std::move(rt->nativePending));
+    rt->nativePending = nullptr;
+    rt->nativeError = 0;
+    return std::int32_t(rt->finallyPending.size());
+}
+
+void scriptJitFinallyRethrow(Runtime* rt, std::int64_t continuation) noexcept
+{
+    const std::size_t number = std::size_t(-std::int32_t(continuation));
+    if (number == 0 || number > rt->finallyPending.size())
+        return;
+    rt->nativePending = std::move(rt->finallyPending[number - 1]);
+    rt->nativeError = std::uint32_t(ErrorCode::Exception);
+    // Anything after it was put aside by a `finally` that an exception then left.
+    rt->finallyPending.resize(number - 1);
 }
 
 }  // extern "C"
@@ -337,6 +556,13 @@ TypeKind kindOf(const TypeInfo* type) noexcept
     if (type->kind == TypeKind::Enum)
         return type->underlying ? type->underlying->kind : TypeKind::Int;
     return type->kind;
+}
+
+/// A value of this static type travels as a tag and a payload.
+bool isTaggedKind(const TypeInfo* type) noexcept
+{
+    const TypeKind kind = kindOf(type);
+    return kind == TypeKind::Object || kind == TypeKind::Interface;
 }
 
 bool isByRef(const ParamInfo& param) noexcept
@@ -420,6 +646,14 @@ void writeResult(const Value& result, const TypeInfo* type, bool constructorResu
     }
     if (!type || type->kind == TypeKind::Void)
         return;
+    if (isTaggedKind(type)) {
+        GCObject* cell = detail::Access::ptr(result);
+        if (cell)
+            detail::incRef(cell);
+        ints[0] = cell ? reinterpret_cast<std::uint64_t>(cell) : std::uint64_t(detail::Access::i8(result));
+        ints[1] = std::uint64_t(std::uint32_t(result.type()));
+        return;
+    }
     const std::uint64_t bits = bitsOfValue(result, type, false);
     if (isFpParam(type, false)) {
         std::memcpy(&fps[0], &bits, sizeof bits);
@@ -441,13 +675,26 @@ extern "C" void* scriptJitBridge(Runtime* rt, MethodInfo* method, std::uint64_t*
     rt->nativeTopPc = nullptr;
     std::uint64_t* ints = saved;
     auto* fps = reinterpret_cast<double*>(saved + kIntRegs);
+    const auto word = [&](const Abi::Place& place) {
+        return place.where == Abi::Where::Int  ? ints[place.index]
+               : place.where == Abi::Where::Fp ? saved[kIntRegs + place.index]
+                                               : stackArgs[place.index];
+    };
+    const auto readArg = [&](Abi& abi, const TypeInfo* type, bool byRef) -> Value {
+        if (!byRef && isTaggedKind(type)) {
+            const std::uint64_t tag = word(abi.next(false));
+            const std::uint64_t payload = word(abi.next(false));
+            return valueOfBits(std::int64_t(tag), payload);
+        }
+        return valueOfArg(word(abi.next(isFpParam(type, byRef))), type, byRef);
+    };
 
     // A call through a delegate is described by the delegate type; a multicast one runs every link.
     if (delegate) {
         // A delegate made from a lambda may carry no delegate type with a signature; the target has the same one.
         const MethodInfo* signature = delegate->type && delegate->type->invoke ? delegate->type->invoke : delegate->method;
         if (!signature) {
-            scriptJitRaise(rt, std::uint32_t(ErrorCode::InvalidOperation));
+            scriptJitRaise(rt, std::uint32_t(ErrorCode::InvalidOperation), 0);
             return nullptr;
         }
         // A delegate that is about to be run often earns its target a native entry.
@@ -467,12 +714,7 @@ extern "C" void* scriptJitBridge(Runtime* rt, MethodInfo* method, std::uint64_t*
             std::vector<Value>& args = buffer.args;
             for (std::size_t i = 0; i < argc; ++i) {
                 const ParamInfo& param = signature->params[i];
-                const bool byRef = isByRef(param);
-                const Abi::Place place = abi.next(isFpParam(param.type, byRef));
-                const std::uint64_t bits = place.where == Abi::Where::Int ? ints[place.index]
-                                           : place.where == Abi::Where::Fp ? saved[kIntRegs + place.index]
-                                                                           : stackArgs[place.index];
-                args.push_back(valueOfArg(bits, param.type, byRef));
+                args.push_back(readArg(abi, param.type, isByRef(param)));
             }
             Value self = detail::Access::make(Type::Delegate, delegate);
             const Value result = invokeDelegate(*rt, self, args.data(), std::uint32_t(argc));
@@ -499,17 +741,14 @@ extern "C" void* scriptJitBridge(Runtime* rt, MethodInfo* method, std::uint64_t*
         const bool nativeConstructor =
             method->isConstructor() && method->owner && method->owner->nativeKind != NativeKind::None;
         if (!method->isStatic()) {
-            const Abi::Place place = abi.next(false);
-            args.push_back(valueOfCell(reinterpret_cast<GCObject*>(ints[place.index])));
+            // The receiver of a method of a primitive is that primitive.
+            const Abi::Place place = abi.next(isFpParam(method->owner, false));
+            const std::uint64_t self = place.where == Abi::Where::Fp ? saved[kIntRegs + place.index] : ints[place.index];
+            args.push_back(isTaggedKind(method->owner) ? valueOfCell(reinterpret_cast<GCObject*>(self))
+                                                       : valueOfArg(self, method->owner, false));
         }
-        for (const ParamInfo& param : method->params) {
-            const bool byRef = isByRef(param);
-            const Abi::Place place = abi.next(isFpParam(param.type, byRef));
-            const std::uint64_t bits = place.where == Abi::Where::Int ? ints[place.index]
-                                       : place.where == Abi::Where::Fp ? saved[kIntRegs + place.index]
-                                                                       : stackArgs[place.index];
-            args.push_back(valueOfArg(bits, param.type, byRef));
-        }
+        for (const ParamInfo& param : method->params)
+            args.push_back(readArg(abi, param.type, isByRef(param)));
         // `invoke` may run an interpreter that grows `args` of a nested level, never this one.
         const Value result = invoke(*rt, method, args.data(), std::uint32_t(args.size()));
         writeResult(result, method->returnType, nativeConstructor, ints, fps);
@@ -563,8 +802,10 @@ struct NativeRun
     Frame& frame;
     bool pushed;
     std::uintptr_t savedLimit;
+    std::size_t savedFinally;
     NativeRun(Runtime& runtime, Frame& marker, bool push)
-        : rt(runtime), frame(marker), pushed(push), savedLimit(runtime.nativeStackLimit)
+        : rt(runtime), frame(marker), pushed(push), savedLimit(runtime.nativeStackLimit),
+          savedFinally(runtime.finallyPending.size())
     {
         frame.nativeRun = true;
         frame.savedTopFrame = rt.nativeTopFrame;
@@ -578,6 +819,7 @@ struct NativeRun
     }
     ~NativeRun()
     {
+        rt.finallyPending.resize(savedFinally);
         rt.nativeStackLimit = savedLimit;
         rt.nativeTopFrame = frame.savedTopFrame;
         rt.nativeTopPc = frame.savedTopPc;
@@ -609,11 +851,20 @@ Value invokeNativeCode(Runtime& rt, const MethodInfo* method, NativeCode* code, 
             stackArgs[place.index] = bits;
     };
     if (!method->isStatic()) {
-        put(false, next < argc ? reinterpret_cast<std::uint64_t>(detail::Access::ptr(args[next])) : 0);
+        put(isFpParam(method->owner, false), next < argc ? bitsOfValue(args[next], method->owner, false) : 0);
         ++next;
     }
     for (const ParamInfo& param : method->params) {
         const bool byRef = isByRef(param);
+        if (!byRef && isTaggedKind(param.type)) {
+            const Value none;
+            const Value& v = next < argc ? args[next] : none;
+            GCObject* cell = detail::Access::ptr(v);
+            put(false, std::uint64_t(std::uint32_t(v.type())));
+            put(false, cell ? reinterpret_cast<std::uint64_t>(cell) : std::uint64_t(detail::Access::i8(v)));
+            ++next;
+            continue;
+        }
         put(isFpParam(param.type, byRef), next < argc ? bitsOfValue(args[next], param.type, byRef) : 0);
         ++next;
     }
@@ -636,20 +887,27 @@ Value invokeNativeCode(Runtime& rt, const MethodInfo* method, NativeCode* code, 
     NativeRun run(rt, marker, true);
     armNativeRun(rt, reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)));
 
-    std::uint64_t intResult = 0;
+    std::uint64_t intResults[2] = {0, 0};
     double fpResult = 0;
     scriptJitEnter(&rt, code->fastEntry, ints, reinterpret_cast<const double*>(fpBits), stackArgs, abi.stackWords(),
-                   delegate, &intResult, &fpResult);
+                   delegate, intResults, &fpResult);
     marker.method = nullptr;
     raisePending(rt);
-    return nativeResultValue(method, intResult, fpResult);
+    return nativeResultValue(method, intResults, fpResult);
 }
 
-Value nativeResultValue(const MethodInfo* method, std::uint64_t intResult, double fpResult)
+Value nativeResultValue(const MethodInfo* method, const std::uint64_t* intResults, double fpResult)
 {
+    const std::uint64_t intResult = intResults[0];
     const TypeInfo* type = method->returnType;
     if (!type || type->kind == TypeKind::Void)
         return Value();
+    if (isTaggedKind(type)) {
+        const Type tag = Type(std::uint32_t(intResults[1]));
+        if (tag >= Type::String)
+            return intResult ? detail::Access::adopt(tag, reinterpret_cast<GCObject*>(intResult)) : Value();
+        return valueOfBits(std::int64_t(tag), intResult);
+    }
     if (isFpParam(type, false)) {
         std::uint64_t bits = 0;
         std::memcpy(&bits, &fpResult, sizeof bits);
@@ -666,6 +924,9 @@ bool tryOnStackReplacement(Runtime& rt, Frame& frame, std::uint32_t pc, Value& r
 {
     MethodInfo& method = const_cast<MethodInfo&>(*frame.method);
     if (!rt.jit || !rt.jit->enabled() || !frame.stack.empty())
+        return false;
+    // Native code knows nothing of a `finally` the interpreter is in the middle of.
+    if (!frame.pending.empty() || frame.unwinding || !frame.exception.isNull())
         return false;
     NativeCode* code = method.code.load(std::memory_order_acquire);
     if (!code && method.hotness.load(std::memory_order_relaxed) != MethodInfo::kNeverCompile)
@@ -690,12 +951,14 @@ bool tryOnStackReplacement(Runtime& rt, Frame& frame, std::uint32_t pc, Value& r
 
     NativeRun run(rt, frame, false);
     armNativeRun(rt, reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)));
-    std::uint64_t intResult = 0;
+    // From here on this frame's handlers are native code's business: what comes out is past all of them.
+    frame.handledNatively = true;
+    std::uint64_t intResults[2] = {0, 0};
     double fpResult = 0;
-    scriptJitEnter(&rt, entry->entry, ints, reinterpret_cast<const double*>(fpBits), nullptr, 0, nullptr, &intResult,
+    scriptJitEnter(&rt, entry->entry, ints, reinterpret_cast<const double*>(fpBits), nullptr, 0, nullptr, intResults,
                    &fpResult);
     raisePending(rt);
-    result = nativeResultValue(frame.method, intResult, fpResult);
+    result = nativeResultValue(frame.method, intResults, fpResult);
     return true;
 }
 

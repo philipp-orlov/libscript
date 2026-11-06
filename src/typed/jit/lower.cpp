@@ -18,7 +18,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
+#include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -63,6 +66,7 @@ enum class Own : std::uint8_t
 struct Entry
 {
     std::int32_t vreg = -1;
+    std::int32_t tagVreg = -1;  ///< `object` and interfaces: the tag
     const TypeInfo* type = nullptr;
     Own own = Own::None;
     bool isConst = false;
@@ -79,6 +83,8 @@ enum class Cls : std::uint8_t
     F64,
     Ref,
     Void,
+    /// `object` or an interface: anything at all, so a tag travels with the payload, in a register of its own.
+    Obj,
 };
 
 TypeKind baseKind(const TypeInfo* type) noexcept
@@ -109,12 +115,12 @@ Cls classOf(const TypeInfo* type)
         case TypeKind::String:
         case TypeKind::Struct:
         case TypeKind::Class:
-        case TypeKind::Interface:
         case TypeKind::Delegate:
         case TypeKind::Array:
         case TypeKind::Null: return Cls::Ref;
-        // `object` can hold a primitive with its tag, so it does not fit in one register. Stays interpreted.
-        default: refuse("a value of type 'object' is not compiled yet");
+        case TypeKind::Object:
+        case TypeKind::Interface: return Cls::Obj;
+        default: refuse("a value of a type that has no representation");
     }
 }
 
@@ -130,10 +136,6 @@ Type refTag(const TypeInfo* type) noexcept
     }
 }
 
-bool needsDynamicTag(const TypeInfo* type) noexcept
-{
-    return baseKind(type) == TypeKind::Interface || !type;
-}
 
 /// One method being lowered: the root, or one inlined into it.
 struct Scope
@@ -145,6 +147,7 @@ struct Scope
     int depth = 0;
 
     std::vector<std::int32_t> localVreg;   ///< by slot: the value, or for a boxed slot the box
+    std::vector<std::int32_t> localTag;    ///< by slot, for `object`: its tag
     std::vector<std::uint8_t> localOwned;  ///< holds a count
     std::vector<std::uint8_t> localConstKnown;
     std::vector<std::int64_t> localConst;
@@ -154,6 +157,7 @@ struct Scope
     std::vector<Entry> stack;
     /// Arguments an inlined call holds counts on for its duration.
     std::vector<std::int32_t> held;
+    std::vector<std::pair<std::int32_t, std::int32_t>> heldTagged;
 
     std::vector<std::int32_t> labels;   ///< by bytecode offset, -1 for no label
     struct Join
@@ -163,8 +167,19 @@ struct Scope
     };
     std::vector<Join> joins;
 
+    /// An inlined constructor's `this` is a cell made just now, in which no field has been written: storing to one has
+    /// nothing to release. Until a label or a call, after which anything might have happened.
+    std::vector<std::uint8_t> freshField;
+    bool thisIsFresh = false;
+    /// By parameter: the caller holds a count on the argument just for this call, and the body reads the parameter once
+    /// and has no branches. Storing it can then take the count over instead of adding one and dropping the other.
+    std::vector<std::uint8_t> consumable;
+    std::vector<std::uint8_t> consumed;
+    std::vector<std::int32_t> argHeldVreg;
+
     std::int32_t exitLabel = -1;   ///< inlined: where a return goes
     std::int32_t resultVreg = -1;  ///< inlined: where a return value goes
+    std::int32_t resultTag = -1;
     bool resultNonNull = false;
 };
 
@@ -192,8 +207,13 @@ public:
         const MethodInfo& m = root_;
         if (m.body.code.empty())
             refuse("the method has no body");
-        if (!m.body.handlers.empty())
-            refuse("the method has exception handlers");
+        for (const Handler& handler : m.body.handlers) {
+            if (handler.stackDepth != 0)
+                refuse("a protected region with values on the evaluation stack");
+            if (handler.kind == HandlerKind::Catch && handler.exceptionSlot < m.frameSize() &&
+                handler.exceptionSlot < m.body.localBoxed.size() && m.body.localBoxed[handler.exceptionSlot])
+                refuse("a caught exception that a lambda captures");
+        }
 
         Scope scope;
         scope.method = &m;
@@ -211,7 +231,12 @@ public:
             // A `ref` or `out` parameter is a box, whatever the box holds.
             const bool byRef = slot >= paramBase && (m.params[slot - paramBase].mode == ParamMode::Ref ||
                                                      m.params[slot - paramBase].mode == ParamMode::Out);
-            const std::int32_t incoming = fn_.newVreg(!byRef && isFpClass(slotClass(scope, slot)));
+            const Cls cls = byRef ? Cls::Ref : slotClass(scope, slot);
+            if (cls == Cls::Obj) {
+                scope.localTag[slot] = fn_.newVreg(false);
+                fn_.params.push_back(scope.localTag[slot]);
+            }
+            const std::int32_t incoming = fn_.newVreg(isFpClass(cls));
             fn_.params.push_back(incoming);
             scope.localVreg[slot] = incoming;
         }
@@ -224,11 +249,11 @@ public:
         for (std::uint32_t slot = 0; slot < argCount; ++slot) {
             if (m.body.localBoxed.size() > slot && m.body.localBoxed[slot])
                 continue;  // a captured parameter moves into its box below
-            if (slotClass(scope, slot) != Cls::Ref)
+            const Cls cls = slotClass(scope, slot);
+            if (cls != Cls::Ref && cls != Cls::Obj)
                 continue;
             if (assigned[slot]) {
-                inst(IrOp::IncRef).a = scope.localVreg[slot];
-                fn_.code.back().isNullable = true;
+                incRefOf(scope.localVreg[slot], scope.localTag[slot], true);
                 scope.localOwned[slot] = 1;
             }
         }
@@ -247,7 +272,19 @@ public:
             fn_.captures.push_back(box);
         }
 
+        if (!m.body.handlers.empty()) {
+            exceptionVreg_ = fn_.newVreg(false);
+            IrInst& none = inst(IrOp::MovImm);
+            none.d = exceptionVreg_;
+            none.imm = 0;
+            fn_.osrZero.push_back(exceptionVreg_);
+        }
+
         lowerBody(scope);
+        for (std::size_t i = 0; i < deferred_.size(); ++i) {
+            const auto block = deferred_[i];
+            block();
+        }
         fn_.hasLoops = hasLoops_;
     }
 
@@ -260,6 +297,21 @@ private:
         fn_.code.emplace_back();
         fn_.code.back().op = op;
         return fn_.code.back();
+    }
+
+    void incRefOf(std::int32_t vreg, std::int32_t tag, bool nullable)
+    {
+        IrInst& in = inst(tag >= 0 ? IrOp::IncRefTagged : IrOp::IncRef);
+        in.a = vreg;
+        in.b = tag;
+        in.isNullable = nullable;
+    }
+    void decRefOf(std::int32_t vreg, std::int32_t tag, bool nullable)
+    {
+        IrInst& in = inst(tag >= 0 ? IrOp::DecRefTagged : IrOp::DecRef);
+        in.a = vreg;
+        in.b = tag;
+        in.isNullable = nullable;
     }
 
     std::int32_t newLabel() { return fn_.labelCount++; }
@@ -282,6 +334,8 @@ private:
             }
         }
         lastBounds_ = {};
+        if (scope_)
+            scope_->thisIsFresh = false;
     }
 
     Cls returnClass(const MethodInfo& m) const
@@ -304,6 +358,7 @@ private:
         const MethodInfo& m = *s.method;
         const std::uint32_t frame = m.frameSize();
         s.localVreg.assign(frame, -1);
+        s.localTag.assign(frame, -1);
         s.localOwned.assign(frame, 0);
         s.localConstKnown.assign(frame, 0);
         s.localConst.assign(frame, 0);
@@ -347,7 +402,7 @@ private:
             const Op op = Op(code[pc]);
             if (pc + 1 + std::size_t(opArity(op)) * 4 > code.size())
                 refuse("the body is truncated");
-            if (op == Op::Br || op == Op::BrTrue || op == Op::BrFalse) {
+            if (op == Op::Br || op == Op::BrTrue || op == Op::BrFalse || op == Op::Leave) {
                 const std::uint32_t target = readU32(&code[pc + 1]);
                 if (target >= code.size())
                     refuse("a branch leaves the body");
@@ -356,6 +411,12 @@ private:
             }
             pc += 1 + std::size_t(opArity(op)) * 4;
         }
+        for (const Handler& handler : s.method->body.handlers) {
+            if (handler.target >= code.size())
+                refuse("a handler outside the body");
+            if (s.labels[handler.target] < 0)
+                s.labels[handler.target] = newLabel();
+        }
     }
 
     std::vector<std::uint8_t> reachable(const MethodInfo& m) const
@@ -363,6 +424,8 @@ private:
         const std::vector<std::uint8_t>& code = m.body.code;
         std::vector<std::uint8_t> seen(code.size() + 1, 0);
         std::vector<std::uint32_t> work{0};
+        for (const Handler& handler : m.body.handlers)
+            work.push_back(handler.target);
         while (!work.empty()) {
             std::uint32_t pc = work.back();
             work.pop_back();
@@ -370,9 +433,9 @@ private:
                 seen[pc] = 1;
                 const Op op = Op(code[pc]);
                 const std::uint32_t next = pc + 1 + std::uint32_t(opArity(op)) * 4;
-                if (op == Op::Ret || op == Op::RetVoid || op == Op::Throw || op == Op::Rethrow)
+                if (op == Op::Ret || op == Op::RetVoid || op == Op::Throw || op == Op::Rethrow || op == Op::EndFinally)
                     break;
-                if (op == Op::Br) {
+                if (op == Op::Br || op == Op::Leave) {
                     pc = readU32(&code[pc + 1]);
                     continue;
                 }
@@ -391,6 +454,13 @@ private:
         const Cls c = boxed ? Cls::Ref : slotClass(s, slot);
         if (s.localVreg[slot] < 0)
             s.localVreg[slot] = fn_.newVreg(isFpClass(c));
+        if (c == Cls::Obj) {
+            if (s.localTag[slot] < 0)
+                s.localTag[slot] = fn_.newVreg(false);
+            IrInst& tag = inst(IrOp::MovImm);
+            tag.d = s.localTag[slot];
+            tag.imm = std::int64_t(Type::Null);
+        }
         if (isFpClass(c)) {
             IrInst& in = inst(IrOp::FMovImm);
             in.d = s.localVreg[slot];
@@ -401,7 +471,7 @@ private:
             in.d = s.localVreg[slot];
             in.imm = 0;
         }
-        if (c == Cls::Ref)
+        if (c == Cls::Ref || c == Cls::Obj)
             s.localOwned[slot] = 1;
     }
 
@@ -420,36 +490,280 @@ private:
     }
 
     /// Everything that holds a count right now, across every scope: what an exit has to release.
-    std::vector<std::int32_t> ownedNow(std::int32_t alsoHeld = -1)
+    std::vector<std::int32_t> ownedNow(bool toHandler = false)
     {
         std::vector<std::int32_t> out;
+        taggedNow_.clear();
         for (Scope* s = scope_; s; s = s->parent) {
-            for (std::size_t slot = 0; slot < s->localVreg.size(); ++slot) {
-                if (s->localOwned[slot] && s->localVreg[slot] >= 0)
+            // A handler in this method carries on with the method's locals.
+            const bool keepLocals = toHandler && !s->parent;
+            for (std::size_t slot = 0; !keepLocals && slot < s->localVreg.size(); ++slot) {
+                if (!s->localOwned[slot] || s->localVreg[slot] < 0)
+                    continue;
+                if (s->localTag[slot] >= 0)
+                    taggedNow_.push_back({s->localVreg[slot], s->localTag[slot]});
+                else
                     out.push_back(s->localVreg[slot]);
             }
+            if (!keepLocals && !s->parent && exceptionVreg_ >= 0)
+                out.push_back(exceptionVreg_);
             for (const Entry& e : s->stack) {
-                if (e.own == Own::Owned && !e.isConst)
+                if (e.own != Own::Owned || e.isConst)
+                    continue;
+                if (e.tagVreg >= 0)
+                    taggedNow_.push_back({e.vreg, e.tagVreg});
+                else
                     out.push_back(e.vreg);
             }
             out.insert(out.end(), s->held.begin(), s->held.end());
+            taggedNow_.insert(taggedNow_.end(), s->heldTagged.begin(), s->heldTagged.end());
         }
-        if (alsoHeld >= 0)
-            out.push_back(alsoHeld);
         return out;
+    }
+
+    /// The handlers this instruction of the root method is protected by, innermost first as the table lists them.
+    std::vector<const Handler*> handlersAt(std::uint32_t pc) const
+    {
+        std::vector<const Handler*> out;
+        for (const Handler& handler : root_.body.handlers) {
+            if (pc >= handler.start && pc < handler.end)
+                out.push_back(&handler);
+        }
+        return out;
+    }
+
+    std::uint32_t rootPc() const noexcept
+    {
+        const Scope* s = scope_;
+        while (s->parent)
+            s = s->parent;
+        return s->pc;
+    }
+
+    /// The code that decides, for an exception raised under these handlers, where it goes; one per distinct list.
+    std::int32_t landingFor(const std::vector<const Handler*>& handlers)
+    {
+        const auto known = landings_.find(handlers);
+        if (known != landings_.end())
+            return known->second;
+        const std::int32_t label = newLabel();
+        landings_.emplace(handlers, label);
+        const std::uint32_t pc = rootPc();
+        Scope* root = scope_;
+        while (root->parent)
+            root = root->parent;
+        deferred_.push_back([this, handlers, label, pc, root]() {
+            scope_ = root;
+            root->stack.clear();
+            root->pc = pc;
+            inst(IrOp::Label).imm = label;
+            for (const Handler* handler : handlers) {
+                if (handler->kind == HandlerKind::Catch) {
+                    const std::int32_t cell = callPure(reinterpret_cast<void*>(&scriptJitCatch),
+                                                       {rtReg(), ptrReg(handler->catchType)}, false);
+                    const std::int32_t next = newLabel();
+                    IrInst& test = inst(IrOp::BrCmp);
+                    test.a = cell;
+                    test.cond = IrCond::Eq;
+                    test.width = 64;
+                    test.hasImm = true;
+                    test.imm = 0;
+                    test.target = next;
+                    // The slot and the exception a `throw;` would raise again each hold a count.
+                    IrInst& second = inst(IrOp::IncRef);
+                    second.a = cell;
+                    assignOwned(exceptionVreg_, cell);
+                    if (handler->exceptionSlot < root->localVreg.size() && root->localVreg[handler->exceptionSlot] >= 0 &&
+                        root->localOwned[handler->exceptionSlot]) {
+                        assignOwned(root->localVreg[handler->exceptionSlot], cell);
+                    } else {
+                        IrInst& drop = inst(IrOp::DecRef);
+                        drop.a = cell;
+                    }
+                    inst(IrOp::Br).imm = root->labels[handler->target];
+                    inst(IrOp::Label).imm = next;
+                } else {
+                    const std::int32_t saved = callPure(reinterpret_cast<void*>(&scriptJitFinallyEnter), {rtReg()}, false);
+                    const std::int32_t next = newLabel();
+                    IrInst& test = inst(IrOp::BrCmp);
+                    test.a = saved;
+                    test.cond = IrCond::Eq;
+                    test.width = 32;
+                    test.hasImm = true;
+                    test.imm = 0;
+                    test.target = next;
+                    const std::int32_t negated = fn_.newVreg(false);
+                    IrInst& neg = inst(IrOp::Neg);
+                    neg.d = negated;
+                    neg.a = saved;
+                    neg.width = 32;
+                    IrInst& mov = inst(IrOp::Mov);
+                    mov.d = continuationVreg(*handler);
+                    mov.a = negated;
+                    inst(IrOp::Br).imm = root->labels[handler->target];
+                    inst(IrOp::Label).imm = next;
+                }
+            }
+            leaveMethod();
+        });
+        return label;
+    }
+
+    /// Carry the pending error out of this method: its locals are released on the way.
+    void leaveMethod()
+    {
+        const std::int32_t always = immReg(0);
+        const std::int32_t at = std::int32_t(fn_.code.size());
+        inst(IrOp::ExitCmp);
+        IrExit exit;
+        exit.cleanup = ownedNow(false);
+        exit.cleanupTagged = taggedNow_;
+        exit.site = site();
+        fn_.maxCleanup = std::max(fn_.maxCleanup, std::uint32_t(exit.cleanup.size() + exit.cleanupTagged.size()));
+        fn_.exits.push_back(std::move(exit));
+        IrInst& leave = fn_.code[std::size_t(at)];
+        leave.a = always;
+        leave.b = always;
+        leave.cond = IrCond::Eq;
+        leave.width = 64;
+        leave.target = std::int32_t(fn_.exits.size()) - 1;
+        inst(IrOp::Trap);
+    }
+
+    void assignOwned(std::int32_t vreg, std::int32_t cell)
+    {
+        const std::int32_t old = fn_.newVreg(false);
+        IrInst& save = inst(IrOp::Mov);
+        save.d = old;
+        save.a = vreg;
+        IrInst& mov = inst(IrOp::Mov);
+        mov.d = vreg;
+        mov.a = cell;
+        IrInst& dec = inst(IrOp::DecRef);
+        dec.a = old;
+        dec.isNullable = true;
+    }
+
+    /// Where a `finally` goes when it ends: negative to carry on raising (the saved exception's number), positive for
+    /// the continuation of that number.
+    std::int32_t continuationVreg(const Handler& handler)
+    {
+        const auto it = continuation_.find(&handler);
+        if (it != continuation_.end())
+            return it->second;
+        const std::int32_t v = fn_.newVreg(false);
+        continuation_.emplace(&handler, v);
+        return v;
+    }
+
+    /// `Leave`: through each `finally` it crosses, then on to the target.
+    void lowerLeave(std::uint32_t pc, std::uint32_t target)
+    {
+        std::vector<const Handler*> chain;
+        for (const Handler& handler : root_.body.handlers) {
+            if (handler.kind != HandlerKind::Finally)
+                continue;
+            if (pc >= handler.start && pc < handler.end && !(target >= handler.start && target < handler.end))
+                chain.push_back(&handler);
+        }
+        while (!scope_->stack.empty()) {
+            const Entry dropped = pop();
+            release(dropped);
+        }
+        std::int32_t next = scope_->labels[target];
+        for (std::size_t i = chain.size(); i-- > 0;) {
+            const Handler* handler = chain[i];
+            std::vector<std::int32_t>& table = finallyExits_[handler];
+            table.push_back(next);
+            const std::int64_t id = std::int64_t(table.size());
+            const std::int32_t cont = continuationVreg(*handler);
+            if (i == 0) {
+                IrInst& set = inst(IrOp::MovImm);
+                set.d = cont;
+                set.imm = id;
+                inst(IrOp::Br).imm = scope_->labels[handler->target];
+                return;
+            }
+            // The one before this ends up here.
+            const std::int32_t stub = newLabel();
+            const std::int32_t handlerLabel = scope_->labels[handler->target];
+            deferred_.push_back([this, stub, cont, id, handlerLabel]() {
+                inst(IrOp::Label).imm = stub;
+                IrInst& set = inst(IrOp::MovImm);
+                set.d = cont;
+                set.imm = id;
+                inst(IrOp::Br).imm = handlerLabel;
+            });
+            next = stub;
+        }
+        inst(IrOp::Br).imm = next;
+    }
+
+    void lowerEndFinally(std::uint32_t pc)
+    {
+        // The `finally` this ends: the innermost one whose body has been entered, by layout.
+        const Handler* handler = nullptr;
+        for (const Handler& candidate : root_.body.handlers) {
+            if (candidate.kind != HandlerKind::Finally || candidate.target > pc)
+                continue;
+            if (finallyEnded_.count(&candidate))
+                continue;
+            if (!handler || candidate.target > handler->target)
+                handler = &candidate;
+        }
+        if (!handler)
+            refuse("an end of a finally with no finally");
+        finallyEnded_.insert(handler);
+        const std::int32_t cont = continuationVreg(*handler);
+        const std::int32_t dispatch = newLabel();
+        inst(IrOp::Br).imm = dispatch;
+        Scope* root = scope_;
+        deferred_.push_back([this, handler, cont, dispatch, pc, root]() {
+            scope_ = root;
+            root->stack.clear();
+            root->pc = pc;
+            inst(IrOp::Label).imm = dispatch;
+            const std::vector<std::int32_t>& table = finallyExits_[handler];
+            for (std::size_t i = 0; i < table.size(); ++i) {
+                IrInst& br = inst(IrOp::BrCmp);
+                br.a = cont;
+                br.cond = IrCond::Eq;
+                br.width = 32;
+                br.hasImm = true;
+                br.imm = std::int64_t(i + 1);
+                br.target = table[i];
+            }
+            // Otherwise an exception is passing through: raise it again, for whatever protects this point.
+            callPure(reinterpret_cast<void*>(&scriptJitFinallyRethrow), {rtReg(), cont}, false, false);
+            const std::vector<const Handler*> outer = handlersAt(pc);
+            if (!outer.empty())
+                inst(IrOp::Br).imm = landingFor(outer);
+            else
+                leaveMethod();
+        });
     }
 
     std::int32_t makeExit(std::uint32_t code, std::vector<std::int32_t> extra = {})
     {
-        std::vector<std::int32_t> cleanup = ownedNow();
+        const std::vector<const Handler*> handlers =
+            root_.body.handlers.empty() ? std::vector<const Handler*>() : handlersAt(rootPc());
+        std::vector<std::int32_t> cleanup = ownedNow(!handlers.empty());
+        std::vector<std::pair<std::int32_t, std::int32_t>> tagged = taggedNow_;
+        tagged.insert(tagged.end(), extraTagged_.begin(), extraTagged_.end());
         cleanup.insert(cleanup.end(), extra.begin(), extra.end());
         const std::int32_t where = site();
+        const std::int32_t handlerLabel = handlers.empty() ? -1 : landingFor(handlers);
         if (!fn_.exits.empty()) {
             const IrExit& last = fn_.exits.back();
-            if (last.code == code && last.cleanup == cleanup && last.site == where)
+            if (last.code == code && last.cleanup == cleanup && last.cleanupTagged == tagged && last.site == where &&
+                last.handlerLabel == handlerLabel && last.indexVreg == pendingIndex_)
                 return std::int32_t(fn_.exits.size()) - 1;
         }
         IrExit exit;
+        exit.handlerLabel = handlerLabel;
+        exit.cleanupTagged = std::move(tagged);
+        exit.indexVreg = pendingIndex_;
+        fn_.maxCleanup = std::max(fn_.maxCleanup, std::uint32_t(cleanup.size() + exit.cleanupTagged.size()));
         fn_.maxCleanup = std::max(fn_.maxCleanup, std::uint32_t(cleanup.size()));
         exit.cleanup = std::move(cleanup);
         exit.code = code;
@@ -540,10 +854,15 @@ private:
         in.d = copy;
         in.a = e.vreg;
         e.vreg = copy;
+        if (e.tagVreg >= 0) {
+            const std::int32_t tagCopy = fn_.newVreg(false);
+            IrInst& tagMov = inst(IrOp::Mov);
+            tagMov.d = tagCopy;
+            tagMov.a = e.tagVreg;
+            e.tagVreg = tagCopy;
+        }
         if (e.own == Own::Local) {
-            IrInst& inc = inst(IrOp::IncRef);
-            inc.a = copy;
-            inc.isNullable = !e.nonNull;
+            incRefOf(copy, e.tagVreg, !e.nonNull);
             e.own = Own::Owned;
         }
         e.local = -1;
@@ -555,8 +874,7 @@ private:
         if (e.isConst || e.own == Own::Owned || e.own == Own::None)
             return;
         if (e.own == Own::Immortal) {
-            IrInst& inc = inst(IrOp::IncRef);
-            inc.a = e.vreg;
+            incRefOf(e.vreg, e.tagVreg, !e.nonNull);
             e.own = Own::Owned;
             return;
         }
@@ -565,9 +883,14 @@ private:
         IrInst& mov = inst(IrOp::Mov);
         mov.d = copy;
         mov.a = e.vreg;
-        IrInst& inc = inst(IrOp::IncRef);
-        inc.a = copy;
-        inc.isNullable = !e.nonNull;
+        if (e.tagVreg >= 0) {
+            const std::int32_t tagCopy = fn_.newVreg(false);
+            IrInst& tagMov = inst(IrOp::Mov);
+            tagMov.d = tagCopy;
+            tagMov.a = e.tagVreg;
+            e.tagVreg = tagCopy;
+        }
+        incRefOf(copy, e.tagVreg, !e.nonNull);
         e.vreg = copy;
         e.own = Own::Owned;
         e.local = -1;
@@ -589,9 +912,61 @@ private:
         if (e.own != Own::Owned || e.isConst)
             return;
         secureWeak();
-        IrInst& dec = inst(IrOp::DecRef);
-        dec.a = e.vreg;
-        dec.isNullable = !e.nonNull;
+        decRefOf(e.vreg, e.tagVreg, !e.nonNull);
+    }
+
+    /// Whatever is headed for a place of static type `object` or an interface: with its tag in a register. Boxing a
+    /// primitive is nothing at run time beyond that.
+    void coerceToObject(Entry& e, const TypeInfo* to)
+    {
+        const Cls from = e.type ? classOf(e.type) : Cls::Ref;
+        if (from == Cls::Obj) {
+            e.type = to;
+            return;
+        }
+        if (from == Cls::Ref) {
+            const bool isNullLiteral = e.isConst;
+            const std::int32_t payload = reg(e);
+            e.vreg = payload;
+            e.isConst = false;
+            if (isNullLiteral || !e.type || baseKind(e.type) == TypeKind::Null) {
+                e.tagVreg = isNullLiteral ? immReg(std::int64_t(Type::Null))
+                                          : callPure(reinterpret_cast<void*>(&scriptJitTagOf), {payload}, false);
+            } else if (e.nonNull) {
+                e.tagVreg = immReg(std::int64_t(refTag(e.type)));
+            } else {
+                const std::int32_t d = fn_.newVreg(false);
+                IrInst& in = inst(IrOp::TagOfNullable);
+                in.d = d;
+                in.a = payload;
+                in.tag = refTag(e.type);
+                e.tagVreg = d;
+            }
+            e.type = to;
+            return;
+        }
+        // A primitive: its bits, and the tag its type says.
+        const std::int32_t tag = immReg(std::int64_t(runtimeTag(baseKind(e.type))));
+        const std::int32_t bits = payloadOfEntry(e);
+        e.vreg = bits;
+        e.tagVreg = tag;
+        e.isConst = false;
+        e.local = -1;
+        e.own = Own::None;
+        e.type = to;
+    }
+
+    /// Make `e` fit a place of static type `to`, when the bytecode left that to the runtime tag.
+    void coerceTo(Entry& e, const TypeInfo* to)
+    {
+        const Cls want = to ? classOf(to) : Cls::Ref;
+        if (want == Cls::Obj) {
+            coerceToObject(e, to);
+            return;
+        }
+        const Cls have = e.type ? classOf(e.type) : Cls::Ref;
+        if (want != have)
+            refuse("a value of a different representation than the place it goes");
     }
 
     /// Null check an entry, unless it is known not to be null.
@@ -610,11 +985,11 @@ private:
         (void)in;
         const std::int32_t exit = makeExit(std::uint32_t(ErrorCode::NullReference));
         IrInst& check = fn_.code[std::size_t(index)];
-        check.a = e.vreg;
+        check.a = e.tagVreg >= 0 ? e.tagVreg : e.vreg;
         check.cond = IrCond::Eq;
-        check.width = 64;
+        check.width = e.tagVreg >= 0 ? 32 : 64;
         check.hasImm = true;
-        check.imm = 0;
+        check.imm = e.tagVreg >= 0 ? std::int64_t(Type::Null) : 0;
         check.target = exit;
         e.nonNull = true;
         if (e.local >= 0)
@@ -626,20 +1001,29 @@ private:
     {
     public:
         Held(Lowering& lowering, std::initializer_list<const Entry*> entries)
-            : scope_(*lowering.scope_), size_(scope_.held.size())
+            : scope_(*lowering.scope_), size_(scope_.held.size()), taggedSize_(scope_.heldTagged.size())
         {
             for (const Entry* e : entries) {
-                if (e->own == Own::Owned && !e->isConst)
+                if (e->own != Own::Owned || e->isConst)
+                    continue;
+                if (e->tagVreg >= 0)
+                    scope_.heldTagged.push_back({e->vreg, e->tagVreg});
+                else
                     scope_.held.push_back(e->vreg);
             }
         }
-        ~Held() { scope_.held.resize(size_); }
+        ~Held()
+        {
+            scope_.held.resize(size_);
+            scope_.heldTagged.resize(taggedSize_);
+        }
         Held(const Held&) = delete;
         Held& operator=(const Held&) = delete;
 
     private:
         Scope& scope_;
         std::size_t size_;
+        std::size_t taggedSize_;
     };
 
     // ---- join points ----
@@ -656,7 +1040,9 @@ private:
                 Entry canonical;
                 canonical.vreg = fn_.newVreg(isFpClass(c));
                 canonical.type = stack[i].type;
-                canonical.own = c == Cls::Ref ? Own::Owned : Own::None;
+                canonical.own = c == Cls::Ref || c == Cls::Obj ? Own::Owned : Own::None;
+                if (c == Cls::Obj)
+                    canonical.tagVreg = fn_.newVreg(false);
                 join.entries[i] = canonical;
             }
         } else if (join.entries.size() != stack.size()) {
@@ -667,14 +1053,28 @@ private:
             Entry& canonical = join.entries[i];
             if (canonical.vreg == e.vreg && !e.isConst)
                 continue;
+            const Cls have = e.type ? classOf(e.type) : Cls::Ref;
+            const Cls want = canonical.type ? classOf(canonical.type) : Cls::Ref;
+            // `cond ? null : x` may see the null first. `a?.Length` makes an int that can be null, with no type to say
+            // so: that keeps interpreting.
+            if (have != want && want != Cls::Obj)
+                refuse("a value of a different representation on each way into a join");
             if (baseKind(canonical.type) == TypeKind::Null && e.type)
-                canonical.type = e.type;  // `cond ? null : x` first saw the null
+                canonical.type = e.type;
+            if (canonical.tagVreg >= 0)
+                coerceToObject(e, canonical.type);
             if (e.own != Own::None)
                 makeOwned(e);
             const std::int32_t from = reg(e);
             IrInst& mov = inst(IrOp::Mov);
             mov.d = canonical.vreg;
             mov.a = from;
+            if (canonical.tagVreg >= 0) {
+                IrInst& tagMov = inst(IrOp::Mov);
+                tagMov.d = canonical.tagVreg;
+                tagMov.a = e.tagVreg;
+                e.tagVreg = canonical.tagVreg;
+            }
             e.vreg = canonical.vreg;
             e.isConst = false;
             e.local = -1;
@@ -789,6 +1189,26 @@ private:
                     lowerThrow();
                     fallsIn = false;
                     break;
+                case Op::Rethrow: {
+                    if (exceptionVreg_ < 0)
+                        refuse("a rethrow outside a handler");
+                    Entry current;
+                    current.vreg = exceptionVreg_;
+                    current.type = core_.exceptionType;
+                    current.own = Own::Immortal;
+                    push(current);
+                    lowerThrow();
+                    fallsIn = false;
+                    break;
+                }
+                case Op::Leave:
+                    lowerLeave(pc, readU32(operands));
+                    fallsIn = false;
+                    break;
+                case Op::EndFinally:
+                    lowerEndFinally(pc);
+                    fallsIn = false;
+                    break;
                 default: lowerSimple(op, operands, pc);
             }
             pc = next;
@@ -811,6 +1231,7 @@ private:
             out.slot = slot;
             out.bytes = c == Cls::I32 || c == Cls::F32 ? 4 : 8;
             out.owned = s.localOwned[slot] != 0;
+            out.tagVreg = c == Cls::Obj ? s.localTag[slot] : -1;
             entry.slots.push_back(out);
         }
         fn_.osrEntries.push_back(std::move(entry));
@@ -892,6 +1313,8 @@ private:
     {
         Entry b = pop();
         Entry a = pop();
+        requireNumber(a);
+        requireNumber(b);
         std::uint8_t width = 32;
         bool fp = false;
         IrCond cond = compareCond(op, width, fp);
@@ -901,9 +1324,10 @@ private:
             const Cls c = classOf(a.type);
             // `!(a < b)` is not `a >= b` when a NaN is about, so the false sense jumps around.
             if (whenTrue) {
+                const std::int32_t ra = reg(a), rb = reg(b);
                 IrInst& br = inst(IrOp::BrFCmp);
-                br.a = reg(a);
-                br.b = reg(b);
+                br.a = ra;
+                br.b = rb;
                 fixFpBranch(br, cond, c, labelFor(target));
             } else {
                 const std::int32_t skip = newLabel();
@@ -972,9 +1396,7 @@ private:
         for (std::size_t slot = 0; slot < s.localVreg.size(); ++slot) {
             if (!s.localOwned[slot] || s.localVreg[slot] < 0 || std::int32_t(slot) == keepSlot)
                 continue;
-            IrInst& dec = inst(IrOp::DecRef);
-            dec.a = s.localVreg[slot];
-            dec.isNullable = true;
+            decRefOf(s.localVreg[slot], s.localTag[slot], true);
         }
     }
 
@@ -982,12 +1404,15 @@ private:
     {
         Scope& s = *scope_;
         std::int32_t value = -1;
+        std::int32_t valueTag = -1;
         std::int32_t keep = -1;
         bool nonNull = false;
         if (hasValue) {
             Entry e = pop();
             const Cls c = s.method->returnType ? classOf(s.method->returnType) : Cls::Void;
-            if (c == Cls::Ref) {
+            if (c != Cls::Void)
+                coerceTo(e, s.method->returnType);
+            if (c == Cls::Ref || c == Cls::Obj) {
                 if (e.own == Own::Local && e.local >= 0 && s.localOwned[std::size_t(e.local)]) {
                     // `return local`: the count moves with it.
                     keep = e.local;
@@ -998,11 +1423,17 @@ private:
                 nonNull = e.nonNull;
             }
             value = reg(e);
+            valueTag = e.tagVreg;
             if (s.parent) {
                 IrInst& mov = inst(IrOp::Mov);
                 mov.d = s.resultVreg;
                 mov.a = value;
                 value = s.resultVreg;
+                if (c == Cls::Obj) {
+                    IrInst& tagMov = inst(IrOp::Mov);
+                    tagMov.d = s.resultTag;
+                    tagMov.a = valueTag;
+                }
             }
         }
         // Anything left on the stack at a return belongs to nobody else.
@@ -1011,18 +1442,27 @@ private:
             release(dropped);
         }
         releaseLocals(s, keep);
+        if (!s.parent && exceptionVreg_ >= 0) {
+            IrInst& dec = inst(IrOp::DecRef);
+            dec.a = exceptionVreg_;
+            dec.isNullable = true;
+        }
         if (s.parent) {
             s.resultNonNull = s.resultNonNull && nonNull;
             inst(IrOp::Br).imm = s.exitLabel;
             return;
         }
-        inst(IrOp::Ret).a = value;
+        IrInst& ret = inst(IrOp::Ret);
+        ret.a = value;
+        ret.b = valueTag;
     }
 
     void lowerThrow()
     {
         Entry thrown = pop();
         const std::int32_t ptr = reg(thrown);
+        if (thrown.tagVreg >= 0 && thrown.own == Own::Owned)
+            extraTagged_ = {{thrown.vreg, thrown.tagVreg}};
         IrCall call;
         call.kind = IrCallKind::Helper;
         call.helper = reinterpret_cast<void*>(&scriptJitThrow);
@@ -1032,7 +1472,7 @@ private:
         emitCall(std::move(call));
         // The helper recorded the exception: leave the way a failed call does.
         std::vector<std::int32_t> extra;
-        if (thrown.own == Own::Owned)
+        if (thrown.own == Own::Owned && thrown.tagVreg < 0)
             extra.push_back(thrown.vreg);
         const std::int32_t at = std::int32_t(fn_.code.size());
         IrInst& always = inst(IrOp::ExitCmp);
@@ -1041,6 +1481,7 @@ private:
         always.cond = IrCond::Eq;
         always.width = 64;
         const std::int32_t exit = makeExit(0, extra);
+        extraTagged_.clear();
         fn_.code[std::size_t(at)].target = exit;
         inst(IrOp::Trap);
         scope_->stack.clear();
@@ -1051,9 +1492,7 @@ private:
     std::int32_t rtReg()
     {
         const std::int32_t d = fn_.newVreg(false);
-        IrInst& in = inst(IrOp::MovImm);
-        in.d = d;
-        in.imm = std::int64_t(reinterpret_cast<std::intptr_t>(&rt_));
+        inst(IrOp::MovRuntime).d = d;
         return d;
     }
 
@@ -1075,7 +1514,12 @@ private:
         forgetBoundsFacts();
     }
 
-    void forgetBoundsFacts() { lastBounds_ = {}; }
+    void forgetBoundsFacts()
+    {
+        lastBounds_ = {};
+        for (Scope* s = scope_; s; s = s->parent)
+            s->thisIsFresh = false;
+    }
 
     /// A helper that returns a cell (or nothing) and may raise.
     std::int32_t callHelper(void* helper, std::vector<std::int32_t> args, bool hasResult,
@@ -1127,6 +1571,22 @@ private:
     {
         const Cls c = classOf(type);
         const std::int32_t d = fn_.newVreg(isFpClass(c));
+        if (c == Cls::Obj) {
+            const std::int32_t tag = fn_.newVreg(false);
+            IrInst& tagLoad = inst(IrOp::Load);
+            tagLoad.d = tag;
+            tagLoad.a = base;
+            tagLoad.imm = offset - kPayloadOffset;
+            tagLoad.width = 1;
+            IrInst& load = inst(IrOp::Load);
+            load.d = d;
+            load.a = base;
+            load.imm = offset;
+            load.width = 8;
+            Entry e = refEntry(d, type, refOwn);
+            e.tagVreg = tag;
+            return e;
+        }
         IrInst& load = inst(IrOp::Load);
         load.d = d;
         load.a = base;
@@ -1137,10 +1597,11 @@ private:
     }
 
     /// Store to a `Value` in memory that already holds a value of this static type, releasing what it held.
-    void storeValueTo(std::int32_t base, std::int64_t valueOffset, const TypeInfo* type, Entry value)
+    void storeValueTo(std::int32_t base, std::int64_t valueOffset, const TypeInfo* type, Entry value, bool fresh = false)
     {
         const Cls c = classOf(type);
-        if (c != Cls::Ref) {
+        coerceTo(value, type);
+        if (c != Cls::Ref && c != Cls::Obj) {
             const std::int32_t v = reg(value);
             IrInst& store = inst(IrOp::Store);
             store.a = base;
@@ -1150,18 +1611,34 @@ private:
             return;
         }
         secureWeak();
+        // The caller's count on an argument moves into the field, when that was the argument's whole purpose.
+        if (value.own == Own::Local && value.local >= 0 && !scope_->consumable.empty() &&
+            std::size_t(value.local) < scope_->consumable.size() && scope_->consumable[std::size_t(value.local)]) {
+            const std::size_t param = std::size_t(value.local);
+            scope_->consumable[param] = 0;
+            scope_->consumed[param] = 1;
+            std::vector<std::int32_t>& held = scope_->parent->held;
+            const auto it = std::find(held.begin(), held.end(), scope_->argHeldVreg[param]);
+            if (it != held.end())
+                held.erase(it);
+            value.own = Own::Owned;
+        }
         makeOwned(value);
         const std::int32_t v = reg(value);
-        if (needsDynamicTag(type)) {
-            callPure(reinterpret_cast<void*>(&scriptJitStoreValue), {addOffset(base, valueOffset), v}, false, false);
+        if (c == Cls::Obj) {
+            callPure(reinterpret_cast<void*>(&scriptJitStoreTagged), {addOffset(base, valueOffset), value.tagVreg, v}, false,
+                     false);
             return;
         }
-        const std::int32_t old = fn_.newVreg(false);
-        IrInst& load = inst(IrOp::Load);
-        load.d = old;
-        load.a = base;
-        load.imm = valueOffset + kPayloadOffset;
-        load.width = 8;
+        std::int32_t old = -1;
+        if (!fresh) {
+            old = fn_.newVreg(false);
+            IrInst& load = inst(IrOp::Load);
+            load.d = old;
+            load.a = base;
+            load.imm = valueOffset + kPayloadOffset;
+            load.width = 8;
+        }
         IrInst& store = inst(IrOp::Store);
         store.a = base;
         store.c = v;
@@ -1172,6 +1649,8 @@ private:
         tag.c = value.nonNull ? -1 : v;
         tag.tag = refTag(type);
         tag.imm = valueOffset;
+        if (fresh)
+            return;
         IrInst& dec = inst(IrOp::DecRef);
         dec.a = old;
         dec.isNullable = true;
@@ -1226,7 +1705,12 @@ private:
             const Held held(*this, {&obj, &value});
             checkNotNull(obj);
         }
-        storeValueTo(obj.vreg, instanceSlotOffset(slot), type, value);
+        bool fresh = false;
+        if (scope_->thisIsFresh && obj.local == 0 && slot < scope_->freshField.size() && scope_->freshField[slot]) {
+            scope_->freshField[slot] = 0;
+            fresh = true;
+        }
+        storeValueTo(obj.vreg, instanceSlotOffset(slot), type, value, fresh);
         release(obj);
     }
 
@@ -1273,7 +1757,9 @@ private:
         load.width = 4;
         const std::int32_t at = std::int32_t(fn_.code.size());
         inst(IrOp::ExitCmp);
+        pendingIndex_ = indexReg;
         const std::int32_t exit = makeExit(std::uint32_t(ErrorCode::IndexOutOfRange));
+        pendingIndex_ = -1;
         IrInst& check = fn_.code[std::size_t(at)];
         check.a = indexReg;
         check.b = len;
@@ -1327,6 +1813,17 @@ private:
             load.imm = kArrayDataOffset + kPayloadOffset;
             load.width = 8;
             Entry result = refEntry(d, element, Own::Weak);
+            if (c == Cls::Obj) {
+                const std::int32_t tag = fn_.newVreg(false);
+                IrInst& tagLoad = inst(IrOp::LoadIdx);
+                tagLoad.d = tag;
+                tagLoad.a = array.vreg;
+                tagLoad.b = scaled;
+                tagLoad.scale = 0;
+                tagLoad.imm = kArrayDataOffset;
+                tagLoad.width = 1;
+                result.tagVreg = tag;
+            }
             if (array.own == Own::Owned) {
                 makeOwned(result);
                 push(result);
@@ -1422,9 +1919,10 @@ private:
         }
         Entry e;
         e.vreg = s.localVreg[slot];
+        e.tagVreg = s.localTag[slot];
         e.type = type;
         e.local = std::int32_t(slot);
-        if (c == Cls::Ref) {
+        if (c == Cls::Ref || c == Cls::Obj) {
             e.own = Own::Local;
             e.nonNull = s.localNonNull[slot] != 0;
         }
@@ -1445,7 +1943,8 @@ private:
             if (e.local == std::int32_t(slot))
                 copyOutOfLocal(e);
         }
-        if (c != Cls::Ref) {
+        coerceTo(value, s.localType[slot]);
+        if (c != Cls::Ref && c != Cls::Obj) {
             s.localConstKnown[slot] = 0;
             if (value.isConst) {
                 const Cls vc = value.type ? classOf(value.type) : c;
@@ -1488,9 +1987,17 @@ private:
         mov.d = s.localVreg[slot];
         mov.a = v;
         s.localNonNull[slot] = nonNull ? 1 : 0;
-        IrInst& dec = inst(IrOp::DecRef);
-        dec.a = old;
-        dec.isNullable = true;
+        std::int32_t oldTag = -1;
+        if (c == Cls::Obj) {
+            oldTag = fn_.newVreg(false);
+            IrInst& saveTag = inst(IrOp::Mov);
+            saveTag.d = oldTag;
+            saveTag.a = s.localTag[slot];
+            IrInst& movTag = inst(IrOp::Mov);
+            movTag.d = s.localTag[slot];
+            movTag.a = value.tagVreg;
+        }
+        decRefOf(old, oldTag, true);
     }
 
     bool isOnAnyStack(std::int32_t vreg) const noexcept
@@ -1509,10 +2016,19 @@ private:
         return in.op == IrOp::Label || in.op == IrOp::OsrEntry;
     }
 
+    /// An operand of an arithmetic instruction: never `object`, whose bits may be of any type.
+    void requireNumber(const Entry& e) const
+    {
+        if (e.type && classOf(e.type) == Cls::Obj)
+            refuse("arithmetic on a value whose static type is object");
+    }
+
     void binaryInt(IrOp op, std::uint8_t width, const TypeInfo* type)
     {
         Entry b = pop();
         Entry a = pop();
+        requireNumber(a);
+        requireNumber(b);
         if (a.isConst && b.isConst && foldInt(op, width, a.imm, b.imm, type))
             return;
         const bool commutes = op == IrOp::Add || op == IrOp::Mul || op == IrOp::And || op == IrOp::Or || op == IrOp::Xor;
@@ -1561,6 +2077,8 @@ private:
     {
         Entry b = pop();
         Entry a = pop();
+        requireNumber(a);
+        requireNumber(b);
         const std::int32_t ra = reg(a);
         const std::int32_t rb = reg(b);
         const std::int32_t d = fn_.newVreg(true);
@@ -1576,6 +2094,8 @@ private:
     {
         Entry b = pop();
         Entry a = pop();
+        requireNumber(a);
+        requireNumber(b);
         if (b.isConst && asWidth(b.imm, width) == 0) {
             b.vreg = reg(b);
             b.isConst = false;
@@ -1614,6 +2134,8 @@ private:
         const IrCond cond = compareCond(op, width, fp);
         Entry b = pop();
         Entry a = pop();
+        requireNumber(a);
+        requireNumber(b);
         const std::int32_t d = fn_.newVreg(false);
         if (fp) {
             const Cls c = classOf(a.type);
@@ -1650,6 +2172,7 @@ private:
     void unaryInt(IrOp op, std::uint8_t width, const TypeInfo* type)
     {
         Entry a = pop();
+        requireNumber(a);
         const std::int32_t ra = reg(a);
         const std::int32_t d = fn_.newVreg(false);
         IrInst& in = inst(op);
@@ -1663,6 +2186,7 @@ private:
     void convertInt(Op op)
     {
         Entry a = pop();
+        requireNumber(a);
         const Cls from = a.type ? classOf(a.type) : Cls::I32;
         const TypeInfo* to = nullptr;
         IrOp narrow = IrOp::Mov;
@@ -1715,6 +2239,7 @@ private:
     void convertLong(Op op)
     {
         Entry a = pop();
+        requireNumber(a);
         const Cls from = a.type ? classOf(a.type) : Cls::I32;
         const TypeInfo* to = op == Op::ConvI8 ? core_.longType : core_.ulongType;
         if (a.isConst && !isFpClass(from)) {
@@ -1750,6 +2275,7 @@ private:
     void convertFp(Op op)
     {
         Entry a = pop();
+        requireNumber(a);
         const Cls from = a.type ? classOf(a.type) : Cls::I32;
         const bool toDouble = op != Op::ConvR4;
         const Cls toClass = toDouble ? Cls::F64 : Cls::F32;
@@ -1804,7 +2330,26 @@ private:
     }
 
     /// Args have been popped. Lower the body in place; the result, if any, is pushed.
-    void inlineCall(const MethodInfo& callee, std::vector<Entry>& args)
+    /// How many times the body reads each slot, and whether it branches at all.
+    static void readCounts(const MethodInfo& m, std::vector<std::uint32_t>& reads, bool& branches)
+    {
+        reads.assign(m.frameSize(), 0);
+        branches = false;
+        const std::vector<std::uint8_t>& code = m.body.code;
+        for (std::size_t pc = 0; pc < code.size();) {
+            const Op op = Op(code[pc]);
+            if (op == Op::LdLoc) {
+                const std::uint32_t slot = readU32(&code[pc + 1]);
+                if (slot < reads.size())
+                    ++reads[slot];
+            } else if (op == Op::Br || op == Op::BrTrue || op == Op::BrFalse) {
+                branches = true;
+            }
+            pc += 1 + std::size_t(opArity(op)) * 4;
+        }
+    }
+
+    void inlineCall(const MethodInfo& callee, std::vector<Entry>& args, bool freshThis = false)
     {
         inlinedBytes_ += callee.body.code.size();
         ++fn_.inlinedMethods;
@@ -1819,9 +2364,24 @@ private:
         scope_ = &inner;  // labels and vregs of the callee from here on
         prepareScope(inner);
 
+        if (freshThis && callee.isConstructor() && callee.owner) {
+            inner.thisIsFresh = true;
+            inner.freshField.assign(callee.owner->instanceSlots, 1);
+        }
+        std::vector<std::uint32_t> reads;
+        bool branches = false;
+        readCounts(callee, reads, branches);
+        inner.consumable.assign(args.size(), 0);
+        inner.consumed.assign(args.size(), 0);
+        inner.argHeldVreg.assign(args.size(), -1);
+
         for (std::size_t i = 0; i < args.size(); ++i) {
             Entry& arg = args[i];
             const Cls c = inner.localType[i] ? classOf(inner.localType[i]) : Cls::Ref;
+            if (c == Cls::Obj) {
+                coerceToObject(arg, inner.localType[i]);
+                inner.localTag[i] = arg.tagVreg;
+            }
             // A parameter that is never assigned can simply be the argument.
             if (!assigned[i]) {
                 if (arg.isConst && !isFpClass(c) && c != Cls::Ref) {
@@ -1830,16 +2390,24 @@ private:
                     continue;
                 }
                 inner.localVreg[i] = reg(arg);
-                if (c == Cls::Ref) {
-                    inner.localNonNull[i] = arg.nonNull ? 1 : 0;
+                if (c == Cls::Obj) {
                     if (arg.own == Own::Owned)
+                        outer->heldTagged.push_back({arg.vreg, arg.tagVreg});
+                } else if (c == Cls::Ref) {
+                    inner.localNonNull[i] = arg.nonNull ? 1 : 0;
+                    if (arg.own == Own::Owned) {
                         outer->held.push_back(arg.vreg);
+                        if (!branches && reads[i] == 1) {
+                            inner.consumable[i] = 1;
+                            inner.argHeldVreg[i] = arg.vreg;
+                        }
+                    }
                 }
                 continue;
             }
             // Otherwise a real local.
             inner.localVreg[i] = fn_.newVreg(isFpClass(c));
-            if (c == Cls::Ref) {
+            if (c == Cls::Ref || c == Cls::Obj) {
                 makeOwned(arg);
                 inner.localOwned[i] = 1;
             }
@@ -1847,6 +2415,12 @@ private:
             IrInst& mov = inst(IrOp::Mov);
             mov.d = inner.localVreg[i];
             mov.a = from;
+            if (c == Cls::Obj) {
+                inner.localTag[i] = fn_.newVreg(false);
+                IrInst& tagMov = inst(IrOp::Mov);
+                tagMov.d = inner.localTag[i];
+                tagMov.a = arg.tagVreg;
+            }
         }
         for (std::uint32_t slot = std::uint32_t(args.size()); slot < inner.localVreg.size(); ++slot)
             initLocal(inner, slot);
@@ -1855,6 +2429,8 @@ private:
         inner.exitLabel = newLabel();
         if (ret != Cls::Void)
             inner.resultVreg = fn_.newVreg(isFpClass(ret));
+        if (ret == Cls::Obj)
+            inner.resultTag = fn_.newVreg(false);
         inner.resultNonNull = true;
 
         lowerBody(inner);
@@ -1862,7 +2438,19 @@ private:
         scope_ = outer;
         bindLabel(inner.exitLabel);
         // The counts on arguments end with the call.
-        for (const Entry& arg : args) {
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            const Entry& arg = args[i];
+            if (inner.consumed[i])
+                continue;
+            if (arg.own == Own::Owned && arg.tagVreg >= 0 && !arg.isConst) {
+                const std::pair<std::int32_t, std::int32_t> key{arg.vreg, arg.tagVreg};
+                const auto it = std::find(outer->heldTagged.begin(), outer->heldTagged.end(), key);
+                if (it != outer->heldTagged.end()) {
+                    outer->heldTagged.erase(it);
+                    decRefOf(arg.vreg, arg.tagVreg, !arg.nonNull);
+                }
+                continue;
+            }
             if (arg.own == Own::Owned && !arg.isConst) {
                 const auto it = std::find(outer->held.begin(), outer->held.end(), arg.vreg);
                 if (it != outer->held.end()) {
@@ -1874,10 +2462,13 @@ private:
             }
         }
         if (ret != Cls::Void) {
-            if (ret == Cls::Ref)
-                push(refEntry(inner.resultVreg, callee.returnType, Own::Owned, inner.resultNonNull));
-            else
+            if (ret == Cls::Ref || ret == Cls::Obj) {
+                Entry result = refEntry(inner.resultVreg, callee.returnType, Own::Owned, inner.resultNonNull);
+                result.tagVreg = inner.resultTag;
+                push(result);
+            } else {
                 push(valueEntry(inner.resultVreg, callee.returnType));
+            }
         }
     }
 
@@ -1913,6 +2504,8 @@ private:
             push(valueEntry(d, core_.doubleType));
             return true;
         }
+        if (lowerCollectionIntrinsic(target, args))
+            return true;
         if (baseKind(target.owner) == TypeKind::String && !target.isStatic()) {
             if (name == u"get_Length" && args.size() == 1) {
                 checkNotNull(args[0]);
@@ -1964,6 +2557,96 @@ private:
         return false;
     }
 
+    /// The collections the engine implements, called directly instead of through the generic way into a native. A value
+    /// goes as its tag and its payload bits; a value that comes back is its payload bits, holding a count if it has one.
+    bool lowerCollectionIntrinsic(const MethodInfo& target, std::vector<Entry>& args)
+    {
+        const NativeKind kind = target.owner->nativeKind;
+        if (kind != NativeKind::List && kind != NativeKind::Dictionary && kind != NativeKind::StringBuilder)
+            return false;
+        if (target.isStatic() || args.empty())
+            return false;
+        // A value that comes back as bits alone loses a tag it may need.
+        if (target.returnType && classOf(target.returnType) == Cls::Obj)
+            return false;
+        const String& name = target.name;
+
+        void* helper = nullptr;
+        bool returnsSelf = false;
+        if (kind == NativeKind::List) {
+            if (name == u"get_Count" && args.size() == 1)
+                helper = reinterpret_cast<void*>(&scriptJitListCount);
+            else if (name == u"get_Item" && args.size() == 2)
+                helper = reinterpret_cast<void*>(&scriptJitListGet);
+            else if (name == u"set_Item" && args.size() == 3)
+                helper = reinterpret_cast<void*>(&scriptJitListSet);
+            else if (name == u"Add" && args.size() == 2)
+                helper = reinterpret_cast<void*>(&scriptJitListAdd);
+        } else if (kind == NativeKind::Dictionary) {
+            if (name == u"get_Count" && args.size() == 1)
+                helper = reinterpret_cast<void*>(&scriptJitDictCount);
+            else if (name == u"get_Item" && args.size() == 2)
+                helper = reinterpret_cast<void*>(&scriptJitDictGet);
+            else if (name == u"set_Item" && args.size() == 3)
+                helper = reinterpret_cast<void*>(&scriptJitDictSet);
+            else if (name == u"ContainsKey" && args.size() == 2)
+                helper = reinterpret_cast<void*>(&scriptJitDictContains);
+        } else if (name == u"Append" && args.size() == 2) {
+            const TypeKind argKind = baseKind(args[1].type);
+            if (argKind == TypeKind::Char)
+                helper = reinterpret_cast<void*>(&scriptJitBuilderAppendChar);
+            else if (argKind == TypeKind::String)
+                helper = reinterpret_cast<void*>(&scriptJitBuilderAppendString);
+            returnsSelf = helper != nullptr;
+        }
+        if (!helper)
+            return false;
+
+        secureWeak();
+        for (Entry& arg : args) {
+            if (arg.own == Own::Weak)
+                makeOwned(arg);
+        }
+        std::vector<std::int32_t> callArgs{rtReg(), reg(args[0])};
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            // An index stays an int; everything else travels as a value.
+            const bool isIndex = kind == NativeKind::List && i == 1 && name != u"Add";
+            const bool isPlain = kind == NativeKind::StringBuilder;
+            if (!isIndex && !isPlain)
+                callArgs.push_back(tagOfEntry(args[i]));
+            callArgs.push_back(payloadOfEntry(args[i]));
+        }
+        const Cls ret = target.returnType ? classOf(target.returnType) : Cls::Void;
+        const bool hasResult = !returnsSelf && ret != Cls::Void;
+        std::int32_t result = callHelper(helper, std::move(callArgs), hasResult, ownedOf(args));
+        if (returnsSelf) {
+            // `Append` hands back the builder it was given: the entry stays as it was.
+            for (std::size_t i = 1; i < args.size(); ++i)
+                release(args[i]);
+            args[0].type = target.returnType;
+            push(args[0]);
+            return true;
+        }
+        for (const Entry& arg : args)
+            release(arg);
+        if (!hasResult)
+            return true;
+        if (isFpClass(ret)) {
+            const std::int32_t d = fn_.newVreg(true);
+            IrInst& in = inst(IrOp::BitsToFp);
+            in.d = d;
+            in.a = result;
+            in.width = ret == Cls::F32 ? 32 : 64;
+            result = d;
+            push(valueEntry(result, target.returnType));
+        } else if (ret == Cls::Ref) {
+            push(refEntry(result, target.returnType, Own::Owned));
+        } else {
+            push(valueEntry(result, target.returnType));
+        }
+        return true;
+    }
+
     void lowerCall(Op op, const std::uint8_t* operands)
     {
         const AssemblyImpl* assembly = scope_->method->assembly;
@@ -1983,8 +2666,15 @@ private:
         // The receiver's static type may be narrower than the method's owner, and an argument's may be a primitive
         // headed for `object`: both are checked against what the callee declares.
         checkSignature(*target, args);
+        const std::size_t paramBase = target->isStatic() ? 0 : 1;
+        for (std::size_t i = 0; i < target->params.size(); ++i) {
+            if (target->params[i].mode != ParamMode::Ref && target->params[i].mode != ParamMode::Out)
+                coerceTo(args[paramBase + i], target->params[i].type);
+        }
 
-        if (!target->isStatic() && argc > 0) {
+        // A method of `int` has a receiver that cannot be null.
+        if (!target->isStatic() && argc > 0 && args[0].type && classOf(args[0].type) != Cls::I32 &&
+            classOf(args[0].type) != Cls::I64 && !isFpClass(classOf(args[0].type))) {
             const std::size_t before = scope_->held.size();
             for (std::int32_t owned : ownedOf(args))
                 scope_->held.push_back(owned);
@@ -2019,27 +2709,55 @@ private:
         if (isInterface)
             call.delegate = callPure(reinterpret_cast<void*>(&scriptJitResolveInterface),
                                      {rtReg(), reg(args[0]), ptrReg(target)}, false);
+        pushCallArgs(call, args, isInterface, extra);
         if (isVirtual && target->owner && target->owner->nativeKind != NativeKind::None)
             refuse("a virtual call on a type the engine implements");
-        for (Entry& arg : args) {
+        finishCall(std::move(call), args, extra, returnClass(*target), target->returnType);
+    }
+
+    /// Lay out a call's arguments. `object` is its tag and its payload; the receiver of an interface call is the payload
+    /// alone, since what it dispatches to takes `this` as a plain reference.
+    void pushCallArgs(IrCall& call, std::vector<Entry>& args, bool receiverIsPlain, std::vector<std::int32_t>& extra)
+    {
+        extraTagged_.clear();
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            Entry& arg = args[i];
+            const bool tagged = arg.tagVreg >= 0 && !(receiverIsPlain && i == 0);
+            if (tagged)
+                call.args.push_back(arg.tagVreg);
             call.args.push_back(reg(arg));
-            if (arg.own == Own::Owned && !arg.isConst)
-                extra.push_back(call.args.back());
+            if (arg.own == Own::Owned && !arg.isConst) {
+                if (arg.tagVreg >= 0)
+                    extraTagged_.push_back({arg.vreg, arg.tagVreg});
+                else
+                    extra.push_back(arg.vreg);
+            }
         }
+    }
+
+    void finishCall(IrCall call, std::vector<Entry>& args, const std::vector<std::int32_t>& extra, Cls ret,
+                    const TypeInfo* returnType)
+    {
         call.exit = makeExit(0, extra);
+        extraTagged_.clear();
         call.site = site();
         call.publishFrame = true;
-        const Cls ret = returnClass(*target);
         if (ret != Cls::Void)
             call.result = fn_.newVreg(isFpClass(ret));
+        if (ret == Cls::Obj)
+            call.resultTag = fn_.newVreg(false);
         const std::int32_t result = call.result;
+        const std::int32_t resultTag = call.resultTag;
         emitCall(std::move(call));
         for (const Entry& arg : args)
             release(arg);
-        if (ret == Cls::Ref)
-            push(refEntry(result, target->returnType, Own::Owned));
-        else if (ret != Cls::Void)
-            push(valueEntry(result, target->returnType));
+        if (ret == Cls::Ref || ret == Cls::Obj) {
+            Entry out = refEntry(result, returnType, Own::Owned);
+            out.tagVreg = resultTag;
+            push(out);
+        } else if (ret != Cls::Void) {
+            push(valueEntry(result, returnType));
+        }
     }
 
     void checkSignature(const MethodInfo& target, const std::vector<Entry>& args)
@@ -2054,9 +2772,10 @@ private:
                 continue;  // a box goes by pointer whatever it holds
             const Cls want = classOf(declared);
             const Cls have = args[base + i].type ? classOf(args[base + i].type) : Cls::Ref;
-            if (want != have)
+            if (want != have && want != Cls::Obj)
                 refuse("an argument of a different representation than the parameter");
         }
+        // What `object`'s own methods dispatch to takes `this` as it is, with no agreement on how to pass it.
         if (!target.isStatic() && target.owner && baseKind(target.owner) == TypeKind::Object)
             refuse("a method of 'object'");
     }
@@ -2080,10 +2799,8 @@ private:
 
         if (type->nativeKind != NativeKind::None) {
             // A type the engine implements makes its own cell; `this` goes in empty.
-            for (std::size_t i = 0; i < ctor->params.size() && i < args.size(); ++i) {
-                if (classOf(ctor->params[i].type) != (args[i].type ? classOf(args[i].type) : Cls::Ref))
-                    refuse("an argument of a different representation than the parameter");
-            }
+            for (std::size_t i = 0; i < ctor->params.size() && i < args.size(); ++i)
+                coerceTo(args[i], ctor->params[i].type);
             IrCall call;
             call.kind = IrCallKind::Direct;
             call.target = ctor;
@@ -2092,24 +2809,19 @@ private:
             for (Entry& arg : args) {
                 if (arg.own == Own::Weak)
                     makeOwned(arg);
-                call.args.push_back(reg(arg));
-                if (arg.own == Own::Owned && !arg.isConst)
-                    extra.push_back(call.args.back());
             }
-            call.exit = makeExit(0, extra);
-            call.site = site();
-            call.publishFrame = true;
-            call.result = fn_.newVreg(false);
-            const std::int32_t result = call.result;
-            emitCall(std::move(call));
-            for (const Entry& arg : args)
-                release(arg);
-            push(refEntry(result, type, Own::Owned, true));
+            pushCallArgs(call, args, false, extra);
+            finishCall(std::move(call), args, extra, Cls::Ref, type);
+            top().nonNull = true;
             return;
         }
 
+        for (std::size_t i = 0; i < ctor->params.size() && i < args.size(); ++i)
+            coerceTo(args[i], ctor->params[i].type);
+        extraTagged_ = taggedOf(args);
         const std::int32_t cell = callHelper(reinterpret_cast<void*>(&scriptJitNewInstance), {rtReg(), ptrReg(type)}, true,
                                              ownedOf(args));
+        extraTagged_.clear();
         // The new object is on the stack as an owned entry while its constructor runs.
         Entry self = refEntry(cell, type, Own::Owned, true);
         push(self);
@@ -2126,41 +2838,38 @@ private:
                 release(arg);
             return;
         }
-        for (std::size_t i = 0; i < ctor->params.size() && i + 1 < call.size(); ++i) {
-            if (classOf(ctor->params[i].type) != (call[i + 1].type ? classOf(call[i + 1].type) : Cls::Ref))
-                refuse("an argument of a different representation than the parameter");
-        }
         for (Entry& arg : call) {
             if (arg.own == Own::Weak)
                 makeOwned(arg);
         }
         if (canInline(*ctor, argc + 1)) {
-            inlineCall(*ctor, call);
+            inlineCall(*ctor, call, true);
             return;
         }
         IrCall irCall;
         irCall.kind = IrCallKind::Direct;
         irCall.target = ctor;
         std::vector<std::int32_t> extra;
-        for (Entry& arg : call) {
-            irCall.args.push_back(reg(arg));
-            if (arg.own == Own::Owned && !arg.isConst)
-                extra.push_back(irCall.args.back());
-        }
-        irCall.exit = makeExit(0, extra);
-        irCall.site = site();
-        irCall.publishFrame = true;
-        emitCall(std::move(irCall));
-        for (const Entry& arg : call)
-            release(arg);
+        pushCallArgs(irCall, call, false, extra);
+        finishCall(std::move(irCall), call, extra, Cls::Void, nullptr);
     }
 
+    /// Plain references that hold a count. What has a tag next to it is in `taggedOf`.
     static std::vector<std::int32_t> ownedOf(const std::vector<Entry>& entries)
     {
         std::vector<std::int32_t> out;
         for (const Entry& e : entries) {
-            if (e.own == Own::Owned && !e.isConst)
+            if (e.own == Own::Owned && !e.isConst && e.tagVreg < 0)
                 out.push_back(e.vreg);
+        }
+        return out;
+    }
+    static std::vector<std::pair<std::int32_t, std::int32_t>> taggedOf(const std::vector<Entry>& entries)
+    {
+        std::vector<std::pair<std::int32_t, std::int32_t>> out;
+        for (const Entry& e : entries) {
+            if (e.own == Own::Owned && !e.isConst && e.tagVreg >= 0)
+                out.push_back({e.vreg, e.tagVreg});
         }
         return out;
     }
@@ -2205,10 +2914,8 @@ private:
         const MethodInfo& sig = *type->invoke;
         if (sig.params.size() != argc)
             refuse("a delegate call with the wrong arguments");
-        for (std::uint32_t i = 0; i < argc; ++i) {
-            if (classOf(sig.params[i].type) != (args[i].type ? classOf(args[i].type) : Cls::Ref))
-                refuse("an argument of a different representation than the parameter");
-        }
+        for (std::uint32_t i = 0; i < argc; ++i)
+            coerceTo(args[i], sig.params[i].type);
         {
             const std::size_t before = scope_->held.size();
             for (std::int32_t owned : ownedOf(args))
@@ -2232,26 +2939,12 @@ private:
         std::vector<std::int32_t> extra;
         if (dlg.own == Own::Owned)
             extra.push_back(dlg.vreg);
-        for (Entry& arg : args) {
-            call.args.push_back(reg(arg));
-            if (arg.own == Own::Owned && !arg.isConst)
-                extra.push_back(call.args.back());
-        }
-        call.exit = makeExit(0, extra);
-        call.site = site();
-        call.publishFrame = true;
+        pushCallArgs(call, args, false, extra);
         const Cls ret = sig.returnType ? classOf(sig.returnType) : Cls::Void;
-        if (ret != Cls::Void)
-            call.result = fn_.newVreg(isFpClass(ret));
-        const std::int32_t result = call.result;
-        emitCall(std::move(call));
-        release(dlg);
-        for (const Entry& arg : args)
-            release(arg);
-        if (ret == Cls::Ref)
-            push(refEntry(result, sig.returnType, Own::Owned));
-        else if (ret != Cls::Void)
-            push(valueEntry(result, sig.returnType));
+        // The delegate's count ends with the call, after the result is safe on the stack.
+        const Entry self = dlg;
+        finishCall(std::move(call), args, extra, ret, sig.returnType);
+        release(self);
     }
 
     /// A value of static type `type` read from a `Box` in memory.
@@ -2276,6 +2969,7 @@ private:
         const Cls c = e.type ? classOf(e.type) : Cls::Ref;
         switch (c) {
             case Cls::Ref: return immReg(-1);  // the helper asks the cell
+            case Cls::Obj: return e.tagVreg;
             default: return immReg(std::int64_t(runtimeTag(baseKind(e.type))));
         }
     }
@@ -2370,9 +3064,14 @@ private:
                 // At entry a parameter's value moves into the box; a local gets its default.
                 const std::uint32_t paramBase = s.method->isStatic() ? 0u : 1u;
                 const bool isParam = slot >= paramBase && slot < paramBase + s.method->params.size();
-                std::int32_t tag = immReg(c == Cls::Ref ? -1 : std::int64_t(runtimeTag(baseKind(type))));
+                std::int32_t tag = immReg(c == Cls::Ref   ? -1
+                                          : c == Cls::Obj ? std::int64_t(Type::Null)
+                                                          : std::int64_t(runtimeTag(baseKind(type))));
                 std::int32_t payload;
-                if (isParam && !boxSeen_[slot]) {
+                if (isParam && !boxSeen_[slot] && c == Cls::Obj) {
+                    tag = s.localTag[slot];
+                    payload = s.localVreg[slot];
+                } else if (isParam && !boxSeen_[slot]) {
                     if (isFpClass(c)) {
                         payload = fn_.newVreg(false);
                         IrInst& in = inst(IrOp::FpToBits);
@@ -2391,11 +3090,9 @@ private:
                 if (isParam && !boxOwned_[slot]) {
                     // The slot was the plain parameter; from here on it is the box.
                     boxOwned_[slot] = 1;
-                    if (s.localOwned[slot]) {
-                        IrInst& dec = inst(IrOp::DecRef);
-                        dec.a = s.localVreg[slot];
-                        dec.isNullable = true;
-                    }
+                    if (s.localOwned[slot])
+                        decRefOf(s.localVreg[slot], s.localTag[slot], true);
+                    s.localTag[slot] = -1;
                     s.localVreg[slot] = fn_.newVreg(false);
                     IrInst& init = inst(IrOp::MovImm);
                     init.d = s.localVreg[slot];
@@ -2453,6 +3150,13 @@ private:
                 } else {
                     Entry value = pop();
                     storeValueTo(base, 0, type, value);
+                    // A static a program never initialized has no tag yet, unlike the fields of an instance.
+                    if (classOf(type) != Cls::Ref && classOf(type) != Cls::Obj) {
+                        IrInst& tag = inst(IrOp::StoreTag);
+                        tag.a = base;
+                        tag.tag = runtimeTag(baseKind(type));
+                        tag.imm = 0;
+                    }
                 }
                 return;
             }
@@ -2498,6 +3202,10 @@ private:
                 if (c == Cls::Ref) {
                     push(constInt(0, type));
                     top().own = Own::Immortal;
+                } else if (c == Cls::Obj) {
+                    Entry e = refEntry(immReg(0), type, Own::Immortal);
+                    e.tagVreg = immReg(std::int64_t(Type::Null));
+                    push(e);
                 } else {
                     push(constInt(0, type));
                 }
@@ -2524,14 +3232,34 @@ private:
             case Op::Unbox:
             case Op::CastClass: {
                 const TypeInfo* to = typeRef(operands);
-                if (classOf(to) != Cls::Ref)
-                    refuse("unboxing to a primitive");
                 Entry e = pop();
                 secureWeak();
                 if (e.own == Own::Weak)
                     makeOwned(e);
-                const std::int32_t source = reg(e);
-                callHelper(reinterpret_cast<void*>(&scriptJitCast), {rtReg(), source, ptrReg(to)}, false, ownedOf({e}));
+                coerceToObject(e, core_.objectType);
+                const Cls toClass = classOf(to);
+                extraTagged_ = taggedOf({e});
+                if (toClass == Cls::I32 || toClass == Cls::I64 || isFpClass(toClass)) {
+                    // Out of `object`: its tag says what it really is, and the conversion does the rest.
+                    std::int32_t bits = callHelper(reinterpret_cast<void*>(&scriptJitUnbox),
+                                                   {rtReg(), e.tagVreg, e.vreg, ptrReg(to)}, true);
+                    extraTagged_.clear();
+                    if (isFpClass(toClass)) {
+                        const std::int32_t d = fn_.newVreg(true);
+                        IrInst& in = inst(IrOp::BitsToFp);
+                        in.d = d;
+                        in.a = bits;
+                        in.width = toClass == Cls::F32 ? 32 : 64;
+                        bits = d;
+                    }
+                    release(e);
+                    push(valueEntry(bits, to));
+                    return;
+                }
+                callHelper(reinterpret_cast<void*>(&scriptJitCast), {rtReg(), e.tagVreg, e.vreg, ptrReg(to)}, false);
+                extraTagged_.clear();
+                if (toClass == Cls::Ref)
+                    e.tagVreg = -1;  // statically known from here on, and the same count
                 e.type = to;
                 push(e);
                 return;
@@ -2543,12 +3271,48 @@ private:
                 secureWeak();
                 if (e.own == Own::Weak)
                     makeOwned(e);
-                const std::int32_t source = reg(e);
+                coerceToObject(e, core_.objectType);
+                const std::int32_t source = e.vreg;
                 const std::int32_t yes = callPure(reinterpret_cast<void*>(&scriptJitIsInstance),
-                                                  {rtReg(), source, ptrReg(to)}, false);
+                                                  {rtReg(), e.tagVreg, source, ptrReg(to)}, false);
                 if (op == Op::IsInst) {
                     release(e);
                     push(valueEntry(yes, core_.boolType));
+                    return;
+                }
+                if (classOf(to) != Cls::Ref) {
+                    // `as` to an interface or a primitive: null or the same thing, tag included.
+                    const std::int32_t d = fn_.newVreg(false);
+                    const std::int32_t t = fn_.newVreg(false);
+                    const std::int32_t keep = newLabel();
+                    IrInst& movValue = inst(IrOp::Mov);
+                    movValue.d = d;
+                    movValue.a = source;
+                    IrInst& movTag = inst(IrOp::Mov);
+                    movTag.d = t;
+                    movTag.a = e.tagVreg;
+                    IrInst& test = inst(IrOp::BrCmp);
+                    test.a = yes;
+                    test.cond = IrCond::Ne;
+                    test.hasImm = true;
+                    test.imm = 0;
+                    test.width = 32;
+                    test.target = keep;
+                    if (e.own == Own::Owned)
+                        decRefOf(source, e.tagVreg, true);
+                    IrInst& zero = inst(IrOp::MovImm);
+                    zero.d = d;
+                    zero.imm = 0;
+                    IrInst& nullTag = inst(IrOp::MovImm);
+                    nullTag.d = t;
+                    nullTag.imm = std::int64_t(Type::Null);
+                    inst(IrOp::Label).imm = keep;
+                    Entry out = refEntry(d, classOf(to) == Cls::Obj ? to : core_.objectType,
+                                         e.own == Own::Owned ? Own::Owned : Own::Weak);
+                    out.tagVreg = t;
+                    if (e.own == Own::Local)
+                        makeOwned(out);
+                    push(out);
                     return;
                 }
                 // `as`: the value, or null.
@@ -2564,11 +3328,8 @@ private:
                 br.imm = 0;
                 br.width = 32;
                 br.target = done;
-                if (e.own == Own::Owned) {
-                    IrInst& dec = inst(IrOp::DecRef);
-                    dec.a = source;
-                    dec.isNullable = true;
-                }
+                if (e.own == Own::Owned)
+                    decRefOf(source, e.tagVreg, true);
                 IrInst& zero = inst(IrOp::MovImm);
                 zero.d = d;
                 zero.imm = 0;
@@ -2603,6 +3364,7 @@ private:
             case Op::ConvR8Un: convertFp(op); return;
             case Op::ConvBool: {
                 Entry a = pop();
+                requireNumber(a);
                 if (a.isConst) {
                     push(constInt(a.imm != 0, core_.boolType));
                     return;
@@ -2663,6 +3425,7 @@ private:
             case Op::NegR8:
             case Op::NegR4: {
                 Entry a = pop();
+                requireNumber(a);
                 const Cls c = op == Op::NegR8 ? Cls::F64 : Cls::F32;
                 const std::int32_t ra = reg(a);
                 const std::int32_t d = fn_.newVreg(true);
@@ -2677,6 +3440,8 @@ private:
             case Op::RemR4: {
                 Entry b = pop();
                 Entry a = pop();
+                requireNumber(a);
+                requireNumber(b);
                 const std::int32_t ra = reg(a);
                 const std::int32_t rb = reg(b);
                 void* helper = op == Op::RemR8 ? reinterpret_cast<void*>(&scriptJitFmod)
@@ -2766,6 +3531,7 @@ private:
             }
             case Op::LogicalNot: {
                 Entry a = pop();
+                requireNumber(a);
                 if (a.isConst) {
                     push(constInt(a.imm == 0, core_.boolType));
                     return;
@@ -2787,7 +3553,7 @@ private:
                     push(constInt(a.imm == 0, core_.boolType));
                     return;
                 }
-                if (a.type && classOf(a.type) != Cls::Ref) {
+                if (a.type && classOf(a.type) != Cls::Ref && classOf(a.type) != Cls::Obj) {
                     // A primitive headed for a null test is never null.
                     push(constInt(0, core_.boolType));
                     return;
@@ -2795,11 +3561,11 @@ private:
                 const std::int32_t d = fn_.newVreg(false);
                 IrInst& in = inst(IrOp::Cset);
                 in.d = d;
-                in.a = a.vreg;
+                in.a = a.tagVreg >= 0 ? a.tagVreg : a.vreg;
                 in.hasImm = true;
-                in.imm = 0;
+                in.imm = a.tagVreg >= 0 ? std::int64_t(Type::Null) : 0;
                 in.cond = IrCond::Eq;
-                in.width = 64;
+                in.width = a.tagVreg >= 0 ? 32 : 64;
                 release(a);
                 push(valueEntry(d, core_.boolType));
                 return;
@@ -2822,8 +3588,10 @@ private:
                     args.push_back(tagOfEntry(part));
                     args.push_back(payloadOfEntry(part));
                 }
+                extraTagged_ = taggedOf(parts);
                 const std::int32_t s = callHelper(reinterpret_cast<void*>(&scriptJitConcat), std::move(args), true,
                                                   ownedOf(parts));
+                extraTagged_.clear();
                 for (const Entry& part : parts)
                     release(part);
                 push(refEntry(s, core_.stringType, Own::Owned, true));
@@ -2837,10 +3605,12 @@ private:
                     makeOwned(a);
                 const std::int32_t tag = tagOfEntry(a);
                 const std::int32_t payload = payloadOfEntry(a);
+                extraTagged_ = taggedOf({a});
                 const std::int32_t s =
                     callHelper(op == Op::ToStr ? reinterpret_cast<void*>(&scriptJitToString)
                                                : reinterpret_cast<void*>(&scriptJitToStringUnsigned),
                                {rtReg(), tag, payload}, true, ownedOf({a}));
+                extraTagged_.clear();
                 release(a);
                 push(refEntry(s, core_.stringType, Own::Owned, true));
                 return;
@@ -2865,13 +3635,12 @@ private:
     {
         const Cls ca = a.type ? classOf(a.type) : Cls::Ref;
         const Cls cb = b.type ? classOf(b.type) : Cls::Ref;
-        if (ca != Cls::Ref || cb != Cls::Ref)
-            refuse("comparing a primitive as a reference");
         std::int32_t d;
-        if (baseKind(a.type) == TypeKind::String || baseKind(b.type) == TypeKind::Interface ||
-            baseKind(a.type) == TypeKind::Interface) {
-            const std::int32_t ra = reg(a), rb = reg(b);
-            d = callPure(reinterpret_cast<void*>(&scriptJitRefEquals), {ra, rb}, false);
+        if (ca != Cls::Ref || cb != Cls::Ref || baseKind(a.type) == TypeKind::String) {
+            // Anything that may be a string or a primitive compares as a value.
+            const std::int32_t tagA = tagOfEntry(a), bitsA = payloadOfEntry(a);
+            const std::int32_t tagB = tagOfEntry(b), bitsB = payloadOfEntry(b);
+            d = callPure(reinterpret_cast<void*>(&scriptJitValueEquals), {tagA, bitsA, tagB, bitsB}, false);
             if (!wantEqual) {
                 const std::int32_t inverted = fn_.newVreg(false);
                 IrInst& in = inst(IrOp::Xor);
@@ -2913,7 +3682,7 @@ private:
     void storeBox(std::int32_t box, const TypeInfo* type, Entry value)
     {
         const Cls c = classOf(type);
-        if (c != Cls::Ref) {
+        if (c != Cls::Ref && c != Cls::Obj) {
             const std::int32_t v = reg(value);
             // The box was made with the tag its slot holds, so the payload is all that changes.
             IrInst& store = inst(IrOp::Store);
@@ -2952,6 +3721,15 @@ private:
     bool isThisAssigned_ = false;
     std::size_t inlinedBytes_ = 0;
     BoundsFact lastBounds_;
+    std::vector<std::pair<std::int32_t, std::int32_t>> taggedNow_;   ///< what `ownedNow` found that has a tag
+    std::vector<std::pair<std::int32_t, std::int32_t>> extraTagged_;  ///< popped, tagged, and still holding a count
+    std::int32_t pendingIndex_ = -1;  ///< the index a bounds failure reports
+    std::int32_t exceptionVreg_ = -1;  ///< what a `throw;` raises again; holds a count
+    std::vector<std::function<void()>> deferred_;  ///< code laid out after the body
+    std::map<std::vector<const Handler*>, std::int32_t> landings_;
+    std::map<const Handler*, std::int32_t> continuation_;
+    std::map<const Handler*, std::vector<std::int32_t>> finallyExits_;
+    std::set<const Handler*> finallyEnded_;
     std::unordered_map<std::uint32_t, std::uint8_t> boxSeen_;
     std::unordered_map<std::uint32_t, std::uint8_t> boxOwned_;
 };

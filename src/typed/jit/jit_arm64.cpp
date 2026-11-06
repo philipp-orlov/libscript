@@ -16,6 +16,7 @@
 // A method that raises records the error in the runtime and returns; its caller checks after the call. Nothing unwinds.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -29,178 +30,6 @@
 namespace script {
 namespace internal {
 namespace typed {
-
-#if defined(SCRIPT_ARCH_ARM64)
-
-// The stubs. `saved` in the bridge is x0-x7 then d0-d7. A jump back out needs x14 and x15 as they came.
-__asm__(R"ASM(
-    .text
-    .p2align 2
-    .globl scriptJitLazyStub
-    .type scriptJitLazyStub, %function
-scriptJitLazyStub:
-    mov x17, #0
-    b 1f
-    .globl scriptJitLazyDelegateStub
-    .type scriptJitLazyDelegateStub, %function
-scriptJitLazyDelegateStub:
-    mov x17, x14
-1:
-    stp x29, x30, [sp, #-176]!
-    mov x29, sp
-    stp x0, x1, [sp, #16]
-    stp x2, x3, [sp, #32]
-    stp x4, x5, [sp, #48]
-    stp x6, x7, [sp, #64]
-    stp d0, d1, [sp, #80]
-    stp d2, d3, [sp, #96]
-    stp d4, d5, [sp, #112]
-    stp d6, d7, [sp, #128]
-    stp x14, x15, [sp, #144]
-    mov x0, x20
-    mov x1, x15
-    add x2, sp, #16
-    add x3, sp, #176
-    mov x4, x17
-    mov x5, x29
-    bl scriptJitBridge
-    mov x16, x0
-    ldp x0, x1, [sp, #16]
-    ldp x2, x3, [sp, #32]
-    ldp x4, x5, [sp, #48]
-    ldp x6, x7, [sp, #64]
-    ldp d0, d1, [sp, #80]
-    ldp d2, d3, [sp, #96]
-    ldp d4, d5, [sp, #112]
-    ldp d6, d7, [sp, #128]
-    ldp x14, x15, [sp, #144]
-    ldp x29, x30, [sp], #176
-    cbz x16, 2f
-    br x16
-2:
-    ret
-    .size scriptJitLazyDelegateStub, .-scriptJitLazyDelegateStub
-
-    // Everything a C call would clobber, kept: x0-x15, d0-d7 and d16-d29. Used by the next two.
-    .macro SAVE_ALL
-    stp x29, x30, [sp, #-336]!
-    mov x29, sp
-    stp x0, x1, [sp, #16]
-    stp x2, x3, [sp, #32]
-    stp x4, x5, [sp, #48]
-    stp x6, x7, [sp, #64]
-    stp x8, x9, [sp, #80]
-    stp x10, x11, [sp, #96]
-    stp x12, x13, [sp, #112]
-    stp x14, x15, [sp, #128]
-    stp d0, d1, [sp, #144]
-    stp d2, d3, [sp, #160]
-    stp d4, d5, [sp, #176]
-    stp d6, d7, [sp, #192]
-    stp d16, d17, [sp, #208]
-    stp d18, d19, [sp, #224]
-    stp d20, d21, [sp, #240]
-    stp d22, d23, [sp, #256]
-    stp d24, d25, [sp, #272]
-    stp d26, d27, [sp, #288]
-    stp d28, d29, [sp, #304]
-    .endm
-    .macro RESTORE_ALL
-    ldp x0, x1, [sp, #16]
-    ldp x2, x3, [sp, #32]
-    ldp x4, x5, [sp, #48]
-    ldp x6, x7, [sp, #64]
-    ldp x8, x9, [sp, #80]
-    ldp x10, x11, [sp, #96]
-    ldp x12, x13, [sp, #112]
-    ldp x14, x15, [sp, #128]
-    ldp d0, d1, [sp, #144]
-    ldp d2, d3, [sp, #160]
-    ldp d4, d5, [sp, #176]
-    ldp d6, d7, [sp, #192]
-    ldp d16, d17, [sp, #208]
-    ldp d18, d19, [sp, #224]
-    ldp d20, d21, [sp, #240]
-    ldp d22, d23, [sp, #256]
-    ldp d24, d25, [sp, #272]
-    ldp d26, d27, [sp, #288]
-    ldp d28, d29, [sp, #304]
-    ldp x29, x30, [sp], #336
-    .endm
-
-    // x16: a cell whose count reached zero.
-    .p2align 2
-    .globl scriptJitDecRefStub
-    .type scriptJitDecRefStub, %function
-scriptJitDecRefStub:
-    SAVE_ALL
-    mov x0, x16
-    bl _ZN6script6detail19destroyUnreferencedEPNS0_8GCObjectE
-    RESTORE_ALL
-    ret
-    .size scriptJitDecRefStub, .-scriptJitDecRefStub
-
-    // Answers in x16: nonzero means stop.
-    .p2align 2
-    .globl scriptJitPollStub
-    .type scriptJitPollStub, %function
-scriptJitPollStub:
-    SAVE_ALL
-    mov x0, x20
-    bl scriptJitPoll
-    mov x16, x0
-    RESTORE_ALL
-    ret
-    .size scriptJitPollStub, .-scriptJitPollStub
-
-    // void scriptJitEnter(rt, entry, ints, fps, stackArgs, stackCount, delegate, intResult, fpResult)
-    .p2align 2
-    .globl scriptJitEnter
-    .type scriptJitEnter, %function
-scriptJitEnter:
-    stp x29, x30, [sp, #-48]!
-    mov x29, sp
-    stp x20, x21, [sp, #16]
-    str x22, [sp, #32]
-    ldr x22, [x29, #48]
-    mov x21, x7
-    mov x20, x0
-    mov x16, x1
-    mov x14, x6
-    mov x9, x2
-    mov x10, x3
-    add x11, x5, #1
-    and x11, x11, #-2
-    sub sp, sp, x11, lsl #3
-    mov x12, #0
-3:
-    cmp x12, x5
-    b.hs 4f
-    ldr x13, [x4, x12, lsl #3]
-    str x13, [sp, x12, lsl #3]
-    add x12, x12, #1
-    b 3b
-4:
-    ldp x0, x1, [x9]
-    ldp x2, x3, [x9, #16]
-    ldp x4, x5, [x9, #32]
-    ldp x6, x7, [x9, #48]
-    ldp d0, d1, [x10]
-    ldp d2, d3, [x10, #16]
-    ldp d4, d5, [x10, #32]
-    ldp d6, d7, [x10, #48]
-    blr x16
-    str x0, [x21]
-    str d0, [x22]
-    mov sp, x29
-    ldp x20, x21, [sp, #16]
-    ldr x22, [sp, #32]
-    ldp x29, x30, [sp], #48
-    ret
-    .size scriptJitEnter, .-scriptJitEnter
-)ASM");
-
-#endif
 
 namespace {
 
@@ -502,6 +331,26 @@ std::int32_t encodeLogicalImm(std::uint64_t value, bool wide) noexcept
     return std::int32_t((n << 12) | (immr << 6) | imms);
 }
 
+/// The eight bits `fmov` can carry for this constant, or -1. Most literals in real code fit: 0.5, 1, 2, 4, 10.
+std::int32_t fmovImm8(std::uint64_t bits, bool isDouble) noexcept
+{
+    if (isDouble) {
+        if (bits & 0xFFFFFFFFFFFFull)
+            return -1;
+        const std::uint32_t exp = std::uint32_t((bits >> 54) & 0x1FF);
+        if (exp != 0x100 && exp != 0xFF)
+            return -1;
+        return std::int32_t(((bits >> 56) & 0x80) | ((bits >> 48) & 0x7F));
+    }
+    const std::uint32_t f = std::uint32_t(bits);
+    if (f & 0x7FFFF)
+        return -1;
+    const std::uint32_t exp = (f >> 25) & 0x3F;
+    if (exp != 0x20 && exp != 0x1F)
+        return -1;
+    return std::int32_t(((f >> 24) & 0x80) | ((f >> 19) & 0x7F));
+}
+
 Cond condOf(IrCond c) noexcept
 {
     switch (c) {
@@ -599,6 +448,7 @@ private:
         std::size_t branch;
         Reg cell;
         std::size_t back;
+        std::int32_t site;  ///< index of the instruction, for what is live there
     };
     struct ColdPoll
     {
@@ -635,6 +485,8 @@ private:
         at += 16;  // x29, x30
         frameBytes_ = (at + 15u) & ~15u;
         hasFrame_ = fn_.makesCalls || hasDecOrPoll || at > 16 || stackWords(fn_.params) > 0;
+        for (const IrExit& exit : fn_.exits)
+            hasFrame_ = hasFrame_ || exit.handlerLabel >= 0;
     }
 
     std::uint32_t stackWords(const std::vector<std::int32_t>& values) const
@@ -667,7 +519,13 @@ private:
             needsOverflowPad_ = true;
         }
         a_.subImm(Reg(31), Reg(31), frameBytes_, true);
-        a_.stpX(X29, X30, Reg(31), std::int32_t(frameBytes_ - 16));
+        // `stp` reaches only 504 bytes.
+        if (frameBytes_ - 16 <= 504) {
+            a_.stpX(X29, X30, Reg(31), std::int32_t(frameBytes_ - 16));
+        } else {
+            a_.strX(X29, Reg(31), frameBytes_ - 16);
+            a_.strX(X30, Reg(31), frameBytes_ - 8);
+        }
         a_.addImm(X29, Reg(31), frameBytes_ - 16, true);
         std::uint32_t at = saveBase_;
         for (Reg r : savedInt_) {
@@ -695,7 +553,12 @@ private:
             a_.ldrD(r, Reg(31), at);
             at += 8;
         }
-        a_.ldpX(X29, X30, Reg(31), std::int32_t(frameBytes_ - 16));
+        if (frameBytes_ - 16 <= 504) {
+            a_.ldpX(X29, X30, Reg(31), std::int32_t(frameBytes_ - 16));
+        } else {
+            a_.ldrX(X29, Reg(31), frameBytes_ - 16);
+            a_.ldrX(X30, Reg(31), frameBytes_ - 8);
+        }
         a_.addImm(Reg(31), Reg(31), frameBytes_, true);
         a_.ret();
     }
@@ -958,9 +821,7 @@ private:
     {
         for (const ColdDecRef& cold : coldDecRefs_) {
             a_.patch(cold.branch, a_.here());
-            a_.movReg(X16, cold.cell);
-            moveImm(X17, reinterpret_cast<std::uint64_t>(&scriptJitDecRefStub));
-            a_.blr(X17);
+            emitReleaseCall(cold);
             a_.patch(a_.b(), cold.back);
         }
         for (const ColdPoll& cold : coldPolls_) {
@@ -979,6 +840,49 @@ private:
             a_.patch(overflowBranch_, a_.here());
             emitFramelessRaise(std::uint32_t(ErrorCode::StackOverflow));
         }
+    }
+
+    /// Destroy a cell from a cold path, keeping exactly the caller-saved registers that are live here.
+    void emitReleaseCall(const ColdDecRef& cold)
+    {
+        const IrFunction::LiveRegs& live = fn_.liveAtRelease[std::size_t(cold.site)];
+        std::vector<std::uint32_t> ints, fps;
+        for (std::uint32_t r = 0; r < 16; ++r) {
+            if ((live.ints >> r) & 1u)
+                ints.push_back(r);
+        }
+        for (std::uint32_t r = 0; r < 30; ++r) {
+            if ((live.fps >> r) & 1u)
+                fps.push_back(r);
+        }
+        const std::uint32_t bytes = std::uint32_t((ints.size() + fps.size() + 1) & ~std::size_t(1)) * 8;
+        if (cold.cell != X0)
+            a_.movReg(X16, cold.cell);
+        if (bytes)
+            a_.subImm(Reg(31), Reg(31), bytes, true);
+        std::uint32_t at = 0;
+        for (std::uint32_t r : ints) {
+            a_.strX(Reg(r), Reg(31), at);
+            at += 8;
+        }
+        for (std::uint32_t r : fps) {
+            a_.strD(r, Reg(31), at);
+            at += 8;
+        }
+        if (cold.cell != X0)
+            a_.movReg(X0, X16);
+        callAbsolute(reinterpret_cast<const void*>(&detail::destroyUnreferenced));
+        at = 0;
+        for (std::uint32_t r : ints) {
+            a_.ldrX(Reg(r), Reg(31), at);
+            at += 8;
+        }
+        for (std::uint32_t r : fps) {
+            a_.ldrD(r, Reg(31), at);
+            at += 8;
+        }
+        if (bytes)
+            a_.addImm(Reg(31), Reg(31), bytes, true);
     }
 
     void emitFramelessRaise(std::uint32_t code)
@@ -1003,6 +907,23 @@ private:
             emitFramelessRaise(exit.code);
             return;
         }
+        for (const IrExit::WriteBack& back : exit.writeBacks) {
+            const Reg base = use(back.base, X16);
+            const std::size_t skip = a_.cbzX(base);
+            std::int64_t offset = back.offset;
+            const Reg address = displaced(base, offset, back.width, X16);
+            if (fn_.vregIsFp[std::size_t(back.vreg)]) {
+                const std::uint32_t v = useFp(back.vreg, kFpScratchA);
+                if (back.width == 4)
+                    a_.strS(v, address, std::uint32_t(offset));
+                else
+                    a_.strD(v, address, std::uint32_t(offset));
+            } else {
+                const Reg v = use(back.vreg, X17);
+                a_.storeMem(v, address, std::uint32_t(offset), back.width);
+            }
+            a_.patch(skip, a_.here());
+        }
         // Parked first: raising clobbers what is in a caller-saved register.
         std::uint32_t parked = 0;
         for (std::int32_t v : exit.cleanup) {
@@ -1012,12 +933,29 @@ private:
             a_.strX(r, Reg(31), parked * 8);
             ++parked;
         }
+        for (const auto& tagged : exit.cleanupTagged) {
+            if (isUnused(tagged.first) || isUnused(tagged.second))
+                continue;
+            // Only a tag that says reference makes the payload a cell.
+            const Reg t = use(tagged.second, X17);
+            const Reg r = use(tagged.first, X16);
+            a_.cmpImm(t, std::uint32_t(Type::String), false);
+            a_.word(0x9A800000u | (XZR << 16) | (std::uint32_t(HS) << 12) | (r << 5) | X16);  // csel x16, r, xzr, hs
+            a_.strX(X16, Reg(31), parked * 8);
+            ++parked;
+        }
+        if (exit.indexVreg >= 0 && exit.code)
+            a_.movW(X2, use(exit.indexVreg, X2));
         if (exit.code)
             raiseHere(exit.code, exit.site);
         if (parked) {
             a_.movSp(X0, Reg(31));
             moveImm(X1, parked);
             callAbsolute(reinterpret_cast<const void*>(&scriptJitCleanup));
+        }
+        if (exit.handlerLabel >= 0) {
+            branchToLabel(a_.b(), exit.handlerLabel);
+            return;
         }
         emitEpilogue();
     }
@@ -1036,6 +974,13 @@ private:
                 emitPrologue(false);
             }
             a_.movReg(X17, X0);
+            for (std::int32_t zero : fn_.osrZero) {
+                if (isUnused(zero))
+                    continue;
+                const Reg d = def(zero, X16);
+                moveImm(d, 0);
+                commit(zero, d);
+            }
             for (const IrOsrEntry::Slot& slot : entry.slots) {
                 if (isUnused(slot.vreg))
                     continue;
@@ -1054,6 +999,11 @@ private:
                     else
                         a_.ldrX(d, X17, offset);
                     commit(slot.vreg, d);
+                }
+                if (slot.tagVreg >= 0 && !isUnused(slot.tagVreg)) {
+                    const Reg d = def(slot.tagVreg, X16);
+                    a_.loadMem(d, X17, slot.slot * 16, 1, false);
+                    commit(slot.tagVreg, d);
                 }
                 if (slot.owned)
                     out.owned.push_back(slot.slot);
@@ -1130,7 +1080,7 @@ private:
                 case IrOp::Add:
                 case IrOp::Sub: {
                     const bool add = (in.op == IrOp::Add) == (imm >= 0);
-                    const std::uint64_t magnitude = imm >= 0 ? std::uint64_t(imm) : std::uint64_t(-imm);
+                    const std::uint64_t magnitude = imm >= 0 ? std::uint64_t(imm) : std::uint64_t(0) - std::uint64_t(imm);
                     if (magnitude < 4096) {
                         if (add)
                             a_.addImm(d, a, std::uint32_t(magnitude), wide);
@@ -1195,11 +1145,63 @@ private:
         }
     }
 
+    /// A signed 32-bit division by a constant of at least 2, as a multiplication: Hacker's Delight, figure 10-1.
+    void divideByConstant(Reg q, Reg a, std::int32_t divisor)
+    {
+        const std::uint32_t two31 = 0x80000000u;
+        const std::uint32_t ad = std::uint32_t(divisor);
+        const std::uint32_t anc = two31 - 1 - two31 % ad;
+        int p = 31;
+        std::uint32_t q1 = two31 / anc, r1 = two31 - q1 * anc;
+        std::uint32_t q2 = two31 / ad, r2 = two31 - q2 * ad;
+        std::uint32_t delta = 0;
+        do {
+            ++p;
+            q1 *= 2;
+            r1 *= 2;
+            if (r1 >= anc) {
+                ++q1;
+                r1 -= anc;
+            }
+            q2 *= 2;
+            r2 *= 2;
+            if (r2 >= ad) {
+                ++q2;
+                r2 -= ad;
+            }
+            delta = ad - r2;
+        } while (q1 < delta || (q1 == delta && r1 == 0));
+        const std::int32_t magic = std::int32_t(q2 + 1);
+        const std::uint32_t shift = std::uint32_t(p - 32);
+
+        moveImm(X17, std::uint64_t(std::uint32_t(magic)));
+        a_.word(0x9B207C00u | (X17 << 16) | (a << 5) | q);  // smull xq, wa, w17
+        a_.asrImm(q, q, 32, true);
+        if (magic < 0)
+            a_.addW(q, q, a);
+        if (shift)
+            a_.asrImm(q, q, shift, false);
+        a_.word(0x0B400000u | (q << 16) | (31u << 10) | (q << 5) | q);  // add wq, wq, wq, lsr #31
+    }
+
     void divideOrRemainder(const IrInst& in)
     {
         const bool wide = in.width == 64;
         const bool isSigned = in.op == IrOp::SDiv || in.op == IrOp::SRem;
         const bool isRem = in.op == IrOp::SRem || in.op == IrOp::URem;
+        if (in.hasImm && !wide && isSigned && in.imm >= 2 && in.imm <= 0x7FFFFFFF) {
+            const Reg a = use(in.a, X15);
+            const Reg d = def(in.d, X14);
+            divideByConstant(X16, a, std::int32_t(in.imm));
+            if (isRem) {
+                moveImm(X17, std::uint64_t(in.imm));
+                a_.msubW(d, X16, X17, a);
+            } else {
+                a_.movW(d, X16);
+            }
+            commit(in.d, d);
+            return;
+        }
         const Reg a = use(in.a, X15);
         Reg b = X14;
         if (in.hasImm)
@@ -1369,7 +1371,22 @@ private:
             a_.ldrW(X16, kRt, offsets_.nativeError);
             branchToExit(a_.cbnzW(X16), call.exit);
         }
-        if (call.result >= 0 && !isUnused(call.result)) {
+        if (call.resultTag >= 0) {
+            std::vector<Move> results;
+            if (!isUnused(call.result)) {
+                Move m;
+                m.from.reg = X0;
+                m.to = placeOf(call.result);
+                results.push_back(m);
+            }
+            if (!isUnused(call.resultTag)) {
+                Move m;
+                m.from.reg = X1;
+                m.to = placeOf(call.resultTag);
+                results.push_back(m);
+            }
+            parallelMoves(std::move(results), false);
+        } else if (call.result >= 0 && !isUnused(call.result)) {
             if (fn_.vregIsFp[std::size_t(call.result)]) {
                 const Place to = placeOf(call.result);
                 if (to.isMem)
@@ -1417,12 +1434,23 @@ private:
                 commit(in.d, d);
                 return;
             }
+            case IrOp::MovRuntime: {
+                if (isUnused(in.d))
+                    return;
+                const Reg d = def(in.d, X16);
+                a_.movReg(d, kRt);
+                commit(in.d, d);
+                return;
+            }
             case IrOp::FMovImm: {
                 if (isUnused(in.d))
                     return;
                 const std::uint32_t d = defFp(in.d, kFpScratchA);
+                const std::int32_t small = fmovImm8(std::uint64_t(in.imm), in.width == 64);
                 if (in.imm == 0) {
                     a_.fmovDX(d, XZR);
+                } else if (small >= 0) {
+                    a_.word((in.width == 64 ? 0x1E601000u : 0x1E201000u) | (std::uint32_t(small) << 13) | d);
                 } else if (in.width == 32) {
                     moveImm(X16, std::uint64_t(std::uint32_t(in.imm)));
                     a_.fmovSW(d, X16);
@@ -1629,10 +1657,11 @@ private:
                 const Reg base = use(in.a, X15);
                 moveImm(X16, std::uint64_t(std::uint32_t(in.tag)));
                 if (in.c >= 0) {
+                    // Whether the reference is null decides between the tag and Null: `csinc` makes the 1 that Null is.
+                    static_assert(std::uint32_t(Type::Null) == 1, "csinc below");
                     const Reg c = use(in.c, X14);
                     a_.cmpImm(c, 0, true);
-                    moveImm(X17, std::uint64_t(std::uint32_t(Type::Null)));
-                    a_.cselW(X16, X16, X17, NE);
+                    a_.word(0x1A9F0400u | (X16 << 5) | (std::uint32_t(NE) << 12) | X16);  // csinc w16, w16, wzr, ne
                 }
                 a_.strB(X16, base, std::uint32_t(in.imm));
                 return;
@@ -1659,9 +1688,53 @@ private:
                 a_.strW(X16, a, std::uint32_t(kCellRefCountOffset));
                 const std::size_t cold = a_.bcond(EQ);
                 // A spilled cell was loaded into x17, which the cold path overwrites only after copying it.
-                coldDecRefs_.push_back({cold, a, a_.here()});
+                coldDecRefs_.push_back({cold, a, a_.here(), std::int32_t(in.target)});
                 if (in.isNullable)
                     a_.patch(skip, a_.here());
+                return;
+            }
+            case IrOp::IncRefTagged: {
+                const Reg t = use(in.b, X16);
+                a_.cmpImm(t, std::uint32_t(Type::String), false);
+                const std::size_t notCell = a_.bcond(LO);
+                const Reg a = use(in.a, X17);
+                std::size_t skip = 0;
+                if (in.isNullable)
+                    skip = a_.cbzX(a);
+                a_.ldrW(X16, a, std::uint32_t(kCellRefCountOffset));
+                a_.addImm(X16, X16, 1, false);
+                a_.strW(X16, a, std::uint32_t(kCellRefCountOffset));
+                if (in.isNullable)
+                    a_.patch(skip, a_.here());
+                a_.patch(notCell, a_.here());
+                return;
+            }
+            case IrOp::DecRefTagged: {
+                const Reg t = use(in.b, X16);
+                a_.cmpImm(t, std::uint32_t(Type::String), false);
+                const std::size_t notCell = a_.bcond(LO);
+                const Reg a = use(in.a, X17);
+                std::size_t skip = 0;
+                if (in.isNullable)
+                    skip = a_.cbzX(a);
+                a_.ldrW(X16, a, std::uint32_t(kCellRefCountOffset));
+                a_.subsImm(X16, X16, 1, false);
+                a_.strW(X16, a, std::uint32_t(kCellRefCountOffset));
+                const std::size_t cold = a_.bcond(EQ);
+                coldDecRefs_.push_back({cold, a, a_.here(), std::int32_t(in.target)});
+                if (in.isNullable)
+                    a_.patch(skip, a_.here());
+                a_.patch(notCell, a_.here());
+                return;
+            }
+            case IrOp::TagOfNullable: {
+                const Reg d = def(in.d, X16);
+                const Reg a = use(in.a, X17);
+                moveImm(X15, std::uint64_t(std::uint32_t(in.tag)));
+                a_.cmpImm(a, 0, true);
+                static_assert(std::uint32_t(Type::Null) == 1, "csinc below");
+                a_.word(0x1A9F0400u | (X15 << 5) | (std::uint32_t(NE) << 12) | d);  // csinc wd, w15, wzr, ne
+                commit(in.d, d);
                 return;
             }
             case IrOp::Poll: {
@@ -1672,7 +1745,18 @@ private:
             }
             case IrOp::Call: emitCall(fn_.calls[std::size_t(in.imm)]); return;
             case IrOp::Ret:
-                if (in.a >= 0) {
+                if (in.b >= 0) {
+                    std::vector<Move> results;
+                    Move payload;
+                    payload.from = placeOf(in.a);
+                    payload.to.reg = X0;
+                    results.push_back(payload);
+                    Move tag;
+                    tag.from = placeOf(in.b);
+                    tag.to.reg = X1;
+                    results.push_back(tag);
+                    parallelMoves(std::move(results), false);
+                } else if (in.a >= 0) {
                     if (fn_.vregIsFp[std::size_t(in.a)]) {
                         const std::uint32_t r = useFp(in.a, 0);
                         if (r != 0)
@@ -1783,6 +1867,14 @@ public:
             std::string why;
             if (!lowerMethod(rt, *method, unit->fn, true, &why)) {
                 method->hotness.store(MethodInfo::kNeverCompile, std::memory_order_relaxed);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+                if (const char* log = std::getenv("SCRIPT_JIT_LOG")) {
+                    if (std::FILE* out = std::fopen(log, "a")) {
+                        std::fprintf(out, "%s\n", why.c_str());
+                        std::fclose(out);
+                    }
+                }
+#endif
                 if (rt.ctx.options.jit.dumpCode)
                     rt.ctx.write(fromUtf8("jit: skipping " + method->qualifiedName() + ": " + why + "\n"), false);
                 if (method == &root) {
@@ -1812,6 +1904,7 @@ public:
 
         std::size_t total = 0;
         for (auto& unit : units) {
+            optimizeLoops(unit->fn);
             allocateRegisters(unit->fn, regs_);
             unit->emitter = std::make_unique<Emitter>(unit->fn, offsets, session);
             if (!unit->emitter->run()) {

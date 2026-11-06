@@ -137,9 +137,11 @@ set(SCRIPT_TYPED_SOURCES
     src/typed/module.cpp
     src/typed/jit/jit.cpp
     src/typed/jit/lower.cpp
+    src/typed/jit/optimize.cpp
     src/typed/jit/regalloc.cpp
     src/typed/jit/jit_runtime.cpp
     src/typed/jit/jit_arm64.cpp
+    src/typed/jit/jit_stubs_arm64.cpp
     src/typed/jit/jit_x64.cpp
     src/typed/builtins/core.cpp
     src/typed/builtins/string.cpp
@@ -216,6 +218,8 @@ endif()
 if(SCRIPT_ENGINE_DYNAMIC)
     list(APPEND SCRIPT_SOURCES ${SCRIPT_DYNAMIC_SOURCES})
 endif()
+
+set_source_files_properties(src/typed/jit/jit_stubs_arm64.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 
 # ---- the generated configuration header ---------------------------------------
 foreach(flag SCRIPT_LANG_CSHARP SCRIPT_LANG_TYPESCRIPT SCRIPT_LANG_JAVASCRIPT

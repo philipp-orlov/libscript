@@ -58,8 +58,6 @@ constexpr bool isDynamicCell(CellKind k) noexcept
 struct GCObject
 {
     std::uint32_t rc = 1;
-    CellKind kind = CellKind::Object;
-    std::uint8_t gcColor = 0;
     std::int32_t gcRef = 0;  ///< cycle collector scratch
     /// Pool slot size in bytes; 0 when the cell came from the general
     /// allocator. Cells with trailing storage can exceed the pool's largest
@@ -69,6 +67,10 @@ struct GCObject
     internal::ContextImpl* rt = nullptr;
     GCObject* gcNext = nullptr;
     GCObject* gcPrev = nullptr;
+    // Last and small on purpose: a derived class's first members move into the padding after these, which takes 8 bytes
+    // off a string, an instance and an array -- a good part of a small object.
+    CellKind kind = CellKind::Object;
+    std::uint8_t gcColor = 0;
 
     GCObject() = default;
     GCObject(const GCObject&) = delete;

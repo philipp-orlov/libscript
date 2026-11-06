@@ -20,7 +20,7 @@ struct NativeCode;
 
 /// Call a method compiled by the optimizing tier, from C++.
 Value invokeNativeCode(Runtime& rt, const MethodInfo* method, NativeCode* code, Value* args, std::uint32_t argc);
-Value nativeResultValue(const MethodInfo* method, std::uint64_t intResult, double fpResult);
+Value nativeResultValue(const MethodInfo* method, const std::uint64_t* intResults, double fpResult);
 /// At a loop head with an empty stack: carry on in native code, if there is an entry for here. True when the method has
 /// run to the end there, leaving its return value in `result`.
 bool tryOnStackReplacement(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result);

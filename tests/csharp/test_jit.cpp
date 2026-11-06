@@ -33,7 +33,9 @@ struct Pair
 
     static script::Context::Options plainOptions()
     {
-        return script::Context::Options{};
+        script::Context::Options options;
+        options.jit.mode = script::JitOptions::Mode::Off;
+        return options;
     }
     static script::Context::Options nativeOptions()
     {

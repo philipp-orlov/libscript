@@ -52,7 +52,6 @@ constexpr std::int64_t kRcOffset = offsetof(GCObject, rc);
 constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
 constexpr std::int64_t kStringCharsOffset = sizeof(StringCell);
 constexpr std::int64_t kIndexOffset = offsetof(DynObject, index);
-constexpr std::int64_t kPropSetterOffset = offsetof(Prop, setter);
 constexpr std::int64_t kPropValueOffset = offsetof(Prop, value);
 constexpr std::int64_t kPropKeyOffset = offsetof(Prop, key);
 constexpr std::int64_t kPropAttrsOffset = offsetof(Prop, attrs);
@@ -1506,8 +1505,6 @@ private:
                         store(props, at + kPropKeyOffset, k, 8);
                         store(props, at + kPropValueOffset, vt, 1);
                         store(props, at + kPropValueOffset + kPayload, vr, 8);
-                        store(props, at + kPropSetterOffset, immReg(std::int64_t(Type::Undefined)), 1);
-                        store(props, at + kPropSetterOffset + kPayload, immReg(0), 8);
                         store(props, at + kPropAttrsOffset, immReg(PropDefault), 1);
                         const std::int32_t end = fn_.newVreg(false);
                         IrInst& add = inst(IrOp::Add);
@@ -2432,10 +2429,6 @@ private:
         store(end, kPropKeyOffset, key, 8);
         store(end, kPropValueOffset, vt, 1);
         store(end, kPropValueOffset + kPayload, vr, 8);
-        const std::int32_t undefinedTag = immReg(std::int64_t(Type::Undefined));
-        const std::int32_t zero = immReg(0);
-        store(end, kPropSetterOffset, undefinedTag, 1);
-        store(end, kPropSetterOffset + kPayload, zero, 8);
         store(end, kPropAttrsOffset, immReg(PropDefault), 1);
         const std::int32_t next = fn_.newVreg(false);
         IrInst& add = inst(IrOp::Add);

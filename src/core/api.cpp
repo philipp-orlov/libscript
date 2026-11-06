@@ -900,10 +900,9 @@ void Value::defineAccessor(std::string_view key, const Value& getterFn, const Va
 #if SCRIPT_ENGINE_DYNAMIC
     ContextImpl& rt = need(*this, "defineAccessor");
     Guard guard(&rt);
-    dyn::Prop& p = needDynObject(*this, "defineAccessor")
-                       .putOwn(rt.intern(fromUtf8(key)), getterFn,
-                               std::uint8_t(std::uint8_t(flags) | dyn::PropAccessor));
-    p.setter = setterFn;
+    dyn::DynObject& object = needDynObject(*this, "defineAccessor");
+    dyn::Prop& p = object.putOwn(rt.intern(fromUtf8(key)), getterFn, std::uint8_t(std::uint8_t(flags) | dyn::PropAccessor));
+    object.setSetter(p, setterFn);
 #else
     (void)key;
     (void)getterFn;

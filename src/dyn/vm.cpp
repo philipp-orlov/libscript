@@ -427,8 +427,8 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
             // setter can take the write.
             for (DynObject* cursor = proto; cursor; cursor = cursor->proto.get()) {
                 if (const Prop* p = cursor->findOwn(key)) {
-                    if (p->accessor() && !p->setter.isUndefined()) {
-                        callValue(rt, p->setter, base, {v});
+                    if (p->accessor() && !cursor->setterOf(*p).isUndefined()) {
+                        callValue(rt, cursor->setterOf(*p), base, {v});
                         return;
                     }
                     break;
@@ -445,9 +445,10 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
         if (!p)
             continue;
         if (p->accessor()) {
-            if (p->setter.isUndefined())
+            const Value setter = cursor->setterOf(*p);
+            if (setter.isUndefined())
                 return;
-            callValue(rt, p->setter, base, {v});
+            callValue(rt, setter, base, {v});
             return;
         }
         if (cursor == obj) {
@@ -1286,7 +1287,7 @@ void defineMemberForNative(Runtime& rt, int mode, DynObject* target, GCObject* k
     if (mode == 1)
         existing->value = v;
     else
-        existing->setter = v;
+        target->setSetter(*existing, v);
 }
 
 DynArray* forInKeysForNative(Runtime& rt, const Value& src)
@@ -1746,7 +1747,7 @@ Value execute(Runtime& rt, Frame& frame)
                         if (op == Op::DefGetter)
                             existing->value = fn;
                         else
-                            existing->setter = fn;
+                            target->setSetter(*existing, fn);
                         break;
                     }
                     case Op::ObjectSpread: {

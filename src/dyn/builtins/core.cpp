@@ -217,7 +217,7 @@ void installObject(Runtime& rt)
         const Value setterFn = getProperty(rt2, desc, rt2.intern("set"));
         if (!getterFn.isUndefined() || !setterFn.isUndefined()) {
             Prop& p = self->putOwn(key.get(), getterFn, std::uint8_t(attrs | PropAccessor));
-            p.setter = setterFn;
+            self->setSetter(p, setterFn);
         } else {
             self->putOwn(key.get(), getProperty(rt2, desc, rt2.atom.value.get()), attrs);
         }
@@ -237,7 +237,7 @@ void installObject(Runtime& rt)
         Value result = detail::Access::adopt(Type::Object, out);
         if (p->accessor()) {
             out->putOwn(rt2.intern("get"), p->value);
-            out->putOwn(rt2.intern("set"), p->setter);
+            out->putOwn(rt2.intern("set"), self->setterOf(*p));
         } else {
             out->putOwn(rt2.atom.value.get(), p->value);
             out->putOwn(rt2.intern("writable"), Value((p->attrs & PropWritable) != 0));

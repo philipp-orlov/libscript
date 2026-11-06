@@ -319,6 +319,8 @@ DynObject* Runtime::newObject(DynObject* proto)
     return o;
 }
 
+static_assert(sizeof(DynObject) % alignof(Prop) == 0, "the properties in the cell follow the object directly");
+
 DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
 {
     // `newCell` and `setProto` by hand: this is how every object literal and every `new` starts, and a fresh object is
@@ -326,21 +328,14 @@ DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
     if (!proto)
         proto = objectProto.get();
     ctx.maybeCollect();
-    const std::size_t bytes = sizeof(DynObject);
-    const std::size_t table = std::size_t(room) * sizeof(Prop);
-    ctx.reserve(bytes + table);
+    // The first properties live in the cell itself: one allocation for the object and its table, while they fit.
+    const std::size_t bytes = sizeof(DynObject) + std::size_t(room) * sizeof(Prop);
+    ctx.reserve(bytes);
     auto* o = new (ctx.heap.allocate(bytes)) DynObject();
     o->cellBytes = std::uint32_t(bytes);
-    if (room) {
-        try {
-            o->props.reserve(room);
-        } catch (...) {
-            o->~DynObject();
-            ctx.heap.deallocate(o, bytes);
-            throw;
-        }
-    }
-    ctx.linkKnown(o, std::uint32_t(bytes + o->props.capacity() * sizeof(Prop)));
+    if (room)
+        o->props.adopt(reinterpret_cast<Prop*>(o + 1), room);
+    ctx.linkKnown(o, std::uint32_t(bytes));
     proto->isProto = true;
     o->proto.reset(proto);
     o->shape = rootShapeFor(proto);
@@ -464,7 +459,7 @@ void installMember(Runtime& rt, HostBinding& binding, const HostClassInfo::Membe
                                                           member.fn, 0),
                                      PropConfigurable | PropEnumerable | PropAccessor);
             if (member.setter)
-                p.setter = rt.makeFunction(ascii("set ") + fromUtf8(spec.name), member.setter, 1);
+                target->setSetter(p, rt.makeFunction(ascii("set ") + fromUtf8(spec.name), member.setter, 1));
             return;
         }
     }

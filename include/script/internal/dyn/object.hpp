@@ -36,7 +36,7 @@ enum PropAttr : std::uint8_t
     PropWritable = 1u << 0,
     PropEnumerable = 1u << 1,
     PropConfigurable = 1u << 2,
-    PropAccessor = 1u << 3,  ///< `value` holds the getter, `setter` the setter
+    PropAccessor = 1u << 3,  ///< `value` holds the getter; the setter is the object's `setterOf`
     PropDefault = PropWritable | PropEnumerable | PropConfigurable,
 };
 
@@ -46,10 +46,122 @@ struct Prop
 {
     Ref<GCObject> key;
     Value value = Value::undefined();
-    Value setter = Value::undefined();
     std::uint8_t attrs = PropDefault;
 
     bool accessor() const noexcept { return (attrs & PropAccessor) != 0; }
+};
+
+/// A property table: a vector's three pointers, which native code reads as one, over storage that may start out at the
+/// end of the object itself, so that a small object is a single allocation.
+class PropVec
+{
+public:
+    using value_type = Prop;
+    using iterator = Prop*;
+    using const_iterator = const Prop*;
+
+    PropVec() = default;
+    PropVec(const PropVec&) = delete;
+    PropVec& operator=(const PropVec&) = delete;
+    ~PropVec()
+    {
+        clear();
+        release();
+    }
+
+    /// Start out in `count` slots at `room`, which belong to the owner and are never freed from here.
+    void adopt(Prop* room, std::size_t count) noexcept
+    {
+        begin_ = end_ = inline_ = room;
+        cap_ = room + count;
+    }
+
+    Prop* begin() noexcept { return begin_; }
+    Prop* end() noexcept { return end_; }
+    const Prop* begin() const noexcept { return begin_; }
+    const Prop* end() const noexcept { return end_; }
+    Prop* data() noexcept { return begin_; }
+    const Prop* data() const noexcept { return begin_; }
+    std::size_t size() const noexcept { return std::size_t(end_ - begin_); }
+    std::size_t capacity() const noexcept { return std::size_t(cap_ - begin_); }
+    bool empty() const noexcept { return end_ == begin_; }
+    Prop& operator[](std::size_t i) noexcept { return begin_[i]; }
+    const Prop& operator[](std::size_t i) const noexcept { return begin_[i]; }
+    Prop& back() noexcept { return end_[-1]; }
+    const Prop& back() const noexcept { return end_[-1]; }
+    /// Slots allocated apart from the owner.
+    std::size_t heapCapacity() const noexcept { return begin_ != inline_ ? capacity() : 0; }
+
+    Prop& emplace_back()
+    {
+        if (end_ == cap_)
+            reallocate(size() < 2 ? 4 : size() * 2);
+        return *new (end_++) Prop();
+    }
+    void push_back(Prop&& p)
+    {
+        if (end_ == cap_)
+            reallocate(size() < 2 ? 4 : size() * 2);
+        new (end_++) Prop(std::move(p));
+    }
+    void push_back(const Prop& p)
+    {
+        Prop copy{p.key, p.value, p.attrs};
+        push_back(std::move(copy));
+    }
+    void reserve(std::size_t n)
+    {
+        if (n > capacity())
+            reallocate(n);
+    }
+    void shrink_to_fit()
+    {
+        if (begin_ == inline_ || end_ == cap_)
+            return;
+        if (empty()) {
+            release();
+            begin_ = end_ = cap_ = nullptr;
+            return;
+        }
+        reallocate(size());
+    }
+    Prop* erase(Prop* at)
+    {
+        for (Prop* p = at; p + 1 < end_; ++p)
+            *p = std::move(p[1]);
+        (--end_)->~Prop();
+        return at;
+    }
+    void clear() noexcept
+    {
+        while (end_ != begin_)
+            (--end_)->~Prop();
+    }
+
+private:
+    void reallocate(std::size_t n)
+    {
+        Prop* fresh = PoolAlloc<Prop>().allocate(n);
+        Prop* out = fresh;
+        for (Prop* p = begin_; p != end_; ++p, ++out) {
+            new (out) Prop(std::move(*p));
+            p->~Prop();
+        }
+        release();
+        begin_ = fresh;
+        end_ = out;
+        cap_ = fresh + n;
+    }
+    void release() noexcept
+    {
+        if (begin_ && begin_ != inline_)
+            PoolAlloc<Prop>().deallocate(begin_, capacity());
+    }
+
+    Prop* begin_ = nullptr;
+    Prop* end_ = nullptr;
+    Prop* cap_ = nullptr;
+    Prop* inline_ = nullptr;
 };
 
 enum class ObjClass : std::uint8_t
@@ -123,12 +235,26 @@ struct DynObject : GCObject
     void dropShape() noexcept;
     /// Append a property known to be missing, moving to `next`, the shape that says so.
     void appendKnown(GCObject* key, Value value, Shape* next);
-    Vec<Prop> props;
+    PropVec props;
     /// Open-addressed map from key pointer to `props` index plus one, sized to
     /// a power of two. Built lazily -- small objects are faster to scan -- and
     /// flat, so a property table is one allocation rather than one per entry.
     Vec<std::uint32_t> index;
     std::unique_ptr<NativeSlot> nativeSlot;
+    /// The setters of accessor properties that have one, by key: few objects have any.
+    std::unique_ptr<Vec<std::pair<Ref<GCObject>, Value>>> setters;
+    Value setterOf(const Prop& p) const noexcept
+    {
+        if (setters) {
+            for (const auto& [key, fn] : *setters) {
+                if (key.get() == p.key.get())
+                    return fn;
+            }
+        }
+        return Value::undefined();
+    }
+    /// Undefined removes it.
+    void setSetter(const Prop& p, Value fn);
 
     DynObject() { kind = CellKind::Object; }
     void children(GcList& out) const override;

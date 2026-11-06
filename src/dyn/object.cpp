@@ -90,7 +90,7 @@ Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
 {
     if (Prop* existing = findOwn(key)) {
         existing->value = std::move(value);
-        existing->setter = Value::undefined();
+        setSetter(*existing, Value::undefined());
         if (existing->attrs != attrs) {
             existing->attrs = attrs;
             dropShape();
@@ -125,6 +125,7 @@ bool DynObject::deleteOwn(GCObject* key)
             continue;
         if (!(props[i].attrs & PropConfigurable))
             return false;
+        setSetter(props[i], Value::undefined());
         props.erase(props.begin() + std::ptrdiff_t(i));
         dropShape();
         reindex();
@@ -170,9 +171,35 @@ void DynObject::children(GcList& out) const
             out.push_back(p.key.get());
         if (GCObject* v = detail::Access::ptr(p.value))
             out.push_back(v);
-        if (GCObject* s = detail::Access::ptr(p.setter))
-            out.push_back(s);
     }
+    if (setters) {
+        for (const auto& [key, fn] : *setters) {
+            if (GCObject* s = detail::Access::ptr(fn))
+                out.push_back(s);
+        }
+    }
+}
+
+void DynObject::setSetter(const Prop& p, Value fn)
+{
+    if (!setters) {
+        if (fn.isUndefined())
+            return;
+        setters = std::make_unique<Vec<std::pair<Ref<GCObject>, Value>>>();
+    }
+    for (std::size_t i = 0; i < setters->size(); ++i) {
+        if ((*setters)[i].first.get() != p.key.get())
+            continue;
+        if (fn.isUndefined()) {
+            (*setters)[i] = std::move(setters->back());
+            setters->pop_back();
+        } else {
+            (*setters)[i].second = std::move(fn);
+        }
+        return;
+    }
+    if (!fn.isUndefined())
+        setters->push_back({p.key, std::move(fn)});
 }
 
 void DynObject::clearReferences()
@@ -183,12 +210,16 @@ void DynObject::clearReferences()
     props.shrink_to_fit();
     index.clear();
     index.shrink_to_fit();
+    setters.reset();
 }
 
 std::size_t DynObject::heapSize() const
 {
-    return sizeof(*this) + props.capacity() * sizeof(Prop) +
-           index.capacity() * sizeof(std::uint32_t);
+    // A plain object made with room has its first properties in the cell, which `cellBytes` covers.
+    const std::size_t cell = kind == CellKind::Object && cls == ObjClass::Plain && cellBytes > sizeof(*this)
+                                 ? cellBytes
+                                 : sizeof(*this);
+    return cell + props.heapCapacity() * sizeof(Prop) + index.capacity() * sizeof(std::uint32_t);
 }
 
 // -------------------------------------------------------------- arrays ---

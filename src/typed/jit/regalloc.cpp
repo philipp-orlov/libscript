@@ -480,7 +480,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         for (const Range& r : iv.ranges)
             busy.insert(std::upper_bound(busy.begin(), busy.end(), r), r);
     };
-    std::uint32_t spillSlots = 0;
+    std::vector<std::vector<Range>> busySlots;
     for (Interval* iv : order) {
         const bool fp = fn.vregIsFp[std::size_t(iv->vreg)] != 0;
         std::vector<std::vector<Range>>& busy = fp ? busyFp : busyInt;
@@ -509,14 +509,21 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             }
         }
         if (chosen < 0) {
-            fn.location[std::size_t(iv->vreg)] = -std::int32_t(spillSlots++) - 1;
+            // Memory is shared the same way, or a large function runs out of the frame it can reach.
+            std::size_t slot = 0;
+            while (slot < busySlots.size() && !fits(busySlots[slot], *iv))
+                ++slot;
+            if (slot == busySlots.size())
+                busySlots.emplace_back();
+            occupy(busySlots[slot], *iv);
+            fn.location[std::size_t(iv->vreg)] = -std::int32_t(slot) - 1;
             continue;
         }
         occupy(busy[std::size_t(chosen)], *iv);
         fn.location[std::size_t(iv->vreg)] = chosen;
         (fp ? fn.usedFpRegs : fn.usedIntRegs) |= std::uint64_t(1) << chosen;
     }
-    fn.spillSlots = spillSlots;
+    fn.spillSlots = std::uint32_t(busySlots.size());
 
     // What a release's cold path has to keep: registers of values live past it. Callee-saved ones keep themselves.
     std::uint64_t callerInt = 0, callerFp = 0;

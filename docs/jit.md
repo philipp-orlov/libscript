@@ -88,49 +88,59 @@ Everything in the language, in principle. `lowerMethod` refuses a method with a 
 
 ## JavaScript, TypeScript and Python
 
-The dynamic engine has its own lowering (`src/dyn/jit_lower.cpp`) onto the same IR, passes and back ends. It is a baseline
-compiler that leans on what the interpreter has learnt, with no speculation it would have to undo:
+The dynamic engine has its own lowering (`src/dyn/jit_lower.cpp`) onto the same IR, passes and back ends. It compiles
+what the interpreter has seen, and when that turns out wrong it hands the call back:
 
-* **Property access** goes through the interpreter's sites. A site knows up to four receiver shapes for a plain own
-  property, a property found on the prototype chain (checked against `protoEpoch`), a getter there, which native code
-  calls directly, and a store that adds a property, which appends to the table in place while it has room. Objects start
-  with room for what objects of their shape have gone on to hold.
-* **Numbers** live unboxed in locals that are never seen to hold anything else; a store of anything else lowers the
-  function again with that local tagged. A `var` declared without a value counts as unwritten, so it does not lose this.
-* **Calls** to a function with native code go straight to it; `new` gets its object inline and calls the constructor the
-  same way, and `f.apply(thisArg, arguments)` passes the array's elements without copying them. Built-ins that call back into script -- `forEach`, `map`, `filter`, `reduce`, `sort` -- enter compiled
-  callbacks directly too (`CallbackLoop`).
-* **Built-ins done in place**, when the callee is still the built-in it was when compiled: `Math.sqrt`, `abs`, `floor`,
-  `ceil`, `trunc`, `Array.prototype.push` and `pop`, `String.prototype.charCodeAt`, `String.fromCharCode`, and the
-  `length` of an array or a string. Object literals lay their plain keys straight into the table.
-* **Strings**: `s += x` on a local that nothing else holds grows the string in its own cell, with room to spare.
+* **Bailing out.** A guard that fails sends the call to the interpreter at the same instruction, with every local, cell
+  and stack entry as it was (`scriptDynResume`). Code that bails more than a few times is thrown away and compiled again
+  from what the interpreter has learnt since; the instructions that bailed get no guess the next time, and after two such
+  rounds a function assumes nothing. Entering a loop part way through checks that locals kept as bare numbers still
+  hold them.
+* **Property access** uses the interpreter's sites. A site that has seen one shape checks it once, and the shape is then
+  known for that object until a join or anything that can run code; a site that has seen a few shapes dispatches on them.
+  A property up the prototype chain is checked against `protoEpoch`, a getter is called directly, and a store that adds
+  a property appends in place. A field that has only held numbers loads straight into a float register.
+* **Objects** keep their first properties in their own cell, so a literal or a `new` object is one allocation. A property
+  is 32 bytes; the setters of accessors live in a list of their own on the few objects that have any.
+* **Numbers.** Arithmetic and comparisons on operands of unknown type check that they are numbers and run the code for
+  numbers; a parameter only ever given numbers is checked on entry. Number locals are int32s in a general register while
+  that holds, with overflow and minus zero bailing; a remainder by a constant is a multiply.
+* **Calls** go straight to native code. A small, loop-free callee known at compile time -- a method found on a prototype, a
+  global function -- is inlined behind a check that it is still that function; a guess that fails inside it finishes the
+  call in the interpreter and carries on in the caller with what that returns. Built-ins that call back into script enter
+  compiled callbacks directly (`CallbackLoop`), and C++ enters native code through `scriptJitCall5`.
+* **Globals** are read and written where they are while `globalEpoch` says the global object's table has not moved.
+* **Built-ins done in place**, when the callee is still the built-in it was: `Math.sqrt`, `abs`, `floor`, `ceil`, `trunc`,
+  `push`, `pop`, `charCodeAt`, `String.fromCharCode`, `f.apply(thisArg, arguments)`, and `length`. `s += x` on a local
+  nothing else holds grows the string in its own cell.
 
-It refuses a function with exception handlers or a `finally`, which keeps running in the interpreter. `--dump-native` lists what it skipped. Every hot function of the eight Octane benchmarks that run compiles.
+It refuses a function with exception handlers or a `finally`, which keeps running in the interpreter. `--dump-native` lists what
+it skipped.
 
 Measured the same way as the table above, against JavaScriptCore running identical programs (`bench/kernels/js`):
 
 | kernel | interpreted | native, default build | JSC | JSC, LLInt only |
 | --- | ---: | ---: | ---: | ---: |
-| `int_loop` | 3.550 | 0.118 | 0.056 | 1.043 |
-| `float_mandel` | 0.479 | 0.029 | 0.015 | 0.100 |
-| `fib_calls` | 2.147 | 0.123 | 0.057 | 0.633 |
-| `prop_rw` | 1.394 | 0.053 | 0.021 | 0.259 |
-| `method_call` | 1.217 | 0.077 | 0.062 | 1.072 |
-| `poly_prop` | 2.114 | 0.093 | 0.025 | 0.767 |
-| `closure` | 1.609 | 0.098 | 0.028 | 0.540 |
-| `nbody` | 4.140 | 0.164 | 0.040 | 0.820 |
-| `sieve_array` | 8.778 | 0.163 | 0.063 | 0.298 |
-| `array_push_hof` | 0.241 | 0.081 | 0.025 | 0.159 |
-| `sort_cmp` | 0.585 | 0.157 | 0.077 | 0.178 |
-| `alloc_small` | 1.154 | 0.222 | 0.098 | 0.398 |
-| `tree_gc` | 2.816 | 0.472 | 0.108 | 0.849 |
-| `string_ops` | 0.965 | 0.106 | 0.052 | 0.345 |
-| `json_rt` | 0.233 | 0.205 | 0.103 | 0.105 |
-| `map_dict` | 0.968 | 0.580 | 0.412 | 0.553 |
+| `int_loop` | 3.550 | 0.114 | 0.056 | 1.043 |
+| `float_mandel` | 0.479 | 0.013 | 0.015 | 0.100 |
+| `fib_calls` | 2.147 | 0.125 | 0.057 | 0.633 |
+| `prop_rw` | 1.394 | 0.044 | 0.021 | 0.259 |
+| `method_call` | 1.217 | 0.066 | 0.062 | 1.072 |
+| `poly_prop` | 2.114 | 0.071 | 0.025 | 0.767 |
+| `closure` | 1.609 | 0.057 | 0.028 | 0.540 |
+| `nbody` | 4.140 | 0.108 | 0.040 | 0.820 |
+| `sieve_array` | 8.778 | 0.143 | 0.063 | 0.298 |
+| `array_push_hof` | 0.241 | 0.046 | 0.025 | 0.159 |
+| `sort_cmp` | 0.585 | 0.115 | 0.077 | 0.178 |
+| `alloc_small` | 1.154 | 0.214 | 0.098 | 0.398 |
+| `tree_gc` | 2.816 | 0.369 | 0.108 | 0.849 |
+| `string_ops` | 0.965 | 0.109 | 0.052 | 0.345 |
+| `json_rt` | 0.233 | 0.197 | 0.103 | 0.105 |
+| `map_dict` | 0.968 | 0.569 | 0.412 | 0.553 |
 
-That is 2.4x JSC's time overall and 0.33x the time of JSC with its JIT off; JSC's optimizing tiers are still ahead on
-every kernel. On Octane the gap is 14x (it was 125x before any native code), with `earley-boyer` and `raytrace` furthest
-behind, at 32x and 27x.
+That is 1.9x JSC's time overall and 0.26x the time of JSC with its JIT off. `float_mandel` is ahead of JSC; its optimizing
+tiers are still ahead on the rest. On Octane the gap is 10.6x (it was 125x before any native code), with `earley-boyer`
+and `raytrace` furthest behind, at 26x and 24x.
 
 `tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several
 thresholds.

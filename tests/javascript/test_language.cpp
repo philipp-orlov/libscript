@@ -504,6 +504,18 @@ TEST(nativeCodeHandsBackWhatItDidNotExpect)
                  " for (var k = 0; k < 500; k++) out.push(Math.sqrt(String(v).length)); return a; }"
                  " for (var i = 0; i < 300; i++) run(i, i * 2); out.length + ':' + out.every(function(x) { return x === 4; })"),
              std::string("150000:true"));
+    // Whole numbers in native code: a remainder by a constant is a multiply, and an answer that is no int32 -- an
+    // overflow, minus zero -- is the interpreter's to give.
+    CHECK_EQ(run("function f(x) { var t = 0; for (var i = x; i < x + 3000; i++) t = (t + i % 7 + i % 10 + i % 3 + i % 1000"
+                 " + i % 65536 + i % 641 + i % 2147483647) | 0; return t; }"
+                 " var r = []; for (var k = 0; k < 6; k++) r.push(f([0, 1, 99991, 2147480000, 1234567, 65530][k])); r.join()"),
+             std::string("11436304,11442744,414775341,186181523,-415072550,208466060"));
+    CHECK_EQ(run("function f(b) { return 1 / ((-b) % String(0).length); } var r; for (var i = 0; i < 400; i++) r = f(i * 2);"
+                 " r + ':' + f(0)"),
+             std::string("-Infinity:-Infinity"));
+    CHECK_EQ(run("function g(n) { var a = 1, z = 0; for (var i = 0; i < n; i++) { a = a * 3; z = i * -1; } return a + ':' + (1 / z); }"
+                 " var r; for (var j = 0; j < 300; j++) r = g(1); r + '|' + g(30) + '|' + g(1)"),
+             std::string("3:-Infinity|205891132094649:-0.034482758620689655|3:-Infinity"));
     CHECK_EQ(run("'use strict'; function A() { this.n = 1; } A.prototype.inc = function(k) { this.n += k.d; return this; };"
                  " var a = new A(); for (var i = 0; i < 3000; i++) a.inc(i < 2500 ? {d: 1} : {e: 0, d: 2}); a.n"),
              std::string("3501"));

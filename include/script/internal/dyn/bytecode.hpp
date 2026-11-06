@@ -312,6 +312,8 @@ struct FunctionCode
     /// Locals the current native code keeps as bare numbers. A store the interpreter made after a bail may have put
     /// anything there, which entering part way through has to check.
     mutable std::vector<std::uint32_t> jitNumberLocals;
+    /// Those of them kept as int32s, which entering part way through converts to.
+    mutable std::vector<std::uint32_t> jitIntLocals;
     /// Where native code has bailed: what it is compiled to next assumes nothing there.
     mutable std::vector<std::uint32_t> jitBailedAt;
     std::vector<Value> consts;         ///< PushConst operands

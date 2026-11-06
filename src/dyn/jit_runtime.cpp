@@ -787,12 +787,26 @@ bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& resul
         if (type != Type::Double && type != Type::Undefined)
             return discard();
     }
+    for (std::uint32_t slot : code.jitIntLocals) {
+        if (slot >= frame.locals.size() || !frame.locals[slot].isDouble())
+            continue;
+        const double d = detail::Access::r8(frame.locals[slot]);
+        if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d)))
+            return discard();
+    }
 
     // Native code reads a picture of the frame: the counts of what it will own move with the values, and those slots must
     // read as empty here from now on.
     const std::size_t valueBytes = frame.locals.size() * sizeof(Value);
     void* values = __builtin_alloca(valueBytes + 16);
     std::memcpy(values, static_cast<const void*>(frame.locals.data()), valueBytes);
+    // An int32 local starts from its whole number, not from the bits of the double the interpreter holds it in.
+    for (std::uint32_t slot : code.jitIntLocals) {
+        if (slot >= frame.locals.size())
+            continue;
+        const std::int64_t whole = frame.locals[slot].isDouble() ? std::int32_t(detail::Access::r8(frame.locals[slot])) : 0;
+        std::memcpy(static_cast<std::uint8_t*>(values) + std::size_t(slot) * 16 + 8, &whole, sizeof whole);
+    }
     const std::size_t cellBytes = frame.cells.size() * sizeof(void*);
     void* cells = __builtin_alloca(cellBytes + 16);
     std::memcpy(cells, static_cast<const void*>(frame.cells.data()), cellBytes);

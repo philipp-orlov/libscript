@@ -8,6 +8,7 @@
 // and calls a helper on a cold path otherwise. Reference counting follows the same rules as `src/typed/jit/lower.cpp`: an
 // entry that reads a local or a field holds no count until something could change that place.
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <map>
@@ -77,6 +78,8 @@ struct Refuse
 struct LowerAgain
 {
     std::uint32_t slot;
+    /// Only the guess that it holds whole numbers was wrong.
+    bool onlyInt = false;
 };
 
 enum class Rep : std::uint8_t
@@ -103,6 +106,8 @@ struct Entry
     bool hasKnownTag = false;  ///< the tag is `known`, and `t` is unused
     Type known = Type::Undefined;
     bool nonNull = false;
+    /// An int32 whose register holds it sign-extended to 64 bits, not just in its low half.
+    bool wide = false;
     std::int32_t r = -1;  ///< the double, the int, or the payload
     std::int32_t t = -1;  ///< the tag
     double number = 0;    ///< constant double or int
@@ -185,8 +190,9 @@ bool isBranch(Op op) noexcept
 class Lowering
 {
 public:
-    Lowering(Runtime& rt, const FunctionCode& code, IrFunction& fn, const std::vector<std::uint8_t>& notNumber)
-        : rt_(rt), code_(code), fn_(fn), notNumber_(notNumber)
+    Lowering(Runtime& rt, const FunctionCode& code, IrFunction& fn, const std::vector<std::uint8_t>& notNumber,
+             const std::vector<std::uint8_t>& notInt)
+        : rt_(rt), code_(code), fn_(fn), notNumber_(notNumber), notInt_(notInt)
     {}
 
     void run()
@@ -216,7 +222,7 @@ public:
         cellOwned_.assign(slots, 0);
         for (std::uint32_t slot = 0; slot < slots; ++slot) {
             if (isNumberLocal(slot)) {
-                localReg_[slot] = fn_.newVreg(true);
+                localReg_[slot] = fn_.newVreg(!isIntLocal(slot));
                 continue;
             }
             localReg_[slot] = fn_.newVreg(false);
@@ -345,9 +351,12 @@ public:
 
         walk();
         code_.jitNumberLocals.clear();
+        code_.jitIntLocals.clear();
         for (std::uint32_t slot = 0; slot < slots; ++slot) {
             if (isNumberLocal(slot))
                 code_.jitNumberLocals.push_back(slot);
+            if (isIntLocal(slot))
+                code_.jitIntLocals.push_back(slot);
         }
     }
 
@@ -514,6 +523,10 @@ private:
         }
     }
 
+    /// A number local guessed to hold only int32 values, in a general register; anything else stored to it bails, or
+    /// when that is known at compile time, makes it a double local.
+    bool isIntLocal(std::uint32_t slot) const noexcept { return speculate_ && !notInt_[slot] && isNumberLocal(slot); }
+
     bool isNumberLocal(std::uint32_t slot) const noexcept
     {
         if (slot < std::uint32_t(std::max(code_.arity, 0)) || notNumber_[slot])
@@ -532,11 +545,12 @@ private:
         e.r = r;
         return e;
     }
-    Entry intEntry(std::int32_t r)
+    Entry intEntry(std::int32_t r, bool wide = false)
     {
         Entry e;
         e.rep = Rep::Int32;
         e.r = r;
+        e.wide = wide;
         return e;
     }
     Entry constDouble(double v)
@@ -718,6 +732,21 @@ private:
         return raw;
     }
 
+    /// An int32, or a constant that is one: what int32 arithmetic takes. Minus zero is not one.
+    static bool isIntLike(const Entry& e) noexcept
+    {
+        if (e.rep == Rep::Int32)
+            return true;
+        return e.isConst && e.rep == Rep::Double && e.number >= -2147483648.0 && e.number <= 2147483647.0 &&
+               double(std::int32_t(e.number)) == e.number && !(e.number == 0 && std::signbit(e.number));
+    }
+    std::int32_t intReg(const Entry& e)
+    {
+        if (e.isConst)
+            return immReg(std::int64_t(std::int32_t(e.number)));
+        return e.r;
+    }
+
     std::int32_t toInt32Reg(const Entry& e)
     {
         if (e.rep == Rep::Int32) {
@@ -784,7 +813,7 @@ private:
             if (e.rep == Rep::Tagged) {
                 makeOwned(e);
             } else {
-                const std::int32_t d = fn_.newVreg(true);
+                const std::int32_t d = fn_.newVreg(e.rep == Rep::Double);
                 IrInst& mov = inst(IrOp::Mov);
                 mov.d = d;
                 mov.a = e.r;
@@ -854,7 +883,7 @@ private:
             const std::uint32_t at = slot * 16;
             if (isNumberLocal(slot)) {
                 byte(at, std::uint8_t(Type::Double));
-                store(area, at + kPayload, localReg_[slot], 8);
+                store(area, at + kPayload, isIntLocal(slot) ? doubleReg(intEntry(localReg_[slot])) : localReg_[slot], 8);
                 continue;
             }
             store(area, at, localTag_[slot], 1);
@@ -1098,8 +1127,10 @@ private:
             if (betHere())
                 expectNumbers(op);
             // A comparison of numbers followed by a branch on it fuses.
-            if ((op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge) && next < c.size() && labels_[next] < 0 &&
-                stack_.size() == 2 && isKnownNumber(top(0)) && isKnownNumber(top(1))) {
+            const bool comparison = op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge || op == Op::StrictEq ||
+                                    op == Op::StrictNe || op == Op::Eq || op == Op::Ne;
+            if (comparison && next < c.size() && labels_[next] < 0 && stack_.size() == 2 && isKnownNumber(top(0)) &&
+                isKnownNumber(top(1))) {
                 const Op after = Op(c[next]);
                 if (after == Op::JumpIfFalse || after == Op::JumpIfTrue) {
                     fusedCompare(op, after == Op::JumpIfTrue, readOperand(c, next + 1), pc);
@@ -1183,12 +1214,26 @@ private:
 
     void fusedCompare(Op op, bool whenTrue, std::uint32_t target, std::uint32_t pc)
     {
-        const Entry b = pop();
-        const Entry a = pop();
+        Entry b = pop();
+        Entry a = pop();
         if (target <= pc)
             poll();
-        if (a.rep == Rep::Int32 && b.rep == Rep::Int32 && !a.isConst) {
-            const IrCond intCond = op == Op::Lt ? IrCond::Lt : op == Op::Le ? IrCond::Le : op == Op::Gt ? IrCond::Gt : IrCond::Ge;
+        // Two int32s, or one and a constant that is one: compared as integers, the constant second.
+        if (isIntLike(a) && isIntLike(b) && !(a.isConst && b.isConst)) {
+            if (a.isConst) {
+                std::swap(a, b);
+                op = op == Op::Lt ? Op::Gt : op == Op::Le ? Op::Ge : op == Op::Gt ? Op::Lt : op == Op::Ge ? Op::Le : op;
+            }
+            IrCond intCond = IrCond::Eq;
+            switch (op) {
+                case Op::Lt: intCond = IrCond::Lt; break;
+                case Op::Le: intCond = IrCond::Le; break;
+                case Op::Gt: intCond = IrCond::Gt; break;
+                case Op::Ge: intCond = IrCond::Ge; break;
+                case Op::StrictNe:
+                case Op::Ne: intCond = IrCond::Ne; break;
+                default: intCond = IrCond::Eq; break;
+            }
             const std::int32_t rb = b.isConst ? -1 : b.r;
             IrInst& br = inst(IrOp::BrCmp);
             br.a = a.r;
@@ -1204,20 +1249,23 @@ private:
         }
         const std::int32_t ra = doubleReg(a);
         const std::int32_t rb = doubleReg(b);
+        const IrCond cond = op == Op::StrictEq || op == Op::Eq   ? IrCond::FEq
+                            : op == Op::StrictNe || op == Op::Ne ? IrCond::FNe
+                                                                 : fpCond(op);
         if (whenTrue) {
             IrInst& br = inst(IrOp::BrFCmp);
             br.a = ra;
             br.b = rb;
-            br.cond = fpCond(op);
+            br.cond = cond;
             br.width = 64;
             br.target = labels_[target];
         } else {
-            // A NaN answers false to all of these, so the false sense has to jump around.
+            // A NaN answers false to all of these but `!=`, so the false sense has to jump around.
             const std::int32_t skip = newLabel();
             IrInst& br = inst(IrOp::BrFCmp);
             br.a = ra;
             br.b = rb;
-            br.cond = fpCond(op);
+            br.cond = cond;
             br.width = 64;
             br.target = skip;
             inst(IrOp::Br).imm = labels_[target];
@@ -1382,7 +1430,7 @@ private:
             case Op::GetLocal: {
                 const std::uint32_t slot = operand();
                 if (isNumberLocal(slot)) {
-                    Entry e = doubleEntry(localReg_[slot]);
+                    Entry e = isIntLocal(slot) ? intEntry(localReg_[slot], true) : doubleEntry(localReg_[slot]);
                     e.local = std::int32_t(slot);
                     push(e);
                 } else if (numberParam_[slot]) {
@@ -1889,6 +1937,8 @@ private:
             case Op::Inc:
             case Op::Dec: {
                 const Entry a = pop();
+                if (a.rep == Rep::Int32 && intArithmetic(op == Op::Inc ? Op::Add : Op::Sub, a, constDouble(1)))
+                    return true;
                 secureWeak();
                 const std::int32_t x = toNumberReg(a);
                 const std::int32_t one = fpImm(1.0);
@@ -2006,6 +2056,16 @@ private:
                 return;
             if (!isKnownNumber(value))
                 throw LowerAgain{slot};
+            if (isIntLocal(slot)) {
+                if (!isIntLike(value))
+                    throw LowerAgain{slot, true};
+                // Kept sign-extended, so that reading it needs no extension.
+                const std::int32_t from = wideInt(value);
+                IrInst& mov = inst(IrOp::Mov);
+                mov.d = localReg_[slot];
+                mov.a = from;
+                return;
+            }
             const std::int32_t from = doubleReg(value);
             IrInst& mov = inst(IrOp::Mov);
             mov.d = localReg_[slot];
@@ -3406,6 +3466,8 @@ private:
     {
         Entry b = pop();
         Entry a = pop();
+        if (intArithmetic(Op::Add, a, b))
+            return;
         if (isKnownNumber(a) && isKnownNumber(b)) {
             const std::int32_t x = doubleReg(a);
             const std::int32_t y = doubleReg(b);
@@ -3466,10 +3528,155 @@ private:
         push(taggedEntry(r, t, Own::Owned));
     }
 
+    /// The 64-bit sign extension of an int32 entry.
+    std::int32_t wideInt(const Entry& e)
+    {
+        if (e.isConst)
+            return immReg(std::int64_t(std::int32_t(e.number)));
+        if (e.wide)
+            return e.r;
+        const std::int32_t d = fn_.newVreg(false);
+        IrInst& in = inst(IrOp::Sext32);
+        in.d = d;
+        in.a = e.r;
+        return d;
+    }
+    /// `x % divisor` for `0 <= x < 2^31` into `d`: a power of two is a mask, anything else a multiply by its reciprocal
+    /// rather than a division, which takes the machine ten times as long.
+    void remainderByConstant(std::int32_t x, std::uint32_t divisor, std::int32_t d)
+    {
+        if ((divisor & (divisor - 1)) == 0) {
+            IrInst& in = inst(IrOp::And);
+            in.d = d;
+            in.a = x;
+            in.hasImm = true;
+            in.imm = std::int64_t(divisor - 1);
+            in.width = 64;
+            return;
+        }
+        // With l = ceil(log2 divisor) and m = ceil(2^(31+l) / divisor), (x * m) >> (31 + l) is x / divisor for every x
+        // below 2^31; m is below 2^32, so the product fits in 64 bits.
+        unsigned l = 0;
+        while ((std::uint64_t(1) << l) < divisor)
+            ++l;
+        const std::uint64_t m = ((std::uint64_t(1) << (31 + l)) + divisor - 1) / divisor;
+        const std::int32_t reciprocal = immReg(std::int64_t(m));
+        const std::int32_t product = fn_.newVreg(false);
+        IrInst& mul = inst(IrOp::Mul);
+        mul.d = product;
+        mul.a = x;
+        mul.b = reciprocal;
+        mul.width = 64;
+        const std::int32_t quotient = fn_.newVreg(false);
+        IrInst& shr = inst(IrOp::Shr);
+        shr.d = quotient;
+        shr.a = product;
+        shr.hasImm = true;
+        shr.imm = std::int64_t(31 + l);
+        shr.width = 64;
+        const std::int32_t by = immReg(std::int64_t(divisor));
+        const std::int32_t back = fn_.newVreg(false);
+        IrInst& times = inst(IrOp::Mul);
+        times.d = back;
+        times.a = quotient;
+        times.b = by;
+        times.width = 64;
+        IrInst& sub = inst(IrOp::Sub);
+        sub.d = d;
+        sub.a = x;
+        sub.b = back;
+        sub.width = 64;
+    }
+
+    /// Bails unless `wide`, a 64-bit result, is an int32.
+    void expectInt32(std::int32_t wide, std::int32_t bail)
+    {
+        const std::int32_t narrow = fn_.newVreg(false);
+        IrInst& ext = inst(IrOp::Sext32);
+        ext.d = narrow;
+        ext.a = wide;
+        IrInst& test = inst(IrOp::BrCmp);
+        test.a = narrow;
+        test.b = wide;
+        test.cond = IrCond::Ne;
+        test.width = 64;
+        test.target = bail;
+    }
+    /// `a + b`, `a - b`, `a * b` and `a % b` of int32s as an int32, where that is what the answer is; where it is not, the
+    /// interpreter does it. False, with nothing emitted, when this is no place for the guess.
+    bool intArithmetic(Op op, const Entry& a, const Entry& b)
+    {
+        if (!betHere() || !isIntLike(a) || !isIntLike(b) || (a.isConst && b.isConst))
+            return false;
+        if (op == Op::Mod && !(b.isConst ? b.number >= 1 : true))
+            return false;
+        const std::int32_t bail = newLabel();
+        const std::int32_t d = fn_.newVreg(false);
+        if (op == Op::Mod) {
+            // Only what the machine's remainder agrees with: a dividend of at least zero, a divisor of at least one.
+            const std::int32_t x = wideInt(a);
+            branchCmp(x, IrCond::Lt, 0, bail, 64);
+            IrInst* rem = nullptr;
+            if (b.isConst) {
+                remainderByConstant(x, std::uint32_t(b.number), d);
+                emitBail(bail, {a, b});
+                push(intEntry(d, true));
+                return true;
+            }
+            if (b.isConst) {
+                IrInst& in = inst(IrOp::SRem);
+                in.hasImm = true;
+                in.imm = std::int64_t(b.number);
+                rem = &in;
+            } else {
+                const std::int32_t y = wideInt(b);
+                branchCmp(y, IrCond::Le, 0, bail, 64);
+                IrInst& in = inst(IrOp::SRem);
+                in.b = y;
+                rem = &in;
+            }
+            rem->d = d;
+            rem->a = x;
+            rem->width = 64;
+        } else {
+            const std::int32_t x = wideInt(a);
+            const bool imm = b.isConst && op != Op::Mul;
+            const std::int32_t y = imm ? -1 : wideInt(b);
+            IrInst& in = inst(op == Op::Add ? IrOp::Add : op == Op::Sub ? IrOp::Sub : IrOp::Mul);
+            in.d = d;
+            in.a = x;
+            in.b = y;
+            in.width = 64;
+            if (imm) {
+                in.hasImm = true;
+                in.imm = std::int64_t(std::int32_t(b.number));
+            }
+            expectInt32(d, bail);
+            if (op == Op::Mul) {
+                // Zero from a negative operand is minus zero, which no int32 is.
+                const std::int32_t skip = newLabel();
+                branchCmp(d, IrCond::Ne, 0, skip, 64);
+                const std::int32_t either = fn_.newVreg(false);
+                IrInst& orr = inst(IrOp::Or);
+                orr.d = either;
+                orr.a = x;
+                orr.b = y;
+                orr.width = 64;
+                branchCmp(either, IrCond::Lt, 0, bail, 64);
+                inst(IrOp::Label).imm = skip;
+            }
+        }
+        emitBail(bail, {a, b});
+        push(intEntry(d, true));
+        return true;
+    }
+
     void arithmetic(Op op)
     {
         const Entry b = pop();
         const Entry a = pop();
+        if (op != Op::Div && intArithmetic(op, a, b))
+            return;
         secureWeak();
         const std::int32_t x = toNumberReg(a);
         const std::int32_t y = toNumberReg(b);
@@ -3490,6 +3697,8 @@ private:
     {
         const Entry b = pop();
         const Entry a = pop();
+        if (intArithmetic(Op::Mod, a, b))
+            return;
         secureWeak();
         const std::int32_t x = toNumberReg(a);
         const bool constDivisor = b.isConst && b.number >= 2 && b.number < 2147483648.0 && double(std::int32_t(b.number)) == b.number;
@@ -3511,7 +3720,15 @@ private:
         fits.cond = IrCond::Ne;
         fits.width = 64;
         fits.target = slow;
-        branchCmp(wa, IrCond::Lt, 0, slow);
+        // The sign of the double, not of the integer: minus zero has a remainder of minus zero.
+        {
+            const std::int32_t bits = fn_.newVreg(false);
+            IrInst& raw = inst(IrOp::FpToBits);
+            raw.d = bits;
+            raw.a = x;
+            raw.width = 64;
+            branchCmp(bits, IrCond::Lt, 0, slow, 64);
+        }
         {
             const std::int32_t back = fn_.newVreg(true);
             IrInst& to = inst(IrOp::IntToFp);
@@ -3597,6 +3814,16 @@ private:
     {
         const Entry b = pop();
         const Entry a = pop();
+        // `x | 0` and its kind on an int32: x itself.
+        if (a.rep == Rep::Int32 && b.isConst && b.rep != Rep::Tagged) {
+            const bool zero = b.number == 0;
+            const bool allOnes = b.number == -1;
+            if ((zero && (op == Op::BitOr || op == Op::BitXor || op == Op::Shl || op == Op::Shr)) ||
+                (allOnes && op == Op::BitAnd)) {
+                push(a);
+                return;
+            }
+        }
         secureWeak();
         const std::int32_t x = toInt32Reg(a);
         const bool isImm = b.isConst && b.rep != Rep::Tagged && double(std::int32_t(b.number)) == b.number;
@@ -3837,6 +4064,7 @@ private:
     const FunctionCode& code_;
     IrFunction& fn_;
     const std::vector<std::uint8_t>& notNumber_;
+    const std::vector<std::uint8_t>& notInt_;
     std::uint32_t pc_ = 0;
     std::int32_t fnReg_ = -1, thisTag_ = -1, thisReg_ = -1;
     /// The instruction lowered just before this one, in straight-line order; `Nop` after a label.
@@ -3940,15 +4168,19 @@ bool lowerFunction(Runtime& rt, const FunctionCode& code, IrFunction& out, std::
 {
     std::vector<std::uint8_t> notNumber = readsBeforeWrite(code);
     notNumber.resize(code.numLocals, 0);
+    std::vector<std::uint8_t> notInt(code.numLocals, 0);
     for (;;) {
         IrFunction fn;
         try {
-            Lowering lowering(rt, code, fn, notNumber);
+            Lowering lowering(rt, code, fn, notNumber, notInt);
             lowering.run();
             out = std::move(fn);
             return true;
         } catch (const LowerAgain& again) {
-            notNumber[again.slot] = 1;
+            if (again.onlyInt)
+                notInt[again.slot] = 1;
+            else
+                notNumber[again.slot] = 1;
         } catch (const Refuse& refusal) {
             if (why)
                 *why = refusal.why;

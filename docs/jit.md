@@ -47,13 +47,15 @@ seconds of a whole process, so warm-up included; lower is better). `bench/kernel
 | `closure` | 2.034 | 0.020 | 0.028 | 0.038 |
 | `nbody` | 3.553 | 0.023 | 0.040 | 0.042 |
 | `sieve_array` | 2.407 | 0.030 | 0.063 | 0.053 |
-| `alloc_small` | 1.027 | 0.108 | 0.098 | 0.054 |
-| `tree_gc` | 1.809 | 0.132 | 0.108 | 0.123 |
+| `alloc_small` | 1.027 | 0.106 | 0.098 | 0.054 |
+| `tree_gc` | 1.809 | 0.118 | 0.108 | 0.123 |
 | `string_ops` | 0.621 | 0.023 | 0.052 | 0.034 |
 | `map_dict` | 0.983 | 0.235 | 0.412 | 0.190 |
 
-The geometric mean is 0.54 of JSC's time. A build with `SCRIPT_PROFILE=Performance` and profile data brings `alloc_small`
-under JSC's time as well; `tree_gc` stays about 1.2x behind in every build.
+The geometric mean is 0.53 of JSC's time. `alloc_small` and `tree_gc` are still about 1.1x behind in a single run; over
+repeated runs in one process they are level with JSC (0.100 and 0.106 against 0.098 and 0.108). What is left is memory: a
+typed instance carries a 64-byte header and 16 bytes a field, against JSC's 16 and 8, so a tree of them touches three times
+the cache lines.
 
 ## The passes
 
@@ -83,6 +85,55 @@ Everything in the language, in principle. `lowerMethod` refuses a method with a 
 * methods whose frame would exceed 4000 bytes.
 
 `--dump-native` prints what was refused and why, along with the code that was made.
+
+## JavaScript, TypeScript and Python
+
+The dynamic engine has its own lowering (`src/dyn/jit_lower.cpp`) onto the same IR, passes and back ends. It is a baseline
+compiler that leans on what the interpreter has learnt, with no speculation it would have to undo:
+
+* **Property access** goes through the interpreter's sites. A site knows up to four receiver shapes for a plain own
+  property, a property found on the prototype chain (checked against `protoEpoch`), a getter there, which native code
+  calls directly, and a store that adds a property, which appends to the table in place while it has room. Objects start
+  with room for what objects of their shape have gone on to hold.
+* **Numbers** live unboxed in locals that are never seen to hold anything else; a store of anything else lowers the
+  function again with that local tagged. A `var` declared without a value counts as unwritten, so it does not lose this.
+* **Calls** to a function with native code go straight to it; `new` gets its object inline and calls the constructor the
+  same way. Built-ins that call back into script -- `forEach`, `map`, `filter`, `reduce`, `sort` -- enter compiled
+  callbacks directly too (`CallbackLoop`).
+* **Built-ins done in place**, when the callee is still the built-in it was when compiled: `Math.sqrt`, `abs`, `floor`,
+  `ceil`, `trunc`, `Array.prototype.push` and `pop`, `String.prototype.charCodeAt`, `String.fromCharCode`, and the
+  `length` of an array or a string.
+* **Strings**: `s += x` on a local that nothing else holds grows the string in its own cell, with room to spare.
+
+It refuses a function with exception handlers or a `finally`, which keeps running in the interpreter. `--dump-native` lists what it skipped. Every hot function of the eight Octane benchmarks that run compiles.
+
+Measured the same way as the table above, against JavaScriptCore running identical programs (`bench/kernels/js`):
+
+| kernel | interpreted | native, default build | JSC | JSC, LLInt only |
+| --- | ---: | ---: | ---: | ---: |
+| `int_loop` | 3.550 | 0.118 | 0.056 | 1.043 |
+| `float_mandel` | 0.479 | 0.029 | 0.015 | 0.100 |
+| `fib_calls` | 2.147 | 0.117 | 0.057 | 0.633 |
+| `prop_rw` | 1.394 | 0.053 | 0.021 | 0.259 |
+| `method_call` | 1.217 | 0.078 | 0.062 | 1.072 |
+| `poly_prop` | 2.114 | 0.093 | 0.025 | 0.767 |
+| `closure` | 1.609 | 0.098 | 0.028 | 0.540 |
+| `nbody` | 4.140 | 0.164 | 0.040 | 0.820 |
+| `sieve_array` | 8.778 | 0.166 | 0.063 | 0.298 |
+| `array_push_hof` | 0.241 | 0.082 | 0.025 | 0.159 |
+| `sort_cmp` | 0.585 | 0.159 | 0.077 | 0.178 |
+| `alloc_small` | 1.154 | 0.323 | 0.098 | 0.398 |
+| `tree_gc` | 2.816 | 0.503 | 0.108 | 0.849 |
+| `string_ops` | 0.965 | 0.106 | 0.052 | 0.345 |
+| `json_rt` | 0.233 | 0.203 | 0.103 | 0.105 |
+| `map_dict` | 0.968 | 0.585 | 0.412 | 0.553 |
+
+That is 2.5x JSC's time overall and 0.34x the time of JSC with its JIT off; JSC's optimizing tiers are still ahead on
+every kernel. On Octane the gap is 16x (it was 125x before any native code), with `raytrace` and `earley-boyer` furthest
+behind, at 46x and 39x.
+
+`tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several
+thresholds.
 
 ## Reference counts in native code
 

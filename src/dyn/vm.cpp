@@ -1891,6 +1891,12 @@ Value execute(Runtime& rt, Frame& frame)
                         popArgs(buffer.args, op == Op::CallSpread);
                         Value self = pop();
                         Value callee = pop();
+#if SCRIPT_ENABLE_DYN_JIT
+                        if (op == Op::Call) {
+                            if (DynFunction* target = asFunction(callee); target && target->fnKind == FnKind::Bytecode && target->code)
+                                code.noteCall(pc - 5, target->code);
+                        }
+#endif
                         sp.push_back(callValue(rt, callee, self, buffer.args));
                         break;
                     }

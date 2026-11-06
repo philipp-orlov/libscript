@@ -317,6 +317,27 @@ struct FunctionCode
     mutable std::vector<std::uint32_t> jitIntLocals;
     /// Where native code has bailed: what it is compiled to next assumes nothing there.
     mutable std::vector<std::uint32_t> jitBailedAt;
+    /// What each call site has called while interpreted, for native code to put in its place: by the instruction's pc,
+    /// and with no target once it has seen two. Weak, as a function can call itself.
+    struct CallTarget
+    {
+        std::uint32_t pc;
+        const FunctionCode* seen;
+        std::weak_ptr<const FunctionCode> code;
+    };
+    mutable std::vector<CallTarget> jitCallTargets;
+    void noteCall(std::uint32_t pc, const std::shared_ptr<const FunctionCode>& target) const
+    {
+        for (CallTarget& known : jitCallTargets) {
+            if (known.pc == pc) {
+                if (known.seen != target.get())
+                    known.seen = nullptr;
+                return;
+            }
+        }
+        if (jitCallTargets.size() < 64)
+            jitCallTargets.push_back({pc, target.get(), target});
+    }
     /// What native code takes to stay alive without counting it: the functions its call sites guard they are calling.
     mutable std::vector<Value> jitKeep;
     std::vector<Value> consts;         ///< PushConst operands

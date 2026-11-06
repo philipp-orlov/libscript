@@ -487,7 +487,7 @@ public:
 
     /// The body with `self` as this and `args` as the parameters, all borrowed from the caller, whose result ends up in
     /// `r` and `t` with a count of its own, and which then goes to `done`.
-    void runInline(const DynFunction* target, const Entry& self, const std::vector<Entry>& args, std::int32_t r,
+    void runInline(std::int32_t target, const Entry& self, const std::vector<Entry>& args, std::int32_t r,
                    std::int32_t t, std::int32_t done)
     {
         speculate_ = parent_->speculate_ && (2 * code_.numLocals + code_.maxStack) * 16 < 4000;
@@ -495,7 +495,7 @@ public:
         inlineDone_ = done;
         inlineR_ = r;
         inlineT_ = t;
-        fnReg_ = ptrReg(target);
+        fnReg_ = target;
         thisTag_ = fn_.newVreg(false);
         thisReg_ = fn_.newVreg(false);
         {
@@ -593,8 +593,6 @@ public:
             const Op op = Op(c.code[pc]);
             switch (op) {
                 case Op::Closure:
-                case Op::GetUpval:
-                case Op::SetUpval:
                 case Op::GetCell:
                 case Op::SetCell:
                 case Op::NewCell:
@@ -644,8 +642,10 @@ public:
     bool inlineCall(const Entry& callee, const Entry& self, const std::vector<Entry>& args, const std::vector<Entry>& held,
                     std::int32_t r, std::int32_t t, std::int32_t generic, std::int32_t done)
     {
-        if (depth_ >= 2 || !callee.hint || callee.rep != Rep::Tagged || callee.isConst)
+        if (depth_ >= 2 || callee.rep != Rep::Tagged || callee.isConst)
             return false;
+        if (!callee.hint)
+            return inlineSeen(callee, self, args, held, r, t, generic, done);
         const auto* target = static_cast<const DynObject*>(callee.hint);
         if (target->kind != CellKind::Object || target->cls != ObjClass::Function)
             return false;
@@ -674,7 +674,54 @@ public:
         const std::vector<std::uint8_t> none(fn->code->numLocals + 1, 1);
         try {
             Lowering inner(*this, *fn->code, none, held, at);
-            inner.runInline(fn, self, args, r, t, done);
+            inner.runInline(ptrReg(fn), self, args, r, t, done);
+        } catch (const Refuse&) {
+            rollBack(before);
+            return false;
+        }
+        ++fn_.inlinedMethods;
+        return true;
+    }
+
+    /// The same for a callee with nothing known of it but what this site has called while interpreted: a function of that
+    /// code, whichever closure it is, reading its captured variables through what it was called as.
+    bool inlineSeen(const Entry& callee, const Entry& self, const std::vector<Entry>& args, const std::vector<Entry>& held,
+                    std::int32_t r, std::int32_t t, std::int32_t generic, std::int32_t done)
+    {
+        std::shared_ptr<const FunctionCode> code;
+        for (const FunctionCode::CallTarget& known : code_.jitCallTargets) {
+            if (known.pc == pc_ && known.seen)
+                code = known.code.lock();
+        }
+        if (!code || code->isClassConstructor || !inlinable(*code))
+            return false;
+        std::uint32_t copies = 0;
+        for (const Lowering* up = this; up; up = up->parent_) {
+            if (&up->code_ == code.get())
+                ++copies;
+        }
+        if (copies > 1)
+            return false;
+        const Mark before = mark();
+        const std::int32_t at = site();
+        if (!callee.hasKnownTag)
+            branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+        const std::int32_t kind = load(callee.r, kCellKindOffset, 1, false, kAliasHeader);
+        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), generic);
+        const std::int32_t cls = load(callee.r, kClsOffset, 1, false, kAliasHeader);
+        branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), generic);
+        const std::int32_t have = load(callee.r, kFnCodeOffset, 8, false, kAliasHeader);
+        const std::int32_t want = ptrReg(code.get());
+        IrInst& same = inst(IrOp::BrCmp);
+        same.a = have;
+        same.b = want;
+        same.cond = IrCond::Ne;
+        same.width = 64;
+        same.target = generic;
+        const std::vector<std::uint8_t> none(code->numLocals + 1, 1);
+        try {
+            Lowering inner(*this, *code, none, held, at);
+            inner.runInline(callee.r, self, args, r, t, done);
         } catch (const Refuse&) {
             rollBack(before);
             return false;

@@ -634,6 +634,70 @@ Value enterNative(Runtime& rt, DynFunction* fn, const FunctionCode& code, const 
     return resultValue(results);
 }
 
+struct CallbackLoop::Session
+{
+    Frame& marker;
+    NativeRun run;
+    explicit Session(Runtime& rt) : marker(rt.acquireFrame(rt.frames.size())), run(rt, marker, true)
+    {
+        armNativeRun(rt, reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)));
+    }
+};
+
+CallbackLoop::CallbackLoop(Runtime& rt, const Value& callee) : rt_(rt), callee_(callee)
+{
+    DynFunction* fn = asFunction(callee);
+    if (fn && fn->fnKind == FnKind::Bytecode && !fn->isClassConstructor && rt.ctx.options.jit.mode != JitOptions::Mode::Off)
+        fn_ = fn;
+}
+
+CallbackLoop::~CallbackLoop()
+{
+    delete session_;
+}
+
+Value CallbackLoop::slow(const Value& thisValue, std::initializer_list<Value> args)
+{
+    ContextImpl::ArgBuffer buffer(rt_.ctx);
+    buffer.args.assign(args.begin(), args.end());
+    return callValue(rt_, callee_, thisValue, buffer.args);
+}
+
+Value CallbackLoop::operator()(const Value& thisValue, std::initializer_list<Value> args)
+{
+    const void* entry = fn_ ? fn_->code->jitCallEntry : nullptr;
+    if (!entry)
+        return slow(thisValue, args);
+    if (!session_)
+        session_ = new Session(rt_);
+    struct Depth
+    {
+        ContextImpl& ctx;
+        explicit Depth(Runtime& rt) : ctx(rt.ctx)
+        {
+            if (++ctx.callDepth > ctx.options.stackLimit) {
+                --ctx.callDepth;
+                throwError(rt, ErrorCode::StackOverflow, "maximum call depth exceeded");
+            }
+        }
+        ~Depth() { --ctx.callDepth; }
+    } depth(rt_);
+    // Each call starts with no native frames published, as a fresh run would.
+    rt_.nativeTopFrame = nullptr;
+    rt_.nativeTopPc = nullptr;
+    std::uint64_t ints[8] = {reinterpret_cast<std::uint64_t>(fn_), std::uint64_t(thisValue.type()), payloadOf(thisValue),
+                             reinterpret_cast<std::uint64_t>(args.begin()), args.size()};
+    const double fps[8] = {};
+    std::uint64_t results[2] = {0, 0};
+    double fpResult = 0;
+    typed::scriptJitEnter(reinterpret_cast<typed::Runtime*>(&rt_), fn_->code->jitEntry, ints, fps, nullptr, 0, nullptr, results,
+                          &fpResult);
+    rt_.nativeKeepAlive = Value::undefined();
+    Value result = resultValue(results);
+    raisePending(rt_);
+    return result;
+}
+
 bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result)
 {
     const FunctionCode& code = *frame.code;

@@ -96,6 +96,26 @@ int compare(Runtime& rt, const Value& a, const Value& b);
 Value callValue(Runtime& rt, const Value& callee, const Value& thisValue,
                 const std::vector<Value>& args);
 Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args);
+
+/// One callee called many times from C++ -- a built-in's callback. Once the callee has native code, each call goes
+/// straight into it, with what a native run needs set up once for the whole loop rather than once a call.
+class CallbackLoop
+{
+public:
+    CallbackLoop(Runtime& rt, const Value& callee);
+    ~CallbackLoop();
+    CallbackLoop(const CallbackLoop&) = delete;
+    CallbackLoop& operator=(const CallbackLoop&) = delete;
+    Value operator()(const Value& thisValue, std::initializer_list<Value> args);
+
+private:
+    Value slow(const Value& thisValue, std::initializer_list<Value> args);
+    Runtime& rt_;
+    Value callee_;
+    DynFunction* fn_ = nullptr;
+    struct Session;
+    Session* session_ = nullptr;
+};
 /// Call `object[name](args...)`.
 Value invokeMethod(Runtime& rt, const Value& object, GCObject* name,
                    const std::vector<Value>& args);

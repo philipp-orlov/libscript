@@ -1924,6 +1924,10 @@ private:
             Own own = base.own;
             base = taggedEntry(payload, tag, own == Own::None ? Own::None : own);
         }
+        if (!keepBase && code_.atoms[operand & kAtomMask].get() == rt_.atom.length.get()) {
+            lengthProp(base, operand);
+            return;
+        }
         const PropertySite* site = siteAt(operand);
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t t = fn_.newVreg(false);
@@ -2743,6 +2747,55 @@ private:
         conv.srcWidth = 32;
         conv.width = 64;
         setDoubleResult(d, r, t);
+    }
+
+    /// `x.length`: an array's from its elements, a string's from its cell, anything else the long way.
+    void lengthProp(Entry base, std::uint32_t operand)
+    {
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const std::int32_t notObject = newLabel();
+        const std::int32_t tag = base.hasKnownTag ? immReg(std::int64_t(base.known)) : base.t;
+        branchCmp(tag, IrCond::Ne, std::int64_t(Type::Object), notObject);
+        const std::int32_t kind = load(base.r, kCellKindOffset, 1);
+        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
+        const std::int32_t cls = load(base.r, kClsOffset, 1);
+        branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Array), slow);
+        const std::int32_t begin = load(base.r, kElementsOffset, 8);
+        const std::int32_t end = load(base.r, kElementsOffset + 8, 8);
+        lengthResult(subtract(end, begin), r, t);
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::Label).imm = notObject;
+        branchCmp(tag, IrCond::Ne, std::int64_t(Type::String), slow);
+        {
+            const std::int32_t length = load(base.r, kStringLengthOffset, 4);
+            const std::int32_t d = fn_.newVreg(true);
+            IrInst& conv = inst(IrOp::IntToFp);
+            conv.d = d;
+            conv.a = length;
+            conv.srcWidth = 32;
+            conv.width = 64;
+            setDoubleResult(d, r, t);
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        const std::int32_t rt = rtReg();
+        coldCall(reinterpret_cast<void*>(&scriptDynGetProp), {rt, ptrReg(&code_), tagReg(base), base.r, immReg(std::int64_t(operand))},
+                 r, t, true, {base});
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        Entry result = taggedEntry(r, t, Own::Weak);
+        if (base.own == Own::Owned) {
+            makeOwned(result);
+            push(result);
+            release(base);
+        } else {
+            push(result);
+        }
     }
 
     /// A read the site says goes to a getter on the prototype chain: called with the receiver, the result owned.

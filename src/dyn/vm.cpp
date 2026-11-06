@@ -997,6 +997,28 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
     return result.isObject() ? result : thisValue;
 }
 
+#if !SCRIPT_ENABLE_DYN_JIT
+// Without native code for the dynamic languages a callback loop is a plain call each time.
+struct CallbackLoop::Session
+{};
+
+CallbackLoop::CallbackLoop(Runtime& rt, const Value& callee) : rt_(rt), callee_(callee) {}
+
+CallbackLoop::~CallbackLoop() = default;
+
+Value CallbackLoop::slow(const Value& thisValue, std::initializer_list<Value> args)
+{
+    ContextImpl::ArgBuffer buffer(rt_.ctx);
+    buffer.args.assign(args.begin(), args.end());
+    return callValue(rt_, callee_, thisValue, buffer.args);
+}
+
+Value CallbackLoop::operator()(const Value& thisValue, std::initializer_list<Value> args)
+{
+    return slow(thisValue, args);
+}
+#endif
+
 Value invokeMethod(Runtime& rt, const Value& object, GCObject* name,
                    const std::vector<Value>& args)
 {

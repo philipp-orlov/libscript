@@ -424,3 +424,22 @@ TEST(aVarReadBeforeItsFirstNumberIsUndefined)
                  " var r = ''; for (var j = 0; j < 400; j++) r = f(j % 10); r"),
              std::string("undefined"));
 }
+
+TEST(callbacksFromBuiltInsUnwindAndRecurse)
+{
+    // A built-in enters a compiled callback directly; throwing out of it, or calling back in, has to behave the same.
+    CHECK_EQ(run("var hit = 0; function f(x) { if (x === 250) throw new Error('at ' + x); hit++; return x * 2; }"
+                 " var a = []; for (var i = 0; i < 300; i++) a.push(i); var r = '';"
+                 " for (var k = 0; k < 3; k++) { try { a.map(f); } catch (e) { r = e.message; } } r + ':' + hit"),
+             std::string("at 250:750"));
+    CHECK_EQ(run("function inner(x) { return [x, x + 1].reduce(function (p, q) { return p + q; }, 0); }"
+                 " var a = []; for (var i = 0; i < 300; i++) a.push(i);"
+                 " var s = 0; for (var k = 0; k < 3; k++) s = a.map(inner).reduce(function (p, q) { return p + q; }, 0); s"),
+             std::string("90000"));
+    CHECK_EQ(run("var a = []; for (var i = 0; i < 500; i++) a.push((i * 7919) % 500);"
+                 " a.sort(function (p, q) { return p - q; }); a[0] + ',' + a[250] + ',' + a[499]"),
+             std::string("0,250,499"));
+    CHECK_EQ(run("function deep(n) { return n === 0 ? 0 : [n].map(function (x) { return deep(x - 1) + 1; })[0]; }"
+                 " try { deep(100000); 'no' } catch (e) { e instanceof RangeError ? 'range' : String(e) }"),
+             std::string("range"));
+}

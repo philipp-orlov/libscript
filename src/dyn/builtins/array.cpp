@@ -282,12 +282,14 @@ void installArray(Runtime& rt)
         rt2.ctx.reserve(a->elements.size() * sizeof(Value) * 2);
         Vec<Value> work(a->elements.begin(), a->elements.end());
         if (asFunction(comparator)) {
+            CallbackLoop call(rt2, comparator);
             mergeSort(work, [&](const Value& x, const Value& y) {
                 if (x.isUndefined())
                     return false;
                 if (y.isUndefined())
                     return true;
-                return toNumber(rt2, callValue(rt2, comparator, Value::undefined(), {x, y})) < 0;
+                const Value order = call(Value::undefined(), {x, y});
+                return (order.isDouble() ? detail::Access::r8(order) : toNumber(rt2, order)) < 0;
             });
         } else {
             mergeSort(work, [&](const Value& x, const Value& y) {
@@ -411,9 +413,10 @@ void installArray(Runtime& rt)
         if (!asFunction(fn))
             ci.fail(ErrorCode::TypeError, "a callback function is required");
         Value produced;
+        CallbackLoop call(rt2, fn);
         for (std::size_t i = 0; i < a->elements.size(); ++i) {
             const Value item = a->elements[i];
-            produced = callValue(rt2, fn, ci.arg(1), {item, Value(double(i)), ci.thisValue()});
+            produced = call(ci.arg(1), {item, Value(double(i)), ci.thisValue()});
             if (!step(i, item, produced))
                 break;
         }
@@ -544,13 +547,13 @@ void installArray(Runtime& rt)
             acc = a->elements[reversed ? n - 1 : 0];
             at = 1;
         }
+        CallbackLoop call(rt2, fn);
         for (; at < n; ++at) {
             const std::size_t i = reversed ? n - 1 - at : at;
             // The callback may have shortened the array; an element that is gone is skipped, as in JavaScript.
             if (i >= a->elements.size())
                 continue;
-            acc = callValue(rt2, fn, Value::undefined(), {acc, a->elements[i], Value(double(i)),
-                                               ci.thisValue()});
+            acc = call(Value::undefined(), {acc, a->elements[i], Value(double(i)), ci.thisValue()});
         }
         return acc;
     };

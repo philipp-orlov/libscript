@@ -46,6 +46,12 @@ struct Frame
     /// tells `EndFinally` to carry on unwinding instead of resuming.
     bool unwinding = false;
 
+    /// This frame stands for a run of native frames, which `captureStack` finds by walking from `nativeInnerFrame`. It
+    /// remembers what the runtime's top was when the run began.
+    bool nativeRun = false;
+    void* savedTopFrame = nullptr;
+    const void* savedTopPc = nullptr;
+
     void begin(const MethodInfo* target);
     /// Release everything the call referenced, keeping the buffers themselves.
     void end() noexcept;

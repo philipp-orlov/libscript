@@ -973,7 +973,7 @@ public:
         return planBody(method, plan, reason);
     }
 
-    NativeCode* compile(Runtime& rt, MethodInfo& method) override
+    NativeCode* compile(Runtime& rt, MethodInfo& method, std::vector<NativeCode*>&) override
     {
         BodyPlan plan;
         if (!planBody(method, plan, nullptr))
@@ -1031,7 +1031,7 @@ public:
             *reason = "this build does not target System V x86-64";
         return false;
     }
-    NativeCode* compile(Runtime&, MethodInfo&) override { return nullptr; }
+    NativeCode* compile(Runtime&, MethodInfo&, std::vector<NativeCode*>&) override { return nullptr; }
     void release(NativeCode* code) noexcept override { delete code; }
 };
 

@@ -39,6 +39,7 @@ set(SCRIPT_LTO_DEFAULT OFF)
 if(SCRIPT_PROFILE STREQUAL "Performance")
     set(SCRIPT_LTO_DEFAULT ON)
 endif()
+option(SCRIPT_JIT_ENV_OVERRIDE "Let SCRIPT_JIT in the environment set the tier of every context: for running the whole test suite against native code" OFF)
 option(SCRIPT_ENABLE_LTO "Link-time optimization of the library and the tools" ${SCRIPT_LTO_DEFAULT})
 # Profile-guided optimization, in two builds: configure with SCRIPT_PGO=generate, run tools/pgo-train.sh, then
 # reconfigure the same tree with SCRIPT_PGO=use.
@@ -135,6 +136,9 @@ set(SCRIPT_TYPED_SOURCES
     src/typed/vm.cpp
     src/typed/module.cpp
     src/typed/jit/jit.cpp
+    src/typed/jit/lower.cpp
+    src/typed/jit/regalloc.cpp
+    src/typed/jit/jit_runtime.cpp
     src/typed/jit/jit_arm64.cpp
     src/typed/jit/jit_x64.cpp
     src/typed/builtins/core.cpp
@@ -250,6 +254,9 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     target_compile_definitions(script PRIVATE SCRIPT_ARCH_X64=1)
 endif()
 
+if(SCRIPT_JIT_ENV_OVERRIDE)
+    target_compile_definitions(script PRIVATE SCRIPT_JIT_ENV_OVERRIDE=1)
+endif()
 if(MSVC)
     target_compile_definitions(script PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

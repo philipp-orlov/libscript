@@ -70,6 +70,31 @@ struct NativeCode
     std::size_t codeBytes = 0;
     /// Which back end produced this, for `Stats` and for the dump.
     const char* backend = "";
+
+    // ---- the optimizing tier; `entry` stays null and these say how to get in ----
+    void* fastEntry = nullptr;
+    /// A loop head in the interpreter's frame, and the code that picks up from there.
+    struct Osr
+    {
+        std::uint32_t pc;
+        void* entry;
+        std::vector<std::uint32_t> ownedSlots;
+    };
+    std::vector<Osr> osr;
+    /// Return addresses inside this code, sorted, and which source position each stands for.
+    struct Site
+    {
+        std::uint32_t offset;
+        std::int32_t site;
+    };
+    std::vector<Site> sites;
+    struct SourceSite
+    {
+        const MethodInfo* method;
+        std::uint32_t pc;
+        std::int32_t parent;
+    };
+    std::vector<SourceSite> sourceSites;
 };
 
 /// Where a `Value`'s tag and payload sit, discovered rather than assumed. A
@@ -166,9 +191,16 @@ public:
     /// end is free to refuse anything; `reason` says why, for the dump.
     virtual bool supports(const MethodInfo& method, std::string* reason) const = 0;
     /// Generate code. Returns null to mean "keep interpreting"; that is not an
-    /// error and must not throw.
-    virtual NativeCode* compile(Runtime& rt, MethodInfo& method) = 0;
+    /// error and must not throw. A back end that compiled other methods along
+    /// with this one, because it calls them, adds them to `others`.
+    virtual NativeCode* compile(Runtime& rt, MethodInfo& method, std::vector<NativeCode*>& others) = 0;
     virtual void release(NativeCode* code) noexcept = 0;
+    /// What `compile` refused the last method for, for the dump.
+    virtual const std::string& lastRefusal() const noexcept
+    {
+        static const std::string kNone;
+        return kNone;
+    }
     /// Disassembly or a hex dump, for `JitOptions::dumpCode`.
     virtual std::string dump(const NativeCode* code) const;
 
@@ -211,6 +243,8 @@ public:
     void forget(AssemblyImpl& assembly) noexcept;
 
     std::uint32_t threshold() const noexcept { return options_.threshold; }
+    /// The code holding an address in the code cache, or null.
+    const NativeCode* findCode(const void* address) const noexcept;
     std::uint64_t compiledCount() const noexcept { return compiled_; }
     std::uint64_t codeBytes() const noexcept;
 

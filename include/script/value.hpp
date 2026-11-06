@@ -32,6 +32,8 @@ struct GCObject;
 struct Access;
 void incRef(GCObject*) noexcept;
 void decRef(GCObject*) noexcept;
+/// What `decRef` does once a count reaches zero; native code does the counting itself.
+void destroyUnreferenced(GCObject*) noexcept;
 }  // namespace detail
 
 class Context;
@@ -97,7 +99,12 @@ public:
         if (heap())
             detail::incRef(obj_);
     }
-    Value(Value&& o) noexcept : tag_(o.tag_), long_(o.long_) { o.tag_ = Type::Null; }
+    Value(Value&& o) noexcept : tag_(o.tag_), long_(o.long_)
+    {
+        // The whole of it: native code reads the payload of a reference without looking at the tag.
+        o.tag_ = Type::Null;
+        o.long_ = 0;
+    }
     Value& operator=(const Value& o) noexcept
     {
         Value tmp(o);

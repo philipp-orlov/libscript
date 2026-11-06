@@ -1192,7 +1192,28 @@ std::size_t Assembly::imageSize() const noexcept
 
 Context::Context() : Context(Options{}) {}
 
-Context::Context(const Options& options) : impl_(std::make_unique<ContextImpl>(*this, options))
+namespace {
+
+Context::Options withEnvironment(const Context::Options& options)
+{
+    Context::Options out = options;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* mode = std::getenv("SCRIPT_JIT")) {
+        if (std::strcmp(mode, "eager") == 0) {
+            out.jit.mode = JitOptions::Mode::Eager;
+            out.compile.native = true;
+        } else if (std::strncmp(mode, "tiered:", 7) == 0) {
+            out.jit.mode = JitOptions::Mode::Tiered;
+            out.jit.threshold = std::uint32_t(std::atoi(mode + 7));
+        }
+    }
+#endif
+    return out;
+}
+
+}  // namespace
+
+Context::Context(const Options& options) : impl_(std::make_unique<ContextImpl>(*this, withEnvironment(options)))
 {
     impl_->print = [](std::string_view text, bool isError) {
         std::FILE* out = isError ? stderr : stdout;

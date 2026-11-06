@@ -447,7 +447,7 @@ public:
             *reason = "no code generator is compiled in";
         return false;
     }
-    NativeCode* compile(Runtime&, MethodInfo&) override { return nullptr; }
+    NativeCode* compile(Runtime&, MethodInfo&, std::vector<NativeCode*>&) override { return nullptr; }
     void release(NativeCode*) noexcept override {}
 };
 
@@ -521,13 +521,20 @@ NativeCode* JitEngine::onHot(Runtime& rt, MethodInfo& method)
         return nullptr;
     }
 
-    NativeCode* code = backend_->compile(rt, method);
+    std::vector<NativeCode*> others;
+    NativeCode* code = backend_->compile(rt, method, others);
     if (!code) {
+        if (options_.dumpCode && !backend_->lastRefusal().empty())
+            rt.ctx.write(fromUtf8("jit: skipping " + method.qualifiedName() + ": " + backend_->lastRefusal() + "\n"), false);
         method.hotness.store(MethodInfo::kNeverCompile, std::memory_order_relaxed);
         return nullptr;
     }
     owned_.push_back(code);
     ++compiled_;
+    for (NativeCode* other : others) {
+        owned_.push_back(other);
+        ++compiled_;
+    }
     if (options_.dumpCode)
         rt.ctx.write(fromUtf8("jit: " + method.qualifiedName() + " (" +
                           std::to_string(code->codeBytes) + " bytes)\n" + backend_->dump(code)),
@@ -538,6 +545,17 @@ NativeCode* JitEngine::onHot(Runtime& rt, MethodInfo& method)
     return code;
 }
 
+const NativeCode* JitEngine::findCode(const void* address) const noexcept
+{
+    const auto* at = static_cast<const std::uint8_t*>(address);
+    for (const NativeCode* code : owned_) {
+        const auto* start = static_cast<const std::uint8_t*>(code->codeStart);
+        if (at >= start && at < start + code->codeBytes)
+            return code;
+    }
+    return nullptr;
+}
+
 std::size_t JitEngine::compileAll(Runtime& rt, AssemblyImpl& assembly)
 {
     if (!hasBackend())
@@ -545,6 +563,8 @@ std::size_t JitEngine::compileAll(Runtime& rt, AssemblyImpl& assembly)
     std::size_t count = 0;
     for (auto& method : assembly.methodTable) {
         if (method->isNative() || method->isAbstract() || method->body.code.empty())
+            continue;
+        if (method->hotness.load(std::memory_order_relaxed) == MethodInfo::kNeverCompile)
             continue;
         if (onHot(rt, *method))
             ++count;
@@ -566,6 +586,8 @@ void JitEngine::forget(AssemblyImpl& assembly) noexcept
         }
         if (backend_)
             backend_->release(code);
+        method->fastEntry = jitLazyEntry();
+        method->delegateEntry = jitLazyDelegateEntry();
     }
 }
 

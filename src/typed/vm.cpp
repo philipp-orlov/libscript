@@ -9,6 +9,7 @@
 
 #include "script/internal/typed/bytecode.hpp"
 #include "script/internal/typed/jit.hpp"
+#include "script/internal/typed/jit_call.hpp"
 #include "script/internal/typed/numconv.hpp"
 #include "script/internal/stack_guard.hpp"
 #include "script/internal/typed/types.hpp"
@@ -275,8 +276,17 @@ Frame& Runtime::acquireFrame(std::size_t depth)
 std::string Runtime::captureStack() const
 {
     std::string out;
+    void* topFrame = nativeTopFrame;
+    const void* topPc = nativeTopPc;
     for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
         const Frame* frame = *it;
+        if (frame && frame->nativeRun) {
+            // Its native frames, from where they last said they were.
+            out += describeNativeFrames(*this, topFrame, topPc);
+            topFrame = frame->savedTopFrame;
+            topPc = frame->savedTopPc;
+            continue;
+        }
         if (!frame || !frame->method)
             continue;
         out += "   at " + frame->method->qualifiedName();
@@ -644,6 +654,8 @@ Value invoke(Runtime& rt, const MethodInfo* method, Value* args, std::uint32_t a
     // Already compiled? Then the frame is all the native code needs.
     MethodInfo& mutableMethod = const_cast<MethodInfo&>(*method);
     if (NativeCode* code = mutableMethod.code.load(std::memory_order_acquire)) {
+        if (code->fastEntry)
+            return invokeNativeCode(rt, method, code, args, argc);
         Frame& native = rt.acquireFrame(rt.ctx.callDepth);
         native.begin(method);
         for (std::uint32_t i = 0; i < argc && i < native.slots.size(); ++i)
@@ -866,6 +878,18 @@ Value runFrame(Runtime& rt, Frame& frame)
     AssemblyImpl* assembly = method.assembly;
 
     std::uint32_t ticks = 0;
+    // Back edges until this method is worth compiling in the middle of running it.
+    std::uint32_t backEdges =
+        rt.jit && rt.jit->enabled() && method.hotness.load(std::memory_order_relaxed) != MethodInfo::kNeverCompile
+            ? rt.jit->threshold()
+            : 0;
+    // On a back edge: when it is time, carry on in native code from the loop head.
+    const auto loopBack = [&](std::uint32_t target, Value& result) {
+        if (backEdges == 0 || --backEdges != 0)
+            return false;
+        frame.pc = target;
+        return tryOnStackReplacement(rt, frame, target, result);
+    };
 
     for (;;) {
         try {
@@ -1150,19 +1174,29 @@ Value runFrame(Runtime& rt, Frame& frame)
                     case Op::RetVoid: return Value();
 
                     // ---- control ----
-                    case Op::Br: frame.pc = readU32(operands); break;
-                    case Op::BrTrue: {
-                        const bool taken = stack.back().toBool();
-                        stack.pop_back();
-                        if (taken)
-                            frame.pc = readU32(operands);
+                    case Op::Br: {
+                        const std::uint32_t target = readU32(operands);
+                        frame.pc = target;
+                        if (target <= pc) {
+                            Value result;
+                            if (loopBack(target, result))
+                                return result;
+                        }
                         break;
                     }
+                    case Op::BrTrue:
                     case Op::BrFalse: {
-                        const bool taken = stack.back().toBool();
+                        const bool taken = stack.back().toBool() == (op == Op::BrTrue);
                         stack.pop_back();
                         if (!taken)
-                            frame.pc = readU32(operands);
+                            break;
+                        const std::uint32_t target = readU32(operands);
+                        frame.pc = target;
+                        if (target <= pc) {
+                            Value result;
+                            if (loopBack(target, result))
+                                return result;
+                        }
                         break;
                     }
                     case Op::Leave:

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <string>
@@ -104,6 +105,15 @@ struct Runtime : EngineRuntime
     /// unwind information the back ends do not emit -- so the trampoline in
     /// `invoke` checks this on the way out. Zero means nothing happened.
     std::uint32_t nativeError = 0;
+    /// The exception behind `nativeError`, when one was made: the trampoline raises it unchanged.
+    std::exception_ptr nativePending;
+    /// Nonzero when a back edge has to ask `scriptJitPoll`. Without an interrupt handler a loop only reads this.
+    std::uint32_t pollFlag = 0;
+    /// The stack address below which native code raises `StackOverflow` instead of making a frame.
+    std::uintptr_t nativeStackLimit = 0;
+    /// The innermost native frame that has told anyone where it is, for a stack trace; and where in it.
+    void* nativeTopFrame = nullptr;
+    const void* nativeTopPc = nullptr;
 
     /// "   at Type.Method(file:line)" for the frames that are live right now.
     std::string captureStack() const override;

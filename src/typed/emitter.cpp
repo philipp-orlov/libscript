@@ -801,6 +801,10 @@ void Emitter::emitConstant(const Value& value, const TypeInfo* type)
             return;
         case Type::Bool: op(value.toBool() ? Op::LdTrue : Op::LdFalse); return;
         case Type::Char:
+            // The tag is what `Append(char)` and `ToString` print by, so it has to be there at run time.
+            op(Op::LdcI4, std::uint32_t(value.toInt()));
+            op(Op::ConvChar);
+            return;
         case Type::Int: op(Op::LdcI4, std::uint32_t(value.toInt())); return;
         case Type::Long: {
             const std::uint64_t bits = std::uint64_t(value.toLong());

@@ -252,6 +252,10 @@ enum MethodFlags : std::uint16_t
     MethodSealed = 1u << 9,
 };
 
+/// The stubs a method's native entries start at; null in a build with no optimizing back end.
+void* jitLazyEntry() noexcept;
+void* jitLazyDelegateEntry() noexcept;
+
 /// One method. The JIT state is the only mutable part, so a loaded assembly
 /// can be shared read-only between a running interpreter and a compiling
 /// back end.
@@ -292,6 +296,11 @@ struct MethodInfo
     /// Non-null once a back end compiled this method: the VM jumps straight
     /// to it. Written once, under the context lock; read on every call.
     std::atomic<NativeCode*> code{nullptr};
+    /// Where native code calls this method, with the native convention. Until the method is compiled, a stub that
+    /// compiles it or goes through the interpreter; which is why every call site can simply jump here.
+    void* fastEntry = jitLazyEntry();
+    /// The same for a call through a delegate, where a receiver has to be fetched first.
+    void* delegateEntry = jitLazyDelegateEntry();
 
     bool isStatic() const noexcept { return (flags & MethodStatic) != 0; }
     /// Abstract counts: the slot it occupies is the one an override takes.
@@ -349,6 +358,9 @@ struct TypeInfo
 
     /// Total instance slots, including the base class's.
     std::uint32_t instanceSlots = 0;
+    /// The tag each slot of a new instance starts with, so that writing a primitive field is writing its payload. Made
+    /// the first time an instance is.
+    mutable std::vector<Type> slotTags;
     /// First slot of this type's static fields in the assembly's static store.
     std::uint32_t staticBase = 0;
     /// The C++ type this stands for, when `nativeKind == Host`.

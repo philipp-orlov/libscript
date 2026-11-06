@@ -52,7 +52,11 @@ void decRef(GCObject* cell) noexcept
 {
     if (!cell || --cell->rc != 0)
         return;
+    destroyUnreferenced(cell);
+}
 
+void destroyUnreferenced(GCObject* cell) noexcept
+{
     internal::ContextImpl* rt = cell->rt;
     if (!rt) {
         cell->~GCObject();

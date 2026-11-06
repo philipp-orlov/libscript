@@ -214,12 +214,38 @@ void Runtime::syncHostClasses()
 
 // ---------------------------------------------------------------- cells ---
 
+namespace {
+
+/// A primitive field reads as its default from the start, with the right tag.
+void computeSlotTags(const TypeInfo& type)
+{
+    type.slotTags.assign(type.instanceSlots, Type::Null);
+    for (const TypeInfo* t = &type; t; t = t->base) {
+        for (const FieldInfo& field : t->fields) {
+            if (field.isStatic || field.slot >= type.instanceSlots || !field.type)
+                continue;
+            const TypeKind kind = field.type->kind;
+            if (isValueKind(kind) || kind == TypeKind::Enum)
+                type.slotTags[field.slot] = runtimeTag(kind);
+        }
+    }
+}
+
+}  // namespace
+
 CSInstance* Runtime::newInstance(const TypeInfo* type)
 {
     const std::uint32_t slots = type ? type->instanceSlots : 0;
     auto* cell = newCellSized<CSInstance>(slots * sizeof(Value));
     cell->type = type;
     cell->initSlots(slots);
+    if (type && slots) {
+        if (type->slotTags.size() != slots)
+            computeSlotTags(*type);
+        Value* first = cell->slots();
+        for (std::uint32_t i = 0; i < slots; ++i)
+            detail::Access::retag(first[i], type->slotTags[i]);
+    }
     recharge(cell);
     return cell;
 }

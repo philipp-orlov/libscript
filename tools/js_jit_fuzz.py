@@ -62,7 +62,7 @@ class Gen:
 
     def stmt(self, s, ind, loop):
         p = '    ' * ind
-        k = self.r.randint(0, 26)
+        k = self.r.randint(0, 28)
         self.depth += 1
         deep = self.depth > 3
         try:
@@ -141,6 +141,13 @@ class Gen:
                 v = self.var(); e = self.expr(s)
                 return [f"{p}class {v} extends C {{ constructor(q) {{ super(q, 1); }} get w() {{ return this.y; }} m(v) {{ return super.m(v); }} }}",
                         f"{p}log(new {v}({e}).m(3)); log(new {v}(1).w);"]
+            if k == 26 and s['arr']:
+                a = self.r.choice(s['arr'])
+                return [f"{p}log({a}.pop()); log({a}.length); log({a}.push({self.expr(s)}, 1));"]
+            if k == 27:
+                v = self.var(); e = self.expr(s)
+                return [f"{p}var {v} = String({e}) + 'q\u00e9';", f"{p}log({v}.charCodeAt({self.pick('0', '1', '-1', '99', '1.5', self.expr(s, 1))}));",
+                        f"{p}log(String.fromCharCode({self.pick('65', '300', '-1', '1e10', self.expr(s, 1))}));"]
             if k == 25:
                 v = self.var(); e = self.expr(s)
                 return [f"{p}var {v} = [1, {e}]; {v}[0] += 2; {v}['x'] = {e}; log({v}[0]); log(typeof nope{v}); log(typeof {v});"]

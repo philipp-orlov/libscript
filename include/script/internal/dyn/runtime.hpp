@@ -100,9 +100,23 @@ struct Runtime : EngineRuntime
 
     // ---- intrinsics ----
     Ref<DynObject> globalObject;
-    /// The Math functions native code computes inline, held so the ones it compares a callee against stay alive:
-    /// sqrt, abs, floor, ceil, trunc.
-    Ref<GCObject> mathInline[5];
+    /// The built-ins native code does in place, held so the ones it compares a callee against stay alive.
+    enum Intrinsic : int
+    {
+        MathSqrt,
+        MathAbs,
+        MathFloor,
+        MathCeil,
+        MathTrunc,
+        ArrayPush,
+        ArrayPop,
+        StringCharCodeAt,
+        StringFromCharCode,
+        IntrinsicCount
+    };
+    Ref<GCObject> intrinsics[IntrinsicCount];
+    /// One-character strings below 128, made on first use.
+    Ref<GCObject> asciiChars[128];
     Ref<DynObject> objectProto, functionProto, arrayProto, stringProto, numberProto, booleanProto,
         symbolProto, errorProto, dateProto, mapProto, setProto, promiseProto, iteratorProto,
         arrayIteratorProto;

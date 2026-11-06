@@ -144,7 +144,16 @@ struct StringCell : GCObject
             hash_ = hashString(text());
         return hash_;
     }
-    std::size_t heapSize() const override { return sizeof(*this) + length * sizeof(Char); }
+    std::size_t heapSize() const override
+    {
+        return std::max<std::size_t>(cellBytes, sizeof(*this) + length * sizeof(Char));
+    }
+    /// How many characters fit in the cell as allocated: more than `length` for one made to be appended to.
+    std::size_t capacity() const noexcept
+    {
+        return cellBytes > sizeof(*this) ? (cellBytes - sizeof(*this)) / sizeof(Char) : length;
+    }
+    Char* mutableChars() noexcept { return reinterpret_cast<Char*>(this + 1); }
 };
 static_assert(alignof(StringCell) >= alignof(Char));
 

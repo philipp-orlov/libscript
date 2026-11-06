@@ -133,6 +133,8 @@ struct ContextImpl
 
     void link(GCObject* cell) noexcept;
     /// `link` for a cell whose size the caller knows and which is not a string: no virtual call.
+    /// `head` then `tail`, in a cell with room for `room` characters, for a string that is about to be appended to.
+    StringCell* newStringRoom(StringView head, StringView tail, std::size_t room);
     void linkKnown(GCObject* cell, std::uint32_t bytes) noexcept
     {
         cell->rt = this;

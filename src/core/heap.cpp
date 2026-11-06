@@ -434,6 +434,12 @@ StringCell* ContextImpl::newString(StringView head, StringView tail)
     return newCellSized<StringCell>((head.size() + tail.size()) * sizeof(Char), head, tail);
 }
 
+StringCell* ContextImpl::newStringRoom(StringView head, StringView tail, std::size_t room)
+{
+    room = std::max(room, head.size() + tail.size());
+    return newCellSized<StringCell>(room * sizeof(Char), head, tail);
+}
+
 StringCell* ContextImpl::intern(StringView text)
 {
     const std::size_t hash = hashString(text);

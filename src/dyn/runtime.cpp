@@ -222,8 +222,10 @@ void Runtime::releaseRoots() noexcept
         }
     }
     programs.clear();
-    for (Ref<GCObject>& fn : mathInline)
+    for (Ref<GCObject>& fn : intrinsics)
         fn.reset();
+    for (Ref<GCObject>& c : asciiChars)
+        c.reset();
     nativeKeepAlive = Value::undefined();
     nativePending = nullptr;
     if (jitBackend) {

@@ -47,6 +47,9 @@ constexpr std::int64_t kShapeOffset = offsetof(DynObject, shape);
 constexpr std::int64_t kPropsOffset = offsetof(DynObject, props);  // the first word of a vector is its data
 constexpr std::int64_t kFrozenOffset = offsetof(DynObject, frozen);
 constexpr std::int64_t kIsProtoOffset = offsetof(DynObject, isProto);
+constexpr std::int64_t kExtensibleOffset = offsetof(DynObject, extensible);
+constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
+constexpr std::int64_t kStringCharsOffset = sizeof(StringCell);
 constexpr std::int64_t kIndexOffset = offsetof(DynObject, index);
 constexpr std::int64_t kPropSetterOffset = offsetof(Prop, setter);
 constexpr std::int64_t kPropValueOffset = offsetof(Prop, value);
@@ -1534,7 +1537,7 @@ private:
                 release(iterator);
                 return true;
             }
-            case Op::Add: lowerAdd(); return true;
+            case Op::Add: lowerAdd(appendsToLocal(pc)); return true;
             case Op::Sub:
             case Op::Mul:
             case Op::Div: arithmetic(op); return true;
@@ -1969,6 +1972,20 @@ private:
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;
         Entry result = taggedEntry(r, t, Own::Weak);
+        // What the callee is likely to be, for a built-in done in place: guarded where it is used, so a guess is fine.
+        if (usable && site->holder && !site->getter && site->index < site->holder->props.size() &&
+            site->holder->props[site->index].value.isObject())
+            result.hint = detail::Access::ptr(site->holder->props[site->index].value);
+        if (!result.hint && keepBase) {
+            GCObject* key = code_.atoms[operand & kAtomMask].get();
+            const auto named = [&](const char* name, Runtime::Intrinsic which) {
+                if (key == rt_.intern(name))
+                    result.hint = rt_.intrinsics[which].get();
+            };
+            named("push", Runtime::ArrayPush);
+            named("pop", Runtime::ArrayPop);
+            named("charCodeAt", Runtime::StringCharCodeAt);
+        }
         if (usable && !site->holder && !site->moreCount && base.hint) {
             const auto* known = static_cast<const DynObject*>(base.hint);
             if (known->kind == CellKind::Object && known->shape == site->shape && site->index < known->props.size() &&
@@ -2413,7 +2430,7 @@ private:
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t generic = newLabel();
         const std::int32_t finished = newLabel();
-        const bool inlined = argc == 1 && mathInline(callee, args[0], r, t, generic);
+        const bool inlined = intrinsic(callee, self, args, r, t, generic);
         if (inlined) {
             inst(IrOp::Br).imm = finished;
             inst(IrOp::Label).imm = generic;
@@ -2484,37 +2501,65 @@ private:
         inst(IrOp::Label).imm = done;
     }
 
-    /// `Math.sqrt(x)` and its kind, computed in place when the callee is the built-in it was when compiled and the
-    /// argument a number. Anything else goes to `generic`.
-    bool mathInline(const Entry& callee, const Entry& arg, std::int32_t r, std::int32_t t, std::int32_t generic)
+    /// A built-in done in place -- `Math.sqrt(x)` and its kind, `push`, `pop`, `charCodeAt`, `String.fromCharCode` -- when
+    /// the callee is the built-in it was when compiled and the operands are what the inline code handles. Anything else
+    /// goes to `generic`.
+    bool intrinsic(const Entry& callee, const Entry& self, const std::vector<Entry>& args, std::int32_t r, std::int32_t t,
+                   std::int32_t generic)
     {
-        static constexpr IrOp kOps[] = {IrOp::FSqrt, IrOp::FAbs, IrOp::FFloor, IrOp::FCeil, IrOp::FTrunc};
         if (!callee.hint || callee.rep != Rep::Tagged || callee.isConst)
             return false;
         int which = -1;
-        for (int i = 0; i < 5; ++i) {
-            if (rt_.mathInline[i].get() == callee.hint)
+        for (int i = 0; i < Runtime::IntrinsicCount; ++i) {
+            if (rt_.intrinsics[i].get() == callee.hint)
                 which = i;
         }
-        if (which < 0)
+        const std::size_t argc = args.size();
+        const bool fits = (which >= Runtime::MathSqrt && which <= Runtime::MathTrunc && argc == 1) ||
+                          (which == Runtime::ArrayPush && argc == 1) || (which == Runtime::ArrayPop && argc == 0) ||
+                          (which == Runtime::StringCharCodeAt && argc == 1) ||
+                          (which == Runtime::StringFromCharCode && argc == 1);
+        if (!fits)
             return false;
         if (!callee.hasKnownTag)
             branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
         const std::int32_t want = ptrReg(callee.hint);
-        IrInst& same = inst(IrOp::BrCmp);
-        same.a = callee.r;
-        same.b = want;
-        same.cond = IrCond::Ne;
-        same.width = 64;
-        same.target = generic;
+        {
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = callee.r;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = generic;
+        }
+        switch (which) {
+            case Runtime::ArrayPush: inlinePush(self, args[0], r, t, generic); return true;
+            case Runtime::ArrayPop: inlinePop(self, r, t, generic); return true;
+            case Runtime::StringCharCodeAt: inlineCharCodeAt(self, args[0], r, t, generic); return true;
+            case Runtime::StringFromCharCode: {
+                const std::int32_t rt = rtReg();
+                coldCall(reinterpret_cast<void*>(&scriptDynFromCharCode), {rt, tagReg(args[0]), payloadReg(args[0])}, r, t, true,
+                         {callee, self, args[0]});
+                return true;
+            }
+            default: break;
+        }
+        static constexpr IrOp kOps[] = {IrOp::FSqrt, IrOp::FAbs, IrOp::FFloor, IrOp::FCeil, IrOp::FTrunc};
+        const Entry& arg = args[0];
         if (!isKnownNumber(arg))
             branchCmp(tagReg(arg), IrCond::Ne, std::int64_t(Type::Double), generic);
         const std::int32_t x = doubleReg(arg);
         const std::int32_t d = fn_.newVreg(true);
-        IrInst& op = inst(kOps[which]);
+        IrInst& op = inst(kOps[which - Runtime::MathSqrt]);
         op.d = d;
         op.a = x;
         op.width = 64;
+        setDoubleResult(d, r, t);
+        return true;
+    }
+
+    void setDoubleResult(std::int32_t d, std::int32_t r, std::int32_t t)
+    {
         IrInst& bits = inst(IrOp::FpToBits);
         bits.d = r;
         bits.a = d;
@@ -2522,7 +2567,175 @@ private:
         IrInst& tag = inst(IrOp::MovImm);
         tag.d = t;
         tag.imm = std::int64_t(Type::Double);
-        return true;
+    }
+
+    /// An array that can change length: extensible and not frozen.
+    void guardGrowableArray(const Entry& self, std::int32_t generic)
+    {
+        guardArray(self, generic);
+        const std::int32_t extensible = load(self.r, kExtensibleOffset, 1);
+        branchCmp(extensible, IrCond::Eq, 0, generic);
+        const std::int32_t frozen = load(self.r, kFrozenOffset, 1);
+        branchCmp(frozen, IrCond::Ne, 0, generic);
+    }
+
+    std::int32_t subtract(std::int32_t a, std::int32_t b)
+    {
+        const std::int32_t d = fn_.newVreg(false);
+        IrInst& sub = inst(IrOp::Sub);
+        sub.d = d;
+        sub.a = a;
+        sub.b = b;
+        sub.width = 64;
+        return d;
+    }
+
+    /// The new length, as a double, from the byte span of the elements.
+    void lengthResult(std::int32_t bytes, std::int32_t r, std::int32_t t)
+    {
+        const std::int32_t count = fn_.newVreg(false);
+        IrInst& shr = inst(IrOp::Shr);
+        shr.d = count;
+        shr.a = bytes;
+        shr.hasImm = true;
+        shr.imm = 4;
+        shr.width = 64;
+        const std::int32_t d = fn_.newVreg(true);
+        IrInst& conv = inst(IrOp::IntToFp);
+        conv.d = d;
+        conv.a = count;
+        conv.srcWidth = 64;
+        conv.width = 64;
+        setDoubleResult(d, r, t);
+    }
+
+    /// `array.push(v)` while the buffer has room: the value's count goes to the array.
+    void inlinePush(const Entry& self, const Entry& value, std::int32_t r, std::int32_t t, std::int32_t generic)
+    {
+        guardGrowableArray(self, generic);
+        const std::int32_t begin = load(self.r, kElementsOffset, 8);
+        const std::int32_t end = load(self.r, kElementsOffset + 8, 8);
+        const std::int32_t cap = load(self.r, kElementsOffset + 16, 8);
+        {
+            IrInst& full = inst(IrOp::BrCmp);
+            full.a = end;
+            full.b = cap;
+            full.cond = IrCond::Eq;
+            full.width = 64;
+            full.target = generic;
+        }
+        // The arguments are owned by now, but the generic path releases them after the call; this one keeps a count.
+        const std::int32_t vt = tagReg(value);
+        const std::int32_t vr = payloadReg(value);
+        if (!value.hasKnownTag)
+            incRefOf(vr, vt, false);
+        else if (value.known >= Type::String)
+            incRefOf(vr, -1, false);
+        store(end, 0, vt, 1);
+        store(end, kPayload, vr, 8);
+        const std::int32_t next = fn_.newVreg(false);
+        IrInst& add = inst(IrOp::Add);
+        add.d = next;
+        add.a = end;
+        add.hasImm = true;
+        add.imm = std::int64_t(sizeof(Value));
+        add.width = 64;
+        store(self.r, kElementsOffset + 8, next, 8);
+        lengthResult(subtract(next, begin), r, t);
+    }
+
+    /// `array.pop()` on an array that is not empty: the element's count comes along with it.
+    void inlinePop(const Entry& self, std::int32_t r, std::int32_t t, std::int32_t generic)
+    {
+        guardGrowableArray(self, generic);
+        const std::int32_t begin = load(self.r, kElementsOffset, 8);
+        const std::int32_t end = load(self.r, kElementsOffset + 8, 8);
+        {
+            IrInst& empty = inst(IrOp::BrCmp);
+            empty.a = end;
+            empty.b = begin;
+            empty.cond = IrCond::Eq;
+            empty.width = 64;
+            empty.target = generic;
+        }
+        const std::int32_t last = fn_.newVreg(false);
+        IrInst& sub = inst(IrOp::Sub);
+        sub.d = last;
+        sub.a = end;
+        sub.hasImm = true;
+        sub.imm = std::int64_t(sizeof(Value));
+        sub.width = 64;
+        const std::int32_t lt = load(last, 0, 1);
+        const std::int32_t lr = load(last, kPayload, 8);
+        store(self.r, kElementsOffset + 8, last, 8);
+        IrInst& mt = inst(IrOp::Mov);
+        mt.d = t;
+        mt.a = lt;
+        IrInst& mr = inst(IrOp::Mov);
+        mr.d = r;
+        mr.a = lr;
+    }
+
+    /// `string.charCodeAt(i)` for a whole number in range.
+    void inlineCharCodeAt(const Entry& self, const Entry& index, std::int32_t r, std::int32_t t, std::int32_t generic)
+    {
+        if (self.hasKnownTag) {
+            if (self.known != Type::String)
+                inst(IrOp::Br).imm = generic;
+        } else {
+            branchCmp(tagReg(self), IrCond::Ne, std::int64_t(Type::String), generic);
+        }
+        const std::int32_t cell = payloadReg(self);
+        std::int32_t i;
+        if (index.rep == Rep::Int32 && !index.isConst) {
+            i = index.r;
+        } else {
+            if (!isKnownNumber(index))
+                branchCmp(tagReg(index), IrCond::Ne, std::int64_t(Type::Double), generic);
+            const std::int32_t fp = doubleReg(index);
+            i = fn_.newVreg(false);
+            IrInst& conv = inst(IrOp::FpToIntRaw);
+            conv.d = i;
+            conv.a = fp;
+            conv.width = 64;
+            const std::int32_t back = fn_.newVreg(true);
+            IrInst& again = inst(IrOp::IntToFp);
+            again.d = back;
+            again.a = i;
+            again.srcWidth = 64;
+            again.width = 64;
+            IrInst& exact = inst(IrOp::BrFCmp);
+            exact.a = fp;
+            exact.b = back;
+            exact.cond = IrCond::Ne;
+            exact.width = 64;
+            exact.target = generic;
+        }
+        // Unsigned against the length: a negative index is out of range too.
+        const std::int32_t length = load(cell, kStringLengthOffset, 4);
+        {
+            IrInst& bound = inst(IrOp::BrCmp);
+            bound.a = i;
+            bound.b = length;
+            bound.cond = IrCond::Hs;
+            bound.width = index.rep == Rep::Int32 && !index.isConst ? 32 : 64;
+            bound.target = generic;
+        }
+        const std::int32_t code = fn_.newVreg(false);
+        IrInst& ld = inst(IrOp::LoadIdx);
+        ld.d = code;
+        ld.a = cell;
+        ld.b = i;
+        ld.scale = 1;
+        ld.imm = kStringCharsOffset;
+        ld.width = 2;
+        const std::int32_t d = fn_.newVreg(true);
+        IrInst& conv = inst(IrOp::IntToFp);
+        conv.d = d;
+        conv.a = code;
+        conv.srcWidth = 32;
+        conv.width = 64;
+        setDoubleResult(d, r, t);
     }
 
     /// A read the site says goes to a getter on the prototype chain: called with the receiver, the result owned.
@@ -2656,7 +2869,30 @@ private:
         push(taggedEntry(r, t, Own::Owned));
     }
 
-    void lowerAdd()
+    /// `local = local + x`: the left operand borrows a local nothing else on the stack borrows, which holds a count of
+    /// its own, and the sum goes straight back into it.
+    bool appendsToLocal(std::uint32_t pc) const
+    {
+        const std::vector<std::uint8_t>& c = code_.code;
+        // `s += x` compiles to Add, Dup, SetLocal: the copy left behind is of the new value.
+        std::uint32_t at = pc + 1;
+        if (at < c.size() && Op(c[at]) == Op::Dup)
+            ++at;
+        if (at + 4 >= c.size() || Op(c[at]) != Op::SetLocal || stack_.size() < 2)
+            return false;
+        const Entry& a = stack_[stack_.size() - 2];
+        const std::uint32_t slot = readOperand(c, at + 1);
+        if (a.own != Own::Local || a.local != std::int32_t(slot) || slot < std::uint32_t(std::max(code_.arity, 0)) ||
+            slot >= localOwned_.size() || !localOwned_[slot])
+            return false;
+        for (std::size_t i = 0; i + 2 < stack_.size(); ++i) {
+            if (stack_[i].local == std::int32_t(slot))
+                return false;
+        }
+        return true;
+    }
+
+    void lowerAdd(bool appendsToLocal = false)
     {
         Entry b = pop();
         Entry a = pop();
@@ -2710,7 +2946,8 @@ private:
         inst(IrOp::ColdBegin);
         inst(IrOp::Label).imm = slow;
         const std::int32_t rt = rtReg();
-        coldCall(reinterpret_cast<void*>(&scriptDynAdd), {rt, ta, pa, tb, pb}, r, t, true, {a, b});
+        coldCall(appendsToLocal ? reinterpret_cast<void*>(&scriptDynAppendLocal) : reinterpret_cast<void*>(&scriptDynAdd),
+                 {rt, ta, pa, tb, pb}, r, t, true, {a, b});
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;

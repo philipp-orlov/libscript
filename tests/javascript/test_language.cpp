@@ -392,3 +392,21 @@ TEST(aPropertyCacheSeesThroughNeitherShapesNorArrays)
     // Writes respect read-only properties and frozen objects on the fast path too.
     CHECK_EQ(num("function set(o) { o.x = 9; } var a = {x: 1}; set(a); var b = Object.freeze({x: 1}); set(b); b.x"), 1.0);
 }
+
+TEST(appendingToAStringLeavesEveryOtherHolderAlone)
+{
+    // Native code grows a string in place when only the local holds it; anything else that sees it keeps the old text.
+    const char* body = "function f(n) { var s = 'abcdefghijklmnopqrstuvwxyz0123456789'; var keep = [];"
+                       " for (var i = 0; i < n; i++) { var t = s; s += 'x'; keep.push(t.length); }"
+                       " var u = s; s += 'y'; return keep[n - 1] + ':' + u.length + ':' + s.length; }"
+                       " var r; for (var j = 0; j < 400; j++) r = f(50); r";
+    CHECK_EQ(run(body), std::string("85:86:87"));
+    CHECK_EQ(run("function g(a, b) { return a.length + ':' + b.length; }"
+                 " function f() { var s = 'abcdefghijklmnopqrstuvwxyz0123456789'; var r = '';"
+                 " for (var i = 0; i < 3; i++) r = g(s, s += 'z'); return r; }"
+                 " var r; for (var j = 0; j < 400; j++) r = f(); r"),
+             std::string("38:39"));
+    CHECK_EQ(run("function f() { var s = 'abcdefghijklmnopqrstuvwxyz0123456789'; for (var i = 0; i < 40; i++) s += s.length;"
+                 " return s.length; } var r; for (var j = 0; j < 400; j++) r = f(); r"),
+             std::string("124"));
+}

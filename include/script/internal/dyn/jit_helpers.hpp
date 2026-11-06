@@ -84,6 +84,10 @@ GCObject* scriptDynForInKeys(Runtime* rt, std::int64_t tag, std::uint64_t payloa
 inline constexpr std::int64_t kForInDone = -1;
 NativePair scriptDynForInNext(Runtime* rt, GCObject* keys, std::int64_t indexTag, std::uint64_t index) noexcept;
 NativePair scriptDynGetSuper(Runtime* rt, GCObject* fn, std::int64_t thisTag, std::uint64_t self, GCObject* key) noexcept;
+/// `a + b` where the result goes back into the local `a` came from: a string nothing else holds grows in place.
+NativePair scriptDynAppendLocal(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept;
+/// `String.fromCharCode(x)` with one argument.
+NativePair scriptDynFromCharCode(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 NativePair scriptDynToObject(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 
 }  // extern "C"

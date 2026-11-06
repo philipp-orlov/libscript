@@ -17,6 +17,15 @@ namespace dyn {
 
 namespace {
 
+/// The receiver's text, without a copy when it is a string already.
+struct ThisText
+{
+    Value keep;
+    String owned;
+    StringView view;
+    explicit ThisText(CallInfo& ci);
+};
+
 String thisString(CallInfo& ci)
 {
     Runtime& rt = rtOf(ci);
@@ -30,6 +39,18 @@ String thisString(CallInfo& ci)
     if (self.isNullish())
         ci.fail(ErrorCode::TypeError, "String.prototype method called on null or undefined");
     return toStringValue(rt, self);
+}
+
+ThisText::ThisText(CallInfo& ci)
+{
+    const Value self = ci.thisValue();
+    if (StringCell* cell = asString(self)) {
+        keep = self;
+        view = cell->text();
+        return;
+    }
+    owned = thisString(ci);
+    view = owned;
 }
 
 std::size_t clampTo(double raw, std::size_t length)
@@ -90,6 +111,8 @@ void installString(Runtime& rt)
         return rt2.str(out);
     }, 1);
 
+    rt.intrinsics[Runtime::StringFromCharCode].reset(detail::Access::ptr(ctor->findOwn(rt.intern("fromCharCode"))->value));
+
     rt.method(ctor, "fromCodePoint", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         String out;
@@ -104,7 +127,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "charAt", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
         if (i < 0 || i >= std::int64_t(s.size()))
             return rt2.str("");
@@ -113,16 +137,20 @@ void installString(Runtime& rt)
 
     rt.method(proto, "charCodeAt", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
         if (i < 0 || i >= std::int64_t(s.size()))
             return Value(std::nan(""));
         return Value(double(s[std::size_t(i)]));
     }, 1);
 
+    rt.intrinsics[Runtime::StringCharCodeAt].reset(detail::Access::ptr(proto->findOwn(rt.intern("charCodeAt"))->value));
+
     rt.method(proto, "codePointAt", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
         if (i < 0 || i >= std::int64_t(s.size()))
             return Value::undefined();
@@ -134,7 +162,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "at", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
         if (i < 0)
             i += std::int64_t(s.size());
@@ -153,7 +182,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "indexOf", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const String needle = toStringValue(rt2, ci.arg(0));
         const std::size_t from = ci.size() > 1 ? clampTo(toNumber(rt2, ci.arg(1)), s.size()) : 0;
         const std::size_t at = s.find(needle, from);
@@ -162,7 +192,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "lastIndexOf", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::size_t at = s.rfind(toStringValue(rt2, ci.arg(0)));
         return Value(at == String::npos ? -1.0 : double(at));
     }, 1);
@@ -174,7 +205,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "startsWith", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const String needle = toStringValue(rt2, ci.arg(0));
         const std::size_t from = ci.size() > 1 ? clampTo(toNumber(rt2, ci.arg(1)), s.size()) : 0;
         return Value(s.compare(from, needle.size(), needle) == 0);
@@ -182,7 +214,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "endsWith", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const String needle = toStringValue(rt2, ci.arg(0));
         const std::size_t end = ci.size() > 1 && !ci.arg(1).isUndefined()
                                     ? clampTo(toNumber(rt2, ci.arg(1)), s.size())
@@ -194,7 +227,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "slice", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::size_t from = ci.size() > 0 ? clampTo(toNumber(rt2, ci.arg(0)), s.size()) : 0;
         const std::size_t to = ci.size() > 1 && !ci.arg(1).isUndefined()
                                    ? clampTo(toNumber(rt2, ci.arg(1)), s.size())
@@ -206,7 +240,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "substring", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         std::size_t a = ci.size() > 0 ? clampTo(std::max(0.0, toNumber(rt2, ci.arg(0))), s.size())
                                       : 0;
         std::size_t b = ci.size() > 1 && !ci.arg(1).isUndefined()
@@ -219,7 +254,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "substr", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::size_t from = clampTo(toNumber(rt2, ci.arg(0)), s.size());
         const std::size_t count =
             ci.arg(1).isUndefined() ? s.size() - from
@@ -262,7 +298,8 @@ void installString(Runtime& rt)
 
     rt.method(proto, "repeat", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::int64_t n = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
         if (n < 0)
             ci.fail(ErrorCode::RangeError, "repeat count must not be negative");
@@ -281,7 +318,8 @@ void installString(Runtime& rt)
 
     auto pad = [](CallInfo& ci, bool atStart) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const std::size_t target =
             std::size_t(std::max<std::int64_t>(0, toIntegerOrInfinity(toNumber(rt2, ci.arg(0)))));
         if (target <= s.size())
@@ -297,14 +335,17 @@ void installString(Runtime& rt)
         while (padding.size() < target - s.size())
             padding += filler;
         padding.resize(target - s.size());
-        return rt2.str(atStart ? padding + s : s + padding);
+        if (atStart)
+            return rt2.str(padding.append(s));
+        return rt2.str(String(s).append(padding));
     };
     rt.method(proto, "padStart", [pad](CallInfo& ci) { return pad(ci, true); }, 2);
     rt.method(proto, "padEnd", [pad](CallInfo& ci) { return pad(ci, false); }, 2);
 
     rt.method(proto, "split", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         Vec<Value> parts;
         if (ci.arg(0).isUndefined()) {
             parts.push_back(rt2.str(s));
@@ -331,7 +372,8 @@ void installString(Runtime& rt)
 
     auto replace = [](CallInfo& ci, bool all) {
         Runtime& rt2 = rtOf(ci);
-        const String s = thisString(ci);
+        const ThisText receiver(ci);
+        const StringView s = receiver.view;
         const String needle = toStringValue(rt2, ci.arg(0));
         const Value replacement = ci.arg(1);
         String out;
@@ -377,7 +419,8 @@ void installString(Runtime& rt)
                   rt.makeFunction(ascii("[Symbol.iterator]"),
                                   [](CallInfo& ci) {
                                       Runtime& rt2 = rtOf(ci);
-                                      const String s = thisString(ci);
+                                      const ThisText receiver(ci);
+        const StringView s = receiver.view;
                                       Vec<Value> chars;
                                       for (std::size_t i = 0; i < s.size(); ++i) {
                                           std::size_t width = 1;

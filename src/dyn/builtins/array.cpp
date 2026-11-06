@@ -187,6 +187,10 @@ void installArray(Runtime& rt)
     }, 2);
 
     // ---- mutation ----
+    // Native code does these two in place, when the callee is still the built-in.
+    const auto keepIntrinsic = [&rt, proto](Runtime::Intrinsic which, const char* name) {
+        rt.intrinsics[which].reset(detail::Access::ptr(proto->findOwn(rt.intern(name))->value));
+    };
     rt.method(proto, "push", [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
         a->appendAll(ci.args().data(), ci.args().size());
@@ -202,6 +206,8 @@ void installArray(Runtime& rt)
         a->trimElements();
         return v;
     }, 0);
+    keepIntrinsic(Runtime::ArrayPush, "push");
+    keepIntrinsic(Runtime::ArrayPop, "pop");
 
     rt.method(proto, "shift", [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);

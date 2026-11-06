@@ -1909,22 +1909,41 @@ private:
         return load(base.r, kShapeOffset, 8);
     }
 
-    /// Branches to one label per shape the site knows a plain own property for, or to `slow`; gives each label's index.
-    std::vector<std::pair<std::int32_t, std::uint32_t>> dispatchShapes(const Entry& base, const PropertySite* site, std::int32_t slow)
+    struct ShapeCase
     {
+        std::int32_t label;
+        std::uint32_t index;
+        const DynObject* holder;  ///< where the property is, null for the receiver
+    };
+
+    /// Branches to one label per shape the site knows, or to `slow`. Cases up a prototype chain are left out unless the
+    /// epoch they were learnt at is still current, and then the epoch is checked once at run time.
+    std::vector<ShapeCase> dispatchShapes(const Entry& base, const PropertySite* site, std::int32_t slow)
+    {
+        const bool chainOk = site->epoch == rt_.ctx.protoEpoch;
+        std::vector<std::pair<const Shape*, ShapeCase>> wanted;
+        if (!site->holder || chainOk)
+            wanted.push_back({site->shape, {newLabel(), site->index, site->holder}});
+        for (std::uint8_t i = 0; i < site->moreCount; ++i) {
+            if (!site->moreHolder[i] || chainOk)
+                wanted.push_back({site->moreShape[i], {newLabel(), site->moreIndex[i], site->moreHolder[i]}});
+        }
+        bool anyHolder = false;
+        for (const auto& w : wanted)
+            anyHolder = anyHolder || w.second.holder;
         const std::int32_t have = shapeOf(base, slow);
-        std::vector<std::pair<std::int32_t, std::uint32_t>> cases;
-        cases.push_back({newLabel(), site->index});
-        for (std::uint8_t i = 0; i < site->moreCount; ++i)
-            cases.push_back({newLabel(), site->moreIndex[i]});
-        for (std::size_t i = 0; i < cases.size(); ++i) {
-            const std::int32_t want = ptrReg(i == 0 ? site->shape : site->moreShape[i - 1]);
+        if (anyHolder)
+            guardEpoch(site->epoch, slow);
+        std::vector<ShapeCase> cases;
+        for (const auto& [shape, c] : wanted) {
+            const std::int32_t want = ptrReg(shape);
             IrInst& test = inst(IrOp::BrCmp);
             test.a = have;
             test.b = want;
             test.cond = IrCond::Eq;
             test.width = 64;
-            test.target = cases[i].first;
+            test.target = c.label;
+            cases.push_back(c);
         }
         inst(IrOp::Br).imm = slow;
         return cases;
@@ -1992,11 +2011,11 @@ private:
             getterProp(base, site, operand, keepBase);
             return;
         }
-        if (usable && site->moreCount) {
-            for (const auto& [label, index] : dispatchShapes(base, site, slow)) {
-                inst(IrOp::Label).imm = label;
-                const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
-                const std::int32_t props = load(base.r, kPropsOffset, 8);
+        if (site && !site->getter && !site->addTo && site->moreCount) {
+            for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
+                inst(IrOp::Label).imm = c.label;
+                const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
+                const std::int32_t props = load(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset, 8);
                 const std::int32_t lt = load(props, at + kPropValueOffset, 1);
                 const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
                 IrInst& mt = inst(IrOp::Mov);
@@ -2090,9 +2109,9 @@ private:
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
         if (site && !site->addTo && site->moreCount) {
-            for (const auto& [label, index] : dispatchShapes(base, site, slow)) {
-                inst(IrOp::Label).imm = label;
-                const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
+            for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
+                inst(IrOp::Label).imm = c.label;
+                const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = load(base.r, kPropsOffset, 8);
                 const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
                 const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
@@ -3419,22 +3438,40 @@ private:
         const std::int32_t pa = payloadReg(a);
         const std::int32_t tb = tagReg(b);
         const std::int32_t pb = payloadReg(b);
+        // Two objects are equal, loosely or strictly, when they are the same object.
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        branchCmp(ta, IrCond::Ne, std::int64_t(Type::Object), slow);
+        branchCmp(tb, IrCond::Ne, std::int64_t(Type::Object), slow);
+        {
+            IrInst& same = inst(IrOp::Cset);
+            same.d = d;
+            same.a = pa;
+            same.b = pb;
+            same.cond = wantEqual ? IrCond::Eq : IrCond::Ne;
+            same.width = 64;
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        const std::int32_t answer = fn_.newVreg(false);
         if (strict) {
-            coldCall(reinterpret_cast<void*>(&scriptDynStrictEquals), {ta, pa, tb, pb}, d, -1, false);
+            coldCall(reinterpret_cast<void*>(&scriptDynStrictEquals), {ta, pa, tb, pb}, answer, -1, false);
         } else {
             const std::int32_t rt = rtReg();
-            coldCall(reinterpret_cast<void*>(&scriptDynLooseEquals), {rt, ta, pa, tb, pb}, d, -1, true, {a, b});
+            coldCall(reinterpret_cast<void*>(&scriptDynLooseEquals), {rt, ta, pa, tb, pb}, answer, -1, true, {a, b});
         }
-        if (!wantEqual) {
-            const std::int32_t inverted = fn_.newVreg(false);
+        {
             IrInst& in = inst(IrOp::Xor);
-            in.d = inverted;
-            in.a = d;
+            in.d = d;
+            in.a = answer;
             in.hasImm = true;
-            in.imm = 1;
+            in.imm = wantEqual ? 0 : 1;
             in.width = 32;
-            d = inverted;
         }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
         release(b);
         release(a);
         push(boolEntry(d));

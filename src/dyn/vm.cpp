@@ -541,9 +541,17 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
             const Value getter = p->value;
             return callValue(rt, getter, base, {});
         }
-        if (cursor == obj && site->plainOwn()) {
-            site->addShape(obj->shape, at);
-            return p->value;
+        if (site->plainRead() && obj->shape != site->shape && site->moreFind(obj->shape) < 0 &&
+            site->moreCount < PropertySite::kMoreShapes) {
+            // One more receiver shape. One whose property is up the chain needs every such entry to share an epoch.
+            DynObject* where = cursor == obj ? nullptr : cursor;
+            const bool sharesEpoch = !site->anyHolder() || site->epoch == rt.ctx.protoEpoch;
+            if (!where || sharesEpoch) {
+                if (where && !site->anyHolder())
+                    site->epoch = rt.ctx.protoEpoch;
+                site->addShape(obj->shape, at, where);
+                return p->value;
+            }
         }
         site->shape = obj->shape;
         site->holder = cursor == obj ? nullptr : cursor;
@@ -575,9 +583,15 @@ inline Value getPropertySite(Runtime& rt, const FunctionCode& code, const Value&
                 return site->holder->props[site->index].value;
             }
         } else if (obj->shape && site->moreCount) {
-            const std::int64_t at = site->moreAt(obj->shape);
-            if (at >= 0)
-                return obj->props[std::size_t(at)].value;
+            const int i = site->moreFind(obj->shape);
+            if (i >= 0) {
+                if (DynObject* where = site->moreHolder[i]) {
+                    if (site->epoch == rt.ctx.protoEpoch)
+                        return where->props[site->moreIndex[i]].value;
+                } else {
+                    return obj->props[site->moreIndex[i]].value;
+                }
+            }
         }
     }
     return getPropertyLearning(rt, base, key, site);

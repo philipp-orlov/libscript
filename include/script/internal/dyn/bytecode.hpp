@@ -200,29 +200,49 @@ struct PropertySite
     std::uint32_t misses = 0;
     /// The property is a getter, to call with the receiver; `holder` and `index` say where it is.
     bool getter = false;
-    /// Further receiver shapes a plain own-property read or write has met, each with where the property is in that one.
+    /// Further receiver shapes a plain read or write has met, each with where the property is in that one: on the
+    /// receiver, or for a read, on `moreHolder` up its prototype chain (valid while `epoch` is current).
     static constexpr std::uint8_t kMoreShapes = 3;
     std::uint8_t moreCount = 0;
     Shape* moreShape[kMoreShapes] = {};
     std::uint32_t moreIndex[kMoreShapes] = {};
+    DynObject* moreHolder[kMoreShapes] = {};
 
-    /// A plain own property, in one of the shapes beyond the first: its position, or -1.
-    std::int64_t moreAt(const Shape* s) const noexcept
+    /// Which of the further shapes `s` is, or -1.
+    int moreFind(const Shape* s) const noexcept
     {
         for (std::uint8_t i = 0; i < moreCount; ++i) {
             if (moreShape[i] == s)
-                return moreIndex[i];
+                return i;
         }
         return -1;
     }
-    bool plainOwn() const noexcept { return shape && !holder && !addTo && !getter; }
-    /// Learn one more shape for a plain own property, while there is room.
-    void addShape(Shape* s, std::uint32_t at) noexcept
+    /// A plain own property, in one of the shapes beyond the first: its position, or -1.
+    std::int64_t moreAt(const Shape* s) const noexcept
     {
-        if (s == shape || moreAt(s) >= 0 || moreCount == kMoreShapes)
+        const int i = moreFind(s);
+        return i >= 0 && !moreHolder[i] ? std::int64_t(moreIndex[i]) : -1;
+    }
+    bool plainOwn() const noexcept { return shape && !holder && !addTo && !getter && !anyHolder(); }
+    bool plainRead() const noexcept { return shape && !addTo && !getter; }
+    bool anyHolder() const noexcept
+    {
+        if (holder)
+            return true;
+        for (std::uint8_t i = 0; i < moreCount; ++i) {
+            if (moreHolder[i])
+                return true;
+        }
+        return false;
+    }
+    /// Learn one more shape, while there is room.
+    void addShape(Shape* s, std::uint32_t at, DynObject* where = nullptr) noexcept
+    {
+        if (s == shape || moreFind(s) >= 0 || moreCount == kMoreShapes)
             return;
         moreShape[moreCount] = s;
         moreIndex[moreCount] = at;
+        moreHolder[moreCount] = where;
         ++moreCount;
     }
 };

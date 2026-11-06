@@ -417,20 +417,30 @@ public:
                 case IrOp::Label:
                     known_.clear();
                     break;
+                case IrOp::ColdBegin:
+                    // The hot path goes from before the cold block straight to after it, so what it knew it knows again.
+                    saved_.push_back(known_);
+                    break;
+                case IrOp::ColdEnd:
+                    if (!saved_.empty()) {
+                        known_ = std::move(saved_.back());
+                        saved_.pop_back();
+                    }
+                    break;
                 case IrOp::Call:
                     // A call may have written anything, so no load survives; a constant or a sum does.
                     dropMemory();
                     killDefs(in);
                     break;
                 case IrOp::Store:
-                    dropLoadsAt(in.imm);
+                    dropLoadsAt(in.imm, in.alias);
                     dropIndexed();
                     break;
                 case IrOp::StoreIdx:
                     dropIndexed();
                     break;
                 case IrOp::StoreTag:
-                    dropLoadsAt(in.imm);
+                    dropLoadsAt(in.imm, in.alias);
                     break;
                 case IrOp::ExitCmp:
                     if (isCheck(in)) {
@@ -534,9 +544,14 @@ private:
     {
         dropWhere([](const IrInst& k, std::int64_t) { return k.op == IrOp::LoadIdx; }, 0);
     }
-    void dropLoadsAt(std::int64_t offset)
+    void dropLoadsAt(std::int64_t offset, std::uint8_t alias)
     {
-        dropWhere([](const IrInst& k, std::int64_t at) { return k.op == IrOp::Load && k.imm == at; }, offset);
+        known_.erase(std::remove_if(known_.begin(), known_.end(),
+                                    [&](const IrInst& k) {
+                                        return k.op == IrOp::Load && k.imm == offset &&
+                                               (k.alias == 0 || alias == 0 || k.alias == alias);
+                                    }),
+                     known_.end());
     }
     void kill(std::int32_t v)
     {
@@ -559,6 +574,7 @@ private:
 
     IrFunction& fn_;
     std::vector<IrInst> known_;
+    std::vector<std::vector<IrInst>> saved_;
 };
 
 /// Removes copies: `t = a op b; x = t` becomes `x = a op b`, and `t = x; ... use t` uses `x`, wherever `t` is a temporary
@@ -609,9 +625,74 @@ public:
             out.push_back(in);
         }
         fn_.code.swap(out);
+        renameCopies();
     }
 
 private:
+    /// `t = x` where each is written exactly once: `x` is already there wherever `t` is used, so `t` becomes `x`.
+    void renameCopies()
+    {
+        count();
+        std::vector<std::int32_t> rename(fn_.vregIsFp.size(), -1);
+        std::vector<std::int32_t> defAt(fn_.vregIsFp.size(), -1);
+        for (std::size_t i = 0; i < fn_.code.size(); ++i) {
+            if (fn_.code[i].d >= 0 && fn_.code[i].op != IrOp::Call)
+                defAt[std::size_t(fn_.code[i].d)] = std::int32_t(i);
+        }
+        const auto reads = [&](const IrInst& in, std::int32_t v) {
+            if (in.op == IrOp::Call) {
+                const IrCall& call = fn_.calls[std::size_t(in.imm)];
+                return call.delegate == v || std::find(call.args.begin(), call.args.end(), v) != call.args.end();
+            }
+            return in.a == v || in.b == v || in.c == v;
+        };
+        bool any = false;
+        for (std::size_t i = 0; i < fn_.code.size(); ++i) {
+            const IrInst& in = fn_.code[i];
+            if (in.op != IrOp::Mov || in.d == in.a || defs_[std::size_t(in.d)] != 1 || defs_[std::size_t(in.a)] != 1 ||
+                pinned_[std::size_t(in.d)] || pinned_[std::size_t(in.a)] ||
+                fn_.vregIsFp[std::size_t(in.d)] != fn_.vregIsFp[std::size_t(in.a)])
+                continue;
+            // `x` is written before the copy, and nothing between reads `t`, which there still holds the `x` of a previous
+            // time round a loop.
+            const std::int32_t from = defAt[std::size_t(in.a)];
+            if (from < 0 || std::size_t(from) >= i)
+                continue;
+            bool clean = true;
+            for (std::size_t j = std::size_t(from) + 1; j < i && clean; ++j)
+                clean = !reads(fn_.code[j], in.d);
+            if (!clean)
+                continue;
+            rename[std::size_t(in.d)] = in.a;
+            any = true;
+        }
+        if (!any)
+            return;
+        const auto to = [&](std::int32_t v) {
+            while (v >= 0 && rename[std::size_t(v)] >= 0)
+                v = rename[std::size_t(v)];
+            return v;
+        };
+        std::vector<IrInst> out;
+        out.reserve(fn_.code.size());
+        for (IrInst in : fn_.code) {
+            if (in.op == IrOp::Mov && in.d >= 0 && rename[std::size_t(in.d)] >= 0)
+                continue;
+            if (in.op == IrOp::Call) {
+                IrCall& call = fn_.calls[std::size_t(in.imm)];
+                for (std::int32_t& v : call.args)
+                    v = to(v);
+                call.delegate = to(call.delegate);
+            } else {
+                in.a = to(in.a);
+                in.b = to(in.b);
+                in.c = to(in.c);
+            }
+            out.push_back(in);
+        }
+        fn_.code.swap(out);
+    }
+
     bool isTemp(std::int32_t v) const noexcept
     {
         return defs_[std::size_t(v)] == 1 && uses_[std::size_t(v)] == 1 && !pinned_[std::size_t(v)];

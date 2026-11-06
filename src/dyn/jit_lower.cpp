@@ -65,6 +65,9 @@ constexpr std::int64_t kBoxValueOffset = offsetof(Box, value);
 #pragma GCC diagnostic pop
 #endif
 constexpr std::int64_t kPayload = 8;
+/// `IrInst::alias` classes.
+constexpr std::uint8_t kAliasHeader = 1;
+constexpr std::uint8_t kAliasValue = 2;
 
 struct Refuse
 {
@@ -652,7 +655,7 @@ private:
         in.b = t;
         in.isNullable = nullable;
     }
-    std::int32_t load(std::int32_t base, std::int64_t offset, std::uint8_t bytes, bool fp = false)
+    std::int32_t load(std::int32_t base, std::int64_t offset, std::uint8_t bytes, bool fp = false, std::uint8_t alias = 0)
     {
         const std::int32_t d = fn_.newVreg(fp);
         IrInst& in = inst(IrOp::Load);
@@ -660,15 +663,29 @@ private:
         in.a = base;
         in.imm = offset;
         in.width = bytes;
+        in.alias = alias;
         return d;
     }
-    void store(std::int32_t base, std::int64_t offset, std::int32_t value, std::uint8_t bytes)
+    /// Values: a property, an element, a box, a frame's slot. Never an object's shape or the vectors it keeps its
+    /// properties and elements in, which `storeHeader` writes.
+    void store(std::int32_t base, std::int64_t offset, std::int32_t value, std::uint8_t bytes, std::uint8_t alias = kAliasValue)
     {
         IrInst& in = inst(IrOp::Store);
         in.a = base;
         in.c = value;
         in.imm = offset;
         in.width = bytes;
+        in.alias = alias;
+    }
+    /// An object's shape, or where its properties or elements are: what only a call or an append changes, so a value
+    /// stored at the same offset elsewhere does not make the optimizer read it again.
+    std::int32_t loadHeader(std::int32_t base, std::int64_t offset)
+    {
+        return load(base, offset, 8, false, kAliasHeader);
+    }
+    void storeHeader(std::int32_t base, std::int64_t offset, std::int32_t value)
+    {
+        store(base, offset, value, 8, kAliasHeader);
     }
     void branchCmp(std::int32_t a, IrCond cond, std::int64_t imm, std::int32_t target, std::uint8_t width = 32)
     {
@@ -1189,9 +1206,8 @@ private:
             ret.a = r;
             ret.b = t;
         }
+        // The fast path carries on from here; the optimizer knows nothing worked out in the block above is there for it.
         inst(IrOp::ColdEnd);
-        // The fast path carries on from here, and nothing worked out in the block above is there for it.
-        inst(IrOp::Label).imm = newLabel();
     }
 
     /// Arithmetic and comparisons on operands of unknown type: numbers is the guess, checked once here, so what follows is
@@ -1795,13 +1811,13 @@ private:
                 return true;
             }
             case Op::GetUpval: {
-                const std::int32_t data = load(fnReg_, kFnUpvaluesOffset, 8);
+                const std::int32_t data = load(fnReg_, kFnUpvaluesOffset, 8, false, kAliasHeader);
                 const std::int32_t box = load(data, std::int64_t(operand()) * 8, 8);
                 readBox(box);
                 return true;
             }
             case Op::SetUpval: {
-                const std::int32_t data = load(fnReg_, kFnUpvaluesOffset, 8);
+                const std::int32_t data = load(fnReg_, kFnUpvaluesOffset, 8, false, kAliasHeader);
                 const std::int32_t box = load(data, std::int64_t(operand()) * 8, 8);
                 writeBox(box);
                 return true;
@@ -1867,7 +1883,7 @@ private:
                         const std::int32_t vt = tagReg(value);
                         const std::int32_t vr = payloadReg(value);
                         const std::int64_t at = std::int64_t(object.fresh->count) * std::int64_t(sizeof(Prop));
-                        const std::int32_t props = load(object.r, kPropsOffset, 8);
+                        const std::int32_t props = loadHeader(object.r, kPropsOffset);
                         const std::int32_t k = ptrReg(key);
                         incRefOf(k, -1, false);
                         store(props, at + kPropKeyOffset, k, 8);
@@ -1881,8 +1897,8 @@ private:
                         add.hasImm = true;
                         add.imm = at + std::int64_t(sizeof(Prop));
                         add.width = 64;
-                        store(object.r, kPropsOffset + 8, end, 8);
-                        store(object.r, kShapeOffset, ptrReg(next), 8);
+                        storeHeader(object.r, kPropsOffset + 8, end);
+                        storeHeader(object.r, kShapeOffset, ptrReg(next));
                         object.fresh = next;
                         return true;
                     }
@@ -2547,9 +2563,9 @@ private:
             branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
         else if (base.known != Type::Object)
             inst(IrOp::Br).imm = slow;
-        const std::int32_t kind = load(base.r, kCellKindOffset, 1);
+        const std::int32_t kind = load(base.r, kCellKindOffset, 1, false, kAliasHeader);
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        return load(base.r, kShapeOffset, 8);
+        return loadHeader(base.r, kShapeOffset);
     }
 
     struct ShapeCase
@@ -2669,7 +2685,7 @@ private:
                 holder = ptrReg(site->holder);
             }
             const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
-            const std::int32_t props = load(holder, kPropsOffset, 8);
+            const std::int32_t props = loadHeader(holder, kPropsOffset);
             const std::int32_t lt = load(props, at + kPropValueOffset, 1);
             if (site->saw == PropertySite::kSawNumber) {
                 branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
@@ -2686,7 +2702,7 @@ private:
             for (const ShapeCase& c : dispatchShapes(base, site, bail)) {
                 inst(IrOp::Label).imm = c.label;
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
-                const std::int32_t props = load(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset, 8);
+                const std::int32_t props = loadHeader(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset);
                 const std::int32_t lt = load(props, at + kPropValueOffset, 1);
                 if (number) {
                     branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
@@ -2712,7 +2728,7 @@ private:
             for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
                 inst(IrOp::Label).imm = c.label;
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
-                const std::int32_t props = load(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset, 8);
+                const std::int32_t props = loadHeader(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset);
                 const std::int32_t lt = load(props, at + kPropValueOffset, 1);
                 const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
                 IrInst& mt = inst(IrOp::Mov);
@@ -2731,7 +2747,7 @@ private:
                 holder = ptrReg(site->holder);
             }
             const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
-            const std::int32_t props = load(holder, kPropsOffset, 8);
+            const std::int32_t props = loadHeader(holder, kPropsOffset);
             const std::int32_t lt = load(props, at + kPropValueOffset, 1);
             const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
             IrInst& mt = inst(IrOp::Mov);
@@ -2796,10 +2812,10 @@ private:
     void appendInPlace(const Entry& base, const PropertySite* site, std::uint32_t operand, std::int32_t vt, std::int32_t vr,
                        std::int32_t slow)
     {
-        const std::int32_t isProto = load(base.r, kIsProtoOffset, 1);
+        const std::int32_t isProto = load(base.r, kIsProtoOffset, 1, false, kAliasHeader);
         branchCmp(isProto, IrCond::Ne, 0, slow);
-        const std::int32_t indexBegin = load(base.r, kIndexOffset, 8);
-        const std::int32_t indexEnd = load(base.r, kIndexOffset + 8, 8);
+        const std::int32_t indexBegin = load(base.r, kIndexOffset, 8, false, kAliasHeader);
+        const std::int32_t indexEnd = load(base.r, kIndexOffset + 8, 8, false, kAliasHeader);
         {
             IrInst& test = inst(IrOp::BrCmp);
             test.a = indexBegin;
@@ -2808,8 +2824,8 @@ private:
             test.width = 64;
             test.target = slow;
         }
-        const std::int32_t end = load(base.r, kPropsOffset + 8, 8);
-        const std::int32_t cap = load(base.r, kPropsOffset + 16, 8);
+        const std::int32_t end = loadHeader(base.r, kPropsOffset + 8);
+        const std::int32_t cap = loadHeader(base.r, kPropsOffset + 16);
         {
             IrInst& test = inst(IrOp::BrCmp);
             test.a = end;
@@ -2831,8 +2847,8 @@ private:
         add.hasImm = true;
         add.imm = std::int64_t(sizeof(Prop));
         add.width = 64;
-        store(base.r, kPropsOffset + 8, next, 8);
-        store(base.r, kShapeOffset, ptrReg(site->addTo), 8);
+        storeHeader(base.r, kPropsOffset + 8, next);
+        storeHeader(base.r, kShapeOffset, ptrReg(site->addTo));
     }
 
     void setProp(std::uint32_t operand)
@@ -2861,7 +2877,7 @@ private:
                 appendInPlace(base, site, operand, vt, vr, bail);
             } else {
                 const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
-                const std::int32_t props = load(base.r, kPropsOffset, 8);
+                const std::int32_t props = loadHeader(base.r, kPropsOffset);
                 const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
                 const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
                 store(props, at + kPropValueOffset, vt, 1);
@@ -2883,7 +2899,7 @@ private:
             for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
                 inst(IrOp::Label).imm = c.label;
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
-                const std::int32_t props = load(base.r, kPropsOffset, 8);
+                const std::int32_t props = loadHeader(base.r, kPropsOffset);
                 const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
                 const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
                 store(props, at + kPropValueOffset, vt, 1);
@@ -2899,7 +2915,7 @@ private:
             // A write to a property the shape says is there and writable: what was there loses its count after.
             guardShape(base, site->shape, slow);
             const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
-            const std::int32_t props = load(base.r, kPropsOffset, 8);
+            const std::int32_t props = loadHeader(base.r, kPropsOffset);
             const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
             const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
             store(props, at + kPropValueOffset, vt, 1);
@@ -3011,8 +3027,8 @@ private:
         const bool bet = betHere();
         guardArray(base, slow);
         const std::int32_t i = arrayIndex(key, slow);
-        const std::int32_t data = load(base.r, kElementsOffset, 8);
-        const std::int32_t end = load(base.r, kElementsOffset + 8, 8);
+        const std::int32_t data = loadHeader(base.r, kElementsOffset);
+        const std::int32_t end = loadHeader(base.r, kElementsOffset + 8);
         const std::int32_t size = fn_.newVreg(false);
         IrInst& sub = inst(IrOp::Sub);
         sub.d = size;
@@ -3073,9 +3089,9 @@ private:
             branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
         else if (base.known != Type::Object)
             inst(IrOp::Br).imm = slow;
-        const std::int32_t kind = load(base.r, kCellKindOffset, 1);
+        const std::int32_t kind = load(base.r, kCellKindOffset, 1, false, kAliasHeader);
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t cls = load(base.r, kClsOffset, 1);
+        const std::int32_t cls = load(base.r, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Array), slow);
     }
 
@@ -3097,10 +3113,10 @@ private:
         const std::int32_t done = newLabel();
         guardArray(base, slow);
         // Frozen, or with named properties that might include an index: the long way.
-        const std::int32_t frozen = load(base.r, kFrozenOffset, 1);
+        const std::int32_t frozen = load(base.r, kFrozenOffset, 1, false, kAliasHeader);
         branchCmp(frozen, IrCond::Ne, 0, slow);
-        const std::int32_t propsBegin = load(base.r, kPropsOffset, 8);
-        const std::int32_t propsEnd = load(base.r, kPropsOffset + 8, 8);
+        const std::int32_t propsBegin = loadHeader(base.r, kPropsOffset);
+        const std::int32_t propsEnd = loadHeader(base.r, kPropsOffset + 8);
         IrInst& noProps = inst(IrOp::BrCmp);
         noProps.a = propsBegin;
         noProps.b = propsEnd;
@@ -3108,8 +3124,8 @@ private:
         noProps.width = 64;
         noProps.target = slow;
         const std::int32_t i = arrayIndex(key, slow);
-        const std::int32_t data = load(base.r, kElementsOffset, 8);
-        const std::int32_t end = load(base.r, kElementsOffset + 8, 8);
+        const std::int32_t data = loadHeader(base.r, kElementsOffset);
+        const std::int32_t end = loadHeader(base.r, kElementsOffset + 8);
         const std::int32_t size = fn_.newVreg(false);
         IrInst& sub = inst(IrOp::Sub);
         sub.d = size;
@@ -3185,7 +3201,7 @@ private:
             if (desc.fromParentLocal) {
                 box = cellReg_[desc.index];
             } else {
-                const std::int32_t data = load(fnReg_, kFnUpvaluesOffset, 8);
+                const std::int32_t data = load(fnReg_, kFnUpvaluesOffset, 8, false, kAliasHeader);
                 box = load(data, std::int64_t(desc.index) * 8, 8);
             }
             store(area, std::int64_t(i) * 8, box, 8);
@@ -3288,13 +3304,13 @@ private:
         const std::int32_t done = newLabel();
         // A function compiled to native code is called directly; anything else takes the long way.
         branchCmp(fnTag, IrCond::Ne, std::int64_t(Type::Object), slow);
-        const std::int32_t kind = load(fnPayload, kCellKindOffset, 1);
+        const std::int32_t kind = load(fnPayload, kCellKindOffset, 1, false, kAliasHeader);
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t cls = load(fnPayload, kClsOffset, 1);
+        const std::int32_t cls = load(fnPayload, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), slow);
-        const std::int32_t codePtr = load(fnPayload, kFnCodeOffset, 8);
+        const std::int32_t codePtr = load(fnPayload, kFnCodeOffset, 8, false, kAliasHeader);
         branchCmp(codePtr, IrCond::Eq, 0, slow, 64);
-        const std::int32_t entry = load(codePtr, kCallEntryOffset, 8);
+        const std::int32_t entry = load(codePtr, kCallEntryOffset, 8, false, kAliasHeader);
         branchCmp(entry, IrCond::Eq, 0, slow, 64);
         {
             IrCall direct;
@@ -3404,9 +3420,9 @@ private:
     void guardGrowableArray(const Entry& self, std::int32_t generic)
     {
         guardArray(self, generic);
-        const std::int32_t extensible = load(self.r, kExtensibleOffset, 1);
+        const std::int32_t extensible = load(self.r, kExtensibleOffset, 1, false, kAliasHeader);
         branchCmp(extensible, IrCond::Eq, 0, generic);
-        const std::int32_t frozen = load(self.r, kFrozenOffset, 1);
+        const std::int32_t frozen = load(self.r, kFrozenOffset, 1, false, kAliasHeader);
         branchCmp(frozen, IrCond::Ne, 0, generic);
     }
 
@@ -3444,9 +3460,9 @@ private:
     void inlinePush(const Entry& self, const Entry& value, std::int32_t r, std::int32_t t, std::int32_t generic)
     {
         guardGrowableArray(self, generic);
-        const std::int32_t begin = load(self.r, kElementsOffset, 8);
-        const std::int32_t end = load(self.r, kElementsOffset + 8, 8);
-        const std::int32_t cap = load(self.r, kElementsOffset + 16, 8);
+        const std::int32_t begin = loadHeader(self.r, kElementsOffset);
+        const std::int32_t end = loadHeader(self.r, kElementsOffset + 8);
+        const std::int32_t cap = loadHeader(self.r, kElementsOffset + 16);
         {
             IrInst& full = inst(IrOp::BrCmp);
             full.a = end;
@@ -3471,7 +3487,7 @@ private:
         add.hasImm = true;
         add.imm = std::int64_t(sizeof(Value));
         add.width = 64;
-        store(self.r, kElementsOffset + 8, next, 8);
+        storeHeader(self.r, kElementsOffset + 8, next);
         lengthResult(subtract(next, begin), r, t);
     }
 
@@ -3479,8 +3495,8 @@ private:
     void inlinePop(const Entry& self, std::int32_t r, std::int32_t t, std::int32_t generic)
     {
         guardGrowableArray(self, generic);
-        const std::int32_t begin = load(self.r, kElementsOffset, 8);
-        const std::int32_t end = load(self.r, kElementsOffset + 8, 8);
+        const std::int32_t begin = loadHeader(self.r, kElementsOffset);
+        const std::int32_t end = loadHeader(self.r, kElementsOffset + 8);
         {
             IrInst& empty = inst(IrOp::BrCmp);
             empty.a = end;
@@ -3498,7 +3514,7 @@ private:
         sub.width = 64;
         const std::int32_t lt = load(last, 0, 1);
         const std::int32_t lr = load(last, kPayload, 8);
-        store(self.r, kElementsOffset + 8, last, 8);
+        storeHeader(self.r, kElementsOffset + 8, last);
         IrInst& mt = inst(IrOp::Mov);
         mt.d = t;
         mt.a = lt;
@@ -3516,8 +3532,8 @@ private:
         guardArray(list, generic);
         const std::int32_t rc = load(list.r, kRcOffset, 4);
         branchCmp(rc, IrCond::Ne, 1, generic);
-        const std::int32_t begin = load(list.r, kElementsOffset, 8);
-        const std::int32_t end = load(list.r, kElementsOffset + 8, 8);
+        const std::int32_t begin = loadHeader(list.r, kElementsOffset);
+        const std::int32_t end = loadHeader(list.r, kElementsOffset + 8);
         const std::int32_t bytes = subtract(end, begin);
         const std::int32_t count = fn_.newVreg(false);
         IrInst& shr = inst(IrOp::Shr);
@@ -3568,7 +3584,7 @@ private:
             exact.target = generic;
         }
         // Unsigned against the length: a negative index is out of range too.
-        const std::int32_t length = load(cell, kStringLengthOffset, 4);
+        const std::int32_t length = load(cell, kStringLengthOffset, 4, false, kAliasHeader);
         {
             IrInst& bound = inst(IrOp::BrCmp);
             bound.a = i;
@@ -3604,18 +3620,18 @@ private:
         const std::int32_t notObject = newLabel();
         const std::int32_t tag = base.hasKnownTag ? immReg(std::int64_t(base.known)) : base.t;
         branchCmp(tag, IrCond::Ne, std::int64_t(Type::Object), notObject);
-        const std::int32_t kind = load(base.r, kCellKindOffset, 1);
+        const std::int32_t kind = load(base.r, kCellKindOffset, 1, false, kAliasHeader);
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t cls = load(base.r, kClsOffset, 1);
+        const std::int32_t cls = load(base.r, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Array), slow);
-        const std::int32_t begin = load(base.r, kElementsOffset, 8);
-        const std::int32_t end = load(base.r, kElementsOffset + 8, 8);
+        const std::int32_t begin = loadHeader(base.r, kElementsOffset);
+        const std::int32_t end = loadHeader(base.r, kElementsOffset + 8);
         lengthResult(subtract(end, begin), r, t);
         inst(IrOp::Br).imm = done;
         inst(IrOp::Label).imm = notObject;
         branchCmp(tag, IrCond::Ne, std::int64_t(Type::String), slow);
         {
-            const std::int32_t length = load(base.r, kStringLengthOffset, 4);
+            const std::int32_t length = load(base.r, kStringLengthOffset, 4, false, kAliasHeader);
             const std::int32_t d = fn_.newVreg(true);
             IrInst& conv = inst(IrOp::IntToFp);
             conv.d = d;
@@ -3655,7 +3671,7 @@ private:
         guardShape(base, site->shape, slow);
         guardEpoch(site->epoch, slow);
         const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
-        const std::int32_t props = load(ptrReg(site->holder), kPropsOffset, 8);
+        const std::int32_t props = loadHeader(ptrReg(site->holder), kPropsOffset);
         const std::int32_t ft = load(props, at + kPropValueOffset, 1);
         const std::int32_t fr = load(props, at + kPropValueOffset + kPayload, 8);
         // The getter keeps a count of its own while it runs: it could take itself off the prototype.
@@ -3707,13 +3723,13 @@ private:
         const std::int32_t done = newLabel();
         // A constructor with native code gets its object here and is called directly.
         branchCmp(fnTag, IrCond::Ne, std::int64_t(Type::Object), slow);
-        const std::int32_t kind = load(fnPayload, kCellKindOffset, 1);
+        const std::int32_t kind = load(fnPayload, kCellKindOffset, 1, false, kAliasHeader);
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t cls = load(fnPayload, kClsOffset, 1);
+        const std::int32_t cls = load(fnPayload, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), slow);
-        const std::int32_t codePtr = load(fnPayload, kFnCodeOffset, 8);
+        const std::int32_t codePtr = load(fnPayload, kFnCodeOffset, 8, false, kAliasHeader);
         branchCmp(codePtr, IrCond::Eq, 0, slow, 64);
-        const std::int32_t entry = load(codePtr, kCallEntryOffset, 8);
+        const std::int32_t entry = load(codePtr, kCallEntryOffset, 8, false, kAliasHeader);
         branchCmp(entry, IrCond::Eq, 0, slow, 64);
         const std::int32_t self = fn_.newVreg(false);
         coldCall(reinterpret_cast<void*>(&scriptDynNewThis), {rt, fnPayload}, self, -1, true, held);

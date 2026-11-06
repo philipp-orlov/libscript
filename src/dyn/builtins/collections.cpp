@@ -415,14 +415,15 @@ String inspectValue(Runtime& rt, const Value& v, int depth)
     String out = prefix + ascii("{ ");
     bool first = true;
     for (const Prop& p : obj->props) {
-        if (!(p.attrs & PropEnumerable) || p.key->kind == CellKind::Symbol)
+        GCObject* const key = obj->keyOf(p);
+        if (!(obj->attrsOf(p) & PropEnumerable) || key->kind == CellKind::Symbol)
             continue;
         if (!first)
             out += ascii(", ");
         first = false;
-        out += static_cast<StringCell*>(p.key.get())->text();
+        out += static_cast<StringCell*>(key)->text();
         out += u": ";
-        out += p.accessor() ? ascii("[Getter]") : inspectValue(rt, p.value, depth + 1);
+        out += obj->accessorOf(p) ? ascii("[Getter]") : inspectValue(rt, p.value, depth + 1);
     }
     return first ? prefix + ascii("{}") : out + ascii(" }");
 }

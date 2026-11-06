@@ -585,8 +585,9 @@ Value entryOf(Runtime& rt, const Value& holder, const Value& key)
                 return arr->elements[std::size_t(d)];
         }
     } else if (key.isString() && detail::Access::ptr(holder)->kind == CellKind::Object) {
-        if (const Prop* p = static_cast<DynObject*>(detail::Access::ptr(holder))->findOwn(detail::Access::ptr(key))) {
-            if (!p->accessor())
+        auto* const object = static_cast<DynObject*>(detail::Access::ptr(holder));
+        if (const Prop* p = object->findOwn(detail::Access::ptr(key))) {
+            if (!object->accessorOf(*p))
                 return p->value;
         }
     }
@@ -709,15 +710,18 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
     constexpr std::size_t kFewKeys = 32;
     bool plain = obj->cls == ObjClass::Plain && obj->props.size() <= kFewKeys;
     if (plain) {
-        for (const Prop& p : obj->props)
-            plain = plain && !p.accessor() && p.key->kind == CellKind::String && (p.attrs & PropEnumerable) != 0 &&
-                    !isIndexKey(static_cast<StringCell*>(p.key.get())->text());
+        for (std::size_t i = 0; plain && i < obj->props.size(); ++i) {
+            GCObject* const key = obj->keyAt(i);
+            const std::uint8_t attrs = obj->attrsAt(i);
+            plain = !(attrs & PropAccessor) && key->kind == CellKind::String && (attrs & PropEnumerable) != 0 &&
+                    !isIndexKey(static_cast<StringCell*>(key)->text());
+        }
     }
     if (plain) {
         Value keys[kFewKeys];
         const std::size_t count = obj->props.size();
         for (std::size_t i = 0; i < count; ++i)
-            keys[i] = detail::Access::make(Type::String, obj->props[i].key.get());
+            keys[i] = detail::Access::make(Type::String, obj->keyAt(i));
         for (std::size_t i = 0; i < count; ++i) {
             const std::size_t mark = out.size();
             if (!first)
@@ -728,7 +732,7 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
             if (!indent.empty())
                 out.push_back(u' ');
             // Where it was, unless something run since has moved it.
-            const Value item = i < obj->props.size() && obj->props[i].key.get() == detail::Access::ptr(keys[i]) && !obj->props[i].accessor()
+            const Value item = i < obj->props.size() && obj->keyAt(i) == detail::Access::ptr(keys[i]) && !(obj->attrsAt(i) & PropAccessor)
                                    ? obj->props[i].value
                                    : entryOf(rt, v, keys[i]);
             if (!stringifyItem(rt, v, keys[i], item, replacer, indent, inner, out, path)) {

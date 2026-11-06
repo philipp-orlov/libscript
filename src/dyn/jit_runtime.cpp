@@ -415,7 +415,7 @@ GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
     if (fn->fnKind != FnKind::Bytecode || fn->isArrow)
         return nullptr;
     const Prop* prototype = fn->findOwn(rt->atom.prototype.get());
-    if (!prototype || prototype->accessor())
+    if (!prototype || fn->accessorOf(*prototype))
         return nullptr;
     DynObject* proto = asObject(prototype->value);
     if (!proto)

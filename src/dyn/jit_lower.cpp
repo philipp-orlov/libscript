@@ -46,7 +46,9 @@ constexpr std::int64_t kCellKindOffset = offsetof(GCObject, kind);
 constexpr std::int64_t kClsOffset = offsetof(DynObject, cls);
 constexpr std::int64_t kShapeOffset = offsetof(DynObject, shape);
 constexpr std::int64_t kProtoOffset = offsetof(DynObject, proto);  // the first word of a reference is the pointer
-constexpr std::int64_t kPropsOffset = offsetof(DynObject, props);  // the first word of a vector is its data
+constexpr std::int64_t kPropsOffset = offsetof(DynObject, props);  // the first word of the table is its data
+constexpr std::int64_t kPropsSizeOffset = kPropsOffset + 8;
+constexpr std::int64_t kPropsCapOffset = kPropsOffset + 12;
 constexpr std::int64_t kFrozenOffset = offsetof(DynObject, frozen);
 constexpr std::int64_t kIsProtoOffset = offsetof(DynObject, isProto);
 constexpr std::int64_t kExtensibleOffset = offsetof(DynObject, extensible);
@@ -55,8 +57,6 @@ constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
 constexpr std::int64_t kStringCharsOffset = sizeof(StringCell);
 constexpr std::int64_t kRareOffset = offsetof(DynObject, rare);
 constexpr std::int64_t kPropValueOffset = offsetof(Prop, value);
-constexpr std::int64_t kPropKeyOffset = offsetof(Prop, key);
-constexpr std::int64_t kPropAttrsOffset = offsetof(Prop, attrs);
 constexpr std::int64_t kElementsOffset = offsetof(DynArray, elements);
 constexpr std::int64_t kFnCodeOffset = offsetof(DynFunction, code);  // the first word of a shared_ptr is the pointer
 constexpr std::int64_t kFnUpvaluesOffset = offsetof(DynFunction, upvalues);
@@ -2140,7 +2140,7 @@ private:
                 GCObject* key = code_.atoms[operand()].get();
                 secureWeak();
                 const Prop* found = rt_.globalObject->findOwn(key);
-                if (found && !found->accessor() && (found->attrs & PropWritable)) {
+                if (found && !rt_.globalObject->accessorOf(*found) && (rt_.globalObject->attrsOf(*found) & PropWritable)) {
                     // A writable global where it was: the property takes the value's count, what it held loses one.
                     makeOwned(value);
                     const std::int32_t tag = tagReg(value);
@@ -2196,21 +2196,9 @@ private:
                         const std::int32_t vr = payloadReg(value);
                         const std::int64_t at = std::int64_t(object.fresh->count) * std::int64_t(sizeof(Prop));
                         const std::int32_t props = loadHeader(object.r, kPropsOffset);
-                        const std::int32_t k = ptrReg(key);
-                        if (!key->pinned)
-                            incRefOf(k, -1, false);
-                        store(props, at + kPropKeyOffset, k, 8);
                         store(props, at + kPropValueOffset, vt, 1);
                         store(props, at + kPropValueOffset + kPayload, vr, 8);
-                        store(props, at + kPropAttrsOffset, immReg(PropDefault), 1);
-                        const std::int32_t end = fn_.newVreg(false);
-                        IrInst& add = inst(IrOp::Add);
-                        add.d = end;
-                        add.a = props;
-                        add.hasImm = true;
-                        add.imm = at + std::int64_t(sizeof(Prop));
-                        add.width = 64;
-                        storeHeader(object.r, kPropsOffset + 8, end);
+                        store(object.r, kPropsSizeOffset, immReg(std::int64_t(next->count)), 4, kAliasHeader);
                         storeHeader(object.r, kShapeOffset, ptrReg(next));
                         object.fresh = next;
                         return true;
@@ -2700,7 +2688,7 @@ private:
                 return false;
         }
         const Prop* prototype = fn->findOwn(rt_.atom.prototype.get());
-        if (!prototype || prototype->accessor() || !prototype->value.isObject())
+        if (!prototype || fn->accessorOf(*prototype) || !prototype->value.isObject())
             return false;
         const std::int64_t at = std::int64_t(prototype - fn->props.data()) * std::int64_t(sizeof(Prop));
         const std::int32_t bail = newLabel();
@@ -2942,7 +2930,7 @@ private:
         DynObject* global = rt_.globalObject.get();
         const Prop* found = global->findOwn(key);
         // A global holding a number, which nothing here assigns, is taken to be a constant, and treated as one from here on.
-        if (found && !found->accessor() && found->value.isDouble() && betHere() && !assignsGlobal(key)) {
+        if (found && !global->accessorOf(*found) && found->value.isDouble() && betHere() && !assignsGlobal(key)) {
             const std::int32_t bail = newLabel();
             const std::int32_t slot = globalSlot(found, bail);
             const std::int32_t lt = load(slot, kPropValueOffset, 1);
@@ -2963,7 +2951,7 @@ private:
             return;
         }
         // Where the property was when this was compiled, while the global object's table has not changed since.
-        if (found && !found->accessor()) {
+        if (found && !global->accessorOf(*found)) {
             const std::int32_t slot = globalSlot(found, slow);
             const std::int32_t lt = load(slot, kPropValueOffset, 1);
             const std::int32_t lr = load(slot, kPropValueOffset + kPayload, 8);
@@ -2985,7 +2973,7 @@ private:
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;
         Entry result = taggedEntry(r, t, Own::Weak);
-        if (found && !found->accessor() && found->value.isObject())
+        if (found && !global->accessorOf(*found) && found->value.isObject())
             result.hint = detail::Access::ptr(found->value);
         pin(result);
         push(result);
@@ -3331,7 +3319,7 @@ private:
         DynObject* proto = rt_.stringProto.get();
         GCObject* key = code_.atoms[operand & kAtomMask].get();
         const Prop* found = proto ? proto->findOwn(key) : nullptr;
-        if (!found || found->accessor())
+        if (!found || proto->accessorOf(*found))
             return false;
         const std::uint32_t index = std::uint32_t(found - proto->props.data());
         const std::int32_t bail = newLabel();
@@ -3367,33 +3355,15 @@ private:
         // No index to keep up, nor anything else out of the ordinary.
         const std::int32_t rare = load(base.r, kRareOffset, 8, false, kAliasHeader);
         branchCmp(rare, IrCond::Ne, 0, slow, 64);
-        const std::int32_t end = loadHeader(base.r, kPropsOffset + 8);
-        const std::int32_t cap = loadHeader(base.r, kPropsOffset + 16);
-        {
-            IrInst& test = inst(IrOp::BrCmp);
-            test.a = end;
-            test.b = cap;
-            test.cond = IrCond::Eq;
-            test.width = 64;
-            test.target = slow;
-        }
-        GCObject* name = code_.atoms[operand & kAtomMask].get();
-        const std::int32_t key = ptrReg(name);
-        // The shape this adds to has the name, which pins it.
-        if (!name->pinned)
-            incRefOf(key, -1, false);
-        store(end, kPropKeyOffset, key, 8);
-        store(end, kPropValueOffset, vt, 1);
-        store(end, kPropValueOffset + kPayload, vr, 8);
-        store(end, kPropAttrsOffset, immReg(PropDefault), 1);
-        const std::int32_t next = fn_.newVreg(false);
-        IrInst& add = inst(IrOp::Add);
-        add.d = next;
-        add.a = end;
-        add.hasImm = true;
-        add.imm = std::int64_t(sizeof(Prop));
-        add.width = 64;
-        storeHeader(base.r, kPropsOffset + 8, next);
+        // The shape this adds to says how many there are.
+        const std::uint32_t count = site->addTo->count - 1;
+        const std::int32_t cap = load(base.r, kPropsCapOffset, 4, false, kAliasHeader);
+        branchCmp(cap, IrCond::Le, std::int64_t(count), slow);
+        const std::int32_t props = loadHeader(base.r, kPropsOffset);
+        const std::int64_t at = std::int64_t(count) * std::int64_t(sizeof(Prop));
+        store(props, at + kPropValueOffset, vt, 1);
+        store(props, at + kPropValueOffset + kPayload, vr, 8);
+        store(base.r, kPropsSizeOffset, immReg(std::int64_t(count) + 1), 4, kAliasHeader);
         storeHeader(base.r, kShapeOffset, ptrReg(site->addTo));
     }
 
@@ -3700,14 +3670,8 @@ private:
         // Frozen, or with named properties that might include an index: the long way.
         const std::int32_t frozen = load(base.r, kFrozenOffset, 1, false, kAliasHeader);
         branchCmp(frozen, IrCond::Ne, 0, slow);
-        const std::int32_t propsBegin = loadHeader(base.r, kPropsOffset);
-        const std::int32_t propsEnd = loadHeader(base.r, kPropsOffset + 8);
-        IrInst& noProps = inst(IrOp::BrCmp);
-        noProps.a = propsBegin;
-        noProps.b = propsEnd;
-        noProps.cond = IrCond::Ne;
-        noProps.width = 64;
-        noProps.target = slow;
+        const std::int32_t named = load(base.r, kPropsSizeOffset, 4, false, kAliasHeader);
+        branchCmp(named, IrCond::Ne, 0, slow);
         const std::int32_t i = arrayIndex(key, slow);
         const std::int32_t data = loadHeader(base.r, kElementsOffset);
         const std::int32_t end = loadHeader(base.r, kElementsOffset + 8);
@@ -4456,7 +4420,7 @@ private:
                 ++copies;
         }
         const Prop* prototype = fn->findOwn(rt_.atom.prototype.get());
-        if (copies > 1 || !prototype || prototype->accessor() || !prototype->value.isObject())
+        if (copies > 1 || !prototype || fn->accessorOf(*prototype) || !prototype->value.isObject())
             return false;
         auto* proto = static_cast<DynObject*>(detail::Access::ptr(prototype->value));
         Shape* root = rt_.rootShapeFor(proto);

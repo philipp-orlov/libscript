@@ -356,7 +356,7 @@ Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Valu
                 return Value(double(s->text().size()));
         }
         if (const Prop* p = cursor->findOwn(key)) {
-            if (!p->accessor())
+            if (!cursor->accessorOf(*p))
                 return p->value;
             if (p->value.isUndefined())
                 return Value::undefined();
@@ -427,7 +427,7 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
             // setter can take the write.
             for (DynObject* cursor = proto; cursor; cursor = cursor->proto.get()) {
                 if (const Prop* p = cursor->findOwn(key)) {
-                    if (p->accessor() && !cursor->setterOf(*p).isUndefined()) {
+                    if (cursor->accessorOf(*p) && !cursor->setterOf(*p).isUndefined()) {
                         callValue(rt, cursor->setterOf(*p), base, {v});
                         return;
                     }
@@ -444,7 +444,7 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
         const Prop* p = cursor->findOwn(key);
         if (!p)
             continue;
-        if (p->accessor()) {
+        if (cursor->accessorOf(*p)) {
             const Value setter = cursor->setterOf(*p);
             if (setter.isUndefined())
                 return;
@@ -452,7 +452,7 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
             return;
         }
         if (cursor == obj) {
-            if (!(p->attrs & PropWritable))
+            if (!(obj->attrsOf(*p) & PropWritable))
                 return;
             obj->findOwn(key)->value = v;
             return;
@@ -531,7 +531,7 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
         if (!p)
             continue;
         const std::uint32_t at = std::uint32_t(p - cursor->props.data());
-        if (p->accessor()) {
+        if (cursor->accessorOf(*p)) {
             // A getter that is a function, called with the receiver each time; the property itself stays put.
             if (!p->value.isObject() || cursor == obj)
                 break;
@@ -621,7 +621,7 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
         return;
     }
     if (const Prop* own = obj->findOwn(key)) {
-        if ((own->attrs & (PropAccessor | PropWritable)) == PropWritable) {
+        if ((obj->attrsOf(*own) & (PropAccessor | PropWritable)) == PropWritable) {
             if (site->plainOwn()) {
                 site->addShape(before, std::uint32_t(own - obj->props.data()));
                 setProperty(rt, base, key, v);
@@ -641,8 +641,8 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
     setProperty(rt, base, key, v);
     // It went on the end of the table, with the plain attributes: the same will happen for this shape as long as nothing
     // on the prototype chain changes, since nothing there has a setter for it now.
-    if (obj->shape && obj->shape != before && obj->props.size() == count + 1 && obj->props.back().key.get() == key &&
-        obj->props.back().attrs == PropDefault) {
+    if (obj->shape && obj->shape != before && obj->props.size() == count + 1 && obj->keyAt(count) == key &&
+        obj->attrsAt(count) == PropDefault) {
         site->shape = before;
         site->holder = nullptr;
         site->getter = false;
@@ -665,7 +665,7 @@ inline void setPropertySite(Runtime& rt, const FunctionCode& code, const Value& 
                 return;
             }
             if (site->epoch == rt.ctx.protoEpoch) {
-                obj->appendKnown(key, v, site->addTo);
+                obj->appendKnown(v, site->addTo);
                 return;
             }
         } else if (obj->shape && site->moreCount) {
@@ -748,15 +748,16 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
                 keys.push_back(rt.str(numberToString(i)));
         }
     }
-    for (const Prop& p : obj->props) {
-        if (enumerableOnly && !(p.attrs & PropEnumerable))
+    for (std::size_t i = 0; i < obj->props.size(); ++i) {
+        if (enumerableOnly && !(obj->attrsAt(i) & PropEnumerable))
             continue;
-        if (p.key->kind == CellKind::Symbol) {
+        GCObject* const key = obj->keyAt(i);
+        if (key->kind == CellKind::Symbol) {
             if (includeSymbols)
-                keys.push_back(detail::Access::make(Type::Symbol, p.key.get()));
+                keys.push_back(detail::Access::make(Type::Symbol, key));
             continue;
         }
-        keys.push_back(detail::Access::make(Type::String, p.key.get()));
+        keys.push_back(detail::Access::make(Type::String, key));
     }
     return keys;
 }
@@ -880,7 +881,7 @@ bool instanceOf(Runtime& rt, const Value& object, const Value& ctor)
     if (!start)
         return false;
     const Prop* own = plain ? fn->findOwn(rt.atom.prototype.get()) : nullptr;
-    Value proto = own && !own->accessor() ? own->value : getPropertyOfObject(rt, fn, rt.atom.prototype.get(), ctor);
+    Value proto = own && !fn->accessorOf(*own) ? own->value : getPropertyOfObject(rt, fn, rt.atom.prototype.get(), ctor);
     DynObject* target = asObject(proto);
     if (!target)
         throwError(rt, ErrorCode::TypeError, "the constructor has no object prototype");
@@ -1242,7 +1243,7 @@ void setPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& ba
 Value getGlobalForNative(Runtime& rt, GCObject* key)
 {
     const Prop* p = rt.globalObject->findOwn(key);
-    if (p && !p->accessor())
+    if (p && !rt.globalObject->accessorOf(*p))
         return p->value;
     const Value g = detail::Access::make(Type::Object, rt.globalObject.get());
     if (!p && !hasProperty(rt, g, key))
@@ -1293,7 +1294,7 @@ void defineMemberForNative(Runtime& rt, int mode, DynObject* target, GCObject* k
         return;
     }
     Prop* existing = target->findOwn(key);
-    if (!existing || !existing->accessor())
+    if (!existing || !target->accessorOf(*existing))
         existing = &target->putOwn(key, Value::undefined(), PropEnumerable | PropConfigurable | PropAccessor);
     if (mode == 1)
         existing->value = v;
@@ -1551,7 +1552,7 @@ Value execute(Runtime& rt, Frame& frame)
                         GCObject* key = code.atoms[operandAt(pc)].get();
                         pc += 4;
                         const Prop* p = rt.globalObject->findOwn(key);
-                        if (p && !p->accessor()) {
+                        if (p && !rt.globalObject->accessorOf(*p)) {
                             sp.push_back(p->value);
                             break;
                         }
@@ -1751,7 +1752,7 @@ Value execute(Runtime& rt, Frame& frame)
                         if (DynFunction* m = asFunction(fn))
                             m->homeObject.reset(target);
                         Prop* existing = target->findOwn(key);
-                        if (!existing || !existing->accessor())
+                        if (!existing || !target->accessorOf(*existing))
                             existing = &target->putOwn(key, Value::undefined(),
                                                        PropEnumerable | PropConfigurable |
                                                            PropAccessor);

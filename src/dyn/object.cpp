@@ -27,12 +27,65 @@ SymbolCell::~SymbolCell()
 
 // ---------------------------------------------------------- properties ---
 
+const Shape::Entry* Shape::entries() const
+{
+    if (table_.empty() && count) {
+        table_.resize(count);
+        std::uint32_t at = count;
+        for (const Shape* s = this; s->parent; s = s->parent)
+            table_[--at] = Entry{s->key.get(), s->attrs};
+    }
+    return table_.data();
+}
+
+std::int32_t Shape::indexOf(const GCObject* k) const
+{
+    // Up the chain for a small shape, or one asked about only in passing: an object being built asks each shape it passes
+    // through once, and a table for each of those would be a square of its size.
+    constexpr std::uint32_t kWalkUpTo = 8;
+    constexpr std::uint32_t kAskedBeforeTable = 4;
+    if (lookup_.empty()) {
+        if (count <= kWalkUpTo || ++asked_ < kAskedBeforeTable) {
+            std::int32_t at = std::int32_t(count);
+            for (const Shape* s = this; s->parent; s = s->parent) {
+                --at;
+                if (s->key.get() == k)
+                    return at;
+            }
+            return -1;
+        }
+        const Entry* all = entries();
+        lookup_.assign(tableSizeFor(std::size_t(count) * 2), 0);
+        const std::size_t mask = lookup_.size() - 1;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::size_t slot = hashPointer(all[i].key) & mask;
+            while (lookup_[slot])
+                slot = (slot + 1) & mask;
+            lookup_[slot] = i + 1;
+        }
+    }
+    const std::size_t mask = lookup_.size() - 1;
+    for (std::size_t slot = hashPointer(k) & mask;; slot = (slot + 1) & mask) {
+        const std::uint32_t packed = lookup_[slot];
+        if (!packed)
+            return -1;
+        if (table_[packed - 1].key == k)
+            return std::int32_t(packed - 1);
+    }
+}
+
 Prop* DynObject::findOwn(GCObject* key) noexcept
 {
-    if (!rare || rare->index.empty()) {
-        for (Prop& p : props) {
-            if (p.key.get() == key)
-                return &p;
+    if (shape) {
+        const std::int32_t at = shape->indexOf(key);
+        return at < 0 ? nullptr : &props[std::size_t(at)];
+    }
+    if (!rare)
+        return nullptr;
+    if (rare->index.empty()) {
+        for (std::size_t i = 0; i < rare->keys.size(); ++i) {
+            if (rare->keys[i].key.get() == key)
+                return &props[i];
         }
         return nullptr;
     }
@@ -44,9 +97,8 @@ Prop* DynObject::findOwn(GCObject* key) noexcept
         const std::uint32_t packed = index[slot];
         if (!packed)
             return nullptr;
-        Prop& p = props[packed - 1];
-        if (p.key.get() == key)
-            return &p;
+        if (rare->keys[packed - 1].key.get() == key)
+            return &props[packed - 1];
         slot = (slot + 1) & mask;
     }
 }
@@ -60,12 +112,32 @@ void DynObject::setProto(DynObject* next)
     proto.reset(next);
     // With nothing in it yet, it can start from what that prototype's other children start from.
     Runtime* engine = rt ? rt->dynIfAny() : nullptr;
-    shape = engine && props.empty() ? engine->rootShapeFor(next) : nullptr;
+    if (engine && props.empty())
+        shape = engine->rootShapeFor(next);
+    else
+        moveKeysHere();
+}
+
+void DynObject::moveKeysHere() noexcept
+{
+    if (!shape)
+        return;
+    if (!props.empty()) {
+        const Shape::Entry* all = shape->entries();
+        Vec<Rare::Key>& keys = rareOf().keys;
+        keys.resize(props.size());
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            keys[i].key.reset(all[i].key);
+            keys[i].attrs = all[i].attrs;
+        }
+    }
+    shape = nullptr;
+    reindex();
 }
 
 void DynObject::dropShape() noexcept
 {
-    shape = nullptr;
+    moveKeysHere();
     if (isProto && rt)
         ++rt->protoEpoch;
     tableChanged();
@@ -78,20 +150,13 @@ void DynObject::tableChanged() noexcept
         ++engine->globalEpoch;
 }
 
-void DynObject::appendKnown(GCObject* key, Value value, Shape* next)
+void DynObject::appendKnown(Value value, Shape* next)
 {
     const std::size_t before = props.capacity();
-    props.emplace_back();
-    Prop& p = props.back();
-    p.key.reset(key);
-    p.value = std::move(value);
+    props.emplace_back().value = std::move(value);
     if (props.capacity() != before)
         tableChanged();
     chargeIfGrown(props, before);
-    if (props.size() > kIndexThreshold && (!rare || rare->index.size() < props.size() * 2))
-        reindex();
-    else if (rare && !rare->index.empty())
-        indexInsert(std::uint32_t(props.size() - 1));
     shape = next;
     if (isProto)
         ++rt->protoEpoch;
@@ -101,30 +166,37 @@ Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
 {
     if (Prop* existing = findOwn(key)) {
         existing->value = std::move(value);
-        setSetter(*existing, Value::undefined());
-        if (existing->attrs != attrs) {
-            existing->attrs = attrs;
+        setSetterOf(key, Value::undefined());
+        if (attrsOf(*existing) != attrs) {
             dropShape();
+            setAttrsAt(std::size_t(existing - props.data()), attrs);
         }
         return *existing;
     }
+    if (shape) {
+        Runtime* engine = rt ? rt->dynIfAny() : nullptr;
+        Shape* next = engine ? engine->shapeAfter(shape, key, attrs) : nullptr;
+        if (next)
+            shape = next;
+        else
+            moveKeysHere();
+    }
     const std::size_t before = props.capacity();
-    props.emplace_back();
-    Prop& p = props.back();
-    p.key.reset(key);
+    Prop& p = props.emplace_back();
     p.value = std::move(value);
-    p.attrs = attrs;
     if (props.capacity() != before)
         tableChanged();
     chargeIfGrown(props, before);
 
-    if (props.size() > kIndexThreshold && (!rare || rare->index.size() < props.size() * 2))
-        reindex();
-    else if (rare && !rare->index.empty())
-        indexInsert(std::uint32_t(props.size() - 1));
-    if (shape) {
-        Runtime* engine = rt ? rt->dynIfAny() : nullptr;
-        shape = engine ? engine->shapeAfter(shape, key, attrs) : nullptr;
+    if (!shape) {
+        Rare& r = rareOf();
+        r.keys.emplace_back();
+        r.keys.back().key.reset(key);
+        r.keys.back().attrs = attrs;
+        if (props.size() > kIndexThreshold && r.index.size() < props.size() * 2)
+            reindex();
+        else if (!r.index.empty())
+            indexInsert(std::uint32_t(props.size() - 1));
     }
     if (isProto && rt)
         ++rt->protoEpoch;
@@ -133,26 +205,26 @@ Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
 
 bool DynObject::deleteOwn(GCObject* key)
 {
-    for (std::size_t i = 0; i < props.size(); ++i) {
-        if (props[i].key.get() != key)
-            continue;
-        if (!(props[i].attrs & PropConfigurable))
-            return false;
-        setSetter(props[i], Value::undefined());
-        props.erase(props.begin() + std::ptrdiff_t(i));
-        dropShape();
-        reindex();
-        trim();
-        return true;
-    }
-    return true;  // deleting a missing property succeeds
+    Prop* p = findOwn(key);
+    if (!p)
+        return true;  // deleting a missing property succeeds
+    if (!(attrsOf(*p) & PropConfigurable))
+        return false;
+    setSetterOf(key, Value::undefined());
+    dropShape();
+    const std::ptrdiff_t at = p - props.data();
+    props.erase(p);
+    rare->keys.erase(rare->keys.begin() + at);
+    reindex();
+    trim();
+    return true;
 }
 
 void DynObject::indexInsert(std::uint32_t at) noexcept
 {
     Vec<std::uint32_t>& index = rare->index;
     const std::size_t mask = index.size() - 1;
-    std::size_t slot = hashPointer(props[at].key.get()) & mask;
+    std::size_t slot = hashPointer(rare->keys[at].key.get()) & mask;
     while (index[slot])
         slot = (slot + 1) & mask;
     index[slot] = at + 1;
@@ -160,7 +232,7 @@ void DynObject::indexInsert(std::uint32_t at) noexcept
 
 void DynObject::reindex()
 {
-    if (props.size() <= kIndexThreshold) {
+    if (shape || props.size() <= kIndexThreshold) {
         if (rare) {
             rare->index.clear();
             rare->index.shrink_to_fit();
@@ -186,10 +258,14 @@ void DynObject::children(GcList& out) const
     if (proto && !proto->pinned)
         out.push_back(proto.get());
     for (const Prop& p : props) {
-        if (p.key && !p.key->pinned)
-            out.push_back(p.key.get());
         if (GCObject* v = detail::Access::ptr(p.value))
             out.push_back(v);
+    }
+    if (rare) {
+        for (const Rare::Key& k : rare->keys) {
+            if (k.key && !k.key->pinned)
+                out.push_back(k.key.get());
+        }
     }
     if (rare && rare->setters) {
         for (const auto& [key, fn] : *rare->setters) {
@@ -199,7 +275,7 @@ void DynObject::children(GcList& out) const
     }
 }
 
-void DynObject::setSetter(const Prop& p, Value fn)
+void DynObject::setSetterOf(GCObject* key, Value fn)
 {
     if (!rare || !rare->setters) {
         if (fn.isUndefined())
@@ -208,7 +284,7 @@ void DynObject::setSetter(const Prop& p, Value fn)
     }
     auto& setters = *rare->setters;
     for (std::size_t i = 0; i < setters.size(); ++i) {
-        if (setters[i].first.get() != p.key.get())
+        if (setters[i].first.get() != key)
             continue;
         if (fn.isUndefined()) {
             setters[i] = std::move(setters.back());
@@ -219,7 +295,7 @@ void DynObject::setSetter(const Prop& p, Value fn)
         return;
     }
     if (!fn.isUndefined())
-        setters.push_back({Ref<GCObject>(p.key.get()), std::move(fn)});
+        setters.push_back({Ref<GCObject>(key), std::move(fn)});
 }
 
 void DynObject::clearReferences()
@@ -229,6 +305,8 @@ void DynObject::clearReferences()
     props.clear();
     props.shrink_to_fit();
     if (rare) {
+        rare->keys.clear();
+        rare->keys.shrink_to_fit();
         rare->index.clear();
         rare->index.shrink_to_fit();
         rare->setters.reset();
@@ -241,7 +319,8 @@ std::size_t DynObject::heapSize() const
     const std::size_t cell = kind == CellKind::Object && cls == ObjClass::Plain && cellBytes > sizeof(*this)
                                  ? cellBytes
                                  : sizeof(*this);
-    return cell + props.heapCapacity() * sizeof(Prop) + (rare ? rare->index.capacity() * sizeof(std::uint32_t) : 0);
+    return cell + props.heapCapacity() * sizeof(Prop) +
+           (rare ? rare->index.capacity() * sizeof(std::uint32_t) + rare->keys.capacity() * sizeof(Rare::Key) : 0);
 }
 
 // -------------------------------------------------------------- arrays ---

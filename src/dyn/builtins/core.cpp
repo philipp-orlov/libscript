@@ -72,7 +72,7 @@ void installObject(Runtime& rt)
             return Value(false);
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(0));
         const Prop* p = self->findOwn(key.get());
-        return Value(p && (p->attrs & PropEnumerable));
+        return Value(p && (self->attrsOf(*p) & PropEnumerable));
     }, 1);
 
     rt.method(proto, "toString", [](CallInfo& ci) {
@@ -235,15 +235,16 @@ void installObject(Runtime& rt)
             return Value::undefined();
         DynObject* out = rt2.newObject(rt2.objectProto.get());
         Value result = detail::Access::adopt(Type::Object, out);
-        if (p->accessor()) {
+        const std::uint8_t attrs = self->attrsOf(*p);
+        if (attrs & PropAccessor) {
             out->putOwn(rt2.intern("get"), p->value);
             out->putOwn(rt2.intern("set"), self->setterOf(*p));
         } else {
             out->putOwn(rt2.atom.value.get(), p->value);
-            out->putOwn(rt2.intern("writable"), Value((p->attrs & PropWritable) != 0));
+            out->putOwn(rt2.intern("writable"), Value((attrs & PropWritable) != 0));
         }
-        out->putOwn(rt2.intern("enumerable"), Value((p->attrs & PropEnumerable) != 0));
-        out->putOwn(rt2.intern("configurable"), Value((p->attrs & PropConfigurable) != 0));
+        out->putOwn(rt2.intern("enumerable"), Value((attrs & PropEnumerable) != 0));
+        out->putOwn(rt2.intern("configurable"), Value((attrs & PropConfigurable) != 0));
         return result;
     }, 2);
 
@@ -252,8 +253,8 @@ void installObject(Runtime& rt)
             self->frozen = true;
             self->extensible = false;
             self->dropShape();
-            for (Prop& p : self->props)
-                p.attrs = std::uint8_t(p.attrs & ~(PropWritable | PropConfigurable));
+            for (std::size_t i = 0; i < self->props.size(); ++i)
+                self->setAttrsAt(i, std::uint8_t(self->attrsAt(i) & ~(PropWritable | PropConfigurable)));
         }
         return ci.arg(0);
     }, 1);

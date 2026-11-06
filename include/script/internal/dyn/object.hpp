@@ -89,17 +89,16 @@ private:
     T* p_ = nullptr;
 };
 
+/// One property's value. Its name and attributes are the object's shape's to say, or, for an object without one, in the
+/// table of its `Rare`: `DynObject::keyAt` and `attrsAt` ask. Objects of a shape share them, so a property takes no more
+/// than what is different in each object.
 struct Prop
 {
-    PinRef<GCObject> key;
     Value value = Value::undefined();
-    std::uint8_t attrs = PropDefault;
-
-    bool accessor() const noexcept { return (attrs & PropAccessor) != 0; }
 };
 
-/// A property table: a vector's three pointers, which native code reads as one, over storage that may start out at the
-/// end of the object itself, so that a small object is a single allocation.
+/// A property table: a pointer and two counts, over storage that may start out at the end of the object itself, so that a
+/// small object is a single allocation.
 class PropVec
 {
 public:
@@ -119,42 +118,32 @@ public:
     /// Start out in `count` slots at `room`, which belong to the owner and are never freed from here.
     void adopt(Prop* room, std::size_t count) noexcept
     {
-        begin_ = end_ = room;
-        cap_ = room + count;
+        begin_ = room;
+        size_ = 0;
+        cap_ = std::uint32_t(count);
     }
 
     Prop* begin() noexcept { return begin_; }
-    Prop* end() noexcept { return end_; }
+    Prop* end() noexcept { return begin_ + size_; }
     const Prop* begin() const noexcept { return begin_; }
-    const Prop* end() const noexcept { return end_; }
+    const Prop* end() const noexcept { return begin_ + size_; }
     Prop* data() noexcept { return begin_; }
     const Prop* data() const noexcept { return begin_; }
-    std::size_t size() const noexcept { return std::size_t(end_ - begin_); }
-    std::size_t capacity() const noexcept { return std::size_t(cap_ - begin_); }
-    bool empty() const noexcept { return end_ == begin_; }
+    std::size_t size() const noexcept { return size_; }
+    std::size_t capacity() const noexcept { return cap_; }
+    bool empty() const noexcept { return size_ == 0; }
     Prop& operator[](std::size_t i) noexcept { return begin_[i]; }
     const Prop& operator[](std::size_t i) const noexcept { return begin_[i]; }
-    Prop& back() noexcept { return end_[-1]; }
-    const Prop& back() const noexcept { return end_[-1]; }
+    Prop& back() noexcept { return begin_[size_ - 1]; }
+    const Prop& back() const noexcept { return begin_[size_ - 1]; }
     /// Slots allocated apart from the owner.
     std::size_t heapCapacity() const noexcept { return inCell() ? 0 : capacity(); }
 
     Prop& emplace_back()
     {
-        if (end_ == cap_)
-            reallocate(size() < 2 ? 4 : size() * 2);
-        return *new (end_++) Prop();
-    }
-    void push_back(Prop&& p)
-    {
-        if (end_ == cap_)
-            reallocate(size() < 2 ? 4 : size() * 2);
-        new (end_++) Prop(std::move(p));
-    }
-    void push_back(const Prop& p)
-    {
-        Prop copy{p.key, p.value, p.attrs};
-        push_back(std::move(copy));
+        if (size_ == cap_)
+            reallocate(size_ < 2 ? 4 : std::size_t(size_) * 2);
+        return *new (begin_ + size_++) Prop();
     }
     void reserve(std::size_t n)
     {
@@ -163,41 +152,40 @@ public:
     }
     void shrink_to_fit()
     {
-        if (inCell() || end_ == cap_)
+        if (inCell() || size_ == cap_)
             return;
         if (empty()) {
             release();
-            begin_ = end_ = cap_ = nullptr;
+            begin_ = nullptr;
+            cap_ = 0;
             return;
         }
-        reallocate(size());
+        reallocate(size_);
     }
     Prop* erase(Prop* at)
     {
-        for (Prop* p = at; p + 1 < end_; ++p)
+        for (Prop* p = at; p + 1 < end(); ++p)
             *p = std::move(p[1]);
-        (--end_)->~Prop();
+        begin_[--size_].~Prop();
         return at;
     }
     void clear() noexcept
     {
-        while (end_ != begin_)
-            (--end_)->~Prop();
+        while (size_)
+            begin_[--size_].~Prop();
     }
 
 private:
     void reallocate(std::size_t n)
     {
         Prop* fresh = PoolAlloc<Prop>().allocate(n);
-        Prop* out = fresh;
-        for (Prop* p = begin_; p != end_; ++p, ++out) {
-            new (out) Prop(std::move(*p));
-            p->~Prop();
+        for (std::uint32_t i = 0; i < size_; ++i) {
+            new (fresh + i) Prop(std::move(begin_[i]));
+            begin_[i].~Prop();
         }
         release();
         begin_ = fresh;
-        end_ = out;
-        cap_ = fresh + n;
+        cap_ = std::uint32_t(n);
     }
     void release() noexcept
     {
@@ -206,8 +194,8 @@ private:
     }
 
     Prop* begin_ = nullptr;
-    Prop* end_ = nullptr;
-    Prop* cap_ = nullptr;
+    std::uint32_t size_ = 0;
+    std::uint32_t cap_ = 0;
     /// Whether the slots are still the ones in the owner's cell.
     bool inCell() const noexcept;
 };
@@ -241,6 +229,8 @@ struct Shape
 
     Ref<GCObject> key;  ///< the property this one added, null for a root
     std::uint8_t attrs = 0;
+    /// Every property of this shape has the attributes of a plain assignment: nothing to look up for most objects.
+    bool plainAttrs = true;
     std::uint32_t count = 0;
     /// Where this tree of shapes starts, and there, how many properties its objects have been seen to reach: a new one
     /// takes its table at that size and grows no more.
@@ -259,6 +249,16 @@ struct Shape
         }
         return false;
     }
+    /// A property, by its place in the table.
+    struct Entry
+    {
+        GCObject* key;
+        std::uint8_t attrs;
+    };
+    /// All of them in order, made the first time something asks.
+    const Entry* entries() const;
+    /// Where `k` is in the table, or -1.
+    std::int32_t indexOf(const GCObject* k) const;
     struct Transition
     {
         GCObject* key;
@@ -266,6 +266,13 @@ struct Shape
         Shape* to;
     };
     Vec<Transition> transitions;
+
+private:
+    /// What `entries` and `indexOf` keep, for the few shapes they are asked about. The lookup is the same table as an
+    /// object's own index: key to place plus one.
+    mutable Vec<Entry> table_;
+    mutable Vec<std::uint32_t> lookup_;
+    mutable std::uint32_t asked_ = 0;
 };
 
 struct DynObject : GCObject
@@ -281,16 +288,37 @@ struct DynObject : GCObject
     PinRef<DynObject> proto;
     /// Sets `proto`, keeping what shapes and sites know right. Every change of prototype goes through here.
     void setProto(DynObject* next);
-    /// The layout is about to change in a way no shape describes.
+    /// The layout is about to change in a way no shape describes. The names and attributes move to the object's own table.
     void dropShape() noexcept;
+    /// Its properties, in table order.
+    GCObject* keyAt(std::size_t i) const noexcept { return shape ? shape->entries()[i].key : rare->keys[i].key.get(); }
+    std::uint8_t attrsAt(std::size_t i) const noexcept
+    {
+        if (!shape)
+            return rare->keys[i].attrs;
+        return shape->plainAttrs ? std::uint8_t(PropDefault) : shape->entries()[i].attrs;
+    }
+    /// Those of a property of this object, which `p` must be.
+    GCObject* keyOf(const Prop& p) const noexcept { return keyAt(std::size_t(&p - props.data())); }
+    std::uint8_t attrsOf(const Prop& p) const noexcept { return attrsAt(std::size_t(&p - props.data())); }
+    bool accessorOf(const Prop& p) const noexcept { return (attrsOf(p) & PropAccessor) != 0; }
+    /// Change one; only an object without a shape can have this differ from its neighbours.
+    void setAttrsAt(std::size_t i, std::uint8_t attrs) noexcept { rare->keys[i].attrs = attrs; }
     /// The table moved or changed shape: the global object says so to native code that reads globals in place.
     void tableChanged() noexcept;
     /// Append a property known to be missing, moving to `next`, the shape that says so.
-    void appendKnown(GCObject* key, Value value, Shape* next);
+    void appendKnown(Value value, Shape* next);
     PropVec props;
     /// What few objects need, kept apart so that the many do not carry it.
     struct Rare
     {
+        /// The names and attributes of the properties of an object without a shape, one for each in `props`.
+        struct Key
+        {
+            PinRef<GCObject> key;
+            std::uint8_t attrs = PropDefault;
+        };
+        Vec<Key> keys;
         /// Open-addressed map from key pointer to `props` index plus one, sized to
         /// a power of two. Built lazily -- small objects are faster to scan -- and
         /// flat, so a property table is one allocation rather than one per entry.
@@ -312,14 +340,15 @@ struct DynObject : GCObject
     {
         if (rare && rare->setters) {
             for (const auto& [key, fn] : *rare->setters) {
-                if (key.get() == p.key.get())
+                if (key.get() == keyOf(p))
                     return fn;
             }
         }
         return Value::undefined();
     }
     /// Undefined removes it.
-    void setSetter(const Prop& p, Value fn);
+    void setSetter(const Prop& p, Value fn) { setSetterOf(keyOf(p), std::move(fn)); }
+    void setSetterOf(GCObject* key, Value fn);
 
     DynObject() { kind = CellKind::Object; }
     void children(GcList& out) const override;
@@ -341,6 +370,7 @@ struct DynObject : GCObject
     static constexpr std::size_t kIndexThreshold = 8;
 
 private:
+    void moveKeysHere() noexcept;
     void indexInsert(std::uint32_t at) noexcept;
 };
 

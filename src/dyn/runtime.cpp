@@ -165,11 +165,11 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     // What was built before this runtime could hand out shapes gets them now, so sites can learn reads from Math, JSON,
     // the constructors and their prototypes.
     for (const Prop& p : globalObject->props) {
-        DynObject* o = p.accessor() ? nullptr : asObject(p.value);
+        DynObject* o = globalObject->accessorOf(p) ? nullptr : asObject(p.value);
         if (!o)
             continue;
         giveShape(o);
-        if (const Prop* proto = o->findOwn(atom.prototype.get()); proto && !proto->accessor())
+        if (const Prop* proto = o->findOwn(atom.prototype.get()); proto && !o->accessorOf(*proto))
             if (DynObject* po = asObject(proto->value))
                 giveShape(po);
     }
@@ -180,12 +180,19 @@ void Runtime::giveShape(DynObject* o)
     if (o->shape)
         return;
     Shape* s = rootShapeFor(o->proto.get());
-    for (const Prop& p : o->props) {
+    for (std::size_t i = 0; i < o->props.size(); ++i) {
         if (!s)
             return;
-        s = shapeAfter(s, p.key.get(), p.attrs);
+        s = shapeAfter(s, o->keyAt(i), o->attrsAt(i));
     }
+    if (!s)
+        return;
     o->shape = s;
+    if (o->rare) {
+        o->rare->keys.clear();
+        o->rare->keys.shrink_to_fit();
+        o->reindex();
+    }
 }
 
 Runtime::~Runtime() = default;
@@ -310,6 +317,7 @@ Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
     // A shape lasts as long as the runtime, so its name does; objects needn't count it.
     key->pin();
     next->attrs = attrs;
+    next->plainAttrs = from->plainAttrs && attrs == PropDefault;
     next->count = from->count + 1;
     next->root = from->root;
     next->parent = from;

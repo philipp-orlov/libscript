@@ -215,7 +215,7 @@ public:
         fn_.osrArguments = {fnReg_, thisTag_, thisReg_};
         // Non-strict: nullish `this` reads as the global object, so it might as well be that from the start. Entering at
         // a loop does the same before it gets here.
-        if (code_.sloppyThis)
+        if (code_.sloppyThis && readsThis())
             normalizeThis();
 
         const std::uint32_t slots = code_.numLocals;
@@ -398,7 +398,7 @@ public:
             mp.d = thisReg_;
             mp.a = payload;
         }
-        if (code_.sloppyThis)
+        if (code_.sloppyThis && readsThis())
             normalizeThis();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
         const std::uint32_t slots = code_.numLocals;
@@ -445,6 +445,17 @@ public:
             cellOwned_[slot] = 1;
         }
         walk();
+    }
+
+    bool readsThis() const
+    {
+        for (std::uint32_t pc = 0; pc < code_.code.size();) {
+            const Op op = Op(code_.code[pc]);
+            if (op == Op::PushThis)
+                return true;
+            pc += 1 + std::uint32_t(operandsOf(op)) * 4;
+        }
+        return false;
     }
 
     void normalizeThis()
@@ -1800,6 +1811,35 @@ private:
                 Entry value = pop();
                 GCObject* key = code_.atoms[operand()].get();
                 secureWeak();
+                const Prop* found = rt_.globalObject->findOwn(key);
+                if (found && !found->accessor() && (found->attrs & PropWritable)) {
+                    // A writable global where it was: the property takes the value's count, what it held loses one.
+                    makeOwned(value);
+                    const std::int32_t tag = tagReg(value);
+                    const std::int32_t payload = payloadReg(value);
+                    const std::int32_t slow = newLabel();
+                    const std::int32_t done = newLabel();
+                    const std::int32_t slot = globalSlot(found, slow);
+                    const std::int32_t oldTag = load(slot, kPropValueOffset, 1);
+                    const std::int32_t old = load(slot, kPropValueOffset + kPayload, 8);
+                    store(slot, kPropValueOffset, tag, 1);
+                    store(slot, kPropValueOffset + kPayload, payload, 8);
+                    decRefOf(old, oldTag, false);
+                    inst(IrOp::ColdBegin);
+                    inst(IrOp::Label).imm = slow;
+                    {
+                        const std::int32_t rt = rtReg();
+                        const std::int32_t k = ptrReg(key);
+                        coldCall(reinterpret_cast<void*>(&scriptDynSetGlobal), {rt, k, tag, payload}, -1, -1, true, {value});
+                        // The helper took its own count.
+                        if (value.own == Own::Owned && !value.isConst && value.rep == Rep::Tagged)
+                            decRefOf(payload, value.hasKnownTag ? -1 : tag, false);
+                    }
+                    inst(IrOp::Br).imm = done;
+                    inst(IrOp::ColdEnd);
+                    inst(IrOp::Label).imm = done;
+                    return true;
+                }
                 const std::int32_t rt = rtReg();
                 const std::int32_t k = ptrReg(key);
                 const std::int32_t tag = tagReg(value);
@@ -2441,6 +2481,27 @@ private:
         inst(IrOp::Label).imm = done;
     }
 
+    /// The address of a global's property, after a check that the table has not changed since it was found there.
+    std::int32_t globalSlot(const Prop* found, std::int32_t slow)
+    {
+        const std::int32_t runtime = rtReg();
+        const std::int64_t offset =
+            std::int64_t(reinterpret_cast<std::uintptr_t>(&rt_.globalEpoch) - reinterpret_cast<std::uintptr_t>(&rt_));
+        const std::int32_t epoch = load(runtime, offset, 8);
+        if (rt_.globalEpoch < 4096) {
+            branchCmp(epoch, IrCond::Ne, std::int64_t(rt_.globalEpoch), slow, 64);
+        } else {
+            const std::int32_t want = immReg(std::int64_t(rt_.globalEpoch));
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = epoch;
+            test.b = want;
+            test.cond = IrCond::Ne;
+            test.width = 64;
+            test.target = slow;
+        }
+        return ptrReg(found);
+    }
+
     void getGlobal(GCObject* key)
     {
         secureWeak();
@@ -2450,39 +2511,11 @@ private:
         const std::int32_t done = newLabel();
         DynObject* global = rt_.globalObject.get();
         const Prop* found = global->findOwn(key);
-        // Where the property is now, checked each time: the table only changes when a global is deleted or added.
+        // Where the property was when this was compiled, while the global object's table has not changed since.
         if (found && !found->accessor()) {
-            const std::size_t index = std::size_t(found - global->props.data());
-            const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
-            const std::int32_t base = ptrReg(global);
-            const std::int32_t props = load(base, kPropsOffset, 8);
-            const std::int32_t size = load(base, kPropsOffset + 8, 8);
-            const std::int32_t count = fn_.newVreg(false);
-            IrInst& sub = inst(IrOp::Sub);
-            sub.d = count;
-            sub.a = size;
-            sub.b = props;
-            sub.width = 64;
-            branchCmp(count, IrCond::Ls, at, slow, 64);
-            const std::int32_t k = load(props, at + kPropKeyOffset, 8);
-            const std::int32_t expected = ptrReg(key);
-            IrInst& test = inst(IrOp::BrCmp);
-            test.a = k;
-            test.b = expected;
-            test.cond = IrCond::Ne;
-            test.width = 64;
-            test.target = slow;
-            const std::int32_t attrs = load(props, at + kPropAttrsOffset, 1);
-            IrInst& mask = inst(IrOp::And);
-            const std::int32_t flag = fn_.newVreg(false);
-            mask.d = flag;
-            mask.a = attrs;
-            mask.hasImm = true;
-            mask.imm = PropAccessor;
-            mask.width = 32;
-            branchCmp(flag, IrCond::Ne, 0, slow);
-            const std::int32_t lt = load(props, at + kPropValueOffset, 1);
-            const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+            const std::int32_t slot = globalSlot(found, slow);
+            const std::int32_t lt = load(slot, kPropValueOffset, 1);
+            const std::int32_t lr = load(slot, kPropValueOffset + kPayload, 8);
             IrInst& mt = inst(IrOp::Mov);
             mt.d = t;
             mt.a = lt;

@@ -548,6 +548,20 @@ TEST(smallMethodsRunInPlaceOfTheirCalls)
              std::string("125751:big 501:truetrue"));
 }
 
+TEST(globalsAreReadWhereTheyAreWhileNothingMovesThem)
+{
+    // Native code reads and writes a global in place while the global object's table stays as it was compiled against.
+    CHECK_EQ(run("var g = 1, h = 0; function f() { h = h + g; return h; } for (var i = 0; i < 600; i++) f();"
+                 " for (var j = 0; j < 300; j++) globalThis['extra' + j] = j; var a = f();"
+                 " delete globalThis.extra5; var b = f(); g = 'x'; var c = f();"
+                 " Object.defineProperty(globalThis, 'g', {get: function() { return 100; }, configurable: true}); var d = f();"
+                 " a + ':' + b + ':' + c + ':' + d"),
+             std::string("601:602:602x:602x100"));
+    CHECK_EQ(run("var count = 0; function bump() { count = count + 1; } for (var i = 0; i < 600; i++) bump();"
+                 " Object.freeze(globalThis); for (var i = 0; i < 600; i++) bump(); count"),
+             std::string("600"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

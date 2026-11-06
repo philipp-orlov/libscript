@@ -233,6 +233,8 @@ struct DynObject : GCObject
     void setProto(DynObject* next);
     /// The layout is about to change in a way no shape describes.
     void dropShape() noexcept;
+    /// The table moved or changed shape: the global object says so to native code that reads globals in place.
+    void tableChanged() noexcept;
     /// Append a property known to be missing, moving to `next`, the shape that says so.
     void appendKnown(GCObject* key, Value value, Shape* next);
     PropVec props;

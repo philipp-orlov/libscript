@@ -67,6 +67,14 @@ void DynObject::dropShape() noexcept
     shape = nullptr;
     if (isProto && rt)
         ++rt->protoEpoch;
+    tableChanged();
+}
+
+void DynObject::tableChanged() noexcept
+{
+    Runtime* engine = rt ? rt->dynIfAny() : nullptr;
+    if (engine && engine->globalObject.get() == this)
+        ++engine->globalEpoch;
 }
 
 void DynObject::appendKnown(GCObject* key, Value value, Shape* next)
@@ -76,6 +84,8 @@ void DynObject::appendKnown(GCObject* key, Value value, Shape* next)
     Prop& p = props.back();
     p.key.reset(key);
     p.value = std::move(value);
+    if (props.capacity() != before)
+        tableChanged();
     chargeIfGrown(props, before);
     if (props.size() > kIndexThreshold && index.size() < props.size() * 2)
         reindex();
@@ -103,6 +113,8 @@ Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
     p.key.reset(key);
     p.value = std::move(value);
     p.attrs = attrs;
+    if (props.capacity() != before)
+        tableChanged();
     chargeIfGrown(props, before);
 
     if (props.size() > kIndexThreshold && index.size() < props.size() * 2)
@@ -158,8 +170,10 @@ void DynObject::reindex()
 
 void DynObject::trim()
 {
-    if (props.capacity() > 8 && props.capacity() > props.size() * 4)
+    if (props.capacity() > 8 && props.capacity() > props.size() * 4) {
         props.shrink_to_fit();
+        tableChanged();
+    }
 }
 
 void DynObject::children(GcList& out) const

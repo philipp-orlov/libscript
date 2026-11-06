@@ -1601,6 +1601,9 @@ private:
     {
         const Cls c = classOf(type);
         coerceTo(value, type);
+        // Null into a field of a new object is what is already there.
+        if (fresh && c == Cls::Ref && value.isConst)
+            return;
         if (c != Cls::Ref && c != Cls::Obj) {
             const std::int32_t v = reg(value);
             IrInst& store = inst(IrOp::Store);
@@ -2330,6 +2333,52 @@ private:
     }
 
     /// Args have been popped. Lower the body in place; the result, if any, is pushed.
+    /// True when running this method, and what it calls, writes no reference to any field, element or static, and calls
+    /// nothing unknown. Optimistic about recursion, which is right: if the rest of the cycle stores nothing, neither does
+    /// the call back into it.
+    bool storesNoReferences(const MethodInfo& method)
+    {
+        const auto known = storesNothing_.find(&method);
+        if (known != storesNothing_.end())
+            return known->second;
+        storesNothing_.emplace(&method, true);
+        bool result = !method.isNative() && !method.isAbstract() && !method.body.code.empty() &&
+                      method.body.handlers.empty();
+        const std::vector<std::uint8_t>& code = method.body.code;
+        for (std::size_t pc = 0; result && pc < code.size();) {
+            const Op op = Op(code[pc]);
+            switch (op) {
+                case Op::StFld:
+                case Op::StSFld:
+                case Op::StElem:
+                case Op::StBoxed:
+                case Op::StInd:
+                case Op::NewObj:
+                case Op::NewDlg:
+                case Op::CallVirt:
+                case Op::CallIface:
+                case Op::CallDlg:
+                case Op::Throw:
+                case Op::Rethrow:
+                case Op::ToStr:
+                case Op::Concat:
+                case Op::InitObj:
+                case Op::CloneVal: result = false; break;
+                case Op::Call: {
+                    const AssemblyImpl* assembly = method.assembly;
+                    const std::uint32_t index = readU32(&code[pc + 1]);
+                    const MethodInfo* callee = index < assembly->methodRefs.size() ? assembly->methodRefs[index] : nullptr;
+                    result = callee && storesNoReferences(*callee);
+                    break;
+                }
+                default: break;
+            }
+            pc += 1 + std::size_t(opArity(op)) * 4;
+        }
+        storesNothing_[&method] = result;
+        return result;
+    }
+
     /// How many times the body reads each slot, and whether it branches at all.
     static void readCounts(const MethodInfo& m, std::vector<std::uint32_t>& reads, bool& branches)
     {
@@ -2493,6 +2542,29 @@ private:
                 op = IrOp::FTrunc;
             else if (name == u"Round")
                 op = IrOp::FRoundEven;
+            if (op == IrOp::Trap)
+                return false;
+            const std::int32_t a = reg(args[0]);
+            const std::int32_t d = fn_.newVreg(true);
+            IrInst& in = inst(op);
+            in.d = d;
+            in.a = a;
+            in.width = 64;
+            push(valueEntry(d, core_.doubleType));
+            return true;
+        }
+        if (owner == u"libc" && args.size() == 1 && ret == Cls::F64 && classOf(args[0].type) == Cls::F64) {
+            IrOp op = IrOp::Trap;
+            if (name == u"sqrt")
+                op = IrOp::FSqrt;
+            else if (name == u"fabs")
+                op = IrOp::FAbs;
+            else if (name == u"floor")
+                op = IrOp::FFloor;
+            else if (name == u"ceil")
+                op = IrOp::FCeil;
+            else if (name == u"trunc")
+                op = IrOp::FTrunc;
             if (op == IrOp::Trap)
                 return false;
             const std::int32_t a = reg(args[0]);
@@ -2691,10 +2763,15 @@ private:
             isVirtual = false;
         const bool isInterface = op == Op::CallIface;
 
-        secureWeak();
-        for (Entry& arg : args) {
-            if (arg.own == Own::Weak)
-                makeOwned(arg);
+        // A callee that stores no reference anywhere cannot invalidate what was read from a field, so no counts are
+        // needed around the call for that.
+        const bool keepsWeak = !isVirtual && !isInterface && storesNoReferences(*target);
+        if (!keepsWeak) {
+            secureWeak();
+            for (Entry& arg : args) {
+                if (arg.own == Own::Weak)
+                    makeOwned(arg);
+            }
         }
 
         if (!isVirtual && !isInterface && canInline(*target, argc)) {
@@ -3730,6 +3807,7 @@ private:
     std::map<const Handler*, std::int32_t> continuation_;
     std::map<const Handler*, std::vector<std::int32_t>> finallyExits_;
     std::set<const Handler*> finallyEnded_;
+    std::unordered_map<const MethodInfo*, bool> storesNothing_;
     std::unordered_map<std::uint32_t, std::uint8_t> boxSeen_;
     std::unordered_map<std::uint32_t, std::uint8_t> boxOwned_;
 };

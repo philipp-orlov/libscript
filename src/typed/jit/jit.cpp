@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "script/internal/typed/bytecode.hpp"
+#include "script/internal/typed/jit_runtime.hpp"
 #include "script/internal/typed/runtime.hpp"
 
 #include "sys/vm.hpp"
@@ -455,7 +456,9 @@ public:
 
 std::unique_ptr<JitBackend> createHostBackend()
 {
-#if defined(SCRIPT_ARCH_ARM64)
+#if !SCRIPT_ENABLE_JIT
+    std::unique_ptr<JitBackend> backend;
+#elif defined(SCRIPT_ARCH_ARM64)
     std::unique_ptr<JitBackend> backend = createArm64Backend();
 #elif defined(SCRIPT_ARCH_X64)
     std::unique_ptr<JitBackend> backend = createX64Backend();
@@ -465,6 +468,24 @@ std::unique_ptr<JitBackend> createHostBackend()
     if (backend && backend->available())
         return backend;
     return std::make_unique<InterpreterOnly>();
+}
+
+void* jitLazyEntry() noexcept
+{
+#if defined(SCRIPT_ARCH_ARM64) && SCRIPT_ENABLE_JIT
+    return reinterpret_cast<void*>(&scriptJitLazyStub);
+#else
+    return nullptr;
+#endif
+}
+
+void* jitLazyDelegateEntry() noexcept
+{
+#if defined(SCRIPT_ARCH_ARM64) && SCRIPT_ENABLE_JIT
+    return reinterpret_cast<void*>(&scriptJitLazyDelegateStub);
+#else
+    return nullptr;
+#endif
 }
 
 // --------------------------------------------------------------- engine ---

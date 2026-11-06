@@ -172,11 +172,19 @@ void Box::children(GcList& out) const
 
 // -------------------------------------------------------------- context ---
 
+namespace {
+
+/// Live cells before a collection is worth having: reference counting has freed everything but cycles by then, and a
+/// collection walks every live cell whether it finds anything or not.
+constexpr std::uint64_t kMinCellBudget = 1u << 17;
+
+}  // namespace
+
 ContextImpl::ContextImpl(Context& ownerContext, const Context::Options& opts)
     : owner(&ownerContext), options(opts)
 {
     nextGcBytes = std::max<std::uint64_t>(options.gcThreshold, 1u << 20);
-    nextGcCells = 1u << 15;
+    nextGcCells = kMinCellBudget;
 }
 
 ContextImpl::~ContextImpl()
@@ -214,9 +222,25 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
     const std::uint32_t bytes = cell->cellBytes;
     // The two kinds a program makes by the million get out of the virtual call.
 #if SCRIPT_ENGINE_TYPED
-    if (cell->kind == CellKind::Instance)
-        static_cast<typed::CSInstance*>(cell)->typed::CSInstance::~CSInstance();
-    else if (cell->kind == CellKind::Array)
+    if (cell->kind == CellKind::Instance) {
+        // By hand, not through `~Value` and `decRef`, because a dying tree spends its time here.
+        auto* instance = static_cast<typed::CSInstance*>(cell);
+        Value* slots = instance->slots();
+        const std::uint32_t count = instance->count;
+        const bool inTeardown = tearingDown;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            GCObject* child = detail::Access::ptr(slots[i]);
+            if (!child || --child->rc != 0 || inTeardown)
+                continue;
+            if (!child->rt || !destroying) {
+                detail::destroyUnreferenced(child);
+                continue;
+            }
+            unlink(child);
+            child->gcNext = pendingFree;
+            pendingFree = child;
+        }
+    } else if (cell->kind == CellKind::Array)
         static_cast<typed::CSArray*>(cell)->typed::CSArray::~CSArray();
     else
         cell->~GCObject();
@@ -303,7 +327,7 @@ void ContextImpl::collectIfDue()
     // legitimately grows is not punished with ever more frequent collections.
     const std::uint64_t baseBytes = options.gcThreshold ? options.gcThreshold : (1u << 20);
     nextGcBytes = std::max<std::uint64_t>(baseBytes, heapBytes * 2);
-    nextGcCells = std::max<std::uint64_t>(1u << 15, (liveObjects + liveStrings) * 2);
+    nextGcCells = std::max<std::uint64_t>(kMinCellBudget, (liveObjects + liveStrings) * 2);
     if (options.memoryLimit && heapBytes > options.memoryLimit)
         throw Error(ErrorCode::OutOfMemory, "the context exceeded its memory limit");
 }

@@ -528,9 +528,15 @@ private:
         }
         a_.addImm(X29, Reg(31), frameBytes_ - 16, true);
         std::uint32_t at = saveBase_;
-        for (Reg r : savedInt_) {
-            a_.strX(r, Reg(31), at);
-            at += 8;
+        for (std::size_t i = 0; i < savedInt_.size(); ++i) {
+            if (i + 1 < savedInt_.size() && at <= 496) {
+                a_.stpX(savedInt_[i], savedInt_[i + 1], Reg(31), std::int32_t(at));
+                ++i;
+                at += 16;
+            } else {
+                a_.strX(savedInt_[i], Reg(31), at);
+                at += 8;
+            }
         }
         for (std::uint32_t r : savedFp_) {
             a_.strD(r, Reg(31), at);
@@ -545,9 +551,15 @@ private:
             return;
         }
         std::uint32_t at = saveBase_;
-        for (Reg r : savedInt_) {
-            a_.ldrX(r, Reg(31), at);
-            at += 8;
+        for (std::size_t i = 0; i < savedInt_.size(); ++i) {
+            if (i + 1 < savedInt_.size() && at <= 496) {
+                a_.ldpX(savedInt_[i], savedInt_[i + 1], Reg(31), std::int32_t(at));
+                ++i;
+                at += 16;
+            } else {
+                a_.ldrX(savedInt_[i], Reg(31), at);
+                at += 8;
+            }
         }
         for (std::uint32_t r : savedFp_) {
             a_.ldrD(r, Reg(31), at);
@@ -2032,24 +2044,6 @@ public:
 std::unique_ptr<JitBackend> createArm64Backend()
 {
     return std::make_unique<Arm64Backend>();
-}
-
-void* jitLazyEntry() noexcept
-{
-#if defined(SCRIPT_ARCH_ARM64) && SCRIPT_ENABLE_JIT
-    return reinterpret_cast<void*>(&scriptJitLazyStub);
-#else
-    return nullptr;
-#endif
-}
-
-void* jitLazyDelegateEntry() noexcept
-{
-#if defined(SCRIPT_ARCH_ARM64) && SCRIPT_ENABLE_JIT
-    return reinterpret_cast<void*>(&scriptJitLazyDelegateStub);
-#else
-    return nullptr;
-#endif
 }
 
 }  // namespace typed

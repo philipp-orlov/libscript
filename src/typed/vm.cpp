@@ -283,7 +283,9 @@ std::string Runtime::captureStack() const
         const Frame* frame = *it;
         if (frame && frame->nativeRun) {
             // Its native frames, from where they last said they were.
+#if SCRIPT_ENABLE_JIT
             out += describeNativeFrames(*this, topFrame, topPc);
+#endif
             topFrame = frame->savedTopFrame;
             topPc = frame->savedTopPc;
             continue;
@@ -655,8 +657,10 @@ Value invoke(Runtime& rt, const MethodInfo* method, Value* args, std::uint32_t a
     // Already compiled? Then the frame is all the native code needs.
     MethodInfo& mutableMethod = const_cast<MethodInfo&>(*method);
     if (NativeCode* code = mutableMethod.code.load(std::memory_order_acquire)) {
+#if SCRIPT_ENABLE_JIT
         if (code->fastEntry)
             return invokeNativeCode(rt, method, code, args, argc);
+#endif
         Frame& native = rt.acquireFrame(rt.ctx.callDepth);
         native.begin(method);
         for (std::uint32_t i = 0; i < argc && i < native.slots.size(); ++i)
@@ -889,7 +893,12 @@ Value runFrame(Runtime& rt, Frame& frame)
         if (backEdges == 0 || --backEdges != 0)
             return false;
         frame.pc = target;
+#if SCRIPT_ENABLE_JIT
         return tryOnStackReplacement(rt, frame, target, result);
+#else
+        (void)result;
+        return false;
+#endif
     };
 
     for (;;) {

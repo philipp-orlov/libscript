@@ -400,6 +400,167 @@ private:
     IrFunction& fn_;
 };
 
+/// Within a basic block, the same computation twice is one computation and a copy; the same check twice is one check. What
+/// makes a load the same is that nothing between could have written there: a store at that offset, or a call.
+class CommonSubexpressions
+{
+public:
+    explicit CommonSubexpressions(IrFunction& fn) : fn_(fn) {}
+
+    void run()
+    {
+        std::vector<IrInst> out;
+        out.reserve(fn_.code.size());
+        for (const IrInst& original : fn_.code) {
+            IrInst in = original;
+            switch (in.op) {
+                case IrOp::Label:
+                    known_.clear();
+                    break;
+                case IrOp::Call:
+                    // A call may have written anything, so no load survives; a constant or a sum does.
+                    dropMemory();
+                    killDefs(in);
+                    break;
+                case IrOp::Store:
+                    dropLoadsAt(in.imm);
+                    dropIndexed();
+                    break;
+                case IrOp::StoreIdx:
+                    dropIndexed();
+                    break;
+                case IrOp::StoreTag:
+                    dropLoadsAt(in.imm);
+                    break;
+                case IrOp::ExitCmp:
+                    if (isCheck(in)) {
+                        if (findCheck(in))
+                            continue;
+                        known_.push_back(in);
+                    }
+                    break;
+                default:
+                    if (isPure(in)) {
+                        const IrInst* same = findSame(in);
+                        if (same && same->d != in.d) {
+                            const std::int32_t from = same->d;
+                            IrInst copy;
+                            copy.op = IrOp::Mov;
+                            copy.d = in.d;
+                            copy.a = from;
+                            killDefs(in);
+                            out.push_back(copy);
+                            continue;
+                        }
+                        const bool selfReferencing = in.d == in.a || in.d == in.b;
+                        killDefs(in);
+                        if (!selfReferencing)
+                            known_.push_back(in);
+                        out.push_back(in);
+                        continue;
+                    }
+                    killDefs(in);
+                    break;
+            }
+            out.push_back(in);
+        }
+        fn_.code.swap(out);
+    }
+
+private:
+    static bool isLoad(const IrInst& in) noexcept { return in.op == IrOp::Load || in.op == IrOp::LoadIdx; }
+    static bool isCheck(const IrInst& in) noexcept
+    {
+        // A comparison that always goes the same way is how a method leaves on purpose.
+        return in.a != in.b;
+    }
+    static bool isPure(const IrInst& in) noexcept
+    {
+        switch (in.op) {
+            case IrOp::MovImm:
+            case IrOp::MovRuntime:
+            case IrOp::FMovImm:
+            case IrOp::Add:
+            case IrOp::Sub:
+            case IrOp::Mul:
+            case IrOp::And:
+            case IrOp::Or:
+            case IrOp::Xor:
+            case IrOp::Shl:
+            case IrOp::Sar:
+            case IrOp::Shr:
+            case IrOp::Sext8:
+            case IrOp::Sext16:
+            case IrOp::Sext32:
+            case IrOp::Zext8:
+            case IrOp::Zext16:
+            case IrOp::Zext32:
+            case IrOp::Load:
+            case IrOp::LoadIdx:
+            case IrOp::Cset: return true;
+            default: return false;
+        }
+    }
+    static bool sameInst(const IrInst& a, const IrInst& b) noexcept
+    {
+        return a.op == b.op && a.a == b.a && a.b == b.b && a.c == b.c && a.imm == b.imm && a.width == b.width &&
+               a.scale == b.scale && a.hasImm == b.hasImm && a.isSigned == b.isSigned && a.cond == b.cond;
+    }
+    const IrInst* findSame(const IrInst& in) const noexcept
+    {
+        for (const IrInst& k : known_) {
+            if (sameInst(k, in) && k.op != IrOp::ExitCmp && fn_.vregIsFp[std::size_t(k.d)] == fn_.vregIsFp[std::size_t(in.d)])
+                return &k;
+        }
+        return nullptr;
+    }
+    bool findCheck(const IrInst& in) const noexcept
+    {
+        for (const IrInst& k : known_) {
+            if (k.op == IrOp::ExitCmp && sameInst(k, in))
+                return true;
+        }
+        return false;
+    }
+    void dropWhere(bool (*test)(const IrInst&, std::int64_t), std::int64_t arg)
+    {
+        known_.erase(std::remove_if(known_.begin(), known_.end(), [&](const IrInst& k) { return test(k, arg); }), known_.end());
+    }
+    void dropMemory()
+    {
+        dropWhere([](const IrInst& k, std::int64_t) { return isLoad(k); }, 0);
+    }
+    void dropIndexed()
+    {
+        dropWhere([](const IrInst& k, std::int64_t) { return k.op == IrOp::LoadIdx; }, 0);
+    }
+    void dropLoadsAt(std::int64_t offset)
+    {
+        dropWhere([](const IrInst& k, std::int64_t at) { return k.op == IrOp::Load && k.imm == at; }, offset);
+    }
+    void kill(std::int32_t v)
+    {
+        known_.erase(std::remove_if(known_.begin(), known_.end(),
+                                    [&](const IrInst& k) { return k.d == v || k.a == v || k.b == v || k.c == v; }),
+                     known_.end());
+    }
+    void killDefs(const IrInst& in)
+    {
+        if (in.d >= 0)
+            kill(in.d);
+        if (in.op == IrOp::Call) {
+            const IrCall& call = fn_.calls[std::size_t(in.imm)];
+            if (call.result >= 0)
+                kill(call.result);
+            if (call.resultTag >= 0)
+                kill(call.resultTag);
+        }
+    }
+
+    IrFunction& fn_;
+    std::vector<IrInst> known_;
+};
+
 /// Removes copies: `t = a op b; x = t` becomes `x = a op b`, and `t = x; ... use t` uses `x`, wherever `t` is a temporary
 /// with that one definition and that one use and nothing changes `x` between.
 class CopyPropagation
@@ -414,6 +575,28 @@ public:
         out.reserve(fn_.code.size());
         for (std::size_t i = 0; i < fn_.code.size(); ++i) {
             IrInst in = fn_.code[i];
+            // `t = a < b; if (t != 0) goto x`
+            if (in.op == IrOp::BrCmp && in.hasImm && in.imm == 0 && !out.empty() && out.back().d == in.a && isTemp(in.a) &&
+                (in.cond == IrCond::Eq || in.cond == IrCond::Ne)) {
+                const IrInst& test = out.back();
+                if (test.op == IrOp::Cset) {
+                    IrInst fused = test;
+                    fused.op = IrOp::BrCmp;
+                    fused.d = -1;
+                    fused.cond = in.cond == IrCond::Ne ? test.cond : invert(test.cond);
+                    fused.target = in.target;
+                    out.back() = fused;
+                    continue;
+                }
+                if (test.op == IrOp::FCset && in.cond == IrCond::Ne) {
+                    IrInst fused = test;
+                    fused.op = IrOp::BrFCmp;
+                    fused.d = -1;
+                    fused.target = in.target;
+                    out.back() = fused;
+                    continue;
+                }
+            }
             // `t = ...; x = t`
             if (in.op == IrOp::Mov && !out.empty() && isTemp(in.a) && out.back().d == in.a && out.back().op != IrOp::Call &&
                 fn_.vregIsFp[std::size_t(in.a)] == fn_.vregIsFp[std::size_t(in.d)] && isPlainDef(out.back())) {
@@ -628,6 +811,7 @@ private:
 
 void optimizeLoops(IrFunction& fn)
 {
+    CommonSubexpressions(fn).run();
     LoopOptimizer(fn).run();
     LoopRotation(fn).run();
     CopyPropagation(fn).run();

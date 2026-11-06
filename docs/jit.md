@@ -1,14 +1,8 @@
 # Native code generation
 
-The typed engine -- the machine C# runs on -- has two back ends,
-`src/typed/jit/jit_arm64.cpp` and `src/typed/jit/jit_x64.cpp`, both emitting
-machine code directly with no assembler or linker involved. The dynamic engine
-has none: its instruction set inspects operand types at run time, which is the
-opposite of what these generators need. The back ends cover the part of a C#
-program where the interpreter's overhead dominates:
-arithmetic, comparisons, conversions and control flow over primitive locals.
-Everything else keeps interpreting, in the same program, with no boundary for
-the host to think about.
+The typed engine -- the machine C#, C and C++ run on -- compiles to machine code by default once a method gets hot. On arm64
+that is an optimizing compiler; x86-64 still has the older template generator (`src/typed/jit/jit_x64.cpp`), which covers
+arithmetic over primitive locals and leaves the rest to the interpreter. The dynamic engine has neither yet.
 
 ## Asking for it
 
@@ -20,7 +14,7 @@ options.compile.native = true;
 
 // Or on demand: interpret until a method has earned it.
 options.jit.mode = script::JitOptions::Mode::Tiered;  // or Eager, or Off
-options.jit.threshold = 2000;                     // calls before compiling
+options.jit.threshold = 200;                      // calls or loop iterations before compiling
 options.jit.codeCacheLimit = 8u << 20;
 options.jit.dumpCode = false;
 
@@ -40,94 +34,102 @@ same answer.
 
 ## What it is worth
 
-From `examples/csharp/native.cpp` on arm64 (Cortex-X925, gcc 13, -O2):
+C# kernels against JavaScriptCore 2.52.6 running the same programs in JavaScript (arm64, Cortex-X925, median wall-clock
+seconds of a whole process, so warm-up included; lower is better). `bench/kernels` has them.
 
-| kernel | interpreted | native | speedup |
-| --- | --- | --- | --- |
-| integer mixing loop, 20M iterations | 2501 ms | 232 ms | 10.8x |
-| escape-time loop over doubles | 561 us | 47 us | 11.8x |
-| nested 64-bit arithmetic | 574 ms | 57 ms | 10.1x |
+| kernel | interpreted before | native, default build | JSC default | .NET 10 |
+| --- | ---: | ---: | ---: | ---: |
+| `int_loop` | 3.663 | 0.030 | 0.056 | 0.046 |
+| `float_mandel` | 0.659 | 0.011 | 0.015 | 0.029 |
+| `fib_calls` | 1.784 | 0.026 | 0.057 | 0.051 |
+| `prop_rw` | 1.505 | 0.009 | 0.021 | 0.052 |
+| `method_call` | 1.026 | 0.007 | 0.062 | 0.024 |
+| `closure` | 2.034 | 0.020 | 0.028 | 0.038 |
+| `nbody` | 3.553 | 0.023 | 0.040 | 0.042 |
+| `sieve_array` | 2.407 | 0.030 | 0.063 | 0.053 |
+| `alloc_small` | 1.027 | 0.108 | 0.098 | 0.054 |
+| `tree_gc` | 1.809 | 0.132 | 0.108 | 0.123 |
+| `string_ops` | 0.621 | 0.023 | 0.052 | 0.034 |
+| `map_dict` | 0.983 | 0.235 | 0.412 | 0.190 |
 
-Ten times is what removing dispatch, `Value` construction and the per-opcode
-bookkeeping buys. It is not what a register allocator buys -- there isn't one
-yet, and every intermediate still goes through its stack slot in memory.
+The geometric mean is 0.54 of JSC's time. A build with `SCRIPT_PROFILE=Performance` and profile data brings `alloc_small`
+under JSC's time as well; `tree_gc` stays about 1.2x behind in every build.
 
-## The subset
+## The passes
 
-`planBody` in `src/typed/jit/jit.cpp` decides. A method qualifies when all of:
+A method goes through three, each in a file of its own under `src/typed/jit/`, plus the thin part for each machine:
 
-* every local and parameter is a **primitive** -- `bool`, `char`, the integer
-  types, `float`, `double` -- and none is captured by a lambda;
-* the return type is primitive or `void`;
-* every instruction is **arithmetic, bitwise, a shift, a comparison, a
-  conversion, a constant, a local load or store, or a branch**;
-* there are **no exception handlers, no calls, no allocation, no strings and no
-  object or array access**;
-* the evaluation stack **depth agrees on every path** into every instruction.
+* **`lower.cpp`, bytecode to IR.** The evaluation stack runs at compile time, so an operand is a register, a constant or a
+  local being read. Compare-and-branch fuses, constants fold and methods of up to 96 bytes of bytecode inline, including
+  constructors, which then skip what a new object does not need.
+* **`optimize.cpp`, on the IR.** Common subexpressions within a block; in a call-free innermost loop, a field of an object
+  the loop does not reassign stays in a register and is written back on every way out; loops are rotated so that an
+  iteration takes one branch; copies disappear.
+* **`regalloc.cpp`.** Linear scan. Each value has one location for its whole life, and what goes to memory when registers
+  run out is what is touched least per instruction, weighted by loop depth.
+* **`jit_arm64.cpp`, the machine.** IR in, words out. `jit_stubs_arm64.cpp` is the assembly at the edge of native code.
 
-That boundary is not arbitrary. Nothing in the subset touches a reference
-count, so generated code needs no GC maps, no write barriers and no safepoints
-where the collector could see a half-formed frame -- the three things that make
-a code generator hard to get right and impossible to debug. `JitOptions::dumpCode`
-prints the reason a method was refused.
+A program's methods are compiled together with everything they call directly, so those calls are plain branches.
 
-## How the generated code is shaped
+## What it compiles
 
-* **The interpreter's frame is the calling convention.** `Value* frame` arrives
-  in a register and stays in a callee-saved one, so `LdLoc n` is a load at the
-  constant offset `n * sizeof(Value) + payloadOffset`.
-* **Tags are never written.** A slot's static type does not change over a
-  method, so generated code writes only the payload half and leaves the tag the
-  caller stored. That is what removes `Value` construction from the inner loop.
-  `internal::ValueLayout` measures the offsets at startup rather than assuming
-  them, so a layout change cannot silently produce wrong code.
-* **The evaluation stack lives in the native frame at constant offsets.**
-  `planBody` proves the depth at every instruction, so there is no stack
-  pointer to maintain at run time.
-* **Conversions are resolved at compile time.** The same analysis carries the
-  type of every stack entry, so `(double)x` is one `scvtf` rather than a tag
-  test and a branch.
-* **Nothing throws.** Generated code writes an `ErrorCode` into
-  `typed::Runtime::nativeError` and returns; the trampoline in `invoke` raises it
-  as an ordinary `script::Exception`. Division by zero and the interrupt hook work
-  from compiled code without the back ends emitting a byte of unwind data.
-* **Loops stay interruptible.** Every back edge calls `scriptJitPoll`, which is the
-  interpreter's tick under another name: it checks the interrupt flag and the
-  deadline, and asks for a return if either fired.
+Everything in the language, in principle. `lowerMethod` refuses a method with a reason, and it keeps interpreting:
 
-## The ABI
+* a value that is null on one way into a join and an `int` on another, which `a?.Length` makes;
+* a method of `object` itself, since what it dispatches to takes `this` in no agreed way;
+* a lambda with more than four captures, a concatenation of more than three parts;
+* a protected region entered with values on the evaluation stack;
+* methods whose frame would exceed 4000 bytes.
 
-```cpp
-void entry(typed::Runtime* rt, const MethodInfo* method, Value* frame,
-           std::uint32_t argc, Value* result);
-```
+`--dump-native` prints what was refused and why, along with the code that was made.
 
-* `frame` points at `method->frameSize()` constructed slots: the receiver (for
-  an instance method) at slot 0, then the parameters in declaration order, then
-  the locals, already zeroed to the defaults in `MethodBody::localTypes`. The
-  caller owns the storage and destroys it.
-* `result` is a default-constructed `Value` the callee overwrites; a `void`
-  method leaves it alone.
-* `argc` is what the caller pushed. The compiler already checked the arity, so
-  this is an assertion, not a dispatch input.
-* `rt` is the typed engine's runtime, which borrows the owning context's heap. Every runtime helper -- allocation, casts, string
-  concatenation, virtual dispatch, element access -- is an ordinary function in
-  `vm.hpp` taking that pointer, so a back end can call what the interpreter
-  calls and only open-code the arithmetic.
+## Reference counts in native code
 
-Returning through an out-parameter rather than by value is deliberate: `Value`
-is not trivially copyable, so the C++ ABI would return it indirectly anyway,
-by rules that differ between platforms. Passing the pointer explicitly means
-the generated code does not have to encode any of them.
+Generated code keeps counts itself, and most of the work is not doing so. A callee borrows its arguments, so a parameter it
+never assigns costs nothing. A read of a field holds no count until something could overwrite that field; a call to a method
+that stores no reference anywhere (`storesNoReferences`) does not count as that. An argument that was owned just for the
+call moves into the field a constructor stores it in. The cycle collector needs nothing from native frames: a count held in a
+register looks like any other reference from outside the heap, so there are no stack maps.
 
-On arm64 the arguments are `x0, x1, x2, w3, x4` and the generated prologue
-parks `frame` in `x19`, `rt` in `x20`, the stack base in `x21` and `result` in
-`x22`. On System V x86-64 they are `rdi, rsi, rdx, ecx, r8`, held in `rbx`,
-`r12`, `r13` and `r14`.
+## Exceptions
 
-Publishing is one release store to `MethodInfo::code`, which every call site
-reads with an acquire load. Bodies are immutable once emitted, so compiling one
-while the interpreter is running it is safe.
+Generated code never unwinds. Raising records the error in `Runtime::nativeError` and the method returns, and each caller
+tests that field after the call. Under a `try`, the same exit goes to a landing block that asks the runtime whether a handler
+may take it, instead of returning. `finally` is entered with a continuation number, negative when an exception is passing
+through. The engine's own limits -- an interrupt, a stack overflow, the memory limit -- are not catchable, as in the
+interpreter.
+
+## The native calling convention
+
+Only generated code and the stubs use it:
+
+* integer and reference arguments in `x0`-`x7`, floats in `d0`-`d7`, the rest in stack words, in order with `this` first; a
+  result in `x0` or `d0`;
+* a value of static type `object` or an interface is two integer words, its tag then its payload, and comes back in `x0`
+  (payload) and `x1` (tag);
+* `x20` holds the runtime; `x14` the delegate at a call through one; `x15` the method at a call through its entry;
+* `x16`, `x17`, `d30` and `d31` are scratch;
+* `x29` chains the frames, which is how a stack trace finds them.
+
+Every `MethodInfo` starts with `fastEntry` at one stub, which compiles the method or marshals the call into `invoke`, and C++
+gets in through `scriptJitEnter`. Natives go through the same stub unless they are intrinsics: `Math.Sqrt` and friends are
+instructions, and `List`, `Dictionary` and `StringBuilder` have direct helpers.
+
+## Tiering
+
+`Mode::Tiered` is the default: a method compiles after `threshold` calls or back edges (200). A hot loop in a method called
+once enters native code at the loop head, with its locals read out of the interpreter's frame. `Mode::Off` and `--interpret`
+ask for none.
+
+## Testing it
+
+The interpreter is the oracle. `tests/csharp/test_jit.cpp` runs programs both ways. `tools/jit_fuzz.py` makes random C#
+programs -- arithmetic, objects, virtual calls, closures, collections, exceptions -- and insists they print the same
+interpreted, compiled up front and tiered; `tools/jit_reduce.py` shrinks a disagreement. A build with
+`-DSCRIPT_JIT_ENV_OVERRIDE=ON` lets `SCRIPT_JIT=eager` or `SCRIPT_JIT=tiered:N` run the entire test suite against native code.
+
+Two things differ from the interpreter on purpose: the depth limit is a budget of stack rather than a count, because native
+frames are far smaller; and a leaf method with no frame of its own has none in a stack trace.
 
 ## The code cache
 
@@ -147,41 +149,15 @@ Combined with [assembly images](compilation.md), that is a deployment where
 the device never sees C# source and starts warm: compile to an image on the
 build machine, ship the image, load it with `native = true` on startup.
 
-## Widening it
-
-The supported set is `isSupportedOp` in `src/typed/jit/jit.cpp`; the back ends are
-switch statements over it. To add an instruction:
-
-1. add it to `isSupportedOp`, and to `pushedType` if it produces a value;
-2. add a case to `jit_arm64.cpp` and to `jit_x64.cpp`;
-3. add it to `tests/csharp/test_jit.cpp`.
-
-Step 3 is the point. Every test there runs the same program interpreted and
-compiled and insists on the same answer over a spread of edge-case operands.
-The interpreter is the oracle, which is why it stays even for what the back
-ends can do.
-
-Worth taking next, in order of what it buys:
-
-* **field access** (`LdFld`, `StFld`) for primitive fields -- no refcount
-  traffic, and it makes whole classes of method compilable;
-* **array elements** (`LdElem`, `StElem`, `LdLen`) with the bounds check
-  open-coded and the failure going through `nativeError`;
-* **calls**, by calling `invoke()` rather than inventing a fast path, so the
-  two tiers stay interchangeable;
-* **reference-typed locals**, the first step that needs generated code to
-  maintain reference counts -- worth doing through the helpers in `vm.hpp`
-  rather than open-coded;
-* **a register allocator**, which is where the next factor of two or three is,
-  and which the constant-offset stack layout was chosen to make possible
-  without rewriting the instruction selection.
-
 ## Building it
 
-`SCRIPT_ENABLE_JIT` is on by default and needs `SCRIPT_LANG_CSHARP`; a build
-without C# has no typed engine and turns it off. `-DSCRIPT_ENABLE_JIT=OFF`
-leaves only the interpreter in the binary, which is what a platform without
-executable pages wants; `jitBackend()` then reports `"interpreter"` and every
-request is a no-op. The x86-64 back end targets the System V convention only -- on Windows
-it reports itself unavailable rather than emitting something plausible and
-wrong.
+`SCRIPT_PROFILE` picks how big a build is. Sizes are the stripped command line tool with every language in.
+
+| profile | what is in it | size |
+| --- | --- | ---: |
+| `Compact` | interpreters only, `-Os`, link-time optimization, no executable pages | 1.5 MB |
+| `Standard` | adds the native code generators; the default | 3.0 MB |
+| `Performance` | adds link-time optimization, and profile data if given (`-DSCRIPT_PGO=generate`, `tools/pgo-train.sh`, `-DSCRIPT_PGO=use`) | 1.9 MB |
+
+`SCRIPT_ENABLE_JIT`, `SCRIPT_ENABLE_LTO` and `SCRIPT_PGO` can each be set on their own. Without a code generator, `jitBackend()`
+reports `"interpreter"` and every request is a no-op: that is what a platform without executable pages wants.

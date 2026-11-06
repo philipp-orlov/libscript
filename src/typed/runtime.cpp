@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 #include "script/internal/typed/vm.hpp"
 
@@ -233,26 +234,52 @@ void computeSlotTags(const TypeInfo& type)
 
 }  // namespace
 
+namespace {
+
+/// A cell's bytes as `new` would leave them, for copying. What differs per cell -- the links -- is filled in afterwards.
+template <class Cell>
+void copyCellImage(Cell* to, const std::uint64_t* image, std::size_t bytes) noexcept
+{
+    auto* out = reinterpret_cast<std::uint64_t*>(to);
+    for (std::size_t i = 0; i < bytes / 8; i += 2) {
+        out[i] = image[i];
+        out[i + 1] = image[i + 1];
+    }
+}
+
+}  // namespace
+
 CSInstance* Runtime::newInstance(const TypeInfo* type)
 {
     const std::uint32_t slots = type ? type->instanceSlots : 0;
     const std::size_t bytes = CSInstance::bytesFor(slots);
     ctx.maybeCollect();
     ctx.reserve(bytes);
-    auto* cell = new (ctx.heap.allocate(bytes)) CSInstance();
-    cell->cellBytes = std::uint32_t(bytes);
-    cell->type = type;
-    cell->count = slots;
-    if (slots) {
-        if (type->slotTags.size() != slots)
-            computeSlotTags(*type);
-        Value* first = cell->slots();
-        const Type* tags = type->slotTags.data();
-        for (std::uint32_t i = 0; i < slots; ++i) {
-            new (first + i) Value();
-            detail::Access::retag(first[i], tags[i]);
+    void* memory = ctx.heap.allocate(bytes);
+    if (!type || type->instanceImage.empty()) {
+        auto* cell = new (memory) CSInstance();
+        cell->cellBytes = std::uint32_t(bytes);
+        cell->type = type;
+        cell->count = slots;
+        if (slots) {
+            if (type->slotTags.size() != slots)
+                computeSlotTags(*type);
+            Value* first = cell->slots();
+            for (std::uint32_t i = 0; i < slots; ++i) {
+                new (first + i) Value();
+                detail::Access::retag(first[i], type->slotTags[i]);
+            }
         }
+        ctx.linkKnown(cell, std::uint32_t(bytes));
+        // From now on, this one's bytes.
+        if (type && bytes % 16 == 0) {
+            type->instanceImage.resize(bytes / 8);
+            std::memcpy(static_cast<void*>(type->instanceImage.data()), static_cast<const void*>(cell), bytes);
+        }
+        return cell;
     }
+    auto* cell = static_cast<CSInstance*>(memory);
+    copyCellImage(cell, type->instanceImage.data(), bytes);
     ctx.linkKnown(cell, std::uint32_t(bytes));
     return cell;
 }

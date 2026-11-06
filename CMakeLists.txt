@@ -34,9 +34,14 @@ if(NOT SCRIPT_PROFILE MATCHES "^(Compact|Standard|Performance)$")
 endif()
 if(SCRIPT_PROFILE STREQUAL "Compact")
     set(SCRIPT_ENABLE_JIT OFF CACHE BOOL "" FORCE)
+    # For size over speed, and nothing that nobody calls.
+    if(NOT MSVC)
+        add_compile_options(-Os)
+        add_link_options(-Wl,--gc-sections)
+    endif()
 endif()
 set(SCRIPT_LTO_DEFAULT OFF)
-if(SCRIPT_PROFILE STREQUAL "Performance")
+if(SCRIPT_PROFILE MATCHES "^(Performance|Compact)$")
     set(SCRIPT_LTO_DEFAULT ON)
 endif()
 option(SCRIPT_JIT_ENV_OVERRIDE "Let SCRIPT_JIT in the environment set the tier of every context: for running the whole test suite against native code" OFF)
@@ -94,8 +99,11 @@ if(NOT MSVC)
 endif()
 
 if(SCRIPT_ENABLE_LTO AND NOT MSVC)
-    add_compile_options(-flto=auto -fno-fat-lto-objects)
-    add_link_options(-flto=auto)
+    # GCC 13's modref analysis, across the whole program at -Os, concludes that `ctx.eval` cannot write through a reference
+    # a host lambda captured, and a test shows the wrong value (tests/csharp/test_binding.cpp, hostState). No undefined
+    # behavior has been found behind that, and turning the analysis off costs nothing measurable.
+    add_compile_options(-flto=auto -fno-fat-lto-objects -fno-ipa-modref)
+    add_link_options(-flto=auto -fno-ipa-modref)
 endif()
 if(SCRIPT_PGO STREQUAL "generate" AND NOT MSVC)
     add_compile_options(-fprofile-generate -fprofile-update=single "-fprofile-dir=${SCRIPT_PGO_DIR}")
@@ -136,13 +144,6 @@ set(SCRIPT_TYPED_SOURCES
     src/typed/vm.cpp
     src/typed/module.cpp
     src/typed/jit/jit.cpp
-    src/typed/jit/lower.cpp
-    src/typed/jit/optimize.cpp
-    src/typed/jit/regalloc.cpp
-    src/typed/jit/jit_runtime.cpp
-    src/typed/jit/jit_arm64.cpp
-    src/typed/jit/jit_stubs_arm64.cpp
-    src/typed/jit/jit_x64.cpp
     src/typed/builtins/core.cpp
     src/typed/builtins/string.cpp
     src/typed/builtins/math.cpp
@@ -219,7 +220,18 @@ if(SCRIPT_ENGINE_DYNAMIC)
     list(APPEND SCRIPT_SOURCES ${SCRIPT_DYNAMIC_SOURCES})
 endif()
 
-set_source_files_properties(src/typed/jit/jit_stubs_arm64.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# The code generators, and the whole optimizing tier with them: a build without them has interpreters and nothing else.
+if(SCRIPT_ENGINE_TYPED AND SCRIPT_ENABLE_JIT)
+    list(APPEND SCRIPT_SOURCES
+        src/typed/jit/lower.cpp
+        src/typed/jit/optimize.cpp
+        src/typed/jit/regalloc.cpp
+        src/typed/jit/jit_runtime.cpp
+        src/typed/jit/jit_arm64.cpp
+        src/typed/jit/jit_stubs_arm64.cpp
+        src/typed/jit/jit_x64.cpp)
+    set_source_files_properties(src/typed/jit/jit_stubs_arm64.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+endif()
 
 # ---- the generated configuration header ---------------------------------------
 foreach(flag SCRIPT_LANG_CSHARP SCRIPT_LANG_TYPESCRIPT SCRIPT_LANG_JAVASCRIPT

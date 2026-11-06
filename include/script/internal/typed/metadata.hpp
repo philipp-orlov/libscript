@@ -361,6 +361,9 @@ struct TypeInfo
     /// The tag each slot of a new instance starts with, so that writing a primitive field is writing its payload. Made
     /// the first time an instance is.
     mutable std::vector<Type> slotTags;
+    /// A new instance of this type, byte for byte, ready to be copied: writing it out field by field is most of what
+    /// allocating an object costs. Made the first time an instance is.
+    mutable std::vector<std::uint64_t> instanceImage;
     /// First slot of this type's static fields in the assembly's static store.
     std::uint32_t staticBase = 0;
     /// The C++ type this stands for, when `nativeKind == Host`.

@@ -92,27 +92,45 @@ The dynamic engine has its own lowering (`src/dyn/jit_lower.cpp`) onto the same 
 what the interpreter has seen, and when that turns out wrong it hands the call back:
 
 * **Bailing out.** A guard that fails sends the call to the interpreter at the same instruction, with every local, cell
-  and stack entry as it was (`scriptDynResume`). Code that bails more than a few times is thrown away and compiled again
-  from what the interpreter has learnt since; the instructions that bailed get no guess the next time, and after two such
-  rounds a function assumes nothing. Entering a loop part way through checks that locals kept as bare numbers still
-  hold them.
+  and stack entry as it was. A bail is a table, not code: one routine per function saves the registers, and `scriptDynBail`
+  rebuilds the frame from a `DeoptInfo` that says where each value lives. Code that bails more than a few times is thrown
+  away and compiled again from what the interpreter has learnt since; the instructions that bailed get no guess the next
+  time. A function under 1 KB of bytecode gets 12 such rounds, a larger one 3, and then it assumes nothing. Entering a loop
+  part way through checks what the code assumes of `this`, parameters and number locals. A property site the interpreter
+  has never reached is a guess too: reaching it bails.
 * **Property access** uses the interpreter's sites. A site that has seen one shape checks it once, and the shape is then
   known for that object until a join or anything that can run code; a site that has seen a few shapes dispatches on them.
   A property up the prototype chain is checked against `protoEpoch`, a getter is called directly, and a store that adds
-  a property appends in place. A field that has only held numbers loads straight into a float register.
-* **Objects** keep their first properties in their own cell, so a literal or a `new` object is one allocation. A property
-  is 32 bytes; the setters of accessors live in a list of their own on the few objects that have any.
+  a property appends in place. A field that has only held numbers loads straight into a float register, and a number
+  stored over a number writes only its bits. Methods read off a primitive string are read from `String.prototype` in place.
+* **Objects** keep their first properties in their own cell, so a literal or a `new` object is one allocation. The header
+  is 104 bytes and a property 32; what few objects need (an index, setters, a host slot) sits behind one `rare` pointer.
 * **Numbers.** Arithmetic and comparisons on operands of unknown type check that they are numbers and run the code for
-  numbers; a parameter only ever given numbers is checked on entry. Number locals are int32s in a general register while
-  that holds, with overflow and minus zero bailing; a remainder by a constant is a multiply.
-* **Calls** go straight to native code. A small, loop-free callee known at compile time -- a method found on a prototype, a
-  global function -- is inlined behind a check that it is still that function; a guess that fails inside it finishes the
-  call in the interpreter and carries on in the caller with what that returns. Built-ins that call back into script enter
-  compiled callbacks directly (`CallbackLoop`), and C++ enters native code through `scriptJitCall5`.
+  numbers. A parameter only ever given numbers is a number local, assigned or not; a wrong guess is found on entry
+  (`scriptDynEntryMiss`), before anything has happened. Number locals are int32s in a general register while that holds. `+`,
+  `-` and small `*` of integers go unchecked in 64 bits while the answer is exact in a double (`Rep::Exact`), so `(a + b) | 0`
+  has no overflow check at all; whatever else uses the value settles it to an int32 or a double. Where the machine has it,
+  ToInt32 is `fjcvtzs`. A global holding a number that the function does not assign is a constant behind a check.
+* **Calls** go straight to native code. A function read from a global or a property is *pinned*: checked to be the one it was
+  when compiled, kept alive by the code (`FunctionCode::jitKeep`), and so called with no count and nothing else checked.
+  A small, loop-free callee is inlined: one known that way, two levels of itself if it is recursive, or at a call through a
+  local, whatever `noteCall` saw the site call, by the code it has, closures included. A constructor goes in place of `new`
+  with its object's shape known from the start, and a small method that only reads takes no counts on its receiver.
+  `f.apply(x, arguments)`, where that is all `arguments` is for, passes the function's own arguments with no array.
+  Built-ins that call back into script enter compiled callbacks directly (`CallbackLoop`).
 * **Globals** are read and written where they are while `globalEpoch` says the global object's table has not moved.
 * **Built-ins done in place**, when the callee is still the built-in it was: `Math.sqrt`, `abs`, `floor`, `ceil`, `trunc`,
-  `push`, `pop`, `charCodeAt`, `String.fromCharCode`, `f.apply(thisArg, arguments)`, and `length`. `s += x` on a local
-  nothing else holds grows the string in its own cell.
+  `push`, `pop`, `charCodeAt`, `String.fromCharCode`, `f.apply`, `instanceof` of a plain function, and `length`. `s += x` on a
+  local nothing else holds grows the string in its own cell.
+
+**What it keeps alive.** Holding a count on the names and prototypes every object shares is a serial chain of memory
+operations, so some are *pinned*, uncounted, until the context ends: the name of any property in a shape (shapes are bounded by
+`kMaxShapes`), a prototype after 1024 objects, the built-in prototypes, and the functions and prototypes compiled code expects.
+A program that makes many large short-lived classes keeps what those reach for longer than it strictly needs.
+
+The allocator is by live range with holes, most-used value first, uses in cold code counting for next to nothing, and spill
+slots shared; the optimizer works through cold blocks, keeps object headers and values apart, forwards stores to loads, folds
+branches on known constants, moves constants out of call-free loops and removes dead values.
 
 It refuses a function with exception handlers or a `finally`, which keeps running in the interpreter. `--dump-native` lists what
 it skipped.
@@ -121,26 +139,26 @@ Measured the same way as the table above, against JavaScriptCore running identic
 
 | kernel | interpreted | native, default build | JSC | JSC, LLInt only |
 | --- | ---: | ---: | ---: | ---: |
-| `int_loop` | 3.550 | 0.114 | 0.056 | 1.043 |
-| `float_mandel` | 0.479 | 0.013 | 0.015 | 0.100 |
-| `fib_calls` | 2.147 | 0.125 | 0.057 | 0.633 |
-| `prop_rw` | 1.394 | 0.044 | 0.021 | 0.259 |
-| `method_call` | 1.217 | 0.066 | 0.062 | 1.072 |
-| `poly_prop` | 2.114 | 0.071 | 0.025 | 0.767 |
-| `closure` | 1.609 | 0.057 | 0.028 | 0.540 |
-| `nbody` | 4.140 | 0.108 | 0.040 | 0.820 |
-| `sieve_array` | 8.778 | 0.143 | 0.063 | 0.298 |
-| `array_push_hof` | 0.241 | 0.046 | 0.025 | 0.159 |
-| `sort_cmp` | 0.585 | 0.115 | 0.077 | 0.178 |
-| `alloc_small` | 1.154 | 0.214 | 0.098 | 0.398 |
-| `tree_gc` | 2.816 | 0.369 | 0.108 | 0.849 |
-| `string_ops` | 0.965 | 0.109 | 0.052 | 0.345 |
-| `json_rt` | 0.233 | 0.197 | 0.103 | 0.105 |
-| `map_dict` | 0.968 | 0.569 | 0.412 | 0.553 |
+| `int_loop` | 3.550 | 0.032 | 0.056 | 1.043 |
+| `float_mandel` | 0.479 | 0.012 | 0.015 | 0.100 |
+| `fib_calls` | 2.147 | 0.058 | 0.057 | 0.633 |
+| `prop_rw` | 1.394 | 0.035 | 0.021 | 0.259 |
+| `method_call` | 1.217 | 0.053 | 0.062 | 1.072 |
+| `poly_prop` | 2.114 | 0.033 | 0.025 | 0.767 |
+| `closure` | 1.609 | 0.043 | 0.028 | 0.540 |
+| `nbody` | 4.140 | 0.077 | 0.040 | 0.820 |
+| `sieve_array` | 8.778 | 0.138 | 0.063 | 0.298 |
+| `array_push_hof` | 0.241 | 0.037 | 0.025 | 0.159 |
+| `sort_cmp` | 0.585 | 0.110 | 0.077 | 0.178 |
+| `alloc_small` | 1.154 | 0.189 | 0.098 | 0.398 |
+| `tree_gc` | 2.816 | 0.257 | 0.108 | 0.849 |
+| `string_ops` | 0.965 | 0.089 | 0.052 | 0.345 |
+| `json_rt` | 0.233 | 0.113 | 0.103 | 0.105 |
+| `map_dict` | 0.968 | 0.552 | 0.412 | 0.553 |
 
-That is 1.9x JSC's time overall and 0.26x the time of JSC with its JIT off. `float_mandel` is ahead of JSC; its optimizing
-tiers are still ahead on the rest. On Octane the gap is 10.6x (it was 125x before any native code), with `earley-boyer`
-and `raytrace` furthest behind, at 26x and 24x.
+That is 1.36x JSC's time overall and 0.19x the time of JSC with its JIT off. `int_loop`, `float_mandel` and `method_call` are
+ahead of JSC and `fib_calls` level with it; its optimizing tiers are still ahead on the rest. On Octane the gap is 7.5x (it
+was 125x before any native code), with `earley-boyer` and `raytrace` furthest behind, at 17x and 12x.
 
 `tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several
 thresholds.

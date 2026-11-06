@@ -443,3 +443,18 @@ TEST(callbacksFromBuiltInsUnwindAndRecurse)
                  " try { deep(100000); 'no' } catch (e) { e instanceof RangeError ? 'range' : String(e) }"),
              std::string("range"));
 }
+
+TEST(objectLiteralsKeepTheirKeysInOrder)
+{
+    // Native code lays a literal's plain keys straight into its table; anything else in the literal must still land right.
+    CHECK_EQ(run("function f(i) { var o = {a: i, b: 2, ...{c: 3, a: 9}, d: 4, ['e' + i]: 5, get g() { return 6; }, h: 7, a: 8};"
+                 " return Object.keys(o).join() + '|' + o.a + o.b + o.c + o.d + o['e' + i] + o.g + o.h; }"
+                 " var r; for (var j = 0; j < 400; j++) r = f(1); r"),
+             std::string("a,b,c,d,e1,g,h|8234567"));
+    CHECK_EQ(run("function f(i) { var o = {x: i, y: i + 1, x: i + 2}; return Object.keys(o).join() + o.x + o.y; }"
+                 " var r; for (var j = 0; j < 400; j++) r = f(1); r"),
+             std::string("x,y32"));
+    CHECK_EQ(run("function f(i) { var o = {p0: 0, p1: 1, p2: 2, p3: 3, p4: 4, p5: 5, p6: 6, p7: 7, p8: 8, p9: i};"
+                 " return o.p9 + o.p8 + o.p0 + Object.keys(o).length; } var r; for (var j = 0; j < 400; j++) r = f(5); r"),
+             std::string("23"));
+}

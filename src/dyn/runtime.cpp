@@ -306,6 +306,7 @@ Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
     next->attrs = attrs;
     next->count = from->count + 1;
     next->root = from->root;
+    next->parent = from;
     next->root->expect = std::max(next->root->expect, next->count);
     from->transitions.push_back({key, attrs, next});
     return next;
@@ -320,12 +321,29 @@ DynObject* Runtime::newObject(DynObject* proto)
 
 DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
 {
-    auto* o = newCell<DynObject>();
-    o->setProto(proto ? proto : objectProto.get());
+    // `newCell` and `setProto` by hand: this is how every object literal and every `new` starts, and a fresh object is
+    // nobody's prototype yet, so neither the virtual size nor the epoch is needed.
+    if (!proto)
+        proto = objectProto.get();
+    ctx.maybeCollect();
+    const std::size_t bytes = sizeof(DynObject);
+    const std::size_t table = std::size_t(room) * sizeof(Prop);
+    ctx.reserve(bytes + table);
+    auto* o = new (ctx.heap.allocate(bytes)) DynObject();
+    o->cellBytes = std::uint32_t(bytes);
     if (room) {
-        o->props.reserve(room);
-        o->chargeGrowth(o->props.capacity() * sizeof(Prop));
+        try {
+            o->props.reserve(room);
+        } catch (...) {
+            o->~DynObject();
+            ctx.heap.deallocate(o, bytes);
+            throw;
+        }
     }
+    ctx.linkKnown(o, std::uint32_t(bytes + o->props.capacity() * sizeof(Prop)));
+    proto->isProto = true;
+    o->proto.reset(proto);
+    o->shape = rootShapeFor(proto);
     return o;
 }
 

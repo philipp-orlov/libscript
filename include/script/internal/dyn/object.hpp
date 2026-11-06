@@ -86,6 +86,17 @@ struct Shape
     /// takes its table at that size and grows no more.
     Shape* root = nullptr;
     std::uint32_t expect = 0;
+    /// The shape this one adds a property to; null for a root.
+    Shape* parent = nullptr;
+    /// Whether an object of this shape has `k`, following the chain back to the root.
+    bool has(const GCObject* k) const noexcept
+    {
+        for (const Shape* s = this; s; s = s->parent) {
+            if (s->key.get() == k)
+                return true;
+        }
+        return false;
+    }
     struct Transition
     {
         GCObject* key;

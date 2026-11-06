@@ -110,6 +110,9 @@ struct Entry
     std::int32_t local = -1;
     /// The object this was when the code was compiled, when that is known: a hint, never relied on unguarded.
     const GCObject* hint = nullptr;
+    /// An object literal under construction, which nothing else can see yet: its shape so far and the room in its table.
+    Shape* fresh = nullptr;
+    std::uint32_t freshRoom = 0;
 };
 
 /// How many 32-bit operands follow an opcode.
@@ -871,6 +874,19 @@ private:
                     continue;
                 }
             }
+            // These change an object under construction behind the back of what `fresh` says about it.
+            switch (op) {
+                case Op::DefMethod:
+                case Op::DefGetter:
+                case Op::DefSetter:
+                case Op::DefElem:
+                case Op::DefMethodElem:
+                case Op::ObjectSpread:
+                    for (Entry& e : stack_)
+                        e.fresh = nullptr;
+                    break;
+                default: break;
+            }
             if (!lowerOne(op, pc))
                 fallsIn = false;
             previousOp_ = op;
@@ -1095,6 +1111,7 @@ private:
             }
             case Op::Dup: {
                 Entry copy = top();
+                copy.fresh = nullptr;
                 if (copy.own == Own::Owned)
                     copy.own = Own::Weak, makeOwned(copy);
                 push(copy);
@@ -1219,9 +1236,41 @@ private:
             case Op::SetElem: setElem(); return true;
             case Op::DefField: {
                 Entry value = pop();
-                const Entry& object = top();
+                Entry& object = stack_.back();
                 GCObject* key = code_.atoms[operand()].get();
                 secureWeak();
+                if (object.fresh && key != rt_.atom.protoName.get() && object.fresh->count < object.freshRoom &&
+                    !object.fresh->has(key)) {
+                    Shape* next = rt_.shapeAfter(object.fresh, key, PropDefault);
+                    if (next && next->count == object.fresh->count + 1) {
+                        // A key the literal has not had yet goes on the end of a table with room for it, as `putOwn` would.
+                        makeOwned(value);
+                        const std::int32_t vt = tagReg(value);
+                        const std::int32_t vr = payloadReg(value);
+                        const std::int64_t at = std::int64_t(object.fresh->count) * std::int64_t(sizeof(Prop));
+                        const std::int32_t props = load(object.r, kPropsOffset, 8);
+                        const std::int32_t k = ptrReg(key);
+                        incRefOf(k, -1, false);
+                        store(props, at + kPropKeyOffset, k, 8);
+                        store(props, at + kPropValueOffset, vt, 1);
+                        store(props, at + kPropValueOffset + kPayload, vr, 8);
+                        store(props, at + kPropSetterOffset, immReg(std::int64_t(Type::Undefined)), 1);
+                        store(props, at + kPropSetterOffset + kPayload, immReg(0), 8);
+                        store(props, at + kPropAttrsOffset, immReg(PropDefault), 1);
+                        const std::int32_t end = fn_.newVreg(false);
+                        IrInst& add = inst(IrOp::Add);
+                        add.d = end;
+                        add.a = props;
+                        add.hasImm = true;
+                        add.imm = at + std::int64_t(sizeof(Prop));
+                        add.width = 64;
+                        store(object.r, kPropsOffset + 8, end, 8);
+                        store(object.r, kShapeOffset, ptrReg(next), 8);
+                        object.fresh = next;
+                        return true;
+                    }
+                }
+                object.fresh = nullptr;
                 const std::int32_t rt = rtReg();
                 const std::int32_t k = ptrReg(key);
                 const std::int32_t tag = tagReg(value);
@@ -1235,7 +1284,11 @@ private:
                 const std::int32_t rt = rtReg();
                 const std::int32_t room = immReg(std::int64_t(operand()));
                 const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynNewObject), {rt, room}, true);
-                push(objectEntry(r));
+                Entry made = objectEntry(r);
+                // Where `newObjectSized` starts it: the shape its prototype's children start from, with this much room.
+                made.fresh = rt_.rootShapeFor(rt_.objectProto.get());
+                made.freshRoom = std::min<std::uint32_t>(operand(), DynObject::kIndexThreshold);
+                push(made);
                 return true;
             }
             case Op::NewArray: {

@@ -358,6 +358,35 @@ struct JsonParser
         at += n;
         return true;
     }
+    /// Keys interned so far, by a cheap hash of their text: the same few names repeat in every object of an array.
+    StringCell* keys[64] = {};
+
+    /// A string with no escape in it, as the text it is, after the closing quote; false, with nothing read, otherwise.
+    bool plainString(StringView& out)
+    {
+        std::size_t end = at + 1;
+        while (end < text.size() && text[end] != u'"' && text[end] != u'\\')
+            ++end;
+        if (end >= text.size() || text[end] != u'"')
+            return false;
+        out = text.substr(at + 1, end - at - 1);
+        at = end + 1;
+        return true;
+    }
+    StringCell* key()
+    {
+        StringView plain;
+        if (!plainString(plain))
+            return rt.intern(string());
+        const std::size_t n = plain.size();
+        const std::size_t slot = (n * 7 + (n ? std::size_t(plain[0]) * 31 + std::size_t(plain[n - 1]) : 0)) & 63;
+        StringCell* known = keys[slot];
+        if (known && known->text() == plain)
+            return known;
+        StringCell* cell = rt.intern(plain);
+        keys[slot] = cell;
+        return cell;
+    }
     String string()
     {
         String out;
@@ -415,8 +444,12 @@ struct JsonParser
         if (at >= text.size())
             fail("unexpected end of input");
         const Char c = text[at];
-        if (c == u'"')
+        if (c == u'"') {
+            StringView plain;
+            if (plainString(plain))
+                return rt.str(plain);
             return rt.str(string());
+        }
         if (c == u'{') {
             ++at;
             DynObject* obj = rt.newObject(rt.objectProto.get());
@@ -430,12 +463,13 @@ struct JsonParser
                 skip();
                 if (at >= text.size() || text[at] != u'"')
                     fail("expected a property name");
-                const String key = string();
+                StringCell* name = key();
+                const Ref<StringCell> held(name);
                 skip();
                 if (at >= text.size() || text[at] != u':')
                     fail("expected ':'");
                 ++at;
-                obj->putOwn(rt.intern(key), value());
+                obj->putOwn(name, value());
                 skip();
                 if (at < text.size() && text[at] == u',') {
                     ++at;
@@ -479,14 +513,50 @@ struct JsonParser
             return Value::null();
 
         const std::size_t start = at;
+        {
+            // A plain integer, the common case, without the general conversion.
+            std::size_t i = at;
+            const bool negative = i < text.size() && text[i] == u'-';
+            if (negative)
+                ++i;
+            std::uint64_t v = 0;
+            const std::size_t first = i;
+            while (i < text.size() && text[i] >= u'0' && text[i] <= u'9' && i - first < 15)
+                v = v * 10 + std::uint64_t(text[i++] - u'0');
+            const bool ends = i == text.size() || (text[i] != u'.' && text[i] != u'e' && text[i] != u'E' &&
+                                                   !(text[i] >= u'0' && text[i] <= u'9'));
+            if (i > first && ends && !(text[first] == u'0' && i - first > 1) && !(negative && v == 0)) {
+                at = i;
+                return Value(negative ? -double(v) : double(v));
+            }
+        }
+        // -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
+        const auto digit = [&](std::size_t i) { return i < text.size() && text[i] >= u'0' && text[i] <= u'9'; };
         if (at < text.size() && text[at] == u'-')
             ++at;
-        while (at < text.size() && ((text[at] >= u'0' && text[at] <= u'9') || text[at] == u'.' ||
-                                    text[at] == u'e' || text[at] == u'E' || text[at] == u'+' ||
-                                    text[at] == u'-'))
-            ++at;
-        if (at == start)
+        if (!digit(at))
             fail("unexpected character");
+        if (text[at] == u'0')
+            ++at;
+        else
+            while (digit(at))
+                ++at;
+        if (at < text.size() && text[at] == u'.') {
+            ++at;
+            if (!digit(at))
+                fail("invalid number");
+            while (digit(at))
+                ++at;
+        }
+        if (at < text.size() && (text[at] == u'e' || text[at] == u'E')) {
+            ++at;
+            if (at < text.size() && (text[at] == u'+' || text[at] == u'-'))
+                ++at;
+            if (!digit(at))
+                fail("invalid number");
+            while (digit(at))
+                ++at;
+        }
         const double n = stringToNumber(text.substr(start, at - start));
         if (std::isnan(n))
             fail("invalid number");
@@ -500,18 +570,67 @@ using JsonPath = Vec<const void*>;  // pooled, so writing JSON still makes no ca
 bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const String& indent,
                     const String& current, String& out, JsonPath& path);
 
-bool stringifyEntry(Runtime& rt, const Value& holder, const Value& key, const Value& replacer,
-                    const String& indent, const String& current, String& out, JsonPath& path)
+/// `holder[key]`: an element or a data property read where it is, anything else the long way.
+Value entryOf(Runtime& rt, const Value& holder, const Value& key)
 {
-    Value item = holder.isUndefined() ? key : getProperty(rt, holder, toPropertyKey(rt, key).get());
+    if (holder.isUndefined())
+        return key;
+    if (DynArray* arr = asArray(holder)) {
+        if (key.isNumber()) {
+            const double d = numberOf(key);
+            if (d >= 0 && d < double(arr->elements.size()) && double(std::size_t(d)) == d)
+                return arr->elements[std::size_t(d)];
+        }
+    } else if (key.isString() && detail::Access::ptr(holder)->kind == CellKind::Object) {
+        if (const Prop* p = static_cast<DynObject*>(detail::Access::ptr(holder))->findOwn(detail::Access::ptr(key))) {
+            if (!p->accessor())
+                return p->value;
+        }
+    }
+    return getProperty(rt, holder, toPropertyKey(rt, key).get());
+}
+
+bool stringifyItem(Runtime& rt, const Value& holder, const Value& key, Value item, const Value& replacer,
+                   const String& indent, const String& current, String& out, JsonPath& path)
+{
     if (item.isObject()) {
-        const Value toJson = getProperty(rt, item, rt.intern("toJSON"));
+        const Value toJson = getProperty(rt, item, rt.atom.toJSON.get());
         if (asFunction(toJson))
             item = callValue(rt, toJson, item, {key});
     }
     if (asFunction(replacer))
         item = callValue(rt, replacer, holder, {key, item});
     return stringifyValue(rt, item, replacer, indent, current, out, path);
+}
+
+bool stringifyEntry(Runtime& rt, const Value& holder, const Value& key, const Value& replacer,
+                    const String& indent, const String& current, String& out, JsonPath& path)
+{
+    return stringifyItem(rt, holder, key, entryOf(rt, holder, key), replacer, indent, current, out, path);
+}
+
+/// A number as JSON writes it: an integer that fits is written straight, digit by digit.
+void appendNumber(double d, String& out)
+{
+    if (!std::isfinite(d)) {
+        out += ascii("null");
+        return;
+    }
+    if (d == std::trunc(d) && std::fabs(d) < 1e15 && !(d == 0 && std::signbit(d))) {
+        char buf[24];
+        int n = 0;
+        std::uint64_t v = std::uint64_t(std::fabs(d));
+        do {
+            buf[n++] = char('0' + v % 10);
+            v /= 10;
+        } while (v);
+        if (d < 0)
+            out.push_back(u'-');
+        while (n)
+            out.push_back(Char(buf[--n]));
+        return;
+    }
+    out += numberToString(d);
 }
 
 bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const String& indent,
@@ -531,11 +650,9 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
         case Type::Long:
         case Type::Float:
         case Type::Char:
-        case Type::Double: {
-            const double d = numberOf(v);
-            out += std::isfinite(d) ? numberToString(d) : ascii("null");
+        case Type::Double:
+            appendNumber(numberOf(v), out);
             return true;
-        }
         case Type::String:
             appendJsonQuoted(asString(v)->text(), out);
             return true;
@@ -569,7 +686,9 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
             if (i)
                 out.push_back(u',');
             out += open;
-            if (!stringifyEntry(rt, v, Value(double(i)), replacer, indent, inner, out, path))
+            const Value key(double(i));
+            const Value item = i < arr->elements.size() ? arr->elements[i] : entryOf(rt, v, key);
+            if (!stringifyItem(rt, v, key, item, replacer, indent, inner, out, path))
                 out += ascii("null");
         }
         if (!arr->elements.empty())
@@ -582,18 +701,20 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
     out.push_back(u'{');
     bool first = true;
     for (const Value& key : ownKeys(rt, obj, true, false)) {
-        String piece;
-        if (!stringifyEntry(rt, v, key, replacer, indent, inner, piece, path))
-            continue;
+        // Written in place, and taken back when the value turns out to be one JSON leaves out.
+        const std::size_t mark = out.size();
         if (!first)
             out.push_back(u',');
-        first = false;
         out += open;
         appendJsonQuoted(asString(key)->text(), out);
         out.push_back(u':');
         if (!indent.empty())
             out.push_back(u' ');
-        out += piece;
+        if (!stringifyEntry(rt, v, key, replacer, indent, inner, out, path)) {
+            out.resize(mark);
+            continue;
+        }
+        first = false;
     }
     if (!first)
         out += close;

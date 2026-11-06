@@ -146,6 +146,7 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     atom.valueOf.reset(intern("valueOf"));
     atom.protoName.reset(intern("__proto__"));
     atom.arguments.reset(intern("arguments"));
+    atom.toJSON.reset(intern("toJSON"));
 
     auto wellKnown = [this](const char* description) {
         auto* s = newCell<SymbolCell>();

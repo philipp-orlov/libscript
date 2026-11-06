@@ -123,6 +123,15 @@ struct Entry
     /// An object literal under construction, which nothing else can see yet: its shape so far and the room in its table.
     Shape* fresh = nullptr;
     std::uint32_t freshRoom = 0;
+
+    /// A number, of no particular value: what an operation with one operand has as its other.
+    static Entry someNumber()
+    {
+        Entry e;
+        e.rep = Rep::Double;
+        e.isConst = true;
+        return e;
+    }
 };
 
 /// How many 32-bit operands follow an opcode.
@@ -1029,6 +1038,13 @@ private:
             if (e.own == Own::Weak)
                 makeOwned(e);
         }
+    }
+    /// Before an operation on these: what reads a borrowed value has to own it first, unless the operation can run none of
+    /// the program's code, which numbers guarantee, so nothing can change where a borrowed value is.
+    void secureWeakFor(const Entry& a, const Entry& b = Entry::someNumber())
+    {
+        if (!isKnownNumber(a) || !isKnownNumber(b))
+            secureWeak();
     }
     void release(const Entry& e)
     {
@@ -2251,7 +2267,7 @@ private:
             case Op::Pow: {
                 const Entry b = pop();
                 const Entry a = pop();
-                secureWeak();
+                secureWeakFor(a, b);
                 const std::int32_t x = toNumberReg(a);
                 const std::int32_t y = toNumberReg(b);
                 const std::int32_t d = fn_.newVreg(true);
@@ -2263,7 +2279,7 @@ private:
             }
             case Op::Neg: {
                 const Entry a = pop();
-                secureWeak();
+                secureWeakFor(a);
                 const std::int32_t x = toNumberReg(a);
                 const std::int32_t d = fn_.newVreg(true);
                 IrInst& in = inst(IrOp::FNeg);
@@ -2292,7 +2308,7 @@ private:
                 const Entry a = pop();
                 if (a.rep == Rep::Int32 && intArithmetic(op == Op::Inc ? Op::Add : Op::Sub, a, constDouble(1)))
                     return true;
-                secureWeak();
+                secureWeakFor(a);
                 const std::int32_t x = toNumberReg(a);
                 const std::int32_t one = fpImm(1.0);
                 const std::int32_t d = fn_.newVreg(true);
@@ -2319,7 +2335,7 @@ private:
             case Op::UShr: bitwise(op); return true;
             case Op::BitNot: {
                 const Entry a = pop();
-                secureWeak();
+                secureWeakFor(a);
                 const std::int32_t x = toInt32Reg(a);
                 const std::int32_t d = fn_.newVreg(false);
                 IrInst& in = inst(IrOp::Not);
@@ -4092,7 +4108,7 @@ private:
         const Entry a = pop();
         if (op != Op::Div && intArithmetic(op, a, b))
             return;
-        secureWeak();
+        secureWeakFor(a, b);
         const std::int32_t x = toNumberReg(a);
         const std::int32_t y = toNumberReg(b);
         const std::int32_t d = fn_.newVreg(true);
@@ -4114,7 +4130,7 @@ private:
         const Entry a = pop();
         if (intArithmetic(Op::Mod, a, b))
             return;
-        secureWeak();
+        secureWeakFor(a, b);
         const std::int32_t x = toNumberReg(a);
         const bool constDivisor = b.isConst && b.number >= 2 && b.number < 2147483648.0 && double(std::int32_t(b.number)) == b.number;
         const std::int32_t y = constDivisor ? -1 : toNumberReg(b);
@@ -4239,7 +4255,7 @@ private:
                 return;
             }
         }
-        secureWeak();
+        secureWeakFor(a, b);
         const std::int32_t x = toInt32Reg(a);
         const bool isImm = b.isConst && b.rep != Rep::Tagged && double(std::int32_t(b.number)) == b.number;
         const std::int32_t y = isImm ? -1 : toInt32Reg(b);
@@ -4283,7 +4299,7 @@ private:
     {
         const Entry b = pop();
         const Entry a = pop();
-        secureWeak();
+        secureWeakFor(a, b);
         const std::int32_t d = fn_.newVreg(false);
         if (isKnownNumber(a) && isKnownNumber(b)) {
             const std::int32_t x = doubleReg(a);

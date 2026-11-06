@@ -40,7 +40,7 @@ struct Job
 struct Atoms
 {
     Ref<StringCell> length, prototype, constructor, name, message, stack, value, done, next, then,
-        toString, valueOf, protoName, arguments;
+        toString, valueOf, protoName, arguments, toJSON;
 };
 
 /// The well-known symbols the engine itself uses.

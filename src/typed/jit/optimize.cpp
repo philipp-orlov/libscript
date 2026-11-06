@@ -624,6 +624,8 @@ private:
             case IrOp::Br:
             case IrOp::BrCmp:
             case IrOp::BrFCmp:
+            case IrOp::ColdBegin:
+            case IrOp::ColdEnd:
             case IrOp::Ret: return false;
             default: return true;
         }
@@ -638,12 +640,16 @@ private:
             pinned_[std::size_t(v)] = 1;
         for (std::int32_t v : fn_.captures)
             pinned_[std::size_t(v)] = 1;
+        for (std::int32_t v : fn_.osrArguments)
+            pinned_[std::size_t(v)] = 1;
         for (const IrOsrEntry& entry : fn_.osrEntries) {
             for (const IrOsrEntry::Slot& slot : entry.slots) {
                 pinned_[std::size_t(slot.vreg)] = 1;
                 if (slot.tagVreg >= 0)
                     pinned_[std::size_t(slot.tagVreg)] = 1;
             }
+            for (const IrOsrEntry::Slot& slot : entry.pointers)
+                pinned_[std::size_t(slot.vreg)] = 1;
         }
         for (const IrExit& exit : fn_.exits) {
             for (std::int32_t v : exit.cleanup)
@@ -688,7 +694,7 @@ private:
         for (std::size_t j = at + 1; j < fn_.code.size(); ++j) {
             IrInst& next = fn_.code[j];
             if (next.op == IrOp::Label || next.op == IrOp::Br || next.op == IrOp::BrCmp || next.op == IrOp::BrFCmp ||
-                next.op == IrOp::Ret || next.op == IrOp::Call)
+                next.op == IrOp::Ret || next.op == IrOp::Call || next.op == IrOp::ColdBegin || next.op == IrOp::ColdEnd)
                 return false;
             bool used = false;
             if (next.a == temp) {

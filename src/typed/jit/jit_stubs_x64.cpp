@@ -80,7 +80,7 @@ scriptJitLazyDelegateStub:
     ret
     .size scriptJitLazyDelegateStub, .-scriptJitLazyDelegateStub
 
-    // Answers in rax: nonzero means stop. Keeps every register allocation can use.
+    // r11: the engine's poll function. Answers in rax: nonzero means stop. Keeps every register allocation can use.
     .p2align 4
     .globl scriptJitPollStub
     .type scriptJitPollStub, @function
@@ -107,7 +107,7 @@ scriptJitPollStub:
     movsd %xmm12, 128(%rsp)
     movsd %xmm13, 136(%rsp)
     mov %r15, %rdi
-    call scriptJitPoll
+    call *%r11
     movslq %eax, %rax
     mov 0(%rsp), %rsi
     mov 8(%rsp), %rdi

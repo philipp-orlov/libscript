@@ -9,6 +9,10 @@
 #include <limits>
 
 #include "script/internal/dyn/vm.hpp"
+#if SCRIPT_ENABLE_DYN_JIT
+#include "script/internal/dyn/jit.hpp"
+#endif
+#include "script/internal/dyn/jit_helpers.hpp"
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/stack_guard.hpp"
@@ -292,7 +296,7 @@ Value toObject(Runtime& rt, const Value& v)
     }
     auto* wrapper = rt.newCell<DynWrapper>();
     wrapper->cls = cls;
-    wrapper->proto.reset(proto);
+    wrapper->setProto(proto);
     wrapper->primitive = v;
     return detail::Access::adopt(Type::Object, wrapper);
 }
@@ -810,6 +814,14 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
                      const std::vector<Value>& args, DynFunction* newTarget)
 {
     const FunctionCode& code = *fn->code;
+#if SCRIPT_ENABLE_DYN_JIT
+    if (code.jitEntry)
+        return enterNative(rt, fn, code, thisValue, args.data(), args.size());
+    if (!code.jitRefused && rt.ctx.options.jit.mode != JitOptions::Mode::Off &&
+        (rt.ctx.options.jit.mode == JitOptions::Mode::Eager || ++code.jitHotness >= rt.ctx.options.jit.threshold) &&
+        compileNative(rt, code))
+        return enterNative(rt, fn, code, thisValue, args.data(), args.size());
+#endif
     Frame& frame = rt.acquireFrame(rt.frames.size());
     frame.begin(fn, &code, thisValue, newTarget);
     rt.frames.push_back(&frame);
@@ -947,6 +959,35 @@ Value invokeMethod(Runtime& rt, const Value& object, GCObject* name,
 
 // ------------------------------------------------------------ closures ---
 
+Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, DynFunction* parent,
+                           Box* const* boxes)
+{
+    DynFunction* fn = rt.newFunction();
+    Value handle = detail::Access::adopt(Type::Object, fn);
+    fn->fnKind = FnKind::Bytecode;
+    fn->code = code;
+    fn->name = code->wideName;
+    fn->arity = code->arity;
+    fn->isArrow = code->isArrow;
+    fn->isClassConstructor = code->isClassConstructor;
+    fn->isDerivedConstructor = code->isDerivedConstructor;
+    fn->props.reserve(3);
+    fn->upvalues.reserve(code->upvals.size());
+    for (std::size_t i = 0; i < code->upvals.size(); ++i)
+        fn->upvalues.emplace_back(boxes[i]);
+    if (parent && code->isArrow)
+        fn->homeObject = parent->homeObject;
+    fn->putOwn(rt.atom.length.get(), Value(double(code->arity)), PropConfigurable);
+    fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
+    if (!code->isArrow && !code->isClassConstructor) {
+        DynObject* proto = rt.newObject(rt.objectProto.get());
+        Value protoValue = detail::Access::adopt(Type::Object, proto);
+        proto->putOwn(rt.atom.constructor.get(), handle, PropWritable | PropConfigurable);
+        fn->putOwn(rt.atom.prototype.get(), protoValue, PropWritable);
+    }
+    return handle;
+}
+
 Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, Frame* parent,
                   bool withPrototype)
 {
@@ -1057,6 +1098,39 @@ Vec<Value> iterableToVector(Runtime& rt, const Value& iterable)
     return out;
 }
 
+// ------------------------------------------------- what native code needs ---
+
+Value getPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand)
+{
+    return getPropertySite(rt, code, base, code.atoms[operand & kAtomMask].get(), operand >> kSiteShift);
+}
+
+void setPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand, const Value& v)
+{
+    setPropertySite(rt, code, base, code.atoms[operand & kAtomMask].get(), v, operand >> kSiteShift);
+}
+
+Value getGlobalForNative(Runtime& rt, GCObject* key)
+{
+    const Prop* p = rt.globalObject->findOwn(key);
+    if (p && !p->accessor())
+        return p->value;
+    const Value g = detail::Access::make(Type::Object, rt.globalObject.get());
+    if (!p && !hasProperty(rt, g, key))
+        throwError(rt, ErrorCode::ReferenceError, toUtf8(static_cast<StringCell*>(key)->text()) + " is not defined");
+    return getProperty(rt, g, key);
+}
+
+void setGlobalForNative(Runtime& rt, GCObject* key, const Value& v)
+{
+    setProperty(rt, detail::Access::make(Type::Object, rt.globalObject.get()), key, v);
+}
+
+void throwValueForNative(Runtime& rt, const Value& v)
+{
+    throwValue(rt, v);
+}
+
 // ---------------------------------------------------------- dispatch ---
 
 namespace {
@@ -1086,6 +1160,19 @@ Value execute(Runtime& rt, Frame& frame)
     std::uint32_t pc = 0;
     std::uint32_t ticks = 0;
     Vec<Value>& sp = frame.stack;
+#if SCRIPT_ENABLE_DYN_JIT
+    // Back edges until this function is worth compiling in the middle of running it.
+    std::uint32_t backEdges =
+        !code.jitRefused && rt.jitBackend && rt.ctx.options.jit.mode != JitOptions::Mode::Off ? rt.ctx.options.jit.threshold : 0;
+    const auto loopBack = [&](std::uint32_t target, Value& result) {
+        if (backEdges == 0 || --backEdges != 0)
+            return false;
+        frame.pc = target;
+        return enterNativeAtLoop(rt, frame, target, result);
+    };
+#else
+    const auto loopBack = [](std::uint32_t, Value&) { return false; };
+#endif
 
     auto pop = [&sp]() -> Value {
         Value v = std::move(sp.back());
@@ -1651,33 +1738,35 @@ Value execute(Runtime& rt, Frame& frame)
                     case Op::ReturnUndefined:
                         return Value::undefined();
 
-                    case Op::Jump:
-                        pc = operandAt(pc);
-                        break;
-                    case Op::JumpIfFalse: {
+                    case Op::Jump: {
                         const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        if (sp.back().type() == Type::Bool) {
-                            if (!detail::Access::boolean(sp.back()))
-                                pc = target;
-                            sp.pop_back();
-                            break;
+                        if (target < pc) {
+                            Value result;
+                            if (loopBack(target, result))
+                                return result;
                         }
-                        if (!toBoolean(pop()))
-                            pc = target;
+                        pc = target;
                         break;
                     }
+                    case Op::JumpIfFalse:
                     case Op::JumpIfTrue: {
                         const std::uint32_t target = operandAt(pc);
                         pc += 4;
+                        bool truthy;
                         if (sp.back().type() == Type::Bool) {
-                            if (detail::Access::boolean(sp.back()))
-                                pc = target;
+                            truthy = detail::Access::boolean(sp.back());
                             sp.pop_back();
-                            break;
+                        } else {
+                            truthy = toBoolean(pop());
                         }
-                        if (toBoolean(pop()))
-                            pc = target;
+                        if (truthy != (op == Op::JumpIfTrue))
+                            break;
+                        if (target < pc) {
+                            Value result;
+                            if (loopBack(target, result))
+                                return result;
+                        }
+                        pc = target;
                         break;
                     }
                     case Op::JumpIfFalseKeep: {
@@ -1996,7 +2085,7 @@ Value execute(Runtime& rt, Frame& frame)
 Value makePromise(Runtime& rt)
 {
     auto* p = rt.newCell<DynPromise>();
-    p->proto.reset(rt.promiseProto.get());
+    p->setProto(rt.promiseProto.get());
     return detail::Access::adopt(Type::Object, p);
 }
 

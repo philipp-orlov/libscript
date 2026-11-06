@@ -13,6 +13,10 @@
 
 namespace script {
 namespace internal {
+namespace typed {
+struct NativeCode;
+}
+
 namespace dyn {
 
 /// Every instruction is one opcode byte followed by zero or more 32-bit
@@ -235,6 +239,15 @@ struct FunctionCode
     /// `GetProp`, `GetPropDup` or `SetProp` packs its atom and its site: see `kSiteShift`.
     mutable Vec<PropertySite> sites;
     std::uint32_t siteCount = 0;
+
+    // ---- native code ----
+    /// Where native code comes in; null until there is some.
+    mutable void* jitEntry = nullptr;
+    /// The same for a plain call, which is not how a class constructor is ever entered.
+    mutable void* jitCallEntry = nullptr;
+    mutable typed::NativeCode* jitCode = nullptr;
+    mutable bool jitRefused = false;
+    mutable std::uint32_t jitHotness = 0;
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;

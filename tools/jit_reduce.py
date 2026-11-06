@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """Shrink a program on which the interpreter and native code disagree, by removing lines while they still do.
 usage: jit_reduce.py <libscript tool> <program.cs> [flag]"""
-import subprocess, sys
+import os, subprocess, sys
 tool, path = sys.argv[1], sys.argv[2]
 flag = sys.argv[3] if len(sys.argv) > 3 else '--native'
+ext = path.rsplit('.', 1)[-1]
+scratch = '/tmp/jit_reduce.' + ext
 def run(lines, flags):
-    open('/tmp/jit_reduce.cs', 'w').write('\n'.join(lines))
+    open(scratch, 'w').write('\n'.join(lines))
+    env = dict(os.environ)
+    # A flag of the form env:SCRIPT_JIT=tiered:1 is for a build with SCRIPT_JIT_ENV_OVERRIDE.
+    plain = []
+    for f in flags:
+        if f.startswith('env:'):
+            k, v = f[4:].split('=', 1)
+            env[k] = v
+        else:
+            plain.append(f)
     try:
-        p = subprocess.run([tool] + flags + ['/tmp/jit_reduce.cs'], capture_output=True, text=True, timeout=20)
+        p = subprocess.run([tool] + plain + [scratch], capture_output=True, text=True, timeout=20, env=env)
     except subprocess.TimeoutExpired:
         return 'timeout', ''
-    return p.returncode, p.stdout + p.stderr.replace('/tmp/jit_reduce.cs', '')
+    return p.returncode, p.stdout + p.stderr.replace(scratch, '')
 def bad(lines):
     a = run(lines, ['--interpret'])
     if a[0] != 0 and 'error' in a[1][:300]:

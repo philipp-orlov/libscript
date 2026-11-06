@@ -1776,8 +1776,11 @@ Context::Stats Context::stats() const
     }
 #endif
 #if SCRIPT_ENGINE_DYNAMIC
-    if (dyn::Runtime* rt = impl_->dynIfAny())
+    if (dyn::Runtime* rt = impl_->dynIfAny()) {
         out.pendingJobs = rt->jobs.size();
+        out.methodsCompiled += rt->jitCompiled;
+        out.nativeCodeBytes += rt->jitBackend ? rt->jitBackend->cache().used() : 0;
+    }
 #endif
     return out;
 }

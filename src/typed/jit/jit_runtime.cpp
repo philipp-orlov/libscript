@@ -944,12 +944,16 @@ bool tryOnStackReplacement(Runtime& rt, Frame& frame, std::uint32_t pc, Value& r
     if (!entry)
         return false;
 
-    // The counts of what native code will own move with the values; the tags go, the payloads stay for it to read.
+    // Native code reads a picture of the frame, because the counts of what it will own move with the values and those
+    // slots must read as empty from now on.
+    const std::size_t pictureBytes = frame.slots.size() * sizeof(Value);
+    void* picture = __builtin_alloca(pictureBytes);
+    std::memcpy(picture, static_cast<const void*>(frame.slots.data()), pictureBytes);
     for (std::uint32_t slot : entry->ownedSlots) {
         if (slot < frame.slots.size())
             detail::Access::retag(frame.slots[slot], Type::Null);
     }
-    std::uint64_t ints[kIntRegs] = {reinterpret_cast<std::uint64_t>(frame.slots.data())};
+    std::uint64_t ints[kIntRegs] = {reinterpret_cast<std::uint64_t>(picture)};
     std::uint64_t fpBits[kFpRegs] = {};
 
     NativeRun run(rt, frame, false);
@@ -990,17 +994,17 @@ std::string describeNativeFrames(const Runtime& rt, void* topFrame, const void* 
         }
         for (; site >= 0; site = code->sourceSites[std::size_t(site)].parent) {
             const NativeCode::SourceSite& where = code->sourceSites[std::size_t(site)];
-            out += "   at " + where.method->qualifiedName();
+            const auto* method = static_cast<const MethodInfo*>(where.method);
+            out += "   at " + method->qualifiedName();
             std::uint32_t line = 0;
-            for (const LineEntry& entry : where.method->body.lines) {
+            for (const LineEntry& entry : method->body.lines) {
                 if (entry.offset > where.pc)
                     break;
                 line = entry.line;
             }
             if (line) {
-                const std::string file = where.method->assembly && where.method->assembly->sourceName
-                                             ? *where.method->assembly->sourceName
-                                             : std::string("<assembly>");
+                const std::string file = method->assembly && method->assembly->sourceName ? *method->assembly->sourceName
+                                                                                           : std::string("<assembly>");
                 out += " (" + file + ":" + std::to_string(line) + ")";
             }
             out += "\n";

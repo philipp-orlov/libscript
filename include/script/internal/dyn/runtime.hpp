@@ -8,6 +8,7 @@
 
 #include <initializer_list>
 #include <cstdint>
+#include <exception>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "script/internal/context.hpp"
+#include "script/internal/typed/jit.hpp"
 #include "script/internal/dyn/bytecode.hpp"
 #include "script/internal/dyn/object.hpp"
 
@@ -147,6 +149,19 @@ struct Runtime : EngineRuntime
 
     // ---- allocation helpers ----
     DynObject* newObject(DynObject* proto = nullptr);
+
+    // ---- native code; see dyn/jit.hpp ----
+    std::unique_ptr<typed::JitBackend> jitBackend;
+    std::vector<typed::NativeCode*> jitCodes;
+    std::uint64_t jitCompiled = 0;
+    std::uint32_t nativeError = 0;
+    std::exception_ptr nativePending;
+    std::uint32_t pollFlag = 0;
+    std::uintptr_t nativeStackLimit = 0;
+    void* nativeTopFrame = nullptr;
+    const void* nativeTopPc = nullptr;
+    /// What a slow path that returns a borrowed value keeps alive until the next one.
+    Value nativeKeepAlive = Value::undefined();
 
     // ---- shapes ----
     /// The shape an empty object with this prototype has. Null when there are too many shapes already.

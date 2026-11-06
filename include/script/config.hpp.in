@@ -21,3 +21,4 @@
 
 /// 1 when the arm64 / x86-64 code generators are compiled in.
 #define SCRIPT_ENABLE_JIT @SCRIPT_ENABLE_JIT_01@
+#define SCRIPT_ENABLE_DYN_JIT @SCRIPT_ENABLE_DYN_JIT_01@

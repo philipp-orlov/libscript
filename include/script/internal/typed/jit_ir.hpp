@@ -78,6 +78,13 @@ enum class IrOp : std::uint8_t
     Trap,        // unreachable, a marker for the disassembly
 
     OsrEntry,    // the point execution joins at when entering from the interpreter: imm is the OSR entry id
+
+    FrameAddr,   // d = the address of byte imm of this frame's memory area (see `frameAreaBytes`)
+    FpToIntRaw,  // d (64 bits) = a (a double) truncated by the plain machine instruction, whatever it does out of range
+    /// Everything between these two is laid out after the method: code a hot path branches to and rarely takes. It goes
+    /// where it is in the IR for everything but the machine code, so the values live across it stay in their registers.
+    ColdBegin,
+    ColdEnd,
 };
 
 enum class IrCond : std::uint8_t
@@ -128,12 +135,13 @@ enum class IrCallKind : std::uint8_t
     Interface, ///< resolved at run time, then through the method's entry
     Delegate,  ///< the delegate in `delegate`
     Helper,    ///< a C function of the runtime, `helper`, with the C calling convention
+    Indirect,  ///< the address in `delegate`
 };
 
 /// Where in the source a machine address came from, for stack traces. `parent` chains inlined frames.
 struct IrSite
 {
-    const MethodInfo* method = nullptr;
+    const void* method = nullptr;  ///< the engine's own idea of a function
     std::uint32_t pc = 0;
     std::int32_t parent = -1;
 };
@@ -150,6 +158,9 @@ struct IrCall
     std::int32_t exit = -1;   ///< where to go when the call raised; -1 when it cannot raise
     std::int32_t site = -1;   ///< index in `sites`
     bool publishFrame = false;  ///< a helper that may raise wants the frame pointer recorded first
+    /// In a cold region: registers live across it are kept by the call itself, not by the allocator's choices.
+    bool cold = false;
+    std::int32_t liveIndex = -1;  ///< with `cold`, into `liveAtRelease`
 };
 
 /// A way out of the method's normal flow. Everything `cleanup` names is released, then `code` is raised (or, when it is
@@ -190,6 +201,8 @@ struct IrOsrEntry
         std::int32_t tagVreg = -1;  ///< `object`: its tag goes here
     };
     std::vector<Slot> slots;
+    /// The dynamic engine: pointers in an array of them (`cells`), read from the second argument of the entry.
+    std::vector<Slot> pointers;
 };
 
 struct IrFunction
@@ -202,6 +215,8 @@ struct IrFunction
     std::vector<IrOsrEntry> osrEntries;
     /// What an on-stack replacement has to set to zero, having no such thing in the interpreter's frame to read.
     std::vector<std::int32_t> osrZero;
+    /// What the third argument of an on-stack entry and those after it arrive in.
+    std::vector<std::int32_t> osrArguments;
     std::vector<std::uint8_t> vregIsFp;
     std::int32_t labelCount = 0;
 
@@ -213,6 +228,7 @@ struct IrFunction
     bool returnsValue = false;
     bool hasLoops = false;
     std::uint32_t maxCleanup = 0;
+    std::uint32_t frameAreaBytes = 0;
     std::uint32_t inlinedMethods = 0;
 
     // ---- what `allocateRegisters` adds ----
@@ -232,6 +248,8 @@ struct IrFunction
         std::uint64_t fps = 0;
     };
     std::vector<LiveRegs> liveAtRelease;
+    /// Words a cold call may need to keep the live registers in.
+    std::uint32_t coldSaveWords = 0;
 
     std::int32_t newVreg(bool fp)
     {

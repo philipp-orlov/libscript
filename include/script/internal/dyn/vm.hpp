@@ -34,6 +34,11 @@ struct Frame
     Value thisValue = Value::undefined();
     Value pendingException = Value::undefined();
     Ref<DynFunction> newTarget;
+    /// This frame stands for a run of native frames, which a stack trace finds by walking from the innermost one. It
+    /// remembers where that was when the run began.
+    bool nativeRun = false;
+    void* savedTopFrame = nullptr;
+    const void* savedTopPc = nullptr;
 
     void begin(DynFunction* function, const FunctionCode* body, Value self, DynFunction* target);
     /// Release everything the call referenced, keeping the buffers themselves.

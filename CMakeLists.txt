@@ -45,6 +45,7 @@ if(SCRIPT_PROFILE MATCHES "^(Performance|Compact)$")
     set(SCRIPT_LTO_DEFAULT ON)
 endif()
 option(SCRIPT_JIT_ENV_OVERRIDE "Let SCRIPT_JIT in the environment set the tier of every context: for running the whole test suite against native code" OFF)
+option(SCRIPT_DISABLE_DYN_JIT "Native code for C#, C and C++ only; JavaScript, TypeScript and Python keep interpreting" OFF)
 option(SCRIPT_ENABLE_LTO "Link-time optimization of the library and the tools" ${SCRIPT_LTO_DEFAULT})
 # Profile-guided optimization, in two builds: configure with SCRIPT_PGO=generate, run tools/pgo-train.sh, then
 # reconfigure the same tree with SCRIPT_PGO=use.
@@ -220,6 +221,14 @@ if(SCRIPT_ENGINE_DYNAMIC)
     list(APPEND SCRIPT_SOURCES ${SCRIPT_DYNAMIC_SOURCES})
 endif()
 
+# Native code for the dynamic languages shares the typed engine's back ends.
+if(SCRIPT_ENGINE_DYNAMIC AND SCRIPT_ENGINE_TYPED AND SCRIPT_ENABLE_JIT AND NOT SCRIPT_DISABLE_DYN_JIT)
+    set(SCRIPT_ENABLE_DYN_JIT ON)
+    list(APPEND SCRIPT_SOURCES src/dyn/jit_lower.cpp src/dyn/jit_runtime.cpp)
+else()
+    set(SCRIPT_ENABLE_DYN_JIT OFF)
+endif()
+
 # The code generators, and the whole optimizing tier with them: a build without them has interpreters and nothing else.
 if(SCRIPT_ENGINE_TYPED AND SCRIPT_ENABLE_JIT)
     list(APPEND SCRIPT_SOURCES
@@ -238,7 +247,7 @@ endif()
 # ---- the generated configuration header ---------------------------------------
 foreach(flag SCRIPT_LANG_CSHARP SCRIPT_LANG_TYPESCRIPT SCRIPT_LANG_JAVASCRIPT
              SCRIPT_LANG_PYTHON SCRIPT_LANG_C SCRIPT_LANG_CPP SCRIPT_ENGINE_TYPED
-             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT)
+             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT SCRIPT_ENABLE_DYN_JIT)
     if(${flag})
         set(${flag}_01 1)
     else()

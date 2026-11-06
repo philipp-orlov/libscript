@@ -4,6 +4,9 @@
 // The dynamic engine's runtime: intrinsics, allocation helpers, host class
 // materialisation, the job queue and the opcode name table.
 #include "script/internal/dyn/runtime.hpp"
+#if SCRIPT_ENABLE_DYN_JIT
+#include "script/internal/dyn/jit.hpp"
+#endif
 
 #include <algorithm>
 
@@ -111,6 +114,11 @@ static_assert(sizeof(DynFunction) <= mem::LocalHeap::kMaxSmall,
 
 Runtime::Runtime(ContextImpl& context) : ctx(context)
 {
+#if SCRIPT_ENABLE_DYN_JIT
+    jitBackend = typed::createHostBackend();
+    if (jitBackend)
+        jitBackend->cache().setLimit(ctx.options.jit.codeCacheLimit);
+#endif
     objectProto.reset(newCell<DynObject>(), true);
 
     // Function.prototype is itself callable (it returns undefined) but is not a constructor. It has to be a real
@@ -190,6 +198,14 @@ void Runtime::releaseRoots() noexcept
         }
     }
     programs.clear();
+    nativeKeepAlive = Value::undefined();
+    nativePending = nullptr;
+    if (jitBackend) {
+        for (typed::NativeCode* code : jitCodes)
+            jitBackend->release(code);
+    }
+    jitCodes.clear();
+    jitBackend.reset();
     shapes.clear();
     nullProtoRoot = nullptr;
     jobs.clear();
@@ -535,8 +551,18 @@ std::string Runtime::captureStack() const
 {
     std::string out;
     int shown = 0;
+    void* topFrame = nativeTopFrame;
+    const void* topPc = nativeTopPc;
     for (std::size_t i = frames.size(); i-- > 0 && shown < 16; ++shown) {
         const Frame* f = frames[i];
+#if SCRIPT_ENABLE_DYN_JIT
+        if (f && f->nativeRun) {
+            out += describeNativeFrames(*this, topFrame, topPc, shown);
+            topFrame = f->savedTopFrame;
+            topPc = f->savedTopPc;
+            continue;
+        }
+#endif
         if (!f || !f->code)
             continue;
         const std::string& name = f->code->name;

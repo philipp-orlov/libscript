@@ -294,7 +294,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
                     extend(back.vreg, i * 2 + 1);
                 }
             }
-            if (in.op == IrOp::Call)
+            if (in.op == IrOp::Call && !fn.calls[std::size_t(in.imm)].cold)
                 callPositions.push_back(i * 2);
             // Raising on the way to a handler in this method calls the runtime, and the handler carries on after it.
             else if (in.op == IrOp::ExitCmp && fn.exits[std::size_t(in.target)].handlerLabel >= 0)
@@ -311,10 +311,15 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         extend(c, -1);
     for (std::int32_t z : fn.osrZero)
         extend(z, -1);
+    for (std::int32_t z : fn.osrArguments)
+        extend(z, -1);
     // Entering at a loop head writes only what is live there; anything else may share a register with something that is.
     for (IrOsrEntry& entry : fn.osrEntries) {
         const std::int32_t at = labelAt[std::size_t(entry.label)];
         const BitSet& live = blocks[std::size_t(blockOfInst[std::size_t(at)])].liveIn;
+        entry.pointers.erase(std::remove_if(entry.pointers.begin(), entry.pointers.end(),
+                                            [&](const IrOsrEntry::Slot& s) { return !live.test(std::size_t(s.vreg)); }),
+                             entry.pointers.end());
         entry.slots.erase(std::remove_if(entry.slots.begin(), entry.slots.end(),
                                          [&](const IrOsrEntry::Slot& s) {
                                              return !live.test(std::size_t(s.vreg)) &&
@@ -475,7 +480,8 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     fn.liveAtRelease.clear();
     for (std::size_t i = 0; i < count; ++i) {
         IrInst& in = fn.code[i];
-        if (in.op != IrOp::DecRef && in.op != IrOp::DecRefTagged)
+        const bool isColdCall = in.op == IrOp::Call && fn.calls[std::size_t(in.imm)].cold;
+        if (in.op != IrOp::DecRef && in.op != IrOp::DecRefTagged && !isColdCall)
             continue;
         IrFunction::LiveRegs live;
         const std::int32_t pos = std::int32_t(i) * 2;
@@ -488,7 +494,14 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             else
                 live.ints |= (std::uint64_t(1) << loc) & callerInt;
         }
-        in.target = std::int32_t(fn.liveAtRelease.size());
+        if (isColdCall) {
+            fn.calls[std::size_t(in.imm)].liveIndex = std::int32_t(fn.liveAtRelease.size());
+            const std::uint32_t words =
+                std::uint32_t(__builtin_popcountll(live.ints)) + std::uint32_t(__builtin_popcountll(live.fps));
+            fn.coldSaveWords = std::max(fn.coldSaveWords, words);
+        } else {
+            in.target = std::int32_t(fn.liveAtRelease.size());
+        }
         fn.liveAtRelease.push_back(live);
     }
 }
@@ -500,7 +513,7 @@ std::string dumpIr(const IrFunction& fn)
         "shr", "sdiv", "udiv", "srem", "urem", "neg", "not", "sext8", "sext16", "sext32", "zext8", "zext16", "zext32",
         "fadd", "fsub", "fmul", "fdiv", "fneg", "fsqrt", "fabs", "ffloor", "fceil", "ftrunc", "fround", "fconv", "i2f",
         "f2i", "cset", "fcset", "br", "brcmp", "brfcmp", "exitcmp", "load", "loadidx", "store", "storeidx", "storetag",
-        "storetagidx", "incref", "decref", "increft", "decreft", "tagof", "poll", "call", "ret", "trap", "osr"};
+        "storetagidx", "incref", "decref", "increft", "decreft", "tagof", "poll", "call", "ret", "trap", "osr", "frameaddr", "fp2intraw", "coldbegin", "coldend"};
     std::string out;
     char line[160];
     for (std::size_t i = 0; i < fn.code.size(); ++i) {

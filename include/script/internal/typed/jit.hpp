@@ -79,6 +79,7 @@ struct NativeCode
         std::uint32_t pc;
         void* entry;
         std::vector<std::uint32_t> ownedSlots;
+        std::vector<std::uint32_t> ownedPointers;
     };
     std::vector<Osr> osr;
     /// Return addresses inside this code, sorted, and which source position each stands for.
@@ -90,7 +91,7 @@ struct NativeCode
     std::vector<Site> sites;
     struct SourceSite
     {
-        const MethodInfo* method;
+        const void* method;
         std::uint32_t pc;
         std::int32_t parent;
     };
@@ -152,6 +153,20 @@ private:
     std::size_t limit_ = 0;
 };
 
+struct IrFunction;
+
+/// What a back end needs to know about the engine it generates code for: where its error flag and friends are, relative to
+/// the pointer pinned in a register for a run of native code, and how to raise and poll.
+struct NativeConfig
+{
+    std::int32_t nativeError = 0;
+    std::int32_t pollFlag = 0;
+    std::int32_t stackLimit = 0;
+    std::int32_t topFrame = 0;
+    const void* raise = nullptr;  ///< void (*)(void* engine, std::uint32_t code, std::int32_t index)
+    const void* poll = nullptr;   ///< int (*)(void* engine)
+};
+
 /// A machine code generator. One instance per context, created from the
 /// options; `available()` false means every request falls back to the
 /// interpreter.
@@ -172,6 +187,13 @@ public:
     /// error and must not throw. A back end that compiled other methods along
     /// with this one, because it calls them, adds them to `others`.
     virtual NativeCode* compile(Runtime& rt, MethodInfo& method, std::vector<NativeCode*>& others) = 0;
+    /// Generate code for one function already in IR, on behalf of any engine. Returns null to mean "keep interpreting".
+    virtual NativeCode* compileFunction(IrFunction& fn, const NativeConfig& config)
+    {
+        (void)fn;
+        (void)config;
+        return nullptr;
+    }
     virtual void release(NativeCode* code) noexcept = 0;
     /// What `compile` refused the last method for, for the dump.
     virtual const std::string& lastRefusal() const noexcept

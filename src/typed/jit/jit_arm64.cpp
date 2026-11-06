@@ -381,19 +381,12 @@ struct CallFixup
     const MethodInfo* target;
 };
 
-struct Offsets
-{
-    std::uint32_t nativeError;
-    std::uint32_t pollFlag;
-    std::uint32_t stackLimit;
-    std::uint32_t topFrame;
-};
 
 class Emitter
 {
 public:
-    Emitter(const IrFunction& fn, const Offsets& offsets, const std::unordered_map<const MethodInfo*, std::size_t>& session)
-        : fn_(fn), offsets_(offsets), session_(session)
+    Emitter(const IrFunction& fn, const NativeConfig& config, const std::unordered_map<const MethodInfo*, std::size_t>& session)
+        : fn_(fn), config_(config), session_(session)
     {}
 
     bool run()
@@ -404,10 +397,23 @@ public:
         labels_.assign(std::size_t(fn_.labelCount), std::size_t(-1));
         emitPrologue(true);
         emitParameters();
-        for (std::size_t i = 0; i < fn_.code.size(); ++i)
-            emit(fn_.code[i]);
+        // The hot code first, then what the IR marked cold, so that the hot code stays together.
+        bool cold = false;
+        for (const IrInst& in : fn_.code) {
+            if (in.op == IrOp::ColdBegin || in.op == IrOp::ColdEnd)
+                cold = in.op == IrOp::ColdBegin;
+            else if (!cold)
+                emit(in);
+        }
         // Falling off the end only happens after a raise, which never comes back.
         a_.brk();
+        cold = false;
+        for (const IrInst& in : fn_.code) {
+            if (in.op == IrOp::ColdBegin || in.op == IrOp::ColdEnd)
+                cold = in.op == IrOp::ColdBegin;
+            else if (cold)
+                emit(in);
+        }
         emitCold();
         emitOsrEntries();
         for (const LabelFixup& fixup : labelFixups_) {
@@ -432,6 +438,7 @@ public:
         std::uint32_t pc;
         std::size_t at;
         std::vector<std::uint32_t> owned;
+        std::vector<std::uint32_t> ownedPointers;
     };
     const std::vector<OsrOut>& osr() const noexcept { return osr_; }
     /// Where a delegate call of an instance lambda comes in, or -1.
@@ -465,13 +472,15 @@ private:
         std::uint32_t outgoing = fn_.maxCleanup;
         bool hasDecOrPoll = false;
         for (const IrInst& in : fn_.code) {
-            if (in.op == IrOp::DecRef || in.op == IrOp::Poll)
+            if (in.op == IrOp::DecRef || in.op == IrOp::DecRefTagged || in.op == IrOp::Poll)
                 hasDecOrPoll = true;
         }
         for (const IrCall& call : fn_.calls)
             outgoing = std::max(outgoing, stackWords(call.args));
-        spillBase_ = outgoing * 8;
-        std::uint32_t at = spillBase_ + fn_.spillSlots * 8;
+        areaBase_ = outgoing * 8;
+        spillBase_ = areaBase_ + ((fn_.frameAreaBytes + 7u) & ~7u);
+        coldSaveBase_ = spillBase_ + fn_.spillSlots * 8;
+        std::uint32_t at = coldSaveBase_ + fn_.coldSaveWords * 8;
         saveBase_ = at;
         for (std::uint32_t r = 19; r <= 28; ++r) {
             if ((fn_.usedIntRegs >> r) & 1u)
@@ -513,7 +522,7 @@ private:
         if (!hasFrame_)
             return;
         if (checkStack && fn_.makesCalls) {
-            a_.ldrX(X16, kRt, offsets_.stackLimit);
+            a_.ldrX(X16, kRt, std::uint32_t(config_.stackLimit));
             a_.cmpSp(X16);
             overflowBranch_ = a_.bcond(LS);
             needsOverflowPad_ = true;
@@ -822,10 +831,10 @@ private:
     /// Raise from a place with a frame already set up.
     void raiseHere(std::uint32_t code, std::int32_t site)
     {
-        a_.strX(X29, kRt, offsets_.topFrame);
+        a_.strX(X29, kRt, std::uint32_t(config_.topFrame));
         a_.movReg(X0, kRt);
         moveImm(X1, code);
-        callAbsolute(reinterpret_cast<const void*>(&scriptJitRaise));
+        callAbsolute(config_.raise);
         noteSite(site);
     }
 
@@ -838,6 +847,7 @@ private:
         }
         for (const ColdPoll& cold : coldPolls_) {
             a_.patch(cold.branch, a_.here());
+            moveImm(X16, reinterpret_cast<std::uint64_t>(config_.poll));
             moveImm(X17, reinterpret_cast<std::uint64_t>(&scriptJitPollStub));
             a_.blr(X17);
             branchToExit(a_.cbnzX(X16), cold.exit);
@@ -901,10 +911,10 @@ private:
     {
         a_.word(0xA9BF7BFDu);  // stp x29, x30, [sp, #-16]!
         a_.word(0x910003FDu);  // mov x29, sp
-        a_.strX(X29, kRt, offsets_.topFrame);
+        a_.strX(X29, kRt, std::uint32_t(config_.topFrame));
         a_.movReg(X0, kRt);
         moveImm(X1, code);
-        callAbsolute(reinterpret_cast<const void*>(&scriptJitRaise));
+        callAbsolute(config_.raise);
         noteSite(-1);
         a_.word(0xA8C17BFDu);  // ldp x29, x30, [sp], #16
         a_.ret();
@@ -985,7 +995,33 @@ private:
             } else {
                 emitPrologue(false);
             }
-            a_.movReg(X17, X0);
+            {
+                // What comes after the two tables, all at once, as a method's parameters do.
+                std::vector<Move> args;
+                std::uint32_t next = 2;
+                for (std::int32_t v : fn_.osrArguments) {
+                    if (!isUnused(v)) {
+                        Move m;
+                        m.from.reg = next;
+                        m.to = placeOf(v);
+                        args.push_back(m);
+                    }
+                    ++next;
+                }
+                // The tables stay reachable through scratch registers while that happens.
+                a_.movReg(X17, X0);
+                a_.movReg(X15, X1);
+                parallelMoves(std::move(args), false);
+            }
+            for (const IrOsrEntry::Slot& slot : entry.pointers) {
+                if (isUnused(slot.vreg))
+                    continue;
+                const Reg d = def(slot.vreg, X16);
+                a_.ldrX(d, X15, slot.slot * 8);
+                commit(slot.vreg, d);
+                if (slot.owned)
+                    out.ownedPointers.push_back(slot.slot);
+            }
             for (std::int32_t zero : fn_.osrZero) {
                 if (isUnused(zero))
                     continue;
@@ -1309,10 +1345,36 @@ private:
         }
     }
 
+    /// A cold call keeps the live caller-saved registers itself, in words of the frame set aside for it.
+    void saveLive(const IrFunction::LiveRegs& live, bool restore)
+    {
+        std::uint32_t at = coldSaveBase_;
+        for (std::uint32_t r = 0; r < 16; ++r) {
+            if (!((live.ints >> r) & 1u))
+                continue;
+            if (restore)
+                a_.ldrX(Reg(r), Reg(31), at);
+            else
+                a_.strX(Reg(r), Reg(31), at);
+            at += 8;
+        }
+        for (std::uint32_t r = 0; r < 30; ++r) {
+            if (!((live.fps >> r) & 1u))
+                continue;
+            if (restore)
+                a_.ldrD(r, Reg(31), at);
+            else
+                a_.strD(r, Reg(31), at);
+            at += 8;
+        }
+    }
+
     void emitCall(const IrCall& call)
     {
-        if (call.publishFrame && call.kind == IrCallKind::Helper)
-            a_.strX(X29, kRt, offsets_.topFrame);
+        if (call.publishFrame && (call.kind == IrCallKind::Helper || call.kind == IrCallKind::Indirect))
+            a_.strX(X29, kRt, std::uint32_t(config_.topFrame));
+        if (call.cold)
+            saveLive(fn_.liveAtRelease[std::size_t(call.liveIndex)], false);
 
         // Arguments go where the convention says, all at once.
         std::vector<Move> ints, fps;
@@ -1364,6 +1426,9 @@ private:
                 a_.ldrX(X16, kMethodReg, std::uint32_t(kMethodFastEntryOffset));
                 a_.blr(X16);
                 break;
+            case IrCallKind::Indirect:
+                a_.blr(kMethodReg);
+                break;
             case IrCallKind::Delegate: {
                 a_.ldrX(X16, kDelegateReg, std::uint32_t(kDelegateNextOffset));
                 const std::size_t multicast = a_.cbnzX(X16);
@@ -1379,8 +1444,39 @@ private:
         }
         if (call.site >= 0)
             noteSite(call.site);
+        if (call.cold) {
+            // The results wait in scratch registers while the live ones come back, which may well include x0.
+            a_.movReg(X14, X0);
+            a_.movReg(X15, X1);
+            a_.fmovD(kFpScratchA, 0);
+            saveLive(fn_.liveAtRelease[std::size_t(call.liveIndex)], true);
+            if (call.exit >= 0) {
+                a_.ldrW(X16, kRt, std::uint32_t(config_.nativeError));
+                branchToExit(a_.cbnzW(X16), call.exit);
+            }
+            if (call.resultTag >= 0 && !isUnused(call.resultTag)) {
+                const Reg d = def(call.resultTag, X15);
+                if (d != X15)
+                    a_.movReg(d, X15);
+                commit(call.resultTag, d);
+            }
+            if (call.result >= 0 && !isUnused(call.result)) {
+                if (fn_.vregIsFp[std::size_t(call.result)]) {
+                    const std::uint32_t d = defFp(call.result, kFpScratchA);
+                    if (d != kFpScratchA)
+                        a_.fmovD(d, kFpScratchA);
+                    commitFp(call.result, d);
+                } else {
+                    const Reg d = def(call.result, X14);
+                    if (d != X14)
+                        a_.movReg(d, X14);
+                    commit(call.result, d);
+                }
+            }
+            return;
+        }
         if (call.exit >= 0) {
-            a_.ldrW(X16, kRt, offsets_.nativeError);
+            a_.ldrW(X16, kRt, std::uint32_t(config_.nativeError));
             branchToExit(a_.cbnzW(X16), call.exit);
         }
         if (call.resultTag >= 0) {
@@ -1750,7 +1846,7 @@ private:
                 return;
             }
             case IrOp::Poll: {
-                a_.ldrW(X16, kRt, offsets_.pollFlag);
+                a_.ldrW(X16, kRt, std::uint32_t(config_.pollFlag));
                 const std::size_t cold = a_.cbnzW(X16);
                 coldPolls_.push_back({cold, in.target, a_.here()});
                 return;
@@ -1782,12 +1878,25 @@ private:
                 emitEpilogue();
                 return;
             case IrOp::Trap: a_.brk(); return;
+            case IrOp::FrameAddr: {
+                const Reg d = def(in.d, X16);
+                a_.addImm(d, Reg(31), areaBase_ + std::uint32_t(in.imm), true);
+                commit(in.d, d);
+                return;
+            }
+            case IrOp::FpToIntRaw: {
+                const std::uint32_t a = useFp(in.a, kFpScratchA);
+                const Reg d = def(in.d, X16);
+                a_.fcvtzsXD(d, a);
+                commit(in.d, d);
+                return;
+            }
             default: return;
         }
     }
 
     const IrFunction& fn_;
-    Offsets offsets_;
+    NativeConfig config_;
     const std::unordered_map<const MethodInfo*, std::size_t>& session_;
     Assembler a_;
     std::vector<std::size_t> labels_;
@@ -1802,7 +1911,9 @@ private:
     std::vector<std::size_t> exitPads_;
     std::vector<Reg> savedInt_;
     std::vector<std::uint32_t> savedFp_;
+    std::uint32_t areaBase_ = 0;
     std::uint32_t spillBase_ = 0;
+    std::uint32_t coldSaveBase_ = 0;
     std::uint32_t saveBase_ = 0;
     std::uint32_t frameBytes_ = 0;
     bool hasFrame_ = false;
@@ -1812,9 +1923,9 @@ private:
 };
 
 template <class T>
-std::uint32_t offsetInRuntime(const Runtime& rt, const T& field) noexcept
+std::int32_t offsetInRuntime(const Runtime& rt, const T& field) noexcept
 {
-    return std::uint32_t(reinterpret_cast<std::uintptr_t>(&field) - reinterpret_cast<std::uintptr_t>(&rt));
+    return std::int32_t(reinterpret_cast<std::uintptr_t>(&field) - reinterpret_cast<std::uintptr_t>(&rt));
 }
 
 class Arm64Backend : public JitBackend
@@ -1908,20 +2019,21 @@ public:
         if (units.empty())
             return nullptr;
 
-        Offsets offsets;
-        offsets.nativeError = offsetInRuntime(rt, rt.nativeError);
-        offsets.pollFlag = offsetInRuntime(rt, rt.pollFlag);
-        offsets.stackLimit = offsetInRuntime(rt, rt.nativeStackLimit);
-        offsets.topFrame = offsetInRuntime(rt, rt.nativeTopFrame);
-        if (offsets.nativeError > 16380 || offsets.pollFlag > 16380 || offsets.stackLimit > 32000 ||
-            offsets.topFrame > 32000)
+        NativeConfig config;
+        config.nativeError = offsetInRuntime(rt, rt.nativeError);
+        config.pollFlag = offsetInRuntime(rt, rt.pollFlag);
+        config.stackLimit = offsetInRuntime(rt, rt.nativeStackLimit);
+        config.topFrame = offsetInRuntime(rt, rt.nativeTopFrame);
+        config.raise = reinterpret_cast<const void*>(&scriptJitRaise);
+        config.poll = reinterpret_cast<const void*>(&scriptJitPoll);
+        if (config.nativeError > 16380 || config.pollFlag > 16380 || config.stackLimit > 32000 || config.topFrame > 32000)
             return nullptr;
 
         std::size_t total = 0;
         for (auto& unit : units) {
             optimizeLoops(unit->fn);
             allocateRegisters(unit->fn, regs_);
-            unit->emitter = std::make_unique<Emitter>(unit->fn, offsets, session);
+            unit->emitter = std::make_unique<Emitter>(unit->fn, config, session);
             if (!unit->emitter->run()) {
                 refusal_ = "the method is too big for the code generator";
                 unit->method->hotness.store(MethodInfo::kNeverCompile, std::memory_order_relaxed);
@@ -1993,6 +2105,42 @@ public:
             }
         }
         return rootCode;
+    }
+
+    NativeCode* compileFunction(IrFunction& fn, const NativeConfig& config) override
+    {
+        optimizeLoops(fn);
+        allocateRegisters(fn, regs_);
+        static const std::unordered_map<const MethodInfo*, std::size_t> kNoSession;
+        Emitter emitter(fn, config, kNoSession);
+        if (!emitter.run())
+            return nullptr;
+        const std::size_t bytes = emitter.code().size() * sizeof(std::uint32_t);
+        void* block = cache_.reserve(bytes);
+        if (!block)
+            return nullptr;
+        std::memcpy(block, emitter.code().data(), bytes);
+        if (!cache_.commit(block, bytes)) {
+            cache_.release(block, bytes);
+            return nullptr;
+        }
+        auto* code = new NativeCode();
+        code->codeStart = block;
+        code->codeBytes = bytes;
+        code->backend = "arm64";
+        code->fastEntry = block;
+        for (const Emitter::OsrOut& osr : emitter.osr()) {
+            NativeCode::Osr out;
+            out.pc = osr.pc;
+            out.entry = static_cast<std::uint8_t*>(block) + osr.at * 4;
+            out.ownedSlots = osr.owned;
+            out.ownedPointers = osr.ownedPointers;
+            code->osr.push_back(std::move(out));
+        }
+        code->sites = emitter.sites();
+        for (const IrSite& site : fn.sites)
+            code->sourceSites.push_back({site.method, site.pc, site.parent});
+        return code;
     }
 
     void release(NativeCode* code) noexcept override

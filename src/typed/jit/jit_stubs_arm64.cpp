@@ -107,15 +107,15 @@ scriptJitLazyDelegateStub:
     ldp x29, x30, [sp], #336
     .endm
 
-    // Answers in x16: nonzero means stop.
+    // x16: the engine's poll function. Answers in x16: nonzero means stop.
     .p2align 2
     .globl scriptJitPollStub
     .type scriptJitPollStub, %function
 scriptJitPollStub:
     SAVE_ALL
     mov x0, x20
-    bl scriptJitPoll
-    mov x16, x0
+    blr x16
+    sxtw x16, w0
     RESTORE_ALL
     ret
     .size scriptJitPollStub, .-scriptJitPollStub

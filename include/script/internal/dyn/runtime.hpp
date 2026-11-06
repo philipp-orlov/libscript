@@ -112,6 +112,7 @@ struct Runtime : EngineRuntime
         ArrayPop,
         StringCharCodeAt,
         StringFromCharCode,
+        FunctionApply,
         IntrinsicCount
     };
     Ref<GCObject> intrinsics[IntrinsicCount];

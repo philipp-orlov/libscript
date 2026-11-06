@@ -309,6 +309,8 @@ void installFunction(Runtime& rt)
         return callValue(rt2, ci.thisValue(), ci.arg(0), buffer.args);
     }, 2);
 
+    rt.intrinsics[Runtime::FunctionApply].reset(detail::Access::ptr(proto->findOwn(rt.intern("apply"))->value));
+
     rt.method(proto, "bind", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynFunction* target = asFunction(ci.thisValue());

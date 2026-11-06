@@ -48,6 +48,7 @@ constexpr std::int64_t kPropsOffset = offsetof(DynObject, props);  // the first 
 constexpr std::int64_t kFrozenOffset = offsetof(DynObject, frozen);
 constexpr std::int64_t kIsProtoOffset = offsetof(DynObject, isProto);
 constexpr std::int64_t kExtensibleOffset = offsetof(DynObject, extensible);
+constexpr std::int64_t kRcOffset = offsetof(GCObject, rc);
 constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
 constexpr std::int64_t kStringCharsOffset = sizeof(StringCell);
 constexpr std::int64_t kIndexOffset = offsetof(DynObject, index);
@@ -2049,6 +2050,7 @@ private:
             named("push", Runtime::ArrayPush);
             named("pop", Runtime::ArrayPop);
             named("charCodeAt", Runtime::StringCharCodeAt);
+            named("apply", Runtime::FunctionApply);
         }
         if (usable && !site->holder && !site->moreCount && base.hint) {
             const auto* known = static_cast<const DynObject*>(base.hint);
@@ -2582,7 +2584,7 @@ private:
         const bool fits = (which >= Runtime::MathSqrt && which <= Runtime::MathTrunc && argc == 1) ||
                           (which == Runtime::ArrayPush && argc == 1) || (which == Runtime::ArrayPop && argc == 0) ||
                           (which == Runtime::StringCharCodeAt && argc == 1) ||
-                          (which == Runtime::StringFromCharCode && argc == 1);
+                          (which == Runtime::StringFromCharCode && argc == 1) || (which == Runtime::FunctionApply && argc == 2);
         if (!fits)
             return false;
         if (!callee.hasKnownTag)
@@ -2600,6 +2602,7 @@ private:
             case Runtime::ArrayPush: inlinePush(self, args[0], r, t, generic); return true;
             case Runtime::ArrayPop: inlinePop(self, r, t, generic); return true;
             case Runtime::StringCharCodeAt: inlineCharCodeAt(self, args[0], r, t, generic); return true;
+            case Runtime::FunctionApply: inlineApply(callee, self, args, r, t, generic); return true;
             case Runtime::StringFromCharCode: {
                 const std::int32_t rt = rtReg();
                 coldCall(reinterpret_cast<void*>(&scriptDynFromCharCode), {rt, tagReg(args[0]), payloadReg(args[0])}, r, t, true,
@@ -2738,6 +2741,31 @@ private:
         IrInst& mr = inst(IrOp::Mov);
         mr.d = r;
         mr.a = lr;
+    }
+
+    /// `fn.apply(thisArg, array)` with an array nothing else holds -- `arguments` above all -- called with the array's
+    /// own elements as the arguments, since no one can change them while the call runs.
+    void inlineApply(const Entry& callee, const Entry& self, const std::vector<Entry>& args, std::int32_t r, std::int32_t t,
+                     std::int32_t generic)
+    {
+        const Entry& list = args[1];
+        guardArray(list, generic);
+        const std::int32_t rc = load(list.r, kRcOffset, 4);
+        branchCmp(rc, IrCond::Ne, 1, generic);
+        const std::int32_t begin = load(list.r, kElementsOffset, 8);
+        const std::int32_t end = load(list.r, kElementsOffset + 8, 8);
+        const std::int32_t bytes = subtract(end, begin);
+        const std::int32_t count = fn_.newVreg(false);
+        IrInst& shr = inst(IrOp::Shr);
+        shr.d = count;
+        shr.a = bytes;
+        shr.hasImm = true;
+        shr.imm = 4;
+        shr.width = 64;
+        std::vector<Entry> held = args;
+        held.push_back(self);
+        held.push_back(callee);
+        invoke(tagReg(self), payloadReg(self), tagReg(args[0]), payloadReg(args[0]), begin, count, r, t, held);
     }
 
     /// `string.charCodeAt(i)` for a whole number in range.

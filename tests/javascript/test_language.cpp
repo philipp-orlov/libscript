@@ -458,3 +458,22 @@ TEST(objectLiteralsKeepTheirKeysInOrder)
                  " return o.p9 + o.p8 + o.p0 + Object.keys(o).length; } var r; for (var j = 0; j < 400; j++) r = f(5); r"),
              std::string("23"));
 }
+
+TEST(applyPassesAnArrayItsElements)
+{
+    // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.
+    CHECK_EQ(run("function C(a, b) { this.s = a + ':' + b + ':' + arguments.length; }"
+                 " function make() { var o = Object.create(C.prototype); C.apply(o, arguments); return o.s; }"
+                 " var r; for (var i = 0; i < 400; i++) r = make(i, 2, 3); r"),
+             std::string("399:2:3"));
+    CHECK_EQ(run("var shared = [1, 2, 3]; function f(a, b, c) { shared.length = 0; shared.push(9); return a + b + c; }"
+                 " function g() { shared = [1, 2, 3]; return f.apply(null, shared); }"
+                 " var r; for (var i = 0; i < 400; i++) r = g(); r"),
+             std::string("6"));
+    CHECK_EQ(run("function f() { return this.v + arguments.length; } function g(n) { return f.apply({v: n}, [1, 2]); }"
+                 " var r; for (var i = 0; i < 400; i++) r = g(i); r"),
+             std::string("401"));
+    CHECK_EQ(run("class K { constructor() {} } function g() { try { K.apply(null, []); return 'no'; } catch (e) { return e.name; } }"
+                 " var r; for (var i = 0; i < 400; i++) r = g(); r"),
+             std::string("TypeError"));
+}

@@ -220,9 +220,7 @@ public:
     {
         if (!code_.handlers.empty())
             refuse("the function has exception handlers");
-        // What a bail writes out has to be in reach of the frame pointer's short offsets.
-        speculate_ = code_.jitMayGuess() && !code_.isClassConstructor &&
-                     (2 * code_.numLocals + code_.maxStack) * 16 < 4000;
+        speculate_ = code_.jitMayGuess() && !code_.isClassConstructor;
         prepare();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
         // An int32 parameter costs a conversion on the way in, and pays it back in a loop or where it meets what wants ints.
@@ -491,7 +489,7 @@ public:
     void runInline(std::int32_t target, const Entry& self, const std::vector<Entry>& args, std::int32_t r,
                    std::int32_t t, std::int32_t done)
     {
-        speculate_ = parent_->speculate_ && (2 * code_.numLocals + code_.maxStack) * 16 < 4000;
+        speculate_ = parent_->speculate_;
         prepare();
         inlineDone_ = done;
         inlineR_ = r;
@@ -1304,62 +1302,78 @@ private:
     {
         inst(IrOp::ColdBegin);
         inst(IrOp::Label).imm = label;
+        inst(IrOp::SaveRegs);
+        // A table says what is where, and nothing is written out until it is needed.
         const std::uint32_t locals = std::uint32_t(localReg_.size());
-        const std::uint32_t count = std::uint32_t(stack_.size() + popped.size());
-        fn_.frameAreaBytes = std::max(fn_.frameAreaBytes, (2 * locals + count) * 16 + 32);
-        // A header with where to carry on and how deep the stack is, then the values.
-        const std::int32_t header = fn_.newVreg(false);
-        IrInst& addr = inst(IrOp::FrameAddr);
-        addr.d = header;
-        addr.imm = 0;
-        store(header, 0, immReg(std::int64_t(pc_) | (std::int64_t(count) << 32)), 8);
-        // The function whose native code this is, which bailing too often throws away: the outermost one.
-        store(header, 8, ptrReg(&outermost()), 8);
-        const std::int32_t area = fn_.newVreg(false);
-        IrInst& values = inst(IrOp::FrameAddr);
-        values.d = area;
-        values.imm = 16;
-        const auto byte = [&](std::uint32_t at, std::uint8_t value) {
-            IrInst& in = inst(IrOp::StoreTag);
-            in.a = area;
-            in.tag = Type(value);
-            in.imm = std::int64_t(at);
+        auto owned = std::make_unique<DeoptInfo>();
+        DeoptInfo* info = owned.get();
+        outermost().jitDeopts.push_back(std::move(owned));
+        info->code = &code_;
+        info->outer = &outermost();
+        info->pc = pc_;
+        info->stack = std::uint32_t(stack_.size() + popped.size());
+        std::vector<std::int32_t> places;
+        const auto at = [&](std::int32_t vreg) {
+            places.push_back(vreg);
+            return std::int32_t(places.size()) - 1;
         };
+        info->fnAt = at(fnReg_);
+        info->thisTagAt = at(thisTag_);
+        info->thisAt = at(thisReg_);
+        info->values.reserve(2 * locals + info->stack);
         for (std::uint32_t slot = 0; slot < locals; ++slot) {
-            const std::uint32_t at = slot * 16;
+            DeoptValue v;
             if (isNumberLocal(slot)) {
-                byte(at, std::uint8_t(Type::Double));
-                store(area, at + kPayload, isIntLocal(slot) ? doubleReg(intEntry(localReg_[slot])) : localReg_[slot], 8);
-                continue;
+                v.tag = std::uint8_t(Type::Double);
+                v.form = isIntLocal(slot) ? DeoptValue::Int64 : DeoptValue::FpBits;
+                v.payloadAt = at(localReg_[slot]);
+            } else {
+                v.tagAt = at(localTag_[slot]);
+                v.owned = localOwned_[slot];
+                v.payloadAt = at(localReg_[slot]);
             }
-            store(area, at, localTag_[slot], 1);
-            byte(at + 1, localOwned_[slot]);
-            store(area, at + kPayload, localReg_[slot], 8);
+            info->values.push_back(v);
         }
         for (std::uint32_t slot = 0; slot < locals; ++slot) {
-            const std::uint32_t at = (locals + slot) * 16;
-            byte(at + 1, cellOwned_[slot]);
-            store(area, at + kPayload, cellReg_[slot], 8);
+            DeoptValue v;
+            v.owned = cellOwned_[slot];
+            v.payloadAt = at(cellReg_[slot]);
+            info->values.push_back(v);
         }
-        std::uint32_t i = 2 * locals;
         const auto put = [&](const Entry& e) {
-            const std::uint32_t at = i++ * 16;
+            DeoptValue v;
             if (e.rep != Rep::Tagged) {
-                byte(at, std::uint8_t(Type::Double));
-                store(area, at + kPayload, e.rep == Rep::Double && !e.isConst ? e.r : payloadReg(e), 8);
-                return;
+                v.tag = std::uint8_t(Type::Double);
+                if (e.isConst) {
+                    v.form = DeoptValue::Constant;
+                    std::memcpy(&v.bits, &e.number, sizeof v.bits);
+                } else {
+                    v.form = e.rep == Rep::Double ? DeoptValue::FpBits : e.rep == Rep::Exact ? DeoptValue::Int64 : DeoptValue::Int32;
+                    v.payloadAt = at(e.r);
+                }
+            } else {
+                if (e.hasKnownTag || e.isConst)
+                    v.tag = std::uint8_t(e.known);
+                else
+                    v.tagAt = at(e.t);
+                v.owned = e.own == Own::Owned && !e.isConst ? 1 : 0;
+                if (e.isConst) {
+                    v.form = DeoptValue::Constant;
+                    v.bits = e.bits;
+                } else {
+                    v.payloadAt = at(e.r);
+                }
             }
-            if (e.hasKnownTag || e.isConst)
-                byte(at, std::uint8_t(e.known));
-            else
-                store(area, at, e.t, 1);
-            byte(at + 1, e.own == Own::Owned && !e.isConst ? 1 : 0);
-            store(area, at + kPayload, payloadReg(e), 8);
+            info->values.push_back(v);
         };
         for (const Entry& e : stack_)
             put(e);
         for (const Entry& e : popped)
             put(e);
+        const std::int32_t saved = fn_.newVreg(false);
+        IrInst& addr = inst(IrOp::FrameAddr);
+        addr.d = saved;
+        addr.imm = 0;
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t t = fn_.newVreg(false);
         IrExit exit;
@@ -1371,8 +1385,11 @@ private:
         fn_.exits.push_back(std::move(exit));
         IrCall call;
         call.kind = IrCallKind::Helper;
-        call.helper = reinterpret_cast<void*>(&scriptDynResume);
-        call.args = {rtReg(), ptrReg(&code_), fnReg_, thisTag_, thisReg_, header};
+        call.helper = reinterpret_cast<void*>(&scriptDynBail);
+        call.args = {rtReg(), ptrReg(info), saved};
+        call.abiArgs = 3;
+        call.readsPlaces = info;
+        call.args.insert(call.args.end(), places.begin(), places.end());
         call.result = r;
         call.resultTag = t;
         call.cold = true;
@@ -2970,6 +2987,21 @@ private:
         const PropertySite* site = siteAt(operand);
         if (!site && stringMethod(base, operand, keepBase))
             return;
+        if (neverRan(operand)) {
+            std::vector<Entry> popped{base};
+            leaveForTheInterpreter(popped);
+            Entry result = taggedEntry(fn_.newVreg(false), fn_.newVreg(false), Own::Weak);
+            IrInst& tag = inst(IrOp::MovImm);
+            tag.d = result.t;
+            tag.imm = std::int64_t(Type::Undefined);
+            IrInst& payload = inst(IrOp::MovImm);
+            payload.d = result.r;
+            payload.imm = 0;
+            push(result);
+            if (keepBase)
+                push(base);
+            return;
+        }
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t slow = newLabel();
@@ -3121,6 +3153,25 @@ private:
         }
     }
 
+    /// A site the interpreter has been through without learning anything has been there to see that; one it has never been
+    /// through is code that has not run. That is a guess too, and the interpreter finds out more than this would.
+    bool neverRan(std::uint32_t operand) const
+    {
+        if (!betHere() || rt_.ctx.options.jit.threshold <= 1 || rt_.ctx.options.jit.mode == JitOptions::Mode::Eager)
+            return false;
+        const std::uint32_t index = operand >> kSiteShift;
+        if (index == kNoSite)
+            return false;
+        if (code_.sites.empty())
+            return true;
+        return index < code_.sites.size() && !code_.sites[index].shape && code_.sites[index].misses == 0;
+    }
+    void leaveForTheInterpreter(const std::vector<Entry>& popped)
+    {
+        const std::int32_t bail = newLabel();
+        inst(IrOp::Br).imm = bail;
+        emitBail(bail, popped);
+    }
     /// `s.charCodeAt` and its kind on a string, at a site that has seen no object: the method read from where it is on
     /// `String.prototype`, while no prototype's table has changed, or the interpreter carries on. False when this is no
     /// place for the guess.
@@ -3201,6 +3252,13 @@ private:
     {
         Entry value = pop();
         Entry base = pop();
+        if (neverRan(operand)) {
+            leaveForTheInterpreter({base, value});
+            // What follows expects the value back, and is not reached.
+            value.own = Own::None;
+            push(value);
+            return;
+        }
         secureWeak();
         makeOwned(value);
         if (base.rep != Rep::Tagged || base.isConst) {

@@ -434,7 +434,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         }
         for (const IrCall& call : fn.calls) {
             std::int32_t intArg = 0, fpArg = 0;
-            for (std::int32_t arg : call.args) {
+            for (std::int32_t arg : call.passed()) {
                 Interval& iv = intervals[std::size_t(arg)];
                 if (fn.vregIsFp[std::size_t(arg)]) {
                     const std::int32_t r = argReg(regs.fpArgs, fpArg++);
@@ -567,7 +567,7 @@ std::string dumpIr(const IrFunction& fn)
         "shr", "sdiv", "udiv", "srem", "urem", "neg", "not", "sext8", "sext16", "sext32", "zext8", "zext16", "zext32",
         "fadd", "fsub", "fmul", "fdiv", "fneg", "fsqrt", "fabs", "ffloor", "fceil", "ftrunc", "fround", "fconv", "i2f",
         "f2i", "cset", "fcset", "br", "brcmp", "brfcmp", "exitcmp", "load", "loadidx", "store", "storeidx", "storetag",
-        "storetagidx", "incref", "decref", "increft", "decreft", "tagof", "poll", "call", "ret", "trap", "osr", "frameaddr", "fp2intraw", "fp2int32js", "coldbegin", "coldend"};
+        "storetagidx", "incref", "decref", "increft", "decreft", "tagof", "poll", "call", "ret", "trap", "osr", "frameaddr", "fp2intraw", "saveregs", "fp2int32js", "coldbegin", "coldend"};
     std::string out;
     char line[160];
     for (std::size_t i = 0; i < fn.code.size(); ++i) {

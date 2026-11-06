@@ -59,6 +59,8 @@ NativePair scriptDynEntryMiss(Runtime* rt, const FunctionCode* code, DynFunction
                               std::uint64_t self, const Value* args, std::uint64_t argc) noexcept;
 /// An object with this prototype and room for this many properties in its cell.
 GCObject* scriptDynNewOf(Runtime* rt, GCObject* proto, std::uint64_t room) noexcept;
+/// Native code bails, having just written its registers to `Runtime::bailRegs`; `frame` is its frame area.
+NativePair scriptDynBail(Runtime* rt, const DeoptInfo* info, const char* frame) noexcept;
 NativePair scriptDynCall(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std::int64_t thisTag, std::uint64_t self,
                          const Value* args, std::uint64_t argc) noexcept;
 NativePair scriptDynNew(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, const Value* args, std::uint64_t argc) noexcept;

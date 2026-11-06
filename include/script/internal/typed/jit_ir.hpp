@@ -81,6 +81,7 @@ enum class IrOp : std::uint8_t
 
     FrameAddr,   // d = the address of byte imm of this frame's memory area (see `frameAreaBytes`)
     FpToIntRaw,  // d (64 bits) = a (a double) truncated by the plain machine instruction, whatever it does out of range
+    SaveRegs,    // every machine register, by number, to 64 words at `NativeConfig::savedRegs`: integers, then fp from word 32
     FpToInt32Js, // d = ToInt32 of a (a double), by the machine: only for a back end that says `hasJsToInt32`
     /// Everything between these two is laid out after the method: code a hot path branches to and rarely takes. It goes
     /// where it is in the IR for everything but the machine code, so the values live across it stay in their registers.
@@ -165,6 +166,15 @@ struct IrCall
     /// In a cold region: registers live across it are kept by the call itself, not by the allocator's choices.
     bool cold = false;
     std::int32_t liveIndex = -1;  ///< with `cold`, into `liveAtRelease`
+    /// When not negative, only so many of `args` are passed. The rest are values something needs to find where they are
+    /// when the call is made, so they are live up to it and no further: see `location`.
+    std::int32_t abiArgs = -1;
+    /// What the engine wants to know of those places, once they are known.
+    void* readsPlaces = nullptr;
+    std::vector<std::int32_t> passed() const
+    {
+        return abiArgs < 0 ? args : std::vector<std::int32_t>(args.begin(), args.begin() + abiArgs);
+    }
 };
 
 /// A way out of the method's normal flow. Everything `cleanup` names is released, then `code` is raised (or, when it is

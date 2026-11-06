@@ -163,6 +163,7 @@ struct NativeConfig
     std::int32_t pollFlag = 0;
     std::int32_t stackLimit = 0;
     std::int32_t topFrame = 0;
+    std::int32_t savedRegs = 0;
     const void* raise = nullptr;  ///< void (*)(void* engine, std::uint32_t code, std::int32_t index)
     const void* poll = nullptr;   ///< int (*)(void* engine)
 };

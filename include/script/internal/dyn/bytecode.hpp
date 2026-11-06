@@ -260,6 +260,43 @@ inline constexpr std::uint32_t kNoSite = 0xFFFu;
 
 /// One compiled function. Immutable once the compiler is done, shared by every
 /// closure made from it.
+struct FunctionCode;
+
+/// One local, cell or stack entry of a bail: how to make the interpreter's value of it from what native code holds.
+struct DeoptValue
+{
+    enum Form : std::uint8_t
+    {
+        Bits,      ///< the payload as it is
+        FpBits,    ///< the payload is the bits of a double in a floating point place
+        Int32,     ///< a number held as an int32
+        Int64,     ///< a number held as an integer in 64 bits
+        Constant,  ///< `bits`
+    };
+    Form form = Bits;
+    std::uint8_t tag = 0;   ///< when `tagAt` is negative
+    std::uint8_t owned = 0;
+    std::int32_t tagAt = -1;      ///< index in `DeoptInfo::places`
+    std::int32_t payloadAt = -1;  ///< the same
+    std::uint64_t bits = 0;
+};
+
+/// What a bail needs to know, which it used to write out in code at every place it could happen.
+struct DeoptInfo
+{
+    const FunctionCode* code = nullptr;
+    const FunctionCode* outer = nullptr;
+    std::uint32_t pc = 0;
+    std::uint32_t stack = 0;
+    std::int32_t fnAt = -1, thisTagAt = -1, thisAt = -1;
+    std::vector<DeoptValue> values;
+    /// The register, or when negative spill slot `-place - 1`, of each value: filled in when compiled.
+    std::vector<std::int32_t> places;
+    std::vector<std::uint8_t> placeIsFp;
+    /// From the saved registers to the spill slots.
+    std::uint32_t spillOffset = 0;
+};
+
 struct FunctionCode
 {
     std::string name;
@@ -338,6 +375,8 @@ struct FunctionCode
         if (jitCallTargets.size() < 64)
             jitCallTargets.push_back({pc, target.get(), target});
     }
+    /// What native code compiled from this has to bail with.
+    mutable std::vector<std::unique_ptr<DeoptInfo>> jitDeopts;
     /// What native code takes to stay alive without counting it: the functions its call sites guard they are calling.
     mutable std::vector<Value> jitKeep;
     std::vector<Value> consts;         ///< PushConst operands

@@ -315,6 +315,43 @@ void scriptDynSetGlobal(Runtime* rt, GCObject* key, std::int64_t tag, std::uint6
     });
 }
 
+NativePair scriptDynBail(Runtime* rt, const DeoptInfo* info, const char* frame) noexcept
+{
+    const std::uint64_t* saved = rt->bailRegs;
+    const auto word = [&](std::int32_t at) -> std::uint64_t {
+        const std::int32_t place = info->places[std::size_t(at)];
+        if (place >= 0)
+            return saved[std::size_t(place) + (info->placeIsFp[std::size_t(at)] ? 32 : 0)];
+        std::uint64_t out = 0;
+        std::memcpy(&out, frame + info->spillOffset + std::size_t(-place - 1) * 8, sizeof out);
+        return out;
+    };
+    // The picture of the frame `scriptDynResume` reads: pc and depth, whose code, then 16 bytes a value.
+    const std::size_t count = info->values.size();
+    auto* buffer = static_cast<std::uint8_t*>(__builtin_alloca(16 + count * 16));
+    std::memset(buffer, 0, 16 + count * 16);
+    const std::uint64_t where = std::uint64_t(info->pc) | (std::uint64_t(info->stack) << 32);
+    std::memcpy(buffer, &where, sizeof where);
+    std::memcpy(buffer + 8, &info->outer, sizeof info->outer);
+    for (std::size_t i = 0; i < count; ++i) {
+        const DeoptValue& v = info->values[i];
+        std::uint8_t* slot = buffer + 16 + i * 16;
+        slot[0] = v.tagAt >= 0 ? std::uint8_t(word(v.tagAt)) : v.tag;
+        slot[1] = v.owned;
+        std::uint64_t payload = v.bits;
+        if (v.form != DeoptValue::Constant) {
+            payload = word(v.payloadAt);
+            if (v.form == DeoptValue::Int32 || v.form == DeoptValue::Int64) {
+                const double d = v.form == DeoptValue::Int32 ? double(std::int32_t(payload)) : double(std::int64_t(payload));
+                std::memcpy(&payload, &d, sizeof payload);
+            }
+        }
+        std::memcpy(slot + 8, &payload, sizeof payload);
+    }
+    return scriptDynResume(rt, info->code, reinterpret_cast<DynFunction*>(word(info->fnAt)), std::int64_t(std::uint8_t(word(info->thisTagAt))),
+                           word(info->thisAt), buffer);
+}
+
 NativePair scriptDynEntryMiss(Runtime* rt, const FunctionCode* code, DynFunction* fn, std::int64_t thisTag,
                               std::uint64_t self, const Value* args, std::uint64_t argc) noexcept
 {
@@ -781,9 +818,11 @@ Value CallbackLoop::operator()(const Value& thisValue, std::initializer_list<Val
         scriptJitCall5(&rt_, entry, reinterpret_cast<std::uint64_t>(fn_), std::uint64_t(thisValue.type()), payloadOf(thisValue),
                        reinterpret_cast<std::uint64_t>(args.begin()), args.size());
     const std::uint64_t results[2] = {out.payload, out.tag};
-    rt_.nativeKeepAlive = Value::undefined();
+    if (!rt_.nativeKeepAlive.isUndefined())
+        rt_.nativeKeepAlive = Value::undefined();
     Value result = resultValue(results);
-    raisePending(rt_);
+    if (rt_.nativeError != 0)
+        raisePending(rt_);
     return result;
 }
 
@@ -895,12 +934,27 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
     config.pollFlag = offset(rt.pollFlag);
     config.stackLimit = offset(rt.nativeStackLimit);
     config.topFrame = offset(rt.nativeTopFrame);
+    config.savedRegs = offset(rt.bailRegs[0]);
     config.raise = reinterpret_cast<const void*>(&scriptDynRaise);
     config.poll = reinterpret_cast<const void*>(&scriptDynPoll);
     typed::NativeCode* compiled = rt.jitBackend->compileFunction(fn, config);
     if (!compiled) {
         code.jitRefused = true;
         return false;
+    }
+    // Where each bail's values ended up, now that that is decided.
+    for (const typed::IrCall& call : fn.calls) {
+        if (!call.readsPlaces)
+            continue;
+        auto* info = static_cast<DeoptInfo*>(call.readsPlaces);
+        const std::size_t first = std::size_t(call.abiArgs);
+        info->places.resize(call.args.size() - first);
+        info->placeIsFp.resize(call.args.size() - first);
+        for (std::size_t i = first; i < call.args.size(); ++i) {
+            info->places[i - first] = fn.location[std::size_t(call.args[i])];
+            info->placeIsFp[i - first] = fn.vregIsFp[std::size_t(call.args[i])];
+        }
+        info->spillOffset = (fn.frameAreaBytes + 7u) & ~7u;
     }
     code.jitCode = compiled;
     rt.jitCodes.push_back(compiled);

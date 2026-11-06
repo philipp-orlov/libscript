@@ -596,7 +596,7 @@ public:
         layoutFrame();
         if (frameBytes_ > 32000)
             return false;
-        labels_.assign(std::size_t(fn_.labelCount), std::size_t(-1));
+        labels_.assign(std::size_t(fn_.labelCount) + 1, std::size_t(-1));
         emitPrologue(true);
         emitParameters();
         // The hot code first, then what the IR marked cold, so that the hot code stays together.
@@ -617,6 +617,15 @@ public:
         }
         emitCold();
         emitOsrEntries();
+        if (saverWanted_) {
+            labels_[std::size_t(fn_.labelCount)] = a_.here();
+            const std::int32_t base = config_.savedRegs;
+            for (std::uint32_t r = 0; r < 16; ++r)
+                a_.store(Reg(r), kRt, base + std::int32_t(r * 8), 8);
+            for (std::uint32_t r = 0; r < 16; ++r)
+                a_.storeSd(Xmm(r), kRt, base + std::int32_t((32 + r) * 8), 8);
+            a_.ret();
+        }
         for (const LabelFixup& fixup : labelFixups_) {
             if (labels_[std::size_t(fixup.label)] == std::size_t(-1))
                 return false;
@@ -676,7 +685,7 @@ private:
                 hasDecOrPoll = true;
         }
         for (const IrCall& call : fn_.calls)
-            outgoing = std::max(outgoing, stackWords(call.args));
+            outgoing = std::max(outgoing, stackWords(call.passed()));
         areaBase_ = outgoing * 8;
         spillBase_ = areaBase_ + ((fn_.frameAreaBytes + 7u) & ~7u);
         coldSaveBase_ = spillBase_ + fn_.spillSlots * 8;
@@ -1437,7 +1446,7 @@ private:
 
         std::vector<Move> ints, fps;
         std::uint32_t nextInt = 0, nextFp = 0, stack = 0;
-        for (std::int32_t arg : call.args) {
+        for (std::int32_t arg : call.passed()) {
             const bool fp = isFp(arg);
             Move m;
             m.from = placeOf(arg);
@@ -1937,6 +1946,10 @@ private:
                 emitEpilogue();
                 return;
             case IrOp::Trap: a_.int3(); return;
+            case IrOp::SaveRegs:
+                saverWanted_ = true;
+                branchToLabel(a_.call(), std::int32_t(fn_.labelCount));
+                return;
             case IrOp::FrameAddr: {
                 const Reg d = def(in.d, RAX);
                 a_.lea(d, RSP, std::int32_t(areaBase_) + std::int32_t(in.imm));
@@ -1954,6 +1967,7 @@ private:
         }
     }
 
+    bool saverWanted_ = false;
     const IrFunction& fn_;
     NativeConfig config_;
     const std::unordered_map<const MethodInfo*, std::size_t>& session_;

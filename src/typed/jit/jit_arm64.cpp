@@ -399,7 +399,7 @@ public:
         layoutFrame();
         if (frameBytes_ > 4000)
             return false;
-        labels_.assign(std::size_t(fn_.labelCount), std::size_t(-1));
+        labels_.assign(std::size_t(fn_.labelCount) + 1, std::size_t(-1));
         emitPrologue(true);
         emitParameters();
         // The hot code first, then what the IR marked cold, so that the hot code stays together.
@@ -421,6 +421,15 @@ public:
         }
         emitCold();
         emitOsrEntries();
+        if (saverWanted_) {
+            labels_[std::size_t(fn_.labelCount)] = a_.here();
+            a_.addImm(X16, kRt, std::uint32_t(config_.savedRegs), true);
+            for (std::uint32_t r = 0; r < 30; r += 2)
+                a_.stpX(Reg(r), Reg(r + 1), X16, std::int32_t(r * 8));
+            for (std::uint32_t r = 0; r < 32; ++r)
+                a_.strD(r, X16, (32 + r) * 8);
+            a_.ret();
+        }
         for (const LabelFixup& fixup : labelFixups_) {
             if (labels_[std::size_t(fixup.label)] == std::size_t(-1) ||
                 !a_.patchChecked(fixup.at, labels_[std::size_t(fixup.label)]))
@@ -481,7 +490,7 @@ private:
                 hasDecOrPoll = true;
         }
         for (const IrCall& call : fn_.calls)
-            outgoing = std::max(outgoing, stackWords(call.args));
+            outgoing = std::max(outgoing, stackWords(call.passed()));
         areaBase_ = outgoing * 8;
         spillBase_ = areaBase_ + ((fn_.frameAreaBytes + 7u) & ~7u);
         coldSaveBase_ = spillBase_ + fn_.spillSlots * 8;
@@ -1384,7 +1393,7 @@ private:
         // Arguments go where the convention says, all at once.
         std::vector<Move> ints, fps;
         std::uint32_t nextInt = 0, nextFp = 0, stack = 0;
-        for (std::int32_t arg : call.args) {
+        for (std::int32_t arg : call.passed()) {
             const bool isFp = fn_.vregIsFp[std::size_t(arg)] != 0;
             Move m;
             m.from = placeOf(arg);
@@ -1889,6 +1898,12 @@ private:
                 commit(in.d, d);
                 return;
             }
+            case IrOp::SaveRegs:
+                // A branch and link to the one place that does it: x30 is in the frame already.
+                saverWanted_ = true;
+                a_.word(0x94000000u);
+                labelFixups_.push_back({a_.here() - 1, std::int32_t(fn_.labelCount)});
+                return;
             case IrOp::FpToInt32Js: {
                 const std::uint32_t a = useFp(in.a, kFpScratchA);
                 const Reg d = def(in.d, X16);
@@ -1907,6 +1922,7 @@ private:
         }
     }
 
+    bool saverWanted_ = false;
     const IrFunction& fn_;
     NativeConfig config_;
     const std::unordered_map<const MethodInfo*, std::size_t>& session_;

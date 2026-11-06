@@ -513,8 +513,11 @@ inline PropertySite* siteOf(const FunctionCode& code, std::uint32_t site) noexce
 Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, PropertySite* site)
 {
     DynObject* obj = asObject(base);
-    if (!site || !obj || !obj->shape || key->kind != CellKind::String)
+    if (!site || !obj || !obj->shape || key->kind != CellKind::String) {
+        if (site)
+            ++site->misses;
         return getProperty(rt, base, key);
+    }
     // An array answers `length` and its indices itself, and a string object its `length`, ahead of any table. Any other
     // name is in the tables, an array's included: `Array.prototype` is one, and where `push` and `map` are.
     std::uint32_t index = 0;
@@ -610,6 +613,8 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
 {
     DynObject* obj = asObject(base);
     Shape* const before = obj ? obj->shape : nullptr;
+    if (site)
+        ++site->misses;
     if (!site || !before || key->kind != CellKind::String || obj->cls == ObjClass::Array ||
         obj->cls == ObjClass::StringObject) {
         setProperty(rt, base, key, v);

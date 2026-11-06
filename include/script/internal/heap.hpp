@@ -70,9 +70,20 @@ struct GCObject
     // Last and small on purpose: a derived class's first members move into the padding after these, which takes 8 bytes
     // off a string, an instance and an array -- a good part of a small object.
     CellKind kind = CellKind::Object;
-    std::uint8_t gcColor = 0;
+    std::uint8_t gcColor : 1;
+    /// Holders do not count references to this: something keeps it for as long as the context lasts.
+    std::uint8_t pinned : 1;
 
-    GCObject() = default;
+    /// From here on it stays. The count this adds is never given back, so it does not matter what was counted before.
+    void pin() noexcept
+    {
+        if (!pinned) {
+            pinned = 1;
+            ++rc;
+        }
+    }
+
+    GCObject() : gcColor(0), pinned(0) {}
     GCObject(const GCObject&) = delete;
     GCObject& operator=(const GCObject&) = delete;
     virtual ~GCObject();
@@ -210,6 +221,8 @@ struct Box : GCObject
     void clearReferences() override { value = Value(); }
     std::size_t heapSize() const override { return sizeof(*this); }
 };
+
+static_assert(offsetof(detail::GCObject, rc) == detail::kCellCountOffset);
 
 /// Set on a cell that wraps a C++ instance registered through `Class<T>`.
 struct NativeSlot

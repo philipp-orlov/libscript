@@ -30,10 +30,25 @@ namespace script {
 namespace detail {
 struct GCObject;
 struct Access;
-void incRef(GCObject*) noexcept;
-void decRef(GCObject*) noexcept;
 /// What `decRef` does once a count reaches zero; native code does the counting itself.
 void destroyUnreferenced(GCObject*) noexcept;
+/// Where in a cell its count is. `GCObject` checks this; counting is too frequent to be a call, and its definition too
+/// much of the engine to bring in here.
+inline constexpr std::size_t kCellCountOffset = 8;
+inline std::uint32_t& cellCount(GCObject* cell) noexcept
+{
+    return *reinterpret_cast<std::uint32_t*>(reinterpret_cast<char*>(cell) + kCellCountOffset);
+}
+inline void incRef(GCObject* cell) noexcept
+{
+    if (cell)
+        ++cellCount(cell);
+}
+inline void decRef(GCObject* cell) noexcept
+{
+    if (cell && --cellCount(cell) == 0)
+        destroyUnreferenced(cell);
+}
 }  // namespace detail
 
 class Context;

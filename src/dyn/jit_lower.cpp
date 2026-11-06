@@ -2018,7 +2018,8 @@ private:
                         const std::int64_t at = std::int64_t(object.fresh->count) * std::int64_t(sizeof(Prop));
                         const std::int32_t props = loadHeader(object.r, kPropsOffset);
                         const std::int32_t k = ptrReg(key);
-                        incRefOf(k, -1, false);
+                        if (!key->pinned)
+                            incRefOf(k, -1, false);
                         store(props, at + kPropKeyOffset, k, 8);
                         store(props, at + kPropValueOffset, vt, 1);
                         store(props, at + kPropValueOffset + kPayload, vr, 8);
@@ -3046,8 +3047,11 @@ private:
             test.width = 64;
             test.target = slow;
         }
-        const std::int32_t key = ptrReg(code_.atoms[operand & kAtomMask].get());
-        incRefOf(key, -1, false);
+        GCObject* name = code_.atoms[operand & kAtomMask].get();
+        const std::int32_t key = ptrReg(name);
+        // The shape this adds to has the name, which pins it.
+        if (!name->pinned)
+            incRefOf(key, -1, false);
         store(end, kPropKeyOffset, key, 8);
         store(end, kPropValueOffset, vt, 1);
         store(end, kPropValueOffset + kPayload, vr, 8);

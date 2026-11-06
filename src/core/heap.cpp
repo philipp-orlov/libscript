@@ -38,23 +38,10 @@ void GCObject::reserveGrowth(std::size_t bytes)
         rt->reserve(bytes);
 }
 
-void incRef(GCObject* cell) noexcept
-{
-    if (cell)
-        ++cell->rc;
-}
-
 /// Freeing one cell releases its children, which may free them too. Doing that
 /// recursively overflows the stack on a long list or a deep tree, so only the
 /// outermost call actually destroys: nested releases park their cell on a
 /// worklist threaded through `gcNext` and the outer loop drains it.
-void decRef(GCObject* cell) noexcept
-{
-    if (!cell || --cell->rc != 0)
-        return;
-    destroyUnreferenced(cell);
-}
-
 void destroyUnreferenced(GCObject* cell) noexcept
 {
     internal::ContextImpl* rt = cell->rt;

@@ -42,9 +42,55 @@ enum PropAttr : std::uint8_t
 
 /// One own property. `key` is either an interned StringCell or a SymbolCell, so
 /// key comparison is pointer comparison.
+/// A reference that counts only while what it points at is not pinned: the names of properties and the prototypes of many
+/// objects, which every object made would otherwise add to and take from the same few counts.
+template <class T>
+class PinRef
+{
+public:
+    PinRef() noexcept = default;
+    PinRef(T* p) noexcept : p_(p)
+    {
+        if (p_ && !p_->pinned)
+            detail::incRef(p_);
+    }
+    PinRef(const PinRef& o) noexcept : PinRef(o.p_) {}
+    PinRef(PinRef&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+    ~PinRef()
+    {
+        if (p_ && !p_->pinned)
+            detail::decRef(p_);
+    }
+    PinRef& operator=(const PinRef& o) noexcept
+    {
+        PinRef tmp(o);
+        std::swap(p_, tmp.p_);
+        return *this;
+    }
+    PinRef& operator=(PinRef&& o) noexcept
+    {
+        std::swap(p_, o.p_);
+        return *this;
+    }
+    void reset(T* p = nullptr) noexcept
+    {
+        PinRef tmp(p);
+        std::swap(p_, tmp.p_);
+    }
+    T* get() const noexcept { return p_; }
+    T* operator->() const noexcept { return p_; }
+    T& operator*() const noexcept { return *p_; }
+    explicit operator bool() const noexcept { return p_ != nullptr; }
+    bool operator==(const PinRef& o) const noexcept { return p_ == o.p_; }
+    bool operator!=(const PinRef& o) const noexcept { return p_ != o.p_; }
+
+private:
+    T* p_ = nullptr;
+};
+
 struct Prop
 {
-    Ref<GCObject> key;
+    PinRef<GCObject> key;
     Value value = Value::undefined();
     std::uint8_t attrs = PropDefault;
 
@@ -198,6 +244,8 @@ struct Shape
     /// takes its table at that size and grows no more.
     Shape* root = nullptr;
     std::uint32_t expect = 0;
+    /// There, too, how many objects have started from it.
+    std::uint32_t births = 0;
     /// The shape this one adds a property to; null for a root.
     Shape* parent = nullptr;
     /// Whether an object of this shape has `k`, following the chain back to the root.
@@ -228,7 +276,7 @@ struct DynObject : GCObject
     Shape* shape = nullptr;
     /// The shape an object with this one as its prototype starts from.
     Shape* childRoot = nullptr;
-    Ref<DynObject> proto;
+    PinRef<DynObject> proto;
     /// Sets `proto`, keeping what shapes and sites know right. Every change of prototype goes through here.
     void setProto(DynObject* next);
     /// The layout is about to change in a way no shape describes.

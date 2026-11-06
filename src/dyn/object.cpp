@@ -178,10 +178,11 @@ void DynObject::trim()
 
 void DynObject::children(GcList& out) const
 {
-    if (proto)
+    // A pinned cell is not counted, so it is no edge.
+    if (proto && !proto->pinned)
         out.push_back(proto.get());
     for (const Prop& p : props) {
-        if (p.key)
+        if (p.key && !p.key->pinned)
             out.push_back(p.key.get());
         if (GCObject* v = detail::Access::ptr(p.value))
             out.push_back(v);
@@ -213,7 +214,7 @@ void DynObject::setSetter(const Prop& p, Value fn)
         return;
     }
     if (!fn.isUndefined())
-        setters->push_back({p.key, std::move(fn)});
+        setters->push_back({Ref<GCObject>(p.key.get()), std::move(fn)});
 }
 
 void DynObject::clearReferences()

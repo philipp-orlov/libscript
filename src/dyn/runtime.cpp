@@ -160,6 +160,8 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     sym.hasInstance.reset(wellKnown("Symbol.hasInstance"), true);
 
     installBuiltins(*this);
+    for (DynObject* builtin : {objectProto.get(), functionProto.get(), arrayProto.get()})
+        builtin->pin();
     // What was built before this runtime could hand out shapes gets them now, so sites can learn reads from Math, JSON,
     // the constructors and their prototypes.
     for (const Prop& p : globalObject->props) {
@@ -305,6 +307,8 @@ Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
     shapes.push_back(std::make_unique<Shape>());
     Shape* next = shapes.back().get();
     next->key.reset(key);
+    // A shape lasts as long as the runtime, so its name does; objects needn't count it.
+    key->pin();
     next->attrs = attrs;
     next->count = from->count + 1;
     next->root = from->root;
@@ -338,9 +342,15 @@ DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
     if (room)
         o->props.adopt(reinterpret_cast<Prop*>(o + 1), room);
     ctx.linkKnown(o, std::uint32_t(bytes));
-    proto->isProto = true;
+    if (!proto->isProto)
+        proto->isProto = true;
+    Shape* root = proto->childRoot ? proto->childRoot : rootShapeFor(proto);
+    // A prototype of this many objects is here to stay, and counting it is a cost of each of them.
+    constexpr std::uint32_t kPinAfter = 1024;
+    if (!proto->pinned && root && ++root->births > kPinAfter)
+        proto->pin();
     o->proto.reset(proto);
-    o->shape = rootShapeFor(proto);
+    o->shape = root;
     return o;
 }
 

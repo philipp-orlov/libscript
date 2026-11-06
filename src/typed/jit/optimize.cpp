@@ -415,7 +415,9 @@ public:
             IrInst in = original;
             switch (in.op) {
                 case IrOp::Label:
-                    known_.clear();
+                    // A join of a cold block that leaves everything as the hot path knows it says so.
+                    if (in.alias == 0)
+                        known_.clear();
                     break;
                 case IrOp::ColdBegin:
                     // The hot path goes from before the cold block straight to after it, so what it knew it knows again.

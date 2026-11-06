@@ -126,7 +126,7 @@ struct IrInst
     bool isUnsigned = false;
     bool isNullable = false;
     /// What memory a load or store touches, for telling apart two that share an offset: 0 is anything, and two non-zero
-    /// classes that differ never overlap.
+    /// classes that differ never overlap. On a label, non-zero says only a cold block that changes nothing joins here.
     std::uint8_t alias = 0;
     std::int32_t d = -1, a = -1, b = -1, c = -1;
     std::int32_t target = -1;

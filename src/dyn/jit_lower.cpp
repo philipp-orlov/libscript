@@ -658,6 +658,50 @@ public:
         return returns;
     }
 
+    /// Nothing in the function can run any other code or change anything the caller might be borrowing from: each read is
+    /// one that hands over to the interpreter rather than call a getter.
+    bool onlyReads(const FunctionCode& c) const
+    {
+        if (!speculate_ || std::find(c.jitBailedAt.begin(), c.jitBailedAt.end(), 0u) != c.jitBailedAt.end())
+            return false;
+        for (std::uint32_t pc = 0; pc < c.code.size();) {
+            const Op op = Op(c.code[pc]);
+            const std::uint32_t next = pc + 1 + std::uint32_t(operandsOf(op)) * 4;
+            switch (op) {
+                case Op::GetLocal:
+                case Op::PushThis:
+                case Op::PushConst:
+                case Op::PushUndefined:
+                case Op::PushNull:
+                case Op::PushTrue:
+                case Op::PushFalse:
+                case Op::Pop:
+                case Op::Jump:
+                case Op::JumpIfFalse:
+                case Op::JumpIfTrue:
+                case Op::JumpIfFalseKeep:
+                case Op::JumpIfTrueKeep:
+                case Op::Return:
+                case Op::ReturnUndefined:
+                case Op::Not: break;
+                case Op::GetProp: {
+                    const std::uint32_t operand = readOperand(c.code, pc + 1);
+                    const std::uint32_t index = operand >> kSiteShift;
+                    if (index == kNoSite || index >= c.sites.size() || std::find(c.jitBailedAt.begin(), c.jitBailedAt.end(), pc) != c.jitBailedAt.end())
+                        return false;
+                    const PropertySite& site = c.sites[index];
+                    if (!site.shape || site.getter || site.addTo || site.moreCount ||
+                        (site.holder && site.epoch != rt_.ctx.protoEpoch) || c.atoms[operand & kAtomMask].get() == rt_.atom.length.get())
+                        return false;
+                    break;
+                }
+                default: return false;
+            }
+            pc = next;
+        }
+        return true;
+    }
+
     /// Where an inlined lowering refused, everything it emitted goes.
     struct Mark
     {
@@ -3384,6 +3428,28 @@ private:
             if (site->addTo) {
                 expectEpoch(site->epoch, bail);
                 appendInPlace(base, site, operand, vt, vr, bail);
+            } else if (isKnownNumber(value)) {
+                // A number over a number, the usual thing for a field that holds one, is only its bits.
+                const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
+                const std::int32_t props = loadHeader(base.r, kPropsOffset);
+                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
+                const std::int32_t other = newLabel();
+                const std::int32_t stored = newLabel();
+                branchCmp(oldTag, IrCond::Ne, std::int64_t(Type::Double), other);
+                const std::int32_t bits = value.rep == Rep::Double && !value.isConst ? value.r : vr;
+                store(props, at + kPropValueOffset + kPayload, bits, 8);
+                inst(IrOp::ColdBegin);
+                inst(IrOp::Label).imm = other;
+                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
+                store(props, at + kPropValueOffset, vt, 1);
+                store(props, at + kPropValueOffset + kPayload, bits, 8);
+                decRefOf(old, oldTag, false);
+                inst(IrOp::Br).imm = stored;
+                inst(IrOp::ColdEnd);
+                // Whichever way it came, the field holds this.
+                IrInst& join = inst(IrOp::Label);
+                join.imm = stored;
+                join.alias = 1;
             } else {
                 const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = loadHeader(base.r, kPropsOffset);
@@ -3778,10 +3844,15 @@ private:
         Entry self = pop();
         Entry callee = pop();
         const DynFunction* known = expectCallee(callee);
-        secureWeak();
-        securePopped(args);
-        if (self.own == Own::Weak)
-            makeOwned(self);
+        // A small function that goes in place of the call and only reads can release nothing, so nothing here needs a
+        // count to stay alive through it.
+        const bool holdsNothing = known && depth_ < 3 && inlinable(*known->code) && onlyReads(*known->code);
+        if (!holdsNothing) {
+            secureWeak();
+            securePopped(args);
+            if (self.own == Own::Weak)
+                makeOwned(self);
+        }
         if (callee.own == Own::Weak)
             makeOwned(callee);
 

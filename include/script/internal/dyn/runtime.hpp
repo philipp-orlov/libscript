@@ -82,7 +82,20 @@ struct Runtime : EngineRuntime
     template <class T, class... Args>
     T* newCell(Args&&... args)
     {
-        return ctx.newCell<T>(std::forward<Args>(args)...);
+        // By hand, not through `link`: this is how every array and function starts, and its size is no question.
+        ctx.maybeCollect();
+        ctx.reserve(sizeof(T));
+        void* memory = ctx.heap.allocate(sizeof(T));
+        T* cell;
+        try {
+            cell = new (memory) T(std::forward<Args>(args)...);
+        } catch (...) {
+            ctx.heap.deallocate(memory, sizeof(T));
+            throw;
+        }
+        cell->cellBytes = std::uint32_t(sizeof(T));
+        ctx.linkKnown(cell, std::uint32_t(sizeof(T)));
+        return cell;
     }
     void maybeCollect() { ctx.maybeCollect(); }
     StringCell* intern(StringView text) { return ctx.intern(text); }

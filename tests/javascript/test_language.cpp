@@ -666,6 +666,21 @@ TEST(jsonSeesElementsAndKeysAsItShould)
              std::string("SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError0,-0.5,100,12"));
 }
 
+TEST(instanceofWalksTheChainInPlaceWhileNothingChanges)
+{
+    // Expected values are from JavaScriptCore.
+    CHECK_EQ(run(R"JS(function A(){} function B(){} B.prototype=Object.create(A.prototype); function C(){}
+function t(x){return (x instanceof A)+':'+(x instanceof B);}
+var xs=[new A,new B,new C,1,'s',null,undefined,{},[],function(){}]; var r='';
+for(var i=0;i<600;i++) for(var j=0;j<xs.length;j++) r=t(xs[j]);
+var o=[];for(var j=0;j<xs.length;j++)o.push(t(xs[j]));
+B.prototype=new C; o.push(t(new B)); o.push(t(xs[1]));
+Object.defineProperty(A,Symbol.hasInstance,{value:function(v){return v===1;}}); o.push(t(1)); o.push(t(xs[0]));
+A.prototype=3; try{ o.push(new C instanceof C); o.push(xs[2] instanceof B);}catch(e){o.push(e.name)}
+o.join(' '))JS"),
+             std::string("true:false true:true false:false false:false false:false false:false false:false false:false false:false false:false false:true true:false true:false false:false true false"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

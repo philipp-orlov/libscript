@@ -45,6 +45,7 @@ using typed::IrSite;
 constexpr std::int64_t kCellKindOffset = offsetof(GCObject, kind);
 constexpr std::int64_t kClsOffset = offsetof(DynObject, cls);
 constexpr std::int64_t kShapeOffset = offsetof(DynObject, shape);
+constexpr std::int64_t kProtoOffset = offsetof(DynObject, proto);  // the first word of a reference is the pointer
 constexpr std::int64_t kPropsOffset = offsetof(DynObject, props);  // the first word of a vector is its data
 constexpr std::int64_t kFrozenOffset = offsetof(DynObject, frozen);
 constexpr std::int64_t kIsProtoOffset = offsetof(DynObject, isProto);
@@ -2142,7 +2143,8 @@ private:
             case Op::InstanceOf: {
                 Entry ctor = pop();
                 Entry obj = pop();
-                binaryPredicate(reinterpret_cast<void*>(&scriptDynInstanceOf), obj, ctor);
+                if (!instanceOfInPlace(obj, ctor))
+                    binaryPredicate(reinterpret_cast<void*>(&scriptDynInstanceOf), obj, ctor);
                 return true;
             }
             case Op::In: {
@@ -2549,6 +2551,92 @@ private:
             default: break;
         }
         refuse(std::string(opName(op)) + " is not compiled yet");
+    }
+
+    /// `x instanceof C` for the plain function C is known to be: up the prototype chain right here, while no prototype's
+    /// table and not C's has changed, which says nothing defines `Symbol.hasInstance`. False, with nothing emitted, when it
+    /// is not that.
+    bool instanceOfInPlace(Entry& obj, Entry& ctor)
+    {
+        if (!ctor.pinned || !betHere() || obj.rep != Rep::Tagged || obj.isConst)
+            return false;
+        auto* fn = const_cast<DynFunction*>(static_cast<const DynFunction*>(ctor.hint));
+        GCObject* hasInstance = rt_.sym.hasInstance.get();
+        if (fn->proto.get() != rt_.functionProto.get() || !fn->shape || fn->findOwn(hasInstance))
+            return false;
+        for (DynObject* cursor = rt_.functionProto.get(); cursor; cursor = cursor->proto.get()) {
+            if (cursor->findOwn(hasInstance))
+                return false;
+        }
+        const Prop* prototype = fn->findOwn(rt_.atom.prototype.get());
+        if (!prototype || prototype->accessor() || !prototype->value.isObject())
+            return false;
+        const std::int64_t at = std::int64_t(prototype - fn->props.data()) * std::int64_t(sizeof(Prop));
+        const std::int32_t bail = newLabel();
+        const std::int32_t no = newLabel();
+        const std::int32_t yes = newLabel();
+        const std::int32_t done = newLabel();
+        const std::int32_t d = fn_.newVreg(false);
+        expectEpoch(rt_.ctx.protoEpoch, bail);
+        expectShape(ctor, fn->shape, bail);
+        const std::int32_t props = loadHeader(ctor.r, kPropsOffset);
+        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1);
+        branchCmp(protoTag, IrCond::Ne, std::int64_t(Type::Object), bail);
+        const std::int32_t target = load(props, at + kPropValueOffset + kPayload, 8);
+        if (!obj.hasKnownTag)
+            branchCmp(obj.t, IrCond::Ne, std::int64_t(Type::Object), no);
+        else if (obj.known != Type::Object)
+            inst(IrOp::Br).imm = no;
+        // Anything else tagged an object, a host's cell above all, has its prototype elsewhere.
+        const std::int32_t kind = load(obj.r, kCellKindOffset, 1, false, kAliasHeader);
+        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), bail);
+        const std::int32_t cursor = fn_.newVreg(false);
+        {
+            IrInst& first = inst(IrOp::Load);
+            first.d = cursor;
+            first.a = obj.r;
+            first.imm = kProtoOffset;
+            first.width = 8;
+        }
+        const std::int32_t walk = newLabel();
+        inst(IrOp::Label).imm = walk;
+        branchCmp(cursor, IrCond::Eq, 0, no, 64);
+        {
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = cursor;
+            same.b = target;
+            same.cond = IrCond::Eq;
+            same.width = 64;
+            same.target = yes;
+        }
+        {
+            IrInst& up = inst(IrOp::Load);
+            up.d = cursor;
+            up.a = cursor;
+            up.imm = kProtoOffset;
+            up.width = 8;
+        }
+        inst(IrOp::Br).imm = walk;
+        inst(IrOp::Label).imm = yes;
+        {
+            IrInst& one = inst(IrOp::MovImm);
+            one.d = d;
+            one.imm = 1;
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::Label).imm = no;
+        {
+            IrInst& zero = inst(IrOp::MovImm);
+            zero.d = d;
+            zero.imm = 0;
+        }
+        inst(IrOp::Label).imm = done;
+        emitBail(bail, {obj, ctor});
+        forgetFacts();
+        release(ctor);
+        release(obj);
+        push(boolEntry(d));
+        return true;
     }
 
     void binaryPredicate(void* helper, Entry& a, Entry& b)

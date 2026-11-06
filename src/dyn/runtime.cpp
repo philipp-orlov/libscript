@@ -197,6 +197,7 @@ void releaseCode(const FunctionCode& code) noexcept
     auto& mutableCode = const_cast<FunctionCode&>(code);
     mutableCode.consts.clear();
     mutableCode.atoms.clear();
+    mutableCode.jitKeep.clear();
     for (const auto& child : mutableCode.children)
         releaseCode(*child);
 }

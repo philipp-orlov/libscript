@@ -316,6 +316,8 @@ struct FunctionCode
     mutable std::vector<std::uint32_t> jitIntLocals;
     /// Where native code has bailed: what it is compiled to next assumes nothing there.
     mutable std::vector<std::uint32_t> jitBailedAt;
+    /// What native code takes to stay alive without counting it: the functions its call sites guard they are calling.
+    mutable std::vector<Value> jitKeep;
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;

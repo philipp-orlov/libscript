@@ -562,6 +562,24 @@ TEST(globalsAreReadWhereTheyAreWhileNothingMovesThem)
              std::string("600"));
 }
 
+TEST(calledFunctionsAreTheOnesTheCodeExpects)
+{
+    // Native code takes a global or a method to be the function it was when compiled, and keeps that one alive: replacing
+    // it, even from inside a call to it, hands the call back, and the old function runs to its end.
+    CHECK_EQ(run("function rec(n) { if (n === 3) { rec = function (m) { return -m; }; } return n <= 0 ? 0 : n + rec(n - 1); }"
+                 " var s = 0; for (var j = 0; j < 500; j++) s += rec(2); var before = rec(5); s + ':' + before + ':' + rec(4)"),
+             std::string("1500:10:-4"));
+    CHECK_EQ(run("function P() { this.v = 1; } P.prototype.get = function () { return this.v; };"
+                 " function sum(o, n) { var s = 0; for (var i = 0; i < n; i++) s += o.get(); return s; }"
+                 " var o = new P(); var a = sum(o, 1000); P.prototype.get = function () { return 10; }; var b = sum(o, 1000);"
+                 " o.get = function () { return 100; }; var c = sum(o, 10);"
+                 " var x = 0; function f() { g = null; return 5; } function g() { return f(); }"
+                 " for (var i = 0; i < 600; i++) { g = function () { return 1; }; x += g(); }"
+                 " var h = function () { h = 0; return 7; }; var y = 0; for (var i = 0; i < 300; i++) { var t = h; y += t(); h = t; }"
+                 " a + ':' + b + ':' + c + ':' + x + ':' + y"),
+             std::string("1000:10000:1000:600:2100"));
+}
+
 TEST(applyPassesAnArrayItsElements)
 {
     // Native code calls straight through `apply` with an array nothing else holds; a shared one must still be copied.

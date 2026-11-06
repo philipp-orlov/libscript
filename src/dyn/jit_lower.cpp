@@ -118,6 +118,8 @@ struct Entry
     std::int32_t local = -1;
     /// The object this was when the code was compiled, when that is known: a hint, never relied on unguarded.
     const GCObject* hint = nullptr;
+    /// The value is `hint`, checked, and the code keeps it alive: it needs no count to be held.
+    bool pinned = false;
     /// An object literal under construction, which nothing else can see yet: its shape so far and the room in its table.
     Shape* fresh = nullptr;
     std::uint32_t freshRoom = 0;
@@ -545,10 +547,14 @@ public:
         const auto* fn = static_cast<const DynFunction*>(target);
         if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isClassConstructor || !inlinable(*fn->code))
             return false;
+        // A recursive function goes in once more: half its calls become branches, and the copy calls itself for real.
+        std::uint32_t copies = 0;
         for (const Lowering* up = this; up; up = up->parent_) {
             if (&up->code_ == fn->code.get())
-                return false;
+                ++copies;
         }
+        if (copies > 1)
+            return false;
         const Mark before = mark();
         const std::int32_t at = site();
         if (!callee.hasKnownTag)
@@ -2552,7 +2558,39 @@ private:
         Entry result = taggedEntry(r, t, Own::Weak);
         if (found && !found->accessor() && found->value.isObject())
             result.hint = detail::Access::ptr(found->value);
+        pin(result);
         push(result);
+    }
+
+    /// A function read from somewhere that may change, a global or a property, is the one it was when this was compiled,
+    /// or the interpreter carries on from here. The code keeps that function alive, so holding it needs no count, and
+    /// calling it needs nothing checked but this.
+    void pin(Entry& e, const std::vector<Entry>& popped = {})
+    {
+        if (!e.hint || e.own != Own::Weak || e.rep != Rep::Tagged || e.isConst || !betHere())
+            return;
+        const auto* target = static_cast<const DynObject*>(e.hint);
+        if (target->kind != CellKind::Object || target->cls != ObjClass::Function)
+            return;
+        const auto* fn = static_cast<const DynFunction*>(target);
+        if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isClassConstructor)
+            return;
+        const std::int32_t bail = newLabel();
+        if (!e.hasKnownTag)
+            branchCmp(e.t, IrCond::Ne, std::int64_t(Type::Object), bail);
+        const std::int32_t want = ptrReg(fn);
+        IrInst& same = inst(IrOp::BrCmp);
+        same.a = e.r;
+        same.b = want;
+        same.cond = IrCond::Ne;
+        same.width = 64;
+        same.target = bail;
+        emitBail(bail, popped);
+        keepAlive(const_cast<DynFunction*>(fn));
+        e.own = Own::Immortal;
+        e.hasKnownTag = true;
+        e.known = Type::Object;
+        e.pinned = true;
     }
 
     /// Guards that the value is a `DynObject` with this shape: anything else goes to `slow`.
@@ -2792,13 +2830,15 @@ private:
                 known->props[site->index].value.isObject())
                 result.hint = detail::Access::ptr(known->props[site->index].value);
         }
+        if (usable)
+            pin(result, {base});
         if (keepBase) {
             // func obj: the function under the receiver.
             push(result);
             push(base);
             return;
         }
-        if (base.own == Own::Owned) {
+        if (base.own == Own::Owned && !result.pinned) {
             makeOwned(result);
             push(result);
             release(base);
@@ -3258,6 +3298,7 @@ private:
             args[i] = pop();
         Entry self = pop();
         Entry callee = pop();
+        const DynFunction* known = expectCallee(callee);
         secureWeak();
         securePopped(args);
         if (self.own == Own::Weak)
@@ -3286,7 +3327,7 @@ private:
         const std::int32_t fnTag = tagReg(callee);
         const std::int32_t fnPayload = payloadReg(callee);
         const std::int32_t count = immReg(std::int64_t(argc));
-        invoke(fnTag, fnPayload, selfTag, selfPayload, area, count, r, t, held);
+        invoke(fnTag, fnPayload, selfTag, selfPayload, area, count, r, t, held, known);
         if (inlined)
             inst(IrOp::Label).imm = finished;
         for (const Entry& arg : args)
@@ -3296,20 +3337,42 @@ private:
         push(taggedEntry(r, t, Own::Owned));
     }
 
+    /// The function a pinned callee is.
+    static const DynFunction* expectCallee(const Entry& callee)
+    {
+        return callee.pinned ? static_cast<const DynFunction*>(callee.hint) : nullptr;
+    }
+    void keepAlive(GCObject* object)
+    {
+        std::vector<Value>& keep = outermost().jitKeep;
+        for (const Value& v : keep) {
+            if (detail::Access::ptr(v) == object)
+                return;
+        }
+        keep.push_back(detail::Access::make(Type::Object, object));
+    }
+
     /// Calls a function value: straight into its native code when it has some, through the runtime otherwise.
     void invoke(std::int32_t fnTag, std::int32_t fnPayload, std::int32_t selfTag, std::int32_t selfPayload, std::int32_t area,
-                std::int32_t count, std::int32_t r, std::int32_t t, const std::vector<Entry>& held)
+                std::int32_t count, std::int32_t r, std::int32_t t, const std::vector<Entry>& held,
+                const DynFunction* known = nullptr)
     {
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
-        // A function compiled to native code is called directly; anything else takes the long way.
-        branchCmp(fnTag, IrCond::Ne, std::int64_t(Type::Object), slow);
-        const std::int32_t kind = load(fnPayload, kCellKindOffset, 1, false, kAliasHeader);
-        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t cls = load(fnPayload, kClsOffset, 1, false, kAliasHeader);
-        branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), slow);
-        const std::int32_t codePtr = load(fnPayload, kFnCodeOffset, 8, false, kAliasHeader);
-        branchCmp(codePtr, IrCond::Eq, 0, slow, 64);
+        // A function compiled to native code is called directly; anything else takes the long way. A function this code
+        // keeps alive and has checked the identity of needs none of that asked.
+        std::int32_t codePtr = -1;
+        if (known) {
+            codePtr = ptrReg(known->code.get());
+        } else {
+            branchCmp(fnTag, IrCond::Ne, std::int64_t(Type::Object), slow);
+            const std::int32_t kind = load(fnPayload, kCellKindOffset, 1, false, kAliasHeader);
+            branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
+            const std::int32_t cls = load(fnPayload, kClsOffset, 1, false, kAliasHeader);
+            branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), slow);
+            codePtr = load(fnPayload, kFnCodeOffset, 8, false, kAliasHeader);
+            branchCmp(codePtr, IrCond::Eq, 0, slow, 64);
+        }
         const std::int32_t entry = load(codePtr, kCallEntryOffset, 8, false, kAliasHeader);
         branchCmp(entry, IrCond::Eq, 0, slow, 64);
         {

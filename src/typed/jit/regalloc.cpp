@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
-// Linear scan register allocation.
+// Register allocation by priority over live ranges.
 //
-// Each virtual register gets one location for its whole life: a machine register, or a spill slot. That is cruder than
-// splitting intervals, and the point is that it is enough: the values worth a register are the ones in loops, and the
-// spill choice below is by how often a value is touched, weighted by loop depth, rather than by how far off its next use
-// is.
+// Each virtual register gets one location for its whole life: a machine register, or a spill slot. Its life is the set of
+// positions where it is live, holes included, so two values share a register wherever their lives do not overlap. Values
+// are placed most-touched first, uses weighted by loop depth and next to nothing in cold code, so what a loop works on
+// gets a register and what only a bail block reads takes what is left.
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -45,11 +45,19 @@ void visitOperands(const IrFunction& fn, const IrInst& in, Use use, Def def)
         def(in.d);
 }
 
+struct Range
+{
+    std::int32_t from;
+    std::int32_t to;  ///< inclusive
+    bool operator<(const Range& o) const noexcept { return from < o.from || (from == o.from && to < o.to); }
+};
+
 struct Interval
 {
     std::int32_t vreg = -1;
     std::int32_t start = 0x7fffffff;
     std::int32_t end = -1;
+    std::vector<Range> ranges;
     double weight = 0;
     bool crossesCall = false;
     std::int32_t hint = -1;  ///< a machine register it would like to be in
@@ -113,6 +121,8 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
 {
     const std::size_t count = fn.code.size();
     const std::size_t vregs = fn.vregIsFp.size();
+    // A use in cold code counts for this much of one in hot code.
+    constexpr double kColdWeight = 0.01;
 
     // ---- basic blocks ----
     std::vector<std::int32_t> labelAt(std::size_t(fn.labelCount), -1);
@@ -129,9 +139,26 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             case IrOp::BrCmp:
             case IrOp::BrFCmp:
             case IrOp::Ret:
+            case IrOp::ColdBegin:
                 starts[i + 1] = 1;
                 break;
+            case IrOp::ColdEnd:
+                starts[i] = 1;
+                break;
             default: break;
+        }
+    }
+    // The hot path goes from before a cold region straight to after it: that is where the region is not laid out.
+    std::vector<std::int32_t> coldEndOf(count, -1);
+    {
+        std::vector<std::size_t> open;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (fn.code[i].op == IrOp::ColdBegin) {
+                open.push_back(i);
+            } else if (fn.code[i].op == IrOp::ColdEnd && !open.empty()) {
+                coldEndOf[open.back()] = std::int32_t(i);
+                open.pop_back();
+            }
         }
     }
     std::vector<Block> blocks;
@@ -161,6 +188,8 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             toLabel(last.target);
             if (b + 1 < blocks.size())
                 block.successors.push_back(std::int32_t(b + 1));
+        } else if (last.op == IrOp::ColdBegin && coldEndOf[std::size_t(block.last)] >= 0) {
+            block.successors.push_back(blockOfInst[std::size_t(coldEndOf[std::size_t(block.last)])]);
         } else if (last.op != IrOp::Ret && b + 1 < blocks.size()) {
             block.successors.push_back(std::int32_t(b + 1));
         }
@@ -251,89 +280,144 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         }
     }
 
-    // ---- intervals ----
-    // Position 2i is where instruction i reads, 2i + 1 where it writes, so a register whose last read is at i can be
-    // the one instruction i writes.
+    // ---- live ranges ----
+    // Position 2i is where instruction i reads, 2i + 1 where it writes. A value's life is a list of closed ranges of
+    // positions, with holes where it is dead: the result of one arm of a conditional is not live across a call in the
+    // other. Ranges are built a block at a time, backwards from what is live out of it.
+    static const double kDepthWeight[] = {1, 8, 64, 512, 4096, 32768, 262144};
+    // Code between ColdBegin and ColdEnd runs about never: a use there costs next to nothing when it reads memory.
+    std::vector<std::uint8_t> cold(count + 1, 0);
+    {
+        int nest = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (fn.code[i].op == IrOp::ColdBegin)
+                ++nest;
+            cold[i] = nest > 0;
+            if (fn.code[i].op == IrOp::ColdEnd && nest > 0)
+                --nest;
+        }
+    }
     std::vector<Interval> intervals(vregs);
     for (std::size_t v = 0; v < vregs; ++v)
         intervals[v].vreg = std::int32_t(v);
-    const auto extend = [&](std::int32_t v, std::int32_t pos) {
-        Interval& iv = intervals[std::size_t(v)];
-        iv.start = std::min(iv.start, pos);
-        iv.end = std::max(iv.end, pos);
-    };
     std::vector<std::int32_t> callPositions;
-    static const double kDepthWeight[] = {1, 8, 64, 512, 4096, 32768, 262144};
-    for (const Block& block : blocks) {
-        block.liveIn.forEach([&](std::size_t v) { extend(std::int32_t(v), block.first * 2); });
-        block.liveOut.forEach([&](std::size_t v) { extend(std::int32_t(v), block.last * 2 + 2); });
-        for (std::int32_t i = block.first; i <= block.last; ++i) {
+    // Where the range being built for each value ends, walking a block backwards; -1 when it is not live there.
+    std::vector<std::int32_t> endOf(vregs, -1);
+    for (std::size_t bi = blocks.size(); bi-- > 0;) {
+        const Block& block = blocks[bi];
+        const std::int32_t from = block.first * 2;
+        const std::int32_t to = block.last * 2 + 1;
+        block.liveOut.forEach([&](std::size_t v) { endOf[v] = to; });
+        const auto use = [&](std::int32_t v, std::int32_t pos) {
+            if (endOf[std::size_t(v)] < 0)
+                endOf[std::size_t(v)] = pos;
+        };
+        const auto def = [&](std::int32_t v, std::int32_t pos) {
+            const std::int32_t end = endOf[std::size_t(v)];
+            intervals[std::size_t(v)].ranges.push_back({pos, end < pos ? pos : end});
+            endOf[std::size_t(v)] = -1;
+        };
+        for (std::int32_t i = block.last; i >= block.first; --i) {
             const IrInst& in = fn.code[std::size_t(i)];
-            const double weight = kDepthWeight[depth[std::size_t(i)]];
-            visitOperands(
-                fn, in,
-                [&](std::int32_t v) {
-                    extend(v, i * 2);
-                    intervals[std::size_t(v)].weight += weight;
-                },
-                [&](std::int32_t v) {
-                    extend(v, i * 2 + 1);
-                    intervals[std::size_t(v)].weight += weight;
-                });
+            const double weight = kDepthWeight[depth[std::size_t(i)]] * (cold[std::size_t(i)] ? kColdWeight : 1.0);
+            visitOperands(fn, in, [](std::int32_t) {}, [&](std::int32_t v) {
+                def(v, i * 2 + 1);
+                intervals[std::size_t(v)].weight += weight;
+            });
             if (const IrExit* exit = exitOf(in)) {
+                const std::int32_t after = i * 2 + 1 + (in.op == IrOp::Call ? 1 : 0);
                 for (std::int32_t v : exit->cleanup)
-                    extend(v, i * 2 + 1 + (in.op == IrOp::Call ? 1 : 0));
+                    use(v, after);
                 for (const auto& tagged : exit->cleanupTagged) {
-                    extend(tagged.first, i * 2 + 1 + (in.op == IrOp::Call ? 1 : 0));
-                    extend(tagged.second, i * 2 + 1 + (in.op == IrOp::Call ? 1 : 0));
+                    use(tagged.first, after);
+                    use(tagged.second, after);
                 }
                 if (exit->indexVreg >= 0)
-                    extend(exit->indexVreg, i * 2 + 1);
+                    use(exit->indexVreg, i * 2 + 1);
                 for (const IrExit::WriteBack& back : exit->writeBacks) {
-                    extend(back.base, i * 2 + 1);
-                    extend(back.vreg, i * 2 + 1);
+                    use(back.base, i * 2 + 1);
+                    use(back.vreg, i * 2 + 1);
                 }
             }
+            visitOperands(fn, in, [&](std::int32_t v) {
+                use(v, i * 2);
+                intervals[std::size_t(v)].weight += weight;
+            }, [](std::int32_t) {});
             if (in.op == IrOp::Call && !fn.calls[std::size_t(in.imm)].cold)
                 callPositions.push_back(i * 2);
             // Raising on the way to a handler in this method calls the runtime, and the handler carries on after it.
             else if (in.op == IrOp::ExitCmp && fn.exits[std::size_t(in.target)].handlerLabel >= 0)
                 callPositions.push_back(i * 2);
         }
+        // What is still open is what is live into the block.
+        block.liveIn.forEach([&](std::size_t v) {
+            if (endOf[v] >= 0)
+                intervals[v].ranges.push_back({from, endOf[v]});
+            endOf[v] = -1;
+        });
     }
+    std::sort(callPositions.begin(), callPositions.end());
     fn.makesCalls = false;
     for (const IrInst& in : fn.code)
         fn.makesCalls = fn.makesCalls || in.op == IrOp::Call;
     // What arrives at entry is live from before the first instruction.
+    const auto fromEntry = [&](std::int32_t v) { intervals[std::size_t(v)].ranges.push_back({-1, 0}); };
     for (std::int32_t p : fn.params)
-        extend(p, -1);
+        fromEntry(p);
     for (std::int32_t c : fn.captures)
-        extend(c, -1);
+        fromEntry(c);
     for (std::int32_t z : fn.osrZero)
-        extend(z, -1);
+        fromEntry(z);
     for (std::int32_t z : fn.osrArguments)
-        extend(z, -1);
+        fromEntry(z);
+    // Sorted and merged: touching ranges are one.
+    for (Interval& iv : intervals) {
+        if (iv.ranges.empty())
+            continue;
+        std::sort(iv.ranges.begin(), iv.ranges.end());
+        std::vector<Range> merged;
+        for (const Range& r : iv.ranges) {
+            if (!merged.empty() && r.from <= merged.back().to + 1)
+                merged.back().to = std::max(merged.back().to, r.to);
+            else
+                merged.push_back(r);
+        }
+        iv.ranges.swap(merged);
+        iv.start = iv.ranges.front().from;
+        iv.end = iv.ranges.back().to;
+    }
     // Entering at a loop head writes only what is live there; anything else may share a register with something that is.
     for (IrOsrEntry& entry : fn.osrEntries) {
         const std::int32_t at = labelAt[std::size_t(entry.label)];
-        const BitSet& live = blocks[std::size_t(blockOfInst[std::size_t(at)])].liveIn;
+        const BitSet& liveIn = blocks[std::size_t(blockOfInst[std::size_t(at)])].liveIn;
         entry.pointers.erase(std::remove_if(entry.pointers.begin(), entry.pointers.end(),
-                                            [&](const IrOsrEntry::Slot& s) { return !live.test(std::size_t(s.vreg)); }),
+                                            [&](const IrOsrEntry::Slot& s) { return !liveIn.test(std::size_t(s.vreg)); }),
                              entry.pointers.end());
         entry.slots.erase(std::remove_if(entry.slots.begin(), entry.slots.end(),
                                          [&](const IrOsrEntry::Slot& s) {
-                                             return !live.test(std::size_t(s.vreg)) &&
-                                                    (s.tagVreg < 0 || !live.test(std::size_t(s.tagVreg)));
+                                             return !liveIn.test(std::size_t(s.vreg)) &&
+                                                    (s.tagVreg < 0 || !liveIn.test(std::size_t(s.tagVreg)));
                                          }),
                           entry.slots.end());
     }
 
-    // A value that has to survive a call needs a callee-saved register or a slot.
+    // A value that has to survive a call needs a callee-saved register or a slot: one live both where the call reads and
+    // where it writes.
+    const auto liveAcross = [](const Interval& iv, std::int32_t pos) {
+        for (const Range& r : iv.ranges) {
+            if (r.from <= pos && r.to >= pos + 1)
+                return true;
+        }
+        return false;
+    };
     for (Interval& iv : intervals) {
-        if (iv.end < 0)
-            continue;
-        const auto it = std::upper_bound(callPositions.begin(), callPositions.end(), iv.start);
-        iv.crossesCall = it != callPositions.end() && *it < iv.end;
+        for (const Range& r : iv.ranges) {
+            auto it = std::lower_bound(callPositions.begin(), callPositions.end(), r.from);
+            if (it != callPositions.end() && *it + 1 <= r.to) {
+                iv.crossesCall = true;
+                break;
+            }
+        }
     }
     // An incoming parameter gets its own register's value handed over at entry with no move if nothing stands in the
     // way; the same goes for an argument computed right before the call that takes it.
@@ -369,65 +453,48 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         }
     }
 
+    // ---- assignment, most valuable first ----
+    // Each value is placed whole: in the first register none of whose values overlaps it, or in memory. Going by how much
+    // a value is touched, the ones a loop reads get registers before ones that only a bail looks at, and those then fit
+    // in around them or spill at little cost.
     std::vector<Interval*> order;
     for (Interval& iv : intervals) {
-        if (iv.end >= 0)
+        if (!iv.ranges.empty())
             order.push_back(&iv);
     }
-    std::sort(order.begin(), order.end(), [](const Interval* a, const Interval* b) { return a->start < b->start; });
+    std::stable_sort(order.begin(), order.end(), [](const Interval* a, const Interval* b) { return a->weight > b->weight; });
 
-    // ---- the scan ----
     fn.location.assign(vregs, IrFunction::kUnused);
-    struct Active
-    {
-        Interval* iv;
-        std::int32_t reg;
+    // What each machine register holds, as sorted, disjoint ranges.
+    std::vector<std::vector<Range>> busyInt(64), busyFp(64);
+    const auto fits = [](const std::vector<Range>& busy, const Interval& iv) {
+        for (const Range& r : iv.ranges) {
+            // The first busy range ending at or after r.from: it overlaps unless it starts after r.to.
+            auto it = std::lower_bound(busy.begin(), busy.end(), r.from, [](const Range& b, std::int32_t at) { return b.to < at; });
+            if (it != busy.end() && it->from <= r.to)
+                return false;
+        }
+        return true;
     };
-    std::vector<Active> activeInt, activeFp;
-    std::uint64_t freeInt = 0, freeFp = 0;
-    std::uint64_t calleeMaskInt = 0, calleeMaskFp = 0;
-    for (std::int32_t r : regs.intCallerSaved)
-        freeInt |= std::uint64_t(1) << r;
-    for (std::int32_t r : regs.intCalleeSaved) {
-        freeInt |= std::uint64_t(1) << r;
-        calleeMaskInt |= std::uint64_t(1) << r;
-    }
-    for (std::int32_t r : regs.fpCallerSaved)
-        freeFp |= std::uint64_t(1) << r;
-    for (std::int32_t r : regs.fpCalleeSaved) {
-        freeFp |= std::uint64_t(1) << r;
-        calleeMaskFp |= std::uint64_t(1) << r;
-    }
-
+    const auto occupy = [](std::vector<Range>& busy, const Interval& iv) {
+        for (const Range& r : iv.ranges)
+            busy.insert(std::upper_bound(busy.begin(), busy.end(), r), r);
+    };
     std::uint32_t spillSlots = 0;
-    std::vector<std::uint32_t> freeSlots;
-
     for (Interval* iv : order) {
         const bool fp = fn.vregIsFp[std::size_t(iv->vreg)] != 0;
-        std::vector<Active>& active = fp ? activeFp : activeInt;
-        std::uint64_t& free = fp ? freeFp : freeInt;
-        const std::uint64_t calleeMask = fp ? calleeMaskFp : calleeMaskInt;
+        std::vector<std::vector<Range>>& busy = fp ? busyFp : busyInt;
         const std::vector<std::int32_t>& callerOrder = fp ? regs.fpCallerSaved : regs.intCallerSaved;
         const std::vector<std::int32_t>& calleeOrder = fp ? regs.fpCalleeSaved : regs.intCalleeSaved;
-
-        for (std::size_t i = 0; i < active.size();) {
-            // An interval that ends where this one starts gives its register up: its last read comes first.
-            if (active[i].iv->end <= iv->start) {
-                free |= std::uint64_t(1) << active[i].reg;
-                active[i] = active.back();
-                active.pop_back();
-            } else {
-                ++i;
-            }
-        }
-
         std::int32_t chosen = -1;
-        const auto isFree = [&](std::int32_t r) { return (free >> r) & 1u; };
-        if (!iv->crossesCall && iv->hint >= 0 && isFree(iv->hint))
+        const auto isCallee = [&](std::int32_t r) {
+            return std::find(calleeOrder.begin(), calleeOrder.end(), r) != calleeOrder.end();
+        };
+        if (iv->hint >= 0 && (!iv->crossesCall || isCallee(iv->hint)) && fits(busy[std::size_t(iv->hint)], *iv))
             chosen = iv->hint;
         if (chosen < 0 && !iv->crossesCall) {
             for (std::int32_t r : callerOrder) {
-                if (isFree(r)) {
+                if (fits(busy[std::size_t(r)], *iv)) {
                     chosen = r;
                     break;
                 }
@@ -435,38 +502,18 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         }
         if (chosen < 0) {
             for (std::int32_t r : calleeOrder) {
-                if (isFree(r)) {
+                if (fits(busy[std::size_t(r)], *iv)) {
                     chosen = r;
                     break;
                 }
             }
         }
         if (chosen < 0) {
-            // Nothing free. Whoever is touched least per unit of length goes to memory: this one, or an active one whose
-            // register this interval is allowed to take.
-            const auto density = [](const Interval* i) { return i->weight / double(i->end - i->start + 1); };
-            Active* victim = nullptr;
-            for (Active& a : active) {
-                if (iv->crossesCall && !((calleeMask >> a.reg) & 1u))
-                    continue;
-                if (!victim || density(a.iv) < density(victim->iv))
-                    victim = &a;
-            }
-            if (victim && density(victim->iv) < density(iv)) {
-                chosen = victim->reg;
-                fn.location[std::size_t(victim->iv->vreg)] = -std::int32_t(spillSlots++) - 1;
-                *victim = active.back();
-                active.pop_back();
-                free |= std::uint64_t(1) << chosen;
-            }
-        }
-        if (chosen < 0) {
             fn.location[std::size_t(iv->vreg)] = -std::int32_t(spillSlots++) - 1;
             continue;
         }
-        free &= ~(std::uint64_t(1) << chosen);
+        occupy(busy[std::size_t(chosen)], *iv);
         fn.location[std::size_t(iv->vreg)] = chosen;
-        active.push_back({iv, chosen});
         (fp ? fn.usedFpRegs : fn.usedIntRegs) |= std::uint64_t(1) << chosen;
     }
     fn.spillSlots = spillSlots;
@@ -487,7 +534,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         const std::int32_t pos = std::int32_t(i) * 2;
         for (const Interval* iv : order) {
             const std::int32_t loc = fn.location[std::size_t(iv->vreg)];
-            if (loc < 0 || iv->start > pos || iv->end <= pos)
+            if (loc < 0 || iv->start > pos || iv->end <= pos || !liveAcross(*iv, pos))
                 continue;
             if (fn.vregIsFp[std::size_t(iv->vreg)])
                 live.fps |= (std::uint64_t(1) << loc) & callerFp;
@@ -522,6 +569,13 @@ std::string dumpIr(const IrFunction& fn)
                       kNames[std::size_t(in.op)], in.width, int(in.cond), in.d, in.a, in.b, in.c, in.target,
                       (long long)in.imm, in.hasImm ? " #" : "");
         out += line;
+        if (in.op == IrOp::Call) {
+            const IrCall& call = fn.calls[std::size_t(in.imm)];
+            out += "         args";
+            for (std::int32_t a : call.args)
+                out += " " + std::to_string(a);
+            out += " -> " + std::to_string(call.result) + "," + std::to_string(call.resultTag) + (call.cold ? " cold\n" : "\n");
+        }
     }
     return out;
 }

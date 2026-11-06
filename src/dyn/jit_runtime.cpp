@@ -821,9 +821,12 @@ bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& resul
             std::memset(static_cast<void*>(&frame.cells[slot]), 0, sizeof(void*));
         }
     }
+    // Native code for non-strict code takes a nullish `this` to have been made the global object on entry.
+    const Value self = code.sloppyThis && frame.thisValue.isNullish()
+                           ? detail::Access::make(Type::Object, rt.globalObject.get())
+                           : frame.thisValue;
     std::uint64_t ints[8] = {reinterpret_cast<std::uint64_t>(values), reinterpret_cast<std::uint64_t>(cells),
-                             reinterpret_cast<std::uint64_t>(frame.fn), std::uint64_t(frame.thisValue.type()),
-                             payloadOf(frame.thisValue)};
+                             reinterpret_cast<std::uint64_t>(frame.fn), std::uint64_t(self.type()), payloadOf(self)};
     const double fps[8] = {};
     NativeRun run(rt, frame, false);
     armNativeRun(rt, reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)));

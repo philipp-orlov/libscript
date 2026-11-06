@@ -213,6 +213,10 @@ public:
         const std::int32_t argc = fn_.newVreg(false);
         fn_.params = {fnReg_, thisTag_, thisReg_, args, argc};
         fn_.osrArguments = {fnReg_, thisTag_, thisReg_};
+        // Non-strict: nullish `this` reads as the global object, so it might as well be that from the start. Entering at
+        // a loop does the same before it gets here.
+        if (code_.sloppyThis)
+            normalizeThis();
 
         const std::uint32_t slots = code_.numLocals;
         localReg_.assign(slots, -1);
@@ -382,8 +386,20 @@ public:
         inlineR_ = r;
         inlineT_ = t;
         fnReg_ = ptrReg(target);
-        thisTag_ = tagReg(self);
-        thisReg_ = payloadReg(self);
+        thisTag_ = fn_.newVreg(false);
+        thisReg_ = fn_.newVreg(false);
+        {
+            const std::int32_t tag = tagReg(self);
+            const std::int32_t payload = payloadReg(self);
+            IrInst& mt = inst(IrOp::Mov);
+            mt.d = thisTag_;
+            mt.a = tag;
+            IrInst& mp = inst(IrOp::Mov);
+            mp.d = thisReg_;
+            mp.a = payload;
+        }
+        if (code_.sloppyThis)
+            normalizeThis();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
         const std::uint32_t slots = code_.numLocals;
         localReg_.assign(slots, -1);
@@ -429,6 +445,20 @@ public:
             cellOwned_[slot] = 1;
         }
         walk();
+    }
+
+    void normalizeThis()
+    {
+        const std::int32_t done = newLabel();
+        branchCmp(thisTag_, IrCond::Hi, std::int64_t(Type::Null), done);
+        IrInst& g = inst(IrOp::MovImm);
+        g.d = thisReg_;
+        g.imm = std::int64_t(reinterpret_cast<std::intptr_t>(rt_.globalObject.get()));
+        IrInst& gt = inst(IrOp::MovImm);
+        gt.d = thisTag_;
+        gt.imm = std::int64_t(Type::Object);
+        inst(IrOp::Label).imm = done;
+        thisNormalized_ = true;
     }
 
     /// Small enough, simple enough, and loop-free: what a call may do in place of calling.
@@ -1604,7 +1634,7 @@ private:
                 return true;
             }
             case Op::PushThis: {
-                if (code_.sloppyThis) {
+                if (code_.sloppyThis && !thisNormalized_) {
                     // Nullish reads as the global object, which outlives everything.
                     const std::int32_t t = fn_.newVreg(false);
                     const std::int32_t r = fn_.newVreg(false);
@@ -4409,6 +4439,8 @@ private:
     std::set<std::int32_t> nonNullLocals_;
     /// Parameters only ever given numbers, by slot.
     std::vector<std::uint8_t> numberParam_;
+    /// Non-strict code whose `this` was made the global object on entry, when nullish: every read is the same register.
+    bool thisNormalized_ = false;
     // ---- inlining ----
     /// The lowering this one is inlined into, what that one holds for the call, and where its result goes.
     const Lowering* parent_ = nullptr;

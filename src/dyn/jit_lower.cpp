@@ -1784,6 +1784,29 @@ private:
                 pc = next + 6;
                 continue;
             }
+            // `this` made in place stays as it was made while nothing could have seen it: what is done here is store
+            // locals, constants and their sums into it.
+            if (freshThis_) {
+                switch (op) {
+                    case Op::PushThis:
+                    case Op::GetLocal:
+                    case Op::PushConst:
+                    case Op::PushUndefined:
+                    case Op::PushNull:
+                    case Op::PushTrue:
+                    case Op::PushFalse:
+                    case Op::Pop:
+                    case Op::Add:
+                    case Op::Sub:
+                    case Op::Mul: break;
+                    case Op::SetProp:
+                        if (stack_.size() >= 2 && stack_[stack_.size() - 2].r == thisReg_ && stack_.back().r != thisReg_)
+                            break;
+                        freshThis_ = false;
+                        break;
+                    default: freshThis_ = false; break;
+                }
+            }
             // These change an object under construction behind the back of what `fresh` says about it.
             switch (op) {
                 case Op::DefMethod:
@@ -1831,11 +1854,35 @@ private:
             const Shape* shape = nullptr;
             bool mixedShapes = false;
             std::uint8_t elements = 0;
+            /// Properties read through it, and whether all a read there has seen are numbers.
+            std::vector<std::pair<std::uint32_t, bool>> reads;
         };
         std::map<std::uint32_t, Wanted> wanted;
+        // Globals this function never assigns, read where the loop runs: their places, and what is read through them.
+        struct WantedGlobal
+        {
+            Wanted w;
+        };
+        std::map<GCObject*, WantedGlobal> globals;
         for (std::uint32_t pc = head; pc <= last;) {
             const Op op = Op(c[pc]);
             const std::uint32_t next = pc + 1 + std::uint32_t(operandsOf(op)) * 4;
+            if (op == Op::GetGlobal) {
+                GCObject* key = code_.atoms[readOperand(c, pc + 1)].get();
+                if (!assignsGlobal(key)) {
+                    WantedGlobal& g = globals[key];
+                    if (const std::int64_t site = propertySiteAfter(next); site >= 0) {
+                        const PropertySite* known = siteAt(std::uint32_t(site));
+                        if (known && known->shape && !known->holder && !known->getter && !known->addTo && !known->moreCount) {
+                            g.w.mixedShapes = g.w.mixedShapes || (g.w.shape && g.w.shape != known->shape);
+                            g.w.shape = known->shape;
+                            g.w.reads.emplace_back(known->index, known->saw == PropertySite::kSawNumber);
+                        }
+                    } else if (const std::uint8_t saw = elementsSeenAfter(next)) {
+                        g.w.elements |= saw;
+                    }
+                }
+            }
             if (op == Op::GetLocal) {
                 const std::uint32_t slot = readOperand(c, pc + 1);
                 if (slot < localReg_.size() && !assigned[slot] && !isNumberLocal(slot) && !(argsLazy_ && slot == code_.argumentsSlot)) {
@@ -1845,6 +1892,7 @@ private:
                             Wanted& w = wanted[slot];
                             w.mixedShapes = w.mixedShapes || (w.shape && w.shape != known->shape);
                             w.shape = known->shape;
+                            w.reads.emplace_back(known->index, known->saw == PropertySite::kSawNumber);
                         }
                     } else if (const std::uint8_t saw = elementsSeenAfter(next)) {
                         wanted[slot].elements |= saw;
@@ -1853,9 +1901,30 @@ private:
             }
             pc = next;
         }
-        if (wanted.empty())
+        if (wanted.empty() && globals.empty())
             return;
         const std::int32_t bail = newLabel();
+        DynObject* global = rt_.globalObject.get();
+        for (const auto& [key, g] : globals) {
+            const Prop* found = global->findOwn(key);
+            // A number is a constant to `getGlobal`, and needs nothing from here.
+            if (!found || global->accessorOf(*found) || found->value.isDouble())
+                continue;
+            const std::int32_t slot = globalSlot(found, bail);
+            const Entry value = taggedEntry(load(slot, kPropValueOffset + kPayload, 8, false, kAliasValue),
+                                            load(slot, kPropValueOffset, 1, false, kAliasValue), Own::Weak);
+            if (g.w.elements && !g.w.shape && found->value.isObject()) {
+                guardArray(value, bail);
+                loadHeader(value.r, kElementsOffset);
+                load(value.r, kElementCountOffset, 4, false, kAliasHeader);
+                load(value.r, kFrozenOffset, 1, false, kAliasHeader);
+                load(value.r, kPropsSizeOffset, 4, false, kAliasHeader);
+                load(value.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+            } else if (g.w.shape && !g.w.mixedShapes && found->value.isObject()) {
+                guardShape(value, g.w.shape, bail);
+                readsBeforeLoop(loadHeader(value.r, kPropsOffset), g.w.reads, bail);
+            }
+        }
         for (const auto& [slot, w] : wanted) {
             const Entry local = taggedEntry(localReg_[slot], localTag_[slot], Own::Weak);
             if (w.elements) {
@@ -1873,11 +1942,32 @@ private:
                     branchCmp(numbersOnly, IrCond::Ne, 0, bail);
             } else if (w.shape && !w.mixedShapes) {
                 guardShape(local, w.shape, bail);
-                loadHeader(local.r, kPropsOffset);
+                readsBeforeLoop(loadHeader(local.r, kPropsOffset), w.reads, bail);
             }
         }
         emitBail(bail, {});
         forgetFacts();
+    }
+
+    /// Ahead of a loop, the reads it makes of properties of what it does not assign, as it makes them: where the loop does
+    /// not store over one, it finds it read, and a number checked, already.
+    void readsBeforeLoop(std::int32_t props, std::vector<std::pair<std::uint32_t, bool>> reads, std::int32_t bail)
+    {
+        std::sort(reads.begin(), reads.end());
+        reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+        for (std::size_t i = 0; i < reads.size(); ++i) {
+            const auto [index, number] = reads[i];
+            // Read both ways in the loop: each read checks for itself.
+            if (i + 1 < reads.size() && reads[i + 1].first == index)
+                continue;
+            if (i > 0 && reads[i - 1].first == index)
+                continue;
+            const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
+            const std::int32_t lt = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+            if (number)
+                branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
+            load(props, at + kPropValueOffset + kPayload, 8, number, kAliasValue);
+        }
     }
 
     /// The operand of the `GetProp` or `GetPropDup` at `pc`, if that is what is there.
@@ -3171,7 +3261,8 @@ private:
         const std::int32_t runtime = rtReg();
         const std::int64_t offset =
             std::int64_t(reinterpret_cast<std::uintptr_t>(&rt_.globalEpoch) - reinterpret_cast<std::uintptr_t>(&rt_));
-        const std::int32_t epoch = load(runtime, offset, 8);
+        // Only the runtime's own code changes it, never a store here.
+        const std::int32_t epoch = load(runtime, offset, 8, false, kAliasHeader);
         if (rt_.globalEpoch < 4096) {
             branchCmp(epoch, IrCond::Ne, std::int64_t(rt_.globalEpoch), slow, 64);
         } else {
@@ -3720,15 +3811,18 @@ private:
     /// shape and the epoch are checked already.
     void appendInPlace(const Entry& base, const Shape* addTo, std::int32_t vt, std::int32_t vr, std::int32_t slow)
     {
-        const std::int32_t isProto = load(base.r, kIsProtoOffset, 1, false, kAliasHeader);
-        branchCmp(isProto, IrCond::Ne, 0, slow);
-        // No index to keep up, nor anything else out of the ordinary.
-        const std::int32_t rare = load(base.r, kRareOffset, 8, false, kAliasHeader);
-        branchCmp(rare, IrCond::Ne, 0, slow, 64);
         // The shape this adds to says how many there are.
         const std::uint32_t count = addTo->count - 1;
-        const std::int32_t cap = load(base.r, kPropsCapOffset, 4, false, kAliasHeader);
-        branchCmp(cap, IrCond::Le, std::int64_t(count), slow);
+        // The object a constructor made in place, which nothing else has seen yet, is all as it was made.
+        if (!freshThis_ || base.r != thisReg_ || addTo->count > freshRoom_) {
+            const std::int32_t isProto = load(base.r, kIsProtoOffset, 1, false, kAliasHeader);
+            branchCmp(isProto, IrCond::Ne, 0, slow);
+            // No index to keep up, nor anything else out of the ordinary.
+            const std::int32_t rare = load(base.r, kRareOffset, 8, false, kAliasHeader);
+            branchCmp(rare, IrCond::Ne, 0, slow, 64);
+            const std::int32_t cap = load(base.r, kPropsCapOffset, 4, false, kAliasHeader);
+            branchCmp(cap, IrCond::Le, std::int64_t(count), slow);
+        }
         const std::int32_t props = loadHeader(base.r, kPropsOffset);
         const std::int64_t at = std::int64_t(count) * std::int64_t(sizeof(Prop));
         store(props, at + kPropValueOffset, vt, 1);
@@ -4677,6 +4771,9 @@ private:
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
         const std::int32_t slot = carveCell(bytes, slow);
+        // It is a prototype from now on, as `newObjectSized` would say: changing it has to tell what was learned about the
+        // objects made here, this code among them, that it no longer holds.
+        proto->isProto = true;
         // What the constructors and `linkKnown` do.
         std::uint64_t image[kWords];
         rt_.objectImage(proto, root, room, image);
@@ -5421,6 +5518,8 @@ private:
         try {
             Lowering inner(*this, *fn->code, none, heldWithSelf, siteHere);
             inner.startShape_ = root;
+            inner.freshThis_ = true;
+            inner.freshRoom_ = room;
             inner.runInline(callee.r, objectEntry(self), args, r, t, finished);
         } catch (const Refuse&) {
             rollBack(before);
@@ -6356,6 +6455,9 @@ private:
     bool thisIsCell_ = false;
     /// Inlined as a constructor: the shape `this` starts with.
     const Shape* startShape_ = nullptr;
+    /// `this` is the object `constructInPlace` made, with room for so many properties, and nothing has seen it yet.
+    bool freshThis_ = false;
+    std::uint32_t freshRoom_ = 0;
 };
 
 /// Which locals may be read before anything was written to them, along some path. Those start as `undefined`, so they are no

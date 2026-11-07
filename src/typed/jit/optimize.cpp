@@ -729,6 +729,9 @@ private:
         std::set<std::int32_t> regs;
         std::set<std::int64_t> headerOffsets;  ///< where it stores into headers
         std::set<std::int64_t> valueOffsets;   ///< where it stores into values
+        /// Of those, where every store is of one byte and one constant: a tag the loop only ever sets to that.
+        std::map<std::int64_t, std::int64_t> constantBytes;
+        std::set<std::int64_t> variedBytes;
         bool memory = false;                   ///< it stores with no more said about where
     };
     struct Floor
@@ -742,6 +745,25 @@ private:
     /// the join a nonzero alias.
     void findQuietLoops()
     {
+        // Registers with one definition, a constant.
+        std::map<std::int32_t, std::uint32_t> defs;
+        for (const IrInst& in : fn_.code) {
+            if (in.d >= 0)
+                ++defs[in.d];
+            if (in.op == IrOp::Call) {
+                const IrCall& call = fn_.calls[std::size_t(in.imm)];
+                if (call.result >= 0)
+                    ++defs[call.result];
+                if (call.resultTag >= 0)
+                    ++defs[call.resultTag];
+            }
+        }
+        for (std::int32_t v : fn_.params)
+            ++defs[v];
+        for (const IrInst& in : fn_.code) {
+            if (in.op == IrOp::MovImm && defs[in.d] == 1)
+                constants_.emplace(in.d, in.imm);
+        }
         std::vector<std::int32_t> labelAt(std::size_t(fn_.labelCount), -1);
         for (std::size_t i = 0; i < fn_.code.size(); ++i) {
             if (fn_.code[i].op == IrOp::Label)
@@ -809,10 +831,19 @@ private:
             if (in.op == IrOp::Store || in.op == IrOp::StoreTag || in.op == IrOp::StoreIdx) {
                 if (in.op == IrOp::Store && in.alias == 1)
                     writes.headerOffsets.insert(in.imm);
-                else if (in.op == IrOp::Store && in.alias == 2)
+                else if (in.op == IrOp::Store && in.alias == 2) {
                     writes.valueOffsets.insert(in.imm);
-                else
+                    const auto constant = constants_.find(in.c);
+                    if (in.width != 1 || constant == constants_.end()) {
+                        writes.variedBytes.insert(in.imm);
+                    } else {
+                        const auto [at, added] = writes.constantBytes.emplace(in.imm, constant->second);
+                        if (!added && at->second != constant->second)
+                            writes.variedBytes.insert(in.imm);
+                    }
+                } else {
                     writes.memory = true;
+                }
             }
         }
         // Branches from before or after the loop into it.
@@ -843,6 +874,20 @@ private:
     /// Forget at a loop head what the loop may make untrue.
     void keepThrough(const LoopWrites& writes)
     {
+        // A byte known to equal the one constant the loop ever stores there stays known: a store makes it that again.
+        std::set<std::int32_t> stays;
+        for (const IrInst& k : known_) {
+            if (k.op != IrOp::Load || k.width != 1 || k.alias != 2 || writes.variedBytes.count(k.imm))
+                continue;
+            const auto constant = writes.constantBytes.find(k.imm);
+            if (constant == writes.constantBytes.end())
+                continue;
+            for (const IrInst& test : known_) {
+                if (test.op == IrOp::BrCmp && test.a == k.d && test.hasImm && test.cond == IrCond::Ne &&
+                    test.imm == constant->second)
+                    stays.insert(k.d);
+            }
+        }
         known_.erase(std::remove_if(known_.begin(), known_.end(),
                                     [&](const IrInst& k) {
                                         if (writes.regs.count(k.d) || writes.regs.count(k.a) || writes.regs.count(k.b) || writes.regs.count(k.c))
@@ -854,6 +899,8 @@ private:
                                                 return true;
                                             if (k.alias == 1)
                                                 return writes.headerOffsets.count(k.imm) != 0;
+                                            if (k.alias == 2 && stays.count(k.d))
+                                                return false;
                                             return k.alias != 2 || writes.valueOffsets.count(k.imm) != 0;
                                         }
                                         return false;
@@ -862,6 +909,7 @@ private:
     }
 
     /// The register this one is a known copy of, if it is.
+    std::map<std::int32_t, std::int64_t> constants_;
     std::set<std::int64_t> singleEntry_;
     std::map<std::int64_t, std::vector<IrInst>> atBranch_;
 

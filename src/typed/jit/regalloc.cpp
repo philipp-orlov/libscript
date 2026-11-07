@@ -453,6 +453,15 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         }
     }
 
+    // Values a copy joins: where one of them has a register the other fits in, the copy becomes nothing.
+    std::vector<std::vector<std::int32_t>> partners(vregs);
+    for (const IrInst& in : fn.code) {
+        if (in.op != IrOp::Mov || in.d < 0 || in.a < 0 || in.d == in.a || fn.vregIsFp[std::size_t(in.d)] != fn.vregIsFp[std::size_t(in.a)])
+            continue;
+        partners[std::size_t(in.d)].push_back(in.a);
+        partners[std::size_t(in.a)].push_back(in.d);
+    }
+
     // ---- assignment, most valuable first ----
     // Each value is placed whole: in the first register none of whose values overlaps it, or in memory. Going by how much
     // a value is touched, the ones a loop reads get registers before ones that only a bail looks at, and those then fit
@@ -490,7 +499,14 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         const auto isCallee = [&](std::int32_t r) {
             return std::find(calleeOrder.begin(), calleeOrder.end(), r) != calleeOrder.end();
         };
-        if (iv->hint >= 0 && (!iv->crossesCall || isCallee(iv->hint)) && fits(busy[std::size_t(iv->hint)], *iv))
+        for (std::int32_t other : partners[std::size_t(iv->vreg)]) {
+            const std::int32_t r = fn.location[std::size_t(other)];
+            if (r >= 0 && r != IrFunction::kUnused && (!iv->crossesCall || isCallee(r)) && fits(busy[std::size_t(r)], *iv)) {
+                chosen = r;
+                break;
+            }
+        }
+        if (chosen < 0 && iv->hint >= 0 && (!iv->crossesCall || isCallee(iv->hint)) && fits(busy[std::size_t(iv->hint)], *iv))
             chosen = iv->hint;
         if (chosen < 0 && !iv->crossesCall) {
             for (std::int32_t r : callerOrder) {

@@ -1042,6 +1042,36 @@ TEST(aCounterCapturedByAClosureCountsExactly)
              std::string("1500|55!110"));
 }
 
+TEST(whatALoopReadsThroughAGlobalIsCheckedBeforeItAndStillHolds)
+{
+    // An array in a global, read in a loop; then another array; then something that is not one.
+    CHECK_EQ(run("var os = [{ x: 1 }, { y: 0, x: 2 }];"
+                 "function k(n) { var s = 0; for (var i = 0; i < n; i++) s += os[i & 1].x; return s; }"
+                 "var r = 0; for (var m = 0; m < 200; m++) r += k(100);"
+                 "os = [{ x: 10 }, { x: 20 }]; r += k(10);"
+                 "os = { length: 0 }; try { r += k(2); } catch (e) { r += 'E'; } r"),
+             std::string("30150E"));
+    // A method of a global object, replaced once the loop is compiled.
+    CHECK_EQ(run("function h(n) { var s = 0; for (var i = 0; i < n; i++) s += Math.sqrt(i); return Math.round(s); }"
+                 "var a = 0; for (var m = 0; m < 100; m++) a = h(100);"
+                 "var keep = Math.sqrt; Math.sqrt = function (x) { return 1; }; var b = h(100); Math.sqrt = keep; a + '|' + b"),
+             std::string("661|100"));
+    // A constructor made in place, then a setter on its prototype for a field it adds.
+    CHECK_EQ(run("function T(l, r) { this.l = l; this.r = r; }"
+                 "function mk(d) { return d === 0 ? new T(null, null) : new T(mk(d - 1), mk(d - 1)); }"
+                 "function chk(t) { return t.l === null ? 1 : 1 + chk(t.l) + chk(t.r); }"
+                 "var c = 0; for (var m = 0; m < 50; m++) c += chk(mk(6));"
+                 "Object.defineProperty(T.prototype, 'r', { set: function (v) { this.rr = v; }, get: function () { return this.rr; } });"
+                 "c + '|' + Object.keys(new T(1, 2)).join()"),
+             std::string("6350|l,rr"));
+    // The same, where native code made every object of that prototype: it is a prototype all the same.
+    CHECK_EQ(run("function T(l, r) { this.l = l; this.r = r; } function f() { return new T(1, 2); }"
+                 "var c = 0; for (var m = 0; m < 500; m++) c += f().l;"
+                 "Object.defineProperty(T.prototype, 'r', { set: function (v) { this.rr = v; }, get: function () { return this.rr; } });"
+                 "c + '|' + Object.keys(f()).join()"),
+             std::string("500|l,rr"));
+}
+
 TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)
 {
     CHECK_EQ(run("function P(a, d) { this.a = a; this.d = d; }"

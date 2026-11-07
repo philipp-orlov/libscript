@@ -98,14 +98,17 @@ what the interpreter has seen, and when that turns out wrong it hands the call b
   part way through checks what the code assumes of `this`, parameters and number locals. A property site the interpreter
   has never reached is a guess too: reaching it bails.
 * **Property access** uses the interpreter's sites. A site that has seen one shape checks it once, and the shape is then
-  known for that object until a join or anything that can run code; a site that has seen a few shapes dispatches on them.
+  known for that object until a join or anything that can run code; a site that has seen a few shapes dispatches on them,
+  stores included, whether they overwrite the property or add it. A shape may be followed by any number of names that are
+  spelled in the source, but only 32 worked out at run time, so an object used as a dictionary drops its shape.
   A property up the prototype chain is checked against `protoEpoch`, a getter is called directly, and a store that adds
   a property appends in place. A field that has only held numbers loads straight into a float register, and a number
   stored over a number writes only its bits. Methods read off a primitive string are read from `String.prototype` in place.
 * **Objects** keep their first properties in their own cell, so a literal or a `new` object is one allocation. The header
   is 80 bytes and a property 16, being only its value: its name and attributes are the shape's, or for the few objects with
   no shape, in a table behind the `rare` pointer, with the other things few objects need. New plain objects are written in
-  native code, popped off the allocator's free list, while no collection is due and no memory limit is set.
+  native code, popped off the allocator's free list or carved from its current block, while no collection is due and no
+  memory limit is set: those of `{...}`, of a constructor compiled in place, and of `new F` for an `F` known when compiled.
 * **Arrays** hold bare doubles at 8 bytes each while every element is a number or `undefined`, which is a reserved NaN
   (`kUndefinedElement`), so `new Array(n)` starts out that way. The first element that needs a `Value` turns the array into one
   of values at 16 bytes for good. A few elements live in the array's own cell. The interpreter records what each access
@@ -130,14 +133,19 @@ what the interpreter has seen, and when that turns out wrong it hands the call b
   Built-ins that call back into script enter compiled callbacks directly (`CallbackLoop`).
 * **Globals** are read and written where they are while `globalEpoch` says the global object's table has not moved.
 * **Built-ins done in place**, when the callee is still the built-in it was: `Math.sqrt`, `abs`, `floor`, `ceil`, `trunc`
-  (an instruction, with nothing held and no call left to get in the way of a loop),
-  `push`, `pop`, `charCodeAt`, `String.fromCharCode`, `f.apply`, `instanceof` of a plain function, and `length`. `s += x` on a
+  (an instruction, with nothing held and no call left to get in the way of a loop); `Math.max`, `min` (a compare, ties and
+  NaN the long way), `pow`, `atan2`, `round`, `sin`, `cos`, `tan`, `atan`, `exp`, `log` and `parseInt` of a number (a direct
+  call on bare doubles); `push` (growing the array or changing its form without calling the built-in), `pop`, `charCodeAt`,
+  `String.fromCharCode`, `f.apply`, `f.call` (a call of `f`, inlined like any other), `Map` and `Set` `get`, `set`, `has` and
+  `add` (the table's own lookup), `instanceof` of a plain function, and `length`. `s += x` on a
   local nothing else holds grows the string in its own cell.
 
 **What it keeps alive.** Holding a count on the names and prototypes every object shares is a serial chain of memory
 operations, so some are *pinned*, uncounted, until the context ends: the name of any property in a shape (shapes are bounded by
-`kMaxShapes`), a prototype after 1024 objects or once its constructor is compiled in place, the built-in prototypes, and the
-functions and prototypes compiled code expects.
+`kMaxShapes`), a prototype after 1024 objects or once compiled code makes objects of it with `new`, the built-in prototypes,
+and the functions and prototypes compiled code expects. A pinned cell's count says nothing, and reaching zero does not free it.
+Any other prototype that is freed, or emptied by the cycle collector, moves `protoEpoch` on, so nothing that learnt where a
+property was on it is used again.
 A program that makes many large short-lived classes keeps what those reach for longer than it strictly needs.
 
 The allocator is by live range with holes, most-used value first, uses in cold code counting for next to nothing, and spill

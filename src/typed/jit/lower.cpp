@@ -1619,20 +1619,41 @@ private:
         }
         const std::int32_t cellBudget = word(heap, offsetof(ContextImpl, nextGcCells));
         slowIfNotBelow(cells, cellBudget);
-        // What `LocalHeap::allocate` does while the current block has a free slot.
+        // What `LocalHeap::allocate` does while the current block has a free slot, or one not yet carved.
         const std::int32_t block = word(ptrReg(ctx.heap.currentBlockOf(bytes)), 0);
-        const std::int32_t slot = word(block, mem::LocalHeap::kBlockFreeOffset);
+        const std::int32_t slot = fn_.newVreg(false);
         {
+            const std::int32_t carve = newLabel();
+            const std::int32_t got = newLabel();
+            const std::int32_t free = word(block, mem::LocalHeap::kBlockFreeOffset);
             IrInst& test = inst(IrOp::BrCmp);
-            test.a = slot;
+            test.a = free;
             test.cond = IrCond::Eq;
             test.hasImm = true;
             test.imm = 0;
             test.width = 64;
-            test.target = slow;
+            test.target = carve;
+            put(block, mem::LocalHeap::kBlockFreeOffset, word(free, 0));
+            IrInst& fromFree = inst(IrOp::Mov);
+            fromFree.d = slot;
+            fromFree.a = free;
+            inst(IrOp::Br).imm = got;
+            inst(IrOp::Label).imm = carve;
+            const std::int32_t bump = word(block, mem::LocalHeap::kBlockBumpOffset);
+            slowIfNotBelow(bump, word(block, mem::LocalHeap::kBlockEndOffset));
+            const std::int32_t step = word(block, mem::LocalHeap::kBlockSlotBytesOffset, 4);
+            const std::int32_t after = fn_.newVreg(false);
+            IrInst& add = inst(IrOp::Add);
+            add.d = after;
+            add.a = bump;
+            add.b = step;
+            add.width = 64;
+            put(block, mem::LocalHeap::kBlockBumpOffset, after);
+            IrInst& fromBump = inst(IrOp::Mov);
+            fromBump.d = slot;
+            fromBump.a = bump;
+            inst(IrOp::Label).imm = got;
         }
-        const std::int32_t nextFree = word(slot, 0);
-        put(block, mem::LocalHeap::kBlockFreeOffset, nextFree);
         const std::int32_t live = word(block, mem::LocalHeap::kBlockLiveOffset, 4);
         put(block, mem::LocalHeap::kBlockLiveOffset, plus(live, 1, 32), 4);
         // What the constructors and `linkKnown` do.

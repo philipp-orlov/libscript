@@ -4427,11 +4427,35 @@ private:
             add.width = 64;
         }
         branchNotBelow(cells, word(heap, std::int64_t(offsetof(ContextImpl, nextGcCells))));
-        // What `LocalHeap::allocate` does while the current block has a free slot.
+        // What `LocalHeap::allocate` does while the current block has a free slot, or one not yet carved.
         const std::int32_t block = word(ptrReg(ctx.heap.currentBlockOf(bytes)), 0);
-        const std::int32_t slot = word(block, std::int64_t(mem::LocalHeap::kBlockFreeOffset));
-        branchCmp(slot, IrCond::Eq, 0, slow, 64);
-        store(block, std::int64_t(mem::LocalHeap::kBlockFreeOffset), word(slot, 0), 8, kAliasHeader);
+        const std::int32_t slot = fn_.newVreg(false);
+        {
+            const std::int32_t carve = newLabel();
+            const std::int32_t got = newLabel();
+            const std::int32_t free = word(block, std::int64_t(mem::LocalHeap::kBlockFreeOffset));
+            branchCmp(free, IrCond::Eq, 0, carve, 64);
+            store(block, std::int64_t(mem::LocalHeap::kBlockFreeOffset), word(free, 0), 8, kAliasHeader);
+            IrInst& fromFree = inst(IrOp::Mov);
+            fromFree.d = slot;
+            fromFree.a = free;
+            inst(IrOp::Br).imm = got;
+            inst(IrOp::Label).imm = carve;
+            const std::int32_t bump = word(block, std::int64_t(mem::LocalHeap::kBlockBumpOffset));
+            branchNotBelow(bump, word(block, std::int64_t(mem::LocalHeap::kBlockEndOffset)));
+            const std::int32_t step = load(block, std::int64_t(mem::LocalHeap::kBlockSlotBytesOffset), 4, false, kAliasHeader);
+            const std::int32_t after = fn_.newVreg(false);
+            IrInst& add = inst(IrOp::Add);
+            add.d = after;
+            add.a = bump;
+            add.b = step;
+            add.width = 64;
+            store(block, std::int64_t(mem::LocalHeap::kBlockBumpOffset), after, 8, kAliasHeader);
+            IrInst& fromBump = inst(IrOp::Mov);
+            fromBump.d = slot;
+            fromBump.a = bump;
+            inst(IrOp::Label).imm = got;
+        }
         const std::int32_t live = load(block, std::int64_t(mem::LocalHeap::kBlockLiveOffset), 4, false, kAliasHeader);
         store(block, std::int64_t(mem::LocalHeap::kBlockLiveOffset), plus(live, 1, 32), 4, kAliasHeader);
         // What the constructors and `linkKnown` do.

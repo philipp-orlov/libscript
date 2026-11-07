@@ -521,6 +521,7 @@ public:
                             copy.d = in.d;
                             copy.a = from;
                             killDefs(in);
+                            known_.push_back(copy);
                             out.push_back(copy);
                             continue;
                         }

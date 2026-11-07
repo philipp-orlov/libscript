@@ -4992,8 +4992,10 @@ private:
         const std::int32_t entry = load(codePtr, kCallEntryOffset, 8, false, kAliasHeader);
         branchCmp(entry, IrCond::Eq, 0, slow, 64);
         const std::int32_t self = fn_.newVreg(false);
-        coldCall(reinterpret_cast<void*>(&scriptDynNewThis), {rt, fnPayload}, self, -1, true, held);
-        branchCmp(self, IrCond::Eq, 0, slow, 64);
+        if (!newOfKnownPrototype(callee, self, slow, held)) {
+            coldCall(reinterpret_cast<void*>(&scriptDynNewThis), {rt, fnPayload}, self, -1, true, held);
+            branchCmp(self, IrCond::Eq, 0, slow, 64);
+        }
         {
             std::vector<Entry> heldWithSelf = held;
             heldWithSelf.push_back(objectEntry(self));
@@ -5049,6 +5051,48 @@ private:
             release(arg);
         release(callee);
         push(taggedEntry(r, t, Own::Owned));
+    }
+
+    /// The object `new F(...)` starts with, for the function F is known to be, where F's `prototype` is still the object it was
+    /// when this was compiled: made here as `scriptDynNewThis` would, or the call goes to `slow`. False, with nothing
+    /// emitted, when F is not known so. The prototype is pinned, as for a constructor compiled in place.
+    bool newOfKnownPrototype(const Entry& callee, std::int32_t self, std::int32_t slow, const std::vector<Entry>& held)
+    {
+        if (!callee.pinned || !betHere())
+            return false;
+        auto* fn = const_cast<DynFunction*>(static_cast<const DynFunction*>(callee.hint));
+        if (fn->fnKind != FnKind::Bytecode || fn->isArrow || fn->isClassConstructor || !fn->shape)
+            return false;
+        const Prop* prototype = fn->findOwn(rt_.atom.prototype.get());
+        if (!prototype || fn->accessorOf(*prototype) || !prototype->value.isObject())
+            return false;
+        auto* proto = static_cast<DynObject*>(detail::Access::ptr(prototype->value));
+        if (proto->kind != CellKind::Object)
+            return false;
+        Shape* root = rt_.rootShapeFor(proto);
+        if (!root)
+            return false;
+        const std::int64_t at = std::int64_t(prototype - fn->props.data()) * std::int64_t(sizeof(Prop));
+        guardShape(callee, fn->shape, slow);
+        const std::int32_t props = loadHeader(callee.r, kPropsOffset);
+        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1);
+        branchCmp(protoTag, IrCond::Ne, std::int64_t(Type::Object), slow);
+        const std::int32_t protoNow = load(props, at + kPropValueOffset + kPayload, 8);
+        keepAlive(proto);
+        {
+            const std::int32_t want = ptrReg(proto);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = protoNow;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = slow;
+        }
+        const std::uint32_t room = std::min<std::uint32_t>(root->expect, 32);
+        proto->pin();
+        allocateObject(proto, root, room, self, reinterpret_cast<void*>(&scriptDynNewOf), {rtReg(), protoNow, immReg(std::int64_t(room))},
+                       held);
+        return true;
     }
 
     /// `new F(...)` for the plain function F is known to be, small enough to go in place of the call: its object is made

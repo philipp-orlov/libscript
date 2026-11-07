@@ -216,6 +216,16 @@ class Gen:
                     f"{p}var s{v} = function (o, x) {{ o.z = x; return o; }};",
                     f"{p}for (var {i} = 0; {i} < 400; {i}++) {{ if ({i} === {at}) {{ {late} }} var o{v} = new N{v}(); b{v}[{i} % {len(orders)}](o{v}); s{v}(o{v}, {i}); s{v}(o{v}, {i} + 1); {r} = Object.keys(o{v}).join() + ':' + o{v}.z + ':' + o{v}.got; }}",
                     f"{p}log({r});"]
+        if self.r.random() < 0.15:
+            late = self.pick(f"N{v}.prototype = {{tag: 'late', init: function (x) {{ this.x = 'L' + x; }}}};", f"N{v}.prototype = 5;",
+                             f"N{v}.x = 1;", f"Object.setPrototypeOf(N{v}.prototype, null);", f"N{v}.prototype.init = function () {{ return {{own: 1}}; }};",
+                             f"delete N{v}.prototype.init;", '')
+            at = self.r.randint(0, 299)
+            body = self.pick('this.init.apply(this, arguments);', 'var r = this.init(a); if (r) return r;', 'this.x = a; for (var k = 0; k < 2; k++) this.x += k;')
+            return [f"{p}function N{v}(a) {{ {body} }} N{v}.prototype.init = function (x) {{ this.x = x; }}; var {r} = '';",
+                    f"{p}var m{v} = function (i) {{ return new N{v}(i); }};",
+                    f"{p}for (var {i} = 0; {i} < 300; {i}++) {{ if ({i} === {at}) {{ {late} }} try {{ var o{v} = m{v}({i}); {r} = String(o{v}.x) + ':' + o{v}.tag + ':' + (o{v} instanceof N{v}) + ':' + o{v}.own; }} catch (x{v}) {{ {r} = x{v}.name; }} }}",
+                    f"{p}log({r});"]
         if self.r.random() < 0.4:
             kinds = ['new Map()', 'new Set()', '{}', 'Object.create(Map.prototype)', '[]']
             coll = self.r.choice(kinds)

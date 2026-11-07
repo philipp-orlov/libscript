@@ -213,6 +213,8 @@ struct ContextImpl
     /// languages nest.
     std::size_t callDepth = 0;
     std::uint32_t interruptCountdown = 0;
+    /// How many times a host has come into the context through the API, for what an interrupt handler must not do.
+    std::uint64_t hostEntries = 0;
     bool interrupted = false;
     /// Which engine is executing host code right now, so a wrapper made by
     /// the binding layer takes the shape its caller expects. `None` outside

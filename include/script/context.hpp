@@ -359,7 +359,9 @@ public:
     const char* jitBackend() const noexcept;
 
     /// Called periodically while a program runs; return true to abort with
-    /// `ErrorCode::Interrupted`. Use it for timeouts and cancellation.
+    /// `ErrorCode::Interrupted`. Use it for timeouts and cancellation. It runs in the middle of the program, so it may read
+    /// `stats()` and otherwise leave the context alone: entering it for anything else also stops the program with
+    /// `Interrupted`, whatever the handler returns.
     void setInterruptHandler(std::function<bool()> handler);
     /// Where `Console.Write`, `console.log` and friends go. Defaults to
     /// stdout/stderr.

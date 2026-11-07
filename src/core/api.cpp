@@ -193,6 +193,8 @@ public:
     {
         if (mtx_)
             mtx_->lock();
+        if (impl)
+            ++impl->hostEntries;
     }
     ~Guard()
     {
@@ -1252,6 +1254,7 @@ Context::Lock::Lock(Context& ctx) : ctx_(&ctx)
 {
     if (ctx_->impl_->options.threadSafe)
         ctx_->impl_->mtx.lock();
+    ++ctx_->impl_->hostEntries;
 }
 
 Context::Lock::~Lock()
@@ -1760,6 +1763,7 @@ void Context::collectGarbage()
 Context::Stats Context::stats() const
 {
     Guard guard(impl_.get());
+    --impl_->hostEntries;  // a look, which is all an interrupt handler may do
     Stats out;
     out.liveObjects = impl_->liveObjects;
     out.liveStrings = impl_->liveStrings;

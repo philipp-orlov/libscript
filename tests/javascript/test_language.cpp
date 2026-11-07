@@ -807,3 +807,33 @@ TEST(arraysOfNumbersBehaveLikeAnyOtherArray)
     // What holds a reference is seen by the collector, and what does not, freed.
     CHECK_EQ(run("var c = [1]; c[0] = c; c[0] === c"), std::string("true"));
 }
+
+TEST(whatALoopKnowsAheadOfItStaysTrue)
+{
+    // Asked once ahead of the loop; these change it inside, each in a way a loop could be caught out by.
+    CHECK_EQ(run("function f(o) { var t = 0; for (var i = 0; i < 3000; i++) { t += o.x; if (i == 2500) o.y = 1; } return t + o.y; } f({x: 1})"),
+             std::string("3001"));
+    CHECK_EQ(run("function f(o, g) { var t = 0; for (var i = 0; i < 3000; i++) { t += o.x; if (i == 2500) g(o); } return t; }"
+                 " f({x: 1}, function (o) { delete o.x; o.x = 2; })"),
+             std::string("3499"));
+    CHECK_EQ(run("function f(a) { var t = 0; for (var i = 0; i < 3000; i++) { t += a[i & 1]; if (i == 2500) a[0] = 'z'; } return t; }"
+                 " typeof f([1, 2])"),
+             std::string("string"));
+    CHECK_EQ(run("function f(a) { for (var i = 0; i < 3000; i++) { a[i & 1] = i; if (i == 2500) a.push(0); } return a.length; } f([1, 2])"),
+             std::string("3"));
+    CHECK_EQ(run("function f(a) { var t = 0; for (var i = 0; i < 3000; i++) { if (i == 2500) a.length = 0; t += a[0] === undefined ? 1 : 0; } return t; } f([1, 2])"),
+             std::string("500"));
+    CHECK_EQ(run("function f(a, b) { var t = 0; for (var i = 0; i < 3000; i++) t += b[i & 1]; a.push('x'); for (i = 0; i < 3000; i++) t += i & 1 ? 0 : 1; return t + ':' + a[2]; }"
+                 " var s = [1, 2]; f(s, s)"),
+             std::string("6000:x"));
+    // Not what the loop was told to expect at all, on the way in.
+    CHECK_EQ(run("function f(o, n) { var t = 0; for (var i = 0; i < n; i++) t += o.x; return t; }"
+                 " for (var k = 0; k < 2000; k++) f({x: 1}, 2); f(null, 0) + f({y: 1, x: 2}, 3) + f('s', 0)"),
+             std::string("6"));
+    CHECK_EQ(run("function f(a, n) { var t = 0; for (var i = 0; i < n; i++) t += a[i]; return t; }"
+                 " for (var k = 0; k < 2000; k++) f([1, 2], 2); f(null, 0) + f(['1'], 1) + f({0: 5}, 1)"),
+             std::string("0015"));
+    CHECK_EQ(run("var d = 0; for (var i = 0; i < 3000; i++) d += Math.sqrt(4); var s = Math.sqrt; Math.sqrt = function () { return 1; };"
+                 " for (i = 0; i < 3000; i++) d += Math.sqrt(4); Math.sqrt = s; d + Math.sqrt('9')"),
+             std::string("9003"));
+}

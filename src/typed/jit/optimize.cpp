@@ -411,13 +411,32 @@ public:
     {
         std::vector<IrInst> out;
         out.reserve(fn_.code.size());
-        for (const IrInst& original : fn_.code) {
-            IrInst in = original;
+        findQuietLoops();
+        for (std::int32_t position = 0; position < std::int32_t(fn_.code.size()); ++position) {
+            while (!floors_.empty() && floors_.back().last < position)
+                floors_.pop_back();
+            IrInst in = fn_.code[std::size_t(position)];
+            // What a register is a copy of makes two reads of the same place look the same.
+            if (in.op != IrOp::Call && in.op != IrOp::Label && in.op != IrOp::Br) {
+                in.a = originalOf(in.a);
+                in.b = originalOf(in.b);
+                in.c = originalOf(in.c);
+            }
             switch (in.op) {
                 case IrOp::Label:
                     // A join of a cold block that leaves everything as the hot path knows it says so.
-                    if (in.alias == 0)
-                        known_.clear();
+                    if (in.alias == 0) {
+                        const auto loop = quietLoops_.find(in.imm);
+                        if (loop != quietLoops_.end()) {
+                            keepThrough(loop->second);
+                            floors_.push_back({loop->second.last, known_});
+                        } else if (!floors_.empty()) {
+                            // A join in such a loop: what holds all the way round it holds here too.
+                            known_ = floors_.back().facts;
+                        } else {
+                            known_.clear();
+                        }
+                    }
                     break;
                 case IrOp::ColdBegin:
                     // The hot path goes from before the cold block straight to after it, so what it knew it knows again.
@@ -451,6 +470,10 @@ public:
                         out.push_back(br);
                         continue;
                     }
+                    // The same question, not taken a moment ago, wherever this one would have gone.
+                    if (passedAlready(in))
+                        continue;
+                    known_.push_back(in);
                     break;
                 }
                 case IrOp::Mov:
@@ -517,6 +540,169 @@ public:
     }
 
 private:
+    /// What a loop can change, for a loop that nothing else enters and that runs nothing it does not see. Facts about what
+    /// is not in here hold all the way round it.
+    struct LoopWrites
+    {
+        std::int32_t last = 0;
+        std::set<std::int32_t> regs;
+        std::set<std::int64_t> headerOffsets;  ///< where it stores into headers
+        std::set<std::int64_t> valueOffsets;   ///< where it stores into values
+        bool memory = false;                   ///< it stores with no more said about where
+    };
+    struct Floor
+    {
+        std::int32_t last;
+        std::vector<IrInst> facts;
+    };
+
+    /// A loop head that is reached from above and from its own back branches only, whose body makes no call that comes
+    /// back, and whose cold blocks leave things as they were or do not return. The lowering says which those are by giving
+    /// the join a nonzero alias.
+    void findQuietLoops()
+    {
+        std::vector<std::int32_t> labelAt(std::size_t(fn_.labelCount), -1);
+        for (std::size_t i = 0; i < fn_.code.size(); ++i) {
+            if (fn_.code[i].op == IrOp::Label)
+                labelAt[std::size_t(fn_.code[i].imm)] = std::int32_t(i);
+        }
+        std::map<std::int64_t, std::int32_t> lastBack;
+        for (std::size_t i = 0; i < fn_.code.size(); ++i) {
+            const std::int64_t label = labelTargetOf(fn_.code[i]);
+            if (label >= 0 && labelAt[std::size_t(label)] >= 0 && labelAt[std::size_t(label)] <= std::int32_t(i))
+                lastBack[label] = std::int32_t(i);
+        }
+        for (const auto& [label, last] : lastBack) {
+            const std::int32_t head = labelAt[std::size_t(label)];
+            // A long loop is unlikely to go without a call, and this looks at everything in it.
+            if (last - head > 4000)
+                continue;
+            LoopWrites writes;
+            writes.last = last;
+            if (loopIsQuiet(head, last, label, labelAt, writes))
+                quietLoops_.emplace(label, std::move(writes));
+        }
+    }
+
+    bool loopIsQuiet(std::int32_t head, std::int32_t last, std::int64_t label, const std::vector<std::int32_t>& labelAt, LoopWrites& writes) const
+    {
+        const auto define = [&](std::int32_t v) {
+            if (v >= 0)
+                writes.regs.insert(v);
+        };
+        int cold = 0;
+        std::vector<std::uint8_t> callInCold(1, 0);
+        for (std::int32_t i = head; i <= last; ++i) {
+            const IrInst& in = fn_.code[std::size_t(i)];
+            // Nothing from outside may land in the middle, other than what is cold and comes back from a cold call.
+            if (in.op == IrOp::ColdBegin) {
+                ++cold;
+                callInCold.push_back(0);
+                continue;
+            }
+            if (in.op == IrOp::ColdEnd) {
+                if (cold)
+                    --cold;
+                callInCold.pop_back();
+                continue;
+            }
+            define(in.d);
+            if (in.op == IrOp::Call) {
+                const IrCall& call = fn_.calls[std::size_t(in.imm)];
+                if (!cold || !call.cold)
+                    return false;
+                callInCold.back() = 1;
+                define(call.result);
+                define(call.resultTag);
+                continue;
+            }
+            const std::int64_t to = labelTargetOf(in);
+            if (to >= 0 && cold) {
+                // A cold block that carries on in the hot path, having called something, may have changed anything, unless
+                // the place it comes back to says otherwise.
+                const std::int32_t at = labelAt[std::size_t(to)];
+                if (callInCold.back() && at >= 0 && fn_.code[std::size_t(at)].alias == 0)
+                    return false;
+            }
+            if (cold)
+                continue;
+            if (in.op == IrOp::Store || in.op == IrOp::StoreTag || in.op == IrOp::StoreIdx) {
+                if (in.op == IrOp::Store && in.alias == 1)
+                    writes.headerOffsets.insert(in.imm);
+                else if (in.op == IrOp::Store && in.alias == 2)
+                    writes.valueOffsets.insert(in.imm);
+                else
+                    writes.memory = true;
+            }
+        }
+        // Branches from before or after the loop into it.
+        std::set<std::int64_t> inside;
+        for (std::int32_t i = head; i <= last; ++i) {
+            if (fn_.code[std::size_t(i)].op == IrOp::Label)
+                inside.insert(fn_.code[std::size_t(i)].imm);
+        }
+        for (std::int32_t i = 0; i < std::int32_t(fn_.code.size()); ++i) {
+            if (i >= head && i <= last)
+                continue;
+            const std::int64_t to = labelTargetOf(fn_.code[std::size_t(i)]);
+            if (to >= 0 && inside.count(to))
+                return false;
+        }
+        for (const IrExit& exit : fn_.exits) {
+            if (exit.handlerLabel >= 0 && inside.count(exit.handlerLabel))
+                return false;
+        }
+        for (const IrOsrEntry& entry : fn_.osrEntries) {
+            if (inside.count(entry.label))
+                return false;
+        }
+        (void)label;
+        return true;
+    }
+
+    /// Forget at a loop head what the loop may make untrue.
+    void keepThrough(const LoopWrites& writes)
+    {
+        known_.erase(std::remove_if(known_.begin(), known_.end(),
+                                    [&](const IrInst& k) {
+                                        if (writes.regs.count(k.d) || writes.regs.count(k.a) || writes.regs.count(k.b) || writes.regs.count(k.c))
+                                            return true;
+                                        if (k.op == IrOp::LoadIdx || k.op == IrOp::Store)
+                                            return true;
+                                        if (k.op == IrOp::Load) {
+                                            if (writes.memory)
+                                                return true;
+                                            if (k.alias == 1)
+                                                return writes.headerOffsets.count(k.imm) != 0;
+                                            return k.alias != 2 || writes.valueOffsets.count(k.imm) != 0;
+                                        }
+                                        return false;
+                                    }),
+                     known_.end());
+    }
+
+    /// The register this one is a known copy of, if it is.
+    std::int32_t originalOf(std::int32_t v) const noexcept
+    {
+        if (v < 0)
+            return v;
+        for (auto k = known_.rbegin(); k != known_.rend(); ++k) {
+            if (k->d != v)
+                continue;
+            return k->op == IrOp::Mov ? k->a : v;
+        }
+        return v;
+    }
+    bool passedAlready(const IrInst& in) const noexcept
+    {
+        for (const IrInst& k : known_) {
+            if (k.op == IrOp::BrCmp && k.a == in.a && k.b == in.b && k.cond == in.cond && k.width == in.width && k.hasImm == in.hasImm &&
+                (!in.hasImm || k.imm == in.imm))
+                return true;
+        }
+        return false;
+    }
+
     static bool isLoad(const IrInst& in) noexcept { return in.op == IrOp::Load || in.op == IrOp::LoadIdx; }
     static bool isCheck(const IrInst& in) noexcept
     {
@@ -683,6 +869,8 @@ private:
     IrFunction& fn_;
     std::vector<IrInst> known_;
     std::vector<std::vector<IrInst>> saved_;
+    std::map<std::int64_t, LoopWrites> quietLoops_;
+    std::vector<Floor> floors_;
 };
 
 /// A constant, or a computation from what the loop does not change, is worked out once ahead of the loop. Calls do not

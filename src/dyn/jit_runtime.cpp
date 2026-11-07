@@ -116,8 +116,11 @@ int scriptDynPoll(Runtime* rt) noexcept
         return 0;
     }
     rt->ctx.interruptCountdown = kPollInterval - 1;
+    // Native code in a loop has what it knows about its objects in registers, so the handler, which runs in the middle of
+    // that, has no business changing them; see `Context::setInterruptHandler`.
+    const std::uint64_t entries = rt->ctx.hostEntries;
     try {
-        if (!rt->ctx.interrupt())
+        if (!rt->ctx.interrupt() && rt->ctx.hostEntries == entries)
             return 0;
     } catch (...) {
     }

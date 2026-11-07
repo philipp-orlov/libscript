@@ -303,6 +303,27 @@ TEST(jitPollsTheInterruptHandlerSparingly)
 }
 #endif
 
+#if SCRIPT_LANG_JAVASCRIPT
+TEST(anInterruptHandlerThatEntersTheContextStopsNativeLoops)
+{
+    // Native code in a loop has what it knows about its objects in registers, so it cannot go on from a change made under it.
+    Context ctx;
+    ctx.eval("var a = [1, 2, 3];", "setup.js");
+    std::uint64_t seen = 0;
+    ctx.setInterruptHandler([&] {
+        seen = ctx.stats().liveObjects;  // a look is fine
+        return false;
+    });
+    CHECK_EQ(ctx.eval("var t = 0; for (var i = 0; i < 200000; i++) t += a[i & 1]; t", "look.js").toInt(), 300000);
+    CHECK(seen > 0);
+    ctx.setInterruptHandler([&] {
+        ctx.eval("a.length = 0", "under.js");
+        return false;
+    });
+    CHECK(outcome(ctx, "var t = 0; for (var i = 0; i < 200000; i++) t += a[i & 1]; t", "touch.js") == ErrorCode::Interrupted);
+}
+#endif
+
 // ------------------------------------------------------- memory limit ---
 
 #if SCRIPT_LANG_JAVASCRIPT

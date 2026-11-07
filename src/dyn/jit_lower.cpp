@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -1703,9 +1704,17 @@ private:
             pc_ = pc;
             if (labels_[pc] >= 0) {
                 previousOp_ = Op::Nop;
+                // A loop entered from above is entered through what it can then count on all the way round; so is it when
+                // the interpreter hands over, which is why that comes in ahead of it too.
+                std::int32_t entry = labels_[pc];
+                if (loopHead[pc] && fallsIn && stack_.empty()) {
+                    entry = newLabel();
+                    bindLabel(entry);
+                    checkBeforeLoop(pc);
+                }
                 enterJoin(pc, fallsIn);
                 if (loopHead[pc] && stack_.empty())
-                    addOsrEntry(pc);
+                    addOsrEntry(pc, entry);
             }
             fallsIn = true;
             if (betHere())
@@ -1754,11 +1763,142 @@ private:
         }
     }
 
-    void addOsrEntry(std::uint32_t pc)
+    /// Ahead of the loop at `head`: what its accesses will want to know about locals it does not assign. A loop that turns out
+    /// to run nothing that could change them then finds it known, and asks no more. Being wrong here costs one bail.
+    void checkBeforeLoop(std::uint32_t head)
+    {
+        if (parent_ || !betHere())
+            return;
+        const std::vector<std::uint8_t>& c = code_.code;
+        std::uint32_t last = head;
+        for (std::uint32_t pc = head; pc < c.size();) {
+            const Op op = Op(c[pc]);
+            if (isBranch(op) && readOperand(c, pc + 1) == head)
+                last = pc;
+            pc += 1 + std::uint32_t(operandsOf(op)) * 4;
+        }
+        std::vector<std::uint8_t> assigned(localReg_.size(), 0);
+        for (std::uint32_t pc = head; pc <= last;) {
+            const Op op = Op(c[pc]);
+            if (op == Op::SetLocal)
+                assigned[readOperand(c, pc + 1)] = 1;
+            pc += 1 + std::uint32_t(operandsOf(op)) * 4;
+        }
+        struct Wanted
+        {
+            const Shape* shape = nullptr;
+            bool mixedShapes = false;
+            std::uint8_t elements = 0;
+        };
+        std::map<std::uint32_t, Wanted> wanted;
+        for (std::uint32_t pc = head; pc <= last;) {
+            const Op op = Op(c[pc]);
+            const std::uint32_t next = pc + 1 + std::uint32_t(operandsOf(op)) * 4;
+            if (op == Op::GetLocal) {
+                const std::uint32_t slot = readOperand(c, pc + 1);
+                if (slot < localReg_.size() && !assigned[slot] && !isNumberLocal(slot) && !(argsLazy_ && slot == code_.argumentsSlot)) {
+                    if (const std::int64_t site = propertySiteAfter(next); site >= 0) {
+                        const PropertySite* known = siteAt(std::uint32_t(site));
+                        if (known && known->shape && !known->holder && !known->getter && !known->addTo && !known->moreCount) {
+                            Wanted& w = wanted[slot];
+                            w.mixedShapes = w.mixedShapes || (w.shape && w.shape != known->shape);
+                            w.shape = known->shape;
+                        }
+                    } else if (const std::uint8_t saw = elementsSeenAfter(next)) {
+                        wanted[slot].elements |= saw;
+                    }
+                }
+            }
+            pc = next;
+        }
+        if (wanted.empty())
+            return;
+        const std::int32_t bail = newLabel();
+        for (const auto& [slot, w] : wanted) {
+            const Entry local = taggedEntry(localReg_[slot], localTag_[slot], Own::Weak);
+            if (w.elements) {
+                if (w.shape)
+                    continue;  // an array that has been read like an object as well: not one thing to know about
+                guardArray(local, bail);
+                loadHeader(local.r, kElementsOffset);
+                load(local.r, kElementCountOffset, 4, false, kAliasHeader);
+                load(local.r, kFrozenOffset, 1, false, kAliasHeader);
+                load(local.r, kPropsSizeOffset, 4, false, kAliasHeader);
+                const std::int32_t numbersOnly = load(local.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+                if (w.elements == ElemSite::kNumbers)
+                    branchCmp(numbersOnly, IrCond::Eq, 0, bail);
+                else if (w.elements == ElemSite::kValues)
+                    branchCmp(numbersOnly, IrCond::Ne, 0, bail);
+            } else if (w.shape && !w.mixedShapes) {
+                guardShape(local, w.shape, bail);
+                loadHeader(local.r, kPropsOffset);
+            }
+        }
+        emitBail(bail, {});
+        forgetFacts();
+    }
+
+    /// The operand of the `GetProp` or `GetPropDup` at `pc`, if that is what is there.
+    std::int64_t propertySiteAfter(std::uint32_t pc) const
+    {
+        const std::vector<std::uint8_t>& c = code_.code;
+        if (pc >= c.size() || labels_[pc] >= 0)
+            return -1;
+        const Op op = Op(c[pc]);
+        return op == Op::GetProp || op == Op::GetPropDup ? std::int64_t(readOperand(c, pc + 1)) : -1;
+    }
+
+    /// What the element access this array on the stack is the base of has seen, if a short pure expression for the key,
+    /// and for a store its value, is all that comes between.
+    std::uint8_t elementsSeenAfter(std::uint32_t pc) const
+    {
+        const std::vector<std::uint8_t>& c = code_.code;
+        int depth = 1;
+        for (int steps = 0; steps < 16 && pc < c.size(); ++steps) {
+            if (labels_[pc] >= 0)
+                return 0;
+            const Op op = Op(c[pc]);
+            switch (op) {
+                case Op::GetLocal:
+                case Op::PushConst:
+                case Op::PushUndefined:
+                case Op::PushNull:
+                case Op::PushTrue:
+                case Op::PushFalse: ++depth; break;
+                case Op::Add:
+                case Op::Sub:
+                case Op::Mul:
+                case Op::BitAnd:
+                case Op::BitOr:
+                case Op::BitXor:
+                case Op::Shl:
+                case Op::Shr: --depth; break;
+                case Op::Dup2:
+                    if (depth != 2)
+                        return 0;
+                    depth += 2;
+                    break;
+                case Op::GetElem:
+                    // With a `Dup2` ahead of it the base is two further down, and that is this one.
+                    if (depth != 2 && depth != 4)
+                        return 0;
+                    return code_.elemSaw[readOperand(c, pc + 1)];
+                case Op::SetElem:
+                    return depth == 3 ? code_.elemSaw[readOperand(c, pc + 1)] : 0;
+                default: return 0;
+            }
+            if (depth < 1)
+                return 0;
+            pc += 1 + std::uint32_t(operandsOf(op)) * 4;
+        }
+        return 0;
+    }
+
+    void addOsrEntry(std::uint32_t pc, std::int32_t label)
     {
         IrOsrEntry entry;
         entry.bytecodePc = pc;
-        entry.label = labels_[pc];
+        entry.label = label;
         for (std::uint32_t slot = 0; slot < localReg_.size(); ++slot) {
             IrOsrEntry::Slot out;
             out.vreg = localReg_[slot];
@@ -3897,6 +4037,8 @@ private:
             args[i] = pop();
         Entry self = pop();
         Entry callee = pop();
+        if (mathInPlace(callee, self, args))
+            return;
         const DynFunction* known = expectCallee(callee);
         // A small function that goes in place of the call and only reads can release nothing, so nothing here needs a
         // count to stay alive through it.
@@ -3952,6 +4094,53 @@ private:
         release(self);
         release(callee);
         push(taggedEntry(r, t, Own::Owned));
+    }
+
+    /// `Math.sqrt(x)` and the like of a number, where it has been the built-in: an instruction, with nothing kept alive for it
+    /// and nothing left in the loop that could be taken for a call. Anything else, the interpreter does.
+    bool mathInPlace(const Entry& callee, const Entry& self, const std::vector<Entry>& args)
+    {
+        if (!callee.hint || callee.rep != Rep::Tagged || callee.isConst || args.size() != 1 || !betHere() || args[0].lazyArgs)
+            return false;
+        int which = -1;
+        for (int i = Runtime::MathSqrt; i <= Runtime::MathTrunc; ++i) {
+            if (rt_.intrinsics[i].get() == callee.hint)
+                which = i;
+        }
+        if (which < 0)
+            return false;
+        const Entry& arg = args[0];
+        const std::int32_t bail = newLabel();
+        if (!callee.hasKnownTag)
+            branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), bail);
+        const std::int32_t want = ptrReg(callee.hint);
+        {
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = callee.r;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = bail;
+        }
+        if (!isKnownNumber(arg)) {
+            if (arg.hasKnownTag || arg.isConst)
+                inst(IrOp::Br).imm = bail;
+            else
+                branchCmp(arg.t, IrCond::Ne, std::int64_t(Type::Double), bail);
+        }
+        const std::int32_t x = doubleReg(arg);
+        static constexpr IrOp kOps[] = {IrOp::FSqrt, IrOp::FAbs, IrOp::FFloor, IrOp::FCeil, IrOp::FTrunc};
+        const std::int32_t d = fn_.newVreg(true);
+        IrInst& op = inst(kOps[which - Runtime::MathSqrt]);
+        op.d = d;
+        op.a = x;
+        op.width = 64;
+        emitBail(bail, {callee, self, arg});
+        release(arg);
+        release(self);
+        release(callee);
+        push(doubleEntry(d));
+        return true;
     }
 
     /// `f.apply(x, arguments)`: `f` called on this call's own arguments as they are, with no array between. True with the

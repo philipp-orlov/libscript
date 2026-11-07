@@ -119,6 +119,22 @@ enum class Op : std::uint8_t
     IterNextOpt,  // iterator -> iterator value|undefined  (destructuring)
     IterRest,     // iterator -> iterator array-of-remaining
     IterClose,
+    IterStartLoop,    // obj -> iterator, of a `for-of`: a handler closes it on the way out
+    IterCloseAt,      // depth: close the iterator at that place in the stack, keeping everything
+    IterCloseThrow,   // iterator exception -> : close it, whatever that does, and throw the exception
+
+    // ---- generators and async functions ----
+    CoStart,          // what has run so far was the call: the rest runs as a coroutine, resumed from here
+    Yield,            // target: value -> sent; resumed by `return`, goes to the target with the value
+    Await,            // value -> settled value, or throws
+    DelegateStart,    // the iterator of a `yield*` is on the stack, and its first call is `next(undefined)`
+    DelegateCall,     // target: iterator -> iterator result; a `return` it has no method for goes to the target
+    DelegateCheck,    // target: iterator result -> value and to the target when done; otherwise yields
+    DelegateDone,     // target: to the target if it was a `return` that ended the delegation
+    AsyncIterStart,   // obj -> async iterator
+    AsyncIterCall,    // iterator -> iterator result
+    AsyncIterCheck,   // target: iterator result -> iterator value; to the target when done
+    AsyncIterClose,   // depth: push what `return()` gave, or undefined
 
     // ---- operators ----
     Add,
@@ -173,6 +189,9 @@ enum class HandlerKind : std::uint8_t
 {
     Catch,
     Finally,
+    /// A `for-of` body. Works as `Catch` does, to code that closes the iterator; native code, which only runs such a loop
+    /// over what needs no closing, has nothing to do for it.
+    IterClose,
 };
 
 /// A protected region. `stackDepth` is the value-stack height to unwind to
@@ -345,6 +364,8 @@ struct FunctionCode
     bool hasRest = false;
     bool isClassConstructor = false;
     bool isDerivedConstructor = false;
+    bool isGenerator = false;
+    bool isAsync = false;
 
     std::uint32_t numLocals = 0;
     std::uint32_t maxStack = 8;

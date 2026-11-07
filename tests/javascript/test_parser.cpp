@@ -83,7 +83,6 @@ TEST(syntaxErrorsAreReported)
     rejects("const x");
     rejects("try { }");
     rejects("/regex/g");
-    rejects("function* gen() {}");
     rejects("1n");
 }
 

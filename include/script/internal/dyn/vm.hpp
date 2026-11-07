@@ -34,6 +34,17 @@ struct Frame
     Value thisValue = Value::undefined();
     Value pendingException = Value::undefined();
     Ref<DynFunction> newTarget;
+    /// A coroutine's frame, not one of the runtime's.
+    DynCoroutine* coroutine = nullptr;
+    /// What `execute` left this frame for, having returned: the value is not what the function returned.
+    enum class Left : std::uint8_t
+    {
+        Finished,
+        Yielded,
+        YieldedResult,  ///< the value is an iterator result already: `yield*` passes on the delegate's
+        Awaiting,
+    };
+    Left left = Left::Finished;
     /// This frame stands for a run of native frames, which a stack trace finds by walking from the innermost one. It
     /// remembers where that was when the run began.
     bool nativeRun = false;
@@ -154,6 +165,18 @@ void rejectPromise(Runtime& rt, DynPromise* p, const Value& reason);
 /// A one-argument native function that settles `promise` when called -- the
 /// `resolve`/`reject` pair handed to executors and `then` callbacks.
 Value makeSettler(Runtime& rt, const Value& promise, bool reject);
+/// What to do when `p` settles; scheduled right away if it has.
+void addReaction(Runtime& rt, DynPromise* p, DynPromise::Reaction reaction);
+
+// ---------------------------------------------------------- coroutines ---
+
+/// `{ value, done }`.
+Value iterResult(Runtime& rt, const Value& value, bool done);
+Value generatorResume(Runtime& rt, DynCoroutine* generator, DynCoroutine::Resume mode, const Value& value);
+/// `next`, `return` or `throw` of an async generator: the promise for its answer.
+Value asyncGeneratorRequest(Runtime& rt, const Value& self, DynCoroutine::Resume mode, const Value& value);
+/// A sync iterator as an async one, as `for await` and `yield*` take it.
+Value asyncFromSyncIterator(Runtime& rt, const Value& iterator);
 
 }  // namespace dyn
 }  // namespace internal

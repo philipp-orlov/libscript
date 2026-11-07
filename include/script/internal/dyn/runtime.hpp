@@ -146,6 +146,7 @@ struct Runtime : EngineRuntime
         ArrayMap,
         ArrayFilter,
         ArrayReduce,
+        ArrayValues,
         StringCharCodeAt,
         StringFromCharCode,
         FunctionApply,
@@ -164,7 +165,8 @@ struct Runtime : EngineRuntime
     /// One-character strings below 128, made on first use.
     Ref<GCObject> asciiChars[128];
     Ref<DynObject> objectProto, functionProto, arrayProto, stringProto, numberProto, booleanProto,
-        symbolProto, errorProto, dateProto, mapProto, setProto, promiseProto, iteratorProto,
+        symbolProto, errorProto, dateProto, mapProto, setProto, promiseProto, iteratorProto, generatorProto, generatorFunctionProto, asyncFunctionProto,
+        asyncIteratorProto, asyncGeneratorProto, asyncGeneratorFunctionProto,
         arrayIteratorProto;
     Ref<DynFunction> objectCtor, arrayCtor, functionCtor, promiseCtor;
     /// Prototype per JavaScript error constructor, indexed by `ErrorCode`.

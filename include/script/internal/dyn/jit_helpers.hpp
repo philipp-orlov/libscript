@@ -23,6 +23,8 @@ int scriptDynPoll(Runtime* rt) noexcept;
 double scriptDynToNumber(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 std::int32_t scriptDynToInt32(double d) noexcept;
 std::int32_t scriptDynToBoolean(std::int64_t tag, std::uint64_t payload) noexcept;
+/// Whether iterating this is the built-in way over an array, whose iterator has nothing to close.
+std::int32_t scriptDynIterIsPlain(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 double scriptDynFmod(double a, double b) noexcept;
 double scriptDynPow(double a, double b) noexcept;
 double scriptDynSin(double d) noexcept;

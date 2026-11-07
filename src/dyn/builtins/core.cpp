@@ -81,9 +81,11 @@ void installObject(Runtime& rt)
             return rt2.str("[object Undefined]");
         if (ci.thisValue().isNull())
             return rt2.str("[object Null]");
-        DynObject* self = asObject(ci.thisValue());
-        const char* tag = self ? classTag(self->cls) : "Object";
-        return rt2.str(ascii(std::string("[object ") + tag + "]"));
+        const Value object = toObject(rt2, ci.thisValue());
+        const Value named = getProperty(rt2, object, rt2.sym.toStringTag.get());
+        if (named.type() == Type::String)
+            return rt2.str(ascii("[object ") + toStringValue(rt2, named) + ascii("]"));
+        return rt2.str(ascii(std::string("[object ") + classTag(asObject(object)->cls) + "]"));
     }, 0);
 
     rt.method(proto, "valueOf", [](CallInfo& ci) { return ci.thisValue(); }, 0);
@@ -519,6 +521,7 @@ void installBuiltins(Runtime& rt)
     installString(rt);
     installMathJson(rt);
     installCollections(rt);
+    installGenerators(rt);
 }
 
 }  // namespace dyn

@@ -648,6 +648,7 @@ void installArray(Runtime& rt)
               [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 2); }, 0);
     proto->putOwn(rt.sym.iterator.get(), proto->findOwn(rt.intern("values"))->value,
                   PropWritable | PropConfigurable);
+    keepIntrinsic(Runtime::ArrayValues, "values");
 }
 
 }  // namespace dyn

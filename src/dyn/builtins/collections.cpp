@@ -208,17 +208,7 @@ void installPromise(Runtime& rt)
         reaction.onFulfilled = ci.arg(0);
         reaction.onRejected = ci.arg(1);
         reaction.next.reset(next);
-        self->reactions.push_back(std::move(reaction));
-        if (self->state != DynPromise::State::Pending) {
-            // Already settled: re-run the settlement so the new reaction fires.
-            const auto state = self->state;
-            const Value result = self->result;
-            self->state = DynPromise::State::Pending;
-            if (state == DynPromise::State::Fulfilled)
-                resolvePromise(rt2, self, result);
-            else
-                rejectPromise(rt2, self, result);
-        }
+        addReaction(rt2, self, std::move(reaction));
         return chained;
     }, 2);
 

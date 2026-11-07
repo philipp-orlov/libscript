@@ -37,7 +37,7 @@ const char* opName(Op op) noexcept
         "Jump", "JumpIfFalse", "JumpIfTrue", "JumpIfFalseKeep", "JumpIfTrueKeep",
         "JumpIfNullishKeep", "JumpIfNotNullishKeep", "JumpSub", "EndFinally", "Throw",
         "ForInStart", "ForInNext", "IterStart", "IterNext", "IterNextOpt", "IterRest",
-        "IterClose",
+        "IterClose", "IterStartLoop", "IterCloseAt", "IterCloseThrow", "CoStart", "Yield", "Await", "DelegateStart", "DelegateCall", "DelegateCheck", "DelegateDone", "AsyncIterStart", "AsyncIterCall", "AsyncIterCheck", "AsyncIterClose",
         "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Neg", "Pos", "BitAnd", "BitOr", "BitXor",
         "BitNot", "Shl", "Shr", "UShr", "Eq", "Ne", "StrictEq", "StrictNe", "Lt", "Le", "Gt",
         "Ge", "In", "InstanceOf", "Not", "TypeOf", "Inc", "Dec", "ToNumber", "ToString",
@@ -257,7 +257,8 @@ void Runtime::releaseRoots() noexcept
     promiseCtor.reset();
     for (Ref<DynObject>* p : {&globalObject, &objectProto, &functionProto, &arrayProto,
                               &stringProto, &numberProto, &booleanProto, &symbolProto,
-                              &errorProto, &dateProto, &mapProto, &setProto, &promiseProto,
+                              &errorProto, &dateProto, &mapProto, &setProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
+                              &asyncGeneratorProto, &asyncGeneratorFunctionProto,
                               &iteratorProto, &arrayIteratorProto})
         p->reset();
     atom = Atoms{};

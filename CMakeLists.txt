@@ -163,6 +163,7 @@ set(SCRIPT_DYNAMIC_SOURCES
     src/dyn/builtins/string.cpp
     src/dyn/builtins/math_json.cpp
     src/dyn/builtins/collections.cpp
+    src/dyn/builtins/generators.cpp
     src/lang/ecmascript/lexer.cpp
     src/lang/ecmascript/parser.cpp
 )

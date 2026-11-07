@@ -1158,6 +1158,55 @@ TEST(callbacksOfArrayMethodsCalledFromNativeCode)
                          "[1,2][1,2]|[1,2][1,2,11,12]|3|[1,2,\"s\"]|1,n|3|1|e2|f|r|TypeError|TypeError|TypeError|2|[1,4]|40|273"));
 }
 
+TEST(generatorsStopAndCarryOn)
+{
+    CHECK_EQ(run("var log = [];"
+                 "function* g(a) { var x = yield a; try { var y = yield x + 1; return y * 2; } finally { log.push('fin'); } }"
+                 "var i = g(1); log.push(JSON.stringify([i.next(), i.next(10), i.next(21), i.next()]));"
+                 "var j = g(1); j.next(); j.next(5); log.push(JSON.stringify(j.return(9)));"
+                 "var k = g(1); k.next(); k.next(5); try { k.throw('boom'); } catch (e) { log.push(e); }"
+                 "function* d() { var s = yield* g(7); log.push('s' + s); yield* [1, 2]; return 'end'; }"
+                 "log.push([...d()].join());"
+                 "log.join('|')"),
+             std::string("fin|[{\"value\":1,\"done\":false},{\"value\":11,\"done\":false},{\"value\":42,\"done\":true},{\"done\":true}]|"
+                         "fin|{\"value\":9,\"done\":true}|fin|boom|fin|sNaN|7,NaN,1,2"));
+    // A `for-of` closes its iterator on the way out however it leaves, and not when it runs out.
+    CHECK_EQ(run("var log = [];"
+                 "function* it(n) { try { yield 1; yield 2; } finally { log.push(n); } }"
+                 "for (var v of it('break')) break;"
+                 "(function () { for (var v of it('return')) return v; })();"
+                 "try { for (var v of it('throw')) throw 'x'; } catch (e) { log.push(e); }"
+                 "outer: for (var a of [1]) { for (var v of it('outer')) continue outer; }"
+                 "for (var v of it('out')) ;"
+                 "var plain = 0; function sum(a) { var s = 0; for (var v of a) s += v; return s; }"
+                 "for (var n = 0; n < 2000; n++) plain = sum([1, 2, 3]);"
+                 "log.join() + '|' + sum(it('notArray')) + '|' + log.length"),
+             std::string("break,return,throw,x,outer,out|3|7"));
+    CHECK_EQ(run("function* g() {} var e = ''; try { new g(); } catch (x) { e = x.name; }"
+                 "Object.prototype.toString.call(g()) + e + (Object.getPrototypeOf(g()) === g.prototype)"),
+             std::string("[object Generator]TypeErrortrue"));
+}
+
+TEST(asyncFunctionsWaitAndComeBack)
+{
+    // What the jobs do is seen from a global, read once the host has run them.
+    script::Context ctx;
+    ctx.eval("var log = [];"
+             "async function af(x) { var a = await x; var b = await new Promise(function (r) { r(a + 1); });"
+             " try { await Promise.reject('rj'); } catch (e) { b += e; } return b; }"
+             "af(1).then(function (v) { log.push('af' + v); });"
+             "async function bad() { throw 'no'; } bad().catch(function (e) { log.push(e); });"
+             "async function* ag() { var s = yield 1; log.push('sent' + s); return 4; }"
+             "var it = ag(); it.next().then(function (r) { log.push(r.value); return it.next('S'); })"
+             " .then(function (r) { log.push(r.value + '' + r.done); });"
+             "(async () => { for await (var y of [Promise.resolve(5), 6]) log.push(y); })();"
+             "log.push('sync');",
+             "<t>.js", script::Language::JavaScript);
+    ctx.runJobs();
+    const std::string all = ctx.eval("log.slice().sort().join()", "<t>.js", script::Language::JavaScript).toString();
+    CHECK_EQ(all, std::string("1,4true,5,6,af2rj,no,sentS,sync"));
+}
+
 TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)
 {
     CHECK_EQ(run("function P(a, d) { this.a = a; this.d = d; }"

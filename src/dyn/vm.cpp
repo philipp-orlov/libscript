@@ -59,6 +59,8 @@ void Frame::end() noexcept
     thisValue = Value::undefined();
     pendingException = Value::undefined();
     newTarget.reset();
+    coroutine = nullptr;
+    left = Left::Finished;
 }
 
 // ------------------------------------------------------------- errors ---
@@ -1061,6 +1063,8 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
         throwError(rt, ErrorCode::TypeError, "an arrow function is not a constructor");
     if (fn == rt.functionProto.get())
         throwError(rt, ErrorCode::TypeError, "Function.prototype is not a constructor");
+    if (fn->fnKind == FnKind::Bytecode && fn->code && (fn->code->isGenerator || fn->code->isAsync))
+        throwError(rt, ErrorCode::TypeError, "a generator or async function is not a constructor");
 
     Value protoValue = getPropertyOfObject(rt, fn, rt.atom.prototype.get(), callee);
     DynObject* proto = asObject(protoValue);
@@ -1123,6 +1127,22 @@ Value invokeMethod(Runtime& rt, const Value& object, GCObject* name,
 
 // ------------------------------------------------------------ closures ---
 
+/// A generator's or async function's object differs from a plain function's in what it inherits, and in what `prototype` it
+/// has. False if it is neither.
+static bool setUpCoroutineFunction(Runtime& rt, DynFunction* fn, const FunctionCode& code)
+{
+    if (!code.isGenerator && !code.isAsync)
+        return false;
+    if (!code.isGenerator) {
+        fn->setProto(rt.asyncFunctionProto.get());
+        return true;
+    }
+    fn->setProto(code.isAsync ? rt.asyncGeneratorFunctionProto.get() : rt.generatorFunctionProto.get());
+    DynObject* proto = rt.newObject(code.isAsync ? rt.asyncGeneratorProto.get() : rt.generatorProto.get());
+    fn->putOwn(rt.atom.prototype.get(), detail::Access::adopt(Type::Object, proto), PropWritable);
+    return true;
+}
+
 Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, DynFunction* parent,
                            Box* const* boxes)
 {
@@ -1143,7 +1163,7 @@ Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode
         fn->homeObject = parent->homeObject;
     fn->putOwn(rt.atom.length.get(), Value(double(code->arity)), PropConfigurable);
     fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
-    if (!code->isArrow && !code->isClassConstructor) {
+    if (!setUpCoroutineFunction(rt, fn, *code) && !code->isArrow && !code->isClassConstructor) {
         DynObject* proto = rt.newObject(rt.objectProto.get());
         Value protoValue = detail::Access::adopt(Type::Object, proto);
         proto->putOwn(rt.atom.constructor.get(), handle, PropWritable | PropConfigurable);
@@ -1181,7 +1201,7 @@ Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, 
 
     fn->putOwn(rt.atom.length.get(), Value(double(code->arity)), PropConfigurable);
     fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
-    if (withPrototype && !code->isArrow && !code->isClassConstructor) {
+    if (!setUpCoroutineFunction(rt, fn, *code) && withPrototype && !code->isArrow && !code->isClassConstructor) {
         DynObject* proto = rt.newObject(rt.objectProto.get());
         Value protoValue = detail::Access::adopt(Type::Object, proto);
         proto->putOwn(rt.atom.constructor.get(), detail::Access::make(Type::Object, fn),
@@ -1375,7 +1395,7 @@ bool findHandler(Frame& frame, const Value& exception)
         if (frame.pc < h.start || frame.pc >= h.end)
             continue;
         frame.stack.resize(h.stackDepth);
-        if (h.kind == HandlerKind::Catch) {
+        if (h.kind != HandlerKind::Finally) {
             frame.stack.push_back(exception);
         } else {
             frame.pendingException = exception;
@@ -1386,6 +1406,8 @@ bool findHandler(Frame& frame, const Value& exception)
     }
     return false;
 }
+
+Value startCoroutine(Runtime& rt, Frame& frame, std::uint32_t pc);
 
 Value execute(Runtime& rt, Frame& frame)
 {
@@ -1469,6 +1491,14 @@ Value execute(Runtime& rt, Frame& frame)
 
     for (;;) {
         try {
+            // Resumed by `throw`, or by an `await` of what was rejected: thrown from where it stopped.
+            if (frame.coroutine && frame.coroutine->throwOnResume) {
+                frame.coroutine->throwOnResume = false;
+                frame.pc = pc - 1;
+                const Value thrown = std::move(frame.coroutine->received);
+                frame.coroutine->received = Value::undefined();
+                throwValue(rt, thrown);
+            }
             for (;;) {
                 frame.pc = pc;
                 if (++ticks >= kInterruptInterval) {
@@ -2154,6 +2184,141 @@ Value execute(Runtime& rt, Frame& frame)
                         iteratorClose(rt, iterator);
                         break;
                     }
+                    case Op::IterStartLoop: {
+                        Value src = pop();
+                        sp.push_back(getIterator(rt, src));
+                        break;
+                    }
+                    case Op::IterCloseAt: {
+                        const Value iterator = sp[operandAt(pc)];
+                        pc += 4;
+                        const Value fn = getProperty(rt, iterator, rt.intern("return"));
+                        if (!fn.isNullish() && !callValue(rt, fn, iterator, {}).isObject())
+                            throwError(rt, ErrorCode::TypeError, "the iterator's return() did not give an object");
+                        break;
+                    }
+                    case Op::IterCloseThrow: {
+                        const Value thrown = pop();
+                        const Value iterator = pop();
+                        try {
+                            iteratorClose(rt, iterator);
+                        } catch (const Exception&) {
+                            // The reason for leaving stands.
+                        }
+                        throwValue(rt, thrown);
+                    }
+                    case Op::CoStart: {
+                        Value made = startCoroutine(rt, frame, pc);
+                        return made;
+                    }
+                    case Op::Yield: {
+                        frame.coroutine->returnPc = operandAt(pc);
+                        pc += 4;
+                        frame.pc = pc;
+                        frame.left = Frame::Left::Yielded;
+                        return pop();
+                    }
+                    case Op::Await: {
+                        frame.pc = pc;
+                        frame.left = Frame::Left::Awaiting;
+                        return pop();
+                    }
+                    case Op::DelegateStart:
+                        frame.coroutine->mode = DynCoroutine::Resume::Next;
+                        frame.coroutine->received = Value::undefined();
+                        break;
+                    case Op::DelegateCall: {
+                        const std::uint32_t target = operandAt(pc);
+                        pc += 4;
+                        DynCoroutine* co = frame.coroutine;
+                        co->delegating = false;
+                        const Value iterator = sp.back();
+                        const Value sent = co->received;
+                        if (co->mode == DynCoroutine::Resume::Next) {
+                            sp.push_back(invokeMethod(rt, iterator, rt.atom.next.get(), {sent}));
+                        } else if (co->mode == DynCoroutine::Resume::Throw) {
+                            const Value fn = getProperty(rt, iterator, rt.intern("throw"));
+                            if (fn.isNullish()) {
+                                iteratorClose(rt, iterator);
+                                throwError(rt, ErrorCode::TypeError, "the iterator has no throw method");
+                            }
+                            sp.push_back(callValue(rt, fn, iterator, {sent}));
+                        } else {
+                            const Value fn = getProperty(rt, iterator, rt.intern("return"));
+                            if (fn.isNullish()) {
+                                sp.back() = sent;
+                                pc = target;
+                                break;
+                            }
+                            sp.push_back(callValue(rt, fn, iterator, {sent}));
+                        }
+                        break;
+                    }
+                    case Op::DelegateCheck: {
+                        const std::uint32_t target = operandAt(pc);
+                        pc += 4;
+                        const Value result = pop();
+                        if (!result.isObject())
+                            throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
+                        if (toBoolean(getProperty(rt, result, rt.atom.done.get()))) {
+                            sp.back() = getProperty(rt, result, rt.atom.value.get());
+                            pc = target;
+                            break;
+                        }
+                        frame.coroutine->delegating = true;
+                        frame.pc = pc;
+                        if (code.isAsync) {
+                            frame.left = Frame::Left::Yielded;
+                            return getProperty(rt, result, rt.atom.value.get());
+                        }
+                        frame.left = Frame::Left::YieldedResult;
+                        return result;
+                    }
+                    case Op::DelegateDone: {
+                        const std::uint32_t target = operandAt(pc);
+                        pc += 4;
+                        if (frame.coroutine->mode == DynCoroutine::Resume::Return)
+                            pc = target;
+                        break;
+                    }
+                    case Op::AsyncIterStart: {
+                        Value src = pop();
+                        const Value method = getProperty(rt, src, rt.sym.asyncIterator.get());
+                        if (method.isNullish()) {
+                            sp.push_back(asyncFromSyncIterator(rt, getIterator(rt, src)));
+                        } else {
+                            Value iterator = callValue(rt, method, src, {});
+                            if (!iterator.isObject())
+                                throwError(rt, ErrorCode::TypeError, "the async iterator is not an object");
+                            sp.push_back(std::move(iterator));
+                        }
+                        break;
+                    }
+                    case Op::AsyncIterCall: {
+                        const Value iterator = sp.back();
+                        sp.push_back(invokeMethod(rt, iterator, rt.atom.next.get(), {}));
+                        break;
+                    }
+                    case Op::AsyncIterCheck: {
+                        const std::uint32_t target = operandAt(pc);
+                        pc += 4;
+                        const Value result = pop();
+                        if (!result.isObject())
+                            throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
+                        if (toBoolean(getProperty(rt, result, rt.atom.done.get()))) {
+                            pc = target;
+                            break;
+                        }
+                        sp.push_back(getProperty(rt, result, rt.atom.value.get()));
+                        break;
+                    }
+                    case Op::AsyncIterClose: {
+                        const Value iterator = sp[operandAt(pc)];
+                        pc += 4;
+                        const Value fn = getProperty(rt, iterator, rt.intern("return"));
+                        sp.push_back(fn.isNullish() ? Value::undefined() : callValue(rt, fn, iterator, {}));
+                        break;
+                    }
 
                     case Op::Add: {
                         {
@@ -2364,6 +2529,10 @@ Value resumeInterpreter(Runtime& rt, DynFunction* fn, const FunctionCode& code, 
 
 // ------------------------------------------------------------ promises ---
 
+namespace {
+void settledAwait(Runtime& rt, DynCoroutine* co, bool fulfilled, const Value& result);
+}
+
 Value makePromise(Runtime& rt)
 {
     auto* p = rt.newCell<DynPromise>();
@@ -2377,6 +2546,18 @@ void scheduleReactions(Runtime& rt, DynPromise* p)
 {
     const bool fulfilled = p->state == DynPromise::State::Fulfilled;
     for (DynPromise::Reaction& r : p->reactions) {
+        if (r.coroutine) {
+            const Value co = detail::Access::make(Type::Object, r.coroutine.get());
+            const Value settled = p->result;
+            rt.enqueue(rt.makeFunction(ascii(""),
+                                       [co, settled, fulfilled](CallInfo&) -> Value {
+                                           settledAwait(*runtimeOf(co), static_cast<DynCoroutine*>(asObject(co)), fulfilled, settled);
+                                           return Value::undefined();
+                                       },
+                                       0),
+                       {});
+            continue;
+        }
         const Value handler = fulfilled ? r.onFulfilled : r.onRejected;
         Value next = detail::Access::make(Type::Object, r.next.get());
         Value result = p->result;
@@ -2415,7 +2596,13 @@ void resolvePromise(Runtime& rt, DynPromise* p, const Value& value)
         return;
     // Adopting a thenable is what makes promise chaining flatten.
     if (value.isObject()) {
-        const Value then = getProperty(rt, value, rt.atom.then.get());
+        Value then;
+        try {
+            then = getProperty(rt, value, rt.atom.then.get());
+        } catch (Exception& e) {
+            rejectPromise(rt, p, e.value());
+            return;
+        }
         if (asFunction(then)) {
             const Value self = detail::Access::make(Type::Object, p);
             Value onOk = makeSettler(rt, self, false);
@@ -2434,6 +2621,14 @@ void resolvePromise(Runtime& rt, DynPromise* p, const Value& value)
     p->state = DynPromise::State::Fulfilled;
     p->result = value;
     scheduleReactions(rt, p);
+}
+
+void addReaction(Runtime& rt, DynPromise* p, DynPromise::Reaction reaction)
+{
+    p->handled = true;
+    p->reactions.push_back(std::move(reaction));
+    if (p->state != DynPromise::State::Pending)
+        scheduleReactions(rt, p);
 }
 
 void rejectPromise(Runtime& rt, DynPromise* p, const Value& reason)
@@ -2462,6 +2657,292 @@ Value makeSettler(Runtime& rt, const Value& promise, bool reject)
             resolvePromise(rtc, target, ci.arg(0));
         return Value::undefined();
     }, 1);
+}
+
+// ---------------------------------------------------------- coroutines ---
+
+DynCoroutine::DynCoroutine() : frame(std::make_unique<Frame>())
+{
+    cls = ObjClass::Generator;
+    frame->coroutine = this;
+}
+
+DynCoroutine::~DynCoroutine() = default;
+
+void DynCoroutine::children(GcList& out) const
+{
+    DynObject::children(out);
+    const auto add = [&out](const Value& v) {
+        if (GCObject* p = detail::Access::ptr(v))
+            out.push_back(p);
+    };
+    add(received);
+    for (const Value& v : frame->locals)
+        add(v);
+    for (const Ref<Box>& box : frame->cells) {
+        if (box)
+            out.push_back(box.get());
+    }
+    for (const Value& v : frame->stack)
+        add(v);
+    add(frame->thisValue);
+    add(frame->pendingException);
+    if (frame->newTarget)
+        out.push_back(frame->newTarget.get());
+    if (function)
+        out.push_back(function.get());
+    if (promise)
+        out.push_back(promise.get());
+    for (const Request& r : requests) {
+        add(r.value);
+        if (r.promise)
+            out.push_back(r.promise.get());
+    }
+}
+
+void DynCoroutine::clearReferences()
+{
+    DynObject::clearReferences();
+    frame->end();
+    frame->coroutine = this;
+    received = Value::undefined();
+    function.reset();
+    promise.reset();
+    requests.clear();
+}
+
+Value iterResult(Runtime& rt, const Value& value, bool done)
+{
+    DynObject* out = rt.newObject(rt.objectProto.get());
+    Value handle = detail::Access::adopt(Type::Object, out);
+    out->putOwn(rt.atom.value.get(), value);
+    out->putOwn(rt.atom.done.get(), Value(done));
+    return handle;
+}
+
+namespace {
+
+void stepAsync(Runtime& rt, DynCoroutine* co, DynCoroutine::Resume mode, const Value& value);
+void drainAsyncGenerator(Runtime& rt, DynCoroutine* co);
+
+/// Run the frame until it next leaves. What it left for is in `left`.
+Value runCoroutine(Runtime& rt, DynCoroutine* co, DynCoroutine::Resume mode, const Value& value)
+{
+    Frame& frame = *co->frame;
+    if (co->state != DynCoroutine::State::SuspendedStart) {
+        if (co->delegating) {
+            co->mode = mode;
+            co->received = value;
+        } else if (mode == DynCoroutine::Resume::Throw) {
+            co->throwOnResume = true;
+            co->received = value;
+        } else {
+            frame.stack.push_back(value);
+            if (mode == DynCoroutine::Resume::Return)
+                frame.pc = co->returnPc;
+        }
+    }
+    co->state = DynCoroutine::State::Running;
+    frame.left = Frame::Left::Finished;
+    DepthGuard depth(rt);
+    rt.frames.push_back(&frame);
+    struct Pop
+    {
+        Runtime& rt;
+        ~Pop() { rt.frames.pop_back(); }
+    } pop{rt};
+    return execute(rt, frame);
+}
+
+void finishCoroutine(DynCoroutine* co)
+{
+    co->state = DynCoroutine::State::Completed;
+    co->frame->end();
+    co->frame->coroutine = co;
+}
+
+/// The promise an `await` waits on, and what happens when it settles.
+void awaitValue(Runtime& rt, DynCoroutine* co, const Value& value)
+{
+    Value waited;
+    try {
+        DynObject* object = asObject(value);
+        if (object && object->cls == ObjClass::Promise &&
+            detail::Access::ptr(getProperty(rt, value, rt.atom.constructor.get())) == rt.promiseCtor.get()) {
+            waited = value;
+        } else {
+            waited = makePromise(rt);
+            resolvePromise(rt, static_cast<DynPromise*>(asObject(waited)), value);
+        }
+    } catch (Exception& e) {
+        settledAwait(rt, co, false, e.value());
+        return;
+    }
+    DynPromise::Reaction reaction;
+    reaction.coroutine.reset(co);
+    addReaction(rt, static_cast<DynPromise*>(asObject(waited)), std::move(reaction));
+}
+
+void settleRequest(Runtime& rt, DynCoroutine* co, bool fulfilled, const Value& value)
+{
+    const Ref<DynPromise> promise = co->requests.front().promise;
+    co->requests.erase(co->requests.begin());
+    if (fulfilled)
+        resolvePromise(rt, promise.get(), value);
+    else
+        rejectPromise(rt, promise.get(), value);
+}
+
+void stepAsync(Runtime& rt, DynCoroutine* co, DynCoroutine::Resume mode, const Value& value)
+{
+    const Value keep = detail::Access::make(Type::Object, co);
+    Value out;
+    bool threw = false;
+    try {
+        out = runCoroutine(rt, co, mode, value);
+    } catch (Exception& e) {
+        threw = true;
+        out = e.value();
+    }
+    if (!threw && co->frame->left == Frame::Left::Awaiting) {
+        awaitValue(rt, co, out);
+        return;
+    }
+    if (co->coKind == DynCoroutine::Kind::AsyncFunction) {
+        finishCoroutine(co);
+        const Ref<DynPromise> promise = co->promise;
+        if (threw)
+            rejectPromise(rt, promise.get(), out);
+        else
+            resolvePromise(rt, promise.get(), out);
+        return;
+    }
+    if (!threw && co->frame->left == Frame::Left::Yielded) {
+        co->state = DynCoroutine::State::SuspendedYield;
+        settleRequest(rt, co, true, iterResult(rt, out, false));
+    } else {
+        finishCoroutine(co);
+        settleRequest(rt, co, !threw, threw ? out : iterResult(rt, out, true));
+    }
+    drainAsyncGenerator(rt, co);
+}
+
+void drainAsyncGenerator(Runtime& rt, DynCoroutine* co)
+{
+    while (!co->requests.empty()) {
+        if (co->state == DynCoroutine::State::Running || co->state == DynCoroutine::State::AwaitingReturn)
+            return;
+        const DynCoroutine::Resume mode = co->requests.front().mode;
+        const Value value = co->requests.front().value;
+        if (co->state == DynCoroutine::State::SuspendedStart && mode != DynCoroutine::Resume::Next)
+            finishCoroutine(co);
+        if (co->state != DynCoroutine::State::Completed) {
+            stepAsync(rt, co, mode, value);
+            return;
+        }
+        if (mode == DynCoroutine::Resume::Next) {
+            settleRequest(rt, co, true, iterResult(rt, Value::undefined(), true));
+        } else if (mode == DynCoroutine::Resume::Throw) {
+            settleRequest(rt, co, false, value);
+        } else {
+            co->state = DynCoroutine::State::AwaitingReturn;
+            awaitValue(rt, co, value);
+            return;
+        }
+    }
+}
+
+void settledAwait(Runtime& rt, DynCoroutine* co, bool fulfilled, const Value& result)
+{
+    if (co->state == DynCoroutine::State::AwaitingReturn) {
+        co->state = DynCoroutine::State::Completed;
+        settleRequest(rt, co, fulfilled, fulfilled ? iterResult(rt, result, true) : result);
+        drainAsyncGenerator(rt, co);
+        return;
+    }
+    stepAsync(rt, co, fulfilled ? DynCoroutine::Resume::Next : DynCoroutine::Resume::Throw, result);
+}
+
+Value startCoroutine(Runtime& rt, Frame& frame, std::uint32_t pc)
+{
+    const FunctionCode& code = *frame.code;
+    auto* co = rt.newCell<DynCoroutine>();
+    Value handle = detail::Access::adopt(Type::Object, co);
+    co->coKind = !code.isGenerator ? DynCoroutine::Kind::AsyncFunction
+                                   : code.isAsync ? DynCoroutine::Kind::AsyncGenerator : DynCoroutine::Kind::Generator;
+    co->function.reset(frame.fn);
+    Frame& own = *co->frame;
+    own.fn = frame.fn;
+    own.code = frame.code;
+    own.pc = pc;
+    own.locals.swap(frame.locals);
+    own.cells.swap(frame.cells);
+    own.stack.swap(frame.stack);
+    own.subStack.swap(frame.subStack);
+    own.thisValue = std::move(frame.thisValue);
+    own.pendingException = std::move(frame.pendingException);
+    own.newTarget = std::move(frame.newTarget);
+    if (co->coKind == DynCoroutine::Kind::AsyncFunction) {
+        co->setProto(rt.objectProto.get());
+        Value promise = makePromise(rt);
+        co->promise.reset(static_cast<DynPromise*>(asObject(promise)));
+        stepAsync(rt, co, DynCoroutine::Resume::Next, Value::undefined());
+        return promise;
+    }
+    // What it inherits is whatever the function's `prototype` is when it is called.
+    const bool isAsync = co->coKind == DynCoroutine::Kind::AsyncGenerator;
+    DynObject* proto = asObject(getProperty(rt, detail::Access::make(Type::Object, frame.fn), rt.atom.prototype.get()));
+    co->setProto(proto ? proto : isAsync ? rt.asyncGeneratorProto.get() : rt.generatorProto.get());
+    return handle;
+}
+
+}  // namespace
+
+Value generatorResume(Runtime& rt, DynCoroutine* g, DynCoroutine::Resume mode, const Value& value)
+{
+    if (g->state == DynCoroutine::State::Running)
+        throwError(rt, ErrorCode::TypeError, "the generator is already running");
+    if (g->state == DynCoroutine::State::SuspendedStart && mode != DynCoroutine::Resume::Next)
+        finishCoroutine(g);
+    if (g->state == DynCoroutine::State::Completed) {
+        if (mode == DynCoroutine::Resume::Throw)
+            throwValue(rt, value);
+        return iterResult(rt, mode == DynCoroutine::Resume::Return ? value : Value::undefined(), true);
+    }
+    Value out;
+    try {
+        out = runCoroutine(rt, g, mode, value);
+    } catch (...) {
+        finishCoroutine(g);
+        throw;
+    }
+    const Frame::Left left = g->frame->left;
+    if (left == Frame::Left::YieldedResult) {
+        g->state = DynCoroutine::State::SuspendedYield;
+        return out;
+    }
+    if (left == Frame::Left::Yielded) {
+        g->state = DynCoroutine::State::SuspendedYield;
+        return iterResult(rt, out, false);
+    }
+    finishCoroutine(g);
+    return iterResult(rt, out, true);
+}
+
+Value asyncGeneratorRequest(Runtime& rt, const Value& self, DynCoroutine::Resume mode, const Value& value)
+{
+    Value promise = makePromise(rt);
+    auto* p = static_cast<DynPromise*>(asObject(promise));
+    DynObject* object = asObject(self);
+    if (!object || object->cls != ObjClass::Generator ||
+        static_cast<DynCoroutine*>(object)->coKind != DynCoroutine::Kind::AsyncGenerator) {
+        rejectPromise(rt, p, makeErrorValue(rt, ErrorCode::TypeError, "not an async generator"));
+        return promise;
+    }
+    auto* co = static_cast<DynCoroutine*>(object);
+    co->requests.push_back(DynCoroutine::Request{mode, value, Ref<DynPromise>(p)});
+    drainAsyncGenerator(rt, co);
+    return promise;
 }
 
 }  // namespace dyn

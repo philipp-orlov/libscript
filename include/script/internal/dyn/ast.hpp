@@ -51,6 +51,8 @@ enum class NK : std::uint8_t
     Member,        // a=object b=computed key                text, computed, optional
     Sequence,      //                                        list
     Spread,        // a=argument
+    Yield,         // a=argument (may be null)               prefix = `yield*`
+    Await,         // a=argument
     Hole,          // elision in an array literal
 
     // ---- patterns ----------------------------------------------------------
@@ -162,6 +164,8 @@ struct Node
     bool exported = false;  ///< `export`, which only means anything in a namespace
     bool isAbstract = false;
     bool isParamProp = false;  ///< a constructor parameter that declares a field
+    bool isGenerator = false;  ///< FunctionExpr: `function*`
+    bool isAsync = false;      ///< FunctionExpr, ArrowExpr: `async`; ForOf: `for await`
 
     String text;
     double number = 0;

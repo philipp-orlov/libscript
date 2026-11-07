@@ -215,6 +215,7 @@ enum class ObjClass : std::uint8_t
     Map,
     Set,
     Promise,
+    Generator,
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.
@@ -610,6 +611,8 @@ struct DynPromise : DynObject
         Value onFulfilled = Value::undefined();
         Value onRejected = Value::undefined();
         Ref<DynPromise> next;
+        /// An `await`: what is to be resumed, in place of the two handlers and the promise for what they give.
+        Ref<DynObject> coroutine;
     };
 
     State state = State::Pending;
@@ -618,6 +621,61 @@ struct DynPromise : DynObject
     std::vector<Reaction> reactions;
 
     DynPromise() { cls = ObjClass::Promise; }
+    void children(GcList& out) const override;
+    void clearReferences() override;
+};
+
+struct Frame;
+
+/// What a generator object is, and what an async function or async generator runs as: a frame of its own, to be run for a
+/// while, left and come back to.
+struct DynCoroutine : DynObject
+{
+    enum class Kind : std::uint8_t
+    {
+        Generator,
+        AsyncFunction,
+        AsyncGenerator,
+    };
+    enum class State : std::uint8_t
+    {
+        SuspendedStart,
+        SuspendedYield,
+        Running,          ///< an async one: this too while it waits for an `await`
+        AwaitingReturn,   ///< async generator: finished, and waiting for what `return(v)` was given
+        Completed,
+    };
+    enum class Resume : std::uint8_t
+    {
+        Next,
+        Throw,
+        Return,
+    };
+    struct Request
+    {
+        Resume mode;
+        Value value;
+        Ref<DynPromise> promise;
+    };
+
+    Kind coKind = Kind::Generator;
+    State state = State::SuspendedStart;
+    /// In a `yield*`: what comes in is the delegate's business.
+    bool delegating = false;
+    bool throwOnResume = false;
+    Resume mode = Resume::Next;
+    Value received = Value::undefined();
+    std::uint32_t returnPc = 0;
+    std::unique_ptr<Frame> frame;
+    /// The function, which the frame only points at.
+    Ref<DynObject> function;
+    /// An async function: the promise for what it comes to.
+    Ref<DynPromise> promise;
+    /// An async generator: what has been asked of it, oldest first.
+    std::vector<Request> requests;
+
+    DynCoroutine();
+    ~DynCoroutine() override;
     void children(GcList& out) const override;
     void clearReferences() override;
 };

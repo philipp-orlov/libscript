@@ -233,6 +233,18 @@ std::int32_t scriptDynLooseEquals(Runtime* rt, std::int64_t ta, std::uint64_t a,
     return guarded(*rt, SCRIPT_HERE, [&]() -> std::int32_t { return looseEquals(*rt, valueOf(ta, a), valueOf(tb, b)); });
 }
 
+std::int32_t scriptDynIterIsPlain(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    DynObject* object = asObject(valueOf(tag, payload));
+    if (!object || object->cls != ObjClass::Array || object->proto.get() != rt->arrayProto.get() || object->findOwn(rt->sym.iterator.get()))
+        return 0;
+    const Prop* iterate = rt->arrayProto->findOwn(rt->sym.iterator.get());
+    if (!iterate || detail::Access::ptr(iterate->value) != rt->intrinsics[Runtime::ArrayValues].get())
+        return 0;
+    GCObject* name = rt->intern("return");
+    return !rt->arrayIteratorProto->findOwn(name) && !rt->iteratorProto->findOwn(name) && !rt->objectProto->findOwn(name);
+}
+
 std::int32_t scriptDynStrictEquals(std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept
 {
     return strictEquals(valueOf(ta, a), valueOf(tb, b)) ? 1 : 0;

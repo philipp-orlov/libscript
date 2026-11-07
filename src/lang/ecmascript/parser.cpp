@@ -410,7 +410,10 @@ NodePtr Parser::statement()
             if (!typescript_)
                 fail("'enum' is TypeScript syntax");
             return enumDeclaration(false);
-        case Tok::Async: fail("async functions are not supported"); break;
+        case Tok::Async:
+            if (asyncFunctionAhead())
+                return functionDeclaration();
+            break;
         case Tok::With: fail("'with' is not supported"); break;
         case Tok::Debugger:
             advance();
@@ -571,6 +574,9 @@ NodePtr Parser::forStatement()
 {
     const std::uint32_t line = cur_.line;
     advance();
+    const bool forAwait = at(Tok::Await) && inAsync_;
+    if (forAwait)
+        advance();
     expect(Tok::LParen, "'('");
 
     NodePtr init;
@@ -584,6 +590,7 @@ NodePtr Parser::forStatement()
             const bool isOf = at(Tok::Of);
             advance();
             NodePtr n = makeNode(isOf ? NK::ForOf : NK::ForIn, line);
+            n->isAsync = forAwait;
             n->varKind = kind;
             n->type = std::move(annotation);
             n->a = std::move(target);
@@ -611,6 +618,7 @@ NodePtr Parser::forStatement()
             const bool isOf = at(Tok::Of);
             advance();
             NodePtr n = makeNode(isOf ? NK::ForOf : NK::ForIn, line);
+            n->isAsync = forAwait;
             n->varKind = VarKind::None;
             n->a = toPattern(std::move(head));
             n->b = isOf ? assignment() : expression();
@@ -684,6 +692,57 @@ NodePtr Parser::switchStatement()
     }
     advance();
     return n;
+}
+
+bool Parser::asyncMethodAhead()
+{
+    Lexer probe = lexer_;
+    const Token after = probe.next(false);
+    if (after.newlineBefore)
+        return false;
+    switch (after.type) {
+        case Tok::LParen:
+        case Tok::Assign:
+        case Tok::Semicolon:
+        case Tok::RBrace:
+        case Tok::Colon:
+        case Tok::Question:
+        case Tok::Comma:
+        case Tok::Lt: return false;
+        default: return true;
+    }
+}
+
+bool Parser::asyncFunctionAhead()
+{
+    Lexer probe = lexer_;
+    const Token after = probe.next(false);
+    return after.type == Tok::Function && !after.newlineBefore;
+}
+
+bool Parser::asyncArrowAhead()
+{
+    Lexer probe = lexer_;
+    const Token after = probe.next(false);
+    if (after.newlineBefore)
+        return false;
+    if (identifierLike(after.type))
+        return probe.next(false).type == Tok::Arrow;
+    if (after.type != Tok::LParen)
+        return false;
+    // `async (...)` is a call unless an arrow follows the closing parenthesis.
+    int depth = 1;
+    while (depth > 0) {
+        const Token t = probe.next(false);
+        if (t.type == Tok::Eof)
+            return false;
+        if (t.type == Tok::LParen || t.type == Tok::LBracket || t.type == Tok::LBrace)
+            ++depth;
+        else if (t.type == Tok::RParen || t.type == Tok::RBracket || t.type == Tok::RBrace)
+            --depth;
+    }
+    const Token next = probe.next(false);
+    return next.type == Tok::Arrow || (typescript_ && next.type == Tok::Colon);
 }
 
 NodePtr Parser::functionDeclaration()
@@ -1374,10 +1433,47 @@ NodePtr Parser::assignment()
     NestingScope nest(exprDepth_);
     if (nest.tooDeep())
         fail("expression is nested too deeply");
-    if (at(Tok::Yield))
-        fail("generators are not supported");
-    if (at(Tok::Await))
-        fail("'await' is not supported; use promise callbacks");
+    if (at(Tok::Yield) && inGenerator_) {
+        NodePtr n = makeNode(NK::Yield, cur_.line);
+        advance();
+        if (!cur_.newlineBefore) {
+            n->prefix = eat(Tok::Star);
+            switch (cur_.type) {
+                case Tok::RParen:
+                case Tok::RBracket:
+                case Tok::RBrace:
+                case Tok::Comma:
+                case Tok::Semicolon:
+                case Tok::Colon:
+                case Tok::In:
+                case Tok::Of:
+                case Tok::Eof:
+                    if (n->prefix)
+                        fail("'yield*' needs an operand");
+                    break;
+                default: n->a = assignment(); break;
+            }
+        }
+        return n;
+    }
+    if (at(Tok::Async) && asyncArrowAhead()) {
+        const std::uint32_t line = cur_.line;
+        advance();
+        std::vector<NodePtr> params;
+        if (at(Tok::LParen)) {
+            const FunctionKind kind(*this, false, true);
+            params = parameterList();
+        } else {
+            NodePtr param = makeNode(NK::Identifier, cur_.line);
+            param->text = cur_.text;
+            advance();
+            params.push_back(std::move(param));
+        }
+        NodePtr returnType = at(Tok::Colon) ? typeAnnotation() : nullptr;
+        expect(Tok::Arrow, "'=>'");
+        arrowIsAsync_ = true;
+        return arrowFromParams(std::move(params), std::move(returnType), line);
+    }
 
     // `x => ...` and `(a, b) => ...`
     if (identifierLike(cur_.type)) {
@@ -1476,6 +1572,12 @@ NodePtr Parser::unary()
     if (nest.tooDeep())
         fail("expression is nested too deeply");
     const std::uint32_t line = cur_.line;
+    if (at(Tok::Await) && inAsync_) {
+        NodePtr n = makeNode(NK::Await, line);
+        advance();
+        n->a = unary();
+        return n;
+    }
     switch (cur_.type) {
         case Tok::Bang:
         case Tok::Tilde:
@@ -1667,6 +1769,9 @@ NodePtr Parser::arrowFromParams(std::vector<NodePtr> params, NodePtr returnType,
     NodePtr n = makeNode(NK::ArrowExpr, line);
     n->list = std::move(params);
     n->type = std::move(returnType);
+    n->isAsync = arrowIsAsync_;
+    arrowIsAsync_ = false;
+    const FunctionKind kind(*this, false, n->isAsync);
     if (at(Tok::LBrace)) {
         n->d = block();
     } else {
@@ -1749,9 +1854,9 @@ std::vector<NodePtr> Parser::parameterList(bool allowModifiers)
 NodePtr Parser::functionExpression(bool isDeclaration)
 {
     NodePtr n = makeNode(NK::FunctionExpr, cur_.line);
+    n->isAsync = eat(Tok::Async);
     expect(Tok::Function, "'function'");
-    if (eat(Tok::Star))
-        fail("generators are not supported");
+    n->isGenerator = eat(Tok::Star);
     if (identifierLike(cur_.type)) {
         n->text = cur_.text;
         n->namedExpr = !isDeclaration;
@@ -1759,6 +1864,7 @@ NodePtr Parser::functionExpression(bool isDeclaration)
     } else if (isDeclaration) {
         fail("a function declaration needs a name");
     }
+    const FunctionKind kind(*this, n->isGenerator, n->isAsync);
     if (typescript_ && at(Tok::Lt))
         n->typeParams = typeParameterList();
     n->list = parameterList();
@@ -1837,8 +1943,12 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             advance();
         }
 
+        const bool memberAsync = at(Tok::Async) && asyncMethodAhead();
+        if (memberAsync)
+            advance();
+        const bool memberGenerator = eat(Tok::Star);
         PropKind kind = PropKind::Method;
-        if (at(Tok::Get) || at(Tok::Set)) {
+        if (!memberAsync && !memberGenerator && (at(Tok::Get) || at(Tok::Set))) {
             Lexer probe = lexer_;
             const Token after = probe.next(false);
             if (after.type != Tok::LParen && after.type != Tok::Assign &&
@@ -1884,6 +1994,9 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             NodePtr fn = makeNode(NK::FunctionExpr, line);
             if (!computed)
                 fn->text = key->text;
+            fn->isAsync = memberAsync;
+            fn->isGenerator = memberGenerator;
+            const FunctionKind functionKind(*this, memberGenerator, memberAsync);
             if (at(Tok::Lt))
                 fn->typeParams = typeParameterList();
             fn->list = parameterList(isConstructor);
@@ -1970,8 +2083,12 @@ NodePtr Parser::objectLiteral()
             continue;
         }
 
+        const bool memberAsync = at(Tok::Async) && asyncMethodAhead();
+        if (memberAsync)
+            advance();
+        const bool memberGenerator = eat(Tok::Star);
         PropKind kind = PropKind::Init;
-        if (at(Tok::Get) || at(Tok::Set)) {
+        if (!memberAsync && !memberGenerator && (at(Tok::Get) || at(Tok::Set))) {
             Lexer probe = lexer_;
             const Token after = probe.next(false);
             if (after.type != Tok::Colon && after.type != Tok::Comma && after.type != Tok::RBrace &&
@@ -1995,6 +2112,9 @@ NodePtr Parser::objectLiteral()
         if (at(Tok::LParen) || (typescript_ && at(Tok::Lt))) {
             NodePtr fn = makeNode(NK::FunctionExpr, line);
             fn->text = p->text;
+            fn->isAsync = memberAsync;
+            fn->isGenerator = memberGenerator;
+            const FunctionKind functionKind(*this, memberGenerator, memberAsync);
             if (at(Tok::Lt))
                 fn->typeParams = typeParameterList();
             fn->list = parameterList();
@@ -2003,6 +2123,8 @@ NodePtr Parser::objectLiteral()
             p->b = std::move(fn);
             if (kind == PropKind::Init)
                 p->propKind = PropKind::Method;
+        } else if (memberAsync || memberGenerator) {
+            fail("a generator or async method needs a parameter list");
         } else if (kind != PropKind::Init) {
             fail("an accessor needs a parameter list");
         } else if (eat(Tok::Colon)) {
@@ -2037,6 +2159,8 @@ NodePtr Parser::templateLiteral()
     n->strs = cur_.parts;
     for (const std::string& raw : cur_.exprs) {
         Parser sub(raw, name_);
+        sub.inGenerator_ = inGenerator_;
+        sub.inAsync_ = inAsync_;
         NodePtr e = sub.expression();
         n->list.push_back(std::move(e));
     }

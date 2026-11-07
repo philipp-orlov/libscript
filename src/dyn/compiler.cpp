@@ -49,6 +49,9 @@ struct LoopCtx
 struct FinallyCtx
 {
     std::vector<std::size_t> sites;  ///< JumpSub operands waiting for `pc`
+    /// Not a `finally` but a `for-of`, whose iterator at this place in the stack is closed by whatever jumps out of it.
+    std::uint32_t iterDepth = kNoSlot;
+    bool asyncIter = false;
 };
 
 struct FnState
@@ -586,6 +589,11 @@ private:
         fs.code->isClassConstructor = node.propKind == PropKind::Constructor;
         fs.code->isDerivedConstructor = node.isStatic;  // set by compileClass
         fs.code->arity = int(node.list.size());
+        fs.code->isGenerator = node.isGenerator;
+        fs.code->isAsync = node.isAsync;
+        // A coroutine lives in a frame of its own, which is the interpreter's to resume.
+        if (node.isGenerator || node.isAsync)
+            fs.code->jitRefused = true;
         const StrictScope strictBody(*this, node.d && hasUseStrict(*node.d));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
 
@@ -595,6 +603,9 @@ private:
 
         FnState* saved = fn_;
         fn_ = &fs;
+        // An async function's promise is rejected by what its parameters throw; a generator's are bound by the call.
+        if (node.isAsync && !node.isGenerator)
+            emit(Op::CoStart);
 
         // Parameters occupy the first slots; the VM writes them there directly
         // unless they are boxed or destructured. Nothing else may take a slot
@@ -649,6 +660,8 @@ private:
         }
 
         hoist(*node.d, false);
+        if (node.isGenerator)
+            emit(Op::CoStart);
         for (const NodePtr& s : node.d->list)
             stmt(*s);
         emit(Op::ReturnUndefined);
@@ -1046,17 +1059,35 @@ private:
     void forEachLoop(const Node& n, const String& label)
     {
         const bool isOf = n.kind == NK::ForOf;
+        const bool isAwait = isOf && n.isAsync;
         expr(*n.b);
-        if (isOf)
-            emit(Op::IterStart);
+        if (isAwait)
+            emit(Op::AsyncIterStart);
+        else if (isOf)
+            emit(Op::IterStartLoop);
         else
             emit(Op::ForInStart);
 
+        const std::uint32_t iterDepth = fn_->stmtDepth;
         fn_->stmtDepth += isOf ? 1 : 2;
         const std::uint32_t top = here();
+        // What leaves the body other than by the loop's own `break` and `continue` closes the iterator.
+        FinallyCtx closes;
+        closes.iterDepth = iterDepth;
+        closes.asyncIter = isAwait;
+        if (isOf)
+            fn_->finallys.push_back(&closes);
         pushLoop(label, true);
-        const std::size_t exit = emitJump(isOf ? Op::IterNext : Op::ForInNext);
+        std::size_t exit;
+        if (isAwait) {
+            emit(Op::AsyncIterCall);
+            emit(Op::Await);
+            exit = emitJump(Op::AsyncIterCheck);
+        } else {
+            exit = emitJump(isOf ? Op::IterNext : Op::ForInNext);
+        }
 
+        const std::uint32_t bodyStart = here();
         beginScope();
         if (n.varKind == VarKind::None)
             assignPattern(*n.a), emit(Op::Pop);
@@ -1064,16 +1095,78 @@ private:
             declarePattern(*n.a, n.varKind);
         stmt(*n.d);
         endScope();
+        const std::uint32_t bodyEnd = here();
         emitU(Op::Jump, top);
 
-        patchHere(exit);
+        if (isOf)
+            fn_->finallys.pop_back();
         const std::uint32_t breakTarget = here();
+        if (isOf) {
+            // A `break` closes it; running out does not.
+            emitFinallyCall(closes);
+            emit(Op::Pop);
+        }
+        const std::size_t afterBreak = isOf ? emitJump(Op::Jump) : 0;
+        patchHere(exit);
         popLoop(breakTarget, top);
         fn_->stmtDepth -= isOf ? 1 : 2;
-        if (isOf)
-            emit(Op::IterClose);
-        else
+        if (isOf) {
+            emit(Op::Pop);
+            patchHere(afterBreak);
+            const std::size_t skip = emitJump(Op::Jump);
+            const std::uint32_t closePc = here();
+            emit(Op::IterCloseThrow);
+            patchHere(skip);
+            fn_->code->handlers.push_back(Handler{bodyStart, bodyEnd, closePc, iterDepth + 1, HandlerKind::IterClose});
+        } else {
             emitU(Op::PopN, 2);
+        }
+    }
+
+    /// `yield e`: on being resumed by `return`, what `return` does here.
+    void yieldExpr(const Node& n)
+    {
+        const bool isAsyncGen = fn_->code->isAsync;
+        if (n.prefix) {
+            yieldStar(n);
+            return;
+        }
+        if (n.a)
+            expr(*n.a);
+        else
+            emit(Op::PushUndefined);
+        if (isAsyncGen)
+            emit(Op::Await);
+        const std::size_t returned = emitJump(Op::Yield);
+        const std::size_t resumed = emitJump(Op::Jump);
+        patchHere(returned);
+        if (isAsyncGen)
+            emit(Op::Await);
+        emitReturnOfTop();
+        patchHere(resumed);
+    }
+
+    void yieldStar(const Node& n)
+    {
+        const bool isAsyncGen = fn_->code->isAsync;
+        expr(*n.a);
+        emit(isAsyncGen ? Op::AsyncIterStart : Op::IterStart);
+        emit(Op::DelegateStart);
+        const std::uint32_t top = here();
+        const std::size_t noMethod = emitJump(Op::DelegateCall);
+        if (isAsyncGen)
+            emit(Op::Await);
+        const std::size_t done = emitJump(Op::DelegateCheck);
+        emitU(Op::Jump, top);
+        patchHere(done);
+        const std::size_t returned = emitJump(Op::DelegateDone);
+        const std::size_t resumed = emitJump(Op::Jump);
+        patchHere(noMethod);
+        if (isAsyncGen)
+            emit(Op::Await);
+        patchHere(returned);
+        emitReturnOfTop();
+        patchHere(resumed);
     }
 
     void labeled(const Node& n)
@@ -1115,24 +1208,40 @@ private:
                                     : "unknown label: " + toUtf8(n.text));
     }
 
-    void emitFinallyCall(FinallyCtx& ctx) { ctx.sites.push_back(emitJump(Op::JumpSub)); }
+    void emitFinallyCall(FinallyCtx& ctx)
+    {
+        if (ctx.iterDepth == kNoSlot) {
+            ctx.sites.push_back(emitJump(Op::JumpSub));
+        } else if (ctx.asyncIter) {
+            emitU(Op::AsyncIterClose, ctx.iterDepth);
+            emit(Op::Await);
+            emit(Op::Pop);
+        } else {
+            emitU(Op::IterCloseAt, ctx.iterDepth);
+        }
+    }
 
     void emitReturn(const Node* argument)
     {
+        if (argument)
+            expr(*argument);
+        else
+            emit(Op::PushUndefined);
+        // What an async generator returns is awaited.
+        if (argument && fn_->code->isAsync && fn_->code->isGenerator)
+            emit(Op::Await);
+        emitReturnOfTop();
+    }
+
+    /// `return` of the value on the stack, through every `finally` it is inside.
+    void emitReturnOfTop()
+    {
         if (fn_->finallys.empty()) {
-            if (argument)
-                expr(*argument);
-            else
-                emit(Op::PushUndefined);
             emit(Op::Return);
             return;
         }
         if (fn_->retvalSlot == kNoSlot)
             fn_->retvalSlot = hiddenSlot();
-        if (argument)
-            expr(*argument);
-        else
-            emit(Op::PushUndefined);
         emitU(Op::SetLocal, fn_->retvalSlot);
         for (std::size_t i = fn_->finallys.size(); i-- > 0;)
             emitFinallyCall(*fn_->finallys[i]);
@@ -1347,6 +1456,11 @@ private:
             }
             case NK::SuperExpr:
                 fail(n.line, "'super' is only valid in a member access or a call");
+            case NK::Yield: yieldExpr(n); return;
+            case NK::Await:
+                expr(*n.a);
+                emit(Op::Await);
+                return;
             case NK::Spread:
                 fail(n.line, "unexpected '...'");
             default:

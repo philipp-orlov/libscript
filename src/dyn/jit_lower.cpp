@@ -200,7 +200,14 @@ int operandsOf(Op op) noexcept
         case Op::JumpIfNotNullishKeep:
         case Op::JumpSub:
         case Op::ForInNext:
-        case Op::IterNext: return 1;
+        case Op::IterNext:
+        case Op::IterCloseAt:
+        case Op::Yield:
+        case Op::DelegateCall:
+        case Op::DelegateCheck:
+        case Op::DelegateDone:
+        case Op::AsyncIterCheck:
+        case Op::AsyncIterClose: return 1;
         default: return 0;
     }
 }
@@ -231,8 +238,11 @@ public:
 
     void run()
     {
-        if (!code_.handlers.empty())
-            refuse("the function has exception handlers");
+        // A `for-of`'s handler is the one kind native code can do without: see `IterStartLoop`.
+        for (const Handler& handler : code_.handlers) {
+            if (handler.kind != HandlerKind::IterClose)
+                refuse("the function has exception handlers");
+        }
         speculate_ = code_.jitMayGuess() && !code_.isClassConstructor;
         prepare();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
@@ -2816,6 +2826,27 @@ private:
                 push(taggedEntry(r, t, Own::Owned));
                 return true;
             }
+            case Op::IterStartLoop: {
+                // Only over what needs no closing, an array as it comes, is leaving the loop no different from dropping the
+                // iterator. Anything else is the interpreter's, here and in what this function is compiled to next.
+                if (!betHere())
+                    refuse("a for-of over what may need closing");
+                Entry src = top();
+                secureWeak();
+                src = top();
+                const std::int32_t bail = newLabel();
+                const std::int32_t plain = callCold(reinterpret_cast<void*>(&scriptDynIterIsPlain), {rtReg(), tagReg(src), payloadReg(src)}, true, {}, false);
+                branchCmp(plain, IrCond::Eq, 0, bail);
+                pop();
+                emitBail(bail, {src});
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynGetIterator), {rtReg(), tagReg(src), payloadReg(src)}, r, t, true, {src});
+                release(src);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
+            case Op::IterCloseAt: (void)operand(); return true;
             case Op::IterNext: {
                 const std::uint32_t target = operand();
                 secureWeak();

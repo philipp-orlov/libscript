@@ -21,6 +21,7 @@ void installArray(Runtime& rt);        // Array and the array iterator
 void installString(Runtime& rt);       // String
 void installMathJson(Runtime& rt);     // Number, Boolean, Math, JSON, Date
 void installCollections(Runtime& rt);  // Map, Set, Promise, console
+void installGenerators(Runtime& rt);   // generator and async function objects, async iteration
 
 /// The one-line rendering `console.log` and `Value::inspect` produce.
 String inspectValue(Runtime& rt, const Value& v, int depth);

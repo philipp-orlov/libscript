@@ -137,6 +137,29 @@ private:
     std::size_t lookaheadLimit_ = 0;
     bool ambient_ = false;   ///< inside `declare`: bodies are not required
     bool noIn_ = false;      ///< parsing a for-in head: `in` ends the expression
+    bool arrowIsAsync_ = false;  ///< the arrow function about to be parsed was written `async`
+    bool inGenerator_ = false;  ///< `yield` is an operator here, not a name
+    bool inAsync_ = false;      ///< `await` is an operator here, not a name
+    /// The kind of function whose parameters and body are about to be parsed, which those words depend on.
+    struct FunctionKind
+    {
+        Parser& parser;
+        bool generator, async;
+        FunctionKind(Parser& p, bool isGenerator, bool isAsync) : parser(p), generator(p.inGenerator_), async(p.inAsync_)
+        {
+            p.inGenerator_ = isGenerator;
+            p.inAsync_ = isAsync;
+        }
+        ~FunctionKind()
+        {
+            parser.inGenerator_ = generator;
+            parser.inAsync_ = async;
+        }
+    };
+    /// `async` followed by what makes it a modifier of a method rather than the method's name.
+    bool asyncMethodAhead();
+    bool asyncFunctionAhead();
+    bool asyncArrowAhead();
     bool typescript_ = true; ///< accept the TypeScript syntax on top of JavaScript
 };
 

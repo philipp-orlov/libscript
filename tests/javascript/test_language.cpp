@@ -1072,6 +1072,24 @@ TEST(whatALoopReadsThroughAGlobalIsCheckedBeforeItAndStillHolds)
              std::string("500|l,rr"));
 }
 
+TEST(aSortOfNumbersAsksTheComparatorWhatItWouldSay)
+{
+    // A difference either way needs no call; anything else is called, its answer made a number, its throw let through
+    // with the array as it was. Several rounds, so that the comparators are compiled for the later ones.
+    CHECK_EQ(run("var xs = [3, -0, 0, Infinity, -Infinity, 2, 1e300, -1e300, 5, 0.5, -2];"
+                 "function show(a) { return a.map(function (x) { return Object.is(x, -0) ? '-0' : String(x); }).join(); }"
+                 "var r = [];"
+                 "for (var k = 0; k < 30; k++) {"
+                 " r.push(show(xs.slice().sort(function (p, q) { return p - q; })));"
+                 " r.push(show(xs.slice().sort(function (p, q) { return q - p; })));"
+                 " r.push(show(xs.slice().sort(function (p, q) { return String(p - q); })));"
+                 " var ys = xs.slice();"
+                 " try { ys.sort(function (p, q) { if (p === 5 || q === 5) throw 'x'; return p - q + 0; }); } catch (e) { r.push(e + show(ys)); } }"
+                 "r.slice(-4).join('|')"),
+             std::string("-Infinity,-1e+300,-2,-0,0,0.5,2,3,5,1e+300,Infinity|Infinity,1e+300,5,3,2,0.5,-0,0,-2,-1e+300,-Infinity|"
+                         "-Infinity,-1e+300,-2,-0,0,0.5,2,3,5,1e+300,Infinity|x3,-0,0,Infinity,-Infinity,2,1e+300,-1e+300,5,0.5,-2"));
+}
+
 TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)
 {
     CHECK_EQ(run("function P(a, d) { this.a = a; this.d = d; }"

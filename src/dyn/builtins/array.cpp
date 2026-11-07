@@ -127,6 +127,33 @@ void mergeSort(Vec<T>& v, const Less& less)
     }
 }
 
+/// `function (a, b) { return a - b; }`, as ascending numeric sorts are written, says 1; `b - a` says -1; anything else 0.
+/// Those need no call: what the comparator would answer is the difference, worked out here.
+int numericComparator(const Value& comparator)
+{
+    const DynFunction* fn = asFunction(comparator);
+    if (!fn || fn->fnKind != FnKind::Bytecode || !fn->code)
+        return 0;
+    const FunctionCode& code = *fn->code;
+    if (code.arity != 2 || code.hasRest || code.argumentsSlot != 0xffffffffu)
+        return 0;
+    const std::vector<std::uint8_t>& c = code.code;
+    if (c.size() < 12 || Op(c[0]) != Op::GetLocal || Op(c[5]) != Op::GetLocal || Op(c[10]) != Op::Sub || Op(c[11]) != Op::Return)
+        return 0;
+    // What may follow the return is never reached.
+    for (std::size_t i = 12; i < c.size(); ++i) {
+        if (Op(c[i]) != Op::ReturnUndefined && Op(c[i]) != Op::Nop)
+            return 0;
+    }
+    const std::uint32_t first = readOperand(c, 1);
+    const std::uint32_t second = readOperand(c, 6);
+    if (first == 0 && second == 1)
+        return 1;
+    if (first == 1 && second == 0)
+        return -1;
+    return 0;
+}
+
 }  // namespace
 
 void installArray(Runtime& rt)
@@ -288,12 +315,15 @@ void installArray(Runtime& rt)
                 std::memcpy(&bits, &d, 8);
                 plain = plain && bits != kUndefinedElement;
             }
-            if (plain) {
+            if (plain && numericComparator(comparator) > 0) {
+                mergeSort(bare, [](double x, double y) { return x - y < 0; });
+            } else if (plain && numericComparator(comparator) < 0) {
+                mergeSort(bare, [](double x, double y) { return y - x < 0; });
+            } else if (plain) {
                 CallbackLoop call(rt2, comparator);
-                mergeSort(bare, [&](double x, double y) {
-                    const Value order = call.ofTwoNumbers(x, y);
-                    return (order.isDouble() ? detail::Access::r8(order) : toNumber(rt2, order)) < 0;
-                });
+                mergeSort(bare, [&](double x, double y) { return call.numberOfTwoNumbers(x, y) < 0; });
+            }
+            if (plain) {
                 a->assignNumbers(bare.data(), bare.size());
                 return ci.thisValue();
             }

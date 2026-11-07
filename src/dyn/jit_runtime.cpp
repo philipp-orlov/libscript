@@ -863,6 +863,37 @@ Value CallbackLoop::ofTwoNumbers(double a, double b)
     return enter(entry, std::int64_t(Type::Undefined), 0, args, 2);
 }
 
+double CallbackLoop::numberOfTwoNumbers(double a, double b)
+{
+    const void* entry = fn_ ? fn_->code->jitCallEntry : nullptr;
+    if (!entry || rt_.ctx.callDepth >= rt_.ctx.options.stackLimit)
+        return toNumber(rt_, ofTwoNumbers(a, b));
+    if (!session_)
+        session_ = new Session(rt_);
+    // Two values as native code reads them, a tag word and a payload each: numbers need no more than that.
+    std::uint64_t args[4] = {std::uint64_t(Type::Double), 0, std::uint64_t(Type::Double), 0};
+    std::memcpy(&args[1], &a, 8);
+    std::memcpy(&args[3], &b, 8);
+    ++rt_.ctx.callDepth;
+    rt_.nativeTopFrame = nullptr;
+    rt_.nativeTopPc = nullptr;
+    const NativePair out = scriptJitCall5(&rt_, entry, reinterpret_cast<std::uint64_t>(fn_), std::uint64_t(Type::Undefined), 0,
+                                          reinterpret_cast<std::uint64_t>(args), 2);
+    --rt_.ctx.callDepth;
+    if (!rt_.nativeKeepAlive.isUndefined())
+        rt_.nativeKeepAlive = Value::undefined();
+    if (std::uint32_t(out.tag) == std::uint32_t(Type::Double) && rt_.nativeError == 0) {
+        double d;
+        std::memcpy(&d, &out.payload, 8);
+        return d;
+    }
+    const std::uint64_t results[2] = {out.payload, out.tag};
+    Value result = resultValue(results);
+    if (rt_.nativeError != 0)
+        raisePending(rt_);
+    return toNumber(rt_, result);
+}
+
 Value CallbackLoop::withArgs(const Value& thisValue, const Value* args, std::size_t count)
 {
     const void* entry = fn_ ? fn_->code->jitCallEntry : nullptr;

@@ -343,6 +343,9 @@ void DynObject::setSetterOf(GCObject* key, Value fn)
 
 void DynObject::clearReferences()
 {
+    // Emptied by the cycle collector, and gone soon after: nothing found here earlier is here now.
+    if (isProto && rt)
+        ++rt->protoEpoch;
     shape = nullptr;
     proto.reset();
     props.clear();

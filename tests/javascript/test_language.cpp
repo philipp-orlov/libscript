@@ -952,6 +952,38 @@ TEST(arrayCallbacksGoAsFarAsTheArrayReachedAtTheStart)
              std::string("4,27"));
 }
 
+TEST(newOfAConstructorThatOnlyForwardsItsArguments)
+{
+    // Not small enough to go in place, so called; its object is made before it is.
+    CHECK_EQ(run("function V() { this.init.apply(this, arguments); } V.prototype.init = function (x, y) { this.x = x; this.y = y; };"
+                 "function mk(i) { return new V(i, i + 1); } var s = 0; for (var i = 0; i < 3000; i++) { var v = mk(i); s += v.x + v.y; }"
+                 "var before = mk(1); V.prototype = { init: function (x) { this.x = -x; }, tag: 'new' }; var after = mk(5);"
+                 "s + ',' + (before instanceof V) + ',' + (after instanceof V) + ',' + after.x + ',' + after.tag + ',' + before.tag"),
+             std::string("9000000,false,true,-5,new,undefined"));
+    // A prototype that is not an object, a constructor that returns one of its own, and a function given a property.
+    CHECK_EQ(run("function V() { this.a = 1; for (var i = 0; i < 2; i++) this.a += i; } function mk() { return new V(); }"
+                 "for (var i = 0; i < 3000; i++) mk(); V.prototype = 5; var p = mk(); V.extra = 1; V.prototype = { k: 2 }; var q = mk();"
+                 "(Object.getPrototypeOf(p) === Object.prototype) + ',' + q.k + ',' + q.a"),
+             std::string("true,2,2"));
+    CHECK_EQ(run("function V(o) { this.a = 1; for (var i = 0; i < 2; i++) this.a += i; if (o) return o; } function mk(o) { return new V(o); }"
+                 "for (var i = 0; i < 3000; i++) mk(); var mine = { m: 1 }; (mk(mine) === mine) + ',' + mk(5).a"),
+             std::string("true,2"));
+}
+
+TEST(whatWasLearnedAboutAPrototypeThatIsGoneIsForgotten)
+{
+    // Each call makes a constructor whose prototype is replaced, and the old one freed, while a read of `init` through
+    // the code they share remembers where it was found.
+    CHECK_EQ(run("function run() {"
+                 " function N(a) { var r = this.init(a); if (r) return r; } N.prototype.init = function (x) { this.x = x; }; var s = '';"
+                 " var m = function (i) { return new N(i); };"
+                 " for (var i = 0; i < 300; i++) { if (i === 75) N.prototype = { tag: 'late', init: function (x) { this.x = 'L' + x; } };"
+                 "  try { var o = m(i); s = String(o.x) + ':' + o.tag + ':' + (o instanceof N); } catch (e) { s = e.name; } }"
+                 " return s; }"
+                 "var r = []; for (var k = 0; k < 40; k++) r.push(run()); r[39] + ',' + r.length"),
+             std::string("L299:late:true,40"));
+}
+
 TEST(callingThroughCallIsCalling)
 {
     CHECK_EQ(run("function g(a, b) { return this.k + a * b; } function f(o, a) { return g.call(o, a, 2); }"

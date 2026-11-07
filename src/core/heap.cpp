@@ -62,6 +62,12 @@ void GCObject::reserveGrowth(std::size_t bytes)
 /// worklist threaded through `pendingNext` and the outer loop drains it.
 void destroyUnreferenced(GCObject* cell) noexcept
 {
+    // A pinned cell stays until its context ends, which frees it with everything else. Not every holder of one keeps a
+    // count of it -- native code writes it into the objects it makes without one -- so its count says nothing.
+    if (cell->pinned) {
+        cellCount(cell) = 1;
+        return;
+    }
     internal::ContextImpl* rt = cell->rt;
     if (!rt) {
         cell->~GCObject();
@@ -264,6 +270,9 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
         case CellKind::Object: {
             // A plain object with nothing unusual about it: its values and its prototype are all it holds.
             auto* object = static_cast<dyn::DynObject*>(cell);
+            // What sites and native code learned about where a property is may name this one: it no longer holds.
+            if (object->isProto)
+                ++protoEpoch;
             if (object->rare || object->props.heapCapacity() != 0 ||
                 (object->cls != dyn::ObjClass::Plain && (object->cls != dyn::ObjClass::Array || !object->props.empty()))) {
                 cell->~GCObject();

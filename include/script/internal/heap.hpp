@@ -71,10 +71,11 @@ struct GCObject
     };
     // Last and small on purpose: a derived class's first members move into the padding after these, which takes 8 bytes
     // off a string, an instance and an array -- a good part of a small object.
-    CellKind kind = CellKind::Object;
     std::uint8_t gcColor : 1;
     /// Holders do not count references to this: something keeps it for as long as the context lasts.
     std::uint8_t pinned : 1;
+    /// Last, so that the first thing a derived class keeps here comes right after it: native code reads both at once.
+    CellKind kind = CellKind::Object;
 
     /// From here on it stays. The count this adds is never given back, so it does not matter what was counted before.
     void pin() noexcept

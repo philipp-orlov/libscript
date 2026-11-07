@@ -71,6 +71,9 @@ constexpr std::int64_t kBoxValueOffset = offsetof(Box, value);
 #endif
 constexpr std::int64_t kPayload = 8;
 /// `IrInst::alias` classes.
+/// A cell's kind and, in an object, its class, read together.
+static_assert(offsetof(DynObject, cls) == offsetof(GCObject, kind) + 1);
+constexpr std::int64_t kKindAndClassOfArray = std::int64_t(CellKind::Object) | std::int64_t(ObjClass::Array) << 8;
 constexpr std::uint8_t kAliasHeader = 1;
 constexpr std::uint8_t kAliasValue = 2;
 
@@ -3167,8 +3170,7 @@ private:
             branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
         else if (base.known != Type::Object)
             inst(IrOp::Br).imm = slow;
-        const std::int32_t kind = load(base.r, kCellKindOffset, 1, false, kAliasHeader);
-        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
+        // Whatever else the tag may point at keeps something there that is never a shape; `heap.cpp` checks.
         return loadHeader(base.r, kShapeOffset);
     }
 
@@ -3854,10 +3856,8 @@ private:
             branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
         else if (base.known != Type::Object)
             inst(IrOp::Br).imm = slow;
-        const std::int32_t kind = load(base.r, kCellKindOffset, 1, false, kAliasHeader);
-        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t cls = load(base.r, kClsOffset, 1, false, kAliasHeader);
-        branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Array), slow);
+        const std::int32_t both = load(base.r, kCellKindOffset, 2, false, kAliasHeader);
+        branchCmp(both, IrCond::Ne, kKindAndClassOfArray, slow);
         learn();
     }
 
@@ -4627,10 +4627,8 @@ private:
         const std::int32_t notObject = newLabel();
         const std::int32_t tag = base.hasKnownTag ? immReg(std::int64_t(base.known)) : base.t;
         branchCmp(tag, IrCond::Ne, std::int64_t(Type::Object), notObject);
-        const std::int32_t kind = load(base.r, kCellKindOffset, 1, false, kAliasHeader);
-        branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
-        const std::int32_t cls = load(base.r, kClsOffset, 1, false, kAliasHeader);
-        branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Array), slow);
+        const std::int32_t both = load(base.r, kCellKindOffset, 2, false, kAliasHeader);
+        branchCmp(both, IrCond::Ne, kKindAndClassOfArray, slow);
         lengthResult(load(base.r, kElementCountOffset, 4, false, kAliasHeader), r, t);
         inst(IrOp::Br).imm = done;
         inst(IrOp::Label).imm = notObject;

@@ -18,6 +18,19 @@
 
 namespace script {
 
+#if SCRIPT_ENGINE_TYPED && SCRIPT_ENGINE_DYNAMIC
+// Native code tells an object of the dynamic engine by the shape it expects at this offset, with no look at what kind of
+// cell it is, so whatever else a value tagged as an object can be must keep something there that is never a shape.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+static_assert(offsetof(internal::dyn::DynObject, shape) == offsetof(internal::typed::CSInstance, type));
+static_assert(offsetof(internal::dyn::DynObject, shape) == offsetof(internal::typed::CSList, type));
+static_assert(offsetof(internal::dyn::DynObject, shape) == offsetof(internal::typed::CSDict, type));
+static_assert(offsetof(internal::dyn::DynObject, shape) == offsetof(internal::typed::CSBuilder, type));
+static_assert(offsetof(internal::dyn::DynObject, shape) == offsetof(internal::NativeCell, typedType));
+#pragma GCC diagnostic pop
+#endif
+
 // ---------------------------------------------------------- refcounting ---
 
 namespace detail {

@@ -3502,11 +3502,12 @@ private:
         emitBail(bail, popped);
     }
     /// `s.charCodeAt` and its kind on a string, at a site that has seen no object: the method read from where it is on
-    /// `String.prototype`, while no prototype's table has changed, or the interpreter carries on. False when this is no
-    /// place for the guess.
-    bool stringMethod(const Entry& base, std::uint32_t operand, bool keepBase)
+    /// `String.prototype`, while no prototype's table has changed. Otherwise the interpreter carries on, or where a bail
+    /// has been blamed on this instruction, which may have been for a check of an earlier one left until here, the long
+    /// way is taken. False when this is no place for it.
+    bool stringMethod(Entry base, std::uint32_t operand, bool keepBase)
     {
-        if (!betHere() || base.rep != Rep::Tagged || (base.hasKnownTag && base.known != Type::String))
+        if (!speculate_ || base.rep != Rep::Tagged || (base.hasKnownTag && base.known != Type::String))
             return false;
         DynObject* proto = rt_.stringProto.get();
         GCObject* key = code_.atoms[operand & kAtomMask].get();
@@ -3514,24 +3515,60 @@ private:
         if (!found || proto->accessorOf(*found))
             return false;
         const std::uint32_t index = std::uint32_t(found - proto->props.data());
-        const std::int32_t bail = newLabel();
+        const bool bet = betHere();
+        const std::int32_t miss = newLabel();
+        if (!bet) {
+            secureWeak();
+            if (keepBase && base.own == Own::Weak)
+                makeOwned(base);
+        }
         if (!base.hasKnownTag)
-            branchCmp(base.t, IrCond::Ne, std::int64_t(Type::String), bail);
-        expectEpoch(rt_.ctx.protoEpoch, bail);
+            branchCmp(base.t, IrCond::Ne, std::int64_t(Type::String), miss);
+        if (bet)
+            expectEpoch(rt_.ctx.protoEpoch, miss);
+        else
+            guardEpoch(rt_.ctx.protoEpoch, miss);
         const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
         const std::int32_t props = loadHeader(ptrReg(proto), kPropsOffset);
         const std::int32_t lt = load(props, at + kPropValueOffset, 1);
         const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
-        emitBail(bail, {base});
-        Entry result = taggedEntry(lr, lt, Own::Weak);
+        Entry result;
+        if (bet) {
+            emitBail(miss, {base});
+            result = taggedEntry(lr, lt, Own::Weak);
+        } else {
+            const std::int32_t r = fn_.newVreg(false);
+            const std::int32_t t = fn_.newVreg(false);
+            const std::int32_t done = newLabel();
+            IrInst& mt = inst(IrOp::Mov);
+            mt.d = t;
+            mt.a = lt;
+            IrInst& mr = inst(IrOp::Mov);
+            mr.d = r;
+            mr.a = lr;
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = miss;
+            const std::int32_t rt = rtReg();
+            const std::int32_t self = ptrReg(&code_);
+            const std::int32_t op = immReg(std::int64_t(operand));
+            coldCall(reinterpret_cast<void*>(&scriptDynGetProp), {rt, self, tagReg(base), base.r, op}, r, t, true, {base});
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
+            result = taggedEntry(r, t, Own::Weak);
+        }
         if (found->value.isObject())
             result.hint = detail::Access::ptr(found->value);
-        // The prototype is held by the runtime for as long as the code runs: what it holds is borrowed from there.
+        // The prototype is held by the runtime for as long as the code runs: what it holds is borrowed from there. What the
+        // long way found is only borrowed for now, and it could be the receiver's alone.
         if (keepBase) {
             push(result);
             push(base);
             return true;
         }
+        if (!bet && base.own == Own::Owned)
+            makeOwned(result);
         push(result);
         release(base);
         return true;
@@ -4458,7 +4495,9 @@ private:
         const bool fits = (which >= Runtime::MathSqrt && which <= Runtime::MathTrunc && argc == 1) ||
                           (which == Runtime::ArrayPush && argc == 1) || (which == Runtime::ArrayPop && argc == 0) ||
                           (which == Runtime::StringCharCodeAt && argc == 1) ||
-                          (which == Runtime::StringFromCharCode && argc == 1) || (which == Runtime::FunctionApply && argc == 2);
+                          (which == Runtime::StringFromCharCode && argc == 1) || (which == Runtime::FunctionApply && argc == 2) ||
+                          ((which == Runtime::MapGet || which == Runtime::MapHas || which == Runtime::SetHas || which == Runtime::SetAdd) && argc == 1) ||
+                          (which == Runtime::MapSet && argc == 2);
         if (!fits)
             return false;
         if (!callee.hasKnownTag)
@@ -4477,6 +4516,39 @@ private:
             case Runtime::ArrayPop: inlinePop(self, r, t, generic); return true;
             case Runtime::StringCharCodeAt: inlineCharCodeAt(self, args[0], r, t, generic); return true;
             case Runtime::FunctionApply: inlineApply(callee, self, args, r, t, generic); return true;
+            case Runtime::MapGet:
+            case Runtime::MapSet:
+            case Runtime::MapHas:
+            case Runtime::SetAdd:
+            case Runtime::SetHas: {
+                // The table's own methods, with no call of the built-in in between, once it is known to be the table asked for.
+                const bool isMap = which == Runtime::MapGet || which == Runtime::MapSet || which == Runtime::MapHas;
+                if (self.rep != Rep::Tagged || self.isConst || (self.hasKnownTag && self.known != Type::Object))
+                    inst(IrOp::Br).imm = generic;
+                else if (!self.hasKnownTag)
+                    branchCmp(self.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+                if (self.rep == Rep::Tagged && !self.isConst) {
+                    const std::int32_t both = load(self.r, kCellKindOffset, 2, false, kAliasHeader);
+                    branchCmp(both, IrCond::Ne, std::int64_t(CellKind::Object) | std::int64_t(isMap ? ObjClass::Map : ObjClass::Set) << 8, generic);
+                }
+                std::vector<Entry> popped = {callee, self};
+                popped.insert(popped.end(), args.begin(), args.end());
+                const std::int32_t rt = rtReg();
+                const std::int32_t cell = payloadReg(self);
+                const std::int32_t keyTag = tagReg(args[0]);
+                const std::int32_t keyBits = payloadReg(args[0]);
+                if (which == Runtime::MapSet) {
+                    const std::int32_t valueTag = tagReg(args[1]);
+                    const std::int32_t valueBits = payloadReg(args[1]);
+                    coldCall(reinterpret_cast<void*>(&scriptDynMapSet), {rt, cell, keyTag, keyBits, valueTag, valueBits}, r, t, true, popped);
+                } else if (which == Runtime::SetAdd) {
+                    coldCall(reinterpret_cast<void*>(&scriptDynMapSet), {rt, cell, keyTag, keyBits, keyTag, keyBits}, r, t, true, popped);
+                } else {
+                    coldCall(which == Runtime::MapGet ? reinterpret_cast<void*>(&scriptDynMapGet) : reinterpret_cast<void*>(&scriptDynMapHas),
+                             {rt, cell, keyTag, keyBits}, r, t, true, popped);
+                }
+                return true;
+            }
             case Runtime::StringFromCharCode: {
                 const std::int32_t rt = rtReg();
                 coldCall(reinterpret_cast<void*>(&scriptDynFromCharCode), {rt, tagReg(args[0]), payloadReg(args[0])}, r, t, true,

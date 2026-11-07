@@ -36,6 +36,10 @@ double scriptDynParseInt(double d) noexcept;
 double scriptDynMax(double a, double b) noexcept;
 double scriptDynMin(double a, double b) noexcept;
 double scriptDynAtan2(double a, double b) noexcept;
+NativePair scriptDynMapGet(Runtime* rt, GCObject* map, std::int64_t tag, std::uint64_t payload) noexcept;
+NativePair scriptDynMapHas(Runtime* rt, GCObject* map, std::int64_t tag, std::uint64_t payload) noexcept;
+NativePair scriptDynMapSet(Runtime* rt, GCObject* map, std::int64_t tag, std::uint64_t payload, std::int64_t valueTag,
+                           std::uint64_t value) noexcept;
 NativePair scriptDynArrayPush(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
 NativePair scriptDynAdd(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept;
 std::int32_t scriptDynCompare(Runtime* rt, std::int64_t op, std::int64_t ta, std::uint64_t a, std::int64_t tb,

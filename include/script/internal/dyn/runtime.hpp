@@ -146,6 +146,11 @@ struct Runtime : EngineRuntime
         StringFromCharCode,
         FunctionApply,
         FunctionCall,
+        MapGet,
+        MapSet,
+        MapHas,
+        SetAdd,
+        SetHas,
         IntrinsicCount
     };
     Ref<GCObject> intrinsics[IntrinsicCount];

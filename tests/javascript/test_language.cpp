@@ -895,6 +895,47 @@ TEST(mathOnBareNumbersAnswersWhatTheStandardSays)
              std::string("mine"));
 }
 
+TEST(aMethodOfAStringFollowingAnOverflowStaysAMethodOfAString)
+{
+    // The check on the product is left until the read of `charCodeAt`, and is what fails.
+    CHECK_EQ(run("function f(s) { var h = 0; for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }"
+                 "var s = ''; for (var i = 0; i < 300; i++) s += String.fromCharCode(97 + i % 26);"
+                 "var y; for (var r = 0; r < 50; r++) y = f(s); y"),
+             std::string("-2071830186"));
+    // And with it blamed, something other than a string, or a method changed under it, still does what it should.
+    CHECK_EQ(run("function f(o, a) { return ((a * 2147483647) + o.m(1)) | 0; }"
+                 "String.prototype.m = function (x) { return x + 1; };"
+                 "var y; for (var i = 0; i < 2000; i++) y = f('s', i);"
+                 "var z = f({ m: function () { return 5; } }, 1); String.prototype.m = function () { return 9; };"
+                 "y + ',' + z + ',' + f('s', 1)"),
+             std::string("2147481651,-2147483644,-2147483640"));
+}
+
+TEST(mapsAndSetsCalledFromNativeCode)
+{
+    CHECK_EQ(run("function f(m, k, v) { m.set(k, v); return m.get(k) + ':' + m.has(k) + ':' + m.has('nope') + ':' + m.get('nope'); }"
+                 "var m = new Map(), y; for (var i = 0; i < 3000; i++) y = f(m, 'k' + (i & 7), i);"
+                 "y + ',' + m.size + ',' + f(m, 0, 'z') + ',' + m.get(-0) + ',' + f(m, NaN, 1) + ',' + f(m, {}, 2) + ',' + m.size"),
+             std::string("2999:true:false:undefined,8,z:true:false:undefined,z,1:true:false:undefined,2:true:false:undefined,11"));
+    // A key that compares by what it says, however it was made; and a chain of `set`, which answers with the map.
+    CHECK_EQ(run("function f(m, a, b) { return m.set(a + b, 1).set(a + b, 2).get(a + b); }"
+                 "var m = new Map(), y; for (var i = 0; i < 3000; i++) y = f(m, 'x', i & 1); y + ',' + m.size"),
+             std::string("2,2"));
+    CHECK_EQ(run("function f(s, k) { return s.add(k).has(k) && s.has(k); } var s = new Set(), y; for (var i = 0; i < 3000; i++) y = f(s, i & 3);"
+                 "y + ',' + s.size + ',' + s.has(4) + ',' + Array.from(s).join()"),
+             std::string("true,4,false,0,1,2,3"));
+    // Anything else that has these methods; the wrong kind of table; methods replaced.
+    CHECK_EQ(run("function f(m, k) { return m.get(k); } for (var i = 0; i < 3000; i++) f(new Map(), i);"
+                 "var r = f({ get: function (k) { return k + 1; } }, 1); try { f(Object.create(Map.prototype), 1); } catch (e) { r += ',' + e.name; }"
+                 "try { Map.prototype.get.call(new Set(), 1); } catch (e) { r += ',' + e.name; }"
+                 "Map.prototype.get = function () { return 'mine'; }; r + ',' + f(new Map(), 1)"),
+             std::string("2,TypeError,TypeError,mine"));
+    // What the table holds lives as long as it does, and comes back with a count of its own.
+    CHECK_EQ(run("function f(m, i) { m.set(i & 15, { n: i }); return m.get(i & 15); } var m = new Map(), y; for (var i = 0; i < 5000; i++) y = f(m, i);"
+                 "y.n + m.get(0).n"),
+             std::string("9991"));
+}
+
 TEST(callingThroughCallIsCalling)
 {
     CHECK_EQ(run("function g(a, b) { return this.k + a * b; } function f(o, a) { return g.call(o, a, 2); }"

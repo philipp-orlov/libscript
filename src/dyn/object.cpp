@@ -826,6 +826,28 @@ std::size_t DynMap::heapSize() const
            lookup.capacity() * sizeof(std::uint32_t);
 }
 
+namespace {
+
+/// `sameValueZero`, for what a table is mostly asked about: a number or a string against one of its own kind.
+inline bool sameKey(const Value& a, const Value& b) noexcept
+{
+    if (a.type() == b.type()) {
+        if (a.type() == Type::Double) {
+            const double x = detail::Access::r8(a);
+            const double y = detail::Access::r8(b);
+            return x == y || (x != x && y != y);
+        }
+        if (a.type() == Type::String) {
+            StringCell* x = asString(a);
+            StringCell* y = asString(b);
+            return x == y || (x->length == y->length && x->hash() == y->hash() && x->text() == y->text());
+        }
+    }
+    return sameValueZero(a, b);
+}
+
+}  // namespace
+
 std::int64_t DynMap::find(const Value& key) const
 {
     if (lookup.empty())
@@ -837,7 +859,7 @@ std::int64_t DynMap::find(const Value& key) const
         if (!packed)
             return -1;
         const std::uint32_t at = packed - 1;
-        if (entries[at].live && sameValueZero(entries[at].key, key))
+        if (entries[at].live && sameKey(entries[at].key, key))
             return std::int64_t(at);
         slot = (slot + 1) & mask;
     }

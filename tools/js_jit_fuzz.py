@@ -216,6 +216,14 @@ class Gen:
                     f"{p}var s{v} = function (o, x) {{ o.z = x; return o; }};",
                     f"{p}for (var {i} = 0; {i} < 400; {i}++) {{ if ({i} === {at}) {{ {late} }} var o{v} = new N{v}(); b{v}[{i} % {len(orders)}](o{v}); s{v}(o{v}, {i}); s{v}(o{v}, {i} + 1); {r} = Object.keys(o{v}).join() + ':' + o{v}.z + ':' + o{v}.got; }}",
                     f"{p}log({r});"]
+        if self.r.random() < 0.4:
+            kinds = ['new Map()', 'new Set()', '{}', 'Object.create(Map.prototype)', '[]']
+            coll = self.r.choice(kinds)
+            keys = ', '.join(self.r.choice(odd) for _ in range(self.r.randint(1, 4)))
+            act = self.pick('o.get(k)', 'o.has(k)', 'o.set(k, n).size', 'o.add(k).size', 'o.set(k, n).get(k)', 'o.size')
+            return [f"{p}var {v} = function (o, k, n) {{ return {act}; }}, {r} = 0, l{v} = {coll}, q{v} = [{keys}];",
+                    f"{p}for (var {i} = 0; {i} < 300; {i}++) {{ try {{ {r} = {v}(l{v}, q{v}[{i} % q{v}.length], {i}); }} catch (x{v}) {{ {r} = x{v}.name; }} }}",
+                    f"{p}log(String({r})); log(String(l{v}.size));"]
         start = self.pick('[]', 'new Array()', 'new Array(3)', "['x']", '[1.5, 2.5, 3.5, 4.5]', 'Object.freeze([])', "{push: function (x) { return 'mine'; }}")
         vals = ', '.join(self.r.choice(['{}', "'s'", 'null', 'undefined', '1', '1.5', 'NaN', '-0', e, f'{i}', f'{i} * 0.5', f'{i} | 0', 'true']) for _ in range(self.r.randint(1, 3)))
         return [f"{p}var {v} = function (a, x) {{ return a.push(x); }}, {r} = 0, l{v} = null;",

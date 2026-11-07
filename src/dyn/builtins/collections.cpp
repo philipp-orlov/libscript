@@ -95,6 +95,9 @@ void installMap(Runtime& rt)
         thisCollection(ci, ObjClass::Map)->insert(ci.arg(0), ci.arg(1));
         return ci.thisValue();
     }, 2);
+    rt.intrinsics[Runtime::MapGet].reset(detail::Access::ptr(proto->findOwn(rt.intern("get"))->value));
+    rt.intrinsics[Runtime::MapSet].reset(detail::Access::ptr(proto->findOwn(rt.intern("set"))->value));
+    rt.intrinsics[Runtime::MapHas].reset(detail::Access::ptr(proto->findOwn(rt.intern("has"))->value));
     rt.method(proto, "forEach", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynMap* m = thisCollection(ci, ObjClass::Map);
@@ -143,6 +146,8 @@ void installSet(Runtime& rt)
         thisCollection(ci, ObjClass::Set)->insert(ci.arg(0), ci.arg(0));
         return ci.thisValue();
     }, 1);
+    rt.intrinsics[Runtime::SetAdd].reset(detail::Access::ptr(proto->findOwn(rt.intern("add"))->value));
+    rt.intrinsics[Runtime::SetHas].reset(detail::Access::ptr(proto->findOwn(rt.intern("has"))->value));
     rt.method(proto, "forEach", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynMap* s = thisCollection(ci, ObjClass::Set);

@@ -172,6 +172,32 @@ double scriptDynParseInt(double d) noexcept
     }
 }
 
+NativePair scriptDynMapGet(Runtime* rt, GCObject* map, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        auto* m = static_cast<DynMap*>(map);
+        const std::int64_t at = m->find(valueOf(tag, payload));
+        return take(at < 0 ? Value::undefined() : m->entries[std::size_t(at)].value);
+    });
+}
+
+NativePair scriptDynMapHas(Runtime* rt, GCObject* map, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        return take(Value(static_cast<DynMap*>(map)->find(valueOf(tag, payload)) >= 0));
+    });
+}
+
+NativePair scriptDynMapSet(Runtime* rt, GCObject* map, std::int64_t tag, std::uint64_t payload, std::int64_t valueTag,
+                           std::uint64_t value) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        auto* m = static_cast<DynMap*>(map);
+        m->insert(valueOf(tag, payload), valueOf(valueTag, value));
+        return take(detail::Access::make(Type::Object, m));
+    });
+}
+
 NativePair scriptDynArrayPush(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {

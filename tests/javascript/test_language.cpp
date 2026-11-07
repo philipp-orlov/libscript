@@ -1007,7 +1007,7 @@ TEST(capturedVariablesOfEveryKindMadeInNativeCode)
                          "1.5:1.5:undefined:null:[object Object]|str:str:undefined:null:2|true:true:undefined:null:0"));
     CHECK_EQ(run("function counters() { var fs = []; for (var i = 0; i < 3; i++) { let j = i; fs.push(function () { return j++; }); } return fs; }"
                  "var t = 0; for (var r = 0; r < 3000; r++) { var fs = counters(); t += fs[0]() + fs[1]() + fs[2]() + fs[2](); } t"),
-             std::string("15000"));
+             std::string("18000"));
 }
 
 TEST(callingThroughCallIsCalling)

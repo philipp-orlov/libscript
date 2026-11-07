@@ -837,3 +837,34 @@ TEST(whatALoopKnowsAheadOfItStaysTrue)
                  " for (i = 0; i < 3000; i++) d += Math.sqrt(4); Math.sqrt = s; d + Math.sqrt('9')"),
              std::string("9003"));
 }
+
+TEST(whatALoopStoresInItsColdPathsCounts)
+{
+    // A field read ahead of the loop as one thing, turned into a number by the out-of-the-way store of a number over it.
+    CHECK_EQ(run("function f(o) { var k = o.x, t = 0; for (var i = 0; i < 3000; i++) { o.x = i; t = o.x; } return typeof k + ':' + t; }"
+                 " var r; for (var c = 0; c < 400; c++) r = f({x: {}}); r"),
+             std::string("object:2999"));
+    CHECK_EQ(run("function f(o) { var k = o.x, t = 0; for (var i = 0; i < 3000; i++) { t += typeof o.x === 'number' ? 1 : 0; o.x = i; } return t; }"
+                 " var r; for (var c = 0; c < 400; c++) r = f({x: 's'}); r"),
+             std::string("2999"));
+}
+
+TEST(aCheckWithAWayRoundItProvesNothingAfterwards)
+{
+    // Read as a string the long way, then read again: the second is not to take it for an array.
+    CHECK_EQ(run("function h(n) { var t = '0123456789ABCDEF'; return t[n & 15] + t[n & 15]; }"
+                 " var y; for (var c = 0; c < 4000; c++) y = h(c & 127); y"),
+             std::string("FF"));
+    CHECK_EQ(run("function h(n) { var t = '0123456789ABCDEF'; return '%' + t[(n >> 4) & 15] + t[n & 15]; }"
+                 " var y; for (var c = 0; c < 4000; c++) y = h(c & 255); y"),
+             std::string("%9F"));
+    CHECK_EQ(run("function h(o, n) { return o[n] + ':' + o[n]; }"
+                 " var y; for (var c = 0; c < 4000; c++) y = h(c & 1 ? 'ab' : {0: 'p', 1: 'q'}, c & 1); y"),
+             std::string("b:b"));
+    CHECK_EQ(run("function h(o, n) { o[n] = 1; o[n] = 2; return o[n]; }"
+                 " var y; for (var c = 0; c < 4000; c++) y = h(c & 1 ? {} : [0, 0], c & 1); y"),
+             std::string("2"));
+    CHECK_EQ(run("function h(o, v) { o.push(v); o.push(v); return o.length; }"
+                 " var y, s = { n: 0, push: function () { this.n++; }, length: 7 }; for (var c = 0; c < 4000; c++) y = h(c & 1 ? s : [], c); y"),
+             std::string("7"));
+}

@@ -3722,7 +3722,7 @@ private:
         const std::int32_t done = newLabel();
         const bool bet = betHere();
         const std::uint8_t saw = code_.elemSaw[elemOperand];
-        guardArray(base, slow);
+        guardArray(base, slow, bet);
         const std::int32_t i = arrayIndex(key, slow);
         const std::int32_t data = elementSpan(base, i, slow);
         if (bet && saw == ElemSite::kNumbers) {
@@ -3843,13 +3843,14 @@ private:
         return bits;
     }
 
-    void guardArray(const Entry& base, std::int32_t slow)
+    /// `leaves` says that `slow` does not come back. What an object is does not change, so one check then holds until the
+    /// register holds something else; a way round the check that rejoins here says nothing of the kind.
+    void guardArray(const Entry& base, std::int32_t slow, bool leaves = false)
     {
-        // What an object is does not change, so one check holds until the register holds something else.
         if (!base.isConst && std::find(knownArrays_.begin(), knownArrays_.end(), base.r) != knownArrays_.end())
             return;
         const auto learn = [&] {
-            if (!base.isConst && base.local >= 0)
+            if (leaves && !base.isConst && base.local >= 0)
                 knownArrays_.push_back(base.r);
         };
         if (!base.hasKnownTag)
@@ -3877,7 +3878,7 @@ private:
         const std::int32_t vr = payloadReg(value);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
-        guardArray(base, slow);
+        guardArray(base, slow, betHere());
         // Frozen, or with named properties that might include an index: the long way.
         const std::int32_t frozen = load(base.r, kFrozenOffset, 1, false, kAliasHeader);
         branchCmp(frozen, IrCond::Ne, 0, slow);

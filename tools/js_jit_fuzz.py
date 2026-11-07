@@ -62,7 +62,7 @@ class Gen:
 
     def stmt(self, s, ind, loop):
         p = '    ' * ind
-        k = self.r.randint(0, 28)
+        k = self.r.randint(0, 31)
         self.depth += 1
         deep = self.depth > 3
         try:
@@ -148,12 +148,35 @@ class Gen:
                 v = self.var(); e = self.expr(s)
                 return [f"{p}var {v} = String({e}) + 'q\u00e9';", f"{p}log({v}.charCodeAt({self.pick('0', '1', '-1', '99', '1.5', self.expr(s, 1))}));",
                         f"{p}log(String.fromCharCode({self.pick('65', '300', '-1', '1e10', self.expr(s, 1))}));"]
+            if k in (29, 30, 31):
+                return self.hotElements(s, p, k)
             if k == 25:
                 v = self.var(); e = self.expr(s)
                 return [f"{p}var {v} = [1, {e}]; {v}[0] += 2; {v}['x'] = {e}; log({v}[0]); log(typeof nope{v}); log(typeof {v});"]
             return [f"{p}log({self.expr(s)});"]
         finally:
             self.depth -= 1
+
+    def hotElements(self, s, p, k):
+        """Long enough to be compiled. What is indexed changes kind, or changes under the code, part of the way through."""
+        v = self.var(); i = self.var(); r = self.var(); e = self.expr(s, 1)
+        kinds = ["'abcd'", '[1, 2, 3, 4]', "[1, 'x', {}, null]", 'new Array(4)', "{0: 'p', 1: 'q'}", '[1.5]', '[]', f'[{e}, 2]']
+        if k == 29:
+            chosen = [self.r.choice(kinds) for _ in range(self.r.randint(1, 3))]
+            read = self.pick('o[n] + ":" + o[n]', 'o[n]', '"%" + o[n & 1] + o[n]', 'o[n] === o[n + 1]')
+            return [f"{p}var {v} = function (o, n) {{ return {read}; }}, {r};",
+                    f"{p}for (var {i} = 0; {i} < 400; {i}++) {{ var o{v} = [{', '.join(chosen)}][{i} % {len(chosen)}]; {r} = {v}(o{v}, {i} & 3); }}",
+                    f"{p}log({r});"]
+        if k == 30:
+            late = self.pick("'s'", '{}', 'undefined', 'null', '2.5', e)
+            return [f"{p}var {v} = {self.r.choice(['[1, 2, 3, 4]', 'new Array(4)', '[0, 0, 0, 0]'])};",
+                    f"{p}for (var {i} = 0; {i} < 500; {i}++) {{ {v}[{i} & 3] = {self.pick(i, f'{i} * 0.5', e)}; if ({i} === {self.r.randint(0, 499)}) {v}[{self.r.randint(0, 3)}] = {late}; }}",
+                    f"{p}log({v}.join()); log({v}.pop()); {v}.push({late}); log({v}.length); log(String({v}[3]));"]
+        start = self.pick('{}', "'s'", 'null', '1', e)
+        return [f"{p}var {v} = {{x: {start}, y: 1}}, {r} = 0;",
+                f"{p}var k{v} = {v}.x;",
+                f"{p}for (var {i} = 0; {i} < 500; {i}++) {{ {v}.x = {i}; {r} += {v}.x; {v}.y = {self.pick(i, chr(39) + 's' + chr(39))}; }}",
+                f"{p}log(typeof k{v}); log({r}); log({v}.y);"]
 
     def program(self):
         s = dict(any=['a', 'b'], num=[], obj=[], arr=[], fn=[])

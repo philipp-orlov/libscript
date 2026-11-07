@@ -625,8 +625,7 @@ private:
                 if (callInCold.back() && at >= 0 && fn_.code[std::size_t(at)].alias == 0)
                     return false;
             }
-            if (cold)
-                continue;
+            // A cold block's stores too: one that carries on in the hot path has done them by then.
             if (in.op == IrOp::Store || in.op == IrOp::StoreTag || in.op == IrOp::StoreIdx) {
                 if (in.op == IrOp::Store && in.alias == 1)
                     writes.headerOffsets.insert(in.imm);

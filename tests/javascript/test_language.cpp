@@ -936,6 +936,22 @@ TEST(mapsAndSetsCalledFromNativeCode)
              std::string("9991"));
 }
 
+TEST(arrayCallbacksGoAsFarAsTheArrayReachedAtTheStart)
+{
+    CHECK_EQ(run("var big = []; for (var i = 0; i < 20; i++) big.push(i);"
+                 "big.filter(function (x, i, arr) { arr[i + 1] = 'z'; return true; }).join('') + ',' + big.length"),
+             std::string("0zzzzzzzzzzzzzzzzzzz,21"));
+    CHECK_EQ(run("[1, 2, 3, 4, 5].map(function (x, i, arr) { if (i == 1) arr.pop(); return x * 2 + arr.length; }).join()"),
+             std::string("7,8,10,12,"));
+    CHECK_EQ(run("var q = [1, 2, 3, 4]; var seen = [];"
+                 "String(q.find(function (x, i, arr) { if (i == 0) arr.length = 2; seen.push(String(x)); return false; })) + ',' + seen.join(':') +"
+                 "',' + [1, 2, 3].map(function (x, i, arr) { arr.length = 1; return x; }).length"),
+             std::string("undefined,1:2:undefined:undefined,3"));
+    CHECK_EQ(run("[3, 'x', {}, null, 0, NaN, '', []].filter(function (x) { return x; }).length + ',' +"
+                 "[1, 2, 3].reduce(function (p, x, i, arr) { return p + x * i + arr.length; }, 10)"),
+             std::string("4,27"));
+}
+
 TEST(callingThroughCallIsCalling)
 {
     CHECK_EQ(run("function g(a, b) { return this.k + a * b; } function f(o, a) { return g.call(o, a, 2); }"

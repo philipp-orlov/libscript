@@ -868,6 +868,17 @@ Value CallbackLoop::ofTwoNumbers(double a, double b)
     return enter(entry, std::int64_t(Type::Undefined), 0, args, 2);
 }
 
+Value CallbackLoop::withArgs(const Value& thisValue, const Value* args, std::size_t count)
+{
+    const void* entry = fn_ ? fn_->code->jitCallEntry : nullptr;
+    if (!entry) {
+        ContextImpl::ArgBuffer buffer(rt_.ctx);
+        buffer.args.assign(args, args + count);
+        return callValue(rt_, callee_, thisValue, buffer.args);
+    }
+    return enter(entry, std::int64_t(thisValue.type()), payloadOf(thisValue), args, count);
+}
+
 Value CallbackLoop::enter(const void* entry, std::int64_t thisTag, std::uint64_t thisPayload, const Value* args, std::size_t count)
 {
     if (!session_)

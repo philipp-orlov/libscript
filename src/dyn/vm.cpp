@@ -1100,6 +1100,13 @@ Value CallbackLoop::ofTwoNumbers(double a, double b)
 {
     return (*this)(Value::undefined(), {Value(a), Value(b)});
 }
+
+Value CallbackLoop::withArgs(const Value& thisValue, const Value* args, std::size_t count)
+{
+    ContextImpl::ArgBuffer buffer(rt_.ctx);
+    buffer.args.assign(args, args + count);
+    return callValue(rt_, callee_, thisValue, buffer.args);
+}
 #endif
 
 Value invokeMethod(Runtime& rt, const Value& object, GCObject* name,

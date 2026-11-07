@@ -430,7 +430,9 @@ void installArray(Runtime& rt)
     }, 1);
 
     // ---- higher order ----
-    auto each = [](CallInfo& ci, auto&& step) {
+    // As far as the array reached when the call began: what the callback adds is not visited, and what it takes away is
+    // skipped, or for `find` and `findIndex`, visited as undefined.
+    auto each = [](CallInfo& ci, auto&& step, bool visitsGone = false) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         const Value fn = ci.arg(0);
@@ -438,10 +440,17 @@ void installArray(Runtime& rt)
             ci.fail(ErrorCode::TypeError, "a callback function is required");
         Value produced;
         CallbackLoop call(rt2, fn);
-        for (std::size_t i = 0; i < a->size(); ++i) {
-            const Value item = a->at(i);
-            produced = call(ci.arg(1), {item, Value(double(i)), ci.thisValue()});
-            if (!step(i, item, produced))
+        // The array itself, as the third argument, is counted once for the whole loop.
+        const Value self = ci.arg(1);
+        Value args[3] = {Value::undefined(), Value::undefined(), ci.thisValue()};
+        const std::size_t n = a->size();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i >= a->size() && !visitsGone)
+                continue;
+            args[0] = i < a->size() ? a->at(i) : Value::undefined();
+            args[1] = Value(double(i));
+            produced = call.withArgs(self, args, 3);
+            if (!step(i, args[0], produced))
                 break;
         }
         return produced;
@@ -452,23 +461,30 @@ void installArray(Runtime& rt)
         return Value::undefined();
     }, 1);
 
+    // What these make goes straight into the array they answer with.
     rt.method(proto, "map", [each](CallInfo& ci) {
-        Vec<Value> out;
-        each(ci, [&out](std::size_t, const Value&, Value& produced) {
-            out.push_back(produced);
+        const std::size_t n = thisArray(ci)->size();
+        DynArray* out = rtOf(ci).newArray(n);
+        Value result = detail::Access::adopt(Type::Object, out);
+        each(ci, [out](std::size_t, const Value&, Value& produced) {
+            out->append(produced);
             return true;
         });
-        return rtOf(ci).makeArray(std::move(out));
+        // As long as the array was; what was skipped has nothing to say.
+        while (out->size() < n)
+            out->append(Value::undefined());
+        return result;
     }, 1);
 
     rt.method(proto, "filter", [each](CallInfo& ci) {
-        Vec<Value> out;
-        each(ci, [&out](std::size_t, const Value& item, Value& produced) {
-            if (toBoolean(produced))
-                out.push_back(item);
+        DynArray* out = rtOf(ci).newArray(0);
+        Value result = detail::Access::adopt(Type::Object, out);
+        each(ci, [out](std::size_t, const Value& item, Value& produced) {
+            if (produced.type() == Type::Bool ? boolOf(produced) : toBoolean(produced))
+                out->append(item);
             return true;
         });
-        return rtOf(ci).makeArray(std::move(out));
+        return result;
     }, 1);
 
     rt.method(proto, "find", [each](CallInfo& ci) {
@@ -478,7 +494,7 @@ void installArray(Runtime& rt)
                 return true;
             found = item;
             return false;
-        });
+        }, true);
         return found;
     }, 1);
 
@@ -489,7 +505,7 @@ void installArray(Runtime& rt)
                 return true;
             found = double(i);
             return false;
-        });
+        }, true);
         return Value(found);
     }, 1);
 
@@ -574,14 +590,17 @@ void installArray(Runtime& rt)
             at = 1;
         }
         CallbackLoop call(rt2, fn);
+        Value args[4] = {std::move(acc), Value::undefined(), Value::undefined(), ci.thisValue()};
         for (; at < n; ++at) {
             const std::size_t i = reversed ? n - 1 - at : at;
             // The callback may have shortened the array; an element that is gone is skipped, as in JavaScript.
             if (i >= a->size())
                 continue;
-            acc = call(Value::undefined(), {acc, a->at(i), Value(double(i)), ci.thisValue()});
+            args[1] = a->at(i);
+            args[2] = Value(double(i));
+            args[0] = call.withArgs(Value::undefined(), args, 4);
         }
-        return acc;
+        return args[0];
     };
     rt.method(proto, "reduce", [reduce](CallInfo& ci) { return reduce(ci, false); }, 1);
     rt.method(proto, "reduceRight", [reduce](CallInfo& ci) { return reduce(ci, true); }, 1);

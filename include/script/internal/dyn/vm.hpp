@@ -109,6 +109,8 @@ public:
     Value operator()(const Value& thisValue, std::initializer_list<Value> args);
     /// `callee(a, b)` with `this` undefined, as a sort's comparator is called.
     Value ofTwoNumbers(double a, double b);
+    /// The arguments in an array the caller keeps, to change only what differs from one call to the next.
+    Value withArgs(const Value& thisValue, const Value* args, std::size_t count);
 
 private:
     Value slow(const Value& thisValue, std::initializer_list<Value> args);

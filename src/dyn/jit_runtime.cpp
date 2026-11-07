@@ -164,12 +164,7 @@ double scriptDynAtan2(double a, double b) noexcept { return std::atan2(a, b); }
 
 double scriptDynParseInt(double d) noexcept
 {
-    // Past what prints without an exponent it does make the text, and an allocation can fail: the answer is then no answer.
-    try {
-        return parseIntOfNumber(d);
-    } catch (...) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
+    return parseIntOfNumber(d);
 }
 
 NativePair scriptDynMapGet(Runtime* rt, GCObject* map, std::int64_t tag, std::uint64_t payload) noexcept

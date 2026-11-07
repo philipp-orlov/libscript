@@ -27,7 +27,7 @@ double stringToNumber(StringView s);
 double parseIntPrefix(StringView s, int radix);
 double parseFloatPrefix(StringView s);
 /// `parseInt(d)` for a number: what its text would give, usually without making the text.
-double parseIntOfNumber(double d);
+double parseIntOfNumber(double d) noexcept;
 
 /// What `Math.pow` and `**`, `Math.max`, `Math.min` and `Math.round` answer where C's functions say otherwise.
 inline double numberPow(double x, double y) noexcept

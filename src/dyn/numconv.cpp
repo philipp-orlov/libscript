@@ -3,6 +3,7 @@
 
 // Number formatting and parsing, following ECMA-262 section 7.1.
 
+#include <charconv>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <system_error>
 
 #include "base/ascii.hpp"
 #include "base/classic_locale.hpp"
@@ -176,15 +178,29 @@ double stringToNumber(StringView s)
     return parsed.consumed == narrow.size() ? parsed.value : std::nan("");
 }
 
-double parseIntOfNumber(double d)
+double parseIntOfNumber(double d) noexcept
 {
-    // A number that prints without an exponent has its whole part for an answer, and no text need be made to say so.
+    if (std::isnan(d) || std::isinf(d))
+        return std::numeric_limits<double>::quiet_NaN();  // "NaN", "Infinity"
+    if (d == 0)
+        return 0;
+    // Below 2^53 a number prints its whole part exactly, and that is the answer.
     const double size = std::fabs(d);
     if (size >= 1e-6 && size < 9007199254740992.0)
         return std::trunc(d);
-    if (d == 0)
-        return 0;
-    return parseIntPrefix(numberToString(d), 0);
+    char text[32];
+    if (size >= 1e-6 && size < 1e21) {
+        // Up to 1e21 it prints its shortest digits padded with zeros, which need not read back as the number.
+        const auto printed = std::to_chars(text, text + sizeof text, d, std::chars_format::fixed);
+        double back = d;
+        if (printed.ec == std::errc())
+            std::from_chars(text, printed.ptr, back);
+        return back;
+    }
+    // One that prints with an exponent stops at its first digit, which is the first of its shortest digits.
+    const auto printed = std::to_chars(text, text + sizeof text, size, std::chars_format::scientific);
+    const double digit = printed.ec == std::errc() ? double(text[0] - '0') : 0;
+    return d < 0 ? -digit : digit;
 }
 
 double parseIntPrefix(StringView s, int radix)
@@ -211,6 +227,19 @@ double parseIntPrefix(StringView s, int radix)
     if (radix < 2 || radix > 36)
         return std::nan("");
 
+    if (radix == 10) {
+        // Correctly rounded, as the standard asks up to 20 significant digits: adding digit by digit in a double is not.
+        std::string digits;
+        for (; i < s.size() && s[i] >= u'0' && s[i] <= u'9'; ++i)
+            digits.push_back(char(s[i]));
+        if (digits.empty())
+            return std::nan("");
+        double value = 0;
+        // A whole number can only be too large, never too small.
+        if (std::from_chars(digits.data(), digits.data() + digits.size(), value).ec == std::errc::result_out_of_range)
+            value = std::numeric_limits<double>::infinity();
+        return sign * value;
+    }
     double acc = 0;
     bool any = false;
     for (; i < s.size(); ++i) {

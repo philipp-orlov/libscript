@@ -857,6 +857,16 @@ TEST(parseIntOfANumberIsWhatItsTextWouldGive)
     CHECK_EQ(run("parseInt(0.0000005) + ',' + parseInt(1e21) + ',' + parseInt(-1.5e300)"), std::string("5,1,-1"));
     CHECK_EQ(run("parseInt(1e20) + ',' + parseInt(9007199254740993)"), std::string("100000000000000000000,9007199254740992"));
     CHECK_EQ(run("String(parseInt(NaN)) + ',' + parseInt(Infinity) + ',' + parseInt(10, 2) + ',' + parseInt(15.9, 8)"), std::string("NaN,NaN,2,13"));
+    CHECK_EQ(run("parseInt('1' + '0'.repeat(400)) + ',' + parseInt('-1' + '0'.repeat(400)) + ',' + parseInt('541421576552814340') + ',' + parseInt('99999999999999999999999')"),
+             std::string("Infinity,-Infinity,541421576552814340,1e+23"));
+    // Whatever the number, the same as parsing what it prints as.
+    CHECK_EQ(run("var bad = 0, x = 1.7;"
+                 "for (var i = 0; i < 20000; i++) { x = (x * 1103.515245 + 12345.678) % 1e7; var e = (i % 90) - 45;"
+                 " var d = (i & 1 ? -1 : 1) * x * Math.pow(10, e); var a = parseInt(d), b = parseInt(String(d));"
+                 " if (a !== a ? b === b : (a !== b || 1 / a !== 1 / b)) bad++; }"
+                 "[9.999999999999999e22, 1e21, 5e-7, -9.5e-7, 1e-6, 0.000001, 123456789012345680000, -1e300, 2e-323]"
+                 ".forEach(function (d) { if (parseInt(d) !== parseInt(String(d))) bad++; }); bad"),
+             std::string("0"));
 }
 
 TEST(mathOnBareNumbersAnswersWhatTheStandardSays)

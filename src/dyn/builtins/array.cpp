@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/proxy.hpp"
 #include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
@@ -220,7 +221,7 @@ void installArray(Runtime& rt)
     }, 1, proto);
     rt.arrayCtor.reset(ctor);
 
-    rt.method(ctor, "isArray", [](CallInfo& ci) { return Value(asArray(ci.arg(0)) != nullptr); }, 1);
+    rt.method(ctor, "isArray", [](CallInfo& ci) { return Value(isArray(rtOf(ci), ci.arg(0))); }, 1);
 
     rt.method(ctor, "of", [](CallInfo& ci) { return rtOf(ci).makeArray(ci.args()); }, 0);
 

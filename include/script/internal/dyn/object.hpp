@@ -234,6 +234,7 @@ enum class ObjClass : std::uint8_t
     SharedArrayBuffer,
     TypedArray,
     DataView,
+    Proxy,  ///< a DynProxy over something that cannot be called
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.
@@ -316,6 +317,8 @@ struct DynObject : GCObject
     bool numbersOnly = false;
     Shape* shape = nullptr;
     PinRef<DynObject> proto;
+    /// A proxy, whose handler answers for it: its class says so, or it is a function of the proxy kind.
+    bool fnKindIsProxy() const noexcept;
     /// Sets `proto`, keeping what shapes and sites know right. Every change of prototype goes through here.
     void setProto(DynObject* next);
     /// The layout is about to change in a way no shape describes. The names and attributes move to the object's own table.
@@ -638,6 +641,7 @@ enum class FnKind : std::uint8_t
     Bytecode,
     Native,
     Bound,
+    Proxy,  ///< a DynProxy over something callable
 };
 
 struct DynFunction : DynObject
@@ -798,6 +802,10 @@ inline SymbolCell* asSymbol(const Value& v) noexcept
     return v.isSymbol() ? static_cast<SymbolCell*>(detail::Access::ptr(v)) : nullptr;
 }
 DynFunction* asFunction(const Value& v) noexcept;
+inline bool DynObject::fnKindIsProxy() const noexcept
+{
+    return cls == ObjClass::Proxy || (cls == ObjClass::Function && static_cast<const DynFunction*>(this)->fnKind == FnKind::Proxy);
+}
 DynArray* asArray(const Value& v) noexcept;
 
 /// SameValueZero, used by Map/Set keys and `Array.prototype.includes`.

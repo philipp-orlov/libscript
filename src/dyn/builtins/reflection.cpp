@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/proxy.hpp"
 #include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
@@ -26,14 +27,8 @@ bool sameValue(const Value& a, const Value& b)
 
 namespace {
 
-struct Descriptor
-{
-    bool hasValue = false, hasWritable = false, hasGet = false, hasSet = false, hasEnumerable = false, hasConfigurable = false;
-    bool writable = false, enumerable = false, configurable = false;
-    Value value = Value::undefined(), getter = Value::undefined(), setter = Value::undefined();
-    bool isAccessor() const noexcept { return hasGet || hasSet; }
-    bool isData() const noexcept { return hasValue || hasWritable; }
-};
+
+}  // namespace
 
 Descriptor toDescriptor(Runtime& rt, const Value& source)
 {
@@ -66,7 +61,7 @@ Descriptor toDescriptor(Runtime& rt, const Value& source)
 }
 
 /// An array's elements are not named properties. What can be said of them, a dense array can only take as a plain element.
-bool defineOnArray(Runtime& rt, DynArray* array, GCObject* key, const Descriptor& d, bool& handled)
+static bool defineOnArray(Runtime& rt, DynArray* array, GCObject* key, const Descriptor& d, bool& handled)
 {
     handled = false;
     if (key == rt.atom.length.get()) {
@@ -87,9 +82,29 @@ bool defineOnArray(Runtime& rt, DynArray* array, GCObject* key, const Descriptor
     if (!(index >= 0) || index != std::floor(index) || index >= 4294967295.0 ||
         numberToString(index) != static_cast<StringCell*>(key)->text())
         return true;
-    // What an element cannot be, a named property of that name can: a read of the index finds it.
-    if (d.isAccessor() || (d.hasWritable && !d.writable) || (d.hasEnumerable && !d.enumerable) || (d.hasConfigurable && !d.configurable))
+    // What an element cannot be, a named property of that name can: the element becomes a hole, so a read of the index
+    // finds the property, which starts out as the element was.
+    if (d.isAccessor() || (d.hasWritable && !d.writable) || (d.hasEnumerable && !d.enumerable) || (d.hasConfigurable && !d.configurable)) {
+        const std::size_t at = std::size_t(index);
+        if (array->findOwn(key))
+            return true;
+        if (at < array->size() && array->hasElement(at)) {
+            if (array->frozen)
+                return true;
+            const Value current = array->at(at);
+            array->makeHole(at);
+            array->dropShape();
+            array->putOwn(key, current, PropDefault);
+        } else if (at >= array->size()) {
+            if (!array->extensible) {
+                handled = true;
+                return false;
+            }
+            array->resize(at + 1);
+            array->makeHole(at);
+        }
         return true;
+    }
     if (std::size_t(index) >= array->size() && !d.hasWritable && !d.hasEnumerable && !d.hasConfigurable)
         return true;
     handled = true;
@@ -103,7 +118,7 @@ bool defineOnArray(Runtime& rt, DynArray* array, GCObject* key, const Descriptor
 }
 
 /// `[[DefineOwnProperty]]`: false where what is there does not allow it.
-bool defineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descriptor& d)
+bool ordinaryDefineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descriptor& d)
 {
     if (self->cls == ObjClass::TypedArray) {
         auto* ta = static_cast<DynTypedArray*>(self);
@@ -175,62 +190,69 @@ bool defineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descriptor& d)
     return true;
 }
 
-Value fromProperty(Runtime& rt, DynObject* self, GCObject* key)
+bool ordinaryGetOwn(Runtime& rt, DynObject* self, GCObject* key, Descriptor& out)
 {
+    out = Descriptor();
+    const auto data = [&](const Value& v, bool writable, bool enumerable, bool configurable) {
+        out.hasValue = out.hasWritable = out.hasEnumerable = out.hasConfigurable = true;
+        out.value = v;
+        out.writable = writable;
+        out.enumerable = enumerable;
+        out.configurable = configurable;
+        return true;
+    };
     if (self->cls == ObjClass::TypedArray) {
         auto* ta = static_cast<DynTypedArray*>(self);
         double index = 0;
         if (numericKey(key, index)) {
             if (!typedArrayHas(ta, index))
-                return Value::undefined();
-            DynObject* out = rt.newObject(rt.objectProto.get());
-            Value result = detail::Access::adopt(Type::Object, out);
-            out->putOwn(rt.atom.value.get(), typedArrayGet(rt, ta, std::size_t(index)));
-            out->putOwn(rt.intern("writable"), Value(true));
-            out->putOwn(rt.intern("enumerable"), Value(true));
-            out->putOwn(rt.intern("configurable"), Value(true));
-            return result;
+                return false;
+            return data(typedArrayGet(rt, ta, std::size_t(index)), true, true, true);
         }
     }
-    if (self->cls == ObjClass::Array && key == rt.atom.length.get()) {
-        DynObject* out = rt.newObject(rt.objectProto.get());
-        Value result = detail::Access::adopt(Type::Object, out);
-        out->putOwn(rt.atom.value.get(), Value(double(static_cast<DynArray*>(self)->size())));
-        out->putOwn(rt.intern("writable"), Value(!self->frozen));
-        out->putOwn(rt.intern("enumerable"), Value(false));
-        out->putOwn(rt.intern("configurable"), Value(false));
-        return result;
-    }
+    if (self->cls == ObjClass::Array && key == rt.atom.length.get())
+        return data(Value(double(static_cast<DynArray*>(self)->size())), !self->frozen, false, false);
     if (self->cls == ObjClass::Array && key->kind == CellKind::String) {
         auto* array = static_cast<DynArray*>(self);
-        const double index = toNumber(rt, detail::Access::make(Type::String, key));
-        if (index >= 0 && index < double(array->size()) && index == std::floor(index) && array->hasElement(std::size_t(index)) && numberToString(index) == static_cast<StringCell*>(key)->text()) {
-            DynObject* out = rt.newObject(rt.objectProto.get());
-            Value result = detail::Access::adopt(Type::Object, out);
-            out->putOwn(rt.atom.value.get(), array->at(std::size_t(index)));
-            out->putOwn(rt.intern("writable"), Value(!self->frozen));
-            out->putOwn(rt.intern("enumerable"), Value(true));
-            out->putOwn(rt.intern("configurable"), Value(!self->frozen));
-            return result;
+        std::uint32_t index = 0;
+        if (arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < array->size() && array->hasElement(index))
+            return data(array->at(index), !self->frozen, true, !self->frozen);
+    }
+    if (self->cls == ObjClass::StringObject && key->kind == CellKind::String) {
+        if (StringCell* text = asString(static_cast<DynWrapper*>(self)->primitive)) {
+            std::uint32_t index = 0;
+            if (key == rt.atom.length.get())
+                return data(Value(double(text->text().size())), false, false, false);
+            if (arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < text->text().size())
+                return data(rt.str(text->text().substr(index, 1)), false, true, false);
         }
     }
     const Prop* p = self->findOwn(key);
     if (!p)
-        return Value::undefined();
-    DynObject* out = rt.newObject(rt.objectProto.get());
-    Value result = detail::Access::adopt(Type::Object, out);
+        return false;
     const std::uint8_t attrs = self->attrsOf(*p);
     if (attrs & PropAccessor) {
-        out->putOwn(rt.intern("get"), p->value);
-        out->putOwn(rt.intern("set"), self->setterOf(*p));
-    } else {
-        out->putOwn(rt.atom.value.get(), p->value);
-        out->putOwn(rt.intern("writable"), Value((attrs & PropWritable) != 0));
+        out.hasGet = out.hasSet = out.hasEnumerable = out.hasConfigurable = true;
+        out.getter = p->value;
+        out.setter = self->setterOf(*p);
+        out.enumerable = attrs & PropEnumerable;
+        out.configurable = attrs & PropConfigurable;
+        return true;
     }
-    out->putOwn(rt.intern("enumerable"), Value((attrs & PropEnumerable) != 0));
-    out->putOwn(rt.intern("configurable"), Value((attrs & PropConfigurable) != 0));
-    return result;
+    return data(p->value, attrs & PropWritable, attrs & PropEnumerable, attrs & PropConfigurable);
 }
+
+namespace {
+
+Value fromProperty(Runtime& rt, DynObject* self, GCObject* key)
+{
+    Descriptor d;
+    if (!getOwnProperty(rt, self, key, d))
+        return Value::undefined();
+    return descriptorToObject(rt, d);
+}
+
+bool defineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descriptor& d) { return defineOwnProperty(rt, self, key, d); }
 
 DynObject* objectArg(CallInfo& ci, std::size_t i, const char* who)
 {
@@ -293,20 +315,38 @@ void installReflection(Runtime& rt)
             ci.fail(ErrorCode::TypeError, "the property cannot be redefined that way");
         return ci.arg(0);
     }, 3);
-    rt.method(object, "defineProperties", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        DynObject* self = objectArg(ci, 0, "Object.defineProperties");
-        const Value props = toObject(rt2, ci.arg(1));
+    // ObjectDefineProperties: every descriptor read first, then all defined.
+    const auto defineAll = [](Runtime& rt2, DynObject* self, const Value& source) {
+        const Value props = toObject(rt2, source);
         std::vector<std::pair<Ref<GCObject>, Descriptor>> all;
-        for (const Value& k : ownKeys(rt2, asObject(props), true, true)) {
+        for (const Value& k : ownPropertyKeys(rt2, asObject(props))) {
             Ref<GCObject> key = toPropertyKey(rt2, k);
+            Descriptor present;
+            if (!getOwnProperty(rt2, asObject(props), key.get(), present) || !present.enumerable)
+                continue;
             all.emplace_back(key, toDescriptor(rt2, getProperty(rt2, props, key.get())));
         }
         for (const auto& [key, d] : all) {
             if (!defineOwn(rt2, self, key.get(), d))
-                ci.fail(ErrorCode::TypeError, "the property cannot be redefined that way");
+                throwError(rt2, ErrorCode::TypeError, "the property cannot be redefined that way");
         }
+    };
+    rt.method(object, "defineProperties", [defineAll](CallInfo& ci) {
+        DynObject* self = objectArg(ci, 0, "Object.defineProperties");
+        defineAll(rtOf(ci), self, ci.arg(1));
         return ci.arg(0);
+    }, 2);
+    rt.method(object, "create", [defineAll](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        if (!ci.arg(0).isObject() && !ci.arg(0).isNull())
+            ci.fail(ErrorCode::TypeError, "Object.create needs an object or null for the prototype");
+        DynObject* out = rt2.newObject(asObject(ci.arg(0)));
+        if (ci.arg(0).isNull())
+            out->setProto(nullptr);
+        Value result = detail::Access::adopt(Type::Object, out);
+        if (!ci.arg(1).isUndefined())
+            defineAll(rt2, out, ci.arg(1));
+        return result;
     }, 2);
     rt.method(object, "getOwnPropertyDescriptor", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
@@ -343,28 +383,107 @@ void installReflection(Runtime& rt)
     }, 2);
     rt.method(object, "preventExtensions", [](CallInfo& ci) {
         if (DynObject* self = asObject(ci.arg(0))) {
-            self->extensible = false;
-            self->dropShape();
+            if (!preventExtensions(rtOf(ci), self))
+                ci.fail(ErrorCode::TypeError, "the object would not stop growing");
         }
         return ci.arg(0);
     }, 1);
-    rt.method(object, "seal", [](CallInfo& ci) {
-        if (DynObject* self = asObject(ci.arg(0)))
-            lockProperties(self, false);
+    // SetIntegrityLevel and TestIntegrityLevel the long way, for a proxy; an ordinary object has its own quick ones.
+    const auto integrity = [](Runtime& rt2, DynObject* self, bool frozen) {
+        if (!preventExtensions(rt2, self))
+            throwError(rt2, ErrorCode::TypeError, "the object would not stop growing");
+        for (const Value& k : ownPropertyKeys(rt2, self)) {
+            Ref<GCObject> key = toPropertyKey(rt2, k);
+            Descriptor d;
+            d.hasConfigurable = true;
+            if (frozen) {
+                Descriptor current;
+                if (!getOwnProperty(rt2, self, key.get(), current))
+                    continue;
+                if (current.isData()) {
+                    d.hasWritable = true;
+                }
+            }
+            if (!defineOwnProperty(rt2, self, key.get(), d))
+                throwError(rt2, ErrorCode::TypeError, "a property would not be fixed");
+        }
+    };
+    const auto tested = [](Runtime& rt2, DynObject* self, bool frozen) {
+        if (isExtensible(rt2, self))
+            return false;
+        for (const Value& k : ownPropertyKeys(rt2, self)) {
+            Ref<GCObject> key = toPropertyKey(rt2, k);
+            Descriptor d;
+            if (!getOwnProperty(rt2, self, key.get(), d))
+                continue;
+            if (d.configurable || (frozen && d.isData() && d.writable))
+                return false;
+        }
+        return true;
+    };
+    rt.method(object, "seal", [integrity](CallInfo& ci) {
+        if (DynObject* self = asObject(ci.arg(0))) {
+            if (asProxy(self))
+                integrity(rtOf(ci), self, false);
+            else
+                lockProperties(self, false);
+        }
+        return ci.arg(0);
+    }, 1);
+    rt.method(object, "freeze", [integrity](CallInfo& ci) {
+        if (DynObject* self = asObject(ci.arg(0))) {
+            if (asProxy(self)) {
+                integrity(rtOf(ci), self, true);
+                return ci.arg(0);
+            }
+            self->frozen = true;
+            self->extensible = false;
+            self->dropShape();
+            for (std::size_t i = 0; i < self->props.size(); ++i) {
+                GCObject* key = self->keyAt(i);
+                if (key->kind != CellKind::Symbol || !static_cast<SymbolCell*>(key)->isPrivate)
+                    self->setAttrsAt(i, std::uint8_t(self->attrsAt(i) & ~(PropWritable | PropConfigurable)));
+            }
+        }
         return ci.arg(0);
     }, 1);
     rt.method(object, "isExtensible", [](CallInfo& ci) {
         DynObject* self = asObject(ci.arg(0));
-        return Value(self && self->extensible);
+        return Value(self && isExtensible(rtOf(ci), self));
     }, 1);
-    rt.method(object, "isSealed", [](CallInfo& ci) {
+    rt.method(object, "isSealed", [tested](CallInfo& ci) {
         DynObject* self = asObject(ci.arg(0));
+        if (self && asProxy(self))
+            return Value(tested(rtOf(ci), self, false));
         return Value(!self || self->frozen || allLocked(self, false));
     }, 1);
-    rt.method(object, "isFrozen", [](CallInfo& ci) {
+    rt.method(object, "isFrozen", [tested](CallInfo& ci) {
         DynObject* self = asObject(ci.arg(0));
+        if (self && asProxy(self))
+            return Value(tested(rtOf(ci), self, true));
         return Value(!self || self->frozen || allLocked(self, true));
     }, 1);
+    rt.method(object, "getPrototypeOf", [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        const Value self = toObject(rt2, ci.arg(0));
+        return getPrototypeOf(rt2, asObject(self));
+    }, 1);
+    rt.method(object, "setPrototypeOf", [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        if (ci.arg(0).isNullish())
+            ci.fail(ErrorCode::TypeError, "Object.setPrototypeOf needs an object");
+        if (!ci.arg(1).isNull() && !ci.arg(1).isObject())
+            ci.fail(ErrorCode::TypeError, "a prototype is an object or null");
+        if (DynObject* self = asObject(ci.arg(0))) {
+            for (DynObject* up = asObject(ci.arg(1)); up && !up->fnKindIsProxy(); up = up->proto.get()) {
+                if (up == self)
+                    ci.fail(ErrorCode::TypeError, "cyclic prototype chain");
+            }
+            if (!setPrototypeOf(rt2, self, asObject(ci.arg(1))))
+                ci.fail(ErrorCode::TypeError, "the prototype cannot be set: the object cannot change");
+        }
+        return ci.arg(0);
+    }, 2);
     rt.method(object, "groupBy", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
         if (ci.arg(0).isNullish())
@@ -442,8 +561,7 @@ void installReflection(Runtime& rt)
         return fromProperty(rt2, self, key.get());
     }, 2);
     rt.method(reflect, "getPrototypeOf", [](CallInfo& ci) -> Value {
-        DynObject* self = objectArg(ci, 0, "Reflect.getPrototypeOf");
-        return self->proto ? detail::Access::make(Type::Object, self->proto.get()) : Value::null();
+        return getPrototypeOf(rtOf(ci), objectArg(ci, 0, "Reflect.getPrototypeOf"));
     }, 1);
     rt.method(reflect, "has", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
@@ -451,23 +569,23 @@ void installReflection(Runtime& rt)
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(1));
         return Value(hasProperty(rt2, ci.arg(0), key.get()));
     }, 2);
-    rt.method(reflect, "isExtensible", [](CallInfo& ci) { return Value(objectArg(ci, 0, "Reflect.isExtensible")->extensible); }, 1);
+    rt.method(reflect, "isExtensible", [](CallInfo& ci) { return Value(isExtensible(rtOf(ci), objectArg(ci, 0, "Reflect.isExtensible"))); }, 1);
     rt.method(reflect, "ownKeys", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
         DynObject* self = objectArg(ci, 0, "Reflect.ownKeys");
-        const Vec<Value> keys = ownKeys(rt2, self, false, true);
+        const Vec<Value> keys = ownPropertyKeys(rt2, self);
         return rt2.makeArray(std::vector<Value>(keys.begin(), keys.end()));
     }, 1);
     rt.method(reflect, "preventExtensions", [](CallInfo& ci) {
         DynObject* self = objectArg(ci, 0, "Reflect.preventExtensions");
-        self->extensible = false;
-        self->dropShape();
-        return Value(true);
+        return Value(preventExtensions(rtOf(ci), self));
     }, 1);
     rt.method(reflect, "set", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynObject* self = objectArg(ci, 0, "Reflect.set");
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(1));
+        if (asProxy(self) || (ci.size() > 3 && !(ci.arg(3).isObject() && asObject(ci.arg(3)) == self)))
+            return Value(setWithReceiver(rt2, self, key.get(), ci.arg(2), ci.size() > 3 ? ci.arg(3) : ci.arg(0)));
         const Prop* own = self->findOwn(key.get());
         if (own && !self->accessorOf(*own) && !(self->attrsOf(*own) & PropWritable))
             return Value(false);
@@ -480,18 +598,9 @@ void installReflection(Runtime& rt)
         DynObject* self = objectArg(ci, 0, "Reflect.setPrototypeOf");
         if (!ci.arg(1).isNull() && !ci.arg(1).isObject())
             ci.fail(ErrorCode::TypeError, "a prototype is an object or null");
-        DynObject* next = asObject(ci.arg(1));
-        if (self->proto.get() == next)
-            return Value(true);
-        if (!self->extensible)
-            return Value(false);
-        for (DynObject* up = next; up; up = up->proto.get()) {
-            if (up == self)
-                return Value(false);
-        }
-        self->setProto(next);
-        return Value(true);
+        return Value(setPrototypeOf(rtOf(ci), self, asObject(ci.arg(1))));
     }, 2);
+    installProxy(rt);
 }
 
 }  // namespace dyn

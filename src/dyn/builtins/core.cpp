@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/proxy.hpp"
 #include "script/internal/dyn/parser.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
@@ -47,9 +48,13 @@ void installObject(Runtime& rt)
     rt.method(proto, "hasOwnProperty", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(0));
-        DynObject* self = asObject(ci.thisValue());
+        DynObject* self = asObject(toObject(rt2, ci.thisValue()));
         if (!self)
             return Value(false);
+        if (self->fnKindIsProxy()) {
+            Descriptor d;
+            return Value(getOwnProperty(rt2, self, key.get(), d));
+        }
         if (self->cls == ObjClass::Array && key->kind == CellKind::String) {
             std::uint32_t index = 0;
             if (arrayIndexOf(static_cast<StringCell*>(key.get())->text(), index))
@@ -72,12 +77,10 @@ void installObject(Runtime& rt)
 
     rt.method(proto, "propertyIsEnumerable", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        DynObject* self = asObject(ci.thisValue());
-        if (!self)
-            return Value(false);
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(0));
-        const Prop* p = self->findOwn(key.get());
-        return Value(p && (self->attrsOf(*p) & PropEnumerable));
+        const Value object = toObject(rt2, ci.thisValue());
+        Descriptor d;
+        return Value(getOwnProperty(rt2, asObject(object), key.get(), d) && d.enumerable);
     }, 1);
 
     rt.method(proto, "toString", [](CallInfo& ci) {

@@ -1315,6 +1315,29 @@ TEST(evalIsOffUnlessTheHostTurnsItOn)
     CHECK_EQ(text("var n; try { eval('1 +'); } catch (e) { n = e.name; } n"), std::string("SyntaxError"));
 }
 
+TEST(aProxyAnswersThroughItsHandler)
+{
+    js::Context ctx;
+    const auto text = [&](const char* source) { return ctx.eval(source, "<test>").toString(); };
+    CHECK_EQ(text("var p = new Proxy({ a: 1 }, { get(t, k) { return k in t ? t[k] : 42; }, set(t, k, v) { t[k] = v * 2; return true; } }); p.b = 5; [p.a, p.x, p.b].join()"), std::string("1,42,10"));
+    CHECK_EQ(text("var f = new Proxy(function (a, b) { return a + b; }, { apply(t, self, args) { return t(...args) * 10; } }); typeof f + f(1, 2)"), std::string("function30"));
+    CHECK_EQ(text("var r = Proxy.revocable({}, {}); r.revoke(); var n; try { r.proxy.x; } catch (e) { n = e.name; } n"), std::string("TypeError"));
+    CHECK_EQ(text("var fixed = {}; Object.defineProperty(fixed, 'k', { value: 1 }); var m; try { new Proxy(fixed, { get() { return 2; } }).k; } catch (e) { m = e.name; } m"), std::string("TypeError"));
+    CHECK_EQ(text("Object.keys(new Proxy({}, { ownKeys() { return ['x', 'y']; }, getOwnPropertyDescriptor() { return { value: 0, enumerable: true, configurable: true }; } })).join()"), std::string("x,y"));
+    CHECK_EQ(text("var inherits = Object.create(new Proxy({}, { get(t, k) { return 'up ' + String(k); } })); inherits.here"), std::string("up here"));
+}
+
+TEST(arraysHaveHolesAndPropertiesAtIndices)
+{
+    js::Context ctx;
+    const auto text = [&](const char* source) { return ctx.eval(source, "<test>").toString(); };
+    CHECK_EQ(text("var a = [1, , 3]; [1 in a, a.indexOf(undefined), a.includes(undefined), Object.keys(a).join('')].join()"), std::string("false,-1,true,02"));
+    CHECK_EQ(text("var c = []; c[5] = 1; var n = 0; c.forEach(() => n++); [4 in c, n, c.length].join()"), std::string("false,1,6"));
+    CHECK_EQ(text("var u = [1, 2]; u[1] = undefined; String(1 in u)"), std::string("true"));
+    CHECK_EQ(text("var g = [1, 2, 3]; Object.defineProperty(g, '1', { get() { return 'got'; } }); g[1] + g.length"), std::string("got3"));
+    CHECK_EQ(text("String([3, , 1, undefined].sort().length)"), std::string("4"));
+}
+
 TEST(aDelegateOfAnAsyncGeneratorThatThrowsIsTheGeneratorsToCatch)
 {
     script::Context ctx;

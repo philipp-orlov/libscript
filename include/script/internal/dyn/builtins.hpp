@@ -25,6 +25,7 @@ void installReflection(Runtime& rt);   // descriptors, the rest of Object, Refle
 void installGenerators(Runtime& rt);   // generator and async function objects, async iteration
 void installRegExp(Runtime& rt);       // RegExp and the String methods that use it
 void installBigInt(Runtime& rt);       // BigInt
+void installProxy(Runtime& rt);        // Proxy, installed by installReflection
 void installTypedArrays(Runtime& rt);  // ArrayBuffer, the typed arrays, DataView, Atomics
 
 /// A regular expression literal: a checked pattern made once into an object, which each evaluation copies.

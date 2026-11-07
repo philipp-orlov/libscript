@@ -18,6 +18,7 @@
 #include "script/internal/dyn/compiler.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/parser.hpp"
+#include "script/internal/dyn/proxy.hpp"
 #include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/stack_guard.hpp"
 
@@ -395,6 +396,8 @@ bool arrayElementKey(DynArray* arr, GCObject* key, std::uint32_t& index)
 Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Value& receiver)
 {
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+        if (cursor->fnKindIsProxy())
+            return proxyGet(rt, asProxy(cursor), key, receiver);
         if (cursor->cls == ObjClass::Array) {
             auto* arr = static_cast<DynArray*>(cursor);
             std::uint32_t index = 0;
@@ -542,6 +545,10 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
 
     // An accessor anywhere on the prototype chain wins over a plain own write.
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+        if (cursor->fnKindIsProxy()) {
+            proxySet(rt, asProxy(cursor), key, v, base);
+            return;
+        }
         if (cursor->cls == ObjClass::TypedArray) {
             auto* ta = static_cast<DynTypedArray*>(cursor);
             double index = 0;
@@ -837,6 +844,8 @@ bool hasProperty(Runtime& rt, const Value& base, GCObject* key)
         return false;
     }
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+        if (cursor->fnKindIsProxy())
+            return proxyHas(rt, asProxy(cursor), key);
         if (cursor->cls == ObjClass::Array) {
             auto* arr = static_cast<DynArray*>(cursor);
             std::uint32_t index = 0;
@@ -856,21 +865,25 @@ bool hasProperty(Runtime& rt, const Value& base, GCObject* key)
     return false;
 }
 
-bool deleteProperty(Runtime&, const Value& base, GCObject* key)
+bool deleteProperty(Runtime& rt, const Value& base, GCObject* key)
 {
     DynObject* obj = asObject(base);
     if (!obj)
         return true;
+    if (obj->fnKindIsProxy())
+        return proxyDelete(rt, asProxy(obj), key);
     if (obj->cls == ObjClass::Array && key->kind == CellKind::String) {
         auto* arr = static_cast<DynArray*>(obj);
         std::uint32_t index = 0;
         if (arrayIndexOf(static_cast<StringCell*>(key)->text(), index)) {
-            if (index < arr->size()) {
+            if (index < arr->size() && arr->hasElement(index)) {
                 if (obj->frozen)
                     return false;
                 arr->makeHole(index);
+                return true;
             }
-            return true;
+            if (!obj->findOwn(key))
+                return true;
         }
     }
     if (obj->cls == ObjClass::TypedArray) {
@@ -887,18 +900,37 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
                            bool includeSymbols)
 {
     Vec<Value> keys;
+    if (obj->fnKindIsProxy()) {
+        for (const Value& k : ownPropertyKeys(rt, obj)) {
+            if (k.isSymbol() && !includeSymbols)
+                continue;
+            if (enumerableOnly) {
+                Ref<GCObject> key = toPropertyKey(rt, k);
+                Descriptor d;
+                if (!getOwnProperty(rt, obj, key.get(), d) || !d.enumerable)
+                    continue;
+            }
+            keys.push_back(k);
+        }
+        return keys;
+    }
     if (obj->cls == ObjClass::Array) {
         auto* arr = static_cast<DynArray*>(obj);
         for (std::uint32_t i = 0; i < arr->size(); ++i) {
             if (arr->hasElement(i))
                 keys.push_back(rt.str(numberToString(i)));
         }
+        // `length` is an own property, only not an enumerable one.
+        if (!enumerableOnly)
+            keys.push_back(detail::Access::make(Type::String, rt.atom.length.get()));
     }
     if (obj->cls == ObjClass::StringObject) {
         auto* w = static_cast<DynWrapper*>(obj);
         if (StringCell* s = asString(w->primitive)) {
             for (std::uint32_t i = 0; i < s->text().size(); ++i)
                 keys.push_back(rt.str(numberToString(i)));
+            if (!enumerableOnly)
+                keys.push_back(detail::Access::make(Type::String, rt.atom.length.get()));
         }
     }
     if (obj->cls == ObjClass::TypedArray) {
@@ -917,8 +949,9 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
         }
         keys.push_back(detail::Access::make(Type::String, key));
     }
-    // Names that are array indexes come first, in order, whenever they were added.
-    if (obj->cls != ObjClass::Array) {
+    // Names that are array indexes come first, in order, whenever they were added: an array's own elements among them,
+    // and any index it keeps as a named property.
+    if (obj->cls != ObjClass::Array || !obj->props.empty()) {
         const auto indexOf = [](const Value& k, double& out) {
             if (k.type() != Type::String)
                 return false;
@@ -1232,6 +1265,8 @@ Value callInternal(Runtime& rt, DynFunction* fn, const Value& thisValue,
     switch (fn->fnKind) {
         case FnKind::Native:
             return callNative(rt, fn, thisValue, args, isNew);
+        case FnKind::Proxy:
+            return proxyCall(rt, static_cast<DynProxy*>(fn), thisValue, args);
         case FnKind::Bound: {
             ContextImpl::ArgBuffer buffer(rt.ctx);
             std::vector<Value>& merged = buffer.args;
@@ -1266,6 +1301,8 @@ bool isConstructor(Runtime& rt, DynFunction* fn)
 {
     if (fn->fnKind == FnKind::Bound)
         return isConstructor(rt, fn->boundTarget.get());
+    if (fn->fnKind == FnKind::Proxy)
+        return static_cast<DynProxy*>(fn)->constructible;
     if (fn->isArrow || fn == rt.functionProto.get())
         return false;
     if (fn->fnKind == FnKind::Native)
@@ -1289,6 +1326,8 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
     if (fn->fnKind == FnKind::Bound)
         return constructValue(rt, detail::Access::make(Type::Object, fn->boundTarget.get()), args,
                               newTarget == fn ? fn->boundTarget.get() : newTarget);
+    if (fn->fnKind == FnKind::Proxy)
+        return proxyConstruct(rt, static_cast<DynProxy*>(fn), args, newTarget == fn ? nullptr : newTarget);
     // A derived class has no object until `super()` gives it one.
     if (fn->isDerivedConstructor)
         return callInternal(rt, fn, Value::undefined(), args, true, newTarget);
@@ -1750,7 +1789,8 @@ Value execute(Runtime& rt, Frame& frame)
         if (double(index) != d)
             return false;
         arr = static_cast<DynArray*>(obj);
-        return index < arr->size();
+        // A hole may stand for a property of that name, or one up the chain.
+        return index < arr->size() && arr->hasElement(index);
     };
     /// Pop two operands, convert both to numbers left to right, push `f(a, b)`.
     auto numeric = [&](bigint::BinaryOp big, auto f) {

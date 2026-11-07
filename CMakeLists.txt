@@ -170,6 +170,7 @@ set(SCRIPT_DYNAMIC_SOURCES
     src/dyn/builtins/collections.cpp
     src/dyn/builtins/generators.cpp
     src/dyn/builtins/reflection.cpp
+    src/dyn/builtins/proxy.cpp
     src/dyn/builtins/regexp.cpp
     src/dyn/builtins/typedarray.cpp
     src/dyn/bigint.cpp

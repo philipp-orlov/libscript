@@ -188,6 +188,16 @@ struct Handler
 
 struct Shape;
 struct DynObject;
+struct DynArray;
+
+/// What the element accesses at one place in the code have met, as a byte of `FunctionCode::elemSaw`.
+struct ElemSite
+{
+    static constexpr std::uint8_t kNumbers = 1;  ///< an element of an array of bare numbers
+    static constexpr std::uint8_t kValues = 2;   ///< an element of an array of values
+    static constexpr std::uint8_t kOther = 4;    ///< anything else: no array, no such element, a key that is no index
+    static std::uint8_t of(const DynArray* array) noexcept;
+};
 
 /// What one property access in the code has seen: an inline cache, for the last shape only.
 struct PropertySite
@@ -300,6 +310,8 @@ struct DeoptInfo
 
 struct FunctionCode
 {
+    /// One for each `GetElem`, `GetElemDup` and `SetElem`, whose operand says which.
+    mutable Vec<std::uint8_t> elemSaw;
     std::string name;
     String wideName;  ///< what every closure over this code answers to
     void setName(std::string text)

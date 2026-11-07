@@ -581,8 +581,8 @@ Value entryOf(Runtime& rt, const Value& holder, const Value& key)
     if (DynArray* arr = asArray(holder)) {
         if (key.isNumber()) {
             const double d = numberOf(key);
-            if (d >= 0 && d < double(arr->elements.size()) && double(std::size_t(d)) == d)
-                return arr->elements[std::size_t(d)];
+            if (d >= 0 && d < double(arr->size()) && double(std::size_t(d)) == d)
+                return arr->at(std::size_t(d));
         }
     } else if (key.isString() && detail::Access::ptr(holder)->kind == CellKind::Object) {
         auto* const object = static_cast<DynObject*>(detail::Access::ptr(holder));
@@ -688,16 +688,16 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
 
     if (DynArray* arr = asArray(v)) {
         out.push_back(u'[');
-        for (std::size_t i = 0; i < arr->elements.size(); ++i) {
+        for (std::size_t i = 0; i < arr->size(); ++i) {
             if (i)
                 out.push_back(u',');
             out += open;
             const Value key{double(i)};
-            const Value item = i < arr->elements.size() ? arr->elements[i] : entryOf(rt, v, key);
+            const Value item = i < arr->size() ? arr->at(i) : entryOf(rt, v, key);
             if (!stringifyItem(rt, v, key, item, replacer, indent, inner, out, path))
                 out += ascii("null");
         }
-        if (!arr->elements.empty())
+        if (!arr->empty())
             out += close;
         out.push_back(u']');
         return true;

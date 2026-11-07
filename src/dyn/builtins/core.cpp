@@ -48,7 +48,7 @@ void installObject(Runtime& rt)
         if (self->cls == ObjClass::Array && key->kind == CellKind::String) {
             std::uint32_t index = 0;
             if (arrayIndexOf(static_cast<StringCell*>(key.get())->text(), index))
-                return Value(index < static_cast<DynArray*>(self)->elements.size());
+                return Value(index < static_cast<DynArray*>(self)->size());
         }
         return Value(self->findOwn(key.get()) != nullptr);
     }, 1);
@@ -302,7 +302,9 @@ void installFunction(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         ContextImpl::ArgBuffer buffer(rt2.ctx);
         if (DynArray* arr = asArray(ci.arg(1))) {
-            buffer.args.assign(arr->elements.begin(), arr->elements.end());
+            buffer.args.reserve(arr->size());
+            for (std::size_t i = 0; i < arr->size(); ++i)
+                buffer.args.push_back(arr->at(i));
         } else if (!ci.arg(1).isNullish()) {
             const Vec<Value> items = iterableToVector(rt2, ci.arg(1));
             buffer.args.assign(items.begin(), items.end());

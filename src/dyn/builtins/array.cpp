@@ -196,15 +196,15 @@ void installArray(Runtime& rt)
     rt.method(proto, "push", [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
         a->appendAll(ci.args().data(), ci.args().size());
-        return Value(double(a->elements.size()));
+        return Value(double(a->size()));
     }, 1);
 
     rt.method(proto, "pop", [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
-        if (a->elements.empty())
+        if (a->empty())
             return Value::undefined();
-        Value v = a->elements.back();
-        a->elements.pop_back();
+        Value v = a->at(a->size() - 1);
+        a->removeRange(a->size() - 1, a->size());
         a->trimElements();
         return v;
     }, 0);
@@ -213,27 +213,24 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "shift", [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
-        if (a->elements.empty())
+        if (a->empty())
             return Value::undefined();
-        Value v = a->elements.front();
-        a->elements.erase(a->elements.begin());
+        Value v = a->at(0);
+        a->removeRange(0, 1);
         a->trimElements();
         return v;
     }, 0);
 
     rt.method(proto, "unshift", [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
-        const std::size_t before = a->elements.capacity();
-        a->reserveFor(a->elements, a->elements.size() + ci.args().size());
-        a->elements.insert(a->elements.begin(), ci.args().begin(), ci.args().end());
-        a->chargeIfGrown(a->elements, before);
-        return Value(double(a->elements.size()));
+        a->insertRange(0, ci.args().data(), ci.args().size());
+        return Value(double(a->size()));
     }, 1);
 
     rt.method(proto, "splice", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisMutableArray(ci);
-        const std::size_t n = a->elements.size();
+        const std::size_t n = a->size();
         const std::size_t start = std::size_t(clampIndex(toNumber(rt2, ci.arg(0)), n));
         std::size_t remove = n - start;
         if (ci.size() > 1) {
@@ -241,14 +238,14 @@ void installArray(Runtime& rt)
             remove = std::size_t(std::max<std::int64_t>(
                 0, std::min<std::int64_t>(requested, std::int64_t(n - start))));
         }
-        Vec<Value> removed(a->elements.begin() + std::ptrdiff_t(start),
-                                   a->elements.begin() + std::ptrdiff_t(start + remove));
+        Vec<Value> removed;
+        removed.reserve(remove);
+        for (std::size_t i = start; i < start + remove; ++i)
+            removed.push_back(a->at(i));
         Vec<Value> inserted(ci.args().begin() + std::min<std::size_t>(2, ci.size()),
                                     ci.args().end());
-        a->elements.erase(a->elements.begin() + std::ptrdiff_t(start),
-                          a->elements.begin() + std::ptrdiff_t(start + remove));
-        a->elements.insert(a->elements.begin() + std::ptrdiff_t(start), inserted.begin(),
-                           inserted.end());
+        a->removeRange(start, start + remove);
+        a->insertRange(start, inserted.data(), inserted.size());
         a->trimElements();
         return rt2.makeArray(std::move(removed));
     }, 2);
@@ -256,22 +253,22 @@ void installArray(Runtime& rt)
     rt.method(proto, "reverse", [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         // One element or none: nothing is written, so a frozen array has nothing to object to.
-        if (a->frozen && a->elements.size() > 1)
+        if (a->frozen && a->size() > 1)
             ci.fail(ErrorCode::TypeError, "the array is frozen");
-        std::reverse(a->elements.begin(), a->elements.end());
+        a->reverse();
         return ci.thisValue();
     }, 0);
 
     rt.method(proto, "fill", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisMutableArray(ci);
-        const std::size_t n = a->elements.size();
+        const std::size_t n = a->size();
         const std::size_t from =
             ci.size() > 1 ? std::size_t(clampIndex(toNumber(rt2, ci.arg(1)), n)) : 0;
         const std::size_t to =
             ci.size() > 2 ? std::size_t(clampIndex(toNumber(rt2, ci.arg(2)), n)) : n;
         for (std::size_t i = from; i < to; ++i)
-            a->elements[i] = ci.arg(0);
+            a->put(i, ci.arg(0));
         return ci.thisValue();
     }, 1);
 
@@ -281,8 +278,11 @@ void installArray(Runtime& rt)
         const Value comparator = ci.arg(0);
         // A comparator is script and may shrink or grow the array while it is being sorted, which would leave the
         // merge reading past the end of the elements. Sort a private copy and put it back when it is done.
-        rt2.ctx.reserve(a->elements.size() * sizeof(Value) * 2);
-        Vec<Value> work(a->elements.begin(), a->elements.end());
+        rt2.ctx.reserve(a->size() * sizeof(Value) * 2);
+        Vec<Value> work;
+        work.reserve(a->size());
+        for (std::size_t i = 0; i < a->size(); ++i)
+            work.push_back(a->at(i));
         if (asFunction(comparator)) {
             CallbackLoop call(rt2, comparator);
             mergeSort(work, [&](const Value& x, const Value& y) {
@@ -302,9 +302,7 @@ void installArray(Runtime& rt)
                 return toStringValue(rt2, x) < toStringValue(rt2, y);
             });
         }
-        const std::size_t before = a->elements.capacity();
-        a->elements = std::move(work);
-        a->chargeIfGrown(a->elements, before);
+        a->assignAll(work.data(), work.size());
         return ci.thisValue();
     }, 1);
 
@@ -314,16 +312,16 @@ void installArray(Runtime& rt)
         DynArray* a = thisArray(ci);
         std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
         if (i < 0)
-            i += std::int64_t(a->elements.size());
-        if (i < 0 || i >= std::int64_t(a->elements.size()))
+            i += std::int64_t(a->size());
+        if (i < 0 || i >= std::int64_t(a->size()))
             return Value::undefined();
-        return a->elements[std::size_t(i)];
+        return a->at(std::size_t(i));
     }, 1);
 
     rt.method(proto, "slice", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
-        const std::size_t n = a->elements.size();
+        const std::size_t n = a->size();
         const std::size_t from =
             ci.size() > 0 ? std::size_t(clampIndex(toNumber(rt2, ci.arg(0)), n)) : 0;
         const std::size_t to =
@@ -332,22 +330,26 @@ void installArray(Runtime& rt)
                 : n;
         Vec<Value> out;
         for (std::size_t i = from; i < to; ++i)
-            out.push_back(a->elements[i]);
+            out.push_back(a->at(i));
         return rt2.makeArray(std::move(out));
     }, 2);
 
     rt.method(proto, "concat", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        std::size_t total = thisArray(ci)->elements.size();
+        DynArray* self = thisArray(ci);
+        std::size_t total = self->size();
         for (const Value& v : ci.args())
-            total += asArray(v) ? asArray(v)->elements.size() : 1;
+            total += asArray(v) ? asArray(v)->size() : 1;
         rt2.ctx.reserve(total * sizeof(Value));  // `a = a.concat(a)` doubles; refuse it before the copy, not after
-        Vec<Value> out = thisArray(ci)->elements;
+        Vec<Value> out;
         out.reserve(total);
+        for (std::size_t i = 0; i < self->size(); ++i)
+            out.push_back(self->at(i));
         for (const Value& v : ci.args()) {
-            if (DynArray* other = asArray(v))
-                out.insert(out.end(), other->elements.begin(), other->elements.end());
-            else
+            if (DynArray* other = asArray(v)) {
+                for (std::size_t i = 0; i < other->size(); ++i)
+                    out.push_back(other->at(i));
+            } else
                 out.push_back(v);
         }
         return rt2.makeArray(std::move(out));
@@ -359,11 +361,12 @@ void installArray(Runtime& rt)
         const String sep =
             ci.arg(0).isUndefined() ? ascii(",") : toStringValue(rt2, ci.arg(0));
         String out;
-        for (std::size_t i = 0; i < a->elements.size(); ++i) {
+        for (std::size_t i = 0; i < a->size(); ++i) {
             checkLongLoop(rt2, i, 0);
             String piece;
-            if (!a->elements[i].isNullish())
-                piece = toStringValue(rt2, a->elements[i]);
+            const Value item = a->at(i);
+            if (!item.isNullish())
+                piece = toStringValue(rt2, item);
             // The text is built in a temporary the memory limit has not seen yet, and one piece can be megabytes,
             // so the check is made on every pass rather than every thousandth.
             rt2.ctx.reserve((out.size() + sep.size() + piece.size()) * sizeof(Char));
@@ -382,8 +385,8 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "indexOf", [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
-        for (std::size_t i = 0; i < a->elements.size(); ++i) {
-            if (strictEquals(a->elements[i], ci.arg(0)))
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            if (strictEquals(a->at(i), ci.arg(0)))
                 return Value(double(i));
         }
         return Value(-1.0);
@@ -391,8 +394,8 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "lastIndexOf", [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
-        for (std::size_t i = a->elements.size(); i-- > 0;) {
-            if (strictEquals(a->elements[i], ci.arg(0)))
+        for (std::size_t i = a->size(); i-- > 0;) {
+            if (strictEquals(a->at(i), ci.arg(0)))
                 return Value(double(i));
         }
         return Value(-1.0);
@@ -400,8 +403,8 @@ void installArray(Runtime& rt)
 
     rt.method(proto, "includes", [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
-        for (const Value& v : a->elements) {
-            if (sameValueZero(v, ci.arg(0)))
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            if (sameValueZero(a->at(i), ci.arg(0)))
                 return Value(true);
         }
         return Value(false);
@@ -416,8 +419,8 @@ void installArray(Runtime& rt)
             ci.fail(ErrorCode::TypeError, "a callback function is required");
         Value produced;
         CallbackLoop call(rt2, fn);
-        for (std::size_t i = 0; i < a->elements.size(); ++i) {
-            const Value item = a->elements[i];
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            const Value item = a->at(i);
             produced = call(ci.arg(1), {item, Value(double(i)), ci.thisValue()});
             if (!step(i, item, produced))
                 break;
@@ -498,22 +501,23 @@ void installArray(Runtime& rt)
             std::isnan(requested) || requested < 1 ? 0 : (requested > 1e9 ? std::size_t(1e9) : std::size_t(requested));
         Vec<Value> out;
         std::size_t level = 0;
-        std::function<void(const Vec<Value>&, std::size_t)> walk =
-            [&](const Vec<Value>& items, std::size_t left) {
+        std::function<void(DynArray*, std::size_t)> walk =
+            [&](DynArray* items, std::size_t left) {
                 NestingScope nest(level);
                 if (nest.tooDeep(10000))
                     throwError(rt2, ErrorCode::RangeError, "array is nested too deeply");
-                for (const Value& v : items) {
+                for (std::size_t i = 0; i < items->size(); ++i) {
+                    const Value v = items->at(i);
                     DynArray* nested = asArray(v);
                     if (nested && left > 0)
-                        walk(nested->elements, left - 1);
+                        walk(nested, left - 1);
                     else {
                         checkLongLoop(rt2, out.size(), out.size() * sizeof(Value) * 2);
                         out.push_back(v);
                     }
                 }
             };
-        walk(thisArray(ci)->elements, depth);
+        walk(thisArray(ci), depth);
         return rt2.makeArray(std::move(out));
     }, 1);
 
@@ -521,12 +525,13 @@ void installArray(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         Vec<Value> out;
-        for (std::size_t i = 0; i < a->elements.size(); ++i) {
+        for (std::size_t i = 0; i < a->size(); ++i) {
             Value produced = callValue(rt2, ci.arg(0), ci.arg(1),
-                                       {a->elements[i], Value(double(i)), ci.thisValue()});
-            if (DynArray* nested = asArray(produced))
-                out.insert(out.end(), nested->elements.begin(), nested->elements.end());
-            else
+                                       {a->at(i), Value(double(i)), ci.thisValue()});
+            if (DynArray* nested = asArray(produced)) {
+                for (std::size_t k = 0; k < nested->size(); ++k)
+                    out.push_back(nested->at(k));
+            } else
                 out.push_back(produced);
         }
         return rt2.makeArray(std::move(out));
@@ -538,7 +543,7 @@ void installArray(Runtime& rt)
         const Value fn = ci.arg(0);
         if (!asFunction(fn))
             ci.fail(ErrorCode::TypeError, "a callback function is required");
-        const std::size_t n = a->elements.size();
+        const std::size_t n = a->size();
         std::size_t at = 0;
         Value acc;
         if (ci.size() > 1) {
@@ -546,16 +551,16 @@ void installArray(Runtime& rt)
         } else {
             if (n == 0)
                 ci.fail(ErrorCode::TypeError, "reduce of an empty array with no initial value");
-            acc = a->elements[reversed ? n - 1 : 0];
+            acc = a->at(reversed ? n - 1 : 0);
             at = 1;
         }
         CallbackLoop call(rt2, fn);
         for (; at < n; ++at) {
             const std::size_t i = reversed ? n - 1 - at : at;
             // The callback may have shortened the array; an element that is gone is skipped, as in JavaScript.
-            if (i >= a->elements.size())
+            if (i >= a->size())
                 continue;
-            acc = call(Value::undefined(), {acc, a->elements[i], Value(double(i)), ci.thisValue()});
+            acc = call(Value::undefined(), {acc, a->at(i), Value(double(i)), ci.thisValue()});
         }
         return acc;
     };

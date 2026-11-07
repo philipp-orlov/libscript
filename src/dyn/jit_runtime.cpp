@@ -594,9 +594,9 @@ NativePair scriptDynForInNext(Runtime* rt, GCObject* keys, std::int64_t indexTag
     (void)rt;
     auto* array = static_cast<DynArray*>(keys);
     const std::size_t at = std::size_t(numberOf(valueOf(indexTag, index)));
-    if (at >= array->elements.size())
+    if (at >= array->size())
         return {0, std::uint64_t(kForInDone)};
-    return take(array->elements[at]);
+    return take(array->at(at));
 }
 
 NativePair scriptDynGetSuper(Runtime* rt, GCObject* fn, std::int64_t thisTag, std::uint64_t self, GCObject* key) noexcept

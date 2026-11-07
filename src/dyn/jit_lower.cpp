@@ -57,7 +57,10 @@ constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
 constexpr std::int64_t kStringCharsOffset = sizeof(StringCell);
 constexpr std::int64_t kRareOffset = offsetof(DynObject, rare);
 constexpr std::int64_t kPropValueOffset = offsetof(Prop, value);
-constexpr std::int64_t kElementsOffset = offsetof(DynArray, elements);
+constexpr std::int64_t kElementsOffset = offsetof(DynArray, store);  // a pointer, then two 32-bit counts
+constexpr std::int64_t kElementCountOffset = kElementsOffset + 8;
+constexpr std::int64_t kElementCapOffset = kElementsOffset + 12;
+constexpr std::int64_t kNumbersOnlyOffset = offsetof(DynObject, numbersOnly);
 constexpr std::int64_t kFnCodeOffset = offsetof(DynFunction, code);  // the first word of a shared_ptr is the pointer
 constexpr std::int64_t kFnUpvaluesOffset = offsetof(DynFunction, upvalues);
 constexpr std::int64_t kCallEntryOffset = offsetof(FunctionCode, jitCallEntry);
@@ -162,6 +165,9 @@ int operandsOf(Op op) noexcept
         case Op::SetGlobal:
         case Op::TypeofGlobal:
         case Op::DeleteGlobal:
+        case Op::GetElem:
+        case Op::SetElem:
+        case Op::GetElemDup:
         case Op::GetProp:
         case Op::SetProp:
         case Op::GetPropDup:
@@ -2179,8 +2185,8 @@ private:
             case Op::GetProp: getProp(operand(), false); return true;
             case Op::GetPropDup: getProp(operand(), true); return true;
             case Op::SetProp: setProp(operand()); return true;
-            case Op::GetElem: getElem(); return true;
-            case Op::SetElem: setElem(); return true;
+            case Op::GetElem: getElem(operand()); return true;
+            case Op::SetElem: setElem(operand()); return true;
             case Op::DefField: {
                 Entry value = pop();
                 Entry& object = stack_.back();
@@ -2245,6 +2251,7 @@ private:
             }
             case Op::GetElemDup: {
                 // base key -> value base
+                (void)operand();
                 Entry key = pop();
                 Entry base = pop();
                 secureWeak();
@@ -3555,7 +3562,7 @@ private:
         return i;
     }
 
-    void getElem()
+    void getElem(std::uint32_t elemOperand)
     {
         Entry key = pop();
         Entry base = pop();
@@ -3572,29 +3579,45 @@ private:
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
         const bool bet = betHere();
+        const std::uint8_t saw = code_.elemSaw[elemOperand];
         guardArray(base, slow);
         const std::int32_t i = arrayIndex(key, slow);
-        const std::int32_t data = loadHeader(base.r, kElementsOffset);
-        const std::int32_t end = loadHeader(base.r, kElementsOffset + 8);
-        const std::int32_t size = fn_.newVreg(false);
-        IrInst& sub = inst(IrOp::Sub);
-        sub.d = size;
-        sub.a = end;
-        sub.b = data;
-        sub.width = 64;
-        const std::int32_t scaled = fn_.newVreg(false);
-        IrInst& shl = inst(IrOp::Shl);
-        shl.d = scaled;
-        shl.a = i;
-        shl.hasImm = true;
-        shl.imm = 4;
-        shl.width = 64;
-        IrInst& bound = inst(IrOp::BrCmp);
-        bound.a = scaled;
-        bound.b = size;
-        bound.cond = IrCond::Hs;
-        bound.width = 64;
-        bound.target = slow;
+        const std::int32_t data = elementSpan(base, i, slow);
+        if (bet && saw == ElemSite::kNumbers) {
+            // Only ever an element of an array of numbers: what it is, known here.
+            const std::int32_t numbersOnly = load(base.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+            branchCmp(numbersOnly, IrCond::Eq, 0, slow);
+            const std::int32_t bits = loadBareElement(data, i, slow);
+            const std::int32_t fp = fn_.newVreg(true);
+            IrInst& conv = inst(IrOp::BitsToFp);
+            conv.d = fp;
+            conv.a = bits;
+            conv.width = 64;
+            emitBail(slow, {base, key});
+            release(key);
+            release(base);
+            push(doubleEntry(fp));
+            return;
+        }
+        const std::int32_t values = newLabel();
+        const std::int32_t joined = newLabel();
+        const bool onlyValues = bet && saw == ElemSite::kValues;
+        const std::int32_t numbersOnly = load(base.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+        if (onlyValues) {
+            branchCmp(numbersOnly, IrCond::Ne, 0, slow);
+        } else {
+            branchCmp(numbersOnly, IrCond::Eq, 0, values);
+            const std::int32_t bits = loadBareElement(data, i, slow);
+            IrInst& mr = inst(IrOp::Mov);
+            mr.d = r;
+            mr.a = bits;
+            IrInst& mt = inst(IrOp::MovImm);
+            mt.d = t;
+            mt.imm = std::int64_t(Type::Double);
+            inst(IrOp::Br).imm = joined;
+            inst(IrOp::Label).imm = values;
+        }
+        const std::int32_t scaled = shiftLeft(i, 4);
         IrInst& lt = inst(IrOp::LoadIdx);
         lt.d = t;
         lt.a = data;
@@ -3606,6 +3629,8 @@ private:
         lr.b = scaled;
         lr.imm = kPayload;
         lr.width = 8;
+        if (!onlyValues)
+            inst(IrOp::Label).imm = joined;
         if (bet) {
             // An index into an array it has; anything else, the interpreter does.
             emitBail(slow, {base, key});
@@ -3630,6 +3655,52 @@ private:
         }
     }
 
+    std::int32_t shiftLeft(std::int32_t a, std::int64_t by)
+    {
+        const std::int32_t d = fn_.newVreg(false);
+        IrInst& shl = inst(IrOp::Shl);
+        shl.d = d;
+        shl.a = a;
+        shl.hasImm = true;
+        shl.imm = by;
+        shl.width = 64;
+        return d;
+    }
+
+    /// Where an array's elements are, once `i` is known to be one of them; otherwise to `slow`.
+    std::int32_t elementSpan(const Entry& base, std::int32_t i, std::int32_t slow)
+    {
+        const std::int32_t data = loadHeader(base.r, kElementsOffset);
+        const std::int32_t count = load(base.r, kElementCountOffset, 4, false, kAliasHeader);
+        IrInst& bound = inst(IrOp::BrCmp);
+        bound.a = i;
+        bound.b = count;
+        bound.cond = IrCond::Hs;
+        bound.width = 64;
+        bound.target = slow;
+        return data;
+    }
+
+    /// The bits of element `i` of an array of numbers; `undefined` goes to `slow`.
+    std::int32_t loadBareElement(std::int32_t data, std::int32_t i, std::int32_t slow)
+    {
+        const std::int32_t bits = fn_.newVreg(false);
+        const std::int32_t scaled = shiftLeft(i, 3);
+        IrInst& load8 = inst(IrOp::LoadIdx);
+        load8.d = bits;
+        load8.a = data;
+        load8.b = scaled;
+        load8.width = 8;
+        const std::int32_t undefinedBits = immReg(std::int64_t(kUndefinedElement));
+        IrInst& undefinedHere = inst(IrOp::BrCmp);
+        undefinedHere.a = bits;
+        undefinedHere.b = undefinedBits;
+        undefinedHere.cond = IrCond::Eq;
+        undefinedHere.width = 64;
+        undefinedHere.target = slow;
+        return bits;
+    }
+
     void guardArray(const Entry& base, std::int32_t slow)
     {
         // What an object is does not change, so one check holds until the register holds something else.
@@ -3650,7 +3721,7 @@ private:
         learn();
     }
 
-    void setElem()
+    void setElem(std::uint32_t elemOperand)
     {
         Entry value = pop();
         Entry key = pop();
@@ -3673,38 +3744,57 @@ private:
         const std::int32_t named = load(base.r, kPropsSizeOffset, 4, false, kAliasHeader);
         branchCmp(named, IrCond::Ne, 0, slow);
         const std::int32_t i = arrayIndex(key, slow);
-        const std::int32_t data = loadHeader(base.r, kElementsOffset);
-        const std::int32_t end = loadHeader(base.r, kElementsOffset + 8);
-        const std::int32_t size = fn_.newVreg(false);
-        IrInst& sub = inst(IrOp::Sub);
-        sub.d = size;
-        sub.a = end;
-        sub.b = data;
-        sub.width = 64;
-        const std::int32_t scaled = fn_.newVreg(false);
-        IrInst& shl = inst(IrOp::Shl);
-        shl.d = scaled;
-        shl.a = i;
-        shl.hasImm = true;
-        shl.imm = 4;
-        shl.width = 64;
-        IrInst& bound = inst(IrOp::BrCmp);
-        bound.a = scaled;
-        bound.b = size;
-        bound.cond = IrCond::Hs;
-        bound.width = 64;
-        bound.target = slow;
-        const std::int32_t slot = fn_.newVreg(false);
-        IrInst& add = inst(IrOp::Add);
-        add.d = slot;
-        add.a = data;
-        add.b = scaled;
-        add.width = 64;
-        const std::int32_t oldTag = load(slot, 0, 1);
-        const std::int32_t old = load(slot, kPayload, 8);
-        store(slot, 0, vt, 1);
-        store(slot, kPayload, vr, 8);
-        decRefOf(old, oldTag, false);
+        const std::int32_t data = elementSpan(base, i, slow);
+        const std::uint8_t saw = code_.elemSaw[elemOperand];
+        const bool bet = betHere();
+        const std::int32_t numbersOnly = load(base.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+        const std::int32_t stored = newLabel();
+        // Into an array of numbers, while what comes is one; the rest of what can be there takes a call to sort out.
+        const auto storeBare = [&] {
+            if (!isKnownNumber(value)) {
+                if (value.hasKnownTag || value.isConst || value.rep != Rep::Tagged)
+                    inst(IrOp::Br).imm = slow;
+                else
+                    branchCmp(vt, IrCond::Ne, std::int64_t(Type::Double), slow);
+            }
+            const std::int32_t slot = fn_.newVreg(false);
+            const std::int32_t scaled = shiftLeft(i, 3);
+            IrInst& add = inst(IrOp::Add);
+            add.d = slot;
+            add.a = data;
+            add.b = scaled;
+            add.width = 64;
+            store(slot, 0, vr, 8);
+        };
+        const auto storeValue = [&] {
+            const std::int32_t slot = fn_.newVreg(false);
+            const std::int32_t scaled = shiftLeft(i, 4);
+            IrInst& add = inst(IrOp::Add);
+            add.d = slot;
+            add.a = data;
+            add.b = scaled;
+            add.width = 64;
+            const std::int32_t oldTag = load(slot, 0, 1);
+            const std::int32_t old = load(slot, kPayload, 8);
+            store(slot, 0, vt, 1);
+            store(slot, kPayload, vr, 8);
+            decRefOf(old, oldTag, false);
+        };
+        if (bet && saw == ElemSite::kNumbers) {
+            branchCmp(numbersOnly, IrCond::Eq, 0, slow);
+            storeBare();
+        } else if (bet && saw == ElemSite::kValues) {
+            branchCmp(numbersOnly, IrCond::Ne, 0, slow);
+            storeValue();
+        } else {
+            const std::int32_t values = newLabel();
+            branchCmp(numbersOnly, IrCond::Eq, 0, values);
+            storeBare();
+            inst(IrOp::Br).imm = stored;
+            inst(IrOp::Label).imm = values;
+            storeValue();
+            inst(IrOp::Label).imm = stored;
+        }
         if (betHere()) {
             emitBail(slow, {base, key, value});
         } else {
@@ -3930,11 +4020,12 @@ private:
         branchNotBelow(heapBytes, word(heap, std::int64_t(offsetof(ContextImpl, nextGcBytes))));
         const std::int32_t liveObjects = word(heap, std::int64_t(offsetof(ContextImpl, liveObjects)));
         const std::int32_t cells = fn_.newVreg(false);
+        const std::int32_t liveStrings = word(heap, std::int64_t(offsetof(ContextImpl, liveStrings)));
         {
             IrInst& add = inst(IrOp::Add);
             add.d = cells;
             add.a = liveObjects;
-            add.b = word(heap, std::int64_t(offsetof(ContextImpl, liveStrings)));
+            add.b = liveStrings;
             add.width = 64;
         }
         branchNotBelow(cells, word(heap, std::int64_t(offsetof(ContextImpl, nextGcCells))));
@@ -4128,16 +4219,9 @@ private:
         return d;
     }
 
-    /// The new length, as a double, from the byte span of the elements.
-    void lengthResult(std::int32_t bytes, std::int32_t r, std::int32_t t)
+    /// A count of elements as the number it is to script.
+    void lengthResult(std::int32_t count, std::int32_t r, std::int32_t t)
     {
-        const std::int32_t count = fn_.newVreg(false);
-        IrInst& shr = inst(IrOp::Shr);
-        shr.d = count;
-        shr.a = bytes;
-        shr.hasImm = true;
-        shr.imm = 4;
-        shr.width = 64;
         const std::int32_t d = fn_.newVreg(true);
         IrInst& conv = inst(IrOp::IntToFp);
         conv.d = d;
@@ -4151,67 +4235,115 @@ private:
     void inlinePush(const Entry& self, const Entry& value, std::int32_t r, std::int32_t t, std::int32_t generic)
     {
         guardGrowableArray(self, generic);
-        const std::int32_t begin = loadHeader(self.r, kElementsOffset);
-        const std::int32_t end = loadHeader(self.r, kElementsOffset + 8);
-        const std::int32_t cap = loadHeader(self.r, kElementsOffset + 16);
+        const std::int32_t data = loadHeader(self.r, kElementsOffset);
+        const std::int32_t count = load(self.r, kElementCountOffset, 4, false, kAliasHeader);
+        const std::int32_t cap = load(self.r, kElementCapOffset, 4, false, kAliasHeader);
         {
             IrInst& full = inst(IrOp::BrCmp);
-            full.a = end;
+            full.a = count;
             full.b = cap;
             full.cond = IrCond::Eq;
             full.width = 64;
             full.target = generic;
         }
-        // The arguments are owned by now, but the generic path releases them after the call; this one keeps a count.
         const std::int32_t vt = tagReg(value);
         const std::int32_t vr = payloadReg(value);
+        const std::int32_t numbersOnly = load(self.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+        const std::int32_t values = newLabel();
+        const std::int32_t stored = newLabel();
+        branchCmp(numbersOnly, IrCond::Eq, 0, values);
+        // Into an array of numbers, if it is one.
+        if (!isKnownNumber(value)) {
+            if (value.hasKnownTag || value.isConst || value.rep != Rep::Tagged)
+                inst(IrOp::Br).imm = generic;
+            else
+                branchCmp(vt, IrCond::Ne, std::int64_t(Type::Double), generic);
+        }
+        {
+            const std::int32_t slot = fn_.newVreg(false);
+            const std::int32_t scaled = shiftLeft(count, 3);
+            IrInst& add = inst(IrOp::Add);
+            add.d = slot;
+            add.a = data;
+            add.b = scaled;
+            add.width = 64;
+            store(slot, 0, vr, 8);
+        }
+        inst(IrOp::Br).imm = stored;
+        inst(IrOp::Label).imm = values;
+        // The arguments are owned by now, but the generic path releases them after the call; this one keeps a count.
         if (!value.hasKnownTag)
             incRefOf(vr, vt, false);
         else if (value.known >= Type::String)
             incRefOf(vr, -1, false);
-        store(end, 0, vt, 1);
-        store(end, kPayload, vr, 8);
+        {
+            const std::int32_t slot = fn_.newVreg(false);
+            const std::int32_t scaled = shiftLeft(count, 4);
+            IrInst& add = inst(IrOp::Add);
+            add.d = slot;
+            add.a = data;
+            add.b = scaled;
+            add.width = 64;
+            store(slot, 0, vt, 1);
+            store(slot, kPayload, vr, 8);
+        }
+        inst(IrOp::Label).imm = stored;
         const std::int32_t next = fn_.newVreg(false);
-        IrInst& add = inst(IrOp::Add);
-        add.d = next;
-        add.a = end;
-        add.hasImm = true;
-        add.imm = std::int64_t(sizeof(Value));
-        add.width = 64;
-        storeHeader(self.r, kElementsOffset + 8, next);
-        lengthResult(subtract(next, begin), r, t);
+        IrInst& plus = inst(IrOp::Add);
+        plus.d = next;
+        plus.a = count;
+        plus.hasImm = true;
+        plus.imm = 1;
+        plus.width = 64;
+        store(self.r, kElementCountOffset, next, 4, kAliasHeader);
+        lengthResult(next, r, t);
     }
 
     /// `array.pop()` on an array that is not empty: the element's count comes along with it.
     void inlinePop(const Entry& self, std::int32_t r, std::int32_t t, std::int32_t generic)
     {
         guardGrowableArray(self, generic);
-        const std::int32_t begin = loadHeader(self.r, kElementsOffset);
-        const std::int32_t end = loadHeader(self.r, kElementsOffset + 8);
-        {
-            IrInst& empty = inst(IrOp::BrCmp);
-            empty.a = end;
-            empty.b = begin;
-            empty.cond = IrCond::Eq;
-            empty.width = 64;
-            empty.target = generic;
-        }
+        const std::int32_t data = loadHeader(self.r, kElementsOffset);
+        const std::int32_t count = load(self.r, kElementCountOffset, 4, false, kAliasHeader);
+        branchCmp(count, IrCond::Eq, 0, generic);
         const std::int32_t last = fn_.newVreg(false);
         IrInst& sub = inst(IrOp::Sub);
         sub.d = last;
-        sub.a = end;
+        sub.a = count;
         sub.hasImm = true;
-        sub.imm = std::int64_t(sizeof(Value));
+        sub.imm = 1;
         sub.width = 64;
-        const std::int32_t lt = load(last, 0, 1);
-        const std::int32_t lr = load(last, kPayload, 8);
-        storeHeader(self.r, kElementsOffset + 8, last);
-        IrInst& mt = inst(IrOp::Mov);
-        mt.d = t;
-        mt.a = lt;
-        IrInst& mr = inst(IrOp::Mov);
-        mr.d = r;
-        mr.a = lr;
+        const std::int32_t numbersOnly = load(self.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+        const std::int32_t values = newLabel();
+        const std::int32_t loaded = newLabel();
+        branchCmp(numbersOnly, IrCond::Eq, 0, values);
+        {
+            const std::int32_t bits = loadBareElement(data, last, generic);
+            IrInst& mr = inst(IrOp::Mov);
+            mr.d = r;
+            mr.a = bits;
+            IrInst& mt = inst(IrOp::MovImm);
+            mt.d = t;
+            mt.imm = std::int64_t(Type::Double);
+        }
+        inst(IrOp::Br).imm = loaded;
+        inst(IrOp::Label).imm = values;
+        {
+            const std::int32_t scaled = shiftLeft(last, 4);
+            IrInst& lt = inst(IrOp::LoadIdx);
+            lt.d = t;
+            lt.a = data;
+            lt.b = scaled;
+            lt.width = 1;
+            IrInst& lr = inst(IrOp::LoadIdx);
+            lr.d = r;
+            lr.a = data;
+            lr.b = scaled;
+            lr.imm = kPayload;
+            lr.width = 8;
+        }
+        inst(IrOp::Label).imm = loaded;
+        store(self.r, kElementCountOffset, last, 4, kAliasHeader);
     }
 
     /// `fn.apply(thisArg, array)` with an array nothing else holds -- `arguments` above all -- called with the array's
@@ -4223,16 +4355,11 @@ private:
         guardArray(list, generic);
         const std::int32_t rc = load(list.r, kRcOffset, 4);
         branchCmp(rc, IrCond::Ne, 1, generic);
+        // Its elements are the arguments only if they are values.
+        const std::int32_t numbersOnly = load(list.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
+        branchCmp(numbersOnly, IrCond::Ne, 0, generic);
         const std::int32_t begin = loadHeader(list.r, kElementsOffset);
-        const std::int32_t end = loadHeader(list.r, kElementsOffset + 8);
-        const std::int32_t bytes = subtract(end, begin);
-        const std::int32_t count = fn_.newVreg(false);
-        IrInst& shr = inst(IrOp::Shr);
-        shr.d = count;
-        shr.a = bytes;
-        shr.hasImm = true;
-        shr.imm = 4;
-        shr.width = 64;
+        const std::int32_t count = load(list.r, kElementCountOffset, 4, false, kAliasHeader);
         std::vector<Entry> held = args;
         held.push_back(self);
         held.push_back(callee);
@@ -4315,9 +4442,7 @@ private:
         branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), slow);
         const std::int32_t cls = load(base.r, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Array), slow);
-        const std::int32_t begin = loadHeader(base.r, kElementsOffset);
-        const std::int32_t end = loadHeader(base.r, kElementsOffset + 8);
-        lengthResult(subtract(end, begin), r, t);
+        lengthResult(load(base.r, kElementCountOffset, 4, false, kAliasHeader), r, t);
         inst(IrOp::Br).imm = done;
         inst(IrOp::Label).imm = notObject;
         branchCmp(tag, IrCond::Ne, std::int64_t(Type::String), slow);

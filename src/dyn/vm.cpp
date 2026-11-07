@@ -337,7 +337,7 @@ bool arrayElementKey(DynArray* arr, GCObject* key, std::uint32_t& index)
 {
     if (key->kind != CellKind::String)
         return false;
-    return arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < arr->elements.size();
+    return arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < arr->size();
 }
 
 }  // namespace
@@ -349,9 +349,9 @@ Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Valu
             auto* arr = static_cast<DynArray*>(cursor);
             std::uint32_t index = 0;
             if (arrayElementKey(arr, key, index))
-                return arr->elements[index];
+                return arr->at(index);
             if (key == rt.atom.length.get())
-                return Value(double(arr->elements.size()));
+                return Value(double(arr->size()));
         }
         if (cursor->cls == ObjClass::StringObject && key == rt.atom.length.get()) {
             auto* w = static_cast<DynWrapper*>(cursor);
@@ -479,15 +479,15 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
         if (key->kind == CellKind::String) {
             std::uint32_t index = 0;
             if (arrayIndexOf(static_cast<StringCell*>(key)->text(), index)) {
-                if (obj->frozen || (index >= arr->elements.size() && !obj->extensible))
+                if (obj->frozen || (index >= arr->size() && !obj->extensible))
                     return;
-                if (index >= arr->elements.size()) {
-                    if (index > arr->elements.size() + (1u << 22))
+                if (index >= arr->size()) {
+                    if (index > arr->size() + (1u << 22))
                         throwError(rt, ErrorCode::RangeError,
                                    "arrays are dense; this index would leave too large a gap");
                     arr->resize(index + 1);
                 }
-                arr->elements[index] = v;
+                arr->put(index, v);
                 return;
             }
         }
@@ -725,8 +725,8 @@ bool deleteProperty(Runtime&, const Value& base, GCObject* key)
         auto* arr = static_cast<DynArray*>(obj);
         std::uint32_t index = 0;
         if (arrayIndexOf(static_cast<StringCell*>(key)->text(), index)) {
-            if (index < arr->elements.size())
-                arr->elements[index] = Value::undefined();
+            if (index < arr->size())
+                arr->put(index, Value::undefined());
             return true;
         }
     }
@@ -741,7 +741,7 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
     Vec<Value> keys;
     if (obj->cls == ObjClass::Array) {
         auto* arr = static_cast<DynArray*>(obj);
-        for (std::uint32_t i = 0; i < arr->elements.size(); ++i)
+        for (std::uint32_t i = 0; i < arr->size(); ++i)
             keys.push_back(rt.str(numberToString(i)));
     }
     if (obj->cls == ObjClass::StringObject) {
@@ -768,8 +768,8 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
 Value getIndex(Runtime& rt, const Value& base, std::uint32_t i)
 {
     if (DynArray* arr = asArray(base)) {
-        if (i < arr->elements.size())
-            return arr->elements[i];
+        if (i < arr->size())
+            return arr->at(i);
         return Value::undefined();
     }
     return getProperty(rt, base, rt.intern(numberToString(i)));
@@ -778,8 +778,8 @@ Value getIndex(Runtime& rt, const Value& base, std::uint32_t i)
 void setIndex(Runtime& rt, const Value& base, std::uint32_t i, const Value& v)
 {
     if (DynArray* arr = asArray(base)) {
-        if (i < arr->elements.size()) {
-            arr->elements[i] = v;
+        if (i < arr->size()) {
+            arr->put(i, v);
             return;
         }
     }
@@ -789,7 +789,7 @@ void setIndex(Runtime& rt, const Value& base, std::uint32_t i, const Value& v)
 std::uint32_t lengthOf(Runtime& rt, const Value& v)
 {
     if (DynArray* arr = asArray(v))
-        return std::uint32_t(arr->elements.size());
+        return std::uint32_t(arr->size());
     if (StringCell* s = asString(v))
         return std::uint32_t(s->text().size());
     const double n = toNumber(rt, getProperty(rt, v, rt.atom.length.get()));
@@ -1216,7 +1216,13 @@ Vec<Value> iterableToVector(Runtime& rt, const Value& iterable)
     if (DynArray* arr = asArray(iterable)) {
         // Fast path: a plain array with the untouched built-in iterator.
         if (arr->proto.get() == rt.arrayProto.get() && !arr->findOwn(rt.sym.iterator.get()))
-            return arr->elements;
+        {
+            Vec<Value> items;
+            items.reserve(arr->size());
+            for (std::size_t i = 0; i < arr->size(); ++i)
+                items.push_back(arr->at(i));
+            return items;
+        }
     }
     Vec<Value> out;
     const Value iterator = getIterator(rt, iterable);
@@ -1382,8 +1388,11 @@ Value execute(Runtime& rt, Frame& frame)
     /// spread forms, one array holding them all.
     auto popArgs = [&](std::vector<Value>& args, bool spread) {
         if (spread) {
-            const Vec<Value>& items = asArray(sp.back())->elements;
-            args.assign(items.begin(), items.end());
+            DynArray* items = asArray(sp.back());
+            args.clear();
+            args.reserve(items->size());
+            for (std::size_t i = 0; i < items->size(); ++i)
+                args.push_back(items->at(i));
             sp.pop_back();
         } else {
             const std::uint32_t argc = operandAt(pc);
@@ -1405,7 +1414,7 @@ Value execute(Runtime& rt, Frame& frame)
         if (double(index) != d)
             return false;
         arr = static_cast<DynArray*>(obj);
-        return index < arr->elements.size();
+        return index < arr->size();
     };
     /// Pop two operands, convert both to numbers left to right, push `f(a, b)`.
     auto numeric = [&](auto f) {
@@ -1645,35 +1654,45 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::GetElem: {
+                        std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
+                        pc += 4;
+                        const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
                         {
                             DynArray* arr = nullptr;
                             std::uint32_t index = 0;
                             const std::size_t n = sp.size();
                             if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
-                                Value r = arr->elements[index];
+                                note(ElemSite::of(arr));
+                                Value r = arr->at(index);
                                 sp.pop_back();
                                 sp.back() = std::move(r);
                                 break;
                             }
                         }
+                        note(ElemSite::kOther);
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
                         sp.push_back(getProperty(rt, base, key.get()));
                         break;
                     }
                     case Op::GetElemDup: {
+                        std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
+                        pc += 4;
+                        const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
                         {
                             DynArray* arr = nullptr;
                             std::uint32_t index = 0;
                             const std::size_t n = sp.size();
                             if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
-                                Value r = arr->elements[index];
+                                note(ElemSite::of(arr));
+                                Value r = arr->at(index);
                                 Value base = sp[n - 2];
                                 sp[n - 2] = std::move(r);
                                 sp[n - 1] = std::move(base);
                                 break;
                             }
                         }
+                        note(ElemSite::kOther);
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = sp.back();
                         sp.back() = getProperty(rt, base, key.get());
@@ -1681,19 +1700,24 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::SetElem: {
+                        std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
+                        pc += 4;
+                        const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
                         {
                             DynArray* arr = nullptr;
                             std::uint32_t index = 0;
                             const std::size_t n = sp.size();
                             // With an own property in the table, "0" may be there with attributes of its own.
                             if (fastIndex(sp[n - 3], sp[n - 2], arr, index) && !arr->frozen && arr->props.empty()) {
-                                arr->elements[index] = sp[n - 1];
+                                note(ElemSite::of(arr));
+                                arr->put(index, sp[n - 1]);
                                 Value v = std::move(sp[n - 1]);
                                 sp.resize(n - 3);
                                 sp.push_back(std::move(v));
                                 break;
                             }
                         }
+                        note(ElemSite::kOther);
                         Value v = pop();
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
@@ -1790,8 +1814,8 @@ Value execute(Runtime& rt, Frame& frame)
                             for (const Value& key : ownKeys(rt, from, true, false)) {
                                 bool drop = false;
                                 if (skip) {
-                                    for (const Value& s : skip->elements)
-                                        drop = drop || strictEquals(s, key);
+                                    for (std::size_t i = 0; i < skip->size(); ++i)
+                                        drop = drop || strictEquals(skip->at(i), key);
                                 }
                                 if (drop)
                                     continue;
@@ -2054,12 +2078,12 @@ Value execute(Runtime& rt, Frame& frame)
                         pc += 4;
                         DynArray* keys = asArray(sp[sp.size() - 2]);
                         const std::size_t index = std::size_t(numberOf(sp.back()));
-                        if (index >= keys->elements.size()) {
+                        if (index >= keys->size()) {
                             pc = target;
                             break;
                         }
                         sp.back() = Value(double(index + 1));
-                        sp.push_back(keys->elements[index]);
+                        sp.push_back(keys->at(index));
                         break;
                     }
                     case Op::IterStart: {

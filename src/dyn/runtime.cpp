@@ -386,14 +386,22 @@ void Runtime::objectImage(DynObject* proto, Shape* root, std::uint32_t room, std
 
 DynArray* Runtime::newArray(std::size_t reserve)
 {
-    const std::size_t room = std::min<std::size_t>(reserve, 1u << 20);
-    ctx.reserve(room * sizeof(Value));  // before the cell exists, so a refusal leaves nothing behind
-    auto* a = newCell<DynArray>();
+    // A few elements are kept in the cell, with room for them to be values: one allocation for a small array.
+    constexpr std::size_t kInCell = 8;
+    const std::size_t room = reserve <= kInCell ? reserve * sizeof(Value) : 0;
+    const std::size_t apart = room ? 0 : std::min<std::size_t>(reserve, 1u << 20);
+    ctx.reserve(apart * sizeof(double));  // before the cell exists, so a refusal leaves nothing behind
+    ctx.maybeCollect();
+    const std::size_t bytes = sizeof(DynArray) + room;
+    ctx.reserve(bytes);
+    auto* a = new (ctx.heap.allocate(bytes)) DynArray();
+    a->cellBytes = std::uint32_t(bytes);
+    if (room)
+        a->adoptRoom(room);
+    ctx.linkKnown(a, std::uint32_t(bytes));
     a->setProto(arrayProto ? arrayProto.get() : objectProto.get());
-    if (reserve) {
-        a->elements.reserve(room);
-        a->chargeGrowth(a->elements.capacity() * sizeof(Value));
-    }
+    if (apart)
+        a->reserveElements(apart);
     return a;
 }
 
@@ -407,9 +415,9 @@ DynFunction* Runtime::newFunction()
 Value Runtime::makeArray(Vec<Value> items)
 {
     DynArray* a = newArray();
-    a->elements = std::move(items);
-    a->chargeGrowth(a->elements.capacity() * sizeof(Value));
-    return detail::Access::adopt(Type::Object, a);
+    Value result = detail::Access::adopt(Type::Object, a);
+    a->assignAll(items.data(), items.size());
+    return result;
 }
 
 Value Runtime::makeArray(const std::vector<Value>& items)

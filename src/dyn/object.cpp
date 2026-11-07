@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "script/internal/dyn/bytecode.hpp"
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/dyn/runtime.hpp"
 
@@ -325,10 +326,39 @@ std::size_t DynObject::heapSize() const
 
 // -------------------------------------------------------------- arrays ---
 
+std::uint8_t ElemSite::of(const DynArray* array) noexcept
+{
+    return array->numbersOnly ? kNumbers : kValues;
+}
+
+DynArray::~DynArray()
+{
+    if (!numbersOnly) {
+        Value* values = store.begin();
+        for (std::uint32_t i = 0; i < store.size_; ++i)
+            values[i].~Value();
+    }
+    freeStorage();
+}
+
+void DynArray::freeStorage() noexcept
+{
+    if (store.data_ && !inCell())
+        PoolAlloc<char>().deallocate(static_cast<char*>(store.data_), std::size_t(store.cap_) * elementBytes());
+}
+
+void DynArray::adoptRoom(std::size_t bytes) noexcept
+{
+    store.data_ = this + 1;
+    store.cap_ = std::uint32_t(bytes / sizeof(double));
+}
+
 void DynArray::children(GcList& out) const
 {
     DynObject::children(out);
-    for (const Value& v : elements) {
+    if (numbersOnly)
+        return;
+    for (const Value& v : store) {
         if (GCObject* p = detail::Access::ptr(v))
             out.push_back(p);
     }
@@ -337,45 +367,234 @@ void DynArray::children(GcList& out) const
 void DynArray::clearReferences()
 {
     DynObject::clearReferences();
-    elements.clear();
-    elements.shrink_to_fit();
+    if (!numbersOnly) {
+        Value* values = store.begin();
+        for (std::uint32_t i = store.size_; i-- > 0;)
+            values[i].~Value();
+    }
+    store.size_ = 0;
+    freeStorage();
+    store.data_ = nullptr;
+    store.cap_ = 0;
+    numbersOnly = true;
+    if (roomInCell())
+        adoptRoom(roomInCell());
 }
 
 std::size_t DynArray::heapSize() const
 {
-    return DynObject::heapSize() + elements.capacity() * sizeof(Value);
+    const std::size_t apart = inCell() ? 0 : std::size_t(store.cap_) * elementBytes();
+    return DynObject::heapSize() + (sizeof(DynArray) - sizeof(DynObject)) + roomInCell() + apart;
+}
+
+void DynArray::moveTo(std::size_t capacity)
+{
+    const std::size_t bytes = capacity * elementBytes();
+    const std::size_t room = roomInCell();
+    if (bytes <= room && (inCell() || room)) {
+        // Back into the cell, or staying there.
+        if (!inCell()) {
+            std::memcpy(static_cast<void*>(this + 1), store.data_, std::size_t(store.size_) * elementBytes());
+            PoolAlloc<char>().deallocate(static_cast<char*>(store.data_), std::size_t(store.cap_) * elementBytes());
+            store.data_ = this + 1;
+        }
+        store.cap_ = std::uint32_t(room / elementBytes());
+        return;
+    }
+    if (capacity == 0) {
+        freeStorage();
+        store.data_ = nullptr;
+        store.cap_ = 0;
+        return;
+    }
+    const std::size_t before = inCell() ? 0 : std::size_t(store.cap_) * elementBytes();
+    char* fresh = PoolAlloc<char>().allocate(bytes);
+    if (store.size_)
+        std::memcpy(static_cast<void*>(fresh), store.data_, std::size_t(store.size_) * elementBytes());
+    freeStorage();
+    store.data_ = fresh;
+    store.cap_ = std::uint32_t(capacity);
+    if (bytes > before)
+        chargeGrowth(bytes - before);
+}
+
+void DynArray::reserveElements(std::size_t n)
+{
+    if (n > store.cap_) {
+        reserveGrowth((n - store.cap_) * elementBytes());
+        moveTo(n);
+    }
+}
+
+void DynArray::growFor(std::size_t n)
+{
+    if (n > store.cap_)
+        reserveElements(std::max<std::size_t>({n, std::size_t(store.cap_) * 2, 4}));
+}
+
+void DynArray::box()
+{
+    if (!numbersOnly)
+        return;
+    const std::uint32_t count = store.size_;
+    const std::size_t bytes = std::size_t(count) * sizeof(Value);
+    const double* from = numbers();
+    Value* to;
+    char* fresh = nullptr;
+    // Back to front, so that this works in the same room when it fits in the cell.
+    const bool fits = inCell() && bytes <= roomInCell();
+    if (fits) {
+        to = reinterpret_cast<Value*>(store.data_);
+    } else if (count) {
+        reserveGrowth(bytes);
+        fresh = PoolAlloc<char>().allocate(bytes);
+        to = reinterpret_cast<Value*>(fresh);
+    } else {
+        to = nullptr;
+    }
+    for (std::uint32_t i = count; i-- > 0;) {
+        std::uint64_t bits;
+        std::memcpy(&bits, from + i, 8);
+        if (bits == kUndefinedElement)
+            new (to + i) Value(Value::undefined());
+        else
+            new (to + i) Value(from[i]);
+    }
+    if (fits) {
+        store.cap_ = std::uint32_t(roomInCell() / sizeof(Value));
+    } else {
+        const std::size_t before = inCell() ? 0 : std::size_t(store.cap_) * sizeof(double);
+        freeStorage();
+        if (fresh) {
+            store.data_ = fresh;
+            store.cap_ = count;
+            if (bytes > before)
+                chargeGrowth(bytes - before);
+        } else {
+            store.data_ = roomInCell() ? static_cast<void*>(this + 1) : nullptr;
+            store.cap_ = std::uint32_t(roomInCell() / sizeof(Value));
+        }
+    }
+    numbersOnly = false;
 }
 
 void DynArray::append(Value v)
 {
-    const std::size_t before = elements.capacity();
-    if (elements.size() == before)  // the vector is about to double
-        reserveGrowth((before ? before : 4) * sizeof(Value));
-    elements.push_back(std::move(v));
-    chargeIfGrown(elements, before);
+    if (numbersOnly && v.type() != Type::Double && !v.isUndefined())
+        box();
+    if (store.size_ == store.cap_)
+        reserveElements(store.cap_ ? std::size_t(store.cap_) * 2 : 4);
+    if (numbersOnly) {
+        if (v.isUndefined())
+            std::memcpy(numbers() + store.size_, &kUndefinedElement, 8);
+        else
+            numbers()[store.size_] = detail::Access::r8(v);
+    } else {
+        new (store.begin() + store.size_) Value(std::move(v));
+    }
+    ++store.size_;
 }
 
 void DynArray::appendAll(const Value* items, std::size_t count)
 {
-    const std::size_t before = elements.capacity();
-    reserveFor(elements, elements.size() + count);
-    elements.insert(elements.end(), items, items + count);
-    chargeIfGrown(elements, before);
+    growFor(std::size_t(store.size_) + count);
+    for (std::size_t i = 0; i < count; ++i)
+        append(items[i]);
 }
 
 void DynArray::resize(std::size_t n)
 {
-    const std::size_t before = elements.capacity();
-    reserveFor(elements, n);
-    elements.resize(n, Value::undefined());
-    chargeIfGrown(elements, before);
+    if (n > store.size_)
+        reserveElements(n);
+    if (numbersOnly) {
+        for (std::size_t i = store.size_; i < n; ++i)
+            std::memcpy(numbers() + i, &kUndefinedElement, 8);
+    } else {
+        Value* values = store.begin();
+        for (std::size_t i = n; i < store.size_; ++i)
+            values[i].~Value();
+        for (std::size_t i = store.size_; i < n; ++i)
+            new (values + i) Value(Value::undefined());
+    }
+    store.size_ = std::uint32_t(n);
     trimElements();
+}
+
+void DynArray::removeRange(std::size_t from, std::size_t to)
+{
+    if (from >= to)
+        return;
+    const std::size_t count = store.size_;
+    if (numbersOnly) {
+        std::memmove(static_cast<void*>(numbers() + from), numbers() + to, (count - to) * sizeof(double));
+    } else {
+        Value* values = store.begin();
+        for (std::size_t i = from; i < to; ++i)
+            values[i].~Value();
+        // A value moves by its bytes: nothing in one points at itself.
+        std::memmove(static_cast<void*>(values + from), static_cast<const void*>(values + to), (count - to) * sizeof(Value));
+    }
+    store.size_ = std::uint32_t(count - (to - from));
+}
+
+void DynArray::insertRange(std::size_t at, const Value* items, std::size_t count)
+{
+    if (!count)
+        return;
+    if (numbersOnly) {
+        for (std::size_t i = 0; i < count && numbersOnly; ++i)
+            if (items[i].type() != Type::Double && !items[i].isUndefined())
+                box();
+    }
+    growFor(std::size_t(store.size_) + count);
+    const std::size_t tail = store.size_ - at;
+    char* base = static_cast<char*>(store.data_) + at * elementBytes();
+    std::memmove(static_cast<void*>(base + count * elementBytes()), static_cast<const void*>(base), tail * elementBytes());
+    const std::size_t end = store.size_ + count;
+    store.size_ = std::uint32_t(at);
+    for (std::size_t i = 0; i < count; ++i)
+        append(items[i]);
+    store.size_ = std::uint32_t(end);
+}
+
+void DynArray::assignAll(const Value* items, std::size_t count)
+{
+    bool bare = true;
+    for (std::size_t i = 0; bare && i < count; ++i)
+        bare = items[i].type() == Type::Double || items[i].isUndefined();
+    if (!numbersOnly) {
+        Value* values = store.begin();
+        for (std::uint32_t i = 0; i < store.size_; ++i)
+            values[i].~Value();
+    }
+    store.size_ = 0;
+    if (bare != numbersOnly) {
+        freeStorage();
+        store.data_ = nullptr;
+        store.cap_ = 0;
+        numbersOnly = bare;
+        if (roomInCell()) {
+            store.data_ = this + 1;
+            store.cap_ = std::uint32_t(roomInCell() / elementBytes());
+        }
+    }
+    reserveElements(count);
+    for (std::size_t i = 0; i < count; ++i)
+        append(items[i]);
+}
+
+void DynArray::reverse()
+{
+    if (numbersOnly)
+        std::reverse(numbers(), numbers() + store.size_);
+    else
+        std::reverse(store.begin(), store.end());
 }
 
 void DynArray::trimElements()
 {
-    if (elements.capacity() > 16 && elements.capacity() > elements.size() * 4)
-        elements.shrink_to_fit();
+    if (store.cap_ > 16 && store.cap_ > std::size_t(store.size_) * 4 && !inCell())
+        moveTo(store.size_);
 }
 
 void DynWrapper::children(GcList& out) const

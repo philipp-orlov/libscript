@@ -304,6 +304,13 @@ private:
         bytes().push_back(std::uint8_t(v >> 16));
         bytes().push_back(std::uint8_t(v >> 24));
     }
+    /// An element access, with its byte of what it has met.
+    void emitElem(Op op)
+    {
+        Vec<std::uint8_t>& saw = fn_->code->elemSaw;
+        emitU(op, std::uint32_t(saw.size()));
+        saw.push_back(0);
+    }
     void emitU(Op op, std::uint32_t a)
     {
         emit(op);
@@ -861,7 +868,7 @@ private:
                     expr(*target.b);
                     emit(Op::Rot3);  // key obj value -> value key obj ... see below
                     emit(Op::Rot3);
-                    emit(Op::SetElem);
+                    emitElem(Op::SetElem);
                 } else {
                     emit(Op::Swap);
                     emitU(Op::SetProp, siteOperand(target.text));
@@ -936,7 +943,7 @@ private:
                 emit(Op::Dup);
                 if (p->computed) {
                     expr(*p->a);
-                    emit(Op::GetElem);
+                    emitElem(Op::GetElem);
                 } else {
                     emitU(Op::GetProp, siteOperand(p->text));
                 }
@@ -1515,7 +1522,7 @@ private:
         if (target.computed) {
             expr(*target.b);
             emit(Op::Dup2);
-            emit(Op::GetElem);
+            emitElem(Op::GetElem);
         } else {
             emit(Op::Dup);
             emitU(Op::GetProp, siteOperand(target.text));
@@ -1531,7 +1538,7 @@ private:
             emitU(Op::SetLocal, slot);
         }
         if (target.computed)
-            emit(Op::SetElem);
+            emitElem(Op::SetElem);
         else
             emitU(Op::SetProp, siteOperand(target.text));
         emit(Op::Pop);
@@ -1569,7 +1576,7 @@ private:
             if (target.computed) {
                 expr(*target.b);
                 expr(*n.b);
-                emit(Op::SetElem);
+                emitElem(Op::SetElem);
             } else {
                 expr(*n.b);
                 emitU(Op::SetProp, siteOperand(target.text));
@@ -1604,10 +1611,10 @@ private:
         if (target.computed) {
             expr(*target.b);
             emit(Op::Dup2);
-            emit(Op::GetElem);
+            emitElem(Op::GetElem);
             expr(*n.b);
             emit(op);
-            emit(Op::SetElem);
+            emitElem(Op::SetElem);
         } else {
             emit(Op::Dup);
             emitU(Op::GetProp, siteOperand(target.text));
@@ -1631,7 +1638,7 @@ private:
             expr(*target.b);
             emit(Op::Rot3);
             emit(Op::Rot3);
-            emit(Op::SetElem);
+            emitElem(Op::SetElem);
             emit(Op::Pop);
         } else {
             emit(Op::Swap);
@@ -1679,7 +1686,7 @@ private:
                 exits.push_back(emitJump(Op::JumpIfNullishKeep));
             if (n.computed) {
                 expr(*n.b);
-                emit(Op::GetElem);
+                emitElem(Op::GetElem);
             } else {
                 emitU(n.bindMethod ? Op::GetPropBound : Op::GetProp, siteOperand(n.text));
             }
@@ -1710,7 +1717,7 @@ private:
                 exits.push_back(emitJump(Op::JumpIfNullishKeep));
             if (callee.computed) {
                 expr(*callee.b);
-                emit(Op::GetElemDup);
+                emitElem(Op::GetElemDup);
             } else {
                 emitU(Op::GetPropDup, siteOperand(callee.text));
             }

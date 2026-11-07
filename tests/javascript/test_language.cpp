@@ -773,3 +773,37 @@ TEST(applyPassesAnArrayItsElements)
                  " var r; for (var i = 0; i < 400; i++) r = g(); r"),
              std::string("TypeError"));
 }
+
+TEST(arraysOfNumbersBehaveLikeAnyOtherArray)
+{
+    // What they turn into, and when, is not for a program to see.
+    CHECK_EQ(run("var a = [1, 2]; a.push('x'); a.push(3); a.join()"), std::string("1,2,x,3"));
+    CHECK_EQ(run("var u = new Array(3); u[1] = 2; String(u[0]) + u[1] + u.length"), std::string("undefined23"));
+    CHECK_EQ(run("var u = [1, 2]; u[0] = undefined; u[1] = null; String(u[0]) + String(u[1])"), std::string("undefinednull"));
+    CHECK_EQ(run("[undefined].includes(undefined) + ':' + [undefined].indexOf(undefined) + ':' + [NaN].includes(NaN) + ':' + [NaN].indexOf(NaN)"),
+             std::string("true:0:true:-1"));
+    CHECK_EQ(run("var m = [1, 2, 3, 4, 5]; var r = m.splice(1, 2, 'a'); r.join() + '/' + m.join()"), std::string("2,3/1,a,4,5"));
+    CHECK_EQ(run("var s = [1, 2]; s.unshift(0); s.unshift('z'); s.shift() + s.join()"), std::string("z0,1,2"));
+    CHECK_EQ(run("var l = [1, 2, 3]; l.length = 1; l.length = 2; String(l[1]) + l.length"), std::string("undefined2"));
+    CHECK_EQ(run("var c = [1].concat([2], ['x'], 3); c.join() + c.length"), std::string("1,2,x,34"));
+    CHECK_EQ(run("JSON.stringify([1, undefined, 2.5])"), std::string("[1,null,2.5]"));
+    CHECK_EQ(run("Math.max.apply(null, [1, 5, 3]) + ':' + Math.max(...[2, 8])"), std::string("5:8"));
+    // In a cell that has room for them, and past it.
+    CHECK_EQ(run("var o = []; for (var i = 0; i < 40; i++) { var a = [i, i + 1, i + 2]; a.push({}); a.push(i); o = a; } o[0] + ':' + o[4] + ':' + o.length"),
+             std::string("39:39:5"));
+    // Hot code that met only numbers, when something else arrives.
+    CHECK_EQ(run("function get(a, i) { return a[i]; } var n = [1, 2, 3, 4], t = 0; for (var i = 0; i < 2000; i++) t += get(n, i & 3);"
+                 " t + ':' + get(n, 9) + ':' + get(['s'], 0) + ':' + get({0: 'o'}, 0)"),
+             std::string("5000:undefined:s:o"));
+    CHECK_EQ(run("function set(a, i, v) { a[i] = v; } var n = [0, 0, 0, 0]; for (var i = 0; i < 2000; i++) set(n, i & 3, i);"
+                 " set(n, 1, 'x'); for (i = 0; i < 2000; i++) set(n, i & 1 ? 2 : 3, i); n.join()"),
+             std::string("1996,x,1999,1998"));
+    CHECK_EQ(run("var w = new Array(4), t = 0; w[0] = 1; for (var i = 0; i < 2000; i++) { var x = w[i & 3]; t += x === undefined ? 1 : x; } t"),
+             std::string("2000"));
+    CHECK_EQ(run("var q = []; for (var i = 0; i < 2000; i++) { q.push(i % 2 ? 's' : i); if (q.length > 9) { q.pop(); q.pop(); } } q.join()"),
+             std::string("0,s,2,s,4,s,6,s"));
+    CHECK_EQ(run("var p = [], bad = 0; for (var i = 0; i < 2000; i++) { p.push(undefined); if (p.pop() !== undefined) bad++; } bad + ':' + p.length"),
+             std::string("0:0"));
+    // What holds a reference is seen by the collector, and what does not, freed.
+    CHECK_EQ(run("var c = [1]; c[0] = c; c[0] === c"), std::string("true"));
+}

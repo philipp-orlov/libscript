@@ -251,12 +251,21 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
         case CellKind::Object: {
             // A plain object with nothing unusual about it: its values and its prototype are all it holds.
             auto* object = static_cast<dyn::DynObject*>(cell);
-            if (object->cls != dyn::ObjClass::Plain || object->rare || object->props.heapCapacity() != 0) {
+            if (object->rare || object->props.heapCapacity() != 0 ||
+                (object->cls != dyn::ObjClass::Plain && (object->cls != dyn::ObjClass::Array || !object->props.empty()))) {
                 cell->~GCObject();
                 break;
             }
             static_assert(sizeof(dyn::Prop) == sizeof(Value));
-            releaseAll(reinterpret_cast<const Value*>(object->props.data()), object->props.size());
+            if (object->cls == dyn::ObjClass::Array) {
+                // Its elements, in place of properties.
+                auto* array = static_cast<dyn::DynArray*>(object);
+                if (!array->numbersOnly)
+                    releaseAll(array->store.begin(), array->size());
+                array->freeStorage();
+            } else {
+                releaseAll(reinterpret_cast<const Value*>(object->props.data()), object->props.size());
+            }
             if (dyn::DynObject* proto = object->proto.get(); proto && !proto->pinned && --proto->rc == 0) {
                 if (tearingDown)
                     break;

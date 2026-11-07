@@ -365,17 +365,17 @@ String inspectValue(Runtime& rt, const Value& v, int depth)
     }
     if (DynArray* arr = asArray(v)) {
         String out = ascii("[ ");
-        for (std::size_t i = 0; i < arr->elements.size(); ++i) {
+        for (std::size_t i = 0; i < arr->size(); ++i) {
             if (i)
                 out += ascii(", ");
             if (i >= 100) {
-                out += ascii("... ") + numberToString(double(arr->elements.size() - i)) +
+                out += ascii("... ") + numberToString(double(arr->size() - i)) +
                        ascii(" more");
                 break;
             }
-            out += inspectValue(rt, arr->elements[i], depth + 1);
+            out += inspectValue(rt, arr->at(i), depth + 1);
         }
-        return arr->elements.empty() ? ascii("[]") : out + ascii(" ]");
+        return arr->empty() ? ascii("[]") : out + ascii(" ]");
     }
     if (obj->cls == ObjClass::Map || obj->cls == ObjClass::Set) {
         auto* m = static_cast<DynMap*>(obj);

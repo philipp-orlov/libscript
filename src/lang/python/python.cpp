@@ -74,9 +74,9 @@ Value getitem(CallInfo& ci)
     const Value& index = ci.arg(1);
     if (DynArray* a = asArray(base)) {
         std::size_t i = 0;
-        if (!resolveIndex(rt, index, a->elements.size(), i))
+        if (!resolveIndex(rt, index, a->size(), i))
             raise(rt, "IndexError", "list index out of range");
-        return a->elements[i];
+        return a->at(i);
     }
     if (StringCell* s = asString(base)) {
         std::size_t i = 0;
@@ -106,9 +106,9 @@ Value setitem(CallInfo& ci)
     const Value& value = ci.arg(2);
     if (DynArray* a = asArray(base)) {
         std::size_t i = 0;
-        if (!resolveIndex(rt, index, a->elements.size(), i))
+        if (!resolveIndex(rt, index, a->size(), i))
             raise(rt, "IndexError", "list assignment index out of range");
-        a->elements[i] = value;
+        a->put(i, value);
         return value;
     }
     if (DynMap* m = asCollection(base, ObjClass::Map)) {
@@ -132,7 +132,7 @@ Value len(CallInfo& ci)
     Runtime& rt = rtOf(ci);
     const Value& v = ci.arg(0);
     if (DynArray* a = asArray(v))
-        return Value(double(a->elements.size()));
+        return Value(double(a->size()));
     if (StringCell* s = asString(v))
         return Value(double(s->text().size()));
     if (DynMap* m = asCollection(v, ObjClass::Map))
@@ -154,7 +154,7 @@ Value truthy(CallInfo& ci)
     Runtime& rt = rtOf(ci);
     const Value& v = ci.arg(0);
     if (DynArray* a = asArray(v))
-        return Value(!a->elements.empty());
+        return Value(!a->empty());
     if (DynMap* m = asCollection(v, ObjClass::Map))
         return Value(m->liveCount != 0);
     if (DynMap* m = asCollection(v, ObjClass::Set))

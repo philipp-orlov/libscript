@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -284,6 +285,8 @@ struct DynObject : GCObject
     bool isProto = false;
     /// The properties started out in the cell, past the end of this.
     bool propsInCell = false;
+    /// An array whose elements are bare numbers; see `DynArray`. Here because it is the one byte left before `shape`.
+    bool numbersOnly = false;
     Shape* shape = nullptr;
     PinRef<DynObject> proto;
     /// Sets `proto`, keeping what shapes and sites know right. Every change of prototype goes through here.
@@ -391,14 +394,95 @@ inline bool PropVec::inCell() const noexcept
 #pragma GCC diagnostic pop
 #endif
 
+/// What stands for `undefined` among the elements of an array of numbers. A signaling NaN with a payload of its own: no
+/// arithmetic produces one, and it is never loaded as a number without being checked for.
+inline constexpr std::uint64_t kUndefinedElement = 0x7FF4DEAD00000001ull;
+
+/// The elements as values, with the part of a vector's interface the engine uses. The storage is a pointer and two counts,
+/// and may start out in the array's own cell. Only `DynArray::values` hands one out, having made sure that is what they are.
+class ElemVec
+{
+public:
+    using value_type = Value;
+    using iterator = Value*;
+    using const_iterator = const Value*;
+
+    Value* begin() noexcept { return static_cast<Value*>(data_); }
+    Value* end() noexcept { return begin() + size_; }
+    const Value* begin() const noexcept { return static_cast<const Value*>(data_); }
+    const Value* end() const noexcept { return begin() + size_; }
+    Value* data() noexcept { return begin(); }
+    std::size_t size() const noexcept { return size_; }
+    std::size_t capacity() const noexcept { return cap_; }
+    bool empty() const noexcept { return size_ == 0; }
+    Value& operator[](std::size_t i) noexcept { return begin()[i]; }
+    const Value& operator[](std::size_t i) const noexcept { return begin()[i]; }
+    Value& back() noexcept { return begin()[size_ - 1]; }
+    Value& front() noexcept { return begin()[0]; }
+    void pop_back() noexcept { begin()[--size_].~Value(); }
+
+private:
+    friend struct DynArray;
+    void* data_ = nullptr;
+    std::uint32_t size_ = 0;
+    std::uint32_t cap_ = 0;  ///< in elements of what it holds now
+};
+
+/// Dense, and in one of two forms, which `numbersOnly` tells apart. Bare doubles at 8 bytes each while every element is a
+/// number or `undefined`, which is what most large arrays hold; or values at 16. The first element that needs a value
+/// turns it into the second for good. Small arrays have their elements in the cell.
 struct DynArray : DynObject
 {
-    Vec<Value> elements;
+    ElemVec store;
 
-    DynArray() { cls = ObjClass::Array; }
+    DynArray()
+    {
+        cls = ObjClass::Array;
+        numbersOnly = true;
+    }
+    ~DynArray() override;
     void children(GcList& out) const override;
     void clearReferences() override;
     std::size_t heapSize() const override;
+
+    std::size_t size() const noexcept { return store.size_; }
+    bool empty() const noexcept { return store.size_ == 0; }
+    double* numbers() noexcept { return static_cast<double*>(store.data_); }
+    const double* numbers() const noexcept { return static_cast<const double*>(store.data_); }
+    /// One element, which must exist.
+    Value at(std::size_t i) const noexcept
+    {
+        if (!numbersOnly)
+            return store[i];
+        std::uint64_t bits;
+        std::memcpy(&bits, numbers() + i, 8);
+        return bits == kUndefinedElement ? Value::undefined() : Value(numbers()[i]);
+    }
+    /// Set one that exists.
+    void put(std::size_t i, const Value& v)
+    {
+        if (numbersOnly) {
+            if (v.type() == Type::Double) {
+                numbers()[i] = detail::Access::r8(v);
+                return;
+            }
+            if (v.isUndefined()) {
+                std::memcpy(numbers() + i, &kUndefinedElement, 8);
+                return;
+            }
+            box();
+        }
+        store[i] = v;
+    }
+    /// The elements as values, which for an array of numbers changes what it is from here on. For what is not worth doing
+    /// twice; the rest asks `numbersOnly`.
+    ElemVec& values()
+    {
+        if (numbersOnly)
+            box();
+        return store;
+    }
+    void box();
 
     /// Append, charging any reallocation to the heap so that a loop which only
     /// grows one array still reaches the collector and the memory limit.
@@ -406,9 +490,30 @@ struct DynArray : DynObject
     void appendAll(const Value* items, std::size_t count);
     /// Set the length, filling with `undefined` or dropping the tail.
     void resize(std::size_t n);
+    /// Take out `[from, to)`, or put `count` values in at `at`.
+    void removeRange(std::size_t from, std::size_t to);
+    void insertRange(std::size_t at, const Value* items, std::size_t count);
+    /// Replace the lot, in whichever form they fit.
+    void assignAll(const Value* items, std::size_t count);
+    void reverse();
     /// Release element capacity once the array has shrunk well below it.
     void trimElements();
+    /// Room for `n` elements of the present form.
+    void reserveElements(std::size_t n);
+    /// Give the elements' storage back, whose values have already been dealt with.
+    void freeStorage() noexcept;
+    /// How many bytes of the cell are for elements.
+    std::size_t roomInCell() const noexcept { return cellBytes > sizeof(DynArray) ? cellBytes - sizeof(DynArray) : 0; }
+    /// A new cell with this room is laid out here; see `Runtime::newArray`.
+    void adoptRoom(std::size_t bytes) noexcept;
+
+private:
+    bool inCell() const noexcept { return store.data_ == static_cast<const void*>(this + 1); }
+    std::size_t elementBytes() const noexcept { return numbersOnly ? sizeof(double) : sizeof(Value); }
+    void moveTo(std::size_t capacity);
+    void growFor(std::size_t n);
 };
+static_assert(sizeof(Value) == 16, "an element is two of what a number takes");
 
 /// Wraps a primitive: `new Number(1)`, `Object("s")`, and `Date` (whose
 /// primitive is its epoch milliseconds).

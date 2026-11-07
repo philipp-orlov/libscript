@@ -488,7 +488,7 @@ void installArray(Runtime& rt)
     }, 1);
 
     rt.method(proto, "find", [each](CallInfo& ci) {
-        Value found;
+        Value found = Value::undefined();
         each(ci, [&found](std::size_t, const Value& item, Value& produced) {
             if (!toBoolean(produced))
                 return true;

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -264,6 +265,15 @@ int main(int argc, char** argv)
             script::supported(script::Language::Python)) {
             try {
                 ctx.global().set("argv", ctx.array(argv2));
+                // What a JavaScript shell has: `read(path)`, a file's text, which programs made for shells look for.
+                ctx.global().set("read", ctx.function("read", [](script::CallInfo& ci) -> script::Value {
+                    const std::string path = ci.arg(0).toString();
+                    std::ifstream in(path, std::ios::binary);
+                    if (!in)
+                        ci.fail(script::ErrorCode::TypeError, "cannot read " + path);
+                    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    return ci.context().str(text);
+                }, 1));
             } catch (const script::Error&) {
             }
         }

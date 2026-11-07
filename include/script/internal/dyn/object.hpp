@@ -424,6 +424,17 @@ inline bool PropVec::inCell() const noexcept
 /// What stands for `undefined` among the elements of an array of numbers. A signaling NaN with a payload of its own: no
 /// arithmetic produces one, and it is never loaded as a number without being checked for.
 inline constexpr std::uint64_t kUndefinedElement = 0x7FF4DEAD00000001ull;
+/// The payload of an `undefined` that marks a hole in an array of values: no element there at all. It reads as undefined
+/// wherever it goes; only the array's own questions -- `in`, its keys, the methods that skip holes -- tell it apart. In an
+/// array of numbers a hole is `kUndefinedElement`, and an `undefined` put there makes it an array of values.
+inline constexpr std::uint64_t kHolePayload = 0x484f4c45ull;
+inline Value holeValue() noexcept
+{
+    Value v(kHolePayload);
+    detail::Access::retag(v, Type::Undefined);
+    return v;
+}
+inline bool isHole(const Value& v) noexcept { return v.isUndefined() && detail::Access::u8(v) == kHolePayload; }
 
 /// The elements as values, with the part of a vector's interface the engine uses. The storage is a pointer and two counts,
 /// and may start out in the array's own cell. Only `DynArray::values` hands one out, having made sure that is what they are.
@@ -479,8 +490,10 @@ struct DynArray : DynObject
     /// One element, which must exist.
     Value at(std::size_t i) const noexcept
     {
-        if (!numbersOnly)
-            return store[i];
+        if (!numbersOnly) {
+            const Value& v = store[i];
+            return v.isUndefined() ? Value::undefined() : v;
+        }
         std::uint64_t bits;
         std::memcpy(&bits, numbers() + i, 8);
         return bits == kUndefinedElement ? Value::undefined() : Value(numbers()[i]);
@@ -491,10 +504,6 @@ struct DynArray : DynObject
         if (numbersOnly) {
             if (v.type() == Type::Double) {
                 numbers()[i] = detail::Access::r8(v);
-                return;
-            }
-            if (v.isUndefined()) {
-                std::memcpy(numbers() + i, &kUndefinedElement, 8);
                 return;
             }
             box();
@@ -510,6 +519,19 @@ struct DynArray : DynObject
         return store;
     }
     void box();
+    /// Whether element `i`, which is within the length, is there at all.
+    bool hasElement(std::size_t i) const noexcept
+    {
+        if (!numbersOnly)
+            return !isHole(store[i]);
+        std::uint64_t bits;
+        std::memcpy(&bits, numbers() + i, 8);
+        return bits != kUndefinedElement;
+    }
+    void makeHole(std::size_t i);
+    void appendHole();
+    /// No holes at all, as the quick ways through an array assume.
+    bool isPacked() const noexcept;
 
     /// Append, charging any reallocation to the heap so that a loop which only
     /// grows one array still reaches the collector and the memory limit.

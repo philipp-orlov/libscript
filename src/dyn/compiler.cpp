@@ -788,7 +788,12 @@ private:
         for (std::size_t i = 0; i < node.list.size(); ++i)
             bindParameter(*node.list[i], plainParams[i]);
 
-        if (!fs.isArrow && (fs.boxAll || mentionsArguments(*node.d))) {
+        // A parameter called `arguments` is what the name means, and there is no object.
+        std::vector<String> allParams;
+        for (const NodePtr& p : node.list)
+            patternNames(*p, allParams);
+        const bool paramIsArguments = std::find(allParams.begin(), allParams.end(), ascii("arguments")) != allParams.end();
+        if (!fs.isArrow && !paramIsArguments && (fs.boxAll || mentionsArguments(*node.d))) {
             // The VM stores the arguments array, boxed or not, at frame entry.
             const std::uint32_t slot = declareLocal(ascii("arguments"), false, false);
             fs.code->argumentsSlot = slot;
@@ -1703,7 +1708,8 @@ private:
                 expr(*e->a);
                 emit(Op::ArraySpread);
             } else if (e->kind == NK::Hole) {
-                emit(Op::PushUndefined);
+                fn_->code->consts.push_back(holeValue());
+                emitU(Op::PushConst, std::uint32_t(fn_->code->consts.size() - 1));
                 emit(Op::ArrayAppend);
             } else {
                 expr(*e);

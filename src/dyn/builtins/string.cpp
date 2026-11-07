@@ -9,6 +9,7 @@
 #include "base/utf16.hpp"
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/dyn/unicode.hpp"
 #include "script/internal/dyn/vm.hpp"
 
 namespace script {
@@ -71,6 +72,71 @@ bool isTrimmable(Char c) noexcept
 
 /// Case mapping over ASCII and Latin-1, which is as far as the engine goes without
 /// a Unicode table.
+/// The whole string in the other case, by code point, with the mappings that make several characters of one and a final
+/// sigma that is one.
+String caseMapped(const String& s, bool toUpper)
+{
+    String out;
+    out.reserve(s.size());
+    const auto put = [&](char32_t c) {
+        if (c > 0xffff) {
+            out.push_back(Char(0xd800 + ((c - 0x10000) >> 10)));
+            out.push_back(Char(0xdc00 + ((c - 0x10000) & 0x3ff)));
+        } else {
+            out.push_back(Char(c));
+        }
+    };
+    const auto codeAt = [&](std::size_t i, std::size_t& width) -> char32_t {
+        width = 1;
+        if (base::isHighSurrogate(s[i]) && i + 1 < s.size() && s[i + 1] >= 0xdc00 && s[i + 1] <= 0xdfff) {
+            width = 2;
+            return 0x10000 + ((char32_t(s[i]) - 0xd800) << 10) + (s[i + 1] - 0xdc00);
+        }
+        return s[i];
+    };
+    const auto isCased = [](char32_t c) { return unicode::simpleLower(c) != c || unicode::simpleUpper(c) != c; };
+    for (std::size_t i = 0; i < s.size();) {
+        std::size_t width;
+        const char32_t c = codeAt(i, width);
+        if (c < 128) {
+            out.push_back(Char(toUpper ? (c >= 'a' && c <= 'z' ? c - 32 : c) : (c >= 'A' && c <= 'Z' ? c + 32 : c)));
+        } else if (toUpper) {
+            char32_t mapped[3];
+            const int n = unicode::fullUpper(c, mapped);
+            for (int k = 0; k < n; ++k)
+                put(mapped[k]);
+        } else if (c == 0x130) {
+            put('i');
+            put(0x307);
+        } else if (c == 0x3a3) {
+            // Final: a cased letter before it, and none after it, skipping what case ignores.
+            bool before = false;
+            for (std::size_t j = i; j-- > 0;) {
+                if (isCased(s[j])) {
+                    before = true;
+                    break;
+                }
+                if (s[j] != 0x27 && s[j] != 0xad && s[j] != 0x2019 && !(s[j] >= 0x300 && s[j] <= 0x36f))
+                    break;
+            }
+            bool after = false;
+            for (std::size_t j = i + 1; j < s.size(); ++j) {
+                if (isCased(s[j])) {
+                    after = true;
+                    break;
+                }
+                if (s[j] != 0x27 && s[j] != 0xad && s[j] != 0x2019 && !(s[j] >= 0x300 && s[j] <= 0x36f))
+                    break;
+            }
+            put(before && !after ? 0x3c2 : 0x3c3);
+        } else {
+            put(unicode::simpleLower(c));
+        }
+        i += width;
+    }
+    return out;
+}
+
 Char upper(Char c) noexcept
 {
     if (c >= u'a' && c <= u'z')
@@ -284,19 +350,62 @@ void installString(Runtime& rt)
         return rt2.str(s.substr(from, count));
     }, 2);
 
-    rt.method(proto, "toUpperCase", [](CallInfo& ci) {
+    const auto toUpper = [](CallInfo& ci) { return rtOf(ci).str(caseMapped(thisString(ci), true)); };
+    const auto toLower = [](CallInfo& ci) { return rtOf(ci).str(caseMapped(thisString(ci), false)); };
+    rt.method(proto, "toUpperCase", toUpper, 0);
+    rt.method(proto, "toLowerCase", toLower, 0);
+    rt.method(proto, "toLocaleUpperCase", toUpper, 0);
+    rt.method(proto, "toLocaleLowerCase", toLower, 0);
+
+    rt.method(proto, "isWellFormed", [](CallInfo& ci) {
+        const String s = thisString(ci);
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (base::isHighSurrogate(s[i]) && i + 1 < s.size() && s[i + 1] >= 0xdc00 && s[i + 1] <= 0xdfff)
+                ++i;
+            else if (s[i] >= 0xd800 && s[i] <= 0xdfff)
+                return Value(false);
+        }
+        return Value(true);
+    }, 0);
+    rt.method(proto, "toWellFormed", [](CallInfo& ci) {
         String s = thisString(ci);
-        for (Char& c : s)
-            c = upper(c);
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (base::isHighSurrogate(s[i]) && i + 1 < s.size() && s[i + 1] >= 0xdc00 && s[i + 1] <= 0xdfff)
+                ++i;
+            else if (s[i] >= 0xd800 && s[i] <= 0xdfff)
+                s[i] = 0xfffd;
+        }
         return rtOf(ci).str(s);
     }, 0);
 
-    rt.method(proto, "toLowerCase", [](CallInfo& ci) {
-        String s = thisString(ci);
-        for (Char& c : s)
-            c = lower(c);
-        return rtOf(ci).str(s);
-    }, 0);
+    // The old HTML wrappers of Annex B.
+    static const struct { const char* name; const char* tag; const char* attribute; } kHtml[] = {
+        {"anchor", "a", "name"}, {"big", "big", nullptr}, {"blink", "blink", nullptr}, {"bold", "b", nullptr}, {"fixed", "tt", nullptr},
+        {"fontcolor", "font", "color"}, {"fontsize", "font", "size"}, {"italics", "i", nullptr}, {"link", "a", "href"}, {"small", "small", nullptr},
+        {"strike", "strike", nullptr}, {"sub", "sub", nullptr}, {"sup", "sup", nullptr},
+    };
+    for (const auto& html : kHtml) {
+        const char* tag = html.tag;
+        const char* attribute = html.attribute;
+        rt.method(proto, html.name, [tag, attribute](CallInfo& ci) {
+            Runtime& rt2 = rtOf(ci);
+            const String s = thisString(ci);
+            String out = ascii("<") + ascii(tag);
+            if (attribute) {
+                String value = toStringValue(rt2, ci.arg(0));
+                String escaped;
+                for (Char c : value) {
+                    if (c == u'"')
+                        escaped += ascii("&quot;");
+                    else
+                        escaped.push_back(c);
+                }
+                out += ascii(" ") + ascii(attribute) + ascii("=\"") + escaped + ascii("\"");
+            }
+            out += ascii(">") + s + ascii("</") + ascii(tag) + ascii(">");
+            return rt2.str(out);
+        }, attribute ? 1 : 0);
+    }
 
     auto trim = [](CallInfo& ci, bool start, bool end) {
         String s = thisString(ci);
@@ -315,6 +424,8 @@ void installString(Runtime& rt)
     rt.method(proto, "trim", [trim](CallInfo& ci) { return trim(ci, true, true); }, 0);
     rt.method(proto, "trimStart", [trim](CallInfo& ci) { return trim(ci, true, false); }, 0);
     rt.method(proto, "trimEnd", [trim](CallInfo& ci) { return trim(ci, false, true); }, 0);
+    proto->putOwn(rt.intern("trimLeft"), proto->findOwn(rt.intern("trimStart"))->value, PropWritable | PropConfigurable);
+    proto->putOwn(rt.intern("trimRight"), proto->findOwn(rt.intern("trimEnd"))->value, PropWritable | PropConfigurable);
 
     rt.method(proto, "repeat", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);

@@ -266,14 +266,26 @@ void installArray(Runtime& rt)
                 ci.fail(ErrorCode::RangeError, "the array-like is too long");
             DynArray* copy = rt2.newArray(std::size_t(length));
             const Value copyValue = detail::Access::adopt(Type::Object, copy);
-            for (double i = 0; i < length; ++i)
-                copy->append(getProperty(rt2, ci.thisValue().type() == Type::String ? ci.thisValue() : object, toPropertyKey(rt2, Value(i)).get()));
+            const Value source = ci.thisValue().type() == Type::String ? ci.thisValue() : object;
+            for (double i = 0; i < length; ++i) {
+                Ref<GCObject> key = toPropertyKey(rt2, Value(i));
+                // What the array-like does not have is a hole in the copy, for the methods that skip them.
+                if (hasProperty(rt2, source, key.get()))
+                    copy->append(getProperty(rt2, source, key.get()));
+                else
+                    copy->appendHole();
+            }
             const CallInfo inner = detail::Access::makeCallInfo(rt2.ctx.owner, &copyValue, &ci.args(), false);
             CallInfo call = inner;
             const Value result = fn(call);
             if (mutates) {
-                for (std::size_t i = 0; i < copy->size(); ++i)
-                    setProperty(rt2, object, toPropertyKey(rt2, Value(double(i))).get(), copy->at(i));
+                for (std::size_t i = 0; i < copy->size(); ++i) {
+                    Ref<GCObject> key = toPropertyKey(rt2, Value(double(i)));
+                    if (copy->hasElement(i))
+                        setProperty(rt2, object, key.get(), copy->at(i));
+                    else
+                        deleteProperty(rt2, object, key.get());
+                }
                 for (double i = double(copy->size()); i < length; ++i)
                     deleteProperty(rt2, object, toPropertyKey(rt2, Value(i)).get());
                 setProperty(rt2, object, rt2.atom.length.get(), Value(double(copy->size())));
@@ -392,8 +404,14 @@ void installArray(Runtime& rt)
         }
         Vec<Value> work;
         work.reserve(a->size());
-        for (std::size_t i = 0; i < a->size(); ++i)
-            work.push_back(a->at(i));
+        // Holes are left out of the sort and come back at the end, after every undefined.
+        std::size_t holes = 0;
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            if (a->hasElement(i))
+                work.push_back(a->at(i));
+            else
+                ++holes;
+        }
         if (asFunction(comparator)) {
             CallbackLoop call(rt2, comparator);
             mergeSort(work, [&](const Value& x, const Value& y) {
@@ -414,6 +432,8 @@ void installArray(Runtime& rt)
             });
         }
         a->assignAll(work.data(), work.size());
+        for (std::size_t i = 0; i < holes; ++i)
+            a->appendHole();
         return ci.thisValue();
     }, 1);
 
@@ -497,7 +517,7 @@ void installArray(Runtime& rt)
     arrayMethod("indexOf", false, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         for (std::size_t i = 0; i < a->size(); ++i) {
-            if (strictEquals(a->at(i), ci.arg(0)))
+            if (strictEquals(a->at(i), ci.arg(0)) && a->hasElement(i))
                 return Value(double(i));
         }
         return Value(-1.0);
@@ -506,7 +526,7 @@ void installArray(Runtime& rt)
     arrayMethod("lastIndexOf", false, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         for (std::size_t i = a->size(); i-- > 0;) {
-            if (strictEquals(a->at(i), ci.arg(0)))
+            if (strictEquals(a->at(i), ci.arg(0)) && a->hasElement(i))
                 return Value(double(i));
         }
         return Value(-1.0);
@@ -537,7 +557,7 @@ void installArray(Runtime& rt)
         Value args[3] = {Value::undefined(), Value::undefined(), ci.thisValue()};
         const std::size_t n = a->size();
         for (std::size_t i = 0; i < n; ++i) {
-            if (i >= a->size() && !visitsGone)
+            if ((i >= a->size() || !a->hasElement(i)) && !visitsGone)
                 continue;
             args[0] = i < a->size() ? a->at(i) : Value::undefined();
             args[1] = Value(double(i));
@@ -558,13 +578,12 @@ void installArray(Runtime& rt)
         const std::size_t n = thisArray(ci)->size();
         DynArray* out = rtOf(ci).newArray(n);
         Value result = detail::Access::adopt(Type::Object, out);
-        each(ci, [out](std::size_t, const Value&, Value& produced) {
-            out->append(produced);
+        // As long as the array was, and a hole where it had one.
+        out->resize(n);
+        each(ci, [out](std::size_t i, const Value&, Value& produced) {
+            out->put(i, produced);
             return true;
         });
-        // As long as the array was; what was skipped has nothing to say.
-        while (out->size() < n)
-            out->append(Value::undefined());
         return result;
     }, 1);
 
@@ -676,17 +695,20 @@ void installArray(Runtime& rt)
         if (ci.size() > 1) {
             acc = ci.arg(1);
         } else {
-            if (n == 0)
+            // The first element there is, holes skipped.
+            while (at < n && !a->hasElement(reversed ? n - 1 - at : at))
+                ++at;
+            if (at >= n)
                 ci.fail(ErrorCode::TypeError, "reduce of an empty array with no initial value");
-            acc = a->at(reversed ? n - 1 : 0);
-            at = 1;
+            acc = a->at(reversed ? n - 1 - at : at);
+            ++at;
         }
         CallbackLoop call(rt2, fn);
         Value args[4] = {std::move(acc), Value::undefined(), Value::undefined(), ci.thisValue()};
         for (; at < n; ++at) {
             const std::size_t i = reversed ? n - 1 - at : at;
             // The callback may have shortened the array; an element that is gone is skipped, as in JavaScript.
-            if (i >= a->size())
+            if (i >= a->size() || !a->hasElement(i))
                 continue;
             args[1] = a->at(i);
             args[2] = Value(double(i));

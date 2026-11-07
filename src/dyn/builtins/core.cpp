@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/parser.hpp"
@@ -554,6 +555,169 @@ void installGlobals(Runtime& rt)
 
     rt.method(g, "eval", [](CallInfo& ci) { return evalString(rtOf(ci), ci.arg(0), nullptr, nullptr); }, 1);
     rt.intrinsics[Runtime::Eval].reset(detail::Access::ptr(g->findOwn(rt.intern("eval"))->value));
+
+    // ---- URIs: UTF-8 in percent escapes
+    static const char kHex[] = "0123456789ABCDEF";
+    const auto encode = [](CallInfo& ci, const char* alsoUnescaped) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        const String s = toStringValue(rt2, ci.arg(0));
+        String out;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            const Char c = s[i];
+            const bool plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                               (c < 128 && (std::strchr("-_.!~*'()", int(c)) || std::strchr(alsoUnescaped, int(c))) && c != 0);
+            if (plain) {
+                out.push_back(c);
+                continue;
+            }
+            char32_t code = c;
+            if (c >= 0xdc00 && c <= 0xdfff)
+                ci.fail(ErrorCode::UriError, "URI malformed: a lone surrogate");
+            if (c >= 0xd800 && c <= 0xdbff) {
+                if (i + 1 >= s.size() || s[i + 1] < 0xdc00 || s[i + 1] > 0xdfff)
+                    ci.fail(ErrorCode::UriError, "URI malformed: a lone surrogate");
+                code = 0x10000 + ((char32_t(c) - 0xd800) << 10) + (s[++i] - 0xdc00);
+            }
+            unsigned char bytes[4];
+            int n;
+            if (code < 0x80) {
+                bytes[0] = std::uint8_t(code);
+                n = 1;
+            } else if (code < 0x800) {
+                bytes[0] = std::uint8_t(0xc0 | (code >> 6));
+                bytes[1] = std::uint8_t(0x80 | (code & 63));
+                n = 2;
+            } else if (code < 0x10000) {
+                bytes[0] = std::uint8_t(0xe0 | (code >> 12));
+                bytes[1] = std::uint8_t(0x80 | ((code >> 6) & 63));
+                bytes[2] = std::uint8_t(0x80 | (code & 63));
+                n = 3;
+            } else {
+                bytes[0] = std::uint8_t(0xf0 | (code >> 18));
+                bytes[1] = std::uint8_t(0x80 | ((code >> 12) & 63));
+                bytes[2] = std::uint8_t(0x80 | ((code >> 6) & 63));
+                bytes[3] = std::uint8_t(0x80 | (code & 63));
+                n = 4;
+            }
+            for (int k = 0; k < n; ++k) {
+                out.push_back(u'%');
+                out.push_back(Char(kHex[bytes[k] >> 4]));
+                out.push_back(Char(kHex[bytes[k] & 15]));
+            }
+        }
+        return rt2.str(out);
+    };
+    const auto hexAt = [](const String& s, std::size_t i) -> int {
+        const auto digit = [](Char c) -> int {
+            if (c >= '0' && c <= '9')
+                return c - '0';
+            if (c >= 'a' && c <= 'f')
+                return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F')
+                return c - 'A' + 10;
+            return -1;
+        };
+        if (i + 1 >= s.size())
+            return -1;
+        const int a = digit(s[i]);
+        const int b = digit(s[i + 1]);
+        return a < 0 || b < 0 ? -1 : a * 16 + b;
+    };
+    const auto decode = [hexAt](CallInfo& ci, const char* reserved) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        const String s = toStringValue(rt2, ci.arg(0));
+        String out;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (s[i] != u'%') {
+                out.push_back(s[i]);
+                continue;
+            }
+            const std::size_t start = i;
+            const int b = hexAt(s, i + 1);
+            if (b < 0)
+                ci.fail(ErrorCode::UriError, "URI malformed");
+            i += 2;
+            if (b < 0x80) {
+                if (b && std::strchr(reserved, b))
+                    out += s.substr(start, 3);
+                else
+                    out.push_back(Char(b));
+                continue;
+            }
+            int n = (b & 0xe0) == 0xc0 ? 2 : (b & 0xf0) == 0xe0 ? 3 : (b & 0xf8) == 0xf0 ? 4 : 0;
+            if (!n)
+                ci.fail(ErrorCode::UriError, "URI malformed");
+            char32_t code = char32_t(b & (0xff >> (n + 1)));
+            for (int k = 1; k < n; ++k) {
+                if (i + 1 >= s.size() || s[i + 1] != u'%')
+                    ci.fail(ErrorCode::UriError, "URI malformed");
+                const int more = hexAt(s, i + 2);
+                if (more < 0 || (more & 0xc0) != 0x80)
+                    ci.fail(ErrorCode::UriError, "URI malformed");
+                code = (code << 6) | char32_t(more & 63);
+                i += 3;
+            }
+            const char32_t least = n == 2 ? 0x80 : n == 3 ? 0x800 : 0x10000;
+            if (code < least || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff))
+                ci.fail(ErrorCode::UriError, "URI malformed");
+            if (code > 0xffff) {
+                out.push_back(Char(0xd800 + ((code - 0x10000) >> 10)));
+                out.push_back(Char(0xdc00 + ((code - 0x10000) & 0x3ff)));
+            } else {
+                out.push_back(Char(code));
+            }
+        }
+        return rt2.str(out);
+    };
+    rt.method(g, "encodeURIComponent", [encode](CallInfo& ci) { return encode(ci, ""); }, 1);
+    rt.method(g, "encodeURI", [encode](CallInfo& ci) { return encode(ci, ";/?:@&=+$,#"); }, 1);
+    rt.method(g, "decodeURIComponent", [decode](CallInfo& ci) { return decode(ci, ""); }, 1);
+    rt.method(g, "decodeURI", [decode](CallInfo& ci) { return decode(ci, ";/?:@&=+$,#"); }, 1);
+    rt.method(g, "escape", [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        const String s = toStringValue(rt2, ci.arg(0));
+        String out;
+        for (Char c : s) {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c < 128 && c && std::strchr("@*_+-./", int(c)))) {
+                out.push_back(c);
+            } else if (c < 256) {
+                out.push_back(u'%');
+                out.push_back(Char(kHex[c >> 4]));
+                out.push_back(Char(kHex[c & 15]));
+            } else {
+                out += ascii("%u");
+                for (int shift = 12; shift >= 0; shift -= 4)
+                    out.push_back(Char(kHex[(c >> shift) & 15]));
+            }
+        }
+        return rt2.str(out);
+    }, 1);
+    rt.method(g, "unescape", [hexAt](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        const String s = toStringValue(rt2, ci.arg(0));
+        String out;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == u'%') {
+                if (i + 5 < s.size() + 0 && s[i + 1] == u'u') {
+                    const int hi = hexAt(s, i + 2);
+                    const int lo = hexAt(s, i + 4);
+                    if (hi >= 0 && lo >= 0) {
+                        out.push_back(Char(hi * 256 + lo));
+                        i += 5;
+                        continue;
+                    }
+                }
+                const int b = hexAt(s, i + 1);
+                if (b >= 0) {
+                    out.push_back(Char(b));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push_back(s[i]);
+        }
+        return rt2.str(out);
+    }, 1);
 
     rt.method(g, "isNaN", [](CallInfo& ci) {
         return Value(std::isnan(toNumber(rtOf(ci), ci.arg(0))));

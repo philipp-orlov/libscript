@@ -501,7 +501,7 @@ void DynArray::box()
         std::uint64_t bits;
         std::memcpy(&bits, from + i, 8);
         if (bits == kUndefinedElement)
-            new (to + i) Value(Value::undefined());
+            new (to + i) Value(holeValue());
         else
             new (to + i) Value(from[i]);
     }
@@ -525,19 +525,42 @@ void DynArray::box()
 
 void DynArray::append(Value v)
 {
-    if (numbersOnly && v.type() != Type::Double && !v.isUndefined())
+    if (numbersOnly && isHole(v)) {
+        appendHole();
+        return;
+    }
+    if (numbersOnly && v.type() != Type::Double)
         box();
     if (store.size_ == store.cap_)
         reserveElements(store.cap_ ? std::size_t(store.cap_) * 2 : 4);
     if (numbersOnly) {
-        if (v.isUndefined())
-            std::memcpy(numbers() + store.size_, &kUndefinedElement, 8);
-        else
-            numbers()[store.size_] = detail::Access::r8(v);
+        numbers()[store.size_] = detail::Access::r8(v);
     } else {
         new (store.begin() + store.size_) Value(std::move(v));
     }
     ++store.size_;
+}
+
+void DynArray::makeHole(std::size_t i)
+{
+    if (numbersOnly)
+        std::memcpy(numbers() + i, &kUndefinedElement, 8);
+    else
+        store.begin()[i] = holeValue();
+}
+
+void DynArray::appendHole()
+{
+    resize(std::size_t(store.size_) + 1);
+}
+
+bool DynArray::isPacked() const noexcept
+{
+    for (std::size_t i = 0; i < store.size_; ++i) {
+        if (!hasElement(i))
+            return false;
+    }
+    return true;
 }
 
 void DynArray::appendAll(const Value* items, std::size_t count)
@@ -559,7 +582,7 @@ void DynArray::resize(std::size_t n)
         for (std::size_t i = n; i < store.size_; ++i)
             values[i].~Value();
         for (std::size_t i = store.size_; i < n; ++i)
-            new (values + i) Value(Value::undefined());
+            new (values + i) Value(holeValue());
     }
     store.size_ = std::uint32_t(n);
     trimElements();

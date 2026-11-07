@@ -387,7 +387,7 @@ bool arrayElementKey(DynArray* arr, GCObject* key, std::uint32_t& index)
 {
     if (key->kind != CellKind::String)
         return false;
-    return arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < arr->size();
+    return arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < arr->size() && arr->hasElement(index);
 }
 
 }  // namespace
@@ -865,8 +865,11 @@ bool deleteProperty(Runtime&, const Value& base, GCObject* key)
         auto* arr = static_cast<DynArray*>(obj);
         std::uint32_t index = 0;
         if (arrayIndexOf(static_cast<StringCell*>(key)->text(), index)) {
-            if (index < arr->size())
-                arr->put(index, Value::undefined());
+            if (index < arr->size()) {
+                if (obj->frozen)
+                    return false;
+                arr->makeHole(index);
+            }
             return true;
         }
     }
@@ -886,8 +889,10 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
     Vec<Value> keys;
     if (obj->cls == ObjClass::Array) {
         auto* arr = static_cast<DynArray*>(obj);
-        for (std::uint32_t i = 0; i < arr->size(); ++i)
-            keys.push_back(rt.str(numberToString(i)));
+        for (std::uint32_t i = 0; i < arr->size(); ++i) {
+            if (arr->hasElement(i))
+                keys.push_back(rt.str(numberToString(i)));
+        }
     }
     if (obj->cls == ObjClass::StringObject) {
         auto* w = static_cast<DynWrapper*>(obj);

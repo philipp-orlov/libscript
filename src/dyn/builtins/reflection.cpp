@@ -204,7 +204,7 @@ Value fromProperty(Runtime& rt, DynObject* self, GCObject* key)
     if (self->cls == ObjClass::Array && key->kind == CellKind::String) {
         auto* array = static_cast<DynArray*>(self);
         const double index = toNumber(rt, detail::Access::make(Type::String, key));
-        if (index >= 0 && index < double(array->size()) && index == std::floor(index) && numberToString(index) == static_cast<StringCell*>(key)->text()) {
+        if (index >= 0 && index < double(array->size()) && index == std::floor(index) && array->hasElement(std::size_t(index)) && numberToString(index) == static_cast<StringCell*>(key)->text()) {
             DynObject* out = rt.newObject(rt.objectProto.get());
             Value result = detail::Access::adopt(Type::Object, out);
             out->putOwn(rt.atom.value.get(), array->at(std::size_t(index)));

@@ -109,6 +109,7 @@ what the interpreter has seen, and when that turns out wrong it hands the call b
   no shape, in a table behind the `rare` pointer, with the other things few objects need. New plain objects are written in
   native code, popped off the allocator's free list or carved from its current block, while no collection is due and no
   memory limit is set: those of `{...}`, of a constructor compiled in place, and of `new F` for an `F` known when compiled.
+  The boxes captured variables live in are made the same way, and an array literal's elements are stored in place.
 * **Arrays** hold bare doubles at 8 bytes each while every element is a number or `undefined`, which is a reserved NaN
   (`kUndefinedElement`), so `new Array(n)` starts out that way. The first element that needs a `Value` turns the array into one
   of values at 16 bytes for good. A few elements live in the array's own cell. The interpreter records what each access

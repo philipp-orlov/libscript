@@ -1090,6 +1090,20 @@ TEST(aSortOfNumbersAsksTheComparatorWhatItWouldSay)
                          "-Infinity,-1e+300,-2,-0,0,0.5,2,3,5,1e+300,Infinity|x3,-0,0,Infinity,-Infinity,2,1e+300,-1e+300,5,0.5,-2"));
 }
 
+TEST(whatEveryWayIntoAJoinKnowsOfATagStaysKnown)
+{
+    // Numbers, booleans, strings and objects from both arms of a choice, and from every return of an inlined function:
+    // known to be what they are, and counted, or not, as such.
+    CHECK_EQ(run("function f(i, x) { var d = (i & 1 ? -1 : 1) * x; return d; }"
+                 "function g(i) { return (i & 4) != 0 || i == 3; }"
+                 "function h(i) { return i & 1 ? 'a' + i : 'b'; }"
+                 "function k(i) { return i & 1 ? { v: i } : { v: -i }; }"
+                 "var s = 0, t = 0, u = '', w = 0;"
+                 "for (var i = 0; i < 3000; i++) { s += f(i, 1.5); if (g(i)) t++; u = h(i); w += k(i).v; }"
+                 "s + '|' + t + '|' + u + '|' + w"),
+             std::string("0|1501|a2999|1500"));
+}
+
 TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)
 {
     CHECK_EQ(run("function P(a, d) { this.a = a; this.d = d; }"

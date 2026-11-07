@@ -771,6 +771,7 @@ public:
         try {
             Lowering inner(*this, *fn->code, none, held, at);
             inner.runInline(ptrReg(fn), self, args, r, t, done);
+            inlinedReturnTag_ = inner.returnTag_;
         } catch (const Refuse&) {
             rollBack(before);
             return false;
@@ -818,6 +819,7 @@ public:
         try {
             Lowering inner(*this, *code, none, held, at);
             inner.runInline(callee.r, self, args, r, t, done);
+            inlinedReturnTag_ = inner.returnTag_;
         } catch (const Refuse&) {
             rollBack(before);
             return false;
@@ -1314,7 +1316,7 @@ private:
     }
     void release(const Entry& e)
     {
-        if (e.own != Own::Owned || e.isConst || e.rep != Rep::Tagged)
+        if (e.own != Own::Owned || e.isConst || e.rep != Rep::Tagged || (e.hasKnownTag && e.known < Type::String))
             return;
         secureWeak();
         decRefOf(e.r, e.hasKnownTag ? -1 : e.t, false);
@@ -1513,6 +1515,7 @@ private:
         fn_.calls.push_back(std::move(call));
         inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
         if (inlineDone_ >= 0) {
+            noteReturn(-1);
             // What the call came to, for the caller to carry on with in native code.
             IrInst& movTag = inst(IrOp::Mov);
             movTag.d = inlineT_;
@@ -1652,9 +1655,11 @@ private:
         if (!join.seen) {
             join.seen = true;
             join.sameFunction.assign(stack_.size(), nullptr);
+            join.sameTag.assign(stack_.size(), -1);
             for (std::size_t i = 0; i < stack_.size(); ++i) {
                 if (stack_[i].pinned && stack_[i].rep == Rep::Tagged && !stack_[i].isConst)
                     join.sameFunction[i] = stack_[i].hint;
+                join.sameTag[i] = knownTagOf(stack_[i]);
             }
             join.entries.resize(stack_.size());
             for (Entry& canonical : join.entries) {
@@ -1669,6 +1674,8 @@ private:
             for (std::size_t i = 0; i < stack_.size(); ++i) {
                 if (!stack_[i].pinned || stack_[i].hint != join.sameFunction[i])
                     join.sameFunction[i] = nullptr;
+                if (knownTagOf(stack_[i]) != join.sameTag[i])
+                    join.sameTag[i] = -1;
             }
         }
         for (std::size_t i = 0; i < stack_.size(); ++i) {
@@ -1710,6 +1717,15 @@ private:
         // knowing which `F` it calls. Each way in counted it, so the entry stays owned. Not at a loop head, which a way in
         // reaches only after this.
         if (joins_[pc].seen && !loopHead_[pc]) {
+            // A tag every way in knew is known here: what `a || b` of two booleans is, say.
+            for (std::size_t i = 0; i < stack_.size() && i < joins_[pc].sameTag.size(); ++i) {
+                if (joins_[pc].sameTag[i] >= 0) {
+                    stack_[i].hasKnownTag = true;
+                    stack_[i].known = Type(joins_[pc].sameTag[i]);
+                    if (stack_[i].known < Type::String)
+                        stack_[i].own = Own::None;
+                }
+            }
             for (std::size_t i = 0; i < stack_.size() && i < joins_[pc].sameFunction.size(); ++i) {
                 if (const void* fn = joins_[pc].sameFunction[i]) {
                     stack_[i].pinned = true;
@@ -2437,7 +2453,8 @@ private:
                         const std::int32_t k = ptrReg(key);
                         coldCall(reinterpret_cast<void*>(&scriptDynSetGlobal), {rt, k, tag, payload}, -1, -1, true, {value});
                         // The helper took its own count.
-                        if (value.own == Own::Owned && !value.isConst && value.rep == Rep::Tagged)
+                        if (value.own == Own::Owned && !value.isConst && value.rep == Rep::Tagged &&
+                            !(value.hasKnownTag && value.known < Type::String))
                             decRefOf(payload, value.hasKnownTag ? -1 : tag, false);
                     }
                     inst(IrOp::Br).imm = done;
@@ -2769,6 +2786,7 @@ private:
             case Op::Return:
             case Op::ReturnUndefined: {
                 Entry value = op == Op::Return ? pop() : constTagged(Type::Undefined);
+                noteReturn(knownTagOf(value));
                 // The count moves with the value; a read of an owned local gives that local's away.
                 std::int32_t keep = -1;
                 if (value.own == Own::Local && value.local >= 0 && localOwned_[std::size_t(value.local)]) {
@@ -3948,7 +3966,7 @@ private:
                 coldCall(reinterpret_cast<void*>(&scriptDynSetProp), {rt, self, tagReg(base), base.r, op, vt, vr}, -1, -1,
                          true, {base, value});
                 // The helper took its own count, so the one made above goes.
-                if (value.own == Own::Owned && !value.isConst)
+                if (value.own == Own::Owned && !value.isConst && !(value.hasKnownTag && value.known < Type::String))
                     decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
             }
             inst(IrOp::Br).imm = done;
@@ -4265,7 +4283,7 @@ private:
                 const std::int32_t rt = rtReg();
                 coldCall(reinterpret_cast<void*>(&scriptDynSetElem),
                          {rt, tagReg(base), base.r, tagReg(key), payloadReg(key), vt, vr}, -1, -1, true, {base, key, value});
-                if (value.own == Own::Owned && !value.isConst)
+                if (value.own == Own::Owned && !value.isConst && !(value.hasKnownTag && value.known < Type::String))
                     decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
             }
             inst(IrOp::Br).imm = done;
@@ -4411,6 +4429,7 @@ private:
         bool inlined = lazy ? forwardArguments(callee, self, args, r, t, generic, held) : intrinsic(callee, self, args, r, t, generic);
         const std::size_t bodyStart = fn_.code.size();
         if (!inlined && !lazy) {
+            inlinedReturnTag_ = -1;
             inlined = inlineCall(callee, self, args, held, r, t, generic, finished);
             // A function's body in place of the call, and something else turning up instead is for the interpreter to deal
             // with: no call to come back from here, so what the body leaves known stays known.
@@ -4431,7 +4450,15 @@ private:
                     release(arg);
                 release(self);
                 release(callee);
-                push(taggedEntry(r, t, Own::Owned));
+                // What every return of the body knew of the value's tag, the caller knows.
+                Entry result = taggedEntry(r, t, Own::Owned);
+                if (inlinedReturnTag_ >= 0) {
+                    result.hasKnownTag = true;
+                    result.known = Type(inlinedReturnTag_);
+                    if (result.known < Type::String)
+                        result.own = Own::None;
+                }
+                push(result);
                 return;
             }
         }
@@ -6403,7 +6430,15 @@ private:
         std::vector<Entry> entries;
         /// Per position, the function every way in so far has had there, known and pinned; null where they differ.
         std::vector<const void*> sameFunction;
+        /// Per position, the tag every way in so far has known the value there to have; -1 where one did not, or they differ.
+        std::vector<std::int16_t> sameTag;
     };
+    static std::int16_t knownTagOf(const Entry& e) noexcept
+    {
+        if (e.rep != Rep::Tagged)
+            return std::int16_t(Type::Double);
+        return e.hasKnownTag ? std::int16_t(e.known) : std::int16_t(-1);
+    }
 
     Runtime& rt_;
     const FunctionCode& code_;
@@ -6430,6 +6465,11 @@ private:
     const std::vector<Entry>* parentHeld_ = nullptr;
     std::int32_t parentSite_ = -1;
     std::int32_t inlineDone_ = -1, inlineR_ = -1, inlineT_ = -1;
+    /// Inlined: the tag every return so far knows its value to have, -1 where they differ or one does not, -2 before any.
+    std::int16_t returnTag_ = -2;
+    /// What the last function inlined here had for that, once done.
+    std::int16_t inlinedReturnTag_ = -1;
+    void noteReturn(std::int16_t tag) noexcept { returnTag_ = returnTag_ == -2 || returnTag_ == tag ? tag : -1; }
     int depth_ = 0;
     /// Whether code may assume what the interpreter has seen so far, and hand the call back to it when that stops being so.
     bool speculate_ = false;

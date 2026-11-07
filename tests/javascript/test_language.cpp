@@ -1104,6 +1104,60 @@ TEST(whatEveryWayIntoAJoinKnowsOfATagStaysKnown)
              std::string("0|1501|a2999|1500"));
 }
 
+TEST(callbacksOfArrayMethodsCalledFromNativeCode)
+{
+    // What `forEach`, `map`, `filter` and `reduce` do when the callback changes the array, drops what it was given, throws
+    // or is no function: the same from the first round, interpreted, to the last, in native code.
+    CHECK_EQ(run(
+                 "function show(a){return JSON.stringify(a);}\n"
+                 "function run(k){\n"
+                 " var r=[];\n"
+                 " // numbers, objects, strings, undefined\n"
+                 " r.push(show([1,2,3].map(function(x,i,a){return x*2+i+a.length;})));\n"
+                 " r.push(show([{v:1},{v:2}].map(function(o){return o.v;})));\n"
+                 " r.push(show(['a','b'].map(function(s){return s+s;})));\n"
+                 " r.push(show([1,undefined,3].map(function(x){return x===undefined?'u':x;})));\n"
+                 " r.push(show([1,2,3,4].filter(function(x){return x&1;})));\n"
+                 " r.push(show([{v:1},{v:0},{v:2}].filter(function(o){return o.v;}).map(function(o){return o.v;})));\n"
+                 " r.push(show(['',\"x\",0,null,NaN,{},[]].filter(function(x){return x;})));\n"
+                 " r.push(String([1,2,3].reduce(function(p,x){return p+x;},10)));\n"
+                 " r.push(String([1,2,3].reduce(function(p,x,i,a){return p+'/'+x+i+a.length;},'s')));\n"
+                 " r.push(show([{v:1},{v:2}].reduce(function(p,o){return {v:p.v+o.v};},{v:0})));\n"
+                 " var seen=0; [5,6].forEach(function(x,i){seen+=x*i;}); r.push(String(seen));\n"
+                 " var t={m:3}; r.push(show([1,2].map(function(x){return x*this.m;},t)));\n"
+                 " var u=0; [1].forEach(function(){u=this.q;},{q:7}); r.push(String(u));\n"
+                 " var w; [1].forEach(function(){'use strict';w=this;}); r.push(String(w));\n"
+                 " // the callback changes the array\n"
+                 " var a=[1,2,3,4]; var seen2=[]; a.forEach(function(x){seen2.push(x); if(x==1){a.pop();a.pop();}}); r.push(show(seen2)+show(a));\n"
+                 " a=[1,2]; seen2=[]; a.forEach(function(x){seen2.push(x); if(a.length<5)a.push(x+10);}); r.push(show(seen2)+show(a));\n"
+                 " a=[1,2,3]; r.push(String(a.map(function(x){a.length=1;return x;}).length));\n"
+                 " a=[1,2,3]; r.push(show(a.filter(function(x){a[2]='s';return true;})));\n"
+                 " a=[{v:1},{v:2}]; r.push(String(a.map(function(o,i){a[0]=null;a[1]=null;return o?o.v:'n';}).join()));\n"
+                 " a=[1,2,3]; r.push(String(a.reduce(function(p,x){a.length=2;return p+x;},0)));\n"
+                 " a=[[1],[2]]; r.push(String(a.reduce(function(p,x){a.pop();return p+x[0];},0)));\n"
+                 " // thrown through\n"
+                 " try { [1,2,3].map(function(x){if(x==2)throw 'e'+x;return x;}); } catch(e){ r.push(e); }\n"
+                 " try { [{},{}].filter(function(o){throw o===null?'n':'f';}); } catch(e){ r.push(e); }\n"
+                 " try { [1].reduce(function(p,x){throw 'r';},{}); } catch(e){ r.push(e); }\n"
+                 " // not what was guessed\n"
+                 " try { [1].map(3); } catch(e){ r.push(e.name); }\n"
+                 " try { [1].forEach(undefined); } catch(e){ r.push(e.name); }\n"
+                 " try { r.push(String(Array.prototype.map.call({length:2,0:'a',1:'b'},function(x){return x;}).length)); } catch(e){ r.push(e.name); }\n"
+                 " r.push(String([3,4].map(Math.sqrt).length));\n"
+                 " r.push(show([1,4].map(Number)));\n"
+                 " // grown past a cell's room, and mixed kinds in the result\n"
+                 " var big=[]; for(var i=0;i<40;i++) big.push(i);\n"
+                 " r.push(String(big.map(function(x){return x&1?x:'s'+x;}).length));\n"
+                 " r.push(String(big.filter(function(x){return x%3==0;}).reduce(function(p,x){return p+x;},0)));\n"
+                 " return r.join('|');\n"
+                 "}\n"
+                 "var last=''; var bad=0;\n"
+                 "for (var k=0;k<400;k++){ var now; try { now=run(k); } catch(e){ now='threw '+e; } if(k&&now!==last) bad++; last=now; }\n"
+                 "bad + ' ' + last;\n"),
+             std::string("0 [5,8,11]|[1,2]|[\"aa\",\"bb\"]|[1,\"u\",3]|[1,3]|[1,2]|[\"x\",{},[]]|16|s/103/213/323|{\"v\":3}|6|[3,6]|7|undefined|"
+                         "[1,2][1,2]|[1,2][1,2,11,12]|3|[1,2,\"s\"]|1,n|3|1|e2|f|r|TypeError|TypeError|TypeError|2|[1,4]|40|273"));
+}
+
 TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)
 {
     CHECK_EQ(run("function P(a, d) { this.a = a; this.d = d; }"

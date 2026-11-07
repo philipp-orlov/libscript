@@ -634,6 +634,10 @@ void installArray(Runtime& rt)
     };
     rt.method(proto, "reduce", [reduce](CallInfo& ci) { return reduce(ci, false); }, 1);
     rt.method(proto, "reduceRight", [reduce](CallInfo& ci) { return reduce(ci, true); }, 1);
+    keepIntrinsic(Runtime::ArrayForEach, "forEach");
+    keepIntrinsic(Runtime::ArrayMap, "map");
+    keepIntrinsic(Runtime::ArrayFilter, "filter");
+    keepIntrinsic(Runtime::ArrayReduce, "reduce");
 
     // ---- iteration ----
     rt.method(proto, "values",

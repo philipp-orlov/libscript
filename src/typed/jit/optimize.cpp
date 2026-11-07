@@ -746,22 +746,22 @@ private:
     void findQuietLoops()
     {
         // Registers with one definition, a constant.
-        std::map<std::int32_t, std::uint32_t> defs;
+        std::vector<std::uint32_t> defs(fn_.vregIsFp.size(), 0);
         for (const IrInst& in : fn_.code) {
             if (in.d >= 0)
-                ++defs[in.d];
+                ++defs[std::size_t(in.d)];
             if (in.op == IrOp::Call) {
                 const IrCall& call = fn_.calls[std::size_t(in.imm)];
                 if (call.result >= 0)
-                    ++defs[call.result];
+                    ++defs[std::size_t(call.result)];
                 if (call.resultTag >= 0)
-                    ++defs[call.resultTag];
+                    ++defs[std::size_t(call.resultTag)];
             }
         }
         for (std::int32_t v : fn_.params)
-            ++defs[v];
+            ++defs[std::size_t(v)];
         for (const IrInst& in : fn_.code) {
-            if (in.op == IrOp::MovImm && defs[in.d] == 1)
+            if (in.op == IrOp::MovImm && defs[std::size_t(in.d)] == 1)
                 constants_.emplace(in.d, in.imm);
         }
         std::vector<std::int32_t> labelAt(std::size_t(fn_.labelCount), -1);

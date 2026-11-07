@@ -2523,87 +2523,25 @@ private:
                 secureWeak();
                 const std::int32_t rt = rtReg();
                 const std::int32_t n = immReg(std::int64_t(operand()));
-                const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynNewArray), {rt, n}, true);
+                // A small array is carved here, elements in its cell, as `newArray` would.
+                std::uint64_t image[sizeof(DynArray) / 8];
+                std::size_t bytes = 0;
+                const std::int32_t r = fn_.newVreg(false);
+                if (mem::LocalHeap::kCanPopInline && !rt_.ctx.options.memoryLimit && rt_.arrayImage(operand(), image, bytes)) {
+                    placeImage(image, sizeof(DynArray) / 8, bytes, operand() ? kElementsOffset : -1, sizeof(DynArray), r,
+                               reinterpret_cast<void*>(&scriptDynNewArray), {rt, n}, {});
+                } else {
+                    coldCall(reinterpret_cast<void*>(&scriptDynNewArray), {rt, n}, r, -1, true);
+                }
                 push(objectEntry(r));
                 return true;
             }
             case Op::ArrayAppend: {
                 // An element of a literal, into the array it is making: nothing else has seen that array, so it is one and
-                // can grow. In place while there is room and the form need not change.
+                // can grow.
                 Entry value = pop();
                 secureWeak();
-                const std::int32_t array = top().r;
-                const std::int32_t tag = tagReg(value);
-                const std::int32_t payload = payloadReg(value);
-                const std::int32_t slow = newLabel();
-                const std::int32_t done = newLabel();
-                const std::int32_t values = newLabel();
-                const std::int32_t stored = newLabel();
-                const std::int32_t data = loadHeader(array, kElementsOffset);
-                const std::int32_t count = load(array, kElementCountOffset, 4, false, kAliasHeader);
-                const std::int32_t cap = load(array, kElementCapOffset, 4, false, kAliasHeader);
-                {
-                    IrInst& full = inst(IrOp::BrCmp);
-                    full.a = count;
-                    full.b = cap;
-                    full.cond = IrCond::Eq;
-                    full.width = 64;
-                    full.target = slow;
-                }
-                const std::int32_t numbersOnly = load(array, kNumbersOnlyOffset, 1, false, kAliasHeader);
-                branchCmp(numbersOnly, IrCond::Eq, 0, values);
-                if (!isKnownNumber(value)) {
-                    if (value.hasKnownTag || value.isConst || value.rep != Rep::Tagged)
-                        inst(IrOp::Br).imm = slow;
-                    else
-                        branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), slow);
-                }
-                {
-                    const std::int32_t slot = fn_.newVreg(false);
-                    const std::int32_t scaled = shiftLeft(count, 3);
-                    IrInst& add = inst(IrOp::Add);
-                    add.d = slot;
-                    add.a = data;
-                    add.b = scaled;
-                    add.width = 64;
-                    store(slot, 0, payload, 8);
-                }
-                inst(IrOp::Br).imm = stored;
-                inst(IrOp::Label).imm = values;
-                // The array takes a count of its own; the value's is released below, as after the helper.
-                if (!value.hasKnownTag)
-                    incRefOf(payload, tag, false);
-                else if (value.known >= Type::String)
-                    incRefOf(payload, -1, false);
-                {
-                    const std::int32_t slot = fn_.newVreg(false);
-                    const std::int32_t scaled = shiftLeft(count, 4);
-                    IrInst& add = inst(IrOp::Add);
-                    add.d = slot;
-                    add.a = data;
-                    add.b = scaled;
-                    add.width = 64;
-                    store(slot, 0, tag, 1);
-                    store(slot, kPayload, payload, 8);
-                }
-                inst(IrOp::Label).imm = stored;
-                {
-                    const std::int32_t next = fn_.newVreg(false);
-                    IrInst& plus = inst(IrOp::Add);
-                    plus.d = next;
-                    plus.a = count;
-                    plus.hasImm = true;
-                    plus.imm = 1;
-                    plus.width = 64;
-                    store(array, kElementCountOffset, next, 4, kAliasHeader);
-                }
-                inst(IrOp::Br).imm = done;
-                inst(IrOp::ColdBegin);
-                inst(IrOp::Label).imm = slow;
-                coldCall(reinterpret_cast<void*>(&scriptDynArrayAppend), {rtReg(), array, tag, payload}, -1, -1, true, {value});
-                inst(IrOp::Br).imm = done;
-                inst(IrOp::ColdEnd);
-                inst(IrOp::Label).imm = done;
+                appendTo(top().r, value, {value});
                 release(value);
                 return true;
             }
@@ -4795,19 +4733,26 @@ private:
             return;
         }
         const std::size_t bytes = sizeof(DynObject) + std::size_t(room) * sizeof(Prop);
-        const std::int32_t slow = newLabel();
-        const std::int32_t done = newLabel();
-        const std::int32_t slot = carveCell(bytes, slow);
         // It is a prototype from now on, as `newObjectSized` would say: changing it has to tell what was learned about the
         // objects made here, this code among them, that it no longer holds.
         proto->isProto = true;
-        // What the constructors and `linkKnown` do.
         std::uint64_t image[kWords];
         rt_.objectImage(proto, root, room, image);
-        for (std::size_t i = 0; i < kWords; ++i)
+        placeImage(image, kWords, bytes, room ? kPropsOffset : -1, sizeof(DynObject), result, helper, std::move(helperArgs), held);
+    }
+
+    /// A new cell of `bytes`, carved here, its first words these: what the constructors and `linkKnown` do. The word at
+    /// `tableAt`, unless that is -1, is the address of what follows those `tableFrom` bytes in. Out of room, the helper.
+    void placeImage(const std::uint64_t* image, std::size_t words, std::size_t bytes, std::int64_t tableAt, std::size_t tableFrom,
+                    std::int32_t result, void* helper, std::vector<std::int32_t> helperArgs, const std::vector<Entry>& held)
+    {
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const std::int32_t slot = carveCell(bytes, slow);
+        for (std::size_t i = 0; i < words; ++i)
             store(slot, std::int64_t(i * 8), immReg(std::int64_t(image[i])), 8, kAliasHeader);
-        if (room)
-            store(slot, kPropsOffset, plusImm(slot, std::int64_t(sizeof(DynObject)), 64), 8, kAliasHeader);
+        if (tableAt >= 0)
+            store(slot, tableAt, plusImm(slot, std::int64_t(tableFrom), 64), 8, kAliasHeader);
         {
             IrInst& mov = inst(IrOp::Mov);
             mov.d = result;
@@ -4893,6 +4838,270 @@ private:
     /// A built-in done in place -- `Math.sqrt(x)` and its kind, `push`, `pop`, `charCodeAt`, `String.fromCharCode` -- when
     /// the callee is the built-in it was when compiled and the operands are what the inline code handles. Anything else
     /// goes to `generic`.
+    /// `value` onto the end of an array that can grow, which takes a count of its own: in place while there is room and the
+    /// form need not change.
+    void appendTo(std::int32_t array, const Entry& value, const std::vector<Entry>& held)
+    {
+        const std::int32_t tag = tagReg(value);
+        const std::int32_t payload = payloadReg(value);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const std::int32_t values = newLabel();
+        const std::int32_t stored = newLabel();
+        const std::int32_t data = loadHeader(array, kElementsOffset);
+        const std::int32_t count = load(array, kElementCountOffset, 4, false, kAliasHeader);
+        const std::int32_t cap = load(array, kElementCapOffset, 4, false, kAliasHeader);
+        {
+            IrInst& full = inst(IrOp::BrCmp);
+            full.a = count;
+            full.b = cap;
+            full.cond = IrCond::Eq;
+            full.width = 64;
+            full.target = slow;
+        }
+        const std::int32_t numbersOnly = load(array, kNumbersOnlyOffset, 1, false, kAliasHeader);
+        branchCmp(numbersOnly, IrCond::Eq, 0, values);
+        if (!isKnownNumber(value)) {
+            if (value.hasKnownTag || value.isConst || value.rep != Rep::Tagged)
+                inst(IrOp::Br).imm = slow;
+            else
+                branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), slow);
+        }
+        {
+            const std::int32_t slot = fn_.newVreg(false);
+            const std::int32_t scaled = shiftLeft(count, 3);
+            IrInst& add = inst(IrOp::Add);
+            add.d = slot;
+            add.a = data;
+            add.b = scaled;
+            add.width = 64;
+            store(slot, 0, payload, 8);
+        }
+        inst(IrOp::Br).imm = stored;
+        inst(IrOp::Label).imm = values;
+        // The array takes a count of its own; the value's is released below, as after the helper.
+        if (!value.hasKnownTag)
+            incRefOf(payload, tag, false);
+        else if (value.known >= Type::String)
+            incRefOf(payload, -1, false);
+        {
+            const std::int32_t slot = fn_.newVreg(false);
+            const std::int32_t scaled = shiftLeft(count, 4);
+            IrInst& add = inst(IrOp::Add);
+            add.d = slot;
+            add.a = data;
+            add.b = scaled;
+            add.width = 64;
+            store(slot, 0, tag, 1);
+            store(slot, kPayload, payload, 8);
+        }
+        inst(IrOp::Label).imm = stored;
+        {
+            const std::int32_t next = fn_.newVreg(false);
+            IrInst& plus = inst(IrOp::Add);
+            plus.d = next;
+            plus.a = count;
+            plus.hasImm = true;
+            plus.imm = 1;
+            plus.width = 64;
+            store(array, kElementCountOffset, next, 4, kAliasHeader);
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        coldCall(reinterpret_cast<void*>(&scriptDynArrayAppend), {rtReg(), array, tag, payload}, -1, -1, true, held);
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+    }
+
+    /// `array.forEach(f)`, `map`, `filter` and `reduce` with an initial value, as a loop here that calls `f` as any native
+    /// code calls a function, with no way through C++ for each element. Nothing past the guards bails: the interpreter
+    /// could not take over part way through a built-in, so whatever is out of the ordinary goes through a helper and comes
+    /// back. The array is read afresh each time, the callback being free to change it; what the built-ins do then, this
+    /// does: as far as it reached at the start, and what has gone since is skipped.
+    void higherOrder(int which, const Entry& callee, const Entry& self, const std::vector<Entry>& args, std::int32_t r, std::int32_t t,
+                     std::int32_t generic)
+    {
+        const Entry& fnEntry = args[0];
+        const bool isMap = which == Runtime::ArrayMap;
+        const bool isFilter = which == Runtime::ArrayFilter;
+        const bool isReduce = which == Runtime::ArrayReduce;
+        if (!self.hasKnownTag)
+            branchCmp(self.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+        branchCmp(load(self.r, kCellKindOffset, 2, false, kAliasHeader), IrCond::Ne, kKindAndClassOfArray, generic);
+        if (!fnEntry.hasKnownTag)
+            branchCmp(fnEntry.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+        branchCmp(load(fnEntry.r, kCellKindOffset, 2, false, kAliasHeader), IrCond::Ne,
+                  std::int64_t(CellKind::Object) | std::int64_t(ObjClass::Function) << 8, generic);
+
+        std::vector<Entry> held = {callee, self};
+        held.insert(held.end(), args.begin(), args.end());
+        const std::int32_t n = load(self.r, kElementCountOffset, 4, false, kAliasHeader);
+        Entry out;
+        if (isMap || isFilter) {
+            const std::int32_t made = callCold(reinterpret_cast<void*>(&scriptDynNewArray), {rtReg(), isMap ? n : immReg(0)}, true, held);
+            out = objectEntry(made);
+            held.push_back(out);
+        }
+        // What `reduce` has so far, with a count of its own.
+        Entry acc;
+        if (isReduce) {
+            acc = taggedEntry(fn_.newVreg(false), fn_.newVreg(false), Own::Owned);
+            const std::int32_t tag = tagReg(args[1]);
+            const std::int32_t payload = payloadReg(args[1]);
+            mov(acc.t, tag);
+            mov(acc.r, payload);
+            incRefOf(acc.r, acc.t, false);
+            held.push_back(acc);
+        }
+        const Entry cbThis = !isReduce && args.size() > 1 ? args[1] : constTagged(Type::Undefined);
+
+        const std::int32_t index = fn_.newVreg(false);
+        IrInst& zero = inst(IrOp::MovImm);
+        zero.d = index;
+        zero.imm = 0;
+        const std::int32_t head = newLabel();
+        const std::int32_t next = newLabel();
+        const std::int32_t end = newLabel();
+        inst(IrOp::Label).imm = head;
+        const auto stopIf = [&](std::int32_t limit, std::int32_t to) {
+            IrInst& past = inst(IrOp::BrCmp);
+            past.a = index;
+            past.b = limit;
+            past.cond = IrCond::Hs;
+            past.width = 64;
+            past.target = to;
+        };
+        stopIf(n, end);
+        stopIf(load(self.r, kElementCountOffset, 4, false, kAliasHeader), next);
+
+        // The element, with a count while the callback has it: the callback could take it out of the array.
+        const Entry elem = taggedEntry(fn_.newVreg(false), fn_.newVreg(false), Own::Owned);
+        {
+            const std::int32_t values = newLabel();
+            const std::int32_t hole = newLabel();
+            const std::int32_t have = newLabel();
+            branchCmp(load(self.r, kNumbersOnlyOffset, 1, false, kAliasHeader), IrCond::Eq, 0, values);
+            const std::int32_t bits = loadBareElement(loadHeader(self.r, kElementsOffset), index, hole);
+            mov(elem.r, bits);
+            mov(elem.t, immReg(std::int64_t(Type::Double)));
+            inst(IrOp::Br).imm = have;
+            inst(IrOp::Label).imm = hole;
+            mov(elem.r, immReg(0));
+            mov(elem.t, immReg(std::int64_t(Type::Undefined)));
+            inst(IrOp::Br).imm = have;
+            inst(IrOp::Label).imm = values;
+            const std::int32_t slot = plusReg(loadHeader(self.r, kElementsOffset), shiftLeft(index, 4));
+            mov(elem.t, load(slot, 0, 1, false, kAliasValue));
+            mov(elem.r, load(slot, kPayload, 8, false, kAliasValue));
+            incRefOf(elem.r, elem.t, false);
+            inst(IrOp::Label).imm = have;
+        }
+        const std::int32_t asDouble = fn_.newVreg(true);
+        {
+            IrInst& conv = inst(IrOp::IntToFp);
+            conv.d = asDouble;
+            conv.a = index;
+            conv.srcWidth = 64;
+            conv.width = 64;
+        }
+        std::vector<Entry> passed;
+        if (isReduce)
+            passed.push_back(acc);
+        passed.push_back(elem);
+        passed.push_back(doubleEntry(asDouble));
+        passed.push_back(self);
+        const std::int32_t area = layOutArgs(passed);
+        const std::int32_t cr = fn_.newVreg(false);
+        const std::int32_t ct = fn_.newVreg(false);
+        const Entry result = taggedEntry(cr, ct, Own::Owned);
+        {
+            std::vector<Entry> inCall = held;
+            inCall.push_back(elem);
+            invoke(tagReg(fnEntry), payloadReg(fnEntry), tagReg(cbThis), payloadReg(cbThis), area, immReg(std::int64_t(passed.size())), cr, ct,
+                   inCall);
+        }
+        if (isMap) {
+            release(elem);
+            std::vector<Entry> inAppend = held;
+            inAppend.push_back(result);
+            appendTo(out.r, result, inAppend);
+            release(result);
+        } else if (isFilter) {
+            const std::int32_t truth = truthyReg(result);
+            release(result);
+            const std::int32_t drop = newLabel();
+            branchCmp(truth, IrCond::Eq, 0, drop);
+            std::vector<Entry> inAppend = held;
+            inAppend.push_back(elem);
+            appendTo(out.r, elem, inAppend);
+            inst(IrOp::Label).imm = drop;
+            release(elem);
+        } else if (isReduce) {
+            release(elem);
+            release(acc);
+            mov(acc.t, ct);
+            mov(acc.r, cr);
+        } else {
+            release(elem);
+            release(result);
+        }
+        inst(IrOp::Label).imm = next;
+        {
+            IrInst& step = inst(IrOp::Add);
+            step.d = index;
+            step.a = index;
+            step.hasImm = true;
+            step.imm = 1;
+            step.width = 64;
+            const std::int32_t at = std::int32_t(fn_.code.size());
+            inst(IrOp::Poll);
+            const std::int32_t exit = makeExit(0, held);
+            fn_.code[std::size_t(at)].target = exit;
+            inst(IrOp::Br).imm = head;
+        }
+        inst(IrOp::Label).imm = end;
+        forgetAtLabel();
+        if (isMap) {
+            // As long as the array was: what was skipped has nothing to say.
+            const std::int32_t pad = newLabel();
+            const std::int32_t padded = newLabel();
+            inst(IrOp::Label).imm = pad;
+            const std::int32_t made = load(out.r, kElementCountOffset, 4, false, kAliasHeader);
+            IrInst& full = inst(IrOp::BrCmp);
+            full.a = made;
+            full.b = n;
+            full.cond = IrCond::Hs;
+            full.width = 64;
+            full.target = padded;
+            coldCall(reinterpret_cast<void*>(&scriptDynArrayAppend), {rtReg(), out.r, immReg(std::int64_t(Type::Undefined)), immReg(0)}, -1, -1, true, held);
+            inst(IrOp::Br).imm = pad;
+            inst(IrOp::Label).imm = padded;
+        }
+        if (isMap || isFilter) {
+            mov(r, out.r);
+            mov(t, immReg(std::int64_t(Type::Object)));
+        } else if (isReduce) {
+            mov(r, acc.r);
+            mov(t, acc.t);
+        } else {
+            mov(r, immReg(0));
+            mov(t, immReg(std::int64_t(Type::Undefined)));
+        }
+    }
+
+    std::int32_t plusReg(std::int32_t a, std::int32_t b)
+    {
+        const std::int32_t d = fn_.newVreg(false);
+        IrInst& add = inst(IrOp::Add);
+        add.d = d;
+        add.a = a;
+        add.b = b;
+        add.width = 64;
+        return d;
+    }
+
     bool intrinsic(const Entry& callee, const Entry& self, const std::vector<Entry>& args, std::int32_t r, std::int32_t t,
                    std::int32_t generic)
     {
@@ -4910,7 +5119,14 @@ private:
                           (which == Runtime::StringFromCharCode && argc == 1) || (which == Runtime::FunctionApply && argc == 2) ||
                           ((which == Runtime::MapGet || which == Runtime::MapHas || which == Runtime::SetHas || which == Runtime::SetAdd) && argc == 1) ||
                           (which == Runtime::MapSet && argc == 2);
-        if (!fits)
+        const bool loops = ((which == Runtime::ArrayForEach || which == Runtime::ArrayMap || which == Runtime::ArrayFilter) && (argc == 1 || argc == 2)) ||
+                           (which == Runtime::ArrayReduce && argc == 2);
+        if (!fits && !loops)
+            return false;
+        const auto anObject = [](const Entry& e) {
+            return e.rep == Rep::Tagged && !e.isConst && (!e.hasKnownTag || e.known == Type::Object);
+        };
+        if (loops && (!anObject(self) || !anObject(args[0])))
             return false;
         if (!callee.hasKnownTag)
             branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
@@ -4922,6 +5138,10 @@ private:
             same.cond = IrCond::Ne;
             same.width = 64;
             same.target = generic;
+        }
+        if (loops) {
+            higherOrder(which, callee, self, args, r, t, generic);
+            return true;
         }
         switch (which) {
             case Runtime::ArrayPush: inlinePush(callee, self, args[0], r, t, generic); return true;

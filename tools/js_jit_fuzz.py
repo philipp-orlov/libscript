@@ -31,7 +31,7 @@ class Gen:
                 return self.pick('"str"', '""', '"12"', 'true', 'false', 'null', 'undefined')
             return self.num()
         a = lambda: self.expr(s, d - 1)
-        k = self.r.randint(0, 22)
+        k = self.r.randint(0, 26)
         if k <= 3: return f"({a()} {self.pick('+','-','*','/','%')} {a()})"
         if k == 4: return f"({a()} {self.pick('&','|','^','<<','>>','>>>')} {a()})"
         if k == 5: return f"({a()} {self.pick('<','<=','>','>=')} {a()})"
@@ -51,6 +51,19 @@ class Gen:
         if k == 19: return f"f{self.r.randint(0, 3)}({a()}, {a()})"
         if k == 20: return f"Math.{self.pick('floor','abs','sqrt')}({a()})"
         if k == 21: return f"[{a()}, {a()}]"
+        if 23 <= k <= 26 and d > 1:
+            # A callback that may change the array it is called for, take what it was given out of it, or throw.
+            base = self.r.choice(s['arr']) if s['arr'] and self.r.random() < 0.6 else f"[{a()}, {a()}, {a()}]"
+            inner = {n: list(v) for n, v in s.items()}
+            inner['any'] = inner['any'] + ['x', 'i']
+            body = self.expr(inner, d - 2)
+            effect = self.pick('', '', '', f"{base}.pop(), ", f"{base}.push(i), ", f"{base}[0] = null, ", f"{base}.length = 1, ",
+                               "(i == 1 ? nope.y : 0), ") if base in s['arr'] else self.pick('', '', '(i == 1 ? nope.y : 0), ')
+            f = f"function (x, i) {{ return ({effect}{body}); }}"
+            if k == 23: return f"String({base}.map({f}))"
+            if k == 24: return f"String({base}.filter({f}))"
+            if k == 25: return f"String({base}.reduce(function (p, x, i) {{ return ({effect}p + {body}); }}, {a()}))"
+            return f"String({base}.forEach({f}))"
         return f"({{x: {a()}, y: {a()}}})"
 
     def stmts(self, s, n, ind, loop=False):

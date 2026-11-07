@@ -383,11 +383,31 @@ void Runtime::objectImage(DynObject* proto, Shape* root, std::uint32_t room, std
     words[offsetof(DynObject, props) / 8] = 0;
 }
 
+bool Runtime::arrayImage(std::size_t reserve, std::uint64_t* words, std::size_t& bytes)
+{
+    DynObject* proto = arrayProto.get();
+    Shape* root = proto && proto->pinned ? rootShapeFor(proto) : nullptr;
+    if (!root || reserve > kArrayInCell)
+        return false;
+    const std::size_t room = reserve * sizeof(Value);
+    bytes = sizeof(DynArray) + room;
+    DynArray image;
+    image.cellBytes = std::uint32_t(bytes);
+    image.gcBytes = std::uint32_t(bytes);
+    image.rt = &ctx;
+    image.shape = root;
+    if (room)
+        image.adoptRoom(room);
+    std::memcpy(words, static_cast<const void*>(&image), sizeof(DynArray));
+    std::memcpy(words + offsetof(DynObject, proto) / 8, &proto, sizeof proto);
+    // The caller knows where the elements will be.
+    words[offsetof(DynArray, store) / 8] = 0;
+    return true;
+}
+
 DynArray* Runtime::newArray(std::size_t reserve)
 {
-    // A few elements are kept in the cell, with room for them to be values: one allocation for a small array.
-    constexpr std::size_t kInCell = 8;
-    const std::size_t room = reserve <= kInCell ? reserve * sizeof(Value) : 0;
+    const std::size_t room = reserve <= kArrayInCell ? reserve * sizeof(Value) : 0;
     const std::size_t apart = room ? 0 : std::min<std::size_t>(reserve, 1u << 20);
     ctx.reserve(apart * sizeof(double));  // before the cell exists, so a refusal leaves nothing behind
     ctx.maybeCollect();

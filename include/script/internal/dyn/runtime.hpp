@@ -142,6 +142,10 @@ struct Runtime : EngineRuntime
         MathAtan2,
         ArrayPush,
         ArrayPop,
+        ArrayForEach,
+        ArrayMap,
+        ArrayFilter,
+        ArrayReduce,
         StringCharCodeAt,
         StringFromCharCode,
         FunctionApply,
@@ -213,6 +217,11 @@ struct Runtime : EngineRuntime
     /// What a new object of this prototype and root shape, with this much room, starts out as, a word at a time, for native
     /// code that makes one itself. All but where its table is, which depends on where it is.
     void objectImage(DynObject* proto, Shape* root, std::uint32_t room, std::uint64_t* words);
+    /// A few elements are kept in the cell, with room for them to be values: one allocation for a small array.
+    static constexpr std::size_t kArrayInCell = 8;
+    /// The same for a new array with room for `reserve` values in its cell, of `bytes` in all: false when it is not one
+    /// native code can make.
+    bool arrayImage(std::size_t reserve, std::uint64_t* words, std::size_t& bytes);
     DynObject* newObjectSized(DynObject* proto, std::uint32_t room);
     DynObject* newObject(DynObject* proto = nullptr);
 

@@ -1101,6 +1101,11 @@ Value CallbackLoop::ofTwoNumbers(double a, double b)
     return (*this)(Value::undefined(), {Value(a), Value(b)});
 }
 
+double CallbackLoop::numberOfTwoNumbers(double a, double b)
+{
+    return toNumber(rt_, ofTwoNumbers(a, b));
+}
+
 Value CallbackLoop::withArgs(const Value& thisValue, const Value* args, std::size_t count)
 {
     ContextImpl::ArgBuffer buffer(rt_.ctx);

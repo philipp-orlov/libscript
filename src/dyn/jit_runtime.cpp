@@ -882,16 +882,15 @@ double CallbackLoop::numberOfTwoNumbers(double a, double b)
     --rt_.ctx.callDepth;
     if (!rt_.nativeKeepAlive.isUndefined())
         rt_.nativeKeepAlive = Value::undefined();
-    if (std::uint32_t(out.tag) == std::uint32_t(Type::Double) && rt_.nativeError == 0) {
+    if (rt_.nativeError != 0)
+        raisePending(rt_);
+    if (std::uint32_t(out.tag) == std::uint32_t(Type::Double)) {
         double d;
         std::memcpy(&d, &out.payload, 8);
         return d;
     }
     const std::uint64_t results[2] = {out.payload, out.tag};
-    Value result = resultValue(results);
-    if (rt_.nativeError != 0)
-        raisePending(rt_);
-    return toNumber(rt_, result);
+    return toNumber(rt_, resultValue(results));
 }
 
 Value CallbackLoop::withArgs(const Value& thisValue, const Value* args, std::size_t count)
@@ -929,10 +928,10 @@ Value CallbackLoop::enter(const void* entry, std::int64_t thisTag, std::uint64_t
     const std::uint64_t results[2] = {out.payload, out.tag};
     if (!rt_.nativeKeepAlive.isUndefined())
         rt_.nativeKeepAlive = Value::undefined();
-    Value result = resultValue(results);
+    // Before making a value of them: after a throw what came back is nothing.
     if (rt_.nativeError != 0)
         raisePending(rt_);
-    return result;
+    return resultValue(results);
 }
 
 bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result)

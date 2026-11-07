@@ -2146,8 +2146,26 @@ public:
 
     NativeCode* compileFunction(IrFunction& fn, const NativeConfig& config) override
     {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (const char* path = std::getenv("SCRIPT_JIT_IR_BEFORE")) {
+            if (std::FILE* out = std::fopen(path, "a")) {
+                const std::string text = dumpIr(fn);
+                std::fwrite(text.data(), 1, text.size(), out);
+                std::fclose(out);
+            }
+        }
+#endif
         optimizeLoops(fn);
         allocateRegisters(fn, regs_);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (const char* path = std::getenv("SCRIPT_JIT_IR")) {
+            if (std::FILE* out = std::fopen(path, "a")) {
+                const std::string text = dumpIr(fn);
+                std::fwrite(text.data(), 1, text.size(), out);
+                std::fclose(out);
+            }
+        }
+#endif
         static const std::unordered_map<const MethodInfo*, std::size_t> kNoSession;
         Emitter emitter(fn, config, kNoSession);
         if (!emitter.run())

@@ -1010,6 +1010,38 @@ TEST(capturedVariablesOfEveryKindMadeInNativeCode)
              std::string("18000"));
 }
 
+TEST(aLoopThatKeepsFieldsInRegistersPutsThemBackOnEveryWayOut)
+{
+    // Leaving for the interpreter part way round: the counter overflows after the last pass has changed both fields.
+    CHECK_EQ(run("function P() { this.a = 1; this.b = 2; }"
+                 "function k(o, s, n) { for (var i = s; i <= n; i++) { o.a = o.b + 1; o.b = o.a + 1; } return o.a + ',' + o.b; }"
+                 "var r; for (var m = 0; m < 500; m++) r = k(new P(), 0, 1);"
+                 "r + '|' + k(new P(), 2147483643, 2147483647)"),
+             std::string("5,6|11,12"));
+    // A field that held a string is released the first time round, and the loop carries on with it in a register.
+    CHECK_EQ(run("function Q() { this.a = 's'; this.b = 2; }"
+                 "function k(o, n) { for (var i = 0; i < n; i++) { o.b = o.b + 1; o.a = o.b * 2; } return o.a + ',' + o.b; }"
+                 "var u; for (var m = 0; m < 300; m++) u = k(new Q(), 50); u"),
+             std::string("104,52"));
+    // Leaving through a value that stops being a number.
+    CHECK_EQ(run("function P() { this.a = 1; this.b = 2; }"
+                 "function k(o, xs) { for (var i = 0; i < xs.length; i++) { o.a = o.b + xs[i]; o.b = o.a - 1; } return o.a + ',' + o.b; }"
+                 "var r; for (var m = 0; m < 300; m++) r = k(new P(), [1, 2, 3, 4, 5, 6, 7, 8]);"
+                 "r + '|' + k(new P(), [1, 2, 3, 'x'])"),
+             std::string("31,30|5x,NaN"));
+}
+
+TEST(aCounterCapturedByAClosureCountsExactly)
+{
+    // Two closures of one function, inlined; then one of them reached through a function that returns a string.
+    CHECK_EQ(run("function mk() { var c = 0; return function (d) { c += d; return c; }; }"
+                 "function k(n, f, g) { var s = 0; for (var i = 0; i < n; i++) s = f(i & 1) + g(1); return s; }"
+                 "var v; for (var j = 0; j < 50; j++) v = k(1000, mk(), mk());"
+                 "var f = mk(), g = mk(); k(100, f, g);"
+                 "v + '|' + k(10, function (d) { return f(d) + '!'; }, g)"),
+             std::string("1500|55!110"));
+}
+
 TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)
 {
     CHECK_EQ(run("function P(a, d) { this.a = a; this.d = d; }"

@@ -3,12 +3,13 @@
 
 // Loop optimizations over the IR: what does not change inside a loop moves out of it.
 //
-// Innermost loops only, and only loops with no call in them, which is where all of this pays and where it can be argued
-// about without an alias analysis:
+// Innermost loops only, and only loops with no call in them that comes back, which is where all of this pays and where it
+// can be argued about without an alias analysis:
 //
 //   * a field of an object the loop does not reassign lives in a register for the length of the loop: read once before it
-//     and, if the loop writes it, written back on every way out. The only places another reference could see it are
-//     another base at the same offset, and that rules the field out; nothing else in a call-free loop can look;
+//     and, if the loop writes it, written back on every way out, a bail to the interpreter included, and before a release
+//     in cold code (read again after it). The only places another reference could see it are another base at the same
+//     offset, and that rules the field out; nothing else in such a loop can look;
 //   * a floating point constant is materialized once before the loop.
 //
 // A loop head an on-stack replacement enters is handled by moving the entry to the new preheader.
@@ -49,6 +50,7 @@ struct Promoted
     bool isFp;
     bool written;
     std::int32_t vreg;
+    bool hot;  ///< isFp is what the hot path uses
 };
 
 class LoopOptimizer
@@ -118,9 +120,21 @@ private:
             }
         }
         std::vector<std::uint8_t> labelInside(std::size_t(fn_.labelCount), 0);
+        // Cold code may leave for good through a call (the dynamic engine's bail to the interpreter, which carries on from
+        // memory), or release something (which may run a host's finalizer): the fields go back to memory first, and after
+        // a release they are read again. Anything else that calls out is not for this pass.
+        int nest = 0;
         for (std::int32_t i = loop.head; i <= loop.last; ++i) {
             const IrInst& in = fn_.code[std::size_t(i)];
-            if (in.op == IrOp::Call || in.op == IrOp::DecRef || in.op == IrOp::DecRefTagged || in.op == IrOp::Trap)
+            if (in.op == IrOp::ColdBegin)
+                ++nest;
+            else if (in.op == IrOp::ColdEnd)
+                --nest;
+            if (in.op == IrOp::Trap)
+                return;
+            if (in.op == IrOp::Call && (nest == 0 || !leavesFor(i)))
+                return;
+            if ((in.op == IrOp::DecRef || in.op == IrOp::DecRefTagged) && nest == 0)
                 return;
             if (in.d >= 0)
                 definedInside[std::size_t(in.d)] = 1;
@@ -140,8 +154,13 @@ private:
         std::map<std::pair<std::int32_t, std::int64_t>, Promoted> fields;
         std::map<std::int64_t, std::vector<std::int32_t>> basesAtOffset;
         std::vector<std::pair<std::int32_t, std::int64_t>> rejected;
+        nest = 0;
         for (std::int32_t i = loop.head; i <= loop.last; ++i) {
             const IrInst& in = fn_.code[std::size_t(i)];
+            if (in.op == IrOp::ColdBegin)
+                ++nest;
+            else if (in.op == IrOp::ColdEnd)
+                --nest;
             if (in.op != IrOp::Load && in.op != IrOp::Store)
                 continue;
             // A byte load is a tag: this is a field of a type that needs one, written by a helper this loop has none of,
@@ -156,14 +175,19 @@ private:
                 rejected.push_back(key);
                 continue;
             }
+            // The register is of the kind the hot path uses; elsewhere the bits are moved across.
             auto it = fields.find(key);
             if (it == fields.end()) {
-                Promoted field{in.a, in.imm, in.width, isFp, in.op == IrOp::Store, -1};
+                Promoted field{in.a, in.imm, in.width, isFp, in.op == IrOp::Store, -1, nest == 0};
                 fields.emplace(key, field);
             } else {
                 it->second.written = it->second.written || in.op == IrOp::Store;
-                if (it->second.width != in.width || it->second.isFp != isFp)
+                if (it->second.width != in.width || (it->second.isFp != isFp && in.width != 8))
                     rejected.push_back(key);
+                if (!it->second.hot && nest == 0) {
+                    it->second.isFp = isFp;
+                    it->second.hot = true;
+                }
             }
         }
         for (const auto& key : rejected)
@@ -273,7 +297,7 @@ private:
                 const auto it = fields.find(std::make_pair(in.a, in.imm));
                 if (it != fields.end()) {
                     IrInst mov;
-                    mov.op = IrOp::Mov;
+                    mov.width = 64;
                     if (in.op == IrOp::Load) {
                         mov.d = in.d;
                         mov.a = it->second.vreg;
@@ -281,9 +305,22 @@ private:
                         mov.d = it->second.vreg;
                         mov.a = in.c;
                     }
+                    const bool fromFp = fn_.vregIsFp[std::size_t(mov.a)] != 0;
+                    const bool toFp = fn_.vregIsFp[std::size_t(mov.d)] != 0;
+                    mov.op = fromFp == toFp ? IrOp::Mov : toFp ? IrOp::BitsToFp : IrOp::FpToBits;
                     out.push_back(mov);
                     continue;
                 }
+            }
+            const bool release = in.op == IrOp::DecRef || in.op == IrOp::DecRefTagged;
+            const bool leaving = (in.op == IrOp::Call && leavesFor(i)) ||
+                                 (in.op == IrOp::Ret && fn_.code[std::size_t(i - 1)].op != IrOp::Call);
+            if ((release || leaving) && anyWritten)
+                emitGuarded(out, list, /*load=*/false);
+            if (release) {
+                out.push_back(in);
+                emitGuarded(out, list, /*load=*/true);
+                continue;
             }
             if (in.op == IrOp::ExitCmp || in.op == IrOp::Poll)
                 in.target = exitFor(in.target);
@@ -334,6 +371,13 @@ private:
                     in.target = preheader;
             }
         }
+    }
+
+    /// A call that is the last thing before the method returns.
+    bool leavesFor(std::int32_t at) const
+    {
+        return fn_.code[std::size_t(at)].op == IrOp::Call && std::size_t(at) + 1 < fn_.code.size() &&
+               fn_.code[std::size_t(at) + 1].op == IrOp::Ret;
     }
 
     static std::vector<const Promoted*> sorted(const std::map<std::pair<std::int32_t, std::int64_t>, Promoted>& fields)
@@ -423,18 +467,36 @@ public:
         for (const IrOsrEntry& entry : fn_.osrEntries)
             use(entry.label);
         std::vector<std::uint8_t> removed(code.size(), 0);
+        // What follows a branch or a return with no label between is never reached.
+        for (std::size_t i = 0; i + 1 < code.size(); ++i) {
+            if (code[i].op != IrOp::Br && code[i].op != IrOp::Ret)
+                continue;
+            for (std::size_t j = i + 1; j < code.size(); ++j) {
+                const IrOp op = code[j].op;
+                if (op == IrOp::Label || op == IrOp::ColdBegin || op == IrOp::ColdEnd || op == IrOp::OsrEntry ||
+                    op == IrOp::Trap)
+                    break;
+                removed[j] = 1;
+                const std::int64_t label = labelTargetOf(code[j]);
+                if (label >= 0)
+                    --uses[std::size_t(label)];
+                i = j;
+            }
+        }
         int cold = 0;
         for (std::size_t i = 0; i < code.size(); ++i) {
             if (code[i].op == IrOp::ColdBegin)
                 ++cold;
             else if (code[i].op == IrOp::ColdEnd)
                 --cold;
-            if (cold || code[i].op != IrOp::Br)
+            if (cold || code[i].op != IrOp::Br || removed[i])
                 continue;
             std::size_t next = i + 1;
             int skipping = 0;
             for (; next < code.size(); ++next) {
                 const IrOp op = code[next].op;
+                if (removed[next])
+                    continue;
                 if (op == IrOp::ColdBegin)
                     ++skipping;
                 else if (op == IrOp::ColdEnd)
@@ -473,6 +535,7 @@ public:
         std::vector<IrInst> out;
         out.reserve(fn_.code.size());
         findQuietLoops();
+        findSingleEntries();
         for (std::int32_t position = 0; position < std::int32_t(fn_.code.size()); ++position) {
             while (!floors_.empty() && floors_.back().last < position)
                 floors_.pop_back();
@@ -486,7 +549,11 @@ public:
             switch (in.op) {
                 case IrOp::Label:
                     // A join of a cold block that leaves everything as the hot path knows it says so.
-                    if (in.alias == 0) {
+                    if (const auto only = atBranch_.find(in.imm); only != atBranch_.end() && !fallsInto(position)) {
+                        // Reached by one branch from above and nothing else: what held there holds here.
+                        known_ = std::move(only->second);
+                        atBranch_.erase(only);
+                    } else if (in.alias == 0) {
                         const auto loop = quietLoops_.find(in.imm);
                         if (loop != quietLoops_.end()) {
                             keepThrough(loop->second);
@@ -521,6 +588,8 @@ public:
                         known_.push_back(in);
                     break;
                 case IrOp::BrCmp: {
+                    if (singleEntry_.count(in.target))
+                        atBranch_[in.target] = known_;
                     bool taken = false;
                     if (decided(in, taken)) {
                         if (!taken)
@@ -545,6 +614,21 @@ public:
                 case IrOp::StoreIdx:
                     dropIndexed();
                     break;
+                case IrOp::IncRefTagged:
+                case IrOp::DecRefTagged: {
+                    // A tag known to be no cell's: nothing to count.
+                    std::int64_t tag = 0;
+                    if (tagOf(in.b, tag) && std::uint32_t(tag) < std::uint32_t(Type::String))
+                        continue;
+                    break;
+                }
+                case IrOp::IncRef:
+                case IrOp::DecRef: {
+                    std::int64_t value = 0;
+                    if (in.isNullable && constantOf(in.a, value) && value == 0)
+                        continue;
+                    break;
+                }
                 case IrOp::StoreTag:
                     dropLoadsAt(in.imm, in.alias);
                     break;
@@ -602,6 +686,41 @@ public:
     }
 
 private:
+    /// Labels after the one conditional branch that goes to them, and that nothing else enters.
+    void findSingleEntries()
+    {
+        std::vector<std::int32_t> refs(std::size_t(fn_.labelCount), 0);
+        std::vector<std::int32_t> from(std::size_t(fn_.labelCount), -1);
+        for (std::size_t i = 0; i < fn_.code.size(); ++i) {
+            const std::int64_t to = labelTargetOf(fn_.code[i]);
+            if (to < 0)
+                continue;
+            ++refs[std::size_t(to)];
+            from[std::size_t(to)] = fn_.code[i].op == IrOp::BrCmp ? std::int32_t(i) : -1;
+        }
+        for (const IrExit& exit : fn_.exits) {
+            if (exit.handlerLabel >= 0)
+                refs[std::size_t(exit.handlerLabel)] += 2;
+        }
+        for (const IrOsrEntry& entry : fn_.osrEntries)
+            refs[std::size_t(entry.label)] += 2;
+        for (std::size_t i = 0; i < fn_.code.size(); ++i) {
+            const IrInst& in = fn_.code[i];
+            if (in.op == IrOp::Label && refs[std::size_t(in.imm)] == 1 && from[std::size_t(in.imm)] >= 0 &&
+                from[std::size_t(in.imm)] < std::int32_t(i))
+                singleEntry_.insert(in.imm);
+        }
+    }
+
+    /// Whether the instruction before a label carries on into it.
+    bool fallsInto(std::int32_t position) const
+    {
+        if (position == 0)
+            return true;
+        const IrOp op = fn_.code[std::size_t(position - 1)].op;
+        return op != IrOp::ColdBegin && op != IrOp::Br && op != IrOp::Ret && op != IrOp::Trap;
+    }
+
     /// What a loop can change, for a loop that nothing else enters and that runs nothing it does not see. Facts about what
     /// is not in here hold all the way round it.
     struct LoopWrites
@@ -743,6 +862,9 @@ private:
     }
 
     /// The register this one is a known copy of, if it is.
+    std::set<std::int64_t> singleEntry_;
+    std::map<std::int64_t, std::vector<IrInst>> atBranch_;
+
     std::int32_t originalOf(std::int32_t v) const noexcept
     {
         if (v < 0)
@@ -828,6 +950,20 @@ private:
         return nullptr;
     }
     /// The constant a register holds, when that is known here.
+    /// A constant, or what a test passed a moment ago says the low 32 bits are: enough for a tag.
+    bool tagOf(std::int32_t v, std::int64_t& value) const noexcept
+    {
+        if (constantOf(v, value))
+            return true;
+        for (const IrInst& k : known_) {
+            if (k.op == IrOp::BrCmp && k.a == v && k.hasImm && k.cond == IrCond::Ne && (k.width == 32 || k.width == 64)) {
+                value = k.imm;
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool constantOf(std::int32_t v, std::int64_t& value) const noexcept
     {
         for (int hops = 0; hops < 4; ++hops) {
@@ -1423,6 +1559,90 @@ private:
     std::vector<std::uint8_t> pinned_;
 };
 
+/// A number goes through memory as a double: `x = load; f = bits of x` loads `f` itself, and `y = bits of f; store y`
+/// stores `f`. Moving bits between the two register files is slower than the load, and a value stored and read back
+/// round a loop pays for it twice an iteration.
+class FpMemory
+{
+public:
+    explicit FpMemory(IrFunction& fn) : fn_(fn) {}
+
+    void run()
+    {
+        std::vector<std::pair<Known, Known>> saved;
+        for (IrInst& in : fn_.code) {
+            switch (in.op) {
+                case IrOp::Label: known_ = Known(); continue;
+                case IrOp::ColdBegin: saved.emplace_back(known_, Known()); continue;
+                case IrOp::ColdEnd:
+                    if (!saved.empty()) {
+                        known_ = saved.back().first;
+                        saved.pop_back();
+                    }
+                    continue;
+                case IrOp::BitsToFp: {
+                    const auto it = known_.loads.find(in.a);
+                    if (it != known_.loads.end() && in.d != in.a) {
+                        const std::int32_t d = in.d;
+                        in = it->second;
+                        in.d = d;
+                    }
+                    break;
+                }
+                case IrOp::Store:
+                    if (in.width == 8 && !fn_.vregIsFp[std::size_t(in.c)]) {
+                        const auto it = known_.bits.find(in.c);
+                        if (it != known_.bits.end())
+                            in.c = it->second;
+                    }
+                    known_.loads.clear();
+                    continue;
+                default: break;
+            }
+            if (in.op == IrOp::StoreIdx || in.op == IrOp::StoreTag || in.op == IrOp::StoreTagIdx || in.op == IrOp::Call)
+                known_.loads.clear();
+            forget(in);
+            if (in.op == IrOp::Load && in.width == 8 && !in.isSigned && !fn_.vregIsFp[std::size_t(in.d)] && in.a != in.d)
+                known_.loads[in.d] = in;
+            if (in.op == IrOp::FpToBits && in.width == 64 && in.d != in.a)
+                known_.bits[in.d] = in.a;
+        }
+    }
+
+private:
+    struct Known
+    {
+        std::map<std::int32_t, IrInst> loads;      ///< an integer register, and the load it holds the result of
+        std::map<std::int32_t, std::int32_t> bits;  ///< an integer register, and the double it holds the bits of
+    };
+
+    /// A register written makes whatever was known of it, or through it, stale.
+    void forget(const IrInst& in)
+    {
+        std::vector<std::int32_t> written;
+        if (in.d >= 0)
+            written.push_back(in.d);
+        if (in.op == IrOp::Call) {
+            const IrCall& call = fn_.calls[std::size_t(in.imm)];
+            written.push_back(call.result);
+            written.push_back(call.resultTag);
+        }
+        for (std::int32_t v : written) {
+            if (v < 0)
+                continue;
+            known_.loads.erase(v);
+            known_.bits.erase(v);
+            for (auto it = known_.loads.begin(); it != known_.loads.end();)
+                it = it->second.a == v ? known_.loads.erase(it) : std::next(it);
+            for (auto it = known_.bits.begin(); it != known_.bits.end();)
+                it = it->second == v ? known_.bits.erase(it) : std::next(it);
+        }
+    }
+
+    IrFunction& fn_;
+    Known known_;
+};
+
 /// `head: if (!c) goto out; body; goto head` becomes `if (!c) goto out; body: ...; if (c) goto body; goto out`: one branch
 /// taken per iteration instead of two. A null check at the very start of the body runs once, between the two tests: what
 /// it tests does not change in the loop.
@@ -1524,6 +1744,7 @@ void optimizeLoops(IrFunction& fn)
     LoopInvariants(fn).run();
     LoopRotation(fn).run();
     CopyPropagation(fn).run();
+    FpMemory(fn).run();
 }
 
 }  // namespace typed

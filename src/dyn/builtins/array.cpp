@@ -21,6 +21,23 @@ namespace dyn {
 
 namespace {
 
+/// Element `i` of `a` as HasProperty and Get see it: its own, or for a hole, one up the prototype chain.
+bool presentElement(Runtime& rt, DynArray* a, std::size_t i, Value& out)
+{
+    if (i >= a->size())
+        return false;
+    if (a->hasElement(i)) {
+        out = a->at(i);
+        return true;
+    }
+    const Value self = detail::Access::make(Type::Object, a);
+    Ref<GCObject> key(rt.intern(numberToString(double(i))));
+    if (!hasProperty(rt, self, key.get()))
+        return false;
+    out = getProperty(rt, self, key.get());
+    return true;
+}
+
 DynArray* thisArray(CallInfo& ci)
 {
     DynArray* arr = asArray(ci.thisValue());
@@ -517,8 +534,10 @@ void installArray(Runtime& rt)
 
     arrayMethod("indexOf", false, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
-        for (std::size_t i = 0; i < a->size(); ++i) {
-            if (strictEquals(a->at(i), ci.arg(0)) && a->hasElement(i))
+        const std::size_t n = a->size();
+        for (std::size_t i = 0; i < n; ++i) {
+            Value item;
+            if (presentElement(rtOf(ci), a, i, item) && strictEquals(item, ci.arg(0)))
                 return Value(double(i));
         }
         return Value(-1.0);
@@ -527,7 +546,8 @@ void installArray(Runtime& rt)
     arrayMethod("lastIndexOf", false, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         for (std::size_t i = a->size(); i-- > 0;) {
-            if (strictEquals(a->at(i), ci.arg(0)) && a->hasElement(i))
+            Value item;
+            if (presentElement(rtOf(ci), a, i, item) && strictEquals(item, ci.arg(0)))
                 return Value(double(i));
         }
         return Value(-1.0);
@@ -558,9 +578,10 @@ void installArray(Runtime& rt)
         Value args[3] = {Value::undefined(), Value::undefined(), ci.thisValue()};
         const std::size_t n = a->size();
         for (std::size_t i = 0; i < n; ++i) {
-            if ((i >= a->size() || !a->hasElement(i)) && !visitsGone)
+            Value item = Value::undefined();
+            if (!presentElement(rt2, a, i, item) && !visitsGone)
                 continue;
-            args[0] = i < a->size() ? a->at(i) : Value::undefined();
+            args[0] = item;
             args[1] = Value(double(i));
             produced = call.withArgs(self, args, 3);
             if (!step(i, args[0], produced))
@@ -697,11 +718,10 @@ void installArray(Runtime& rt)
             acc = ci.arg(1);
         } else {
             // The first element there is, holes skipped.
-            while (at < n && !a->hasElement(reversed ? n - 1 - at : at))
+            while (at < n && !presentElement(rt2, a, reversed ? n - 1 - at : at, acc))
                 ++at;
             if (at >= n)
                 ci.fail(ErrorCode::TypeError, "reduce of an empty array with no initial value");
-            acc = a->at(reversed ? n - 1 - at : at);
             ++at;
         }
         CallbackLoop call(rt2, fn);
@@ -709,9 +729,8 @@ void installArray(Runtime& rt)
         for (; at < n; ++at) {
             const std::size_t i = reversed ? n - 1 - at : at;
             // The callback may have shortened the array; an element that is gone is skipped, as in JavaScript.
-            if (i >= a->size() || !a->hasElement(i))
+            if (!presentElement(rt2, a, i, args[1]))
                 continue;
-            args[1] = a->at(i);
             args[2] = Value(double(i));
             args[0] = call.withArgs(Value::undefined(), args, 4);
         }
@@ -753,8 +772,14 @@ void installArray(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         std::vector<Value> items;
-        for (std::size_t i = 0; i < a->size(); ++i)
-            items.push_back(a->at(i));
+        // As long as it was to begin with, each element read as Get reads it: a getter may change the rest.
+        const std::size_t n = a->size();
+        for (std::size_t i = 0; i < n; ++i) {
+            Value item = Value::undefined();
+            if (!presentElement(rt2, a, i, item) && i >= a->size())
+                item = Value::undefined();
+            items.push_back(item);
+        }
         return rt2.makeArray(items);
     };
     arrayMethod("toReversed", false, [copied](CallInfo& ci) -> Value {
@@ -772,17 +797,26 @@ void installArray(Runtime& rt)
         invokeMethod(rtOf(ci), out, rtOf(ci).intern("splice"), ci.args());
         return out;
     }, 2);
-    arrayMethod("with", false, [copied](CallInfo& ci) -> Value {
+    arrayMethod("with", false, [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
-        const Value out = copied(ci);
-        DynArray* a = asArray(out);
-        std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
-        if (i < 0)
-            i += std::int64_t(a->size());
-        if (i < 0 || i >= std::int64_t(a->size()))
+        DynArray* a = thisArray(ci);
+        const std::size_t n = a->size();
+        std::int64_t at = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
+        if (at < 0)
+            at += std::int64_t(n);
+        if (at < 0 || at >= std::int64_t(n))
             ci.fail(ErrorCode::RangeError, "the index is out of range");
-        a->put(std::size_t(i), ci.arg(1));
-        return out;
+        std::vector<Value> items;
+        // The element it replaces is never read.
+        for (std::size_t i = 0; i < n; ++i) {
+            Value item = Value::undefined();
+            if (std::int64_t(i) == at)
+                item = ci.arg(1);
+            else
+                presentElement(rt2, a, i, item);
+            items.push_back(item);
+        }
+        return rt2.makeArray(items);
     }, 2);
     arrayMethod("copyWithin", true, [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);

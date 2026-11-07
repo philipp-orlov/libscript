@@ -846,6 +846,13 @@ bool hasProperty(Runtime& rt, const Value& base, GCObject* key)
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
         if (cursor->fnKindIsProxy())
             return proxyHas(rt, asProxy(cursor), key);
+        if (cursor->cls == ObjClass::StringObject && key->kind == CellKind::String) {
+            if (StringCell* text = asString(static_cast<DynWrapper*>(cursor)->primitive)) {
+                std::uint32_t index = 0;
+                if (key == rt.atom.length.get() || (arrayIndexOf(static_cast<StringCell*>(key)->text(), index) && index < text->text().size()))
+                    return true;
+            }
+        }
         if (cursor->cls == ObjClass::Array) {
             auto* arr = static_cast<DynArray*>(cursor);
             std::uint32_t index = 0;

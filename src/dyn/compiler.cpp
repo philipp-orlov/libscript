@@ -867,20 +867,35 @@ private:
 
         emitU(Op::GetLocal, slot);
         if (defaultValue)
-            emitDefault(*defaultValue);
+            emitDefault(*defaultValue, target->kind == NK::Identifier ? target->text : String());
         declarePattern(*target, VarKind::Let);
     }
 
     /// Replace the value on top of the stack with `value` when it is undefined.
-    void emitDefault(const Node& value)
+    void emitDefault(const Node& value, const String& name = String())
     {
         emit(Op::Dup);
         emit(Op::PushUndefined);
         emit(Op::StrictEq);
         const std::size_t skip = emitJump(Op::JumpIfFalse);
         emit(Op::Pop);
-        expr(value);
+        exprNamed(value, name);
         patchHere(skip);
+    }
+
+    /// An anonymous function or class takes the name of what it is assigned to.
+    void exprNamed(const Node& value, const String& name)
+    {
+        if (!name.empty() && (value.kind == NK::FunctionExpr || value.kind == NK::ArrowExpr) && value.text.empty() && !value.isMethod) {
+            function(value, name);
+            return;
+        }
+        if (!name.empty() && value.kind == NK::ClassExpr && value.text.empty()) {
+            classNameHint_ = name;
+            classExpr(value);
+            return;
+        }
+        expr(value);
     }
 
     /// Push `this`, from its box when an arrow function captured it.
@@ -1015,16 +1030,17 @@ private:
     {
         for (const NodePtr& d : n.list) {
             const Node& target = *d->a;
+            const String name = target.kind == NK::Identifier ? target.text : String();
             if (n.varKind == VarKind::Var) {
                 if (!d->b)
                     continue;  // already hoisted to undefined
-                expr(*d->b);
+                exprNamed(*d->b, name);
                 assignPattern(target);
                 emit(Op::Pop);
                 continue;
             }
             if (d->b)
-                expr(*d->b);
+                exprNamed(*d->b, name);
             else
                 emit(Op::PushUndefined);
             declarePattern(target, n.varKind);
@@ -1103,7 +1119,7 @@ private:
             return;
         }
         if (pattern.kind == NK::AssignPattern) {
-            emitDefault(*pattern.b);
+            emitDefault(*pattern.b, pattern.a->kind == NK::Identifier ? pattern.a->text : String());
             destructure(*pattern.a, kind, declaring);
             return;
         }
@@ -1740,7 +1756,10 @@ private:
                     emit(Op::DefElem);
                 continue;
             }
-            expr(*p->b);
+            if (p->propKind == PropKind::Init && p->text != u"__proto__")
+                exprNamed(*p->b, p->text);
+            else
+                expr(*p->b);
             switch (p->propKind) {
                 case PropKind::Getter: emitU(Op::DefGetter, atomFor(p->text)); break;
                 case PropKind::Setter: emitU(Op::DefSetter, atomFor(p->text)); break;
@@ -1905,7 +1924,7 @@ private:
                 return;
             }
             if (target.kind == NK::Identifier) {
-                expr(*n.b);
+                exprNamed(*n.b, target.text);
                 emit(Op::Dup);
                 storeVar(target.text, n.line);
                 return;
@@ -2390,6 +2409,9 @@ private:
 
     void classExpr(const Node& n)
     {
+        // A name given by what it is assigned to, for this class and no class inside it.
+        const String className = classNameHint_;
+        classNameHint_.clear();
         const StrictScope strictBody(*this, true);
         const bool derived = n.a != nullptr;
         if (earlyErrors())
@@ -2462,7 +2484,7 @@ private:
         }
         ctor->propKind = PropKind::Constructor;
         ctor->isStatic = derived && !n.allocatesThis;  // read back as isDerivedConstructor
-        function(*ctor, n.text.empty() ? ascii("") : n.text);
+        function(*ctor, n.text.empty() ? className : n.text);
         ctor->isStatic = false;
         ctor->propKind = PropKind::Init;
 
@@ -2619,6 +2641,7 @@ private:
 
     Runtime& rt_;
     std::shared_ptr<const std::string> sourceName_;
+    String classNameHint_;
     FnState* fn_ = nullptr;
     std::vector<std::set<String>> privateScopes_;
     bool sloppyThis_ = false;

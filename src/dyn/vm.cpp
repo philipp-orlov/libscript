@@ -16,6 +16,7 @@
 #include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/stack_guard.hpp"
 
 namespace script {
@@ -405,6 +406,12 @@ Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Valu
             if (StringCell* s = asString(w->primitive))
                 return Value(double(s->text().size()));
         }
+        if (cursor->cls == ObjClass::TypedArray) {
+            auto* ta = static_cast<DynTypedArray*>(cursor);
+            double index = 0;
+            if (numericKey(key, index))
+                return typedArrayHas(ta, index) ? typedArrayGet(rt, ta, std::size_t(index)) : Value::undefined();
+        }
         if (const Prop* p = cursor->findOwn(key)) {
             if (!cursor->accessorOf(*p))
                 return p->value;
@@ -533,6 +540,21 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
 
     // An accessor anywhere on the prototype chain wins over a plain own write.
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+        if (cursor->cls == ObjClass::TypedArray) {
+            auto* ta = static_cast<DynTypedArray*>(cursor);
+            double index = 0;
+            if (numericKey(key, index)) {
+                if (cursor == obj) {
+                    typedArraySet(rt, ta, index, v);
+                    return;
+                }
+                // Reached by inheritance: nothing happens unless there is such an element, and then it is the
+                // receiver's own property that gets written.
+                if (!typedArrayHas(ta, index))
+                    return;
+                break;
+            }
+        }
         const Prop* p = cursor->findOwn(key);
         if (!p)
             continue;
@@ -614,6 +636,14 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
     // name is in the tables, an array's included: `Array.prototype` is one, and where `push` and `map` are.
     std::uint32_t index = 0;
     const bool answeredApart = key == rt.atom.length.get() || arrayIndexOf(static_cast<StringCell*>(key)->text(), index);
+    // A typed array anywhere on the way answers for anything that reads as a number.
+    double numeric = 0;
+    if (numericKey(key, numeric)) {
+        for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+            if (cursor->cls == ObjClass::TypedArray)
+                return getProperty(rt, base, key);
+        }
+    }
     if ((obj->cls == ObjClass::StringObject || obj->cls == ObjClass::Array) && answeredApart)
         return getProperty(rt, base, key);
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
@@ -708,7 +738,7 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
     if (site)
         ++site->misses;
     if (!site || !before || key->kind != CellKind::String || obj->cls == ObjClass::Array ||
-        obj->cls == ObjClass::StringObject) {
+        obj->cls == ObjClass::StringObject || obj->cls == ObjClass::TypedArray) {
         setProperty(rt, base, key, v);
         return;
     }
@@ -813,6 +843,11 @@ bool hasProperty(Runtime& rt, const Value& base, GCObject* key)
             if (key == rt.atom.length.get())
                 return true;
         }
+        if (cursor->cls == ObjClass::TypedArray) {
+            double index = 0;
+            if (numericKey(key, index))
+                return typedArrayHas(static_cast<DynTypedArray*>(cursor), index);
+        }
         if (cursor->findOwn(key))
             return true;
     }
@@ -832,6 +867,11 @@ bool deleteProperty(Runtime&, const Value& base, GCObject* key)
                 arr->put(index, Value::undefined());
             return true;
         }
+    }
+    if (obj->cls == ObjClass::TypedArray) {
+        double index = 0;
+        if (numericKey(key, index))
+            return !typedArrayHas(static_cast<DynTypedArray*>(obj), index);
     }
     if (obj->frozen)
         return false;
@@ -853,6 +893,11 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
             for (std::uint32_t i = 0; i < s->text().size(); ++i)
                 keys.push_back(rt.str(numberToString(i)));
         }
+    }
+    if (obj->cls == ObjClass::TypedArray) {
+        const std::size_t count = static_cast<DynTypedArray*>(obj)->length;
+        for (std::size_t i = 0; i < count; ++i)
+            keys.push_back(rt.str(numberToString(double(i))));
     }
     for (std::size_t i = 0; i < obj->props.size(); ++i) {
         if (enumerableOnly && !(obj->attrsAt(i) & PropEnumerable))
@@ -908,6 +953,10 @@ Value getIndex(Runtime& rt, const Value& base, std::uint32_t i)
         if (i < arr->size())
             return arr->at(i);
         return Value::undefined();
+    }
+    if (DynObject* o = asObject(base); o && o->cls == ObjClass::TypedArray) {
+        auto* ta = static_cast<DynTypedArray*>(o);
+        return i < ta->length ? typedArrayGet(rt, ta, i) : Value::undefined();
     }
     return getProperty(rt, base, rt.intern(numberToString(i)));
 }
@@ -1240,6 +1289,8 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
     const Value target = detail::Access::make(Type::Object, newTarget);
     Value protoValue = getPropertyOfObject(rt, newTarget, rt.atom.prototype.get(), target);
     DynObject* proto = asObject(protoValue);
+    // A built-in whose new target has no usable prototype keeps the one it gives its own kind.
+    const bool keepNativeProto = !proto;
     if (!proto)
         proto = rt.objectProto.get();
     // Room for what objects made the same way have gone on to hold.
@@ -1252,7 +1303,7 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
     if (!result.isObject())
         return thisValue;
     // A built-in makes its own kind of object, which a class extending it inherits from the class.
-    if (fn->fnKind == FnKind::Native && newTarget != fn) {
+    if (fn->fnKind == FnKind::Native && newTarget != fn && !keepNativeProto) {
         if (DynObject* made = asObject(result))
             made->setProto(proto);
     }
@@ -1419,6 +1470,12 @@ Value getIterator(Runtime& rt, const Value& obj)
 
 bool iteratorStep(Runtime& rt, const Value& iterator, Value& out)
 {
+    // No result object to make and take apart when `next` is the one it started with.
+    if (DynObject* o = asObject(iterator); o && o->cls == ObjClass::ArrayIterator && o->proto.get() == rt.arrayIteratorProto.get() && o->props.empty()) {
+        const Prop* next = rt.arrayIteratorProto->findOwn(rt.atom.next.get());
+        if (next && detail::Access::ptr(next->value) == rt.intrinsics[Runtime::ArrayIteratorNext].get())
+            return arrayIteratorStep(rt, static_cast<DynArrayIterator*>(o), out);
+    }
     const Value result = invokeMethod(rt, iterator, rt.atom.next.get(), {});
     if (!result.isObject())
         throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
@@ -1929,6 +1986,20 @@ Value execute(Runtime& rt, Frame& frame)
                             }
                         }
                         note(ElemSite::kOther);
+                        {
+                            const std::size_t n = sp.size();
+                            DynObject* holder = asObject(sp[n - 2]);
+                            if (holder && holder->cls == ObjClass::TypedArray && sp[n - 1].isDouble()) {
+                                const double d = detail::Access::r8(sp[n - 1]);
+                                auto* ta = static_cast<DynTypedArray*>(holder);
+                                if (d >= 0 && d < double(ta->length) && d == std::floor(d)) {
+                                    Value r = typedArrayGet(rt, ta, std::size_t(d));
+                                    sp.pop_back();
+                                    sp.back() = std::move(r);
+                                    break;
+                                }
+                            }
+                        }
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
                         sp.push_back(getProperty(rt, base, key.get()));
@@ -1977,6 +2048,20 @@ Value execute(Runtime& rt, Frame& frame)
                             }
                         }
                         note(ElemSite::kOther);
+                        {
+                            const std::size_t n = sp.size();
+                            DynObject* holder = asObject(sp[n - 3]);
+                            if (holder && holder->cls == ObjClass::TypedArray && sp[n - 2].isDouble()) {
+                                const double d = detail::Access::r8(sp[n - 2]);
+                                if (d >= 0 && d == std::floor(d)) {
+                                    typedArraySet(rt, static_cast<DynTypedArray*>(holder), d, sp[n - 1]);
+                                    Value v = std::move(sp[n - 1]);
+                                    sp.resize(n - 3);
+                                    sp.push_back(std::move(v));
+                                    break;
+                                }
+                            }
+                        }
                         Value v = pop();
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();

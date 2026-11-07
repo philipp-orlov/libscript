@@ -561,6 +561,7 @@ void installBuiltins(Runtime& rt)
     installReflection(rt);
     installRegExp(rt);
     installBigInt(rt);
+    installTypedArrays(rt);
 }
 
 }  // namespace dyn

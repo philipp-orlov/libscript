@@ -25,6 +25,7 @@ void installReflection(Runtime& rt);   // descriptors, the rest of Object, Refle
 void installGenerators(Runtime& rt);   // generator and async function objects, async iteration
 void installRegExp(Runtime& rt);       // RegExp and the String methods that use it
 void installBigInt(Runtime& rt);       // BigInt
+void installTypedArrays(Runtime& rt);  // ArrayBuffer, the typed arrays, DataView, Atomics
 
 /// A regular expression literal: a checked pattern made once into an object, which each evaluation copies.
 Value makeRegExpTemplate(Runtime& rt, StringView pattern, StringView flags);
@@ -49,6 +50,13 @@ inline void checkLongLoop(Runtime& rt, std::size_t iteration, std::size_t tempBy
 }
 
 bool sameValue(const Value& a, const Value& b);
+/// SpeciesConstructor.
+Value speciesConstructor(Runtime& rt, const Value& object, const Value& fallback);
+/// `next` of what comes back goes over `target` live: 0 values, 1 keys, 2 entries.
+Value makeArrayIterator(Runtime& rt, const Value& target, int mode);
+bool arrayIteratorStep(Runtime& rt, DynArrayIterator* it, Value& out);
+/// LengthOfArrayLike, past what an array can be long.
+double lengthOfLike(Runtime& rt, const Value& v);
 
 /// JSON, shared with `Value::toJson` and `Context::parseJson`.
 Value jsonParse(Runtime& rt, StringView text);

@@ -229,6 +229,11 @@ enum class ObjClass : std::uint8_t
     RegExp,
     RegExpStringIterator,
     BigIntObject,
+    ArrayIterator,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    TypedArray,
+    DataView,
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.
@@ -570,6 +575,21 @@ struct DynRegExp : DynObject
         DynObject::clearReferences();
         source = Value::undefined();
         flagText = Value::undefined();
+    }
+};
+
+/// What `values`, `keys` and `entries` of an array or a typed array hand back.
+struct DynArrayIterator : DynObject
+{
+    Value target = Value::undefined();  ///< undefined once it is done
+    double index = 0;
+    int mode = 0;  ///< 0 values, 1 keys, 2 entries
+
+    void children(GcList& out) const override;
+    void clearReferences() override
+    {
+        DynObject::clearReferences();
+        target = Value::undefined();
     }
 };
 

@@ -147,6 +147,7 @@ struct Runtime : EngineRuntime
         ArrayFilter,
         ArrayReduce,
         ArrayValues,
+        ArrayIteratorNext,
         StringCharCodeAt,
         StringFromCharCode,
         FunctionApply,
@@ -170,6 +171,7 @@ struct Runtime : EngineRuntime
         arrayIteratorProto, regExpProto, regExpStringIteratorProto, bigintProto;
     /// See builtins/regexp.cpp.
     std::shared_ptr<struct RegExpState> regexp;
+    std::shared_ptr<struct TypedState> typed;
     Ref<DynFunction> objectCtor, arrayCtor, functionCtor, promiseCtor;
     /// Prototype per JavaScript error constructor, indexed by `ErrorCode`.
     std::unordered_map<int, Ref<DynObject>> errorProtos;

@@ -361,23 +361,6 @@ DynObject* requireObject(CallInfo& ci, const char* what)
     return o;
 }
 
-/// SpeciesConstructor.
-Value speciesOf(Runtime& rt, const Value& object, const Value& fallback)
-{
-    const Value ctor = getProperty(rt, object, rt.atom.constructor.get());
-    if (ctor.isUndefined())
-        return fallback;
-    if (!asObject(ctor))
-        throwError(rt, ErrorCode::TypeError, "constructor is not an object");
-    const Value species = getProperty(rt, ctor, rt.sym.species.get());
-    if (species.isNullish())
-        return fallback;
-    DynFunction* fn = asFunction(species);
-    if (!fn || !isConstructor(rt, fn))
-        throwError(rt, ErrorCode::TypeError, "Symbol.species is not a constructor");
-    return species;
-}
-
 /// GetSubstitution.
 void substitute(Runtime& rt, String& out, StringView matched, StringView s, std::size_t position, const std::vector<Value>& captures, const Value& named, StringView tpl)
 {
@@ -724,7 +707,7 @@ Value symbolSplit(CallInfo& ci)
         parts.push_back(rt.str(s.substr(p)));
         return rt.makeArray(std::move(parts));
     }
-    const Value ctor = speciesOf(rt, rx, objectValue(state.ctor.get()));
+    const Value ctor = speciesConstructor(rt, rx, objectValue(state.ctor.get()));
     const String flags = toStringValue(rt, getProperty(rt, rx, state.flags.get()));
     const bool pairs = flags.find(u'u') != String::npos || flags.find(u'v') != String::npos;
     String newFlags = flags;
@@ -786,7 +769,7 @@ Value symbolMatchAll(CallInfo& ci)
     requireObject(ci, "RegExp.prototype[Symbol.matchAll]");
     const Value rx = ci.thisValue();
     const Value input = rt.str(toStringValue(rt, ci.arg(0)));
-    const Value ctor = speciesOf(rt, rx, objectValue(state.ctor.get()));
+    const Value ctor = speciesConstructor(rt, rx, objectValue(state.ctor.get()));
     const String flags = toStringValue(rt, getProperty(rt, rx, state.flags.get()));
     const Value matcher = constructValue(rt, ctor, {rx, rt.str(flags)});
     const double last = toLength(rt, getProperty(rt, rx, state.lastIndex.get()));
@@ -1026,7 +1009,21 @@ void installLegacyStatics(Runtime& rt, DynFunction* ctor)
 
 }  // namespace
 
-void releaseRegExpState(Runtime& rt) noexcept { rt.regexp.reset(); }
+Value speciesConstructor(Runtime& rt, const Value& object, const Value& fallback)
+{
+    const Value ctor = getProperty(rt, object, rt.atom.constructor.get());
+    if (ctor.isUndefined())
+        return fallback;
+    if (!asObject(ctor))
+        throwError(rt, ErrorCode::TypeError, "constructor is not an object");
+    const Value species = getProperty(rt, ctor, rt.sym.species.get());
+    if (species.isNullish())
+        return fallback;
+    DynFunction* fn = asFunction(species);
+    if (!fn || !isConstructor(rt, fn))
+        throwError(rt, ErrorCode::TypeError, "Symbol.species is not a constructor");
+    return species;
+}
 
 Value makeRegExpTemplate(Runtime& rt, StringView pattern, StringView flags)
 {

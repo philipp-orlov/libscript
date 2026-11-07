@@ -1272,6 +1272,30 @@ TEST(regularExpressionsTheProgramHasInterferedWithDoWhatItAsks)
     CHECK_EQ(ctx.eval("try { new RegExp('('); } catch (e) { e.name }", "<test>").toString(), std::string("SyntaxError"));
 }
 
+TEST(typedArraysAreViewsOfOneBuffer)
+{
+    js::Context ctx;
+    const auto text = [&](const char* source) { return ctx.eval(source, "<test>").toString(); };
+    CHECK_EQ(text("var b = new ArrayBuffer(8); var i = new Int32Array(b); i[1] = -1; var u = new Uint8Array(b, 4, 2); u[0] + ',' + u.length + ',' + new DataView(b).getInt32(4, true)"), std::string("255,2,-1"));
+    CHECK_EQ(text("String(new Uint8ClampedArray([300, -1, 1.5, 2.5]))"), std::string("255,0,2,2"));
+    CHECK_EQ(text("var f = new Float64Array(2); f[5] = 1; f[1] = 0.5; [f[5], f.join('|'), 5 in f].join()"), std::string(",0|0.5,false"));
+    CHECK_EQ(text("var r = new ArrayBuffer(4, { maxByteLength: 16 }); var t = new Uint8Array(r); r.resize(8); var n = r.transfer(); [t.length, r.detached, n.byteLength].join()"), std::string("0,true,8"));
+    CHECK_EQ(text("String(new BigInt64Array([1n, -2n])) + new Uint8Array([72, 105]).toHex()"), std::string("1,-24869"));
+    CHECK_EQ(text("function sum(x) { var s = 0; for (var k = 0; k < x.length; k++) s += x[k]; return s; }"
+                  "var big = new Float64Array(100).fill(2); for (var q = 0; q < 3000; q++) sum(big); sum(big) + ',' + sum([4, 5])"), std::string("200,9"));
+}
+
+TEST(bigIntsAreIntegersOfAnySize)
+{
+    js::Context ctx;
+    const auto text = [&](const char* source) { return ctx.eval(source, "<test>").toString(); };
+    CHECK_EQ(text("String(2n ** 64n)"), std::string("18446744073709551616"));
+    CHECK_EQ(text("[-7n / 2n, -7n % 2n, (-5n) >> 1n, ~5n, 5n & -2n, BigInt.asIntN(8, 255n)].join()"), std::string("-3,-1,-3,-6,4,-1"));
+    CHECK_EQ(text("[1n == 1, 2n > 1, '3' == 3n, typeof 1n].join()"), std::string("true,true,true,bigint"));
+    CHECK_EQ(text("var e; try { 1n + 1; } catch (x) { e = x.name; } e"), std::string("TypeError"));
+    CHECK_EQ(text("function m(a, b) { return a * b; } for (var i = 0; i < 20000; i++) m(i, 2); String(m(3n, 4n))"), std::string("12"));
+}
+
 TEST(aDelegateOfAnAsyncGeneratorThatThrowsIsTheGeneratorsToCatch)
 {
     script::Context ctx;

@@ -97,8 +97,10 @@ Generators, async functions, async generators, `for await`, classes with private
 members, static blocks, computed accessors and `new.target`, tagged templates,
 `Reflect`, array-likes in `Array.prototype` and regular expressions (lookbehind,
 named groups, modifiers, `\p{...}` and the set notation of `v`, but not the
-properties of strings such as `\p{RGI_Emoji}`) are all there. These are not yet:
-`BigInt`, typed arrays, `Proxy`, iterator helpers, `with`,
+properties of strings such as `\p{RGI_Emoji}`), `BigInt`, and `ArrayBuffer`
+with the typed arrays, `DataView` and `Atomics` (one thread: nothing ever waits) are
+all there. These are not yet:
+`Proxy`, iterator helpers, `with`,
 modules through `import()`, `Temporal`. `eval` and `new Function` stay out by
 design: the engine runs only what its host gives it.
 

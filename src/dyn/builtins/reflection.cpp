@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
 
@@ -104,6 +105,19 @@ bool defineOnArray(Runtime& rt, DynArray* array, GCObject* key, const Descriptor
 /// `[[DefineOwnProperty]]`: false where what is there does not allow it.
 bool defineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descriptor& d)
 {
+    if (self->cls == ObjClass::TypedArray) {
+        auto* ta = static_cast<DynTypedArray*>(self);
+        double index = 0;
+        if (numericKey(key, index)) {
+            if (!typedArrayHas(ta, index))
+                return false;
+            if ((d.hasConfigurable && !d.configurable) || (d.hasEnumerable && !d.enumerable) || d.isAccessor() || (d.hasWritable && !d.writable))
+                return false;
+            if (d.hasValue)
+                typedArraySet(rt, ta, index, d.value);
+            return true;
+        }
+    }
     if (self->cls == ObjClass::Array) {
         bool handled = false;
         const bool result = defineOnArray(rt, static_cast<DynArray*>(self), key, d, handled);
@@ -163,6 +177,21 @@ bool defineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descriptor& d)
 
 Value fromProperty(Runtime& rt, DynObject* self, GCObject* key)
 {
+    if (self->cls == ObjClass::TypedArray) {
+        auto* ta = static_cast<DynTypedArray*>(self);
+        double index = 0;
+        if (numericKey(key, index)) {
+            if (!typedArrayHas(ta, index))
+                return Value::undefined();
+            DynObject* out = rt.newObject(rt.objectProto.get());
+            Value result = detail::Access::adopt(Type::Object, out);
+            out->putOwn(rt.atom.value.get(), typedArrayGet(rt, ta, std::size_t(index)));
+            out->putOwn(rt.intern("writable"), Value(true));
+            out->putOwn(rt.intern("enumerable"), Value(true));
+            out->putOwn(rt.intern("configurable"), Value(true));
+            return result;
+        }
+    }
     if (self->cls == ObjClass::Array && key == rt.atom.length.get()) {
         DynObject* out = rt.newObject(rt.objectProto.get());
         Value result = detail::Access::adopt(Type::Object, out);

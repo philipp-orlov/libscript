@@ -660,6 +660,13 @@ void DynArray::trimElements()
         moveTo(store.size_);
 }
 
+void DynArrayIterator::children(GcList& out) const
+{
+    DynObject::children(out);
+    if (GCObject* p = detail::Access::ptr(target))
+        out.push_back(p);
+}
+
 void DynRegExp::children(GcList& out) const
 {
     DynObject::children(out);

@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
 #include "script/internal/stack_guard.hpp"
@@ -46,39 +47,56 @@ std::int64_t clampIndex(double raw, std::size_t length)
     return std::max<std::int64_t>(0, std::min<std::int64_t>(i, std::int64_t(length)));
 }
 
-/// Iterates live, so growing the array during a `for..of` is observable, as it
-/// is in a real engine.
-Value makeIndexIterator(Runtime& rt, Value target, int mode)  // 0 values, 1 keys, 2 entries
+}  // namespace
+
+Value makeArrayIterator(Runtime& rt, const Value& target, int mode)
 {
-    DynObject* it = rt.newObject(rt.arrayIteratorProto.get());
-    Value result = detail::Access::adopt(Type::Object, it);
-    auto index = std::make_shared<std::uint32_t>(0);
-    rt.method(it, "next", [target, index, mode](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        DynObject* out = rt2.newObject(rt2.objectProto.get());
-        Value record = detail::Access::adopt(Type::Object, out);
-        const std::uint32_t length = lengthOf(rt2, target);
-        if (*index >= length) {
-            out->putOwn(rt2.atom.value.get(), Value::undefined());
-            out->putOwn(rt2.atom.done.get(), Value(true));
-            return record;
-        }
-        const std::uint32_t i = (*index)++;
-        Value item;
-        if (mode == 1)
-            item = Value(double(i));
-        else if (mode == 2)
-            item = rt2.makeArray({Value(double(i)), getIndex(rt2, target, i)});
-        else
-            item = getIndex(rt2, target, i);
-        out->putOwn(rt2.atom.value.get(), item);
-        out->putOwn(rt2.atom.done.get(), Value(false));
-        return record;
-    }, 0);
-    return result;
+    auto* it = rt.newCell<DynArrayIterator>();
+    it->cls = ObjClass::ArrayIterator;
+    it->setProto(rt.arrayIteratorProto.get());
+    it->target = target;
+    it->mode = mode;
+    return detail::Access::adopt(Type::Object, it);
 }
 
-}  // namespace
+double lengthOfLike(Runtime& rt, const Value& v)
+{
+    if (DynArray* arr = asArray(v))
+        return double(arr->size());
+    const double n = toNumber(rt, getProperty(rt, v, rt.atom.length.get()));
+    if (std::isnan(n) || n <= 0)
+        return 0;
+    return std::min(std::trunc(n), 9007199254740991.0);
+}
+
+bool arrayIteratorStep(Runtime& rt, DynArrayIterator* it, Value& out)
+{
+    if (it->target.isUndefined())
+        return false;
+    double length;
+    DynObject* target = asObject(it->target);
+    if (target && target->cls == ObjClass::TypedArray) {
+        auto* ta = static_cast<DynTypedArray*>(target);
+        if (ta->outOfBounds || ta->buffer->detached)
+            throwError(rt, ErrorCode::TypeError, "the typed array's buffer is detached or too short for it");
+        length = double(ta->length);
+    } else {
+        length = lengthOfLike(rt, it->target);
+    }
+    if (it->index >= length) {
+        it->target = Value::undefined();
+        return false;
+    }
+    const double i = it->index++;
+    if (it->mode == 1) {
+        out = Value(i);
+        return true;
+    }
+    const Value keep = it->target;
+    const Value item = i < 4294967295.0 ? getIndex(rt, keep, std::uint32_t(i)) : getProperty(rt, keep, rt.intern(numberToString(i)));
+    out = it->mode == 2 ? rt.makeArray({Value(i), item}) : item;
+    return true;
+}
 
 /// A snapshot iterator, used where the collection cannot be indexed.
 Value makeIterator(Runtime& rt, Vec<Value> items)
@@ -165,6 +183,18 @@ void installArray(Runtime& rt)
                                       [](CallInfo& ci) { return ci.thisValue(); }, 0),
                       PropWritable | PropConfigurable);
     rt.arrayIteratorProto.reset(rt.newObject(iterProto), true);
+    rt.arrayIteratorProto->putOwn(rt.sym.toStringTag.get(), rt.str("Array Iterator"), PropConfigurable);
+    Value iteratorNext = rt.makeFunction(ascii("next"), [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        DynObject* o = asObject(ci.thisValue());
+        if (!o || o->cls != ObjClass::ArrayIterator)
+            ci.fail(ErrorCode::TypeError, "not an Array Iterator");
+        Value item = Value::undefined();
+        const bool more = arrayIteratorStep(rt2, static_cast<DynArrayIterator*>(o), item);
+        return iterResult(rt2, item, !more);
+    }, 0);
+    rt.arrayIteratorProto->putOwn(rt.atom.next.get(), iteratorNext, PropWritable | PropConfigurable);
+    rt.intrinsics[Runtime::ArrayIteratorNext].reset(detail::Access::ptr(iteratorNext));
 
     auto* protoArray = rt.newCell<DynArray>();
     protoArray->setProto(rt.objectProto.get());
@@ -747,9 +777,9 @@ void installArray(Runtime& rt)
     }, 2);
 
     // ---- iteration ----
-    arrayMethod("values", false, [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 0); }, 0);
-    arrayMethod("keys", false, [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 1); }, 0);
-    arrayMethod("entries", false, [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 2); }, 0);
+    arrayMethod("values", false, [](CallInfo& ci) { return makeArrayIterator(rtOf(ci), toObject(rtOf(ci), ci.thisValue()), 0); }, 0);
+    arrayMethod("keys", false, [](CallInfo& ci) { return makeArrayIterator(rtOf(ci), toObject(rtOf(ci), ci.thisValue()), 1); }, 0);
+    arrayMethod("entries", false, [](CallInfo& ci) { return makeArrayIterator(rtOf(ci), toObject(rtOf(ci), ci.thisValue()), 2); }, 0);
     proto->putOwn(rt.sym.iterator.get(), proto->findOwn(rt.intern("values"))->value,
                   PropWritable | PropConfigurable);
     keepIntrinsic(Runtime::ArrayValues, "values");

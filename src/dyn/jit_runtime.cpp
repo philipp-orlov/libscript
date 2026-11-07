@@ -242,6 +242,9 @@ std::int32_t scriptDynIterIsPlain(Runtime* rt, std::int64_t tag, std::uint64_t p
     const Prop* iterate = rt->arrayProto->findOwn(rt->sym.iterator.get());
     if (!iterate || detail::Access::ptr(iterate->value) != rt->intrinsics[Runtime::ArrayValues].get())
         return 0;
+    const Prop* next = rt->arrayIteratorProto->findOwn(rt->atom.next.get());
+    if (!next || detail::Access::ptr(next->value) != rt->intrinsics[Runtime::ArrayIteratorNext].get())
+        return 0;
     GCObject* name = rt->intern("return");
     return !rt->arrayIteratorProto->findOwn(name) && !rt->iteratorProto->findOwn(name) && !rt->objectProto->findOwn(name);
 }

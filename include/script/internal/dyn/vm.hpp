@@ -60,6 +60,8 @@ struct Frame
 
 [[noreturn]] void throwError(Runtime& rt, ErrorCode code, const std::string& message);
 Value makeErrorValue(Runtime& rt, ErrorCode code, const std::string& message);
+/// `throw v`, of any value.
+[[noreturn]] void throwValue(Runtime& rt, const Value& v);
 /// Turn any C++ exception coming out of native code into a TS `Exception`.
 [[noreturn]] void rethrowAsScript(Runtime& rt);
 

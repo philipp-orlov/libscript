@@ -17,6 +17,163 @@ namespace dyn {
 
 namespace {
 
+Value objectValue(DynObject* o) { return detail::Access::make(Type::Object, o); }
+
+[[noreturn]] void throwValueOf(Runtime& rt, const Value& v) { throwValue(rt, v); }
+
+/// A promise, and the two functions that settle it.
+struct Capability
+{
+    Value promise;
+    Value resolve;
+    Value reject;
+};
+
+/// NewPromiseCapability: for Promise itself, a promise made directly; for anything else, what its constructor makes.
+Capability newCapability(Runtime& rt, const Value& ctor)
+{
+    Capability cap;
+    if (asObject(ctor) == rt.promiseCtor.get()) {
+        cap.promise = makePromise(rt);
+        cap.resolve = makeSettler(rt, cap.promise, false);
+        cap.reject = makeSettler(rt, cap.promise, true);
+        return cap;
+    }
+    DynFunction* fn = asFunction(ctor);
+    if (!fn || !isConstructor(rt, fn))
+        throwError(rt, ErrorCode::TypeError, "a promise capability needs a constructor");
+    auto slots = std::make_shared<std::pair<Value, Value>>(Value::undefined(), Value::undefined());
+    const Value executor = rt.makeFunction(String(), [slots](CallInfo& inner) -> Value {
+        if (!slots->first.isUndefined() || !slots->second.isUndefined())
+            inner.fail(ErrorCode::TypeError, "the promise capability's functions are given once");
+        slots->first = inner.arg(0);
+        slots->second = inner.arg(1);
+        return Value::undefined();
+    }, 2);
+    cap.promise = constructValue(rt, ctor, {executor});
+    if (!asFunction(slots->first) || !asFunction(slots->second))
+        throwError(rt, ErrorCode::TypeError, "the promise constructor gave no functions to settle it");
+    cap.resolve = slots->first;
+    cap.reject = slots->second;
+    return cap;
+}
+
+/// PromiseResolve.
+Value promiseResolve(Runtime& rt, const Value& ctor, const Value& x)
+{
+    if (DynObject* o = asObject(x); o && o->cls == ObjClass::Promise) {
+        const Value made = getProperty(rt, x, rt.atom.constructor.get());
+        if (sameValue(made, ctor))
+            return x;
+    }
+    const Capability cap = newCapability(rt, ctor);
+    callValue(rt, cap.resolve, Value::undefined(), {x});
+    return cap.promise;
+}
+
+enum class Combine
+{
+    All,
+    AllSettled,
+    Any,
+    Race,
+};
+
+/// Promise.all, allSettled, any and race: one iteration, each element resolved through the constructor's own resolve.
+Value combinator(CallInfo& ci, Combine kind)
+{
+    Runtime& rt = rtOf(ci);
+    const Value ctor = ci.thisValue();
+    const Capability cap = newCapability(rt, ctor);
+    const auto rejectWith = [&](const Value& reason) {
+        callValue(rt, cap.reject, Value::undefined(), {reason});
+        return cap.promise;
+    };
+    Value resolveFn;
+    Value iterator;
+    try {
+        resolveFn = getProperty(rt, ctor, rt.intern("resolve"));
+        if (!asFunction(resolveFn))
+            throwError(rt, ErrorCode::TypeError, "the constructor's resolve is not a function");
+        iterator = getIterator(rt, ci.arg(0));
+    } catch (Exception& e) {
+        return rejectWith(e.value());
+    }
+    auto values = std::make_shared<std::vector<Value>>();
+    auto remaining = std::make_shared<std::size_t>(1);
+    const auto finish = [cap, values, kind](Runtime& rtc) {
+        if (kind == Combine::Any) {
+            const Value error = constructValue(rtc, getProperty(rtc, objectValue(rtc.globalObject.get()), rtc.intern("AggregateError")),
+                                               {rtc.makeArray(*values), rtc.str("all promises were rejected")});
+            callValue(rtc, cap.reject, Value::undefined(), {error});
+            return;
+        }
+        callValue(rtc, cap.resolve, Value::undefined(), {rtc.makeArray(*values)});
+    };
+    for (std::size_t index = 0;; ++index) {
+        Value next;
+        try {
+            if (!iteratorStep(rt, iterator, next)) {
+                if (kind != Combine::Race && --*remaining == 0)
+                    finish(rt);
+                return cap.promise;
+            }
+        } catch (Exception& e) {
+            return rejectWith(e.value());
+        }
+        try {
+            const Value nextPromise = callValue(rt, resolveFn, ctor, {next});
+            if (kind == Combine::Race) {
+                invokeMethod(rt, nextPromise, rt.atom.then.get(), {cap.resolve, cap.reject});
+                continue;
+            }
+            values->push_back(Value::undefined());
+            ++*remaining;
+            // Each element's function counts once, however often it is called.
+            const auto element = [values, remaining, index, kind, finish](int mode) {
+                auto called = std::make_shared<bool>(false);
+                return [values, remaining, index, kind, finish, mode, called](CallInfo& inner) -> Value {
+                    if (*called)
+                        return Value::undefined();
+                    *called = true;
+                    Runtime& rtc = rtOf(inner);
+                    if (kind == Combine::AllSettled) {
+                        DynObject* entry = rtc.newObject(rtc.objectProto.get());
+                        Value entryValue = detail::Access::adopt(Type::Object, entry);
+                        entry->putOwn(rtc.intern("status"), rtc.str(mode == 0 ? "fulfilled" : "rejected"));
+                        entry->putOwn(mode == 0 ? rtc.atom.value.get() : rtc.intern("reason"), inner.arg(0));
+                        (*values)[index] = entryValue;
+                    } else {
+                        (*values)[index] = inner.arg(0);
+                    }
+                    if (--*remaining == 0)
+                        finish(rtc);
+                    return Value::undefined();
+                };
+            };
+            Value onFulfilled, onRejected;
+            switch (kind) {
+                case Combine::All:
+                    onFulfilled = rt.makeFunction(String(), element(0), 1);
+                    onRejected = cap.reject;
+                    break;
+                case Combine::AllSettled:
+                    onFulfilled = rt.makeFunction(String(), element(0), 1);
+                    onRejected = rt.makeFunction(String(), element(1), 1);
+                    break;
+                default:
+                    onFulfilled = cap.resolve;
+                    onRejected = rt.makeFunction(String(), element(1), 1);
+                    break;
+            }
+            invokeMethod(rt, nextPromise, rt.atom.then.get(), {onFulfilled, onRejected});
+        } catch (Exception& e) {
+            iteratorClose(rt, iterator);
+            return rejectWith(e.value());
+        }
+    }
+}
+
 DynMap* thisCollection(CallInfo& ci, ObjClass expected)
 {
     DynObject* o = asObject(ci.thisValue());
@@ -202,15 +359,22 @@ void installPromise(Runtime& rt)
     rt.method(proto, "then", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynPromise* self = thisPromise(ci);
-        Value chained = makePromise(rt2);
-        auto* next = static_cast<DynPromise*>(asObject(chained));
+        const Value ctor = speciesConstructor(rt2, ci.thisValue(), objectValue(rt2.promiseCtor.get()));
         self->handled = true;
         DynPromise::Reaction reaction;
-        reaction.onFulfilled = ci.arg(0);
-        reaction.onRejected = ci.arg(1);
-        reaction.next.reset(next);
+        reaction.onFulfilled = asFunction(ci.arg(0)) ? ci.arg(0) : Value::undefined();
+        reaction.onRejected = asFunction(ci.arg(1)) ? ci.arg(1) : Value::undefined();
+        if (asObject(ctor) == rt2.promiseCtor.get()) {
+            Value chained = makePromise(rt2);
+            reaction.next.reset(static_cast<DynPromise*>(asObject(chained)));
+            addReaction(rt2, self, std::move(reaction));
+            return chained;
+        }
+        const Capability cap = newCapability(rt2, ctor);
+        reaction.capResolve = cap.resolve;
+        reaction.capReject = cap.reject;
         addReaction(rt2, self, std::move(reaction));
-        return chained;
+        return cap.promise;
     }, 2);
 
     rt.method(proto, "catch", [](CallInfo& ci) {
@@ -220,148 +384,74 @@ void installPromise(Runtime& rt)
 
     rt.method(proto, "finally", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        const Value fn = ci.arg(0);
-        Value wrap = rt2.makeFunction(ascii(""), [fn](CallInfo& inner) {
-            if (asFunction(fn))
-                callValue(rtOf(inner), fn, Value::undefined(), {});
-            return inner.arg(0);
-        }, 1);
-        return invokeMethod(rt2, ci.thisValue(), rt2.atom.then.get(), {wrap, wrap});
+        if (!ci.thisValue().isObject())
+            ci.fail(ErrorCode::TypeError, "Promise.prototype.finally called on something not an object");
+        const Value ctor = speciesConstructor(rt2, ci.thisValue(), objectValue(rt2.promiseCtor.get()));
+        const Value onFinally = ci.arg(0);
+        if (!asFunction(onFinally))
+            return invokeMethod(rt2, ci.thisValue(), rt2.atom.then.get(), {onFinally, onFinally});
+        const auto after = [ctor, onFinally](bool rejected) {
+            return [ctor, onFinally, rejected](CallInfo& inner) -> Value {
+                Runtime& rtc = rtOf(inner);
+                const Value outcome = inner.arg(0);
+                const Value result = callValue(rtc, onFinally, Value::undefined(), {});
+                const Value waited = promiseResolve(rtc, ctor, result);
+                const Value pass = rtc.makeFunction(String(), [outcome, rejected](CallInfo& last) -> Value {
+                    if (rejected)
+                        throwValueOf(rtOf(last), outcome);
+                    return outcome;
+                }, 0);
+                return invokeMethod(rtc, waited, rtc.atom.then.get(), {pass});
+            };
+        };
+        const Value thenFinally = rt2.makeFunction(String(), after(false), 1);
+        const Value catchFinally = rt2.makeFunction(String(), after(true), 1);
+        return invokeMethod(rt2, ci.thisValue(), rt2.atom.then.get(), {thenFinally, catchFinally});
     }, 1);
 
     rt.method(ctor, "resolve", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        if (DynObject* o = asObject(ci.arg(0)); o && o->cls == ObjClass::Promise)
-            return ci.arg(0);
-        Value promise = makePromise(rt2);
-        resolvePromise(rt2, static_cast<DynPromise*>(asObject(promise)), ci.arg(0));
-        return promise;
+        if (!ci.thisValue().isObject())
+            ci.fail(ErrorCode::TypeError, "Promise.resolve called on something not an object");
+        return promiseResolve(rt2, ci.thisValue(), ci.arg(0));
     }, 1);
 
     rt.method(ctor, "reject", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        Value promise = makePromise(rt2);
-        rejectPromise(rt2, static_cast<DynPromise*>(asObject(promise)), ci.arg(0));
-        return promise;
+        const Capability cap = newCapability(rt2, ci.thisValue());
+        callValue(rt2, cap.reject, Value::undefined(), {ci.arg(0)});
+        return cap.promise;
     }, 1);
 
-    rt.method(ctor, "all", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        const Vec<Value> items = iterableToVector(rt2, ci.arg(0));
-        Value promise = makePromise(rt2);
-        auto* target = static_cast<DynPromise*>(asObject(promise));
-        auto results = std::make_shared<std::vector<Value>>(items.size());
-        auto remaining = std::make_shared<std::size_t>(items.size());
-        if (items.empty()) {
-            resolvePromise(rt2, target, rt2.makeArray({}));
-            return promise;
-        }
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            Value one = invokeMethod(rt2, detail::Access::make(Type::Object, rt2.promiseCtor.get()),
-                                     rt2.intern("resolve"), {items[i]});
-            Value onOk = rt2.makeFunction(ascii(""), [promise, results, remaining, i](
-                                                         CallInfo& inner) {
-                (*results)[i] = inner.arg(0);
-                if (--*remaining == 0) {
-                    Runtime& rtc = rtOf(inner);
-                    resolvePromise(rtc, static_cast<DynPromise*>(asObject(promise)),
-                                   rtc.makeArray(*results));
-                }
-                return Value::undefined();
-            }, 1);
-            invokeMethod(rt2, one, rt2.atom.then.get(), {onOk, makeSettler(rt2, promise, true)});
-        }
-        return promise;
-    }, 1);
-
-    // `Promise.allSettled` and `Promise.any`: what each settles to says when all of it is known.
-    const auto gather = [](CallInfo& ci, int kind) -> Value {
-        Runtime& rt2 = rtOf(ci);
-        Value promise = makePromise(rt2);
-        auto* target = static_cast<DynPromise*>(asObject(promise));
-        Vec<Value> items;
-        try {
-            items = iterableToVector(rt2, ci.arg(0));
-        } catch (Exception& e) {
-            rejectPromise(rt2, target, e.value());
-            return promise;
-        }
-        auto results = std::make_shared<std::vector<Value>>(items.size());
-        auto remaining = std::make_shared<std::size_t>(items.size());
-        const auto finish = [promise, results, kind](Runtime& rtc) {
-            auto* p = static_cast<DynPromise*>(asObject(promise));
-            if (kind == 0) {
-                resolvePromise(rtc, p, rtc.makeArray(*results));
-                return;
-            }
-            const Value error = constructValue(rtc, getProperty(rtc, detail::Access::make(Type::Object, rtc.globalObject.get()), rtc.intern("AggregateError")),
-                                               {rtc.makeArray(*results), rtc.str(ascii("all promises were rejected"))});
-            rejectPromise(rtc, p, error);
-        };
-        if (items.empty()) {
-            finish(rt2);
-            return promise;
-        }
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            const auto settle = [results, remaining, i, kind, finish](bool fulfilled) {
-                return [results, remaining, i, kind, finish, fulfilled](CallInfo& inner) -> Value {
-                    Runtime& rtc = rtOf(inner);
-                    if (kind == 0) {
-                        DynObject* entry = rtc.newObject(rtc.objectProto.get());
-                        Value entryValue = detail::Access::adopt(Type::Object, entry);
-                        entry->putOwn(rtc.intern("status"), rtc.str(ascii(fulfilled ? "fulfilled" : "rejected")));
-                        entry->putOwn(fulfilled ? rtc.atom.value.get() : rtc.intern("reason"), inner.arg(0));
-                        (*results)[i] = entryValue;
-                    } else {
-                        (*results)[i] = inner.arg(0);
-                    }
-                    if (--*remaining == 0)
-                        finish(rtc);
-                    return Value::undefined();
-                };
-            };
-            Value one = invokeMethod(rt2, detail::Access::make(Type::Object, rt2.promiseCtor.get()), rt2.intern("resolve"), {items[i]});
-            const Value onOk = kind == 0 ? rt2.makeFunction(ascii(""), settle(true), 1) : makeSettler(rt2, promise, false);
-            invokeMethod(rt2, one, rt2.atom.then.get(), {onOk, rt2.makeFunction(ascii(""), settle(false), 1)});
-        }
-        return promise;
-    };
-    rt.method(ctor, "allSettled", [gather](CallInfo& ci) { return gather(ci, 0); }, 1);
-    rt.method(ctor, "any", [gather](CallInfo& ci) { return gather(ci, 1); }, 1);
+    rt.method(ctor, "all", [](CallInfo& ci) { return combinator(ci, Combine::All); }, 1);
+    rt.method(ctor, "allSettled", [](CallInfo& ci) { return combinator(ci, Combine::AllSettled); }, 1);
+    rt.method(ctor, "any", [](CallInfo& ci) { return combinator(ci, Combine::Any); }, 1);
+    rt.method(ctor, "race", [](CallInfo& ci) { return combinator(ci, Combine::Race); }, 1);
     rt.method(ctor, "withResolvers", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
-        Value promise = makePromise(rt2);
+        const Capability cap = newCapability(rt2, ci.thisValue());
         DynObject* out = rt2.newObject(rt2.objectProto.get());
         Value result = detail::Access::adopt(Type::Object, out);
-        out->putOwn(rt2.intern("promise"), promise);
-        out->putOwn(rt2.intern("resolve"), makeSettler(rt2, promise, false));
-        out->putOwn(rt2.intern("reject"), makeSettler(rt2, promise, true));
+        out->putOwn(rt2.intern("promise"), cap.promise);
+        out->putOwn(rt2.intern("resolve"), cap.resolve);
+        out->putOwn(rt2.intern("reject"), cap.reject);
         return result;
     }, 0);
     rt.method(ctor, "try", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
-        Value promise = makePromise(rt2);
-        auto* target = static_cast<DynPromise*>(asObject(promise));
+        if (!ci.thisValue().isObject())
+            ci.fail(ErrorCode::TypeError, "Promise.try called on something not an object");
+        const Capability cap = newCapability(rt2, ci.thisValue());
         try {
             std::vector<Value> rest(ci.args().begin() + (ci.size() ? 1 : 0), ci.args().end());
-            resolvePromise(rt2, target, callValue(rt2, ci.arg(0), Value::undefined(), rest));
+            const Value result = callValue(rt2, ci.arg(0), Value::undefined(), rest);
+            callValue(rt2, cap.resolve, Value::undefined(), {result});
         } catch (Exception& e) {
-            rejectPromise(rt2, target, e.value());
+            callValue(rt2, cap.reject, Value::undefined(), {e.value()});
         }
-        return promise;
+        return cap.promise;
     }, 1);
-
-    rt.method(ctor, "race", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        Value promise = makePromise(rt2);
-        for (const Value& item : iterableToVector(rt2, ci.arg(0))) {
-            Value one = invokeMethod(rt2, detail::Access::make(Type::Object, rt2.promiseCtor.get()),
-                                     rt2.intern("resolve"), {item});
-            invokeMethod(rt2, one, rt2.atom.then.get(),
-                         {makeSettler(rt2, promise, false), makeSettler(rt2, promise, true)});
-        }
-        return promise;
-    }, 1);
+    ctor->putOwn(rt.sym.species.get(), rt.makeFunction(ascii("get [Symbol.species]"), [](CallInfo& c) { return c.thisValue(); }, 0), PropConfigurable | PropAccessor);
 }
 
 void installConsole(Runtime& rt)

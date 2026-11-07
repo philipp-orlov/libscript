@@ -715,6 +715,9 @@ struct DynPromise : DynObject
         Value onFulfilled = Value::undefined();
         Value onRejected = Value::undefined();
         Ref<DynPromise> next;
+        /// Without `next`: the capability of a promise some other constructor made, settled through its functions.
+        Value capResolve = Value::undefined();
+        Value capReject = Value::undefined();
         /// An `await`: what is to be resumed, in place of the two handlers and the promise for what they give.
         Ref<DynObject> coroutine;
     };

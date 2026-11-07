@@ -102,7 +102,6 @@ void rethrowAsScript(Runtime& rt)
     }
 }
 
-namespace {
 /// Throw an arbitrary value the way `throw` does, without letting a hostile
 /// `toString` derail the unwind.
 [[noreturn]] void throwValue(Runtime& rt, const Value& v)
@@ -132,6 +131,8 @@ namespace {
     }
     throw Exception(code, message, v, rt.captureStack());
 }
+
+namespace {
 }  // namespace
 
 // -------------------------------------------------------- conversions ---
@@ -3073,9 +3074,37 @@ void scheduleReactions(Runtime& rt, DynPromise* p)
             continue;
         }
         const Value handler = fulfilled ? r.onFulfilled : r.onRejected;
-        Value next = detail::Access::make(Type::Object, r.next.get());
         Value result = p->result;
         const bool isFulfilled = fulfilled;
+        if (!r.next) {
+            // Another constructor's promise: what the handler gives goes to its resolve, what it throws to its reject.
+            const Value resolve = r.capResolve;
+            const Value reject = r.capReject;
+            rt.enqueue(rt.makeFunction(ascii(""),
+                                       [handler, resolve, reject, result, isFulfilled](CallInfo& ci) -> Value {
+                                           Runtime& rtc = rtOf(ci);
+                                           if (!asFunction(handler)) {
+                                               if (asFunction(isFulfilled ? resolve : reject))
+                                                   callValue(rtc, isFulfilled ? resolve : reject, Value::undefined(), {result});
+                                               return Value::undefined();
+                                           }
+                                           Value out;
+                                           try {
+                                               out = callValue(rtc, handler, Value::undefined(), {result});
+                                           } catch (Exception& e) {
+                                               if (asFunction(reject))
+                                                   callValue(rtc, reject, Value::undefined(), {e.value()});
+                                               return Value::undefined();
+                                           }
+                                           if (asFunction(resolve))
+                                               callValue(rtc, resolve, Value::undefined(), {out});
+                                           return Value::undefined();
+                                       },
+                                       0),
+                       {});
+            continue;
+        }
+        Value next = detail::Access::make(Type::Object, r.next.get());
         rt.enqueue(rt.makeFunction(ascii(""),
                                    [handler, next, result, isFulfilled](CallInfo& ci) -> Value {
                                        Runtime& rtc = *runtimeOf(next);
@@ -3108,6 +3137,10 @@ void resolvePromise(Runtime& rt, DynPromise* p, const Value& value)
 {
     if (p->state != DynPromise::State::Pending)
         return;
+    if (value.isObject() && asObject(value) == p) {
+        rejectPromise(rt, p, makeErrorValue(rt, ErrorCode::TypeError, "a promise cannot be resolved with itself"));
+        return;
+    }
     // Adopting a thenable is what makes promise chaining flatten.
     if (value.isObject()) {
         Value then;
@@ -3119,12 +3152,30 @@ void resolvePromise(Runtime& rt, DynPromise* p, const Value& value)
         }
         if (asFunction(then)) {
             const Value self = detail::Access::make(Type::Object, p);
-            Value onOk = makeSettler(rt, self, false);
-            Value onErr = makeSettler(rt, self, true);
+            // One of the two counts, once: what the thenable does after that is ignored.
+            auto done = std::make_shared<bool>(false);
+            Value onOk = rt.makeFunction(String(), [self, done](CallInfo& ci) -> Value {
+                if (!*done) {
+                    *done = true;
+                    resolvePromise(rtOf(ci), static_cast<DynPromise*>(asObject(self)), ci.arg(0));
+                }
+                return Value::undefined();
+            }, 1);
+            Value onErr = rt.makeFunction(String(), [self, done](CallInfo& ci) -> Value {
+                if (!*done) {
+                    *done = true;
+                    rejectPromise(rtOf(ci), static_cast<DynPromise*>(asObject(self)), ci.arg(0));
+                }
+                return Value::undefined();
+            }, 1);
             rt.enqueue(rt.makeFunction(ascii(""),
-                                       [then, value, onOk, onErr](CallInfo&) -> Value {
-                                           callValue(*runtimeOf(value), then, value,
-                                                     {onOk, onErr});
+                                       [then, value, onOk, onErr](CallInfo& ci) -> Value {
+                                           Runtime& rtc = rtOf(ci);
+                                           try {
+                                               callValue(rtc, then, value, {onOk, onErr});
+                                           } catch (Exception& e) {
+                                               callValue(rtc, onErr, Value::undefined(), {e.value()});
+                                           }
                                            return Value::undefined();
                                        },
                                        0),

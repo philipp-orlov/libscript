@@ -1020,6 +1020,10 @@ void DynPromise::children(GcList& out) const
             out.push_back(p);
         if (r.next)
             out.push_back(r.next.get());
+        if (GCObject* p = detail::Access::ptr(r.capResolve))
+            out.push_back(p);
+        if (GCObject* p = detail::Access::ptr(r.capReject))
+            out.push_back(p);
     }
 }
 

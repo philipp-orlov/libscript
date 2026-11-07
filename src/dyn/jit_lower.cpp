@@ -451,9 +451,8 @@ public:
             const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynArgsArray), {rt, args, argc, from}, true);
             const std::uint32_t slot = code_.argumentsSlot;
             if (code_.argumentsBoxed) {
-                const std::int32_t rt2 = rtReg();
                 const std::int32_t tag = immReg(std::int64_t(Type::Object));
-                const std::int32_t box = callCold(reinterpret_cast<void*>(&scriptDynNewBox), {rt2, tag, r}, true);
+                const std::int32_t box = newBox(tag, r);
                 decRefOf(r, -1, false);
                 IrInst& mov = inst(IrOp::Mov);
                 mov.d = cellReg_[slot];
@@ -471,8 +470,7 @@ public:
         for (std::uint32_t slot : code_.boxedParams) {
             if (slot >= slots || isNumberLocal(slot))
                 refuse("a boxed parameter out of the ordinary");
-            const std::int32_t box = callCold(reinterpret_cast<void*>(&scriptDynNewBox),
-                                              {rtReg(), localTag_[slot], localReg_[slot]}, true);
+            const std::int32_t box = newBox(localTag_[slot], localReg_[slot]);
             IrInst& mov = inst(IrOp::Mov);
             mov.d = cellReg_[slot];
             mov.a = box;
@@ -2260,8 +2258,7 @@ private:
                     tag = immReg(std::int64_t(Type::Undefined));
                     payload = immReg(0);
                 }
-                const std::int32_t rt = rtReg();
-                const std::int32_t box = callCold(reinterpret_cast<void*>(&scriptDynNewBox), {rt, tag, payload}, true);
+                const std::int32_t box = newBox(tag, payload);
                 const std::int32_t old = fn_.newVreg(false);
                 IrInst& save = inst(IrOp::Mov);
                 save.d = old;
@@ -2384,12 +2381,82 @@ private:
                 return true;
             }
             case Op::ArrayAppend: {
+                // An element of a literal, into the array it is making: nothing else has seen that array, so it is one and
+                // can grow. In place while there is room and the form need not change.
                 Entry value = pop();
                 secureWeak();
-                const std::int32_t rt = rtReg();
+                const std::int32_t array = top().r;
                 const std::int32_t tag = tagReg(value);
                 const std::int32_t payload = payloadReg(value);
-                coldCall(reinterpret_cast<void*>(&scriptDynArrayAppend), {rt, top().r, tag, payload}, -1, -1, true, {value});
+                const std::int32_t slow = newLabel();
+                const std::int32_t done = newLabel();
+                const std::int32_t values = newLabel();
+                const std::int32_t stored = newLabel();
+                const std::int32_t data = loadHeader(array, kElementsOffset);
+                const std::int32_t count = load(array, kElementCountOffset, 4, false, kAliasHeader);
+                const std::int32_t cap = load(array, kElementCapOffset, 4, false, kAliasHeader);
+                {
+                    IrInst& full = inst(IrOp::BrCmp);
+                    full.a = count;
+                    full.b = cap;
+                    full.cond = IrCond::Eq;
+                    full.width = 64;
+                    full.target = slow;
+                }
+                const std::int32_t numbersOnly = load(array, kNumbersOnlyOffset, 1, false, kAliasHeader);
+                branchCmp(numbersOnly, IrCond::Eq, 0, values);
+                if (!isKnownNumber(value)) {
+                    if (value.hasKnownTag || value.isConst || value.rep != Rep::Tagged)
+                        inst(IrOp::Br).imm = slow;
+                    else
+                        branchCmp(tag, IrCond::Ne, std::int64_t(Type::Double), slow);
+                }
+                {
+                    const std::int32_t slot = fn_.newVreg(false);
+                    const std::int32_t scaled = shiftLeft(count, 3);
+                    IrInst& add = inst(IrOp::Add);
+                    add.d = slot;
+                    add.a = data;
+                    add.b = scaled;
+                    add.width = 64;
+                    store(slot, 0, payload, 8);
+                }
+                inst(IrOp::Br).imm = stored;
+                inst(IrOp::Label).imm = values;
+                // The array takes a count of its own; the value's is released below, as after the helper.
+                if (!value.hasKnownTag)
+                    incRefOf(payload, tag, false);
+                else if (value.known >= Type::String)
+                    incRefOf(payload, -1, false);
+                {
+                    const std::int32_t slot = fn_.newVreg(false);
+                    const std::int32_t scaled = shiftLeft(count, 4);
+                    IrInst& add = inst(IrOp::Add);
+                    add.d = slot;
+                    add.a = data;
+                    add.b = scaled;
+                    add.width = 64;
+                    store(slot, 0, tag, 1);
+                    store(slot, kPayload, payload, 8);
+                }
+                inst(IrOp::Label).imm = stored;
+                {
+                    const std::int32_t next = fn_.newVreg(false);
+                    IrInst& plus = inst(IrOp::Add);
+                    plus.d = next;
+                    plus.a = count;
+                    plus.hasImm = true;
+                    plus.imm = 1;
+                    plus.width = 64;
+                    store(array, kElementCountOffset, next, 4, kAliasHeader);
+                }
+                inst(IrOp::Br).imm = done;
+                inst(IrOp::ColdBegin);
+                inst(IrOp::Label).imm = slow;
+                coldCall(reinterpret_cast<void*>(&scriptDynArrayAppend), {rtReg(), array, tag, payload}, -1, -1, true, {value});
+                inst(IrOp::Br).imm = done;
+                inst(IrOp::ColdEnd);
+                inst(IrOp::Label).imm = done;
                 release(value);
                 return true;
             }
@@ -4381,18 +4448,23 @@ private:
     /// A new object of pinned prototype `proto`, starting from `root`, in `result`: popped off its size's free list and
     /// written here while the heap has one ready and nothing is due; otherwise `helper` makes it, which it also does when
     /// something about this context or build needs it to.
-    void allocateObject(DynObject* proto, Shape* root, std::uint32_t room, std::int32_t result, void* helper,
-                        std::vector<std::int32_t> helperArgs, const std::vector<Entry>& held)
+    std::int32_t plusImm(std::int32_t a, std::int64_t imm, std::uint8_t width)
+    {
+        const std::int32_t d = fn_.newVreg(false);
+        IrInst& add = inst(IrOp::Add);
+        add.d = d;
+        add.a = a;
+        add.hasImm = true;
+        add.imm = imm;
+        add.width = width;
+        return d;
+    }
+
+    /// A cell of `bytes` from the heap, as `newCell` would get it and account for it, while no collection is due and the
+    /// allocator's current block has room; otherwise to `slow`. The caller writes the cell.
+    std::int32_t carveCell(std::size_t bytes, std::int32_t slow)
     {
         ContextImpl& ctx = rt_.ctx;
-        constexpr std::size_t kWords = sizeof(DynObject) / 8;
-        if (!mem::LocalHeap::kCanPopInline || ctx.options.memoryLimit || !root || !proto->pinned || room > 32) {
-            coldCall(helper, std::move(helperArgs), result, -1, true, held);
-            return;
-        }
-        const std::size_t bytes = sizeof(DynObject) + std::size_t(room) * sizeof(Prop);
-        const std::int32_t slow = newLabel();
-        const std::int32_t done = newLabel();
         const auto word = [&](std::int32_t base, std::int64_t offset) { return load(base, offset, 8, false, kAliasHeader); };
         const auto plus = [&](std::int32_t a, std::int64_t imm, std::uint8_t width) {
             const std::int32_t d = fn_.newVreg(false);
@@ -4458,17 +4530,107 @@ private:
         }
         const std::int32_t live = load(block, std::int64_t(mem::LocalHeap::kBlockLiveOffset), 4, false, kAliasHeader);
         store(block, std::int64_t(mem::LocalHeap::kBlockLiveOffset), plus(live, 1, 32), 4, kAliasHeader);
+        store(heap, std::int64_t(offsetof(ContextImpl, heapBytes)), plus(heapBytes, std::int64_t(bytes), 64), 8, kAliasHeader);
+        const std::int32_t total = word(heap, std::int64_t(offsetof(ContextImpl, totalAllocated)));
+        store(heap, std::int64_t(offsetof(ContextImpl, totalAllocated)), plus(total, std::int64_t(bytes), 64), 8, kAliasHeader);
+        store(heap, std::int64_t(offsetof(ContextImpl, liveObjects)), plus(liveObjects, 1, 64), 8, kAliasHeader);
+        return slot;
+    }
+
+    /// A box holding the value `tag`/`payload`, which it counts: made here for undefined, null, a number or a reference,
+    /// whose bits need no tidying, and by `scriptDynNewBox` for anything else, or when no slot is ready.
+    std::int32_t newBox(std::int32_t tag, std::int32_t payload)
+    {
+        ContextImpl& ctx = rt_.ctx;
+        const std::int32_t result = fn_.newVreg(false);
+        if (!mem::LocalHeap::kCanPopInline || ctx.options.memoryLimit) {
+            coldCall(reinterpret_cast<void*>(&scriptDynNewBox), {rtReg(), tag, payload}, result, -1, true);
+            return result;
+        }
+        constexpr std::size_t kWords = sizeof(Box) / 8;
+        static_assert(sizeof(Box) % 8 == 0, "a box is written a word at a time");
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const std::int32_t plain = newLabel();
+        const std::int32_t ready = newLabel();
+        const std::int32_t counted = newLabel();
+        // The bits the box holds: a number's or a reference's own, nothing for undefined and null.
+        const std::int32_t bits = fn_.newVreg(false);
+        {
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = bits;
+            mov.a = payload;
+        }
+        branchCmp(tag, IrCond::Eq, std::int64_t(Type::Double), ready);
+        branchCmp(tag, IrCond::Ls, std::int64_t(Type::Null), plain);
+        branchCmp(tag, IrCond::Lo, std::int64_t(Type::String), slow);
+        incRefOf(payload, -1, false);
+        inst(IrOp::Br).imm = ready;
+        inst(IrOp::Label).imm = plain;
+        {
+            IrInst& zero = inst(IrOp::MovImm);
+            zero.d = bits;
+            zero.imm = 0;
+        }
+        inst(IrOp::Label).imm = ready;
+        {
+            // The count taken above is the box's; should no slot be ready, the helper takes its own, and this one goes.
+            const std::int32_t slot = carveCell(sizeof(Box), counted);
+            std::uint64_t image[kWords];
+            {
+                Box made;
+                made.cellBytes = std::uint32_t(sizeof(Box));
+                made.gcBytes = std::uint32_t(sizeof(Box));
+                made.rt = &ctx;
+                std::memcpy(image, static_cast<const void*>(&made), sizeof(Box));
+            }
+            for (std::size_t i = 0; i < kWords; ++i)
+                store(slot, std::int64_t(i * 8), immReg(std::int64_t(image[i])), 8, kAliasHeader);
+            store(slot, kBoxValueOffset, tag, 1);
+            store(slot, kBoxValueOffset + kPayload, bits, 8);
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = result;
+            mov.a = slot;
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = counted;
+        {
+            // Back to what the helper expects: the value with no count from here.
+            const std::int32_t uncounted = newLabel();
+            branchCmp(tag, IrCond::Lo, std::int64_t(Type::String), uncounted);
+            decRefOf(payload, -1, false);
+            inst(IrOp::Label).imm = uncounted;
+        }
+        inst(IrOp::Label).imm = slow;
+        coldCall(reinterpret_cast<void*>(&scriptDynNewBox), {rtReg(), tag, payload}, result, -1, true);
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        forgetFacts();
+        return result;
+    }
+
+    void allocateObject(DynObject* proto, Shape* root, std::uint32_t room, std::int32_t result, void* helper,
+                        std::vector<std::int32_t> helperArgs, const std::vector<Entry>& held)
+    {
+        ContextImpl& ctx = rt_.ctx;
+        constexpr std::size_t kWords = sizeof(DynObject) / 8;
+        if (!mem::LocalHeap::kCanPopInline || ctx.options.memoryLimit || !root || !proto->pinned || room > 32) {
+            coldCall(helper, std::move(helperArgs), result, -1, true, held);
+            return;
+        }
+        const std::size_t bytes = sizeof(DynObject) + std::size_t(room) * sizeof(Prop);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const std::int32_t slot = carveCell(bytes, slow);
         // What the constructors and `linkKnown` do.
         std::uint64_t image[kWords];
         rt_.objectImage(proto, root, room, image);
         for (std::size_t i = 0; i < kWords; ++i)
             store(slot, std::int64_t(i * 8), immReg(std::int64_t(image[i])), 8, kAliasHeader);
         if (room)
-            store(slot, kPropsOffset, plus(slot, std::int64_t(sizeof(DynObject)), 64), 8, kAliasHeader);
-        store(heap, std::int64_t(offsetof(ContextImpl, heapBytes)), plus(heapBytes, std::int64_t(bytes), 64), 8, kAliasHeader);
-        const std::int32_t total = word(heap, std::int64_t(offsetof(ContextImpl, totalAllocated)));
-        store(heap, std::int64_t(offsetof(ContextImpl, totalAllocated)), plus(total, std::int64_t(bytes), 64), 8, kAliasHeader);
-        store(heap, std::int64_t(offsetof(ContextImpl, liveObjects)), plus(liveObjects, 1, 64), 8, kAliasHeader);
+            store(slot, kPropsOffset, plusImm(slot, std::int64_t(sizeof(DynObject)), 64), 8, kAliasHeader);
         {
             IrInst& mov = inst(IrOp::Mov);
             mov.d = result;

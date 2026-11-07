@@ -994,6 +994,22 @@ TEST(whatWasLearnedAboutAPrototypeThatIsGoneIsForgotten)
              std::string("L299:late:true,40"));
 }
 
+TEST(capturedVariablesOfEveryKindMadeInNativeCode)
+{
+    // A captured variable lives in a box, made as the function starts or the loop goes round, whatever it holds.
+    CHECK_EQ(run("function mk(v, w) { var u; var n = null; var o = { k: v }; var f = function () { return [String(v), String(w), String(u), String(n), o.k]; };"
+                 " v = w; return f; }"
+                 "var all = []; var kinds = [1.5, 'str', true, null, undefined, { x: 1 }, [2], -0];"
+                 "for (var i = 0; i < 4000; i++) { var f = mk(kinds[i & 7], kinds[(i + 3) & 7]); if (i >= 3992) all.push(f().join(':')); }"
+                 "all.join('|')"),
+             std::string("null:null:undefined:null:1.5|undefined:undefined:undefined:null:str|"
+                         "[object Object]:[object Object]:undefined:null:true|2:2:undefined:null:|0:0:undefined:null:|"
+                         "1.5:1.5:undefined:null:[object Object]|str:str:undefined:null:2|true:true:undefined:null:0"));
+    CHECK_EQ(run("function counters() { var fs = []; for (var i = 0; i < 3; i++) { let j = i; fs.push(function () { return j++; }); } return fs; }"
+                 "var t = 0; for (var r = 0; r < 3000; r++) { var fs = counters(); t += fs[0]() + fs[1]() + fs[2]() + fs[2](); } t"),
+             std::string("15000"));
+}
+
 TEST(callingThroughCallIsCalling)
 {
     CHECK_EQ(run("function g(a, b) { return this.k + a * b; } function f(o, a) { return g.call(o, a, 2); }"

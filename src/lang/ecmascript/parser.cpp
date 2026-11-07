@@ -478,11 +478,12 @@ NodePtr Parser::statement()
         Lexer probe = lexer_;
         const Token after = probe.next(false);
         if (after.type == Tok::Colon) {
+            checkReference();
             NodePtr n = makeNode(NK::Labeled, line);
             n->text = cur_.text;
             advance();
             advance();
-            n->d = statement();
+            n->d = bodyStatement(true);
             return n;
         }
     }
@@ -540,9 +541,9 @@ NodePtr Parser::ifStatement()
     expect(Tok::LParen, "'('");
     n->a = expression();
     expect(Tok::RParen, "')'");
-    n->b = statement();
+    n->b = bodyStatement(true);
     if (eat(Tok::Else))
-        n->c = statement();
+        n->c = bodyStatement(true);
     return n;
 }
 
@@ -553,7 +554,7 @@ NodePtr Parser::whileStatement()
     expect(Tok::LParen, "'('");
     n->a = expression();
     expect(Tok::RParen, "')'");
-    n->d = statement();
+    n->d = bodyStatement(false);
     return n;
 }
 
@@ -561,7 +562,7 @@ NodePtr Parser::doStatement()
 {
     NodePtr n = makeNode(NK::DoWhile, cur_.line);
     advance();
-    n->d = statement();
+    n->d = bodyStatement(false);
     expect(Tok::While, "'while'");
     expect(Tok::LParen, "'('");
     n->a = expression();
@@ -596,7 +597,7 @@ NodePtr Parser::forStatement()
             n->a = std::move(target);
             n->b = isOf ? assignment() : expression();
             expect(Tok::RParen, "')'");
-            n->d = statement();
+            n->d = bodyStatement(false);
             return n;
         }
         // Not a for-in/of: the target starts an ordinary declaration list.
@@ -623,7 +624,7 @@ NodePtr Parser::forStatement()
             n->a = toPattern(std::move(head));
             n->b = isOf ? assignment() : expression();
             expect(Tok::RParen, "')'");
-            n->d = statement();
+            n->d = bodyStatement(false);
             return n;
         }
         init = makeNode(NK::ExprStatement, line);
@@ -640,7 +641,7 @@ NodePtr Parser::forStatement()
     if (!at(Tok::RParen))
         n->c = expression();
     expect(Tok::RParen, "')'");
-    n->d = statement();
+    n->d = bodyStatement(false);
     return n;
 }
 
@@ -1264,8 +1265,43 @@ std::vector<NodePtr> Parser::typeArguments()
 
 // ------------------------------------------------------------ patterns ---
 
+/// `yield` and `await` where they are operators, and a keyword written with an escape, name nothing.
+void Parser::checkReference()
+{
+    if (cur_.escapedKeyword)
+        fail("a keyword cannot be written with an escape");
+    if (at(Tok::Yield) && inGenerator_)
+        fail("'yield' is not a name in a generator");
+    if (at(Tok::Await) && (inAsync_ || inStaticBlock_))
+        fail("'await' is not a name here");
+}
+
+NodePtr Parser::bodyStatement(bool allowsFunction)
+{
+    bool refused = at(Tok::Class) || at(Tok::Const);
+    if (at(Tok::Function))
+        refused = !allowsFunction;
+    if (at(Tok::Async) && asyncFunctionAhead())
+        refused = true;
+    if (at(Tok::Let)) {
+        Lexer probe = lexer_;
+        const Token after = probe.next(false);
+        refused = after.type == Tok::LBracket || (!after.newlineBefore && (identifierLike(after.type) || after.type == Tok::LBrace));
+    }
+    if (refused)
+        fail("a declaration cannot be the body of this statement");
+    if (at(Tok::Function) && allowsFunction) {
+        Lexer probe = lexer_;
+        if (probe.next(false).type == Tok::Star)
+            fail("a generator cannot be the body of this statement");
+    }
+    return statement();
+}
+
 NodePtr Parser::bindingTarget()
 {
+    if (identifierLike(cur_.type))
+        checkReference();
     if (at(Tok::LBracket))
         return arrayPattern();
     if (at(Tok::LBrace))
@@ -1303,6 +1339,9 @@ NodePtr Parser::arrayPattern()
             NodePtr rest = makeNode(NK::RestElement, cur_.line);
             rest->a = bindingTarget();
             n->list.push_back(std::move(rest));
+            if (!at(Tok::RBracket))
+                fail("a rest element must be the last");
+            continue;
         } else {
             n->list.push_back(bindingElement());
         }
@@ -1321,7 +1360,12 @@ NodePtr Parser::objectPattern()
         if (eat(Tok::Ellipsis)) {
             NodePtr rest = makeNode(NK::RestElement, cur_.line);
             rest->a = bindingTarget();
+            if (rest->a->kind != NK::Identifier)
+                fail("the rest of an object pattern is a name");
             n->list.push_back(std::move(rest));
+            if (!at(Tok::RBrace))
+                fail("a rest element must be the last");
+            continue;
         } else {
             NodePtr prop = makeNode(NK::Property, cur_.line);
             if (at(Tok::LBracket)) {
@@ -1365,6 +1409,8 @@ NodePtr Parser::toPattern(NodePtr expr)
             NodePtr n = makeNode(NK::ArrayPattern, expr->line);
             for (NodePtr& e : expr->list) {
                 if (e->kind == NK::Spread) {
+                    if (&e != &expr->list.back())
+                        fail("a rest element must be the last");
                     NodePtr rest = makeNode(NK::RestElement, e->line);
                     rest->a = toPattern(std::move(e->a));
                     n->list.push_back(std::move(rest));
@@ -1434,6 +1480,8 @@ NodePtr Parser::assignment()
     if (nest.tooDeep())
         fail("expression is nested too deeply");
     if (at(Tok::Yield) && inGenerator_) {
+        if (inParameters_)
+            fail("'yield' cannot be used in a generator's parameters");
         NodePtr n = makeNode(NK::Yield, cur_.line);
         advance();
         if (!cur_.newlineBefore) {
@@ -1573,6 +1621,8 @@ NodePtr Parser::unary()
         fail("expression is nested too deeply");
     const std::uint32_t line = cur_.line;
     if (at(Tok::Await) && inAsync_) {
+        if (inParameters_)
+            fail("'await' cannot be used in an async function's parameters");
         NodePtr n = makeNode(NK::Await, line);
         advance();
         n->a = unary();
@@ -1705,7 +1755,16 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
             n->list = argumentList();
             base = std::move(n);
         } else if (at(Tok::Template)) {
-            fail("tagged template literals are not supported");
+            NodePtr n = makeNode(NK::Call, base->line);
+            n->a = std::move(base);
+            NodePtr strings = makeNode(NK::TemplateObject, cur_.line);
+            strings->strs = cur_.parts;
+            strings->raws = cur_.raws;
+            NodePtr literal = templateLiteral();
+            n->list.push_back(std::move(strings));
+            for (NodePtr& e : literal->list)
+                n->list.push_back(std::move(e));
+            base = std::move(n);
         } else {
             return base;
         }
@@ -1787,7 +1846,7 @@ NodePtr Parser::arrowFromParams(std::vector<NodePtr> params, NodePtr returnType,
     n->type = std::move(returnType);
     n->isAsync = arrowIsAsync_;
     arrowIsAsync_ = false;
-    const FunctionKind kind(*this, false, n->isAsync);
+    const FunctionKind kind(*this, false, n->isAsync, true);
     if (at(Tok::LBrace)) {
         n->d = block();
     } else {
@@ -1802,6 +1861,7 @@ NodePtr Parser::arrowFromParams(std::vector<NodePtr> params, NodePtr returnType,
 
 std::vector<NodePtr> Parser::parameterList(bool allowModifiers)
 {
+    FlagSet inParameters(inParameters_, true);
     std::vector<NodePtr> params;
     expect(Tok::LParen, "'('");
     while (!at(Tok::RParen)) {
@@ -1812,7 +1872,7 @@ std::vector<NodePtr> Parser::parameterList(bool allowModifiers)
             rest->type = typeAnnotation();
             params.push_back(std::move(rest));
             if (!at(Tok::RParen))
-                expect(Tok::Comma, "','");
+                fail("a rest parameter must be the last");
             continue;
         }
 
@@ -1964,6 +2024,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             NodePtr staticBlock = makeNode(NK::StaticBlock, cur_.line);
             staticBlock->isStatic = true;
             const FunctionKind blockKind(*this, false, false);
+            inStaticBlock_ = true;
             staticBlock->d = block();
             n->list.push_back(std::move(staticBlock));
             continue;
@@ -2025,6 +2086,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
                 fn->text = key->text;
             fn->isAsync = memberAsync;
             fn->isGenerator = memberGenerator;
+            fn->isMethod = true;
             const FunctionKind functionKind(*this, memberGenerator, memberAsync);
             if (at(Tok::Lt))
                 fn->typeParams = typeParameterList();
@@ -2133,12 +2195,14 @@ NodePtr Parser::objectLiteral()
 
         NodePtr p = makeNode(NK::Property, line);
         p->propKind = kind;
+        bool shorthandOk = false;
         if (at(Tok::LBracket)) {
             advance();
             p->computed = true;
             p->a = assignment();
             expect(Tok::RBracket, "']'");
         } else {
+            shorthandOk = identifierLike(cur_.type) && !cur_.escapedKeyword;
             p->text = propertyName();
         }
 
@@ -2147,6 +2211,7 @@ NodePtr Parser::objectLiteral()
             fn->text = p->text;
             fn->isAsync = memberAsync;
             fn->isGenerator = memberGenerator;
+            fn->isMethod = true;
             const FunctionKind functionKind(*this, memberGenerator, memberAsync);
             if (at(Tok::Lt))
                 fn->typeParams = typeParameterList();
@@ -2163,6 +2228,9 @@ NodePtr Parser::objectLiteral()
         } else if (eat(Tok::Colon)) {
             p->b = assignment();
         } else {
+            // `{ x }` is a read of the variable x, which a keyword cannot be.
+            if (!shorthandOk)
+                fail("expected ':' after a property name that is no variable's");
             NodePtr id = makeNode(NK::Identifier, line);
             id->text = p->text;
             if (at(Tok::Assign)) {
@@ -2234,6 +2302,10 @@ NodePtr Parser::primary()
         case Tok::LBracket: return arrayLiteral();
         case Tok::LBrace: return objectLiteral();
         case Tok::Regex: fail("regular expression literals are not supported"); break;
+        case Tok::Async:
+            if (asyncFunctionAhead())
+                return functionExpression(false);
+            break;
         case Tok::PrivateName: {
             // Only `#x in o`.
             NodePtr n = makeNode(NK::Identifier, line);
@@ -2269,6 +2341,7 @@ NodePtr Parser::primary()
         default: break;
     }
     if (identifierLike(cur_.type)) {
+        checkReference();
         NodePtr n = makeNode(NK::Identifier, line);
         n->text = cur_.text;
         advance();

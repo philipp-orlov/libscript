@@ -54,6 +54,7 @@ enum class NK : std::uint8_t
     Yield,         // a=argument (may be null)               prefix = `yield*`
     Await,         // a=argument
     NewTarget,     //                                        `new.target`
+    TemplateObject,//                                        strs = cooked, raws: the first argument of a tagged template
     StaticBlock,   // d=block
     FieldInit,     // a=computed key or private name  b=value  text, computed, propKind: what a field or private method does to `this`
     Hole,          // elision in an array literal
@@ -168,6 +169,7 @@ struct Node
     bool isAbstract = false;
     bool isParamProp = false;  ///< a constructor parameter that declares a field
     bool allocatesThis = false;  ///< ClassExpr: Python's way, where `self` exists before the base's `__init__` runs
+    bool isMethod = false;     ///< FunctionExpr: a method or accessor, or what runs a field: `super.x` means something
     bool isPrivate = false;    ///< a member named `#x`; an Identifier that is such a name
     bool isGenerator = false;  ///< FunctionExpr: `function*`
     bool isAsync = false;      ///< FunctionExpr, ArrowExpr: `async`; ForOf: `for await`
@@ -175,6 +177,7 @@ struct Node
     String text;
     double number = 0;
     std::vector<String> strs;  ///< cooked chunks of a template literal
+    std::vector<String> raws;  ///< the same as written, for a tag
 
     NodePtr a, b, c, d;
     std::vector<NodePtr> list;

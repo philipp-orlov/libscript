@@ -162,6 +162,10 @@ struct Token
     /// `exprs` the raw source of each `${...}`, re-parsed by the parser.
     std::vector<String> parts;
     std::vector<std::string> exprs;
+    /// Each chunk as written, for a tag to see.
+    std::vector<String> raws;
+    /// An escape spelled this word, which was then no keyword.
+    bool escapedKeyword = false;
 };
 
 /// A single-pass tokenizer. Division and regular-expression literals are told
@@ -192,6 +196,7 @@ private:
     Token readIdentifier();
     void readEscape(String& out);
 
+    bool unicodeSpace(bool& sawNewline);
     std::string_view src_;
     std::string name_;
     std::size_t pos_ = 0;

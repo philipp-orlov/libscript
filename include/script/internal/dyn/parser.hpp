@@ -138,6 +138,8 @@ private:
     bool ambient_ = false;   ///< inside `declare`: bodies are not required
     bool noIn_ = false;      ///< parsing a for-in head: `in` ends the expression
     bool arrowIsAsync_ = false;  ///< the arrow function about to be parsed was written `async`
+    bool inParameters_ = false;
+    bool inStaticBlock_ = false;
     bool inGenerator_ = false;  ///< `yield` is an operator here, not a name
     bool inAsync_ = false;      ///< `await` is an operator here, not a name
     /// The kind of function whose parameters and body are about to be parsed, which those words depend on.
@@ -145,19 +147,36 @@ private:
     {
         Parser& parser;
         bool generator, async;
-        FunctionKind(Parser& p, bool isGenerator, bool isAsync) : parser(p), generator(p.inGenerator_), async(p.inAsync_)
+        bool parameters, staticBlock;
+        FunctionKind(Parser& p, bool isGenerator, bool isAsync, bool isArrow = false)
+            : parser(p), generator(p.inGenerator_), async(p.inAsync_), parameters(p.inParameters_), staticBlock(p.inStaticBlock_)
         {
             p.inGenerator_ = isGenerator;
             p.inAsync_ = isAsync;
+            p.inParameters_ = false;
+            if (!isArrow)
+                p.inStaticBlock_ = false;
         }
         ~FunctionKind()
         {
             parser.inGenerator_ = generator;
             parser.inAsync_ = async;
+            parser.inParameters_ = parameters;
+            parser.inStaticBlock_ = staticBlock;
         }
     };
+    struct FlagSet
+    {
+        bool& flag;
+        bool old;
+        FlagSet(bool& f, bool value) : flag(f), old(f) { f = value; }
+        ~FlagSet() { flag = old; }
+    };
     /// `async` followed by what makes it a modifier of a method rather than the method's name.
+    void checkReference();
     void privateMember(Node& member);
+    /// A statement that is the body of an `if`, a loop or a label: no declarations.
+    NodePtr bodyStatement(bool allowsFunction);
     bool asyncMethodAhead();
     bool asyncFunctionAhead();
     bool asyncArrowAhead();

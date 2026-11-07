@@ -75,6 +75,7 @@ struct FnState
     bool isArrow = false;
     bool isGlobal = false;
     bool isDerivedCtor = false;
+    bool isMethod = false;
 };
 
 enum class RefKind
@@ -287,6 +288,7 @@ public:
         const StrictScope strictProgram(*this, hasUseStrict(node));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
 
+        checkDeclarations(node.list, true);
         collectCaptured(node, fs.captured);
         fs.completionSlot = hiddenSlot();
         emit(Op::PushUndefined);
@@ -611,6 +613,27 @@ private:
             fs.code->jitRefused = true;
         const StrictScope strictBody(*this, node.d && hasUseStrict(*node.d));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
+        fs.isMethod = node.isMethod || fs.code->isClassConstructor;
+        std::vector<String> paramNames;
+        if (earlyErrors()) {
+            bool simple = true;
+            for (const NodePtr& p : node.list) {
+                simple = simple && p->kind == NK::Identifier;
+                patternNames(*p, paramNames);
+            }
+            if (!simple && node.d && hasUseStrict(*node.d))
+                fail(node.line, "'use strict' needs simple parameters");
+            std::set<String> seen;
+            for (const String& name : paramNames) {
+                checkBindingName(name, node.line);
+                if (!seen.insert(name).second && (inStrictCode() || !simple || fs.isArrow || node.isMethod))
+                    fail(node.line, "a parameter is named twice: " + toUtf8(name));
+            }
+            if (!node.text.empty() && node.kind == NK::FunctionExpr && !node.isMethod)
+                checkBindingName(node.text, node.line);
+            if (node.d)
+                checkDeclarations(node.d->list, true, &paramNames);
+        }
 
         collectCaptured(*node.d, fs.captured);
         for (const NodePtr& p : node.list)
@@ -798,6 +821,8 @@ private:
                 varDecl(n);
                 return;
             case NK::Block:
+                if (!n.list.empty())
+                    checkDeclarations(n.list, false);
                 beginScope();
                 predeclareLexical(n.list);
                 for (const NodePtr& s : n.list)
@@ -1424,6 +1449,7 @@ private:
                 emit(Op::PushNull);
                 return;
             case NK::Identifier:
+                checkStrictWord(n.text, n.line);
                 if (n.isPrivate && std::none_of(privateScopes_.begin(), privateScopes_.end(), [&](const std::set<String>& names) { return names.count(n.text) != 0; }))
                     fail(n.line, "a private name is not declared in any class around it: " + toUtf8(n.text));
                 if (n.text == ascii("undefined") && !findLocal(*fn_, n.text)) {
@@ -1513,6 +1539,7 @@ private:
             }
             case NK::SuperExpr:
                 fail(n.line, "'super' is only valid in a member access or a call");
+            case NK::TemplateObject: templateObject(n); return;
             case NK::NewTarget:
                 if (fn_->isArrow)
                     loadVar(ascii(" nt"));
@@ -1636,6 +1663,10 @@ private:
         }
         if (n.op == Tok::Delete) {
             const Node& target = *n.a;
+            if (target.kind == NK::Member && target.b && target.b->isPrivate)
+                fail(n.line, "a private member cannot be deleted");
+            if (earlyErrors() && inStrictCode() && target.kind == NK::Identifier)
+                fail(n.line, "strict code cannot delete a name");
             if (target.kind == NK::Member) {
                 expr(*target.a);
                 if (target.computed) {
@@ -1855,6 +1886,13 @@ private:
         checkNativeStack();
         if (n.kind == NK::Member) {
             if (n.a->kind == NK::SuperExpr) {
+                if (earlyErrors()) {
+                    const FnState* owner = fn_;
+                    while (owner->isArrow && owner->parent)
+                        owner = owner->parent;
+                    if (!owner->isMethod)
+                        fail(n.line, "'super' is only valid in a method");
+                }
                 if (n.computed) {
                     expr(*n.b);
                     emit(Op::GetSuperElem);
@@ -1880,6 +1918,13 @@ private:
         const bool spread = hasSpread(n.list);
 
         if (callee.kind == NK::SuperExpr) {
+            if (earlyErrors()) {
+                const FnState* owner = fn_;
+                while (owner->isArrow && owner->parent)
+                    owner = owner->parent;
+                if (!owner->isDerivedCtor)
+                    fail(n.line, "'super()' is only valid in the constructor of a derived class");
+            }
             // `this` from here on is what the super constructor made. An arrow function has neither the constructor nor
             // `this` in its own frame.
             if (fn_->isArrow) {
@@ -1989,6 +2034,7 @@ private:
     NodePtr initFunction(std::uint32_t line)
     {
         NodePtr fn = makeNode(NK::FunctionExpr, line);
+        fn->isMethod = true;
         fn->d = makeNode(NK::Block, line);
         return fn;
     }
@@ -2030,6 +2076,27 @@ private:
         emit(Op::Pop);
     }
 
+    /// One object for each place in the source, whatever the tag does with it: frozen, as is what `raw` gives.
+    void templateObject(const Node& n)
+    {
+        const auto frozen = [&](const std::vector<String>& items) {
+            DynArray* array = rt_.newArray(items.size());
+            Value handle = detail::Access::adopt(Type::Object, array);
+            for (const String& item : items)
+                array->append(rt_.str(item));
+            return handle;
+        };
+        Value cooked = frozen(n.strs);
+        Value raw = frozen(n.raws);
+        asObject(raw)->frozen = true;
+        asObject(raw)->extensible = false;
+        asObject(cooked)->putOwn(rt_.intern("raw"), raw, 0);
+        asObject(cooked)->frozen = true;
+        asObject(cooked)->extensible = false;
+        fn_->code->consts.push_back(cooked);
+        emitU(Op::PushConst, std::uint32_t(fn_->code->consts.size() - 1));
+    }
+
     void storeThisBox()
     {
         const VarRef ref = resolve(ascii("this"));
@@ -2040,10 +2107,164 @@ private:
         }
     }
 
+    // ---- what a program may not say ----
+    bool earlyErrors() const noexcept { return sloppyThis_; }
+    bool inStrictCode() const noexcept { return strictDepth_ > 0; }
+
+    static void patternNames(const Node& p, std::vector<String>& out)
+    {
+        checkNativeStack();
+        switch (p.kind) {
+            case NK::Identifier: out.push_back(p.text); return;
+            case NK::AssignPattern:
+            case NK::RestElement:
+                if (p.a)
+                    patternNames(*p.a, out);
+                return;
+            case NK::ArrayPattern:
+                for (const NodePtr& e : p.list)
+                    patternNames(*e, out);
+                return;
+            case NK::ObjectPattern:
+                for (const NodePtr& e : p.list) {
+                    if (e->kind == NK::RestElement)
+                        patternNames(*e, out);
+                    else if (e->b)
+                        patternNames(*e->b, out);
+                }
+                return;
+            default: return;
+        }
+    }
+
+    void checkBindingName(const String& name, std::uint32_t line)
+    {
+        if (!earlyErrors() || !inStrictCode())
+            return;
+        if (name == ascii("eval") || name == ascii("arguments"))
+            fail(line, "strict code cannot bind " + toUtf8(name));
+        checkStrictWord(name, line);
+    }
+
+    void checkStrictWord(const String& name, std::uint32_t line)
+    {
+        if (!earlyErrors() || !inStrictCode())
+            return;
+        for (const char* word : {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"}) {
+            if (name == ascii(word))
+                fail(line, toUtf8(name) + " is reserved in strict code");
+        }
+    }
+
+    /// Names `var` declares in these statements, however deep, short of another function.
+    static void varNames(const Node& n, std::vector<String>& out)
+    {
+        checkNativeStack();
+        switch (n.kind) {
+            case NK::FunctionExpr:
+            case NK::ArrowExpr:
+            case NK::ClassExpr:
+            case NK::FunctionDecl:
+            case NK::ClassDecl: return;
+            case NK::VarDecl:
+                if (n.varKind == VarKind::Var) {
+                    for (const NodePtr& d : n.list) {
+                        if (d->a)
+                            patternNames(*d->a, out);
+                    }
+                }
+                return;
+            default: break;
+        }
+        forEachChild(n, [&](const Node& kid) { varNames(kid, out); });
+    }
+
+    /// A name declared twice in one scope, or both lexically and by a `var` that passes through it. At the top of a function
+    /// or program a function declaration counts as a `var`; in a block it is lexical, and only plain ones may repeat in
+    /// code that is not strict.
+    void checkDeclarations(const std::vector<NodePtr>& statements, bool functionTop, const std::vector<String>* params = nullptr)
+    {
+        if (!earlyErrors())
+            return;
+        std::set<String> lexical;
+        std::set<String> plainFunctions;
+        std::set<String> vars;
+        const auto declare = [&](const String& name, std::uint32_t line) {
+            if (!lexical.insert(name).second)
+                fail(line, "a name is declared twice: " + toUtf8(name));
+        };
+        for (const NodePtr& s : statements) {
+            std::vector<String> names;
+            if (s->kind == NK::VarDecl && s->varKind != VarKind::Var) {
+                for (const NodePtr& d : s->list) {
+                    if (d->a)
+                        patternNames(*d->a, names);
+                }
+                for (const String& name : names)
+                    declare(name, s->line);
+            } else if (s->kind == NK::ClassDecl) {
+                declare(s->text, s->line);
+            } else if (s->kind == NK::FunctionDecl) {
+                if (functionTop) {
+                    vars.insert(s->text);
+                } else if (!inStrictCode() && !s->a->isGenerator && !s->a->isAsync) {
+                    if (!plainFunctions.insert(s->text).second)
+                        continue;
+                    if (lexical.count(s->text))
+                        fail(s->line, "a name is declared twice: " + toUtf8(s->text));
+                    lexical.insert(s->text);
+                } else {
+                    declare(s->text, s->line);
+                }
+            } else {
+                varNames(*s, names);
+                vars.insert(names.begin(), names.end());
+            }
+        }
+        for (const String& name : vars) {
+            if (lexical.count(name))
+                fail(statements.front()->line, "a name is declared both with 'var' and lexically: " + toUtf8(name));
+        }
+        if (params) {
+            for (const String& name : *params) {
+                if (lexical.count(name))
+                    fail(statements.front()->line, "a parameter is declared again: " + toUtf8(name));
+            }
+        }
+    }
+
+    void checkClassMembers(const Node& n)
+    {
+        bool hasConstructor = false;
+        for (const NodePtr& m : n.list) {
+            if ((m->kind != NK::MethodDef && m->kind != NK::FieldDef) || m->computed || m->isPrivate || !m->a)
+                continue;
+            const bool isCtorName = m->a->text == ascii("constructor");
+            if (m->kind == NK::FieldDef) {
+                if (isCtorName || (m->isStatic && m->a->text == ascii("prototype")))
+                    fail(m->line, "a field cannot be called " + toUtf8(m->a->text));
+                continue;
+            }
+            if (m->isStatic && m->a->text == ascii("prototype"))
+                fail(m->line, "a static method cannot be called prototype");
+            if (m->propKind == PropKind::Constructor) {
+                if (hasConstructor)
+                    fail(m->line, "a class has one constructor");
+                hasConstructor = true;
+                if (m->b->isGenerator || m->b->isAsync)
+                    fail(m->line, "a constructor cannot be a generator or async");
+            } else if (isCtorName && !m->isStatic) {
+                fail(m->line, "a constructor cannot be an accessor, a generator or async");
+            }
+        }
+    }
+
     void classExpr(const Node& n)
     {
         const StrictScope strictBody(*this, true);
         const bool derived = n.a != nullptr;
+        if (earlyErrors())
+            checkClassMembers(n);
         beginScope();
 
         // The private names, each a variable of the class's scope that its methods capture as they do any other.
@@ -2138,6 +2359,8 @@ private:
             if (m->kind == NK::FieldDef) {
                 if (m->declared)
                     continue;
+                if (earlyErrors() && m->b && mentionsArguments(*m->b))
+                    fail(m->line, "a field's initialiser cannot use 'arguments'");
                 NodePtr init = makeNode(NK::FieldInit, m->line);
                 init->isPrivate = m->isPrivate;
                 init->computed = m->computed;
@@ -2246,6 +2469,8 @@ private:
         copy->isGenerator = n.isGenerator;
         copy->isAsync = n.isAsync;
         copy->isPrivate = n.isPrivate;
+        copy->isMethod = n.isMethod;
+        copy->raws = n.raws;
         copy->declared = n.declared;
         copy->text = n.text;
         copy->number = n.number;

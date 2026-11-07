@@ -3,6 +3,7 @@
 
 // Tokenizer.
 
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <unordered_map>
@@ -158,6 +159,30 @@ void Lexer::fail(const std::string& sourceName, std::uint32_t line, const std::s
     throw Error(ErrorCode::SyntaxError, sourceName + ":" + std::to_string(line) + ": " + message);
 }
 
+/// The characters beyond ASCII that separate tokens, in UTF-8, stepping over one if it is next.
+bool Lexer::unicodeSpace(bool& sawNewline)
+{
+    const auto a = static_cast<unsigned char>(peek());
+    const auto b = static_cast<unsigned char>(peek(1));
+    const auto c = static_cast<unsigned char>(peek(2));
+    if (a == 0xC2 && b == 0xA0) {  // no-break space
+        pos_ += 2;
+        return true;
+    }
+    if (a == 0xE2 && b == 0x80 && (c == 0xA8 || c == 0xA9)) {  // line and paragraph separators
+        ++line_;
+        sawNewline = true;
+        pos_ += 3;
+        return true;
+    }
+    const bool space = (a == 0xEF && b == 0xBB && c == 0xBF) || (a == 0xE1 && b == 0x9A && c == 0x80) ||
+                       (a == 0xE2 && b == 0x80 && ((c >= 0x80 && c <= 0x8A) || c == 0xAF)) ||
+                       (a == 0xE2 && b == 0x81 && c == 0x9F) || (a == 0xE3 && b == 0x80 && c == 0x80);
+    if (space)
+        pos_ += 3;
+    return space;
+}
+
 bool Lexer::skipSpace()
 {
     bool sawNewline = false;
@@ -186,8 +211,8 @@ bool Lexer::skipSpace()
                 }
                 ++pos_;
             }
-        } else if (static_cast<unsigned char>(c) == 0xef && pos_ == 0) {
-            pos_ += 3;  // UTF-8 byte order mark
+        } else if (static_cast<unsigned char>(c) >= 0xC2 && unicodeSpace(sawNewline)) {
+            // Taken as it went by.
         } else {
             return sawNewline;
         }
@@ -290,11 +315,28 @@ Token Lexer::readTemplate()
     t.line = line_;
     ++pos_;  // opening backtick
     String chunk;
+    std::size_t rawStart = pos_;
+    const auto keepRaw = [&](std::size_t end) {
+        std::string raw(src_.substr(rawStart, end - rawStart));
+        // Line endings come out as one, whatever they were in the file.
+        std::string plain;
+        for (std::size_t i = 0; i < raw.size(); ++i) {
+            if (raw[i] == '\r') {
+                plain.push_back('\n');
+                if (i + 1 < raw.size() && raw[i + 1] == '\n')
+                    ++i;
+            } else {
+                plain.push_back(raw[i]);
+            }
+        }
+        t.raws.push_back(fromUtf8(plain));
+    };
     for (;;) {
         if (pos_ >= src_.size())
             fail("unterminated template literal");
         const char c = src_[pos_];
         if (c == '`') {
+            keepRaw(pos_);
             ++pos_;
             t.parts.push_back(chunk);
             break;
@@ -306,6 +348,7 @@ Token Lexer::readTemplate()
         }
         if (c == '$' && peek(1) == '{') {
             t.parts.push_back(chunk);
+            keepRaw(pos_);
             chunk.clear();
             pos_ += 2;
             const std::size_t start = pos_;
@@ -355,6 +398,7 @@ Token Lexer::readTemplate()
                 fail("unterminated template substitution");
             t.exprs.emplace_back(src_.substr(start, pos_ - start));
             ++pos_;  // closing brace
+            rawStart = pos_;
             continue;
         }
         if (c == '\n')
@@ -441,7 +485,56 @@ Token Lexer::readIdentifier()
     while (pos_ < src_.size() && isIdPart(static_cast<unsigned char>(src_[pos_])))
         ++pos_;
     t.text = fromUtf8(src_.substr(start, pos_ - start));
+    // `\u0061` and `\u{61}` are the letter they name, in any part of a name.
+    bool escaped = false;
+    while (peek() == '\\') {
+        if (peek(1) != 'u')
+            fail("unexpected character '\\'");
+        pos_ += 2;
+        std::uint32_t code = 0;
+        if (peek() == '{') {
+            ++pos_;
+            int digits = 0;
+            while (peek() != '}') {
+                const int d = std::isxdigit(static_cast<unsigned char>(peek())) ? base::hexValue(peek()) : -1;
+                if (d < 0 || (code = code * 16 + std::uint32_t(d)) > 0x10FFFF)
+                    fail("invalid Unicode escape in a name");
+                ++pos_;
+                ++digits;
+            }
+            ++pos_;
+            if (!digits)
+                fail("invalid Unicode escape in a name");
+        } else {
+            for (int i = 0; i < 4; ++i, ++pos_) {
+                const int d = std::isxdigit(static_cast<unsigned char>(peek())) ? base::hexValue(peek()) : -1;
+                if (d < 0)
+                    fail("invalid Unicode escape in a name");
+                code = code * 16 + std::uint32_t(d);
+            }
+        }
+        const bool fits = code >= 0x80 ? !(code >= 0xD800 && code <= 0xDFFF)
+                          : t.text.empty() ? isIdStart(static_cast<unsigned char>(code)) : isIdPart(static_cast<unsigned char>(code));
+        if (!fits || code == 0x2028 || code == 0x2029)
+            fail("that escape does not name a letter of a name");
+        if (code >= 0x10000) {
+            t.text.push_back(Char(0xD800 + ((code - 0x10000) >> 10)));
+            t.text.push_back(Char(0xDC00 + ((code - 0x10000) & 0x3FF)));
+        } else {
+            t.text.push_back(Char(code));
+        }
+        escaped = true;
+        const std::size_t more = pos_;
+        while (pos_ < src_.size() && isIdPart(static_cast<unsigned char>(src_[pos_])))
+            ++pos_;
+        t.text += fromUtf8(src_.substr(more, pos_ - more));
+    }
     t.type = keywordOf(t.text);
+    // A word spelled with an escape is a name, and not the keyword: a property may be called that, a variable may not.
+    if (escaped && t.type != Tok::Identifier) {
+        t.escapedKeyword = true;
+        t.type = Tok::Identifier;
+    }
     return t;
 }
 
@@ -461,7 +554,7 @@ Token Lexer::readToken(bool regexAllowed)
         return t;
 
     const char c = src_[pos_];
-    if (isIdStart(static_cast<unsigned char>(c)))
+    if (isIdStart(static_cast<unsigned char>(c)) || c == '\\')
         return readIdentifier();
     if (isDigit(c) || (c == '.' && isDigit(peek(1))))
         return readNumber();

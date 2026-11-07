@@ -802,6 +802,20 @@ Value CallbackLoop::operator()(const Value& thisValue, std::initializer_list<Val
     const void* entry = fn_ ? fn_->code->jitCallEntry : nullptr;
     if (!entry)
         return slow(thisValue, args);
+    return enter(entry, std::int64_t(thisValue.type()), payloadOf(thisValue), args.begin(), args.size());
+}
+
+Value CallbackLoop::ofTwoNumbers(double a, double b)
+{
+    const void* entry = fn_ ? fn_->code->jitCallEntry : nullptr;
+    if (!entry)
+        return slow(Value::undefined(), {Value(a), Value(b)});
+    const Value args[2] = {Value(a), Value(b)};
+    return enter(entry, std::int64_t(Type::Undefined), 0, args, 2);
+}
+
+Value CallbackLoop::enter(const void* entry, std::int64_t thisTag, std::uint64_t thisPayload, const Value* args, std::size_t count)
+{
     if (!session_)
         session_ = new Session(rt_);
     struct Depth
@@ -819,9 +833,8 @@ Value CallbackLoop::operator()(const Value& thisValue, std::initializer_list<Val
     // Each call starts with no native frames published, as a fresh run would.
     rt_.nativeTopFrame = nullptr;
     rt_.nativeTopPc = nullptr;
-    const NativePair out =
-        scriptJitCall5(&rt_, entry, reinterpret_cast<std::uint64_t>(fn_), std::uint64_t(thisValue.type()), payloadOf(thisValue),
-                       reinterpret_cast<std::uint64_t>(args.begin()), args.size());
+    const NativePair out = scriptJitCall5(&rt_, entry, reinterpret_cast<std::uint64_t>(fn_), std::uint64_t(thisTag), thisPayload,
+                                          reinterpret_cast<std::uint64_t>(args), count);
     const std::uint64_t results[2] = {out.payload, out.tag};
     if (!rt_.nativeKeepAlive.isUndefined())
         rt_.nativeKeepAlive = Value::undefined();

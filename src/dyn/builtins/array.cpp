@@ -103,13 +103,13 @@ namespace {
 
 /// Merge sort: a user comparator may be inconsistent, and std::sort is allowed
 /// to run off the end of the range when it is.
-template <class Less>
-void mergeSort(Vec<Value>& v, const Less& less)
+template <class T, class Less>
+void mergeSort(Vec<T>& v, const Less& less)
 {
     if (v.size() < 2)
         return;
     // Each pass moves every value once, from one buffer to the other, so no count changes on the way.
-    Vec<Value> scratch(v.size());
+    Vec<T> scratch(v.size());
     for (std::size_t width = 1; width < v.size(); width *= 2) {
         for (std::size_t start = 0; start < v.size(); start += 2 * width) {
             const std::size_t mid = std::min(start + width, v.size());
@@ -279,6 +279,25 @@ void installArray(Runtime& rt)
         // A comparator is script and may shrink or grow the array while it is being sorted, which would leave the
         // merge reading past the end of the elements. Sort a private copy and put it back when it is done.
         rt2.ctx.reserve(a->size() * sizeof(Value) * 2);
+        // Numbers and a comparator, which is what a sort usually is: no values to shuffle, nor undefined to sort last.
+        if (asFunction(comparator) && a->numbersOnly) {
+            Vec<double> bare(a->numbers(), a->numbers() + a->size());
+            bool plain = true;
+            for (const double& d : bare) {
+                std::uint64_t bits;
+                std::memcpy(&bits, &d, 8);
+                plain = plain && bits != kUndefinedElement;
+            }
+            if (plain) {
+                CallbackLoop call(rt2, comparator);
+                mergeSort(bare, [&](double x, double y) {
+                    const Value order = call.ofTwoNumbers(x, y);
+                    return (order.isDouble() ? detail::Access::r8(order) : toNumber(rt2, order)) < 0;
+                });
+                a->assignNumbers(bare.data(), bare.size());
+                return ci.thisValue();
+            }
+        }
         Vec<Value> work;
         work.reserve(a->size());
         for (std::size_t i = 0; i < a->size(); ++i)
@@ -411,7 +430,7 @@ void installArray(Runtime& rt)
     }, 1);
 
     // ---- higher order ----
-    auto each = [](CallInfo& ci, const std::function<bool(std::size_t, const Value&, Value&)>& step) {
+    auto each = [](CallInfo& ci, auto&& step) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         const Value fn = ci.arg(0);

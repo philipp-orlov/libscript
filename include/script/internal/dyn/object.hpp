@@ -495,6 +495,7 @@ struct DynArray : DynObject
     void insertRange(std::size_t at, const Value* items, std::size_t count);
     /// Replace the lot, in whichever form they fit.
     void assignAll(const Value* items, std::size_t count);
+    void assignNumbers(const double* items, std::size_t count);
     void reverse();
     /// Release element capacity once the array has shrunk well below it.
     void trimElements();

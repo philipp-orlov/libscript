@@ -583,6 +583,24 @@ void DynArray::assignAll(const Value* items, std::size_t count)
         append(items[i]);
 }
 
+void DynArray::assignNumbers(const double* items, std::size_t count)
+{
+    // Script ran since these were taken out, and may have made it hold anything.
+    if (!numbersOnly) {
+        Vec<Value> values;
+        values.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+            values.push_back(Value(items[i]));
+        assignAll(values.data(), count);
+        return;
+    }
+    store.size_ = 0;
+    reserveElements(count);
+    if (count)
+        std::memcpy(static_cast<void*>(numbers()), items, count * sizeof(double));
+    store.size_ = std::uint32_t(count);
+}
+
 void DynArray::reverse()
 {
     if (numbersOnly)

@@ -1539,6 +1539,132 @@ private:
         return result;
     }
 
+    /// A new instance, popped off its size's free list and written here while the heap has one ready and nothing is due;
+    /// `scriptJitNewInstance` otherwise.
+    std::int32_t newInstanceCell(const TypeInfo* type, const std::vector<std::int32_t>& extraCleanup)
+    {
+        ContextImpl& ctx = rt_.ctx;
+        constexpr std::size_t kMostBytes = 256;
+        const auto helper = [&] {
+            return callHelper(reinterpret_cast<void*>(&scriptJitNewInstance), {rtReg(), ptrReg(type)}, true, extraCleanup);
+        };
+        if (!mem::LocalHeap::kCanPopInline || ctx.options.memoryLimit || !type || CSInstance::bytesFor(type->instanceSlots) > kMostBytes)
+            return helper();
+        // Its bytes are worked out by making one, the first time.
+        if (type->instanceImage.empty()) {
+            try {
+                detail::decRef(rt_.newInstance(type));
+            } catch (...) {
+                return helper();
+            }
+            if (type->instanceImage.empty())
+                return helper();
+        }
+        const std::size_t bytes = type->instanceImage.size() * 8;
+        const std::int32_t result = fn_.newVreg(false);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const auto word = [&](std::int32_t base, std::size_t offset, std::uint8_t width = 8) {
+            const std::int32_t d = fn_.newVreg(false);
+            IrInst& load = inst(IrOp::Load);
+            load.d = d;
+            load.a = base;
+            load.imm = std::int64_t(offset);
+            load.width = width;
+            return d;
+        };
+        const auto put = [&](std::int32_t base, std::size_t offset, std::int32_t value, std::uint8_t width = 8) {
+            IrInst& store = inst(IrOp::Store);
+            store.a = base;
+            store.c = value;
+            store.imm = std::int64_t(offset);
+            store.width = width;
+        };
+        const auto plus = [&](std::int32_t a, std::int64_t imm, std::uint8_t width = 64) {
+            const std::int32_t d = fn_.newVreg(false);
+            IrInst& add = inst(IrOp::Add);
+            add.d = d;
+            add.a = a;
+            add.hasImm = true;
+            add.imm = imm;
+            add.width = width;
+            return d;
+        };
+        const auto slowIfNotBelow = [&](std::int32_t a, std::int32_t b) {
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = a;
+            test.b = b;
+            test.cond = IrCond::Hs;
+            test.width = 64;
+            test.target = slow;
+        };
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+        // What `maybeCollect` asks.
+        const std::int32_t heap = ptrReg(&ctx);
+        const std::int32_t heapBytes = word(heap, offsetof(ContextImpl, heapBytes));
+        const std::int32_t budget = word(heap, offsetof(ContextImpl, nextGcBytes));
+        slowIfNotBelow(heapBytes, budget);
+        const std::int32_t liveObjects = word(heap, offsetof(ContextImpl, liveObjects));
+        const std::int32_t liveStrings = word(heap, offsetof(ContextImpl, liveStrings));
+        const std::int32_t cells = fn_.newVreg(false);
+        {
+            IrInst& add = inst(IrOp::Add);
+            add.d = cells;
+            add.a = liveObjects;
+            add.b = liveStrings;
+            add.width = 64;
+        }
+        const std::int32_t cellBudget = word(heap, offsetof(ContextImpl, nextGcCells));
+        slowIfNotBelow(cells, cellBudget);
+        // What `LocalHeap::allocate` does while the current block has a free slot.
+        const std::int32_t block = word(ptrReg(ctx.heap.currentBlockOf(bytes)), 0);
+        const std::int32_t slot = word(block, mem::LocalHeap::kBlockFreeOffset);
+        {
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = slot;
+            test.cond = IrCond::Eq;
+            test.hasImm = true;
+            test.imm = 0;
+            test.width = 64;
+            test.target = slow;
+        }
+        const std::int32_t nextFree = word(slot, 0);
+        put(block, mem::LocalHeap::kBlockFreeOffset, nextFree);
+        const std::int32_t live = word(block, mem::LocalHeap::kBlockLiveOffset, 4);
+        put(block, mem::LocalHeap::kBlockLiveOffset, plus(live, 1, 32), 4);
+        // What the constructors and `linkKnown` do.
+        for (std::size_t i = 0; i < type->instanceImage.size(); ++i)
+            put(slot, i * 8, immReg(std::int64_t(type->instanceImage[i])));
+        put(heap, offsetof(ContextImpl, heapBytes), plus(heapBytes, std::int64_t(bytes)));
+        const std::int32_t total = word(heap, offsetof(ContextImpl, totalAllocated));
+        put(heap, offsetof(ContextImpl, totalAllocated), plus(total, std::int64_t(bytes)));
+        put(heap, offsetof(ContextImpl, liveObjects), plus(liveObjects, 1));
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+        {
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = result;
+            mov.a = slot;
+        }
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        const std::int32_t made = helper();
+        fn_.calls.back().cold = true;
+        {
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = result;
+            mov.a = made;
+        }
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        return result;
+    }
+
     /// A helper that cannot raise.
     std::int32_t callPure(void* helper, std::vector<std::int32_t> args, bool fpResult, bool hasResult = true)
     {
@@ -2895,8 +3021,7 @@ private:
         for (std::size_t i = 0; i < ctor->params.size() && i < args.size(); ++i)
             coerceTo(args[i], ctor->params[i].type);
         extraTagged_ = taggedOf(args);
-        const std::int32_t cell = callHelper(reinterpret_cast<void*>(&scriptJitNewInstance), {rtReg(), ptrReg(type)}, true,
-                                             ownedOf(args));
+        const std::int32_t cell = newInstanceCell(type, ownedOf(args));
         extraTagged_.clear();
         // The new object is on the stack as an owned entry while its constructor runs.
         Entry self = refEntry(cell, type, Own::Owned, true);
@@ -3269,8 +3394,7 @@ private:
             case Op::InitObj: {
                 const TypeInfo* type = typeRef(operands);
                 if (type->kind == TypeKind::Struct) {
-                    const std::int32_t cell = callHelper(reinterpret_cast<void*>(&scriptJitNewInstance),
-                                                         {rtReg(), ptrReg(type)}, true);
+                    const std::int32_t cell = newInstanceCell(type, {});
                     push(refEntry(cell, type, Own::Owned, true));
                     return;
                 }

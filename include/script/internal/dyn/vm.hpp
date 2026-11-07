@@ -107,9 +107,12 @@ public:
     CallbackLoop(const CallbackLoop&) = delete;
     CallbackLoop& operator=(const CallbackLoop&) = delete;
     Value operator()(const Value& thisValue, std::initializer_list<Value> args);
+    /// `callee(a, b)` with `this` undefined, as a sort's comparator is called.
+    Value ofTwoNumbers(double a, double b);
 
 private:
     Value slow(const Value& thisValue, std::initializer_list<Value> args);
+    Value enter(const void* entry, std::int64_t thisTag, std::uint64_t thisPayload, const Value* args, std::size_t count);
     Runtime& rt_;
     Value callee_;
     DynFunction* fn_ = nullptr;

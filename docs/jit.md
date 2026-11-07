@@ -63,11 +63,13 @@ A method goes through three, each in a file of its own under `src/typed/jit/`, p
 * **`lower.cpp`, bytecode to IR.** The evaluation stack runs at compile time, so an operand is a register, a constant or a
   local being read. Compare-and-branch fuses, constants fold and methods of up to 96 bytes of bytecode inline, including
   constructors, which then skip what a new object does not need.
-* **`optimize.cpp`, on the IR.** Common subexpressions within a block; in a call-free innermost loop, a field of an object
-  the loop does not reassign stays in a register and is written back on every way out; loops are rotated so that an
-  iteration takes one branch; copies disappear.
-* **`regalloc.cpp`.** Linear scan. Each value has one location for its whole life, and what goes to memory when registers
-  run out is what is touched least per instruction, weighted by loop depth.
+* **`optimize.cpp`, on the IR.** Common subexpressions within a block, and past a label with one way in; in an innermost
+  loop with no call that comes back, a field of an object the loop does not reassign stays in a register, written back on
+  every way out, a bail included, and around a release in cold code; loops are rotated so that an iteration takes one
+  branch; copies disappear; a number goes through memory as a double, with no move between register files.
+* **`regalloc.cpp`.** Each value has one location for its whole life, and what goes to memory when registers run out is
+  what is touched least per instruction, weighted by loop depth. A value prefers the register of one it is copied from or
+  to, which makes the copy nothing.
 * **`jit_arm64.cpp` and `jit_x64.cpp`, the machine.** IR in, bytes out. `jit_stubs_arm64.cpp` and `jit_stubs_x64.cpp` are the
   assembly at the edge of native code.
 
@@ -184,6 +186,13 @@ much on these kernels and 8.5x on Octane, which `tests/javascript/test_gc.cpp` a
 
 `tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several
 thresholds.
+
+### Array callbacks
+
+`forEach`, `map`, `filter` and `reduce` with an initial value are emitted as a loop where the built-in is known, and call the
+callback as native code calls any function. Guards ahead of the loop fall back to calling the built-in. Nothing inside
+bails, because the interpreter cannot take over part way through a built-in: whatever is out of the ordinary goes through a
+helper and comes back. The array is read afresh each time round, as the callback may change it.
 
 ## Reference counts in native code
 

@@ -1619,6 +1619,17 @@ NodePtr Parser::postfix()
     return base;
 }
 
+void Parser::privateMember(Node& member)
+{
+    // A computed access whose key is the variable holding the private name: every kind of assignment to a member then
+    // works the same, and what is different about it is in what such a key does when it is used.
+    member.computed = true;
+    member.b = makeNode(NK::Identifier, cur_.line);
+    member.b->text = ascii("#") + cur_.text;
+    member.b->isPrivate = true;
+    advance();
+}
+
 NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
 {
     std::size_t links = 0;
@@ -1629,7 +1640,10 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
             advance();
             NodePtr n = makeNode(NK::Member, base->line);
             n->a = std::move(base);
-            n->text = propertyName();
+            if (at(Tok::PrivateName))
+                privateMember(*n);
+            else
+                n->text = propertyName();
             base = std::move(n);
         } else if (at(Tok::QuestionDot)) {
             advance();
@@ -1652,6 +1666,8 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
                     n->b = expression();
                 }
                 expect(Tok::RBracket, "']'");
+            } else if (at(Tok::PrivateName)) {
+                privateMember(*n);
             } else {
                 n->text = propertyName();
             }
@@ -1929,7 +1945,8 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             const Token after = probe.next(false);
             if (after.type == Tok::LParen || after.type == Tok::Assign ||
                 after.type == Tok::Colon || after.type == Tok::Semicolon ||
-                after.type == Tok::RBrace || after.type == Tok::Question || after.type == Tok::Lt)
+                after.type == Tok::RBrace || after.type == Tok::Question || after.type == Tok::Lt ||
+                (after.newlineBefore && t == Tok::Static && after.type == Tok::Eof))
                 break;  // the modifier word is really the member's name
             switch (t) {
                 case Tok::Static: isStatic = true; break;
@@ -1943,6 +1960,14 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             advance();
         }
 
+        if (isStatic && at(Tok::LBrace)) {
+            NodePtr staticBlock = makeNode(NK::StaticBlock, cur_.line);
+            staticBlock->isStatic = true;
+            const FunctionKind blockKind(*this, false, false);
+            staticBlock->d = block();
+            n->list.push_back(std::move(staticBlock));
+            continue;
+        }
         const bool memberAsync = at(Tok::Async) && asyncMethodAhead();
         if (memberAsync)
             advance();
@@ -1961,6 +1986,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
 
         NodePtr key;
         bool computed = false;
+        bool isPrivate = false;
         const std::uint32_t line = cur_.line;
         if (at(Tok::LBracket)) {
             Lexer probe = lexer_;
@@ -1978,7 +2004,10 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             key = assignment();
             expect(Tok::RBracket, "']'");
         } else if (at(Tok::PrivateName)) {
-            fail("private class members are not supported; use 'private'");
+            isPrivate = true;
+            key = makeNode(NK::StringLit, line);
+            key->text = ascii("#") + cur_.text;
+            advance();
         } else {
             key = makeNode(NK::StringLit, line);
             key->text = propertyName();
@@ -2017,6 +2046,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             m->optional = optional;
             m->visibility = visibility;
             m->isAbstract = memberAbstract;
+            m->isPrivate = isPrivate;
             m->declared = fn->declared;
             m->a = std::move(key);
             m->b = std::move(fn);
@@ -2032,10 +2062,13 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
         f->visibility = visibility;
         f->isAbstract = memberAbstract;
         f->declared = memberAbstract || ambientMember;
+        f->isPrivate = isPrivate;
         f->a = std::move(key);
         f->type = typeAnnotation();
-        if (eat(Tok::Assign))
+        if (eat(Tok::Assign)) {
+            const FunctionKind fieldKind(*this, false, false);
             f->b = assignment();
+        }
         semicolon();
         n->list.push_back(std::move(f));
     }
@@ -2201,8 +2234,24 @@ NodePtr Parser::primary()
         case Tok::LBracket: return arrayLiteral();
         case Tok::LBrace: return objectLiteral();
         case Tok::Regex: fail("regular expression literals are not supported"); break;
+        case Tok::PrivateName: {
+            // Only `#x in o`.
+            NodePtr n = makeNode(NK::Identifier, line);
+            n->text = ascii("#") + cur_.text;
+            n->isPrivate = true;
+            advance();
+            if (!at(Tok::In))
+                fail("a private name is only valid in a member access or before 'in'");
+            return n;
+        }
         case Tok::New: {
             advance();
+            if (eat(Tok::Dot)) {
+                if (cur_.text != ascii("target"))
+                    fail("expected 'new.target'");
+                advance();
+                return makeNode(NK::NewTarget, line);
+            }
             NodePtr n = makeNode(NK::NewExpr, line);
             n->a = callOrMember(primary(), false);
             if (at(Tok::Lt) && looksLikeTypeArguments())

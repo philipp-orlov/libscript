@@ -123,6 +123,22 @@ enum class Op : std::uint8_t
     IterCloseAt,      // depth: close the iterator at that place in the stack, keeping everything
     IterCloseThrow,   // iterator exception -> : close it, whatever that does, and throw the exception
 
+    // ---- classes ----
+    NewPrivateName,      // atom: -> a private name, new each time the class is evaluated
+    PrivateIn,           // object name -> boolean
+    DefPrivate,          // object name value -> object
+    DefPrivateMethod,    // object name function -> object
+    DefPrivateAccessor,  // setter?: object name function -> object
+    DefAccessorElem,     // flags (1 setter, 2 not enumerable): object key function -> object
+    CheckThis,           // this -> this, or a ReferenceError ahead of `super()`
+    DerivedReturn,       // value this -> what a derived constructor returns
+    PushNewTarget,
+    CallSuperVia,        // argc: constructor newTarget this arg... -> result, from an arrow function
+    CallSuperViaSpread,  // constructor newTarget this array -> result
+    SetFieldInit,        // constructor function -> constructor
+    CallStaticInit,      // constructor function -> constructor
+    SetHome,             // home function -> function
+
     // ---- generators and async functions ----
     CoStart,          // what has run so far was the call: the rest runs as a coroutine, resumed from here
     Yield,            // target: value -> sent; resumed by `return`, goes to the target with the value

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <set>
 #include <string>
+#include <map>
 #include <vector>
 
 #include "script/internal/dyn/compiler.hpp"
@@ -73,6 +74,7 @@ struct FnState
     std::uint32_t tempSlot = kNoSlot;
     bool isArrow = false;
     bool isGlobal = false;
+    bool isDerivedCtor = false;
 };
 
 enum class RefKind
@@ -118,6 +120,17 @@ void collectNames(const Node& n, std::set<String>& out, bool inArrow)
         case NK::ThisExpr:
             if (inArrow)
                 out.insert(ascii("this"));
+            break;
+        case NK::SuperExpr:
+            if (inArrow) {
+                out.insert(ascii("this"));
+                out.insert(ascii(" ctor"));
+                out.insert(ascii(" nt"));
+            }
+            break;
+        case NK::NewTarget:
+            if (inArrow)
+                out.insert(ascii(" nt"));
             break;
         case NK::FunctionExpr:
             inArrow = false;
@@ -588,11 +601,13 @@ private:
         fs.isArrow = fs.code->isArrow;
         fs.code->isClassConstructor = node.propKind == PropKind::Constructor;
         fs.code->isDerivedConstructor = node.isStatic;  // set by compileClass
+        fs.isDerivedCtor = fs.code->isDerivedConstructor && fs.code->isClassConstructor;
         fs.code->arity = int(node.list.size());
         fs.code->isGenerator = node.isGenerator;
         fs.code->isAsync = node.isAsync;
         // A coroutine lives in a frame of its own, which is the interpreter's to resume.
-        if (node.isGenerator || node.isAsync)
+        // And what `super()` binds `this` to is known only in the frame.
+        if (node.isGenerator || node.isAsync || fs.isDerivedCtor)
             fs.code->jitRefused = true;
         const StrictScope strictBody(*this, node.d && hasUseStrict(*node.d));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
@@ -627,6 +642,16 @@ private:
         if (!fs.isArrow && fs.captured.count(ascii("this"))) {
             const std::uint32_t slot = declareLocal(ascii("this"), false);
             emit(Op::PushThis);
+            emitU(Op::SetCell, slot);
+        }
+        if (!fs.isArrow && fs.captured.count(ascii(" ctor"))) {
+            const std::uint32_t slot = declareLocal(ascii(" ctor"), false);
+            emit(Op::PushCallee);
+            emitU(Op::SetCell, slot);
+        }
+        if (!fs.isArrow && fs.captured.count(ascii(" nt"))) {
+            const std::uint32_t slot = declareLocal(ascii(" nt"), false);
+            emit(Op::PushNewTarget);
             emitU(Op::SetCell, slot);
         }
 
@@ -664,7 +689,12 @@ private:
             emit(Op::CoStart);
         for (const NodePtr& s : node.d->list)
             stmt(*s);
-        emit(Op::ReturnUndefined);
+        if (fs.isDerivedCtor) {
+            emit(Op::PushUndefined);
+            emitFinalReturn();
+        } else {
+            emit(Op::ReturnUndefined);
+        }
 
         fn_ = saved;
         fn_->code->children.push_back(fs.code);
@@ -721,10 +751,28 @@ private:
     /// Push `this`, from its box when an arrow function captured it.
     void loadThis()
     {
+        loadThisUnchecked();
+        // Ahead of `super()` there is none yet.
+        const FnState* owner = fn_;
+        while (owner->isArrow && owner->parent)
+            owner = owner->parent;
+        if (owner->isDerivedCtor)
+            emit(Op::CheckThis);
+    }
+    void loadThisUnchecked()
+    {
         if (findLocal(*fn_, ascii("this")) || fn_->isArrow)
             loadVar(ascii("this"));
         else
             emit(Op::PushThis);
+    }
+    void emitFinalReturn()
+    {
+        if (fn_->isDerivedCtor) {
+            loadThisUnchecked();
+            emit(Op::DerivedReturn);
+        }
+        emit(Op::Return);
     }
 
     // ---- statements ----
@@ -735,6 +783,7 @@ private:
         switch (n.kind) {
             case NK::Empty:
                 return;
+            case NK::FieldInit: fieldInit(n); return;
             case NK::ExprStatement:
                 expr(*n.a);
                 // The value of a program is the value of the last expression
@@ -1237,7 +1286,7 @@ private:
     void emitReturnOfTop()
     {
         if (fn_->finallys.empty()) {
-            emit(Op::Return);
+            emitFinalReturn();
             return;
         }
         if (fn_->retvalSlot == kNoSlot)
@@ -1246,7 +1295,7 @@ private:
         for (std::size_t i = fn_->finallys.size(); i-- > 0;)
             emitFinallyCall(*fn_->finallys[i]);
         emitU(Op::GetLocal, fn_->retvalSlot);
-        emit(Op::Return);
+        emitFinalReturn();
     }
 
     void tryStatement(const Node& n)
@@ -1375,6 +1424,8 @@ private:
                 emit(Op::PushNull);
                 return;
             case NK::Identifier:
+                if (n.isPrivate && std::none_of(privateScopes_.begin(), privateScopes_.end(), [&](const std::set<String>& names) { return names.count(n.text) != 0; }))
+                    fail(n.line, "a private name is not declared in any class around it: " + toUtf8(n.text));
                 if (n.text == ascii("undefined") && !findLocal(*fn_, n.text)) {
                     emit(Op::PushUndefined);
                     return;
@@ -1407,6 +1458,12 @@ private:
                 update(n);
                 return;
             case NK::Binary:
+                if (n.op == Tok::In && n.a->isPrivate) {
+                    expr(*n.b);
+                    expr(*n.a);
+                    emit(Op::PrivateIn);
+                    return;
+                }
                 expr(*n.a);
                 expr(*n.b);
                 emit(binaryOp(n.op, n.line));
@@ -1456,6 +1513,12 @@ private:
             }
             case NK::SuperExpr:
                 fail(n.line, "'super' is only valid in a member access or a call");
+            case NK::NewTarget:
+                if (fn_->isArrow)
+                    loadVar(ascii(" nt"));
+                else
+                    emit(Op::PushNewTarget);
+                return;
             case NK::Yield: yieldExpr(n); return;
             case NK::Await:
                 expr(*n.a);
@@ -1514,10 +1577,10 @@ private:
             if (p->computed) {
                 expr(*p->a);
                 emit(Op::ToPropertyKey);
-                if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter)
-                    fail(p->line, "computed accessor names are not supported");
                 expr(*p->b);
-                if (p->propKind == PropKind::Method)
+                if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter)
+                    emitU(Op::DefAccessorElem, p->propKind == PropKind::Setter ? 1u : 0u);
+                else if (p->propKind == PropKind::Method)
                     emit(Op::DefMethodElem);
                 else
                     emit(Op::DefElem);
@@ -1817,11 +1880,28 @@ private:
         const bool spread = hasSpread(n.list);
 
         if (callee.kind == NK::SuperExpr) {
-            pushArgs(n.list, spread);
-            if (spread)
-                emit(Op::CallSuperSpread);
-            else
-                emitU(Op::CallSuper, std::uint32_t(n.list.size()));
+            // `this` from here on is what the super constructor made. An arrow function has neither the constructor nor
+            // `this` in its own frame.
+            if (fn_->isArrow) {
+                loadVar(ascii(" ctor"));
+                loadVar(ascii(" nt"));
+                loadThisUnchecked();
+                pushArgs(n.list, spread);
+                if (spread)
+                    emit(Op::CallSuperViaSpread);
+                else
+                    emitU(Op::CallSuperVia, std::uint32_t(n.list.size()));
+            } else {
+                pushArgs(n.list, spread);
+                if (spread)
+                    emit(Op::CallSuperSpread);
+                else
+                    emitU(Op::CallSuper, std::uint32_t(n.list.size()));
+            }
+            if (findLocal(*fn_, ascii("this")) || fn_->isArrow) {
+                emit(Op::Dup);
+                storeThisBox();
+            }
             return;
         }
 
@@ -1905,23 +1985,106 @@ private:
     }
 
     // ---- classes ----
+    /// A new function, of the given statements, that runs with `this` the object they are about.
+    NodePtr initFunction(std::uint32_t line)
+    {
+        NodePtr fn = makeNode(NK::FunctionExpr, line);
+        fn->d = makeNode(NK::Block, line);
+        return fn;
+    }
+
+    /// What a field does to `this`, or for a private method, what makes it one of `this`'s.
+    void fieldInit(const Node& n)
+    {
+        emit(Op::PushThis);
+        if (n.propKind != PropKind::Init) {
+            loadVar(n.text);
+            loadVar(n.a->text);
+            if (n.propKind == PropKind::Method)
+                emit(Op::DefPrivateMethod);
+            else
+                emitU(Op::DefPrivateAccessor, n.propKind == PropKind::Setter ? 1u : 0u);
+            emit(Op::Pop);
+            return;
+        }
+        const auto value = [&](StringView name) {
+            if (!n.b)
+                emit(Op::PushUndefined);
+            else if ((n.b->kind == NK::FunctionExpr || n.b->kind == NK::ArrowExpr) && n.b->text.empty())
+                function(*n.b, name);
+            else
+                expr(*n.b);
+        };
+        if (n.isPrivate) {
+            loadVar(n.text);
+            value(n.text);
+            emit(Op::DefPrivate);
+        } else if (n.computed) {
+            loadVar(n.a->text);
+            value(ascii(""));
+            emit(Op::DefElem);
+        } else {
+            value(n.text);
+            emitU(Op::DefField, atomFor(n.text));
+        }
+        emit(Op::Pop);
+    }
+
+    void storeThisBox()
+    {
+        const VarRef ref = resolve(ascii("this"));
+        switch (ref.kind) {
+            case RefKind::Box: emitU(Op::SetCell, ref.index); break;
+            case RefKind::Upval: emitU(Op::SetUpval, ref.index); break;
+            default: emitU(Op::SetLocal, ref.index); break;
+        }
+    }
+
     void classExpr(const Node& n)
     {
         const StrictScope strictBody(*this, true);
         const bool derived = n.a != nullptr;
+        beginScope();
+
+        // The private names, each a variable of the class's scope that its methods capture as they do any other.
+        std::map<String, int> privateKinds;  // 1 getter, 2 setter, 4 anything else, 8 static
+        for (const NodePtr& m : n.list) {
+            if ((m->kind != NK::MethodDef && m->kind != NK::FieldDef) || !m->isPrivate)
+                continue;
+            const String& name = m->a->text;
+            if (name == ascii("#constructor"))
+                fail(m->line, "a private name cannot be #constructor");
+            const int kind = m->kind == NK::MethodDef && m->propKind == PropKind::Getter ? 1
+                             : m->kind == NK::MethodDef && m->propKind == PropKind::Setter ? 2 : 4;
+            const auto seen = privateKinds.find(name);
+            if (seen != privateKinds.end() && (kind == 4 || (seen->second & 7 & kind) || (seen->second & 4) || bool(seen->second & 8) != m->isStatic))
+                fail(m->line, "a private name is declared twice: " + toUtf8(name));
+            privateKinds[name] |= kind | (m->isStatic ? 8 : 0);
+        }
+        privateScopes_.push_back({});
+        for (const auto& entry : privateKinds) {
+            privateScopes_.back().insert(entry.first);
+            fn_->captured.insert(entry.first);
+            const std::uint32_t slot = declareLocal(entry.first, true);
+            emitU(Op::NewPrivateName, atomFor(entry.first));
+            emitU(fn_->locals.back().boxed ? Op::SetCell : Op::SetLocal, slot);
+        }
+
+        std::int64_t innerName = -1;
+        bool innerBoxed = false;
+        if (!n.text.empty()) {
+            innerName = declareLocal(n.text, true);
+            innerBoxed = fn_->locals.back().boxed;
+        }
+
         if (derived)
             expr(*n.a);
 
         const Node* ctorNode = nullptr;
-        std::vector<const Node*> fields;
         for (const NodePtr& m : n.list) {
             if (m->kind == NK::MethodDef && m->propKind == PropKind::Constructor)
                 ctorNode = m->b.get();
-            else if (m->kind == NK::FieldDef && !m->isStatic)
-                fields.push_back(m.get());
         }
-
-        // Field initialisers run at the top of the constructor, after super().
         NodePtr synthesized;
         Node* ctor = const_cast<Node*>(ctorNode);
         if (!ctor) {
@@ -1947,92 +2110,123 @@ private:
             }
             ctor = synthesized.get();
         }
-
-        std::vector<NodePtr> prologue;
-        for (const Node* f : fields) {
-            NodePtr member = makeNode(NK::Member, f->line);
-            member->a = makeNode(NK::ThisExpr, f->line);
-            if (f->computed) {
-                member->computed = true;
-                member->b = cloneExpression(*f->a);
-            } else {
-                member->text = f->a->text;
-            }
-            NodePtr assignNode = makeNode(NK::Assign, f->line);
-            assignNode->op = Tok::Assign;
-            assignNode->a = std::move(member);
-            if (f->b) {
-                assignNode->b = cloneExpression(*f->b);
-            } else {
-                assignNode->b = makeNode(NK::Identifier, f->line);
-                assignNode->b->text = ascii("undefined");
-            }
-            NodePtr es = makeNode(NK::ExprStatement, f->line);
-            es->a = std::move(assignNode);
-            prologue.push_back(std::move(es));
-        }
-        if (!prologue.empty()) {
-            // Field initialisers assign to `this`, so in a derived class they
-            // have to follow the super() call that sets it up.
-            auto& body = ctor->d->list;
-            std::size_t at = 0;
-            if (derived && !body.empty()) {
-                const Node& first = *body[0];
-                if (first.kind == NK::ExprStatement && first.a && first.a->kind == NK::Call &&
-                    first.a->a && first.a->a->kind == NK::SuperExpr)
-                    at = 1;
-            }
-            body.insert(body.begin() + std::ptrdiff_t(at),
-                        std::make_move_iterator(prologue.begin()),
-                        std::make_move_iterator(prologue.end()));
-        }
-
         ctor->propKind = PropKind::Constructor;
-        ctor->isStatic = derived;  // read back as isDerivedConstructor
+        ctor->isStatic = derived && !n.allocatesThis;  // read back as isDerivedConstructor
         function(*ctor, n.text.empty() ? ascii("") : n.text);
         ctor->isStatic = false;
         ctor->propKind = PropKind::Init;
 
-        emitU(Op::ClassSetup, derived ? 1u : 0u);
+        emitU(Op::ClassSetup, derived ? (n.allocatesThis ? 3u : 1u) : 0u);
 
+        // Methods go on as they are met, and a computed field name is worked out then, once, for every instance to come.
+        NodePtr instanceInit = initFunction(n.line);
+        std::vector<NodePtr> statics;
+        std::uint32_t hidden = 0;
+        const auto hiddenVar = [&](const String& name) {
+            fn_->captured.insert(name);
+            declareLocal(name, false);
+            return &fn_->locals.back();
+        };
         for (const NodePtr& m : n.list) {
-            if (m->kind == NK::FieldDef) {
-                if (!m->isStatic)
-                    continue;
-                emit(Op::Dup);
-                if (m->b)
-                    expr(*m->b);
-                else
-                    emit(Op::PushUndefined);
-                if (m->computed)
-                    fail(m->line, "computed static field names are not supported");
-                emitU(Op::DefField, atomFor(m->a->text));
-                emit(Op::Pop);
+            if (m->kind == NK::StaticBlock) {
+                NodePtr fn = initFunction(m->line);
+                for (const NodePtr& s : m->d->list)
+                    fn->d->list.push_back(cloneExpression(*s));
+                statics.push_back(std::move(fn));
                 continue;
             }
-            if (m->propKind == PropKind::Constructor)
+            if (m->kind == NK::FieldDef) {
+                if (m->declared)
+                    continue;
+                NodePtr init = makeNode(NK::FieldInit, m->line);
+                init->isPrivate = m->isPrivate;
+                init->computed = m->computed;
+                if (m->b)
+                    init->b = cloneExpression(*m->b);
+                if (m->computed) {
+                    const String name = ascii(" fk") + numberToString(double(hidden++));
+                    expr(*m->a);
+                    emit(Op::ToPropertyKey);
+                    const Local* local = hiddenVar(name);
+                    emitU(local->boxed ? Op::SetCell : Op::SetLocal, local->slot);
+                    init->a = makeNode(NK::Identifier, m->line);
+                    init->a->text = name;
+                } else {
+                    init->text = m->a->text;
+                }
+                if (m->isStatic) {
+                    NodePtr fn = initFunction(m->line);
+                    fn->d->list.push_back(std::move(init));
+                    statics.push_back(std::move(fn));
+                } else {
+                    instanceInit->d->list.push_back(std::move(init));
+                }
+                continue;
+            }
+            if (m->kind != NK::MethodDef || m->propKind == PropKind::Constructor || m->declared)
                 continue;
 
             emit(Op::Dup);
             if (!m->isStatic)
                 emitU(Op::GetProp, siteOperand(ascii("prototype")));
+            const bool getter = m->propKind == PropKind::Getter;
+            const bool setter = m->propKind == PropKind::Setter;
+            if (m->isPrivate) {
+                // A private method belongs to the instance, and a static one to the class, from the start of each.
+                const String& name = m->a->text;
+                function(*m->b, getter ? ascii("get ") + name : setter ? ascii("set ") + name : name);
+                emit(Op::SetHome);
+                const String holder = name + (getter ? ascii(" get") : setter ? ascii(" set") : ascii(" method"));
+                const Local* local = hiddenVar(holder);
+                emitU(local->boxed ? Op::SetCell : Op::SetLocal, local->slot);
+                NodePtr init = makeNode(NK::FieldInit, m->line);
+                init->propKind = getter ? PropKind::Getter : setter ? PropKind::Setter : PropKind::Method;
+                init->text = name;
+                init->a = makeNode(NK::Identifier, m->line);
+                init->a->text = holder;
+                if (m->isStatic) {
+                    // Ahead of the static fields: run where the class is finished.
+                    NodePtr fn = initFunction(m->line);
+                    fn->d->list.push_back(std::move(init));
+                    statics.insert(statics.begin(), std::move(fn));
+                } else {
+                    instanceInit->d->list.insert(instanceInit->d->list.begin(), std::move(init));
+                }
+                continue;
+            }
             if (m->computed) {
-                if (m->propKind != PropKind::Method)
-                    fail(m->line, "computed accessor names are not supported");
                 expr(*m->a);
                 emit(Op::ToPropertyKey);
                 function(*m->b, ascii(""));
-                emit(Op::DefMethodElem);
+                if (getter || setter)
+                    emitU(Op::DefAccessorElem, (setter ? 1u : 0u) | 2u);
+                else
+                    emit(Op::DefMethodElem);
+            } else if (getter || setter) {
+                expr(*m->a);
+                function(*m->b, (getter ? ascii("get ") : ascii("set ")) + m->a->text);
+                emitU(Op::DefAccessorElem, (setter ? 1u : 0u) | 2u);
             } else {
                 function(*m->b, m->a->text);
-                switch (m->propKind) {
-                    case PropKind::Getter: emitU(Op::DefGetter, atomFor(m->a->text)); break;
-                    case PropKind::Setter: emitU(Op::DefSetter, atomFor(m->a->text)); break;
-                    default: emitU(Op::DefMethod, atomFor(m->a->text)); break;
-                }
+                emitU(Op::DefMethod, atomFor(m->a->text));
             }
             emit(Op::Pop);
         }
+
+        if (!instanceInit->d->list.empty()) {
+            function(*instanceInit, ascii(""));
+            emit(Op::SetFieldInit);
+        }
+        if (innerName >= 0) {
+            emit(Op::Dup);
+            emitU(innerBoxed ? Op::SetCell : Op::SetLocal, std::uint32_t(innerName));
+        }
+        for (const NodePtr& fn : statics) {
+            function(*fn, ascii(""));
+            emit(Op::CallStaticInit);
+        }
+        privateScopes_.pop_back();
+        endScope();
     }
 
     /// Field initialisers are compiled into the constructor, so the nodes have
@@ -2048,6 +2242,11 @@ private:
         copy->isStatic = n.isStatic;
         copy->prefix = n.prefix;
         copy->optional = n.optional;
+        copy->namedExpr = n.namedExpr;
+        copy->isGenerator = n.isGenerator;
+        copy->isAsync = n.isAsync;
+        copy->isPrivate = n.isPrivate;
+        copy->declared = n.declared;
         copy->text = n.text;
         copy->number = n.number;
         copy->strs = n.strs;
@@ -2067,6 +2266,7 @@ private:
     Runtime& rt_;
     std::shared_ptr<const std::string> sourceName_;
     FnState* fn_ = nullptr;
+    std::vector<std::set<String>> privateScopes_;
     bool sloppyThis_ = false;
     int strictDepth_ = 0;  ///< how many enclosing scopes are strict: a directive, or a class body
 };

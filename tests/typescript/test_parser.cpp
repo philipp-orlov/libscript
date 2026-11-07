@@ -160,6 +160,5 @@ TEST(typeSyntaxErrorsAreReported)
     rejects("type = ;");
     rejects("enum { A }");
     rejects("interface A extends { }");
-    rejects("class D { #x = 1 }");
     rejects("type T = A extends B ? C : D;");
 }

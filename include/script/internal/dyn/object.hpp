@@ -25,6 +25,7 @@ struct SymbolCell : GCObject
 {
     String description;
     bool registered = false;  ///< created through Symbol.for, held by the registry
+    bool isPrivate = false;   ///< a class's `#x`: no reflection sees it, and only its own object has it
 
     SymbolCell() { kind = CellKind::Symbol; }
     ~SymbolCell() override;
@@ -554,6 +555,7 @@ struct DynFunction : DynObject
     std::shared_ptr<const FunctionCode> code;  ///< Bytecode
     Vec<Ref<Box>> upvalues;           ///< Bytecode
     Ref<DynObject> homeObject;                  ///< `super` lookups start here
+    Ref<DynFunction> fieldInit;                 ///< a class: what makes the fields of a new instance
 
     NativeFunction native;  ///< Native
 

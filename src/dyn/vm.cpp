@@ -380,8 +380,33 @@ DynObject* hostProtoOf(Runtime& rt, const Value& v)
     return rt.hostPrototypeFor(static_cast<NativeCell*>(cell)->slot.typeKey);
 }
 
+static inline bool isPrivateName(const GCObject* key) noexcept
+{
+    return key->kind == CellKind::Symbol && static_cast<const SymbolCell*>(key)->isPrivate;
+}
+
+/// Only the object's own, and to not have it is an error.
+static Prop* privateOf(Runtime& rt, const Value& base, GCObject* key, DynObject*& object)
+{
+    object = asObject(base);
+    Prop* p = object ? object->findOwn(key) : nullptr;
+    if (!p)
+        throwError(rt, ErrorCode::TypeError, "this object has no private member " + toUtf8(static_cast<SymbolCell*>(key)->description));
+    return p;
+}
+
 Value getProperty(Runtime& rt, const Value& base, GCObject* key)
 {
+    if (isPrivateName(key)) {
+        DynObject* object = nullptr;
+        Prop* p = privateOf(rt, base, key, object);
+        if (!object->accessorOf(*p))
+            return p->value;
+        const Value getter = p->value;
+        if (getter.isUndefined())
+            throwError(rt, ErrorCode::TypeError, "a private accessor has no getter");
+        return callValue(rt, getter, base, {});
+    }
     if (DynObject* proto = hostProtoOf(rt, base))
         return getPropertyOfObject(rt, proto, key, base);
     switch (base.type()) {
@@ -423,6 +448,21 @@ Value getProperty(Runtime& rt, const Value& base, GCObject* key)
 
 void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
 {
+    if (isPrivateName(key)) {
+        DynObject* object = nullptr;
+        Prop* p = privateOf(rt, base, key, object);
+        if (object->accessorOf(*p)) {
+            const Value setter = object->setterOf(*p);
+            if (setter.isUndefined())
+                throwError(rt, ErrorCode::TypeError, "a private accessor has no setter");
+            callValue(rt, setter, base, {v});
+            return;
+        }
+        if (!(object->attrsAt(std::size_t(p - object->props.data())) & PropWritable))
+            throwError(rt, ErrorCode::TypeError, "a private method cannot be assigned to");
+        p->value = v;
+        return;
+    }
     DynObject* obj = asObject(base);
     if (!obj) {
         if (base.isNullish())
@@ -772,7 +812,7 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
             continue;
         GCObject* const key = obj->keyAt(i);
         if (key->kind == CellKind::Symbol) {
-            if (includeSymbols)
+            if (includeSymbols && !static_cast<SymbolCell*>(key)->isPrivate)
                 keys.push_back(detail::Access::make(Type::Symbol, key));
             continue;
         }
@@ -1052,21 +1092,38 @@ Value callValue(Runtime& rt, const Value& callee, const Value& thisValue,
     return callInternal(rt, fn, thisValue, args, false, nullptr);
 }
 
-Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args)
+/// Whether `new` can be used on this.
+static bool isConstructor(Runtime& rt, DynFunction* fn)
+{
+    if (fn->fnKind == FnKind::Bound)
+        return isConstructor(rt, fn->boundTarget.get());
+    if (fn->isArrow || fn == rt.functionProto.get())
+        return false;
+    return !(fn->fnKind == FnKind::Bytecode && fn->code && (fn->code->isGenerator || fn->code->isAsync));
+}
+
+static void runFieldInit(Runtime& rt, DynFunction* ctor, const Value& self)
+{
+    if (ctor->fieldInit)
+        callInternal(rt, ctor->fieldInit.get(), self, {}, false, nullptr);
+}
+
+Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args, DynFunction* newTarget)
 {
     DynFunction* fn = asFunction(callee);
-    if (!fn)
-        throwError(rt, ErrorCode::TypeError, "value is not a constructor");
+    if (!fn || !isConstructor(rt, fn))
+        throwError(rt, ErrorCode::TypeError, (fn && !fn->name.empty() ? toUtf8(fn->name) : std::string("value")) + " is not a constructor");
+    if (!newTarget)
+        newTarget = fn;
     if (fn->fnKind == FnKind::Bound)
-        return constructValue(rt, detail::Access::make(Type::Object, fn->boundTarget.get()), args);
-    if (fn->isArrow)
-        throwError(rt, ErrorCode::TypeError, "an arrow function is not a constructor");
-    if (fn == rt.functionProto.get())
-        throwError(rt, ErrorCode::TypeError, "Function.prototype is not a constructor");
-    if (fn->fnKind == FnKind::Bytecode && fn->code && (fn->code->isGenerator || fn->code->isAsync))
-        throwError(rt, ErrorCode::TypeError, "a generator or async function is not a constructor");
+        return constructValue(rt, detail::Access::make(Type::Object, fn->boundTarget.get()), args,
+                              newTarget == fn ? fn->boundTarget.get() : newTarget);
+    // A derived class has no object until `super()` gives it one.
+    if (fn->isDerivedConstructor)
+        return callInternal(rt, fn, Value::undefined(), args, true, newTarget);
 
-    Value protoValue = getPropertyOfObject(rt, fn, rt.atom.prototype.get(), callee);
+    const Value target = detail::Access::make(Type::Object, newTarget);
+    Value protoValue = getPropertyOfObject(rt, newTarget, rt.atom.prototype.get(), target);
     DynObject* proto = asObject(protoValue);
     if (!proto)
         proto = rt.objectProto.get();
@@ -1074,9 +1131,17 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
     Shape* root = rt.rootShapeFor(proto);
     DynObject* self = rt.newObjectSized(proto, root ? std::min<std::uint32_t>(root->expect, 32) : 0);
     const Value thisValue = detail::Access::adopt(Type::Object, self);
+    runFieldInit(rt, fn, thisValue);
 
-    const Value result = callInternal(rt, fn, thisValue, args, true, fn);
-    return result.isObject() ? result : thisValue;
+    const Value result = callInternal(rt, fn, thisValue, args, true, newTarget);
+    if (!result.isObject())
+        return thisValue;
+    // A built-in makes its own kind of object, which a class extending it inherits from the class.
+    if (fn->fnKind == FnKind::Native && newTarget != fn) {
+        if (DynObject* made = asObject(result))
+            made->setProto(proto);
+    }
+    return result;
 }
 
 #if !SCRIPT_ENABLE_DYN_JIT
@@ -1408,6 +1473,19 @@ bool findHandler(Frame& frame, const Value& exception)
 }
 
 Value startCoroutine(Runtime& rt, Frame& frame, std::uint32_t pc);
+
+/// `super(...)`: the constructor above `ctor`, made to make `this`, which then gets `ctor`'s fields.
+Value superCall(Runtime& rt, DynFunction* ctor, DynFunction* newTarget, const std::vector<Value>& args, const Value& thisNow)
+{
+    DynObject* above = ctor->proto.get();
+    DynFunction* super = above ? asFunction(detail::Access::make(Type::Object, above)) : nullptr;
+    if (!super || !isConstructor(rt, super))
+        throwError(rt, ErrorCode::TypeError, "the super class is not a constructor");
+    Value made = constructValue(rt, detail::Access::make(Type::Object, super), args, newTarget);
+    if (!thisNow.isUndefined())
+        throwError(rt, ErrorCode::ReferenceError, "super() has already been called");
+    return made;
+}
 
 Value execute(Runtime& rt, Frame& frame)
 {
@@ -1951,6 +2029,7 @@ Value execute(Runtime& rt, Frame& frame)
                     }
                     case Op::ClassSetup: {
                         const bool hasSuper = operandAt(pc) != 0;
+                        const bool allocatesThis = operandAt(pc) == 3;
                         pc += 4;
                         Value ctorValue = pop();
                         Value superValue = Value::undefined();
@@ -1973,7 +2052,7 @@ Value execute(Runtime& rt, Frame& frame)
                         ctor->putOwn(rt.atom.prototype.get(), protoValue, 0);
                         ctor->homeObject.reset(proto);
                         ctor->isClassConstructor = true;
-                        ctor->isDerivedConstructor = hasSuper;
+                        ctor->isDerivedConstructor = hasSuper && !allocatesThis;
                         if (super)
                             ctor->setProto(super);
                         sp.push_back(std::move(ctorValue));
@@ -2006,22 +2085,134 @@ Value execute(Runtime& rt, Frame& frame)
                     case Op::CallSuper:
                     case Op::CallSuperSpread: {
                         ContextImpl::ArgBuffer buffer(rt.ctx);
-                        std::vector<Value>& args = buffer.args;
-                        popArgs(args, op == Op::CallSuperSpread);
-                        DynFunction* super = frame.fn->proto
-                                                ? asFunction(detail::Access::make(
-                                                      Type::Object, frame.fn->proto.get()))
-                                                : nullptr;
-                        // Inside an arrow function the running function is the arrow, whose prototype is
-                        // Function.prototype; `this` is not this frame's either. A class that extends null has no
-                        // constructor to call at all.
-                        if (frame.fn->isArrow)
-                            throwError(rt, ErrorCode::TypeError, "super() inside an arrow function is not supported");
-                        if (!super || super == rt.functionProto.get())
-                            throwError(rt, ErrorCode::TypeError,
-                                       "'super' is only valid in a derived constructor");
-                        callInternal(rt, super, frame.thisValue, args, true, super);
-                        sp.push_back(Value::undefined());
+                        popArgs(buffer.args, op == Op::CallSuperSpread);
+                        // `self` is there already, for the base's `__init__` to work on.
+                        if (!code.isDerivedConstructor) {
+                            DynFunction* base = frame.fn->proto ? asFunction(detail::Access::make(Type::Object, frame.fn->proto.get())) : nullptr;
+                            if (!base || base == rt.functionProto.get())
+                                throwError(rt, ErrorCode::TypeError, "the class has no base to call");
+                            callInternal(rt, base, frame.thisValue, buffer.args, true, base);
+                            sp.push_back(Value::undefined());
+                            break;
+                        }
+                        Value made = superCall(rt, frame.fn, frame.newTarget.get(), buffer.args, frame.thisValue);
+                        frame.thisValue = made;
+                        runFieldInit(rt, frame.fn, made);
+                        sp.push_back(std::move(made));
+                        break;
+                    }
+                    case Op::CallSuperVia:
+                    case Op::CallSuperViaSpread: {
+                        ContextImpl::ArgBuffer buffer(rt.ctx);
+                        popArgs(buffer.args, op == Op::CallSuperViaSpread);
+                        const Value thisNow = pop();
+                        const Value target = pop();
+                        const Value ctorValue = pop();
+                        DynFunction* ctor = asFunction(ctorValue);
+                        Value made = superCall(rt, ctor, asFunction(target), buffer.args, thisNow);
+                        runFieldInit(rt, ctor, made);
+                        sp.push_back(std::move(made));
+                        break;
+                    }
+                    case Op::CheckThis:
+                        if (sp.back().isUndefined())
+                            throwError(rt, ErrorCode::ReferenceError, "'this' is not there until super() has been called");
+                        break;
+                    case Op::DerivedReturn: {
+                        const Value self = pop();
+                        if (sp.back().isObject())
+                            break;
+                        if (!sp.back().isUndefined())
+                            throwError(rt, ErrorCode::TypeError, "a derived constructor can only return an object or undefined");
+                        if (self.isUndefined())
+                            throwError(rt, ErrorCode::ReferenceError, "a derived constructor did not call super()");
+                        sp.back() = self;
+                        break;
+                    }
+                    case Op::PushNewTarget:
+                        sp.push_back(frame.newTarget ? detail::Access::make(Type::Object, frame.newTarget.get()) : Value::undefined());
+                        break;
+                    case Op::NewPrivateName: {
+                        auto* name = rt.newCell<SymbolCell>();
+                        name->isPrivate = true;
+                        name->description = asString(detail::Access::make(Type::String, code.atoms[operandAt(pc)].get()))->text();
+                        pc += 4;
+                        sp.push_back(detail::Access::adopt(Type::Symbol, name));
+                        break;
+                    }
+                    case Op::PrivateIn: {
+                        const Value name = pop();
+                        const Value object = pop();
+                        DynObject* o = asObject(object);
+                        if (!o)
+                            throwError(rt, ErrorCode::TypeError, "the right of 'in' with a private name must be an object");
+                        sp.emplace_back(o->findOwn(detail::Access::ptr(name)) != nullptr);
+                        break;
+                    }
+                    case Op::DefPrivate:
+                    case Op::DefPrivateMethod: {
+                        const Value value = pop();
+                        const Value name = pop();
+                        DynObject* o = asObject(sp.back());
+                        GCObject* key = detail::Access::ptr(name);
+                        if (o->findOwn(key))
+                            throwError(rt, ErrorCode::TypeError, "this object has that private member already");
+                        o->putOwn(key, value, op == Op::DefPrivate ? std::uint8_t(PropWritable) : std::uint8_t(0));
+                        break;
+                    }
+                    case Op::DefPrivateAccessor: {
+                        const bool setter = operandAt(pc) != 0;
+                        pc += 4;
+                        const Value fn = pop();
+                        const Value name = pop();
+                        DynObject* o = asObject(sp.back());
+                        GCObject* key = detail::Access::ptr(name);
+                        Prop* existing = o->findOwn(key);
+                        if (!existing)
+                            existing = &o->putOwn(key, Value::undefined(), PropAccessor);
+                        if (setter)
+                            o->setSetter(*existing, fn);
+                        else
+                            existing->value = fn;
+                        break;
+                    }
+                    case Op::DefAccessorElem: {
+                        const std::uint32_t flags = operandAt(pc);
+                        pc += 4;
+                        const Value fn = pop();
+                        Ref<GCObject> key = toPropertyKey(rt, pop());
+                        DynObject* target = asObject(sp.back());
+                        if (DynFunction* m = asFunction(fn))
+                            m->homeObject.reset(target);
+                        Prop* existing = target->findOwn(key.get());
+                        if (!existing || !target->accessorOf(*existing))
+                            existing = &target->putOwn(key.get(), Value::undefined(),
+                                                       std::uint8_t((flags & 2 ? 0 : PropEnumerable) | PropConfigurable | PropAccessor));
+                        if (flags & 1)
+                            target->setSetter(*existing, fn);
+                        else
+                            existing->value = fn;
+                        break;
+                    }
+                    case Op::SetFieldInit: {
+                        const Value fn = pop();
+                        DynFunction* ctor = asFunction(sp.back());
+                        DynFunction* init = asFunction(fn);
+                        init->homeObject = ctor->homeObject;
+                        ctor->fieldInit.reset(init);
+                        break;
+                    }
+                    case Op::CallStaticInit: {
+                        const Value fn = pop();
+                        asFunction(fn)->homeObject.reset(asObject(sp.back()));
+                        const Value self = sp.back();
+                        callInternal(rt, asFunction(fn), self, {}, false, nullptr);
+                        break;
+                    }
+                    case Op::SetHome: {
+                        const Value fn = pop();
+                        asFunction(fn)->homeObject.reset(asObject(sp.back()));
+                        sp.back() = fn;
                         break;
                     }
                     case Op::Return:

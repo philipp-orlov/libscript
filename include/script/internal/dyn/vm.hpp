@@ -106,7 +106,8 @@ int compare(Runtime& rt, const Value& a, const Value& b);
 
 Value callValue(Runtime& rt, const Value& callee, const Value& thisValue,
                 const std::vector<Value>& args);
-Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args);
+/// `new callee(...args)`. `newTarget`, when given, is the function whose `prototype` the object inherits from.
+Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args, DynFunction* newTarget = nullptr);
 
 /// One callee called many times from C++ -- a built-in's callback. Once the callee has native code, each call goes
 /// straight into it, with what a native run needs set up once for the whole loop rather than once a call.

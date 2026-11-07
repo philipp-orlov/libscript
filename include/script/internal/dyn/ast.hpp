@@ -53,6 +53,9 @@ enum class NK : std::uint8_t
     Spread,        // a=argument
     Yield,         // a=argument (may be null)               prefix = `yield*`
     Await,         // a=argument
+    NewTarget,     //                                        `new.target`
+    StaticBlock,   // d=block
+    FieldInit,     // a=computed key or private name  b=value  text, computed, propKind: what a field or private method does to `this`
     Hole,          // elision in an array literal
 
     // ---- patterns ----------------------------------------------------------
@@ -164,6 +167,8 @@ struct Node
     bool exported = false;  ///< `export`, which only means anything in a namespace
     bool isAbstract = false;
     bool isParamProp = false;  ///< a constructor parameter that declares a field
+    bool allocatesThis = false;  ///< ClassExpr: Python's way, where `self` exists before the base's `__init__` runs
+    bool isPrivate = false;    ///< a member named `#x`; an Identifier that is such a name
     bool isGenerator = false;  ///< FunctionExpr: `function*`
     bool isAsync = false;      ///< FunctionExpr, ArrowExpr: `async`; ForOf: `for await`
 

@@ -202,6 +202,10 @@ int operandsOf(Op op) noexcept
         case Op::ForInNext:
         case Op::IterNext:
         case Op::IterCloseAt:
+        case Op::NewPrivateName:
+        case Op::DefPrivateAccessor:
+        case Op::DefAccessorElem:
+        case Op::CallSuperVia:
         case Op::Yield:
         case Op::DelegateCall:
         case Op::DelegateCheck:

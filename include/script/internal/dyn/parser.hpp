@@ -157,6 +157,7 @@ private:
         }
     };
     /// `async` followed by what makes it a modifier of a method rather than the method's name.
+    void privateMember(Node& member);
     bool asyncMethodAhead();
     bool asyncFunctionAhead();
     bool asyncArrowAhead();

@@ -326,7 +326,7 @@ std::string messageOf(const char* source)
     js::Context ctx;
     try {
         ctx.eval(source, "<test>");
-    } catch (const js::Exception& e) {
+    } catch (const std::exception& e) {
         return e.what();
     }
     return "<no exception>";
@@ -352,8 +352,9 @@ TEST(functionPrototypeIsCallableButNotAConstructor)
 TEST(superCallsWithNothingToCallAreErrors)
 {
     CHECK(messageOf("class C extends null { constructor() { super(); } } new C()").find("super") != std::string::npos);
-    CHECK(messageOf("class A {} class B extends A { constructor() { var f = () => super(); f(); } } new B()")
+    CHECK(messageOf("class A {} class B extends A { constructor() { var f = () => super(); f(); f(); } } new B()")
               .find("super") != std::string::npos);
+    CHECK(messageOf("class A {} class B extends A { constructor() { } } new B()").find("super") != std::string::npos);
 }
 
 TEST(aHugeArrayLengthIsARangeError)
@@ -1156,6 +1157,32 @@ TEST(callbacksOfArrayMethodsCalledFromNativeCode)
                  "bad + ' ' + last;\n"),
              std::string("0 [5,8,11]|[1,2]|[\"aa\",\"bb\"]|[1,\"u\",3]|[1,3]|[1,2]|[\"x\",{},[]]|16|s/103/213/323|{\"v\":3}|6|[3,6]|7|undefined|"
                          "[1,2][1,2]|[1,2][1,2,11,12]|3|[1,2,\"s\"]|1,n|3|1|e2|f|r|TypeError|TypeError|TypeError|2|[1,4]|40|273"));
+}
+
+TEST(classesAsTheLanguageHasThem)
+{
+    CHECK_EQ(run("var log = [];"
+                 "class A { #x = 1; y = 2; static s = 3; static #p = 4; #m() { return this.#x; } get #g() { return 10; } set #g(v) { this.#x = v; } static #sm() { return 5; }"
+                 " static get P() { return A.#p + A.#sm(); } t() { this.#g = 7; return [this.#x, this.#m(), this.#g, #x in this, #x in {}].join(); }"
+                 " ['comp' + 1] = 9; get ['acc']() { return 'A'; } static { log.push('block', this.s); } }"
+                 "log.push(new A().t(), A.P, JSON.stringify(new A()), new A().acc, Object.keys(new A()).join());"
+                 "try { A.prototype.t.call({}); } catch (e) { log.push(e.name); }"
+                 "class B extends A { constructor() { try { this; } catch (e) { log.push(e.name); } super(); this.z = 1; log.push(new.target === B); } }"
+                 "log.push(new B().z, new B().y);"
+                 "class Arr extends Array { sum() { return this.reduce(function (a, b) { return a + b; }, 0); } }"
+                 "var ar = new Arr(); ar.push(1, 2); log.push(ar.sum(), ar instanceof Arr, Array.isArray(ar), ar.length);"
+                 "class E1 extends Error { constructor(m) { super(m); this.k = 1; } } var e1 = new E1('hi'); log.push(e1.message, e1 instanceof E1, e1 instanceof Error);"
+                 "class C1 extends A { constructor() { var f = () => super(); f(); try { f(); } catch (e) { log.push(e.name); } } } log.push(new C1().y);"
+                 "class D1 extends A { constructor() { return { o: 1 }; } } log.push(new D1().o);"
+                 "class D2 extends A { constructor() { } } try { new D2(); } catch (e) { log.push(e.name); }"
+                 "class F1 { a = this; b = () => this; static x = this; } var f1 = new F1(); log.push(f1.a === f1, f1.b() === f1, F1.x === F1);"
+                 "function Old() { log.push(new.target === Old, new.target === undefined); } new Old(); Old();"
+                 "var o = { get ['x' + 1]() { return 1; }, set ['x' + 1](v) { } }; log.push(o.x1);"
+                 "log.join('|')"),
+             std::string("block|3|7,7,10,true,false|9|{\"y\":2,\"comp1\":9}|A|y,comp1|TypeError|ReferenceError|true|ReferenceError|true|1|2|3|true|true|2|hi|true|true|"
+                         "ReferenceError|2|1|ReferenceError|true|true|true|true|false|false|true|1"));
+    CHECK(messageOf("class A { m() { return this.#nope; } }").find("#nope") != std::string::npos);
+    CHECK(messageOf("class A { #x; #x; }").find("#x") != std::string::npos);
 }
 
 TEST(generatorsStopAndCarryOn)

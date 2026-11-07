@@ -255,8 +255,11 @@ void installObject(Runtime& rt)
             self->frozen = true;
             self->extensible = false;
             self->dropShape();
-            for (std::size_t i = 0; i < self->props.size(); ++i)
-                self->setAttrsAt(i, std::uint8_t(self->attrsAt(i) & ~(PropWritable | PropConfigurable)));
+            for (std::size_t i = 0; i < self->props.size(); ++i) {
+                GCObject* key = self->keyAt(i);
+                if (key->kind != CellKind::Symbol || !static_cast<SymbolCell*>(key)->isPrivate)
+                    self->setAttrsAt(i, std::uint8_t(self->attrsAt(i) & ~(PropWritable | PropConfigurable)));
+            }
         }
         return ci.arg(0);
     }, 1);

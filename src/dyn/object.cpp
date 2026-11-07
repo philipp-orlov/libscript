@@ -678,6 +678,8 @@ void DynFunction::children(GcList& out) const
     }
     if (homeObject)
         out.push_back(homeObject.get());
+    if (fieldInit)
+        out.push_back(fieldInit.get());
     if (boundTarget)
         out.push_back(boundTarget.get());
     if (GCObject* p = detail::Access::ptr(boundThis))
@@ -699,6 +701,7 @@ void DynFunction::clearReferences()
     DynObject::clearReferences();
     upvalues.clear();
     homeObject.reset();
+    fieldInit.reset();
     boundTarget.reset();
     boundThis = Value::undefined();
     boundArgs.clear();

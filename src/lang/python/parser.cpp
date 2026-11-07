@@ -970,6 +970,7 @@ void Parser::classDef(std::vector<NodePtr>& out)
 
     NodePtr cls = make(NK::ClassExpr, at);
     cls->text = name;
+    cls->allocatesThis = true;
     String baseName;
     if (eat(Tok::LParen)) {
         if (!is(Tok::RParen)) {

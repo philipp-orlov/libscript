@@ -382,6 +382,7 @@ struct FunctionCode
     bool isDerivedConstructor = false;
     bool isGenerator = false;
     bool isAsync = false;
+    bool isMethod = false;  ///< written as a method or accessor: `new` means nothing for it
 
     std::uint32_t numLocals = 0;
     std::uint32_t maxStack = 8;

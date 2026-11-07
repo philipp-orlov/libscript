@@ -818,6 +818,40 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
         }
         keys.push_back(detail::Access::make(Type::String, key));
     }
+    // Names that are array indexes come first, in order, whenever they were added.
+    if (obj->cls != ObjClass::Array) {
+        const auto indexOf = [](const Value& k, double& out) {
+            if (k.type() != Type::String)
+                return false;
+            const StringView text = static_cast<StringCell*>(detail::Access::ptr(k))->text();
+            if (text.empty() || text.size() > 10 || (text[0] == u'0' && text.size() > 1))
+                return false;
+            double n = 0;
+            for (const Char c : text) {
+                if (c < u'0' || c > u'9')
+                    return false;
+                n = n * 10 + double(c - u'0');
+            }
+            out = n;
+            return n < 4294967295.0;
+        };
+        std::vector<std::pair<double, Value>> numbered;
+        Vec<Value> named;
+        for (const Value& k : keys) {
+            double n = 0;
+            if (indexOf(k, n))
+                numbered.emplace_back(n, k);
+            else
+                named.push_back(k);
+        }
+        if (!numbered.empty()) {
+            std::stable_sort(numbered.begin(), numbered.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            keys.clear();
+            for (const auto& entry : numbered)
+                keys.push_back(entry.second);
+            keys.insert(keys.end(), named.begin(), named.end());
+        }
+    }
     return keys;
 }
 
@@ -1093,13 +1127,15 @@ Value callValue(Runtime& rt, const Value& callee, const Value& thisValue,
 }
 
 /// Whether `new` can be used on this.
-static bool isConstructor(Runtime& rt, DynFunction* fn)
+bool isConstructor(Runtime& rt, DynFunction* fn)
 {
     if (fn->fnKind == FnKind::Bound)
         return isConstructor(rt, fn->boundTarget.get());
     if (fn->isArrow || fn == rt.functionProto.get())
         return false;
-    return !(fn->fnKind == FnKind::Bytecode && fn->code && (fn->code->isGenerator || fn->code->isAsync));
+    if (fn->fnKind == FnKind::Native)
+        return fn->isNativeConstructor;
+    return !(fn->code && (fn->code->isGenerator || fn->code->isAsync || fn->code->isMethod));
 }
 
 static void runFieldInit(Runtime& rt, DynFunction* ctor, const Value& self)
@@ -1400,7 +1436,8 @@ void classSetupForNative(Runtime& rt, bool hasSuper, const Value& superValue, co
     ctor->putOwn(rt.atom.prototype.get(), protoValue, 0);
     ctor->homeObject.reset(proto);
     ctor->isClassConstructor = true;
-    ctor->isDerivedConstructor = hasSuper;
+    // What Python's classes are not: see `Node::allocatesThis`.
+    ctor->isDerivedConstructor = hasSuper && ctor->code && ctor->code->isDerivedConstructor;
     if (super)
         ctor->setProto(super);
 }
@@ -2456,14 +2493,12 @@ Value execute(Runtime& rt, Frame& frame)
                             pc = target;
                             break;
                         }
+                        // Only once nothing more can throw: what is thrown from here on is the generator's own.
+                        Value out = code.isAsync ? getProperty(rt, result, rt.atom.value.get()) : result;
                         frame.coroutine->delegating = true;
                         frame.pc = pc;
-                        if (code.isAsync) {
-                            frame.left = Frame::Left::Yielded;
-                            return getProperty(rt, result, rt.atom.value.get());
-                        }
-                        frame.left = Frame::Left::YieldedResult;
-                        return result;
+                        frame.left = code.isAsync ? Frame::Left::Yielded : Frame::Left::YieldedResult;
+                        return out;
                     }
                     case Op::DelegateDone: {
                         const std::uint32_t target = operandAt(pc);

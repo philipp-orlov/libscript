@@ -1533,7 +1533,10 @@ Value Context::function(std::string_view name, NativeFunction fn, int arity)
 {
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
-    return impl_->dyn().makeFunction(fromUtf8(name), std::move(fn), arity);
+    Value made = impl_->dyn().makeFunction(fromUtf8(name), std::move(fn), arity);
+    // What a host hands over may well be called with `new`.
+    internal::dyn::asFunction(made)->isNativeConstructor = true;
+    return made;
 #else
     (void)name;
     (void)fn;

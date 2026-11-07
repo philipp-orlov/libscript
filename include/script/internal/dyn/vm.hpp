@@ -106,6 +106,7 @@ int compare(Runtime& rt, const Value& a, const Value& b);
 
 Value callValue(Runtime& rt, const Value& callee, const Value& thisValue,
                 const std::vector<Value>& args);
+bool isConstructor(Runtime& rt, DynFunction* fn);
 /// `new callee(...args)`. `newTarget`, when given, is the function whose `prototype` the object inherits from.
 Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args, DynFunction* newTarget = nullptr);
 

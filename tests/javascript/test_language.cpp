@@ -552,7 +552,7 @@ TEST(smallMethodsRunInPlaceOfTheirCalls)
 TEST(globalsAreReadWhereTheyAreWhileNothingMovesThem)
 {
     // Native code reads and writes a global in place while the global object's table stays as it was compiled against.
-    CHECK_EQ(run("var g = 1, h = 0; function f() { h = h + g; return h; } for (var i = 0; i < 600; i++) f();"
+    CHECK_EQ(run("globalThis.g = 1, h = 0; function f() { h = h + g; return h; } for (var i = 0; i < 600; i++) f();"
                  " for (var j = 0; j < 300; j++) globalThis['extra' + j] = j; var a = f();"
                  " delete globalThis.extra5; var b = f(); g = 'x'; var c = f();"
                  " Object.defineProperty(globalThis, 'g', {get: function() { return 100; }, configurable: true}); var d = f();"
@@ -1156,7 +1156,7 @@ TEST(callbacksOfArrayMethodsCalledFromNativeCode)
                  "for (var k=0;k<400;k++){ var now; try { now=run(k); } catch(e){ now='threw '+e; } if(k&&now!==last) bad++; last=now; }\n"
                  "bad + ' ' + last;\n"),
              std::string("0 [5,8,11]|[1,2]|[\"aa\",\"bb\"]|[1,\"u\",3]|[1,3]|[1,2]|[\"x\",{},[]]|16|s/103/213/323|{\"v\":3}|6|[3,6]|7|undefined|"
-                         "[1,2][1,2]|[1,2][1,2,11,12]|3|[1,2,\"s\"]|1,n|3|1|e2|f|r|TypeError|TypeError|TypeError|2|[1,4]|40|273"));
+                         "[1,2][1,2]|[1,2][1,2,11,12]|3|[1,2,\"s\"]|1,n|3|1|e2|f|r|TypeError|TypeError|2|2|[1,4]|40|273"));
 }
 
 TEST(classesAsTheLanguageHasThem)
@@ -1232,6 +1232,19 @@ TEST(asyncFunctionsWaitAndComeBack)
     ctx.runJobs();
     const std::string all = ctx.eval("log.slice().sort().join()", "<t>.js", script::Language::JavaScript).toString();
     CHECK_EQ(all, std::string("1,4true,5,6,af2rj,no,sentS,sync"));
+}
+
+TEST(aDelegateOfAnAsyncGeneratorThatThrowsIsTheGeneratorsToCatch)
+{
+    script::Context ctx;
+    ctx.eval("var log = [];"
+             "var it = { [Symbol.asyncIterator]() { return this; }, next() { return { get value() { throw 'vt'; }, done: false }; } };"
+             "async function* g() { try { yield* it; } catch (e) { log.push('c' + e); yield 'after'; } }"
+             "var i = g(); i.next().then(function (r) { log.push(r.value); return i.next(); }).then(function (r) { log.push(r.done); });"
+             "async function* h() { yield* it; } h().next().catch(function (e) { log.push('rej' + e); });",
+             "<t>.js", script::Language::JavaScript);
+    ctx.runJobs();
+    CHECK_EQ(ctx.eval("log.slice().sort().join()", "<t>.js", script::Language::JavaScript).toString(), std::string("after,cvt,rejvt,true"));
 }
 
 TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)

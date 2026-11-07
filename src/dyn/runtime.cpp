@@ -479,6 +479,7 @@ DynFunction* Runtime::makeConstructor(const char* name, NativeFunction fn, int a
 {
     Value ctorValue = makeFunction(ascii(name), std::move(fn), arity);
     DynFunction* ctor = asFunction(ctorValue);
+    ctor->isNativeConstructor = true;
     ctor->putOwn(atom.prototype.get(), detail::Access::make(Type::Object, proto), 0);
     proto->putOwn(atom.constructor.get(), ctorValue, PropWritable | PropConfigurable);
     globalObject->putOwn(intern(name), ctorValue, PropWritable | PropConfigurable);
@@ -558,6 +559,7 @@ void Runtime::syncHostClasses()
                                                0);
                 DynFunction* ctor = asFunction(ctorValue);
                 ctor->isClassConstructor = true;
+                ctor->isNativeConstructor = true;
                 ctor->putOwn(atom.prototype.get(), detail::Access::make(Type::Object, proto), 0);
                 proto->putOwn(atom.constructor.get(), ctorValue, PropWritable | PropConfigurable);
                 binding.target.reset(ctor);

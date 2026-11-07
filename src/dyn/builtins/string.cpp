@@ -111,6 +111,19 @@ void installString(Runtime& rt)
         return rt2.str(out);
     }, 1);
 
+    rt.method(ctor, "raw", [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        const Value cooked = toObject(rt2, ci.arg(0));
+        const Value raw = toObject(rt2, getProperty(rt2, cooked, rt2.intern("raw")));
+        const double n = toNumber(rt2, getProperty(rt2, raw, rt2.atom.length.get()));
+        String out;
+        for (double i = 0; i < n; ++i) {
+            out += toStringValue(rt2, getProperty(rt2, raw, toPropertyKey(rt2, Value(i)).get()));
+            if (i + 1 < n && std::size_t(i) + 1 < ci.size())
+                out += toStringValue(rt2, ci.arg(std::size_t(i) + 1));
+        }
+        return rt2.str(out);
+    }, 1);
     rt.intrinsics[Runtime::StringFromCharCode].reset(detail::Access::ptr(ctor->findOwn(rt.intern("fromCharCode"))->value));
 
     rt.method(ctor, "fromCodePoint", [](CallInfo& ci) {

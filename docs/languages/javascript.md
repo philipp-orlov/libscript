@@ -1,6 +1,6 @@
 # JavaScript
 
-libscript's JavaScript is the part of ES2020 that people write by hand. This
+libscript's JavaScript is most of the language people write by hand. This
 page is the contract: if something is listed as supported it has a test in
 `tests/javascript/test_language.cpp` or `tests/javascript/test_builtins.cpp`.
 A JavaScript source is one the host names with a `.js`, `.mjs` or `.cjs`
@@ -90,6 +90,19 @@ through `Symbol.iterator`, and any object that implements it participates.
   the program itself produces is a `Double`.
 - **A `void` host function returns `undefined`,** and a missing argument to a
   host function reads as `undefined`.
+
+## What is not there yet
+
+Generators, async functions, async generators, `for await`, classes with private
+members, static blocks, computed accessors and `new.target`, tagged templates,
+`Reflect` and array-likes in `Array.prototype` are all there. These are not yet:
+regular expressions, `BigInt`, typed arrays, `Proxy`, iterator helpers, `with`,
+modules through `import()`, `Temporal`. `eval` and `new Function` stay out by
+design: the engine runs only what its host gives it.
+
+Functions that use generators or async, and derived class constructors, run in
+the interpreter. A `for-of` runs in native code only over a plain array, whose
+iterator has nothing to close.
 
 ## What is not JavaScript
 

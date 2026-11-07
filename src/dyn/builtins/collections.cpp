@@ -273,6 +273,83 @@ void installPromise(Runtime& rt)
         return promise;
     }, 1);
 
+    // `Promise.allSettled` and `Promise.any`: what each settles to says when all of it is known.
+    const auto gather = [](CallInfo& ci, int kind) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        Value promise = makePromise(rt2);
+        auto* target = static_cast<DynPromise*>(asObject(promise));
+        Vec<Value> items;
+        try {
+            items = iterableToVector(rt2, ci.arg(0));
+        } catch (Exception& e) {
+            rejectPromise(rt2, target, e.value());
+            return promise;
+        }
+        auto results = std::make_shared<std::vector<Value>>(items.size());
+        auto remaining = std::make_shared<std::size_t>(items.size());
+        const auto finish = [promise, results, kind](Runtime& rtc) {
+            auto* p = static_cast<DynPromise*>(asObject(promise));
+            if (kind == 0) {
+                resolvePromise(rtc, p, rtc.makeArray(*results));
+                return;
+            }
+            const Value error = constructValue(rtc, getProperty(rtc, detail::Access::make(Type::Object, rtc.globalObject.get()), rtc.intern("AggregateError")),
+                                               {rtc.makeArray(*results), rtc.str(ascii("all promises were rejected"))});
+            rejectPromise(rtc, p, error);
+        };
+        if (items.empty()) {
+            finish(rt2);
+            return promise;
+        }
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            const auto settle = [results, remaining, i, kind, finish](bool fulfilled) {
+                return [results, remaining, i, kind, finish, fulfilled](CallInfo& inner) -> Value {
+                    Runtime& rtc = rtOf(inner);
+                    if (kind == 0) {
+                        DynObject* entry = rtc.newObject(rtc.objectProto.get());
+                        Value entryValue = detail::Access::adopt(Type::Object, entry);
+                        entry->putOwn(rtc.intern("status"), rtc.str(ascii(fulfilled ? "fulfilled" : "rejected")));
+                        entry->putOwn(fulfilled ? rtc.atom.value.get() : rtc.intern("reason"), inner.arg(0));
+                        (*results)[i] = entryValue;
+                    } else {
+                        (*results)[i] = inner.arg(0);
+                    }
+                    if (--*remaining == 0)
+                        finish(rtc);
+                    return Value::undefined();
+                };
+            };
+            Value one = invokeMethod(rt2, detail::Access::make(Type::Object, rt2.promiseCtor.get()), rt2.intern("resolve"), {items[i]});
+            const Value onOk = kind == 0 ? rt2.makeFunction(ascii(""), settle(true), 1) : makeSettler(rt2, promise, false);
+            invokeMethod(rt2, one, rt2.atom.then.get(), {onOk, rt2.makeFunction(ascii(""), settle(false), 1)});
+        }
+        return promise;
+    };
+    rt.method(ctor, "allSettled", [gather](CallInfo& ci) { return gather(ci, 0); }, 1);
+    rt.method(ctor, "any", [gather](CallInfo& ci) { return gather(ci, 1); }, 1);
+    rt.method(ctor, "withResolvers", [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        Value promise = makePromise(rt2);
+        DynObject* out = rt2.newObject(rt2.objectProto.get());
+        Value result = detail::Access::adopt(Type::Object, out);
+        out->putOwn(rt2.intern("promise"), promise);
+        out->putOwn(rt2.intern("resolve"), makeSettler(rt2, promise, false));
+        out->putOwn(rt2.intern("reject"), makeSettler(rt2, promise, true));
+        return result;
+    }, 0);
+    rt.method(ctor, "try", [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        Value promise = makePromise(rt2);
+        auto* target = static_cast<DynPromise*>(asObject(promise));
+        try {
+            std::vector<Value> rest(ci.args().begin() + (ci.size() ? 1 : 0), ci.args().end());
+            resolvePromise(rt2, target, callValue(rt2, ci.arg(0), Value::undefined(), rest));
+        } catch (Exception& e) {
+            rejectPromise(rt2, target, e.value());
+        }
+        return promise;
+    }, 1);
+
     rt.method(ctor, "race", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         Value promise = makePromise(rt2);

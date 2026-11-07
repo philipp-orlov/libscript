@@ -547,6 +547,7 @@ struct DynFunction : DynObject
 {
     FnKind fnKind = FnKind::Native;
     bool isClassConstructor = false;
+    bool isNativeConstructor = false;  ///< a built-in `new` means something for
     bool isDerivedConstructor = false;
     bool isArrow = false;
     int arity = 0;

@@ -220,13 +220,45 @@ void installArray(Runtime& rt)
     const auto keepIntrinsic = [&rt, proto](Runtime::Intrinsic which, const char* name) {
         rt.intrinsics[which].reset(detail::Access::ptr(proto->findOwn(rt.intern(name))->value));
     };
-    rt.method(proto, "push", [](CallInfo& ci) {
+    // Every method works on anything with a length: on a copy of its elements as an array, which what changes the array
+    // writes back.
+    const auto arrayMethod = [&rt, proto](const char* name, bool mutates, auto fn, int arity = 0) {
+        rt.method(proto, name, [fn, mutates](CallInfo& ci) -> Value {
+            if (asArray(ci.thisValue()))
+                return fn(ci);
+            Runtime& rt2 = rtOf(ci);
+            if (ci.thisValue().isNullish())
+                ci.fail(ErrorCode::TypeError, "this method needs an object");
+            const Value object = toObject(rt2, ci.thisValue());
+            const double raw = toNumber(rt2, getProperty(rt2, object, rt2.atom.length.get()));
+            const double length = std::isnan(raw) || raw <= 0 ? 0 : std::floor(raw);
+            if (length > double(1u << 24))
+                ci.fail(ErrorCode::RangeError, "the array-like is too long");
+            DynArray* copy = rt2.newArray(std::size_t(length));
+            const Value copyValue = detail::Access::adopt(Type::Object, copy);
+            for (double i = 0; i < length; ++i)
+                copy->append(getProperty(rt2, ci.thisValue().type() == Type::String ? ci.thisValue() : object, toPropertyKey(rt2, Value(i)).get()));
+            const CallInfo inner = detail::Access::makeCallInfo(rt2.ctx.owner, &copyValue, &ci.args(), false);
+            CallInfo call = inner;
+            const Value result = fn(call);
+            if (mutates) {
+                for (std::size_t i = 0; i < copy->size(); ++i)
+                    setProperty(rt2, object, toPropertyKey(rt2, Value(double(i))).get(), copy->at(i));
+                for (double i = double(copy->size()); i < length; ++i)
+                    deleteProperty(rt2, object, toPropertyKey(rt2, Value(i)).get());
+                setProperty(rt2, object, rt2.atom.length.get(), Value(double(copy->size())));
+            }
+            return asObject(result) == copy ? object : result;
+        }, arity);
+    };
+
+    arrayMethod("push", true, [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
         a->appendAll(ci.args().data(), ci.args().size());
         return Value(double(a->size()));
     }, 1);
 
-    rt.method(proto, "pop", [](CallInfo& ci) {
+    arrayMethod("pop", true, [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
         if (a->empty())
             return Value::undefined();
@@ -238,7 +270,7 @@ void installArray(Runtime& rt)
     keepIntrinsic(Runtime::ArrayPush, "push");
     keepIntrinsic(Runtime::ArrayPop, "pop");
 
-    rt.method(proto, "shift", [](CallInfo& ci) {
+    arrayMethod("shift", true, [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
         if (a->empty())
             return Value::undefined();
@@ -248,13 +280,13 @@ void installArray(Runtime& rt)
         return v;
     }, 0);
 
-    rt.method(proto, "unshift", [](CallInfo& ci) {
+    arrayMethod("unshift", true, [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);
         a->insertRange(0, ci.args().data(), ci.args().size());
         return Value(double(a->size()));
     }, 1);
 
-    rt.method(proto, "splice", [](CallInfo& ci) {
+    arrayMethod("splice", true, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisMutableArray(ci);
         const std::size_t n = a->size();
@@ -277,7 +309,7 @@ void installArray(Runtime& rt)
         return rt2.makeArray(std::move(removed));
     }, 2);
 
-    rt.method(proto, "reverse", [](CallInfo& ci) {
+    arrayMethod("reverse", true, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         // One element or none: nothing is written, so a frozen array has nothing to object to.
         if (a->frozen && a->size() > 1)
@@ -286,7 +318,7 @@ void installArray(Runtime& rt)
         return ci.thisValue();
     }, 0);
 
-    rt.method(proto, "fill", [](CallInfo& ci) {
+    arrayMethod("fill", true, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisMutableArray(ci);
         const std::size_t n = a->size();
@@ -299,7 +331,7 @@ void installArray(Runtime& rt)
         return ci.thisValue();
     }, 1);
 
-    rt.method(proto, "sort", [](CallInfo& ci) {
+    arrayMethod("sort", true, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisMutableArray(ci);
         const Value comparator = ci.arg(0);
@@ -356,7 +388,7 @@ void installArray(Runtime& rt)
     }, 1);
 
     // ---- queries ----
-    rt.method(proto, "at", [](CallInfo& ci) {
+    arrayMethod("at", false, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
@@ -367,7 +399,7 @@ void installArray(Runtime& rt)
         return a->at(std::size_t(i));
     }, 1);
 
-    rt.method(proto, "slice", [](CallInfo& ci) {
+    arrayMethod("slice", false, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         const std::size_t n = a->size();
@@ -383,7 +415,7 @@ void installArray(Runtime& rt)
         return rt2.makeArray(std::move(out));
     }, 2);
 
-    rt.method(proto, "concat", [](CallInfo& ci) {
+    arrayMethod("concat", false, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* self = thisArray(ci);
         std::size_t total = self->size();
@@ -404,7 +436,7 @@ void installArray(Runtime& rt)
         return rt2.makeArray(std::move(out));
     }, 1);
 
-    rt.method(proto, "join", [](CallInfo& ci) {
+    arrayMethod("join", false, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         const String sep =
@@ -427,12 +459,12 @@ void installArray(Runtime& rt)
         return rt2.str(out);
     }, 1);
 
-    rt.method(proto, "toString", [](CallInfo& ci) {
+    arrayMethod("toString", false, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         return invokeMethod(rt2, ci.thisValue(), rt2.intern("join"), {});
     }, 0);
 
-    rt.method(proto, "indexOf", [](CallInfo& ci) {
+    arrayMethod("indexOf", false, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         for (std::size_t i = 0; i < a->size(); ++i) {
             if (strictEquals(a->at(i), ci.arg(0)))
@@ -441,7 +473,7 @@ void installArray(Runtime& rt)
         return Value(-1.0);
     }, 1);
 
-    rt.method(proto, "lastIndexOf", [](CallInfo& ci) {
+    arrayMethod("lastIndexOf", false, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         for (std::size_t i = a->size(); i-- > 0;) {
             if (strictEquals(a->at(i), ci.arg(0)))
@@ -450,7 +482,7 @@ void installArray(Runtime& rt)
         return Value(-1.0);
     }, 1);
 
-    rt.method(proto, "includes", [](CallInfo& ci) {
+    arrayMethod("includes", false, [](CallInfo& ci) {
         DynArray* a = thisArray(ci);
         for (std::size_t i = 0; i < a->size(); ++i) {
             if (sameValueZero(a->at(i), ci.arg(0)))
@@ -486,13 +518,13 @@ void installArray(Runtime& rt)
         return produced;
     };
 
-    rt.method(proto, "forEach", [each](CallInfo& ci) {
+    arrayMethod("forEach", false, [each](CallInfo& ci) {
         each(ci, [](std::size_t, const Value&, Value&) { return true; });
         return Value::undefined();
     }, 1);
 
     // What these make goes straight into the array they answer with.
-    rt.method(proto, "map", [each](CallInfo& ci) {
+    arrayMethod("map", false, [each](CallInfo& ci) {
         const std::size_t n = thisArray(ci)->size();
         DynArray* out = rtOf(ci).newArray(n);
         Value result = detail::Access::adopt(Type::Object, out);
@@ -506,7 +538,7 @@ void installArray(Runtime& rt)
         return result;
     }, 1);
 
-    rt.method(proto, "filter", [each](CallInfo& ci) {
+    arrayMethod("filter", false, [each](CallInfo& ci) {
         DynArray* out = rtOf(ci).newArray(0);
         Value result = detail::Access::adopt(Type::Object, out);
         each(ci, [out](std::size_t, const Value& item, Value& produced) {
@@ -517,7 +549,7 @@ void installArray(Runtime& rt)
         return result;
     }, 1);
 
-    rt.method(proto, "find", [each](CallInfo& ci) {
+    arrayMethod("find", false, [each](CallInfo& ci) {
         Value found = Value::undefined();
         each(ci, [&found](std::size_t, const Value& item, Value& produced) {
             if (!toBoolean(produced))
@@ -528,7 +560,7 @@ void installArray(Runtime& rt)
         return found;
     }, 1);
 
-    rt.method(proto, "findIndex", [each](CallInfo& ci) {
+    arrayMethod("findIndex", false, [each](CallInfo& ci) {
         double found = -1;
         each(ci, [&found](std::size_t i, const Value&, Value& produced) {
             if (!toBoolean(produced))
@@ -539,7 +571,7 @@ void installArray(Runtime& rt)
         return Value(found);
     }, 1);
 
-    rt.method(proto, "some", [each](CallInfo& ci) {
+    arrayMethod("some", false, [each](CallInfo& ci) {
         bool any = false;
         each(ci, [&any](std::size_t, const Value&, Value& produced) {
             any = toBoolean(produced);
@@ -548,7 +580,7 @@ void installArray(Runtime& rt)
         return Value(any);
     }, 1);
 
-    rt.method(proto, "every", [each](CallInfo& ci) {
+    arrayMethod("every", false, [each](CallInfo& ci) {
         bool all = true;
         each(ci, [&all](std::size_t, const Value&, Value& produced) {
             all = toBoolean(produced);
@@ -557,7 +589,7 @@ void installArray(Runtime& rt)
         return Value(all);
     }, 1);
 
-    rt.method(proto, "flat", [](CallInfo& ci) {
+    arrayMethod("flat", false, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         // `flat(Infinity)` is the usual spelling of "all the way"; converting an infinity to int is undefined, so the
         // depth is clamped as a number first.
@@ -586,7 +618,7 @@ void installArray(Runtime& rt)
         return rt2.makeArray(std::move(out));
     }, 1);
 
-    rt.method(proto, "flatMap", [](CallInfo& ci) {
+    arrayMethod("flatMap", false, [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         Vec<Value> out;
@@ -632,20 +664,92 @@ void installArray(Runtime& rt)
         }
         return args[0];
     };
-    rt.method(proto, "reduce", [reduce](CallInfo& ci) { return reduce(ci, false); }, 1);
-    rt.method(proto, "reduceRight", [reduce](CallInfo& ci) { return reduce(ci, true); }, 1);
+    arrayMethod("reduce", false, [reduce](CallInfo& ci) { return reduce(ci, false); }, 1);
+    arrayMethod("reduceRight", false, [reduce](CallInfo& ci) { return reduce(ci, true); }, 1);
     keepIntrinsic(Runtime::ArrayForEach, "forEach");
     keepIntrinsic(Runtime::ArrayMap, "map");
     keepIntrinsic(Runtime::ArrayFilter, "filter");
     keepIntrinsic(Runtime::ArrayReduce, "reduce");
 
+    arrayMethod("findLast", false, [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        DynArray* a = thisArray(ci);
+        if (!asFunction(ci.arg(0)))
+            ci.fail(ErrorCode::TypeError, "a callback function is required");
+        for (std::size_t i = a->size(); i-- > 0;) {
+            const Value item = i < a->size() ? a->at(i) : Value::undefined();
+            if (toBoolean(callValue(rt2, ci.arg(0), ci.arg(1), {item, Value(double(i)), ci.thisValue()})))
+                return item;
+        }
+        return Value::undefined();
+    }, 1);
+    arrayMethod("findLastIndex", false, [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        DynArray* a = thisArray(ci);
+        if (!asFunction(ci.arg(0)))
+            ci.fail(ErrorCode::TypeError, "a callback function is required");
+        for (std::size_t i = a->size(); i-- > 0;) {
+            const Value item = i < a->size() ? a->at(i) : Value::undefined();
+            if (toBoolean(callValue(rt2, ci.arg(0), ci.arg(1), {item, Value(double(i)), ci.thisValue()})))
+                return Value(double(i));
+        }
+        return Value(-1.0);
+    }, 1);
+    // What comes back from these is a new array: the same method is asked of a copy.
+    const auto copied = [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        DynArray* a = thisArray(ci);
+        std::vector<Value> items;
+        for (std::size_t i = 0; i < a->size(); ++i)
+            items.push_back(a->at(i));
+        return rt2.makeArray(items);
+    };
+    arrayMethod("toReversed", false, [copied](CallInfo& ci) -> Value {
+        const Value out = copied(ci);
+        return invokeMethod(rtOf(ci), out, rtOf(ci).intern("reverse"), {});
+    }, 0);
+    arrayMethod("toSorted", false, [copied](CallInfo& ci) -> Value {
+        if (!ci.arg(0).isUndefined() && !asFunction(ci.arg(0)))
+            ci.fail(ErrorCode::TypeError, "the comparator must be a function");
+        const Value out = copied(ci);
+        return invokeMethod(rtOf(ci), out, rtOf(ci).intern("sort"), {ci.arg(0)});
+    }, 1);
+    arrayMethod("toSpliced", false, [copied](CallInfo& ci) -> Value {
+        const Value out = copied(ci);
+        invokeMethod(rtOf(ci), out, rtOf(ci).intern("splice"), ci.args());
+        return out;
+    }, 2);
+    arrayMethod("with", false, [copied](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        const Value out = copied(ci);
+        DynArray* a = asArray(out);
+        std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
+        if (i < 0)
+            i += std::int64_t(a->size());
+        if (i < 0 || i >= std::int64_t(a->size()))
+            ci.fail(ErrorCode::RangeError, "the index is out of range");
+        a->put(std::size_t(i), ci.arg(1));
+        return out;
+    }, 2);
+    arrayMethod("copyWithin", true, [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        DynArray* a = thisMutableArray(ci);
+        const std::size_t n = a->size();
+        const auto to = std::size_t(clampIndex(toNumber(rt2, ci.arg(0)), n));
+        const auto from = std::size_t(clampIndex(toNumber(rt2, ci.arg(1)), n));
+        const auto end = ci.arg(2).isUndefined() ? n : std::size_t(clampIndex(toNumber(rt2, ci.arg(2)), n));
+        std::vector<Value> items;
+        for (std::size_t i = from; i < end; ++i)
+            items.push_back(a->at(i));
+        for (std::size_t i = 0; i < items.size() && to + i < n; ++i)
+            a->put(to + i, items[i]);
+        return ci.thisValue();
+    }, 2);
+
     // ---- iteration ----
-    rt.method(proto, "values",
-              [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 0); }, 0);
-    rt.method(proto, "keys",
-              [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 1); }, 0);
-    rt.method(proto, "entries",
-              [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 2); }, 0);
+    arrayMethod("values", false, [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 0); }, 0);
+    arrayMethod("keys", false, [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 1); }, 0);
+    arrayMethod("entries", false, [](CallInfo& ci) { return makeIndexIterator(rtOf(ci), ci.thisValue(), 2); }, 0);
     proto->putOwn(rt.sym.iterator.get(), proto->findOwn(rt.intern("values"))->value,
                   PropWritable | PropConfigurable);
     keepIntrinsic(Runtime::ArrayValues, "values");

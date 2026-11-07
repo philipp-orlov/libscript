@@ -614,6 +614,7 @@ private:
         const StrictScope strictBody(*this, node.d && hasUseStrict(*node.d));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
         fs.isMethod = node.isMethod || fs.code->isClassConstructor;
+        fs.code->isMethod = node.isMethod && !fs.code->isClassConstructor;
         std::vector<String> paramNames;
         if (earlyErrors()) {
             bool simple = true;

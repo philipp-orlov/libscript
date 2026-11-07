@@ -218,6 +218,9 @@ void installMath(Runtime& rt)
             return d;
         return d < 0 ? -1.0 : 1.0;
     });
+    unary("asinh", [](double d) { return std::asinh(d); });
+    unary("acosh", [](double d) { return std::acosh(d); });
+    unary("atanh", [](double d) { return std::atanh(d); });
     unary("fround", [](double d) { return double(float(d)); });
     unary("round", [](double d) { return numberRound(d); });
 
@@ -228,6 +231,16 @@ void installMath(Runtime& rt)
     rt.method(math, "atan2", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         return Value(std::atan2(toNumber(rt2, ci.arg(0)), toNumber(rt2, ci.arg(1))));
+    }, 2);
+    rt.method(math, "clz32", [](CallInfo& ci) {
+        const std::uint32_t v = std::uint32_t(toInt32(toNumber(rtOf(ci), ci.arg(0))));
+        return Value(v ? double(__builtin_clz(v)) : 32.0);
+    }, 1);
+    rt.method(math, "imul", [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        const std::uint32_t a = std::uint32_t(toInt32(toNumber(rt2, ci.arg(0))));
+        const std::uint32_t b = std::uint32_t(toInt32(toNumber(rt2, ci.arg(1))));
+        return Value(double(std::int32_t(a * b)));
     }, 2);
     rt.method(math, "hypot", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);

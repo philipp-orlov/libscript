@@ -463,6 +463,30 @@ void installErrors(Runtime& rt)
     define("EvalError", ErrorCode::EvalError, base.first, base.second);
     define("URIError", ErrorCode::UriError, base.first, base.second);
     define("InternalError", ErrorCode::InternalError, base.first, base.second);
+
+    {
+        DynObject* proto = rt.newObject(base.first);
+        Value protoValue = detail::Access::adopt(Type::Object, proto);
+        rt.constant(proto, "name", rt.str("AggregateError"));
+        rt.constant(proto, "message", rt.str(""));
+        DynFunction* ctor = rt.makeConstructor("AggregateError", [protoValue](CallInfo& ci) -> Value {
+            Runtime& rt2 = rtOf(ci);
+            Value self = ci.thisValue();
+            DynObject* obj = asObject(self);
+            if (!ci.isConstructorCall() || !obj || obj == rt2.globalObject.get()) {
+                obj = rt2.newObject(asObject(protoValue));
+                self = detail::Access::adopt(Type::Object, obj);
+            }
+            obj->cls = ObjClass::Error;
+            if (!ci.arg(1).isUndefined())
+                obj->putOwn(rt2.atom.message.get(), rt2.str(toStringValue(rt2, ci.arg(1))), PropWritable | PropConfigurable);
+            const Vec<Value> errors = iterableToVector(rt2, ci.arg(0));
+            obj->putOwn(rt2.intern("errors"), rt2.makeArray(std::vector<Value>(errors.begin(), errors.end())), PropWritable | PropConfigurable);
+            obj->putOwn(rt2.atom.stack.get(), rt2.str(fromUtf8(rt2.captureStack())), PropWritable | PropConfigurable);
+            return self;
+        }, 2, proto);
+        ctor->setProto(base.second);
+    }
 }
 
 void installGlobals(Runtime& rt)
@@ -525,6 +549,7 @@ void installBuiltins(Runtime& rt)
     installMathJson(rt);
     installCollections(rt);
     installGenerators(rt);
+    installReflection(rt);
 }
 
 }  // namespace dyn

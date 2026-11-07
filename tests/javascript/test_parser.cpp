@@ -83,7 +83,6 @@ TEST(syntaxErrorsAreReported)
     rejects("const x");
     rejects("try { }");
     rejects("/(/g");
-    rejects("1n");
 }
 
 TEST(errorMessagesCarryPositions)

@@ -11,6 +11,7 @@
 #include <limits>
 #include <random>
 
+#include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
@@ -59,7 +60,11 @@ void installNumber(Runtime& rt)
 
     DynFunction* ctor = rt.makeConstructor("Number", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
-        const double n = ci.size() ? toNumber(rt2, ci.arg(0)) : 0;
+        double n = 0;
+        if (ci.size()) {
+            const Value primitive = toPrimitive(rt2, ci.arg(0), 1);
+            n = primitive.isBigInt() ? bigint::toDouble(bigint::cellOf(primitive)) : toNumber(rt2, primitive);
+        }
         if (!ci.isConstructorCall())
             return Value(n);
         return toObject(rt2, Value(n));
@@ -651,6 +656,8 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
                     const String& current, String& out, JsonPath& path)
 {
     switch (v.type()) {
+        case Type::BigInt:
+            throwError(rt, ErrorCode::TypeError, "a BigInt has no JSON form");
         case Type::Undefined:
         case Type::Symbol:
             return false;
@@ -845,6 +852,72 @@ void installMathJson(Runtime& rt)
             return Value::undefined();
         return rt2.str(out);
     }, 3);
+}
+
+void installBigInt(Runtime& rt)
+{
+    DynObject* proto = rt.newObject(rt.objectProto.get());
+    rt.bigintProto.reset(proto, true);
+    DynFunction* ctor = rt.makeConstructor("BigInt", [](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        if (ci.isConstructorCall())
+            ci.fail(ErrorCode::TypeError, "BigInt is not a constructor");
+        const Value primitive = toPrimitive(rt2, ci.arg(0), 1);
+        if (primitive.isNumber()) {
+            const double d = numberOf(primitive);
+            if (!std::isfinite(d) || d != std::trunc(d))
+                ci.fail(ErrorCode::RangeError, "a number that is not an integer cannot be a BigInt");
+            return bigint::fromDouble(rt2, d);
+        }
+        return toBigInt(rt2, primitive);
+    }, 1, proto);
+
+    const auto toIndex = [](Runtime& rt2, const Value& v) -> std::uint64_t {
+        const double d = v.isUndefined() ? 0 : toNumber(rt2, v);
+        const double whole = std::isnan(d) ? 0 : std::trunc(d);
+        if (whole < 0 || whole > 9007199254740991.0)
+            throwError(rt2, ErrorCode::RangeError, "bits must be an index");
+        return std::uint64_t(whole);
+    };
+    rt.method(ctor, "asIntN", [toIndex](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        const std::uint64_t bits = toIndex(rt2, ci.arg(0));
+        const Value value = toBigInt(rt2, ci.arg(1));
+        return bigint::asIntN(rt2, bits, bigint::cellOf(value), true);
+    }, 2);
+    rt.method(ctor, "asUintN", [toIndex](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        const std::uint64_t bits = toIndex(rt2, ci.arg(0));
+        const Value value = toBigInt(rt2, ci.arg(1));
+        return bigint::asIntN(rt2, bits, bigint::cellOf(value), false);
+    }, 2);
+
+    const auto thisBigInt = [](CallInfo& ci) -> Value {
+        const Value self = ci.thisValue();
+        if (self.isBigInt())
+            return self;
+        DynObject* o = asObject(self);
+        if (o && o->cls == ObjClass::BigIntObject)
+            return static_cast<DynWrapper*>(o)->primitive;
+        ci.fail(ErrorCode::TypeError, "not a BigInt");
+    };
+    rt.method(proto, "toString", [thisBigInt](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        const Value self = thisBigInt(ci);
+        double radix = 10;
+        if (!ci.arg(0).isUndefined()) {
+            radix = toNumber(rt2, ci.arg(0));
+            radix = std::isnan(radix) ? 0 : std::trunc(radix);
+            if (radix < 2 || radix > 36)
+                ci.fail(ErrorCode::RangeError, "radix must be between 2 and 36");
+        }
+        return rt2.str(bigint::toString(bigint::cellOf(self), int(radix)));
+    }, 0);
+    rt.method(proto, "toLocaleString", [thisBigInt](CallInfo& ci) -> Value {
+        return rtOf(ci).str(bigint::toString(bigint::cellOf(thisBigInt(ci))));
+    }, 0);
+    rt.method(proto, "valueOf", [thisBigInt](CallInfo& ci) -> Value { return thisBigInt(ci); }, 0);
+    proto->putOwn(rt.sym.toStringTag.get(), rt.str("BigInt"), PropConfigurable);
 }
 
 }  // namespace dyn

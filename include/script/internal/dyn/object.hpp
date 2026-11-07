@@ -43,6 +43,15 @@ enum PropAttr : std::uint8_t
     PropDefault = PropWritable | PropEnumerable | PropConfigurable,
 };
 
+struct BigIntCell : GCObject
+{
+    bool negative = false;
+    Vec<std::uint32_t> digits;  ///< little end first, with no zeros at the top: zero has none
+
+    BigIntCell() { kind = CellKind::BigInt; }
+    std::size_t heapSize() const override { return sizeof(*this) + digits.capacity() * sizeof(std::uint32_t); }
+};
+
 /// One own property. `key` is either an interned StringCell or a SymbolCell, so
 /// key comparison is pointer comparison.
 /// A reference that counts only while what it points at is not pinned: the names of properties and the prototypes of many
@@ -219,6 +228,7 @@ enum class ObjClass : std::uint8_t
     Generator,
     RegExp,
     RegExpStringIterator,
+    BigIntObject,
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.

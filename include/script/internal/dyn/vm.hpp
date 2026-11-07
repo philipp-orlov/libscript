@@ -69,6 +69,8 @@ const char* typeOfName(const Value& v) noexcept;
 Value toPrimitive(Runtime& rt, const Value& v, int hint);  ///< 0 default, 1 number, 2 string
 double toNumber(Runtime& rt, const Value& v);
 String toStringValue(Runtime& rt, const Value& v);
+/// ToBigInt.
+Value toBigInt(Runtime& rt, const Value& v);
 std::int32_t toInt32(double d) noexcept;
 std::uint32_t toUint32(double d) noexcept;
 std::int64_t toIntegerOrInfinity(double d) noexcept;

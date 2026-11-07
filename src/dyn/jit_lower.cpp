@@ -1611,6 +1611,45 @@ private:
         }
     }
 
+    /// Without that guess the conversions below make a number of whatever comes, and a bigint, or an object that may turn
+    /// into one, is not a number: the interpreter takes those.
+    void leaveOnBigInt(Op op)
+    {
+        switch (op) {
+            case Op::Sub:
+            case Op::Mul:
+            case Op::Div:
+            case Op::Mod:
+            case Op::BitAnd:
+            case Op::BitOr:
+            case Op::BitXor:
+            case Op::Shl:
+            case Op::Shr:
+            case Op::UShr:
+            case Op::Pow:
+            case Op::Neg:
+            case Op::BitNot:
+            case Op::Inc:
+            case Op::Dec:
+            case Op::ToNumber: break;
+            default: return;
+        }
+        const std::size_t n = (op == Op::Neg || op == Op::BitNot || op == Op::Inc || op == Op::Dec || op == Op::ToNumber) ? 1 : 2;
+        if (stack_.size() < n)
+            return;
+        std::int32_t bail = -1;
+        for (std::size_t i = 0; i < n; ++i) {
+            const Entry& e = top(i);
+            if (e.rep != Rep::Tagged || (e.hasKnownTag && e.known == Type::Double) || (e.isConst && e.known < Type::BigInt))
+                continue;
+            if (bail < 0)
+                bail = newLabel();
+            branchCmp(e.isConst ? immReg(std::int64_t(e.known)) : e.t, IrCond::Hs, std::int64_t(Type::BigInt), bail);
+        }
+        if (bail >= 0)
+            emitBail(bail, {});
+    }
+
     /// Bails to `bail` unless `base` is an object of `shape`, which is known from then on.
     void expectShape(const Entry& base, const Shape* shape, std::int32_t bail)
     {
@@ -1791,6 +1830,8 @@ private:
             fallsIn = true;
             if (betHere())
                 expectNumbers(op);
+            else
+                leaveOnBigInt(op);
             // A comparison of numbers followed by a branch on it fuses.
             const bool comparison = op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge || op == Op::StrictEq ||
                                     op == Op::StrictNe || op == Op::Eq || op == Op::Ne;
@@ -2169,6 +2210,8 @@ private:
                 return immReg(reinterpret_cast<const StringCell*>(e.bits)->length != 0 ? 1 : 0);
             if (e.known == Type::Bool)
                 return immReg(e.bits != 0 ? 1 : 0);
+            if (e.known == Type::BigInt)
+                return immReg(reinterpret_cast<const BigIntCell*>(e.bits)->digits.empty() ? 0 : 1);
             return immReg(e.known >= Type::Symbol ? 1 : 0);
         }
         if (e.rep == Rep::Tagged && e.hasKnownTag && e.known == Type::Bool)

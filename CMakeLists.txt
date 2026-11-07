@@ -171,6 +171,7 @@ set(SCRIPT_DYNAMIC_SOURCES
     src/dyn/builtins/generators.cpp
     src/dyn/builtins/reflection.cpp
     src/dyn/builtins/regexp.cpp
+    src/dyn/bigint.cpp
     src/dyn/regexp.cpp
     src/dyn/unicode.cpp
     src/lang/ecmascript/lexer.cpp

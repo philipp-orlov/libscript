@@ -268,7 +268,7 @@ void Runtime::releaseRoots() noexcept
                               &stringProto, &numberProto, &booleanProto, &symbolProto,
                               &errorProto, &dateProto, &mapProto, &setProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
                               &asyncGeneratorProto, &asyncGeneratorFunctionProto,
-                              &iteratorProto, &arrayIteratorProto, &regExpProto, &regExpStringIteratorProto})
+                              &iteratorProto, &arrayIteratorProto, &regExpProto, &regExpStringIteratorProto, &bigintProto})
         p->reset();
     atom = Atoms{};
     sym = Symbols{};

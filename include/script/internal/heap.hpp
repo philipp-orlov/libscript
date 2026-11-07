@@ -41,6 +41,7 @@ enum class CellKind : std::uint8_t
     Builder,     ///< System.Text.StringBuilder
     Native,      ///< a C++ object exposed through `Class<T>`, readable by both engines
 
+    BigInt,      ///< a JavaScript bigint
     Symbol,      ///< a JavaScript symbol
     Object,      ///< any JavaScript object: plain, array, function, error, ...
 };

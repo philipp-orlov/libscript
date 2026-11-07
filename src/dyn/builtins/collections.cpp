@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
@@ -410,6 +411,8 @@ String inspectValue(Runtime& rt, const Value& v, int depth)
         case Type::String:
             return depth == 0 ? String(asString(v)->text())
                               : ascii("'") + String(asString(v)->text()) + ascii("'");
+        case Type::BigInt:
+            return bigint::toString(bigint::cellOf(v)) + ascii("n");
         case Type::Symbol:
             return ascii("Symbol(") + asSymbol(v)->description + ascii(")");
         default:

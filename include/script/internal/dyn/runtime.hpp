@@ -167,7 +167,7 @@ struct Runtime : EngineRuntime
     Ref<DynObject> objectProto, functionProto, arrayProto, stringProto, numberProto, booleanProto,
         symbolProto, errorProto, dateProto, mapProto, setProto, promiseProto, iteratorProto, generatorProto, generatorFunctionProto, asyncFunctionProto,
         asyncIteratorProto, asyncGeneratorProto, asyncGeneratorFunctionProto,
-        arrayIteratorProto, regExpProto, regExpStringIteratorProto;
+        arrayIteratorProto, regExpProto, regExpStringIteratorProto, bigintProto;
     /// See builtins/regexp.cpp.
     std::shared_ptr<struct RegExpState> regexp;
     Ref<DynFunction> objectCtor, arrayCtor, functionCtor, promiseCtor;

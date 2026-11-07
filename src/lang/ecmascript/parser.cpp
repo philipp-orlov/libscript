@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "script/internal/dyn/parser.hpp"
+#include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/regexp.hpp"
 #include "script/internal/stack_guard.hpp"
@@ -24,6 +25,7 @@ bool operandJustEnded(Tok t) noexcept
     switch (t) {
         case Tok::Identifier:
         case Tok::Number:
+        case Tok::BigIntLit:
         case Tok::StringLit:
         case Tok::Template:
         case Tok::Regex:
@@ -349,6 +351,8 @@ String Parser::propertyName()
         String name = cur_.text;
         if (cur_.type == Tok::Number)
             name = numberToString(cur_.number);
+        else if (cur_.type == Tok::BigIntLit)
+            name = bigint::literalToDecimal(cur_.text);
         advance();
         return name;
     }
@@ -2283,6 +2287,12 @@ NodePtr Parser::primary()
         }
         case Tok::StringLit: {
             NodePtr n = makeNode(NK::StringLit, line);
+            n->text = cur_.text;
+            advance();
+            return n;
+        }
+        case Tok::BigIntLit: {
+            NodePtr n = makeNode(NK::BigIntLit, line);
             n->text = cur_.text;
             advance();
             return n;

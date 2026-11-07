@@ -54,6 +54,7 @@ enum class NK : std::uint8_t
     Yield,         // a=argument (may be null)               prefix = `yield*`
     Await,         // a=argument
     NewTarget,     //                                        `new.target`
+    BigIntLit,     //                                        text = the digits, with any 0x, 0o or 0b
     RegExpLit,     //                                        text = pattern, strs[0] = flags
     TemplateObject,//                                        strs = cooked, raws: the first argument of a tagged template
     StaticBlock,   // d=block

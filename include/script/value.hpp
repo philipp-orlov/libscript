@@ -69,6 +69,7 @@ enum class Type : std::uint8_t
     Double,  ///< every JavaScript number
     // --- everything below is a heap reference ---
     String,
+    BigInt,    ///< a JavaScript bigint
     Symbol,
     Object,    ///< a class instance, or any JavaScript object (arrays and functions included)
     Array,     ///< a C# array
@@ -175,6 +176,7 @@ public:
     bool isDouble() const noexcept { return tag_ == Type::Double; }
     bool isNumber() const noexcept { return tag_ >= Type::Int && tag_ <= Type::Double; }
     bool isString() const noexcept { return tag_ == Type::String; }
+    bool isBigInt() const noexcept { return tag_ == Type::BigInt; }
     bool isSymbol() const noexcept { return tag_ == Type::Symbol; }
     bool isObject() const noexcept { return tag_ == Type::Object; }
     bool isReference() const noexcept { return tag_ >= Type::String; }

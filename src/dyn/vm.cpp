@@ -13,6 +13,7 @@
 #include "script/internal/dyn/jit.hpp"
 #endif
 #include "script/internal/dyn/jit_helpers.hpp"
+#include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/stack_guard.hpp"
@@ -144,9 +145,46 @@ const char* typeOfName(const Value& v) noexcept
         case Type::Float:
         case Type::Double: return "number";
         case Type::String: return "string";
+        case Type::BigInt: return "bigint";
         case Type::Symbol: return "symbol";
         default: return asFunction(v) ? "function" : "object";
     }
+}
+
+Value toBigInt(Runtime& rt, const Value& v)
+{
+    const Value primitive = toPrimitive(rt, v, 1);
+    switch (primitive.type()) {
+        case Type::BigInt: return primitive;
+        case Type::Bool: return bigint::fromInt64(rt, boolOf(primitive) ? 1 : 0);
+        case Type::String: {
+            Value parsed;
+            if (!bigint::parseString(rt, asString(primitive)->text(), parsed))
+                throwError(rt, ErrorCode::SyntaxError, "cannot convert the string to a BigInt");
+            return parsed;
+        }
+        default:
+            throwError(rt, ErrorCode::TypeError, "cannot convert the value to a BigInt");
+    }
+}
+
+/// Arithmetic with a bigint on either side: both must be, or it is an error.
+Value numericSlow(Runtime& rt, bigint::BinaryOp op, const Value& a, const Value& b)
+{
+    if (!a.isBigInt() || !b.isBigInt())
+        throwError(rt, ErrorCode::TypeError, "cannot mix BigInt and other types");
+    return bigint::binary(rt, op, bigint::cellOf(a), bigint::cellOf(b));
+}
+
+/// ToNumeric: a number or a bigint.
+Value toNumeric(Runtime& rt, const Value& v)
+{
+    if (v.isNumber() || v.isBigInt())
+        return v;
+    const Value primitive = toPrimitive(rt, v, 1);
+    if (primitive.isBigInt())
+        return primitive;
+    return Value(toNumber(rt, primitive));
 }
 
 bool toBoolean(const Value& v) noexcept
@@ -167,6 +205,8 @@ bool toBoolean(const Value& v) noexcept
         }
         case Type::String:
             return !asString(v)->text().empty();
+        case Type::BigInt:
+            return !static_cast<BigIntCell*>(detail::Access::ptr(v))->digits.empty();
         default:
             return true;
     }
@@ -219,6 +259,8 @@ double toNumber(Runtime& rt, const Value& v)
             return numberOf(v);
         case Type::String:
             return stringToNumber(asString(v)->text());
+        case Type::BigInt:
+            throwError(rt, ErrorCode::TypeError, "cannot convert a BigInt to a number");
         case Type::Symbol:
             throwError(rt, ErrorCode::TypeError, "cannot convert a symbol to a number");
         default:
@@ -243,6 +285,8 @@ String toStringValue(Runtime& rt, const Value& v)
             return numberToString(numberOf(v));
         case Type::String:
             return String(asString(v)->text());
+        case Type::BigInt:
+            return bigint::toString(bigint::cellOf(v));
         case Type::Symbol:
             throwError(rt, ErrorCode::TypeError, "cannot convert a symbol to a string");
         default:
@@ -293,6 +337,7 @@ Value toObject(Runtime& rt, const Value& v)
         case Type::Char:
         case Type::Double: proto = rt.numberProto.get(); cls = ObjClass::NumberObject; break;
         case Type::Bool: proto = rt.booleanProto.get(); cls = ObjClass::BooleanObject; break;
+        case Type::BigInt: proto = rt.bigintProto.get(); cls = ObjClass::BigIntObject; break;
         case Type::Symbol: proto = rt.symbolProto.get(); cls = ObjClass::SymbolObject; break;
         default: break;
     }
@@ -439,6 +484,8 @@ Value getProperty(Runtime& rt, const Value& base, GCObject* key)
             return getPropertyOfObject(rt, rt.numberProto.get(), key, base);
         case Type::Bool:
             return getPropertyOfObject(rt, rt.booleanProto.get(), key, base);
+        case Type::BigInt:
+            return getPropertyOfObject(rt, rt.bigintProto.get(), key, base);
         case Type::Symbol:
             return getPropertyOfObject(rt, rt.symbolProto.get(), key, base);
         default:
@@ -900,6 +947,8 @@ Value add(Runtime& rt, const Value& a, const Value& b)
             return rt.ctx.concat(asString(pa)->text(), asString(pb)->text());
         return rt.str(toStringValue(rt, pa) + toStringValue(rt, pb));
     }
+    if (pa.isBigInt() || pb.isBigInt())
+        return numericSlow(rt, bigint::BinaryOp::Add, pa, pb);
     return Value(toNumber(rt, pa) + toNumber(rt, pb));
 }
 
@@ -913,6 +962,26 @@ int compare(Runtime& rt, const Value& a, const Value& b)
         if (x < y)
             return -1;
         return x == y ? 0 : 1;
+    }
+    if (pa.isBigInt() || pb.isBigInt()) {
+        if (pa.isBigInt() && pb.isBigInt())
+            return bigint::compare(bigint::cellOf(pa), bigint::cellOf(pb));
+        if (pa.isBigInt() && pb.isString()) {
+            Value parsed;
+            if (!bigint::parseString(rt, asString(pb)->text(), parsed))
+                return 2;
+            return bigint::compare(bigint::cellOf(pa), bigint::cellOf(parsed));
+        }
+        if (pa.isString()) {
+            Value parsed;
+            if (!bigint::parseString(rt, asString(pa)->text(), parsed))
+                return 2;
+            return bigint::compare(bigint::cellOf(parsed), bigint::cellOf(pb));
+        }
+        if (pa.isBigInt())
+            return bigint::compareDouble(bigint::cellOf(pa), toNumber(rt, pb));
+        const int order = bigint::compareDouble(bigint::cellOf(pb), toNumber(rt, pa));
+        return order == 2 ? 2 : -order;
     }
     const double x = toNumber(rt, pa);
     const double y = toNumber(rt, pb);
@@ -935,6 +1004,16 @@ bool looseEquals(Runtime& rt, const Value& a, const Value& b)
         return numberOf(a) == stringToNumber(asString(b)->text());
     if (a.isString() && b.isNumber())
         return stringToNumber(asString(a)->text()) == numberOf(b);
+    if (a.isBigInt() && b.isNumber())
+        return bigint::compareDouble(bigint::cellOf(a), numberOf(b)) == 0;
+    if (a.isNumber() && b.isBigInt())
+        return bigint::compareDouble(bigint::cellOf(b), numberOf(a)) == 0;
+    if (a.isBigInt() && b.isString()) {
+        Value parsed;
+        return bigint::parseString(rt, asString(b)->text(), parsed) && bigint::equal(bigint::cellOf(a), bigint::cellOf(parsed));
+    }
+    if (a.isString() && b.isBigInt())
+        return looseEquals(rt, b, a);
     if (a.isBool())
         return looseEquals(rt, Value(boolOf(a) ? 1.0 : 0.0), b);
     if (b.isBool())
@@ -1585,7 +1664,7 @@ Value execute(Runtime& rt, Frame& frame)
         return index < arr->size();
     };
     /// Pop two operands, convert both to numbers left to right, push `f(a, b)`.
-    auto numeric = [&](auto f) {
+    auto numeric = [&](bigint::BinaryOp big, auto f) {
         {
             const std::size_t n = sp.size();
             Value& fa = sp[n - 2];
@@ -1599,9 +1678,13 @@ Value execute(Runtime& rt, Frame& frame)
         }
         Value b = pop();
         Value a = pop();
-        const double x = toNumber(rt, a);
-        const double y = toNumber(rt, b);
-        sp.emplace_back(f(x, y));
+        const Value x = toNumeric(rt, a);
+        const Value y = toNumeric(rt, b);
+        if (x.isBigInt() || y.isBigInt()) {
+            sp.push_back(numericSlow(rt, big, x, y));
+            return;
+        }
+        sp.emplace_back(f(numberOf(x), numberOf(y)));
     };
 
     for (;;) {
@@ -2573,16 +2656,16 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::Sub:
-                        numeric([](double a, double b) { return a - b; });
+                        numeric(bigint::BinaryOp::Sub, [](double a, double b) { return a - b; });
                         break;
                     case Op::Mul:
-                        numeric([](double a, double b) { return a * b; });
+                        numeric(bigint::BinaryOp::Mul, [](double a, double b) { return a * b; });
                         break;
                     case Op::Div:
-                        numeric([](double a, double b) { return a / b; });
+                        numeric(bigint::BinaryOp::Div, [](double a, double b) { return a / b; });
                         break;
                     case Op::Mod:
-                        numeric([](double a, double b) {
+                        numeric(bigint::BinaryOp::Mod, [](double a, double b) {
                             if (a > 0 && b > 0 && a <= 2147483647.0 && b <= 2147483647.0) {
                                 const std::int32_t ia = std::int32_t(a), ib = std::int32_t(b);
                                 if (double(ia) == a && double(ib) == b)
@@ -2592,14 +2675,21 @@ Value execute(Runtime& rt, Frame& frame)
                         });
                         break;
                     case Op::Pow:
-                        numeric([](double a, double b) { return numberPow(a, b); });
+                        numeric(bigint::BinaryOp::Pow, [](double a, double b) { return numberPow(a, b); });
                         break;
-                    case Op::Neg:
-                        sp.back() = Value(-toNumber(rt, sp.back()));
+                    case Op::Neg: {
+                        const Value operand = toNumeric(rt, sp.back());
+                        if (operand.isBigInt())
+                            sp.back() = bigint::negate(rt, bigint::cellOf(operand));
+                        else
+                            sp.back() = Value(-numberOf(operand));
                         break;
+                    }
                     case Op::Pos:
-                    case Op::ToNumber:
                         sp.back() = Value(toNumber(rt, sp.back()));
+                        break;
+                    case Op::ToNumber:  // ToNumeric: what `x++` starts with
+                        sp.back() = toNumeric(rt, sp.back());
                         break;
                     case Op::ToString:
                         sp.back() = rt.str(toStringValue(rt, sp.back()));
@@ -2615,41 +2705,54 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::Inc:
-                        sp.back() = Value(toNumber(rt, sp.back()) + 1);
+                    case Op::Dec: {
+                        const Value operand = toNumeric(rt, sp.back());
+                        if (operand.isBigInt())
+                            sp.back() = bigint::increment(rt, bigint::cellOf(operand), op == Op::Inc ? 1 : -1);
+                        else
+                            sp.back() = Value(numberOf(operand) + (op == Op::Inc ? 1 : -1));
                         break;
-                    case Op::Dec:
-                        sp.back() = Value(toNumber(rt, sp.back()) - 1);
-                        break;
+                    }
                     case Op::Void:
                         sp.back() = Value::undefined();
                         break;
                     case Op::BitAnd:
-                        numeric([](double a, double b) { return double(toInt32(a) & toInt32(b)); });
+                        numeric(bigint::BinaryOp::And, [](double a, double b) { return double(toInt32(a) & toInt32(b)); });
                         break;
                     case Op::BitOr:
-                        numeric([](double a, double b) { return double(toInt32(a) | toInt32(b)); });
+                        numeric(bigint::BinaryOp::Or, [](double a, double b) { return double(toInt32(a) | toInt32(b)); });
                         break;
                     case Op::BitXor:
-                        numeric([](double a, double b) { return double(toInt32(a) ^ toInt32(b)); });
+                        numeric(bigint::BinaryOp::Xor, [](double a, double b) { return double(toInt32(a) ^ toInt32(b)); });
                         break;
-                    case Op::BitNot:
-                        sp.back() = Value(double(~toInt32(toNumber(rt, sp.back()))));
+                    case Op::BitNot: {
+                        const Value operand = toNumeric(rt, sp.back());
+                        if (operand.isBigInt())
+                            sp.back() = bigint::bitNot(rt, bigint::cellOf(operand));
+                        else
+                            sp.back() = Value(double(~toInt32(numberOf(operand))));
                         break;
+                    }
                     case Op::Shl:
-                        numeric([](double a, double b) {
+                        numeric(bigint::BinaryOp::Shl, [](double a, double b) {
                             return double(std::int32_t(toUint32(a) << (toUint32(b) & 31)));
                         });
                         break;
                     case Op::Shr:
-                        numeric([](double a, double b) {
+                        numeric(bigint::BinaryOp::Shr, [](double a, double b) {
                             return double(toInt32(a) >> (toUint32(b) & 31));
                         });
                         break;
-                    case Op::UShr:
-                        numeric([](double a, double b) {
-                            return double(toUint32(a) >> (toUint32(b) & 31));
-                        });
+                    case Op::UShr: {
+                        const Value right = pop();
+                        const Value left = pop();
+                        const Value x = toNumeric(rt, left);
+                        const Value y = toNumeric(rt, right);
+                        if (x.isBigInt() || y.isBigInt())
+                            throwError(rt, ErrorCode::TypeError, "BigInts have no unsigned right shift");
+                        sp.emplace_back(double(toUint32(numberOf(x)) >> (toUint32(numberOf(y)) & 31)));
                         break;
+                    }
                     case Op::Eq: {
                         Value b = pop();
                         Value a = pop();

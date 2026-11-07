@@ -104,6 +104,7 @@ const char* toString(Type type) noexcept
         case Type::Float: return "float";
         case Type::Double: return "double";
         case Type::String: return "string";
+        case Type::BigInt: return "bigint";
         case Type::Symbol: return "symbol";
         case Type::Object: return "object";
         case Type::Array: return "array";

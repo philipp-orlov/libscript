@@ -560,6 +560,7 @@ void installBuiltins(Runtime& rt)
     installGenerators(rt);
     installReflection(rt);
     installRegExp(rt);
+    installBigInt(rt);
 }
 
 }  // namespace dyn

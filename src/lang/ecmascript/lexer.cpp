@@ -470,8 +470,21 @@ Token Lexer::readNumber()
         t.number = base::parseDouble(text).value;
     }
 
-    if (peek() == 'n')
-        fail("BigInt literals are not supported");
+    if (peek() == 'n') {
+        std::string text;
+        for (std::size_t i = start; i < pos_; ++i) {
+            if (src_[i] == '.' || src_[i] == 'e' || src_[i] == 'E')
+                if (!(src_[start] == '0' && (src_[start + 1] == 'x' || src_[start + 1] == 'X')))
+                    fail("a BigInt literal is a whole number");
+            if (src_[i] != '_')
+                text.push_back(src_[i]);
+        }
+        if (text.size() > 1 && text[0] == '0' && isDigit(text[1]))
+            fail("a BigInt literal has no leading zero");
+        ++pos_;
+        t.type = Tok::BigIntLit;
+        t.text = fromUtf8(text);
+    }
     if (isIdStart(static_cast<unsigned char>(peek())))
         fail("identifier immediately after a number");
     return t;

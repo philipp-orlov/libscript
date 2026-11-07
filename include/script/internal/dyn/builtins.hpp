@@ -24,6 +24,7 @@ void installCollections(Runtime& rt);  // Map, Set, Promise, console
 void installReflection(Runtime& rt);   // descriptors, the rest of Object, Reflect
 void installGenerators(Runtime& rt);   // generator and async function objects, async iteration
 void installRegExp(Runtime& rt);       // RegExp and the String methods that use it
+void installBigInt(Runtime& rt);       // BigInt
 
 /// A regular expression literal: a checked pattern made once into an object, which each evaluation copies.
 Value makeRegExpTemplate(Runtime& rt, StringView pattern, StringView flags);

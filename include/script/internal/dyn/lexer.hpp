@@ -24,6 +24,7 @@ enum class Tok : std::uint8_t
     Number,
     StringLit,
     Template,  // a whole `...${...}...` literal, pre-split
+    BigIntLit, // text = the digits, with any 0x, 0o or 0b
     Regex,     // recognised so the error can say so
 
     // punctuation

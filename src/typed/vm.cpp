@@ -1520,7 +1520,7 @@ Value runFrame(Runtime& rt, Frame& frame)
                 // counter is a single decrement on the hot path.
                 if (++ticks >= 4096) {
                     ticks = 0;
-                    if (rt.ctx.interrupt && rt.ctx.interrupt())
+                    if (rt.ctx.interruptAsked())
                         throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
                     rt.maybeCollect();
                 }

@@ -29,7 +29,7 @@ constexpr std::uint32_t kInterruptInterval = 4096;
 void checkLongLoopSlow(Runtime& rt, std::size_t tempBytes)
 {
     rt.ctx.reserve(tempBytes);
-    if (rt.ctx.interrupt && rt.ctx.interrupt())
+    if (rt.ctx.interruptAsked())
         throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
 }
 
@@ -1081,6 +1081,11 @@ Value CallbackLoop::operator()(const Value& thisValue, std::initializer_list<Val
 {
     return slow(thisValue, args);
 }
+
+Value CallbackLoop::ofTwoNumbers(double a, double b)
+{
+    return (*this)(Value::undefined(), {Value(a), Value(b)});
+}
 #endif
 
 Value invokeMethod(Runtime& rt, const Value& object, GCObject* name,
@@ -1442,7 +1447,7 @@ Value execute(Runtime& rt, Frame& frame)
                 frame.pc = pc;
                 if (++ticks >= kInterruptInterval) {
                     ticks = 0;
-                    if (rt.ctx.interrupt && rt.ctx.interrupt())
+                    if (rt.ctx.interruptAsked())
                         throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
                     // A loop that only grows containers it already owns never
                     // reaches cell allocation, so budgets are checked here too.

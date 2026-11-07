@@ -114,7 +114,7 @@ extern "C" int scriptJitPoll(Runtime* rt) noexcept
     }
     rt->ctx.interruptCountdown = kPollInterval - 1;
     try {
-        if (!rt->ctx.interrupt())
+        if (!rt->ctx.interruptAsked())
             return 0;
     } catch (...) {
         // A handler that threw is treated as a request to stop: letting the

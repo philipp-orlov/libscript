@@ -224,6 +224,16 @@ struct ContextImpl
     EngineKind lastEngine = EngineKind::None;
 
     std::function<bool()> interrupt;
+    /// Whether the handler says to stop. So does its having come into the context for anything but a look: running code has
+    /// what it knows about its objects in registers, and cannot go on from a change made under it.
+    bool interruptAsked()
+    {
+        if (!interrupt)
+            return false;
+        const std::uint64_t entries = hostEntries;
+        const bool stop = interrupt();
+        return stop || hostEntries != entries;
+    }
     std::function<void(std::string_view, bool)> print;
     std::function<bool(std::string&)> readLine;
     std::function<void(const Value&)> unhandledRejection;

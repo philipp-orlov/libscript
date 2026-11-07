@@ -137,6 +137,7 @@ using detail::GcList;
 struct StringCell : GCObject
 {
     bool interned = false;  ///< also present in the context's string table
+    bool inSource = false;  ///< a name some compiled program spells out; there are only as many of those as the source has
     std::uint32_t length;
     std::size_t hash_ = 0;  ///< 0 until someone asks
 

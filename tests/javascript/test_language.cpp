@@ -849,6 +849,36 @@ TEST(whatALoopStoresInItsColdPathsCounts)
              std::string("2999"));
 }
 
+TEST(parseIntOfANumberIsWhatItsTextWouldGive)
+{
+    CHECK_EQ(run("parseInt(3.9) + ',' + parseInt(-3.9) + ',' + parseInt(0) + ',' + (1 / parseInt(-0))"), std::string("3,-3,0,Infinity"));
+    CHECK_EQ(run("1 / parseInt(-0.5)"), std::string("-Infinity"));
+    // Below a millionth and from 1e21 up the text has an exponent, and stops at it.
+    CHECK_EQ(run("parseInt(0.0000005) + ',' + parseInt(1e21) + ',' + parseInt(-1.5e300)"), std::string("5,1,-1"));
+    CHECK_EQ(run("parseInt(1e20) + ',' + parseInt(9007199254740993)"), std::string("100000000000000000000,9007199254740992"));
+    CHECK_EQ(run("String(parseInt(NaN)) + ',' + parseInt(Infinity) + ',' + parseInt(10, 2) + ',' + parseInt(15.9, 8)"), std::string("NaN,NaN,2,13"));
+}
+
+TEST(aProgramMayHaveAnyNumberOfWaysToGrowAnObject)
+{
+    // More classes with statics, and literals starting differently, than a shape's limit for names worked out at run time.
+    std::string source = "var all = [], lits = [];";
+    for (int i = 0; i < 200; ++i) {
+        const std::string n = std::to_string(i);
+        source += "function C" + n + "() {} C" + n + ".first" + n + " = " + n + "; C" + n + ".common = " + n + "; all.push(C" + n + ");";
+        source += "lits.push({ a" + n + ": " + n + ", b: 1 });";
+    }
+    source += "function read(c) { return c.common; } function lit(o) { return o.b; }"
+              "var s = 0; for (var r = 0; r < 200; r++) for (var i = 0; i < 200; i++) s += read(all[i]) + lit(lits[i]);"
+              "s + ',' + C7.first7 + ',' + C199.first199 + ',' + lits[150].a150 + ',' + Object.keys(C3).join();";
+    CHECK_EQ(run(source.c_str()), std::string("4020000,7,199,150,first3,common"));
+    // Keys worked out at run time still make dictionaries that behave.
+    CHECK_EQ(run("var ds = []; for (var i = 0; i < 500; i++) { var d = {}; d['k' + i] = i; d.common = 1; ds.push(d); }"
+                 "var s = 0; for (var i = 0; i < 500; i++) { s += ds[i]['k' + i] + ds[i].common; delete ds[i].common; }"
+                 "s + ',' + ds[9].common + ',' + Object.keys(ds[499]).join()"),
+             std::string("125250,undefined,k499"));
+}
+
 TEST(aCheckWithAWayRoundItProvesNothingAfterwards)
 {
     // Read as a string the long way, then read again: the second is not to take it for an array.

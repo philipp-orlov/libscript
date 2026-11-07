@@ -75,6 +75,48 @@ std::int32_t Shape::indexOf(const GCObject* k) const
     }
 }
 
+Shape* Shape::after(const GCObject* k, std::uint8_t a) const noexcept
+{
+    if (transitionIndex_.empty()) {
+        for (const Transition& t : transitions) {
+            if (t.key == k && t.attrs == a)
+                return t.to;
+        }
+        return nullptr;
+    }
+    const std::size_t mask = transitionIndex_.size() - 1;
+    for (std::size_t slot = hashPointer(k) & mask;; slot = (slot + 1) & mask) {
+        const std::uint32_t packed = transitionIndex_[slot];
+        if (!packed)
+            return nullptr;
+        const Transition& t = transitions[packed - 1];
+        if (t.key == k && t.attrs == a)
+            return t.to;
+    }
+}
+
+void Shape::addTransition(GCObject* k, std::uint8_t a, Shape* to)
+{
+    constexpr std::size_t kScanUpTo = 16;
+    transitions.push_back({k, a, to});
+    if (transitions.size() <= kScanUpTo)
+        return;
+    const auto insert = [this](std::uint32_t at) {
+        const std::size_t mask = transitionIndex_.size() - 1;
+        std::size_t slot = hashPointer(transitions[at].key) & mask;
+        while (transitionIndex_[slot])
+            slot = (slot + 1) & mask;
+        transitionIndex_[slot] = at + 1;
+    };
+    if (transitionIndex_.size() < transitions.size() * 2) {
+        transitionIndex_.assign(tableSizeFor(transitions.size() * 4), 0);
+        for (std::uint32_t i = 0; i < transitions.size(); ++i)
+            insert(i);
+    } else {
+        insert(std::uint32_t(transitions.size() - 1));
+    }
+}
+
 Prop* DynObject::findOwn(GCObject* key) noexcept
 {
     if (shape) {

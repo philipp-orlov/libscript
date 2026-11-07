@@ -304,11 +304,10 @@ Shape* Runtime::rootShapeFor(DynObject* proto)
 
 Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
 {
-    for (const Shape::Transition& t : from->transitions) {
-        if (t.key == key && t.attrs == attrs)
-            return t.to;
-    }
-    if (from->count >= Shape::kMaxProperties || from->transitions.size() >= Shape::kMaxTransitions ||
+    if (Shape* known = from->after(key, attrs))
+        return known;
+    const bool named = key->kind == CellKind::String && static_cast<StringCell*>(key)->inSource;
+    if (from->count >= Shape::kMaxProperties || (!named && from->transitions.size() >= Shape::kMaxTransitions) ||
         shapes.size() >= kMaxShapes)
         return nullptr;
     shapes.push_back(std::make_unique<Shape>());
@@ -322,7 +321,7 @@ Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
     next->root = from->root;
     next->parent = from;
     next->root->expect = std::max(next->root->expect, next->count);
-    from->transitions.push_back({key, attrs, next});
+    from->addTransition(key, attrs, next);
     return next;
 }
 

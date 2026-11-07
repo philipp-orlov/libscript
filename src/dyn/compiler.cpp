@@ -359,7 +359,12 @@ private:
         atoms.emplace_back(key);
         return std::uint32_t(atoms.size() - 1);
     }
-    std::uint32_t atomFor(StringView name) { return atomIndex(rt_.intern(name)); }
+    std::uint32_t atomFor(StringView name)
+    {
+        StringCell* key = rt_.intern(name);
+        key->inSource = true;
+        return atomIndex(key);
+    }
     /// The operand of an instruction with an inline cache.
     std::uint32_t siteOperand(StringView name)
     {

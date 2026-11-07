@@ -226,6 +226,9 @@ enum class ObjClass : std::uint8_t
 struct Shape
 {
     static constexpr std::uint32_t kMaxProperties = 128;
+    /// How many different properties may follow a shape when they are names worked out at run time. An object used as a
+    /// dictionary stops there, and has no shape. Names in the source have no such limit: a program has only so many,
+    /// and a large one has more than this many classes with a static member, or literals starting differently.
     static constexpr std::size_t kMaxTransitions = 32;
 
     Ref<GCObject> key;  ///< the property this one added, null for a root
@@ -267,8 +270,13 @@ struct Shape
         Shape* to;
     };
     Vec<Transition> transitions;
+    /// The shape that adding `k` with `attrs` leads to, if one was made already.
+    Shape* after(const GCObject* k, std::uint8_t attrs) const noexcept;
+    void addTransition(GCObject* k, std::uint8_t attrs, Shape* to);
 
 private:
+    /// Past a few transitions, key to place plus one, as `lookup_` is for properties.
+    Vec<std::uint32_t> transitionIndex_;
     /// What `entries` and `indexOf` keep, for the few shapes they are asked about. The lookup is the same table as an
     /// object's own index: key to place plus one.
     mutable Vec<Entry> table_;

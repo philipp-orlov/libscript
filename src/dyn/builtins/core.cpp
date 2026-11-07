@@ -469,6 +469,15 @@ void installGlobals(Runtime& rt)
 
     rt.method(g, "parseInt", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
+        // A number that prints without an exponent has its whole part for an answer, and no text need be made to say so.
+        if (ci.arg(0).isDouble() && ci.arg(1).isUndefined()) {
+            const double d = detail::Access::r8(ci.arg(0));
+            const double size = std::fabs(d);
+            if (size >= 1e-6 && size < 9007199254740992.0)
+                return Value(std::trunc(d));
+            if (d == 0)
+                return Value(0.0);
+        }
         const String s = toStringValue(rt2, ci.arg(0));
         const int radix = ci.arg(1).isUndefined() ? 0 : int(toNumber(rt2, ci.arg(1)));
         return Value(parseIntPrefix(s, radix));

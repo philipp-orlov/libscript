@@ -915,6 +915,12 @@ private:
         in.b = t;
         in.isNullable = nullable;
     }
+    void mov(std::int32_t d, std::int32_t a)
+    {
+        IrInst& in = inst(IrOp::Mov);
+        in.d = d;
+        in.a = a;
+    }
     std::int32_t load(std::int32_t base, std::int64_t offset, std::uint8_t bytes, bool fp = false, std::uint8_t alias = 0)
     {
         const std::int32_t d = fn_.newVreg(fp);
@@ -1772,6 +1778,7 @@ private:
                 labels_[next] < 0 && labels_[next + 5] < 0) {
                 // Not the `PushUndefined; SetLocal` of a declaration, which `storeLocal` treats as one.
                 previousOp_ = Op::Dup;
+                settleExact(Op::SetLocal, next);
                 storeLocal(readOperand(c, next + 1));
                 previousOp_ = Op::Pop;
                 pc = next + 6;
@@ -2328,8 +2335,8 @@ private:
                     const std::int32_t slow = newLabel();
                     const std::int32_t done = newLabel();
                     const std::int32_t slot = globalSlot(found, slow);
-                    const std::int32_t oldTag = load(slot, kPropValueOffset, 1);
-                    const std::int32_t old = load(slot, kPropValueOffset + kPayload, 8);
+                    const std::int32_t oldTag = load(slot, kPropValueOffset, 1, false, kAliasValue);
+                    const std::int32_t old = load(slot, kPropValueOffset + kPayload, 8, false, kAliasValue);
                     store(slot, kPropValueOffset, tag, 1);
                     store(slot, kPropValueOffset + kPayload, payload, 8);
                     decRefOf(old, oldTag, false);
@@ -2950,9 +2957,9 @@ private:
         expectEpoch(rt_.ctx.protoEpoch, bail);
         expectShape(ctor, fn->shape, bail);
         const std::int32_t props = loadHeader(ctor.r, kPropsOffset);
-        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1);
+        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
         branchCmp(protoTag, IrCond::Ne, std::int64_t(Type::Object), bail);
-        const std::int32_t target = load(props, at + kPropValueOffset + kPayload, 8);
+        const std::int32_t target = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
         if (!obj.hasKnownTag)
             branchCmp(obj.t, IrCond::Ne, std::int64_t(Type::Object), no);
         else if (obj.known != Type::Object)
@@ -3206,9 +3213,9 @@ private:
         if (found && !global->accessorOf(*found) && found->value.isDouble() && betHere() && !assignsGlobal(key)) {
             const std::int32_t bail = newLabel();
             const std::int32_t slot = globalSlot(found, bail);
-            const std::int32_t lt = load(slot, kPropValueOffset, 1);
+            const std::int32_t lt = load(slot, kPropValueOffset, 1, false, kAliasValue);
             branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
-            const std::int32_t lr = load(slot, kPropValueOffset + kPayload, 8);
+            const std::int32_t lr = load(slot, kPropValueOffset + kPayload, 8, false, kAliasValue);
             const double value = detail::Access::r8(found->value);
             std::uint64_t bits = 0;
             std::memcpy(&bits, &value, sizeof bits);
@@ -3223,11 +3230,24 @@ private:
             push(constDouble(value));
             return;
         }
-        // Where the property was when this was compiled, while the global object's table has not changed since.
+        // Where the property was when this was compiled, while the global object's table has not changed since; once the
+        // table has changed under this, the interpreter reads it, and later compiles call for it.
+        if (found && !global->accessorOf(*found) && betHere()) {
+            const std::int32_t bail = newLabel();
+            const std::int32_t slot = globalSlot(found, bail);
+            Entry result = taggedEntry(load(slot, kPropValueOffset + kPayload, 8, false, kAliasValue),
+                                       load(slot, kPropValueOffset, 1, false, kAliasValue), Own::Weak);
+            emitBail(bail, {});
+            if (found->value.isObject())
+                result.hint = detail::Access::ptr(found->value);
+            pin(result);
+            push(result);
+            return;
+        }
         if (found && !global->accessorOf(*found)) {
             const std::int32_t slot = globalSlot(found, slow);
-            const std::int32_t lt = load(slot, kPropValueOffset, 1);
-            const std::int32_t lr = load(slot, kPropValueOffset + kPayload, 8);
+            const std::int32_t lt = load(slot, kPropValueOffset, 1, false, kAliasValue);
+            const std::int32_t lr = load(slot, kPropValueOffset + kPayload, 8, false, kAliasValue);
             IrInst& mt = inst(IrOp::Mov);
             mt.d = t;
             mt.a = lt;
@@ -3480,12 +3500,12 @@ private:
             }
             const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
             const std::int32_t props = loadHeader(holder, kPropsOffset);
-            const std::int32_t lt = load(props, at + kPropValueOffset, 1);
+            const std::int32_t lt = load(props, at + kPropValueOffset, 1, false, kAliasValue);
             if (site->saw == PropertySite::kSawNumber) {
                 branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
-                result = doubleEntry(load(props, at + kPropValueOffset + kPayload, 8, true));
+                result = doubleEntry(load(props, at + kPropValueOffset + kPayload, 8, true, kAliasValue));
             } else {
-                result = taggedEntry(load(props, at + kPropValueOffset + kPayload, 8), lt, Own::Weak);
+                result = taggedEntry(load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue), lt, Own::Weak);
             }
             emitBail(bail, {base});
         } else if (polyBet) {
@@ -3497,15 +3517,15 @@ private:
                 inst(IrOp::Label).imm = c.label;
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = loadHeader(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset);
-                const std::int32_t lt = load(props, at + kPropValueOffset, 1);
+                const std::int32_t lt = load(props, at + kPropValueOffset, 1, false, kAliasValue);
                 if (number) {
                     branchCmp(lt, IrCond::Ne, std::int64_t(Type::Double), bail);
-                    const std::int32_t v = load(props, at + kPropValueOffset + kPayload, 8, true);
+                    const std::int32_t v = load(props, at + kPropValueOffset + kPayload, 8, true, kAliasValue);
                     IrInst& md = inst(IrOp::Mov);
                     md.d = d;
                     md.a = v;
                 } else {
-                    const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+                    const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
                     IrInst& mt = inst(IrOp::Mov);
                     mt.d = t;
                     mt.a = lt;
@@ -3523,8 +3543,8 @@ private:
                 inst(IrOp::Label).imm = c.label;
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = loadHeader(c.holder ? ptrReg(c.holder) : base.r, kPropsOffset);
-                const std::int32_t lt = load(props, at + kPropValueOffset, 1);
-                const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+                const std::int32_t lt = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+                const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
                 IrInst& mt = inst(IrOp::Mov);
                 mt.d = t;
                 mt.a = lt;
@@ -3542,8 +3562,8 @@ private:
             }
             const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
             const std::int32_t props = loadHeader(holder, kPropsOffset);
-            const std::int32_t lt = load(props, at + kPropValueOffset, 1);
-            const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+            const std::int32_t lt = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+            const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
             IrInst& mt = inst(IrOp::Mov);
             mt.d = t;
             mt.a = lt;
@@ -3652,8 +3672,8 @@ private:
             guardEpoch(rt_.ctx.protoEpoch, miss);
         const std::int64_t at = std::int64_t(index) * std::int64_t(sizeof(Prop));
         const std::int32_t props = loadHeader(ptrReg(proto), kPropsOffset);
-        const std::int32_t lt = load(props, at + kPropValueOffset, 1);
-        const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8);
+        const std::int32_t lt = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+        const std::int32_t lr = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
         Entry result;
         if (bet) {
             emitBail(miss, {base});
@@ -3752,7 +3772,7 @@ private:
                 // A number over a number, the usual thing for a field that holds one, is only its bits.
                 const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = loadHeader(base.r, kPropsOffset);
-                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
+                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
                 const std::int32_t other = newLabel();
                 const std::int32_t stored = newLabel();
                 branchCmp(oldTag, IrCond::Ne, std::int64_t(Type::Double), other);
@@ -3760,7 +3780,7 @@ private:
                 store(props, at + kPropValueOffset + kPayload, bits, 8);
                 inst(IrOp::ColdBegin);
                 inst(IrOp::Label).imm = other;
-                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
+                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
                 store(props, at + kPropValueOffset, vt, 1);
                 store(props, at + kPropValueOffset + kPayload, bits, 8);
                 decRefOf(old, oldTag, false);
@@ -3773,8 +3793,8 @@ private:
             } else {
                 const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = loadHeader(base.r, kPropsOffset);
-                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
-                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
+                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
                 store(props, at + kPropValueOffset, vt, 1);
                 store(props, at + kPropValueOffset + kPayload, vr, 8);
                 decRefOf(old, oldTag, false);
@@ -3800,8 +3820,8 @@ private:
                 }
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = loadHeader(base.r, kPropsOffset);
-                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
-                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
+                const std::int32_t oldTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+                const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
                 store(props, at + kPropValueOffset, vt, 1);
                 store(props, at + kPropValueOffset + kPayload, vr, 8);
                 decRefOf(old, oldTag, false);
@@ -3816,8 +3836,8 @@ private:
             guardShape(base, site->shape, slow);
             const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
             const std::int32_t props = loadHeader(base.r, kPropsOffset);
-            const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
-            const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8);
+            const std::int32_t oldTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+            const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
             store(props, at + kPropValueOffset, vt, 1);
             store(props, at + kPropValueOffset + kPayload, vr, 8);
             decRefOf(old, oldTag, false);
@@ -5094,6 +5114,34 @@ private:
     /// `x.length`: an array's from its elements, a string's from its cell, anything else the long way.
     void lengthProp(Entry base, std::uint32_t operand)
     {
+        // Betting it is an array's or a string's, which is an int32 as long as it is below 2^31: anything else is the
+        // interpreter's, which reads it again, and the next compile bets no more here.
+        if (betHere()) {
+            const std::int32_t n = fn_.newVreg(false);
+            const std::int32_t bail = newLabel();
+            const std::int32_t done = newLabel();
+            const std::int32_t notObject = newLabel();
+            const std::int32_t tag = base.hasKnownTag ? immReg(std::int64_t(base.known)) : base.t;
+            branchCmp(tag, IrCond::Ne, std::int64_t(Type::Object), notObject);
+            const std::int32_t both = load(base.r, kCellKindOffset, 2, false, kAliasHeader);
+            branchCmp(both, IrCond::Ne, kKindAndClassOfArray, bail);
+            const std::int32_t count = load(base.r, kElementCountOffset, 4, false, kAliasHeader);
+            branchCmp(count, IrCond::Lt, 0, bail);
+            mov(n, count);
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::Label).imm = notObject;
+            branchCmp(tag, IrCond::Ne, std::int64_t(Type::String), bail);
+            mov(n, load(base.r, kStringLengthOffset, 4, false, kAliasHeader));
+            inst(IrOp::Br).imm = done;
+            emitBail(bail, {base});
+            inst(IrOp::Label).imm = done;
+            Entry length = intEntry(n, true);
+            length.atLeastZero = true;
+            push(length);
+            if (base.own == Own::Owned)
+                release(base);
+            return;
+        }
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t slow = newLabel();
@@ -5149,8 +5197,8 @@ private:
         guardEpoch(site->epoch, slow);
         const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
         const std::int32_t props = loadHeader(ptrReg(site->holder), kPropsOffset);
-        const std::int32_t ft = load(props, at + kPropValueOffset, 1);
-        const std::int32_t fr = load(props, at + kPropValueOffset + kPayload, 8);
+        const std::int32_t ft = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+        const std::int32_t fr = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
         // The getter keeps a count of its own while it runs: it could take itself off the prototype.
         incRefOf(fr, ft, false);
         Entry getter = taggedEntry(fr, ft, Own::Owned);
@@ -5294,9 +5342,9 @@ private:
         const std::int64_t at = std::int64_t(prototype - fn->props.data()) * std::int64_t(sizeof(Prop));
         guardShape(callee, fn->shape, slow);
         const std::int32_t props = loadHeader(callee.r, kPropsOffset);
-        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1);
+        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
         branchCmp(protoTag, IrCond::Ne, std::int64_t(Type::Object), slow);
-        const std::int32_t protoNow = load(props, at + kPropValueOffset + kPayload, 8);
+        const std::int32_t protoNow = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
         keepAlive(proto);
         {
             const std::int32_t want = ptrReg(proto);
@@ -5346,9 +5394,9 @@ private:
         const std::int32_t finished = newLabel();
         guardShape(callee, fn->shape, slow);
         const std::int32_t props = loadHeader(callee.r, kPropsOffset);
-        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1);
+        const std::int32_t protoTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
         branchCmp(protoTag, IrCond::Ne, std::int64_t(Type::Object), slow);
-        const std::int32_t protoNow = load(props, at + kPropValueOffset + kPayload, 8);
+        const std::int32_t protoNow = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
         // Its objects then start from the shape that prototype's do. It stays alive, or something else could come to be
         // at that address.
         keepAlive(proto);

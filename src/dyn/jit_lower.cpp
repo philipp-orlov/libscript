@@ -3214,6 +3214,47 @@ private:
         return cases;
     }
 
+    struct StoreCase
+    {
+        std::int32_t label;
+        std::uint32_t index;
+        const Shape* addTo;  ///< the shape a store that adds the property leads to, null for one that overwrites
+    };
+
+    /// The same for a store. Cases that add the property need the epoch they were learnt at, and room for an index not to
+    /// be needed; any others are left to `slow`.
+    std::vector<StoreCase> dispatchStores(const Entry& base, const PropertySite* site, std::int32_t slow)
+    {
+        const bool chainOk = site->epoch == rt_.ctx.protoEpoch;
+        std::vector<std::pair<const Shape*, StoreCase>> wanted;
+        const auto want = [&](const Shape* shape, std::uint32_t index, const Shape* addTo) {
+            if (!addTo || (chainOk && addTo->count <= DynObject::kIndexThreshold))
+                wanted.push_back({shape, {newLabel(), index, addTo}});
+        };
+        want(site->shape, site->index, site->addTo);
+        for (std::uint8_t i = 0; i < site->moreCount; ++i)
+            want(site->moreShape[i], site->moreIndex[i], site->moreAddTo[i]);
+        bool anyAdds = false;
+        for (const auto& w : wanted)
+            anyAdds = anyAdds || w.second.addTo;
+        const std::int32_t have = shapeOf(base, slow);
+        if (anyAdds)
+            guardEpoch(site->epoch, slow);
+        std::vector<StoreCase> cases;
+        for (const auto& [shape, c] : wanted) {
+            const std::int32_t wantShape = ptrReg(shape);
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = have;
+            test.b = wantShape;
+            test.cond = IrCond::Eq;
+            test.width = 64;
+            test.target = c.label;
+            cases.push_back(c);
+        }
+        inst(IrOp::Br).imm = slow;
+        return cases;
+    }
+
     void guardShape(const Entry& base, const Shape* shape, std::int32_t slow)
     {
         const std::int32_t have = shapeOf(base, slow);
@@ -3496,8 +3537,7 @@ private:
 
     /// A store that adds the property, in place while the table has room and no index: what `appendKnown` does. The
     /// shape and the epoch are checked already.
-    void appendInPlace(const Entry& base, const PropertySite* site, std::uint32_t operand, std::int32_t vt, std::int32_t vr,
-                       std::int32_t slow)
+    void appendInPlace(const Entry& base, const Shape* addTo, std::int32_t vt, std::int32_t vr, std::int32_t slow)
     {
         const std::int32_t isProto = load(base.r, kIsProtoOffset, 1, false, kAliasHeader);
         branchCmp(isProto, IrCond::Ne, 0, slow);
@@ -3505,7 +3545,7 @@ private:
         const std::int32_t rare = load(base.r, kRareOffset, 8, false, kAliasHeader);
         branchCmp(rare, IrCond::Ne, 0, slow, 64);
         // The shape this adds to says how many there are.
-        const std::uint32_t count = site->addTo->count - 1;
+        const std::uint32_t count = addTo->count - 1;
         const std::int32_t cap = load(base.r, kPropsCapOffset, 4, false, kAliasHeader);
         branchCmp(cap, IrCond::Le, std::int64_t(count), slow);
         const std::int32_t props = loadHeader(base.r, kPropsOffset);
@@ -3513,7 +3553,7 @@ private:
         store(props, at + kPropValueOffset, vt, 1);
         store(props, at + kPropValueOffset + kPayload, vr, 8);
         store(base.r, kPropsSizeOffset, immReg(std::int64_t(count) + 1), 4, kAliasHeader);
-        storeHeader(base.r, kShapeOffset, ptrReg(site->addTo));
+        storeHeader(base.r, kShapeOffset, ptrReg(addTo));
     }
 
     void setProp(std::uint32_t operand)
@@ -3546,7 +3586,7 @@ private:
             expectShape(base, site->shape, bail);
             if (site->addTo) {
                 expectEpoch(site->epoch, bail);
-                appendInPlace(base, site, operand, vt, vr, bail);
+                appendInPlace(base, site->addTo, vt, vr, bail);
             } else if (isKnownNumber(value)) {
                 // A number over a number, the usual thing for a field that holds one, is only its bits.
                 const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
@@ -3589,9 +3629,14 @@ private:
                 }
                 learnShape(base.r, site->addTo);
             }
-        } else if (site && !site->addTo && site->moreCount) {
-            for (const ShapeCase& c : dispatchShapes(base, site, slow)) {
+        } else if (site && site->moreCount) {
+            for (const StoreCase& c : dispatchStores(base, site, slow)) {
                 inst(IrOp::Label).imm = c.label;
+                if (c.addTo) {
+                    appendInPlace(base, c.addTo, vt, vr, slow);
+                    inst(IrOp::Br).imm = done;
+                    continue;
+                }
                 const std::int64_t at = std::int64_t(c.index) * std::int64_t(sizeof(Prop));
                 const std::int32_t props = loadHeader(base.r, kPropsOffset);
                 const std::int32_t oldTag = load(props, at + kPropValueOffset, 1);
@@ -3604,7 +3649,7 @@ private:
         } else if (site && site->addTo && site->epoch == rt_.ctx.protoEpoch && site->addTo->count <= DynObject::kIndexThreshold) {
             guardShape(base, site->shape, slow);
             guardEpoch(site->epoch, slow);
-            appendInPlace(base, site, operand, vt, vr, slow);
+            appendInPlace(base, site->addTo, vt, vr, slow);
         } else if (site && !site->addTo) {
             // A write to a property the shape says is there and writable: what was there loses its count after.
             guardShape(base, site->shape, slow);

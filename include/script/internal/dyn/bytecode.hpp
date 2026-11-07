@@ -216,12 +216,18 @@ struct PropertySite
     /// The property is a getter, to call with the receiver; `holder` and `index` say where it is.
     bool getter = false;
     /// Further receiver shapes a plain read or write has met, each with where the property is in that one: on the
-    /// receiver, or for a read, on `moreHolder` up its prototype chain (valid while `epoch` is current).
+    /// receiver, or for a read, on `moreHolder` up its prototype chain (valid while `epoch` is current). For a write, a
+    /// shape that lacks the property has `moreAddTo`, the shape adding it leads to, valid likewise. A site does only the
+    /// one or the other, so only that member of the union is ever used.
     static constexpr std::uint8_t kMoreShapes = 3;
     std::uint8_t moreCount = 0;
     Shape* moreShape[kMoreShapes] = {};
     std::uint32_t moreIndex[kMoreShapes] = {};
-    DynObject* moreHolder[kMoreShapes] = {};
+    union
+    {
+        DynObject* moreHolder[kMoreShapes] = {};
+        Shape* moreAddTo[kMoreShapes];
+    };
 
     /// Which of the further shapes `s` is, or -1.
     int moreFind(const Shape* s) const noexcept
@@ -232,13 +238,6 @@ struct PropertySite
         }
         return -1;
     }
-    /// A plain own property, in one of the shapes beyond the first: its position, or -1.
-    std::int64_t moreAt(const Shape* s) const noexcept
-    {
-        const int i = moreFind(s);
-        return i >= 0 && !moreHolder[i] ? std::int64_t(moreIndex[i]) : -1;
-    }
-    bool plainOwn() const noexcept { return shape && !holder && !addTo && !getter && !anyHolder(); }
     bool plainRead() const noexcept { return shape && !addTo && !getter; }
     bool anyHolder() const noexcept
     {
@@ -249,6 +248,27 @@ struct PropertySite
                 return true;
         }
         return false;
+    }
+    /// Whether a store here adds the property for any shape it knows, and so depends on `epoch`.
+    bool anyAdds() const noexcept
+    {
+        if (addTo)
+            return true;
+        for (std::uint8_t i = 0; i < moreCount; ++i) {
+            if (moreAddTo[i])
+                return true;
+        }
+        return false;
+    }
+    /// Learn one more shape a store meets, while there is room.
+    void addStore(Shape* s, std::uint32_t at, Shape* to) noexcept
+    {
+        if (s == shape || moreFind(s) >= 0 || moreCount == kMoreShapes)
+            return;
+        moreShape[moreCount] = s;
+        moreIndex[moreCount] = at;
+        moreAddTo[moreCount] = to;
+        ++moreCount;
     }
     /// Learn one more shape, while there is room.
     void addShape(Shape* s, std::uint32_t at, DynObject* where = nullptr) noexcept

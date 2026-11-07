@@ -859,6 +859,32 @@ TEST(parseIntOfANumberIsWhatItsTextWouldGive)
     CHECK_EQ(run("String(parseInt(NaN)) + ',' + parseInt(Infinity) + ',' + parseInt(10, 2) + ',' + parseInt(15.9, 8)"), std::string("NaN,NaN,2,13"));
 }
 
+TEST(aStoreMayAddAPropertyToObjectsOfSeveralShapes)
+{
+    // Fields that arrive in either order, through one store each, and objects that have them already.
+    CHECK_EQ(run("function N() {} N.prototype.l = null; N.prototype.r = null;"
+                 "function setL(n, v) { n.l = v; } function setR(n, v) { n.r = v; }"
+                 "var s = 0; for (var i = 0; i < 6000; i++) { var a = new N();"
+                 " if (i & 1) { setL(a, 1); setR(a, 2); } else { setR(a, 3); setL(a, 4); }"
+                 " if (i & 2) { setL(a, 5); setR(a, 6); }"
+                 " s += a.l * 10 + a.r; if (Object.keys(a).length != 2) s = -1e9; }"
+                 "s + ',' + Object.keys((function () { var b = new N(); setR(b, 1); setL(b, 1); return b; })()).join()"),
+             std::string("250500,r,l"));
+    // Something on the prototype chain that changes what a store does: what the site learnt no longer holds.
+    CHECK_EQ(run("function N() {} function set(n, v) { n.x = v; return n; }"
+                 "var seen = 0; var s = 0; for (var i = 0; i < 4000; i++) { var a = new N(); if (i & 1) a.y = 1; set(a, 2); s += a.x; }"
+                 "Object.defineProperty(N.prototype, 'x', { set: function (v) { seen = v; }, get: function () { return 7; } });"
+                 "var a = new N(); set(a, 9); var b = new N(); b.y = 1; set(b, 8);"
+                 "s + ',' + seen + ',' + a.x + ',' + Object.keys(a).length + ',' + Object.keys(b).length"),
+             std::string("8000,8,7,0,1"));
+    // More shapes than a site keeps, and one of them frozen.
+    CHECK_EQ(run("function set(n, v) { n.z = v; return n; }"
+                 "var s = 0; for (var i = 0; i < 4000; i++) { var a = {}; a['p' + (i & 7)] = 1; set(a, i & 1); s += a.z; }"
+                 "var f = Object.freeze({ a: 1 }); try { set(f, 1); } catch (e) {}"
+                 "s + ',' + f.z"),
+             std::string("2000,undefined"));
+}
+
 TEST(aProgramMayHaveAnyNumberOfWaysToGrowAnObject)
 {
     // More classes with statics, and literals starting differently, than a shape's limit for names worked out at run time.

@@ -625,8 +625,8 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
     }
     if (const Prop* own = obj->findOwn(key)) {
         if ((obj->attrsOf(*own) & (PropAccessor | PropWritable)) == PropWritable) {
-            if (site->plainOwn()) {
-                site->addShape(before, std::uint32_t(own - obj->props.data()));
+            if (site->shape) {
+                site->addStore(before, std::uint32_t(own - obj->props.data()), nullptr);
                 setProperty(rt, base, key, v);
                 return;
             }
@@ -646,6 +646,13 @@ void setPropertyLearning(Runtime& rt, const Value& base, GCObject* key, const Va
     // on the prototype chain changes, since nothing there has a setter for it now.
     if (obj->shape && obj->shape != before && obj->props.size() == count + 1 && obj->keyAt(count) == key &&
         obj->attrsAt(count) == PropDefault) {
+        // Objects whose fields arrive in different orders: `a.left = x` where `a` may or may not have its `right` yet.
+        const bool adds = site->anyAdds();
+        if (site->shape && before != site->shape && (!adds || site->epoch == rt.ctx.protoEpoch)) {
+            site->epoch = rt.ctx.protoEpoch;
+            site->addStore(before, std::uint32_t(count), obj->shape);
+            return;
+        }
         site->shape = before;
         site->holder = nullptr;
         site->getter = false;
@@ -672,10 +679,17 @@ inline void setPropertySite(Runtime& rt, const FunctionCode& code, const Value& 
                 return;
             }
         } else if (obj->shape && site->moreCount) {
-            const std::int64_t at = site->moreAt(obj->shape);
-            if (at >= 0) {
-                obj->props[std::size_t(at)].value = v;
-                return;
+            const int i = site->moreFind(obj->shape);
+            if (i >= 0) {
+                if (Shape* to = site->moreAddTo[i]) {
+                    if (site->epoch == rt.ctx.protoEpoch) {
+                        obj->appendKnown(v, to);
+                        return;
+                    }
+                } else {
+                    obj->props[site->moreIndex[i]].value = v;
+                    return;
+                }
             }
         }
     }

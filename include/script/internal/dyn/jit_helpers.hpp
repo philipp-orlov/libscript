@@ -25,6 +25,18 @@ std::int32_t scriptDynToInt32(double d) noexcept;
 std::int32_t scriptDynToBoolean(std::int64_t tag, std::uint64_t payload) noexcept;
 double scriptDynFmod(double a, double b) noexcept;
 double scriptDynPow(double a, double b) noexcept;
+double scriptDynSin(double d) noexcept;
+double scriptDynCos(double d) noexcept;
+double scriptDynTan(double d) noexcept;
+double scriptDynAtan(double d) noexcept;
+double scriptDynExp(double d) noexcept;
+double scriptDynLog(double d) noexcept;
+double scriptDynRound(double d) noexcept;
+double scriptDynParseInt(double d) noexcept;
+double scriptDynMax(double a, double b) noexcept;
+double scriptDynMin(double a, double b) noexcept;
+double scriptDynAtan2(double a, double b) noexcept;
+NativePair scriptDynArrayPush(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
 NativePair scriptDynAdd(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept;
 std::int32_t scriptDynCompare(Runtime* rt, std::int64_t op, std::int64_t ta, std::uint64_t a, std::int64_t tb,
                               std::uint64_t b) noexcept;

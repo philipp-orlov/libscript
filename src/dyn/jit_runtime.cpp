@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 
+#include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/jit.hpp"
 #include "script/internal/dyn/jit_helpers.hpp"
 #include "script/internal/dyn/runtime.hpp"
@@ -147,7 +148,37 @@ double scriptDynFmod(double a, double b) noexcept
 
 double scriptDynPow(double a, double b) noexcept
 {
-    return std::pow(a, b);
+    return numberPow(a, b);
+}
+
+double scriptDynSin(double d) noexcept { return std::sin(d); }
+double scriptDynCos(double d) noexcept { return std::cos(d); }
+double scriptDynTan(double d) noexcept { return std::tan(d); }
+double scriptDynAtan(double d) noexcept { return std::atan(d); }
+double scriptDynExp(double d) noexcept { return std::exp(d); }
+double scriptDynLog(double d) noexcept { return std::log(d); }
+double scriptDynRound(double d) noexcept { return numberRound(d); }
+double scriptDynMax(double a, double b) noexcept { return numberMax(a, b); }
+double scriptDynMin(double a, double b) noexcept { return numberMin(a, b); }
+double scriptDynAtan2(double a, double b) noexcept { return std::atan2(a, b); }
+
+double scriptDynParseInt(double d) noexcept
+{
+    // Past what prints without an exponent it does make the text, and an allocation can fail: the answer is then no answer.
+    try {
+        return parseIntOfNumber(d);
+    } catch (...) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+}
+
+NativePair scriptDynArrayPush(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        auto* a = static_cast<DynArray*>(array);
+        a->append(valueOf(tag, payload));
+        return take(Value(double(a->size())));
+    });
 }
 
 NativePair scriptDynAdd(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept

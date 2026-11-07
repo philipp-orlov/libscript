@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/jit.hpp"
 #include "script/internal/dyn/jit_helpers.hpp"
 #include "script/internal/dyn/object.hpp"
@@ -3456,6 +3457,7 @@ private:
             named("pop", Runtime::ArrayPop);
             named("charCodeAt", Runtime::StringCharCodeAt);
             named("apply", Runtime::FunctionApply);
+            named("call", Runtime::FunctionCall);
         }
         if (usable && !site->holder && !site->moreCount && base.hint) {
             const auto* known = static_cast<const DynObject*>(base.hint);
@@ -4085,6 +4087,29 @@ private:
         Entry callee = pop();
         if (mathInPlace(callee, self, args))
             return;
+        // `f.call(x, a)` is `f(a)` on `x`, with everything a call to `f` could have, while `call` is the built-in.
+        if (callee.hint && callee.hint == rt_.intrinsics[Runtime::FunctionCall].get() && betHere() && argc >= 1 &&
+            callee.rep == Rep::Tagged && !callee.isConst && !args[0].lazyArgs) {
+            const std::int32_t bail = newLabel();
+            if (!callee.hasKnownTag)
+                branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), bail);
+            const std::int32_t want = ptrReg(callee.hint);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = callee.r;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = bail;
+            std::vector<Entry> popped = {callee, self};
+            popped.insert(popped.end(), args.begin(), args.end());
+            emitBail(bail, popped);
+            // The runtime holds on to the built-in itself.
+            release(callee);
+            callee = self;
+            self = args[0];
+            args.erase(args.begin());
+            --argc;
+        }
         const DynFunction* known = expectCallee(callee);
         // A small function that goes in place of the call and only reads can release nothing, so nothing here needs a
         // count to stay alive through it.
@@ -4146,14 +4171,15 @@ private:
     /// and nothing left in the loop that could be taken for a call. Anything else, the interpreter does.
     bool mathInPlace(const Entry& callee, const Entry& self, const std::vector<Entry>& args)
     {
-        if (!callee.hint || callee.rep != Rep::Tagged || callee.isConst || args.size() != 1 || !betHere() || args[0].lazyArgs)
+        if (!callee.hint || callee.rep != Rep::Tagged || callee.isConst || args.empty() || args.size() > 2 || !betHere() ||
+            args.back().lazyArgs)
             return false;
         int which = -1;
-        for (int i = Runtime::MathSqrt; i <= Runtime::MathTrunc; ++i) {
+        for (int i = Runtime::MathSqrt; i <= Runtime::MathAtan2; ++i) {
             if (rt_.intrinsics[i].get() == callee.hint)
                 which = i;
         }
-        if (which < 0)
+        if (which < 0 || args.size() != (which >= Runtime::MathMax ? 2u : 1u))
             return false;
         const Entry& arg = args[0];
         const std::int32_t bail = newLabel();
@@ -4168,21 +4194,72 @@ private:
             same.width = 64;
             same.target = bail;
         }
-        if (!isKnownNumber(arg)) {
-            if (arg.hasKnownTag || arg.isConst)
+        for (const Entry& each : args) {
+            if (isKnownNumber(each))
+                continue;
+            if (each.hasKnownTag || each.isConst)
                 inst(IrOp::Br).imm = bail;
             else
-                branchCmp(arg.t, IrCond::Ne, std::int64_t(Type::Double), bail);
+                branchCmp(each.t, IrCond::Ne, std::int64_t(Type::Double), bail);
         }
         const std::int32_t x = doubleReg(arg);
-        static constexpr IrOp kOps[] = {IrOp::FSqrt, IrOp::FAbs, IrOp::FFloor, IrOp::FCeil, IrOp::FTrunc};
+        const std::int32_t y = args.size() == 2 ? doubleReg(args[1]) : -1;
         const std::int32_t d = fn_.newVreg(true);
-        IrInst& op = inst(kOps[which - Runtime::MathSqrt]);
-        op.d = d;
-        op.a = x;
-        op.width = 64;
-        emitBail(bail, {callee, self, arg});
-        release(arg);
+        if (which <= Runtime::MathTrunc) {
+            static constexpr IrOp kOps[] = {IrOp::FSqrt, IrOp::FAbs, IrOp::FFloor, IrOp::FCeil, IrOp::FTrunc};
+            IrInst& op = inst(kOps[which - Runtime::MathSqrt]);
+            op.d = d;
+            op.a = x;
+            op.width = 64;
+        } else if (which == Runtime::MathMax || which == Runtime::MathMin) {
+            // Whichever compares greater or less; a tie, which may be of zeros of either sign, or a NaN, the long way.
+            const IrCond better = which == Runtime::MathMax ? IrCond::FGt : IrCond::FLt;
+            const std::int32_t done = newLabel();
+            const std::int32_t other = newLabel();
+            const auto take = [&](std::int32_t from, std::int32_t against) {
+                IrInst& mov = inst(IrOp::Mov);
+                mov.d = d;
+                mov.a = from;
+                IrInst& test = inst(IrOp::BrFCmp);
+                test.a = from;
+                test.b = against;
+                test.cond = better;
+                test.width = 64;
+                test.target = done;
+            };
+            take(x, y);
+            take(y, x);
+            inst(IrOp::Br).imm = other;
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = other;
+            coldCall(reinterpret_cast<void*>(which == Runtime::MathMax ? &scriptDynMax : &scriptDynMin), {x, y}, d, -1, false);
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
+        } else {
+            void* helper = nullptr;
+            switch (which) {
+                case Runtime::MathSin: helper = reinterpret_cast<void*>(&scriptDynSin); break;
+                case Runtime::MathCos: helper = reinterpret_cast<void*>(&scriptDynCos); break;
+                case Runtime::MathTan: helper = reinterpret_cast<void*>(&scriptDynTan); break;
+                case Runtime::MathAtan: helper = reinterpret_cast<void*>(&scriptDynAtan); break;
+                case Runtime::MathExp: helper = reinterpret_cast<void*>(&scriptDynExp); break;
+                case Runtime::MathLog: helper = reinterpret_cast<void*>(&scriptDynLog); break;
+                case Runtime::MathRound: helper = reinterpret_cast<void*>(&scriptDynRound); break;
+                case Runtime::ParseInt: helper = reinterpret_cast<void*>(&scriptDynParseInt); break;
+                case Runtime::MathPow: helper = reinterpret_cast<void*>(&scriptDynPow); break;
+                default: helper = reinterpret_cast<void*>(&scriptDynAtan2); break;
+            }
+            if (y >= 0)
+                coldCall(helper, {x, y}, d, -1, false);
+            else
+                coldCall(helper, {x}, d, -1, false);
+        }
+        std::vector<Entry> popped = {callee, self};
+        popped.insert(popped.end(), args.begin(), args.end());
+        emitBail(bail, popped);
+        for (std::size_t i = args.size(); i-- > 0;)
+            release(args[i]);
         release(self);
         release(callee);
         push(doubleEntry(d));
@@ -4396,7 +4473,7 @@ private:
             same.target = generic;
         }
         switch (which) {
-            case Runtime::ArrayPush: inlinePush(self, args[0], r, t, generic); return true;
+            case Runtime::ArrayPush: inlinePush(callee, self, args[0], r, t, generic); return true;
             case Runtime::ArrayPop: inlinePop(self, r, t, generic); return true;
             case Runtime::StringCharCodeAt: inlineCharCodeAt(self, args[0], r, t, generic); return true;
             case Runtime::FunctionApply: inlineApply(callee, self, args, r, t, generic); return true;
@@ -4467,9 +4544,15 @@ private:
     }
 
     /// `array.push(v)` while the buffer has room: the value's count goes to the array.
-    void inlinePush(const Entry& self, const Entry& value, std::int32_t r, std::int32_t t, std::int32_t generic)
+    void inlinePush(const Entry& callee, const Entry& self, const Entry& value, std::int32_t r, std::int32_t t, std::int32_t generic)
     {
         guardGrowableArray(self, generic);
+        // An array, wanting to grow or to hold something other than numbers: no call of the built-in is needed for that.
+        const std::int32_t grow = newLabel();
+        const std::int32_t pushed = newLabel();
+        // Ahead of the first way there, which wants them too.
+        const std::int32_t vt = tagReg(value);
+        const std::int32_t vr = payloadReg(value);
         const std::int32_t data = loadHeader(self.r, kElementsOffset);
         const std::int32_t count = load(self.r, kElementCountOffset, 4, false, kAliasHeader);
         const std::int32_t cap = load(self.r, kElementCapOffset, 4, false, kAliasHeader);
@@ -4479,10 +4562,8 @@ private:
             full.b = cap;
             full.cond = IrCond::Eq;
             full.width = 64;
-            full.target = generic;
+            full.target = grow;
         }
-        const std::int32_t vt = tagReg(value);
-        const std::int32_t vr = payloadReg(value);
         const std::int32_t numbersOnly = load(self.r, kNumbersOnlyOffset, 1, false, kAliasHeader);
         const std::int32_t values = newLabel();
         const std::int32_t stored = newLabel();
@@ -4490,9 +4571,9 @@ private:
         // Into an array of numbers, if it is one.
         if (!isKnownNumber(value)) {
             if (value.hasKnownTag || value.isConst || value.rep != Rep::Tagged)
-                inst(IrOp::Br).imm = generic;
+                inst(IrOp::Br).imm = grow;
             else
-                branchCmp(vt, IrCond::Ne, std::int64_t(Type::Double), generic);
+                branchCmp(vt, IrCond::Ne, std::int64_t(Type::Double), grow);
         }
         {
             const std::int32_t slot = fn_.newVreg(false);
@@ -4532,6 +4613,13 @@ private:
         plus.width = 64;
         store(self.r, kElementCountOffset, next, 4, kAliasHeader);
         lengthResult(next, r, t);
+        inst(IrOp::Br).imm = pushed;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = grow;
+        coldCall(reinterpret_cast<void*>(&scriptDynArrayPush), {rtReg(), self.r, vt, vr}, r, t, true, {callee, self, value});
+        inst(IrOp::Br).imm = pushed;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = pushed;
     }
 
     /// `array.pop()` on an array that is not empty: the element's count comes along with it.

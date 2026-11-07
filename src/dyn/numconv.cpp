@@ -176,6 +176,17 @@ double stringToNumber(StringView s)
     return parsed.consumed == narrow.size() ? parsed.value : std::nan("");
 }
 
+double parseIntOfNumber(double d)
+{
+    // A number that prints without an exponent has its whole part for an answer, and no text need be made to say so.
+    const double size = std::fabs(d);
+    if (size >= 1e-6 && size < 9007199254740992.0)
+        return std::trunc(d);
+    if (d == 0)
+        return 0;
+    return parseIntPrefix(numberToString(d), 0);
+}
+
 double parseIntPrefix(StringView s, int radix)
 {
     std::size_t i = 0;

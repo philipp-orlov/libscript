@@ -2183,7 +2183,7 @@ Value execute(Runtime& rt, Frame& frame)
                         });
                         break;
                     case Op::Pow:
-                        numeric([](double a, double b) { return std::pow(a, b); });
+                        numeric([](double a, double b) { return numberPow(a, b); });
                         break;
                     case Op::Neg:
                         sp.back() = Value(-toNumber(rt, sp.back()));

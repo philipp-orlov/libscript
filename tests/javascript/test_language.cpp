@@ -859,6 +859,84 @@ TEST(parseIntOfANumberIsWhatItsTextWouldGive)
     CHECK_EQ(run("String(parseInt(NaN)) + ',' + parseInt(Infinity) + ',' + parseInt(10, 2) + ',' + parseInt(15.9, 8)"), std::string("NaN,NaN,2,13"));
 }
 
+TEST(mathOnBareNumbersAnswersWhatTheStandardSays)
+{
+    const auto at = [](const std::string& expr, const std::string& a, const std::string& b) {
+        const std::string source = "function f(a, b) { return " + expr + "; } var y; for (var i = 0; i < 3000; i++) f(i, i + 1); y = f(" + a + ", " + b + "); 1 / y === -Infinity ? '-0' : String(y)";
+        return run(source.c_str());
+    };
+    CHECK_EQ(at("Math.max(a, b)", "0", "-0"), std::string("0"));
+    CHECK_EQ(at("Math.max(a, b)", "-0", "0"), std::string("0"));
+    CHECK_EQ(at("Math.max(a, b)", "-0", "-0"), std::string("-0"));
+    CHECK_EQ(at("Math.min(a, b)", "0", "-0"), std::string("-0"));
+    CHECK_EQ(at("Math.min(a, b)", "-0", "0"), std::string("-0"));
+    CHECK_EQ(at("Math.max(a, b)", "NaN", "1"), std::string("NaN"));
+    CHECK_EQ(at("Math.max(a, b)", "1", "NaN"), std::string("NaN"));
+    CHECK_EQ(at("Math.min(a, b)", "NaN", "1"), std::string("NaN"));
+    CHECK_EQ(at("Math.min(a, b)", "2", "1"), std::string("1"));
+    CHECK_EQ(at("Math.max(a, b)", "2", "'7'"), std::string("7"));
+    CHECK_EQ(at("Math.pow(a, b)", "1", "Infinity"), std::string("NaN"));
+    CHECK_EQ(at("Math.pow(a, b)", "-1", "-Infinity"), std::string("NaN"));
+    CHECK_EQ(at("Math.pow(a, b)", "1", "NaN"), std::string("NaN"));
+    CHECK_EQ(at("Math.pow(a, b)", "NaN", "0"), std::string("1"));
+    CHECK_EQ(at("a ** b", "1", "Infinity"), std::string("NaN"));
+    CHECK_EQ(at("Math.pow(a, b)", "2", "10"), std::string("1024"));
+    CHECK_EQ(at("Math.round(a)", "-0.2", "0"), std::string("-0"));
+    CHECK_EQ(at("Math.round(a)", "0.49999999999999994", "0"), std::string("0"));
+    CHECK_EQ(at("Math.round(a)", "2.5", "0"), std::string("3"));
+    CHECK_EQ(at("Math.round(a)", "-2.5", "0"), std::string("-2"));
+    CHECK_EQ(at("Math.atan2(a, b)", "0", "1"), std::string("0"));
+    CHECK_EQ(at("parseInt(a)", "'12px'", "0"), std::string("12"));
+    CHECK_EQ(at("parseInt(a)", "1e21", "0"), std::string("1"));
+    CHECK_EQ(at("parseInt(a)", "-0.5", "0"), std::string("-0"));
+    // A program's own `max` is no business of the built-in's.
+    CHECK_EQ(run("function f(a, b) { return Math.max(a, b); } for (var i = 0; i < 3000; i++) f(i, 1);"
+                 "Math.max = function () { return 'mine'; }; f(1, 2)"),
+             std::string("mine"));
+}
+
+TEST(callingThroughCallIsCalling)
+{
+    CHECK_EQ(run("function g(a, b) { return this.k + a * b; } function f(o, a) { return g.call(o, a, 2); }"
+                 "var y; for (var i = 0; i < 3000; i++) y = f({ k: 1 }, i); y"),
+             std::string("5999"));
+    // No arguments, too few, too many, and `this` left to the callee to make sense of.
+    CHECK_EQ(run("function g(a, b) { return String(this === globalThis) + a + b + arguments.length; }"
+                 "function f(x) { return g.call(undefined, x) + g.call(null) + g.call(undefined, 1, 2, 3); }"
+                 "var y; for (var i = 0; i < 3000; i++) y = f(i); y"),
+             std::string("true2999undefined1trueundefinedundefined0true123"));
+    CHECK_EQ(run("function g() { return this === globalThis; } function f(t) { return g.call(t); } var y; for (var i = 0; i < 3000; i++) y = f(null); y + ',' + f(undefined) + ',' + f({})"),
+             std::string("true,true,false"));
+    // Not a function, or a `call` that is not the built-in; and a built-in called through it.
+    CHECK_EQ(run("function f(o) { return o.call(1, 2); } function g(a) { return a; } for (var i = 0; i < 3000; i++) f(g);"
+                 "var r = f({ call: function (x, y) { return x + y; } }); try { f({ call: 5 }); } catch (e) { r += ':' + e.name; } r"),
+             std::string("3:TypeError"));
+    CHECK_EQ(run("function f(s) { return String.prototype.toUpperCase.call(s); } var y; for (var i = 0; i < 3000; i++) y = f('ab'); y"),
+             std::string("AB"));
+    CHECK_EQ(run("function g() { return arguments.length; } function f() { return g.call(this, arguments); } var y; for (var i = 0; i < 3000; i++) y = f(1, 2); y"),
+             std::string("1"));
+    CHECK_EQ(run("function g(a) { throw new Error(String(a)); } function f(a) { try { g.call(null, a); } catch (e) { return e.message; } } var y; for (var i = 0; i < 3000; i++) y = f(i); y"),
+             std::string("2999"));
+}
+
+TEST(pushGrowingOrChangingAnArrayInPlace)
+{
+    CHECK_EQ(run("function f(a, v) { return a.push(v); } var s = 0;"
+                 "for (var i = 0; i < 3000; i++) { var a = []; for (var j = 0; j < 20; j++) s += f(a, j & 1 ? j : 'x' + j); }"
+                 "var b = [1, 2]; f(b, 3); f(b, 'four'); f(b, null); f(b, undefined); s + ',' + b.join() + ',' + b.length"),
+             std::string("630000,1,2,3,four,,,6"));
+    CHECK_EQ(run("function f(a, v) { return a.push(v); } for (var i = 0; i < 3000; i++) f([], {});"
+                 "var r = ''; try { f(Object.freeze([]), 1); } catch (e) { r = e.name; } r"),
+             std::string("TypeError"));
+    // A value pushed by way of the path that grows the array, in each form the compiler may have it.
+    CHECK_EQ(run("function f(a, x) { a.push(x * 2); a.push(7); a.push(x | 0); a.push(true); return a; }"
+                 "var y; for (var i = 0; i < 3000; i++) y = f([], i); y.join() + ',' + f(new Array(), 1.5).join()"),
+             std::string("5998,7,2999,true,3,7,1,true"));
+    // What it holds keeps it alive; what it replaces in a full array does not go.
+    CHECK_EQ(run("function f(a, v) { a.push(v); } var a = []; for (var i = 0; i < 5000; i++) f(a, { n: i }); a[4999].n + a[17].n"),
+             std::string("5016"));
+}
+
 TEST(aStoreMayAddAPropertyToObjectsOfSeveralShapes)
 {
     // Fields that arrive in either order, through one store each, and objects that have them already.

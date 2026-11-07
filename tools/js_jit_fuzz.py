@@ -62,7 +62,7 @@ class Gen:
 
     def stmt(self, s, ind, loop):
         p = '    ' * ind
-        k = self.r.randint(0, 31)
+        k = self.r.randint(0, 35)
         self.depth += 1
         deep = self.depth > 3
         try:
@@ -150,6 +150,8 @@ class Gen:
                         f"{p}log(String.fromCharCode({self.pick('65', '300', '-1', '1e10', self.expr(s, 1))}));"]
             if k in (29, 30, 31):
                 return self.hotElements(s, p, k)
+            if k in (32, 33, 34, 35):
+                return self.hotCalls(s, p, k)
             if k == 25:
                 v = self.var(); e = self.expr(s)
                 return [f"{p}var {v} = [1, {e}]; {v}[0] += 2; {v}['x'] = {e}; log({v}[0]); log(typeof nope{v}); log(typeof {v});"]
@@ -177,6 +179,48 @@ class Gen:
                 f"{p}var k{v} = {v}.x;",
                 f"{p}for (var {i} = 0; {i} < 500; {i}++) {{ {v}.x = {i}; {r} += {v}.x; {v}.y = {self.pick(i, chr(39) + 's' + chr(39))}; }}",
                 f"{p}log(typeof k{v}); log({r}); log({v}.y);"]
+
+    def hotCalls(self, s, p, k):
+        """Built-ins done in place, `.call`, and stores that add properties, hot, with the odd value to surprise them."""
+        v = self.var(); i = self.var(); r = self.var(); e = self.expr(s, 1)
+        odd = ['0', '-0', 'NaN', 'Infinity', '-Infinity', '1', '-1', '0.5', '-0.5', '2.5', '1e21', '1e-7', "'7'", 'null', 'undefined', '{}', e]
+        if k == 32:
+            f = self.pick('Math.max(a, b)', 'Math.min(a, b)', 'Math.pow(a, b)', 'Math.atan2(a, b)', 'a ** b', 'Math.round(a)', 'parseInt(a)',
+                          'Math.sin(a)', 'Math.cos(a)', 'Math.tan(a)', 'Math.atan(a)', 'Math.exp(a)', 'Math.log(a)')
+            x, y = self.r.choice(odd), self.r.choice(odd)
+            late = self.r.randint(0, 299)
+            return [f"{p}var {v} = function (a, b) {{ return {f}; }}, {r} = 0;",
+                    f"{p}for (var {i} = 0; {i} < 300; {i}++) {{ {r} = {v}({i} * 0.25, 3 - {i}); if ({i} === {late}) log({r}); }}",
+                    f"{p}{r} = {v}({x}, {y}); log(1 / {r}); log({r});"]
+        if k == 33:
+            self_ = self.r.choice(['undefined', 'null', '{k: 1}', 'globalThis', '[]'])
+            args = ', '.join(self.r.choice(odd) for _ in range(self.r.randint(0, 3)))
+            target = self.pick('function (a, b) { return String(a) + String(b) + arguments.length; }',
+                               'function () { return this === globalThis; }', 'Math.max', 'String.prototype.concat',
+                               'function (a) { return a + 1; }')
+            late = self.pick(f'{v}.call = function () {{ return "own"; }};', f'{v} = {{}};', f'{v} = {{call: 5}};', '')
+            call_args = f'{self_}, {args}' if args else self_
+            return [f"{p}var {v} = {target}, {r} = 0;",
+                    f"{p}var c{v} = function () {{ return {v}.call({call_args}); }};",
+                    f"{p}for (var {i} = 0; {i} < 300; {i}++) {{ {r} = String(c{v}()); }}",
+                    f"{p}log({r}); {late} try {{ log(String(c{v}())); }} catch (x{v}) {{ log(x{v}.name); }}"]
+        if k == 34:
+            names = ['a', 'b', 'c', 'd', 'e', 'f']
+            self.r.shuffle(names)
+            orders = [names[:self.r.randint(0, 5)] for _ in range(self.r.randint(2, 5))]
+            builds = ', '.join('function (o) { ' + ''.join(f'o.{n} = 1; ' for n in order) + '}' for order in orders)
+            late = self.pick(f"Object.defineProperty(N{v}.prototype, 'z', {{ set: function (x) {{ this.got = x; }}, get: function () {{ return 'g'; }}, configurable: true }});",
+                             f"N{v}.prototype.z = 'proto';", f"Object.freeze(N{v}.prototype);", f"N{v}.prototype = {{z: 'other'}};", '')
+            at = self.r.randint(0, 399)
+            return [f"{p}function N{v}() {{}} var b{v} = [{builds}], {r} = '';",
+                    f"{p}var s{v} = function (o, x) {{ o.z = x; return o; }};",
+                    f"{p}for (var {i} = 0; {i} < 400; {i}++) {{ if ({i} === {at}) {{ {late} }} var o{v} = new N{v}(); b{v}[{i} % {len(orders)}](o{v}); s{v}(o{v}, {i}); s{v}(o{v}, {i} + 1); {r} = Object.keys(o{v}).join() + ':' + o{v}.z + ':' + o{v}.got; }}",
+                    f"{p}log({r});"]
+        start = self.pick('[]', 'new Array()', 'new Array(3)', "['x']", '[1.5, 2.5, 3.5, 4.5]', 'Object.freeze([])', "{push: function (x) { return 'mine'; }}")
+        vals = ', '.join(self.r.choice(['{}', "'s'", 'null', 'undefined', '1', '1.5', 'NaN', '-0', e, f'{i}', f'{i} * 0.5', f'{i} | 0', 'true']) for _ in range(self.r.randint(1, 3)))
+        return [f"{p}var {v} = function (a, x) {{ return a.push(x); }}, {r} = 0, l{v} = null;",
+                f"{p}for (var {i} = 0; {i} < 300; {i}++) {{ if ({i} % 50 === 0) l{v} = {start}; var q{v} = [{vals}]; try {{ {r} = {v}(l{v}, q{v}[{i} % q{v}.length]); }} catch (x{v}) {{ {r} = x{v}.name; }} }}",
+                f"{p}log({r}); log(String(l{v}.length)); if (l{v}.join) log(l{v}.map(function (x) {{ return 1 / x; }}).join());"]
 
     def program(self):
         s = dict(any=['a', 'b'], num=[], obj=[], arr=[], fn=[])

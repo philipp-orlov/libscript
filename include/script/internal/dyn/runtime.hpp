@@ -127,11 +127,25 @@ struct Runtime : EngineRuntime
         MathFloor,
         MathCeil,
         MathTrunc,
+        // Numbers in, a number out, and nothing else happens: called directly on bare doubles.
+        MathSin,
+        MathCos,
+        MathTan,
+        MathAtan,
+        MathExp,
+        MathLog,
+        MathRound,
+        ParseInt,
+        MathMax,
+        MathMin,
+        MathPow,
+        MathAtan2,
         ArrayPush,
         ArrayPop,
         StringCharCodeAt,
         StringFromCharCode,
         FunctionApply,
+        FunctionCall,
         IntrinsicCount
     };
     Ref<GCObject> intrinsics[IntrinsicCount];

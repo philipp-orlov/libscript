@@ -219,16 +219,11 @@ void installMath(Runtime& rt)
         return d < 0 ? -1.0 : 1.0;
     });
     unary("fround", [](double d) { return double(float(d)); });
-    unary("round", [](double d) {
-        // JavaScript rounds halves towards +Infinity, unlike std::round.
-        if (std::isnan(d) || std::isinf(d))
-            return d;
-        return std::floor(d + 0.5);
-    });
+    unary("round", [](double d) { return numberRound(d); });
 
     rt.method(math, "pow", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        return Value(std::pow(toNumber(rt2, ci.arg(0)), toNumber(rt2, ci.arg(1))));
+        return Value(numberPow(toNumber(rt2, ci.arg(0)), toNumber(rt2, ci.arg(1))));
     }, 2);
     rt.method(math, "atan2", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
@@ -247,10 +242,7 @@ void installMath(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         double best = -std::numeric_limits<double>::infinity();
         for (const Value& v : ci.args()) {
-            const double d = toNumber(rt2, v);
-            if (std::isnan(d))
-                return Value(d);
-            best = std::max(best, d);
+            best = numberMax(best, toNumber(rt2, v));
         }
         return Value(best);
     }, 2);
@@ -258,13 +250,16 @@ void installMath(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         double best = std::numeric_limits<double>::infinity();
         for (const Value& v : ci.args()) {
-            const double d = toNumber(rt2, v);
-            if (std::isnan(d))
-                return Value(d);
-            best = std::min(best, d);
+            best = numberMin(best, toNumber(rt2, v));
         }
         return Value(best);
     }, 2);
+    const std::pair<Runtime::Intrinsic, const char*> direct[] = {
+        {Runtime::MathSin, "sin"},     {Runtime::MathCos, "cos"}, {Runtime::MathTan, "tan"}, {Runtime::MathAtan, "atan"},
+        {Runtime::MathExp, "exp"},     {Runtime::MathLog, "log"}, {Runtime::MathRound, "round"}, {Runtime::MathMax, "max"},
+        {Runtime::MathMin, "min"},     {Runtime::MathPow, "pow"}, {Runtime::MathAtan2, "atan2"}};
+    for (const auto& [which, name] : direct)
+        rt.intrinsics[which].reset(detail::Access::ptr(math->findOwn(rt.intern(name))->value));
     rt.method(math, "random", [](CallInfo&) {
         static thread_local std::mt19937_64 engine{std::random_device{}()};
         static thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);

@@ -762,6 +762,7 @@ void installBuiltins(Runtime& rt)
     installRegExp(rt);
     installBigInt(rt);
     installTypedArrays(rt);
+    installIteratorHelpers(rt);
 }
 
 }  // namespace dyn

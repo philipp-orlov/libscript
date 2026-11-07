@@ -262,6 +262,7 @@ void Runtime::releaseRoots() noexcept
     nativePending = nullptr;
     regexp.reset();
     typed.reset();
+    iterators.reset();
     if (jitBackend) {
         for (typed::NativeCode* code : jitCodes)
             jitBackend->release(code);

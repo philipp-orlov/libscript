@@ -173,6 +173,7 @@ struct Runtime : EngineRuntime
     /// See builtins/regexp.cpp.
     std::shared_ptr<struct RegExpState> regexp;
     std::shared_ptr<struct TypedState> typed;
+    std::shared_ptr<struct IteratorStateHolder> iterators;
     Ref<DynFunction> objectCtor, arrayCtor, functionCtor, promiseCtor;
     /// Prototype per JavaScript error constructor, indexed by `ErrorCode`.
     std::unordered_map<int, Ref<DynObject>> errorProtos;

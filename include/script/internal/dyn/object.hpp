@@ -235,6 +235,7 @@ enum class ObjClass : std::uint8_t
     TypedArray,
     DataView,
     Proxy,  ///< a DynProxy over something that cannot be called
+    IteratorHelper,
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.

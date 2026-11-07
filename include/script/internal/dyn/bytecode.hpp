@@ -86,6 +86,7 @@ enum class Op : std::uint8_t
     ArraySpread,  // (arr iterable -> arr)
     ObjectSpread,
     Closure,  // child index
+    DirectEval,  // eval scope: stack func this arg... as Call
     NewRegExp,  // constant: the literal's first object, which every evaluation copies
 
     // ---- calls ----
@@ -196,6 +197,22 @@ const char* opName(Op op) noexcept;
 
 /// Where a closure finds a captured variable: either a boxed local of the
 /// enclosing frame, or one of the enclosing closure's own upvalues.
+/// What a direct `eval` can see from where it is: each name in scope, and where it is to the function making the call.
+struct EvalScope
+{
+    struct Name
+    {
+        String name;
+        bool local = false;  ///< one of the caller's cells; otherwise one of its upvalues
+        bool isConst = false;
+        std::uint32_t index = 0;
+    };
+    std::vector<Name> names;
+    std::uint32_t argc = 0;
+    bool global = false;  ///< called from the top level of a program
+    bool strict = false;
+};
+
 struct UpvalDesc
 {
     bool fromParentLocal = true;
@@ -456,6 +473,7 @@ struct FunctionCode
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;
+    std::vector<EvalScope> evalScopes;  ///< DirectEval operands
     std::vector<UpvalDesc> upvals;
     std::vector<Handler> handlers;
     /// Sorted by pc; the line of an instruction is the last entry at or below it.

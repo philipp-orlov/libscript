@@ -78,6 +78,9 @@ struct FnState
     bool isGlobal = false;
     bool isDerivedCtor = false;
     bool isMethod = false;
+    /// Something in here calls `eval` directly: every name is kept in a cell, where the code it compiles can find it.
+    bool boxAll = false;
+    bool isEval = false;
 };
 
 enum class RefKind
@@ -166,6 +169,17 @@ void collectCaptured(const Node& n, std::set<String>& out)
         return;
     }
     forEachChild(n, [&](const Node& kid) { collectCaptured(kid, out); });
+}
+
+/// A call of `eval` by that name, here or in any function nested here.
+bool containsDirectEval(const Node& n)
+{
+    checkNativeStack();
+    if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval")
+        return true;
+    bool found = false;
+    forEachChild(n, [&](const Node& kid) { found = found || containsDirectEval(kid); });
+    return found;
 }
 
 /// `var` and function-declaration names, which hoist to the top of the
@@ -292,6 +306,9 @@ public:
 
         checkDeclarations(node.list, true);
         collectCaptured(node, fs.captured);
+        fs.boxAll = containsDirectEval(node);
+        if (fs.boxAll)
+            fs.code->jitRefused = true;
         fs.completionSlot = hiddenSlot();
         emit(Op::PushUndefined);
         emitU(Op::SetLocal, fs.completionSlot);
@@ -305,7 +322,89 @@ public:
         return fs.code;
     }
 
+    std::shared_ptr<FunctionCode> evalCode(const Node& node, const EvalScope& scope)
+    {
+        // The caller, as far as this code can tell: its cells as boxed locals, its upvalues as upvalues of its own.
+        FnState outermost;
+        FnState caller;
+        caller.parent = &outermost;
+        caller.code = std::make_shared<FunctionCode>();
+        for (const EvalScope::Name& name : scope.names) {
+            if (name.local) {
+                Local local;
+                local.name = name.name;
+                local.slot = name.index;
+                local.boxed = true;
+                local.isConst = name.isConst;
+                caller.locals.push_back(local);
+            } else {
+                if (caller.upvalNames.size() <= name.index) {
+                    caller.upvalNames.resize(name.index + 1, ascii(" none"));
+                    caller.upvalConst.resize(name.index + 1, false);
+                }
+                caller.upvalNames[name.index] = name.name;
+                caller.upvalConst[name.index] = name.isConst;
+            }
+        }
+        FnState fs;
+        fs.parent = &caller;
+        fs.code = std::make_shared<FunctionCode>();
+        fs.code->setName("<eval>");
+        fs.code->sourceName = sourceName_;
+        fs.code->isArrow = true;
+        fs.code->jitRefused = true;
+        fs.isArrow = true;
+        fs.isEval = true;
+        fs.isGlobal = scope.global;
+        fn_ = &fs;
+        const StrictScope inherited(*this, scope.strict);
+        const StrictScope strictProgram(*this, hasUseStrict(node));
+        fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
+        checkDeclarations(node.list, true);
+        collectCaptured(node, fs.captured);
+        fs.boxAll = containsDirectEval(node);
+        fs.completionSlot = hiddenSlot();
+        emit(Op::PushUndefined);
+        emitU(Op::SetLocal, fs.completionSlot);
+        hoist(node, true);
+        for (const NodePtr& s : node.list)
+            stmt(*s);
+        emitU(Op::GetLocal, fs.completionSlot);
+        emit(Op::Return);
+        return fs.code;
+    }
+
 private:
+    /// What a direct `eval` here can see.
+    std::uint32_t evalScopeHere(std::uint32_t argc)
+    {
+        EvalScope scope;
+        scope.argc = argc;
+        scope.global = fn_->isGlobal;
+        scope.strict = inStrictCode();
+        std::set<String> seen;
+        for (std::size_t i = fn_->locals.size(); i-- > 0;) {
+            const Local& local = fn_->locals[i];
+            if (!local.boxed || !seen.insert(local.name).second)
+                continue;
+            scope.names.push_back({local.name, true, local.isConst, local.slot});
+        }
+        for (FnState* outer = fn_->parent; outer; outer = outer->parent) {
+            for (std::size_t i = outer->locals.size(); i-- > 0;) {
+                const String name = outer->locals[i].name;
+                if (!outer->locals[i].boxed || seen.count(name))
+                    continue;
+                const int up = resolveUpval(*fn_, name);
+                if (up < 0)
+                    continue;
+                seen.insert(name);
+                scope.names.push_back({name, false, fn_->upvalConst[std::size_t(up)], std::uint32_t(up)});
+            }
+        }
+        fn_->code->evalScopes.push_back(std::move(scope));
+        return std::uint32_t(fn_->code->evalScopes.size() - 1);
+    }
+
     // ---- emission ----
     std::vector<std::uint8_t>& bytes() { return fn_->code->code; }
     std::uint32_t here() const { return std::uint32_t(fn_->code->code.size()); }
@@ -419,7 +518,7 @@ private:
         local.name = name;
         local.slot = fn_->nextSlot++;
         local.depth = fn_->depth;
-        local.boxed = fn_->captured.count(name) != 0;
+        local.boxed = fn_->boxAll || fn_->captured.count(name) != 0;
         local.isConst = isConst;
         fn_->code->numLocals = std::max(fn_->code->numLocals, local.slot + 1);
         fn_->locals.push_back(local);
@@ -641,6 +740,11 @@ private:
         collectCaptured(*node.d, fs.captured);
         for (const NodePtr& p : node.list)
             collectCaptured(*p, fs.captured);
+        fs.boxAll = containsDirectEval(*node.d);
+        for (const NodePtr& p : node.list)
+            fs.boxAll = fs.boxAll || containsDirectEval(*p);
+        if (fs.boxAll)
+            fs.code->jitRefused = true;
 
         FnState* saved = fn_;
         fn_ = &fs;
@@ -665,17 +769,17 @@ private:
 
         // Arrow functions inside this one read `this` from a box. It is made
         // before the parameters are bound so a default value can use it.
-        if (!fs.isArrow && fs.captured.count(ascii("this"))) {
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(ascii("this")))) {
             const std::uint32_t slot = declareLocal(ascii("this"), false);
             emit(Op::PushThis);
             emitU(Op::SetCell, slot);
         }
-        if (!fs.isArrow && fs.captured.count(ascii(" ctor"))) {
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(ascii(" ctor")))) {
             const std::uint32_t slot = declareLocal(ascii(" ctor"), false);
             emit(Op::PushCallee);
             emitU(Op::SetCell, slot);
         }
-        if (!fs.isArrow && fs.captured.count(ascii(" nt"))) {
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(ascii(" nt")))) {
             const std::uint32_t slot = declareLocal(ascii(" nt"), false);
             emit(Op::PushNewTarget);
             emitU(Op::SetCell, slot);
@@ -684,7 +788,7 @@ private:
         for (std::size_t i = 0; i < node.list.size(); ++i)
             bindParameter(*node.list[i], plainParams[i]);
 
-        if (!fs.isArrow && mentionsArguments(*node.d)) {
+        if (!fs.isArrow && (fs.boxAll || mentionsArguments(*node.d))) {
             // The VM stores the arguments array, boxed or not, at frame entry.
             const std::uint32_t slot = declareLocal(ascii("arguments"), false, false);
             fs.code->argumentsSlot = slot;
@@ -744,7 +848,7 @@ private:
             local.name = target->text;
             local.slot = slot;
             local.depth = fn_->depth;
-            local.boxed = fn_->captured.count(target->text) != 0;
+            local.boxed = fn_->boxAll || fn_->captured.count(target->text) != 0;
             fn_->locals.push_back(local);
             if (local.boxed) {
                 // The VM leaves the raw argument in the plain slot; move it
@@ -814,7 +918,7 @@ private:
                 expr(*n.a);
                 // The value of a program is the value of the last expression
                 // statement it evaluated, wherever that statement sits.
-                if (fn_->isGlobal && fn_->completionSlot != kNoSlot) {
+                if ((fn_->isGlobal || fn_->isEval) && fn_->completionSlot != kNoSlot) {
                     emit(Op::Dup);
                     emitU(Op::SetLocal, fn_->completionSlot);
                 }
@@ -927,7 +1031,8 @@ private:
     {
         const bool isConst = kind == VarKind::Const;
         if (target.kind == NK::Identifier) {
-            if (fn_->isGlobal && fn_->depth == 0) {
+            // What `let` and `const` declare in an `eval` stays in it.
+            if (fn_->isGlobal && fn_->depth == 0 && !(fn_->isEval && kind != VarKind::Var)) {
                 // Top-level bindings live on the global object so a REPL and
                 // successive `eval` calls see each other's declarations.
                 emitU(Op::DefGlobal, atomFor(target.text), PropWritable | PropEnumerable);
@@ -1440,6 +1545,8 @@ private:
         note(n.line);
         switch (n.kind) {
             case NK::NumberLit:
+                if (n.legacyOctal && earlyErrors() && inStrictCode())
+                    fail(n.line, "a number with a leading zero is not allowed in strict code");
                 emitU(Op::PushConst, constIndex(Value(n.number)));
                 return;
             case NK::StringLit:
@@ -2000,6 +2107,8 @@ private:
         pushArgs(n.list, spread);
         if (spread)
             emit(Op::CallSpread);
+        else if (callee.kind == NK::Identifier && callee.text == u"eval" && !receiverPushed && !n.optional)
+            emitU(Op::DirectEval, evalScopeHere(std::uint32_t(n.list.size())));
         else
             emitU(Op::Call, std::uint32_t(n.list.size()));
     }
@@ -2518,6 +2627,14 @@ std::shared_ptr<FunctionCode> compileProgram(Runtime& rt, const Node& program,
     Compiler compiler(rt, sourceName);
     compiler.setSloppyThis(sloppyThis);
     return compiler.program(program);
+}
+
+std::shared_ptr<FunctionCode> compileEval(Runtime& rt, const Node& program, const std::string& sourceName,
+                                          const EvalScope& scope)
+{
+    Compiler compiler(rt, sourceName);
+    compiler.setSloppyThis(true);
+    return compiler.evalCode(program, scope);
 }
 
 }  // namespace dyn

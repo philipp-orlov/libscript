@@ -44,6 +44,7 @@ void usage()
     std::puts("  --stats            print heap statistics when the program ends");
     std::puts("  --strict           TypeScript: strictNullChecks and noImplicitAny");
     std::puts("  --no-check         TypeScript: skip type checking");
+    std::puts("  --no-eval          JavaScript: eval and new Function are errors, as in an embedding by default");
     std::puts("  --interpret        C#: no native code at all");
     std::puts("  --jit              C#: compile a method to native code once it gets hot (the default)");
     std::puts("  --native           C#: compile every method it can up front");
@@ -123,6 +124,8 @@ int repl(script::Context& ctx, script::Language language)
 int main(int argc, char** argv)
 {
     script::Context::Options options;
+    // A command line runs the source it is given, and whatever that source makes of strings.
+    options.runtimeCode = true;
     script::Language language = script::Language::Auto;
     std::string source;
     std::string sourceName;
@@ -191,6 +194,10 @@ int main(int argc, char** argv)
         }
         if (arg == "--no-check") {
             options.check.enabled = false;
+            continue;
+        }
+        if (arg == "--no-eval") {
+            options.runtimeCode = false;
             continue;
         }
         if (arg == "--interpret") {

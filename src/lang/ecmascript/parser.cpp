@@ -2282,6 +2282,7 @@ NodePtr Parser::primary()
         case Tok::Number: {
             NodePtr n = makeNode(NK::NumberLit, line);
             n->number = cur_.number;
+            n->legacyOctal = cur_.legacyOctal;
             advance();
             return n;
         }

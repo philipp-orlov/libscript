@@ -23,6 +23,10 @@ struct Runtime;
 std::shared_ptr<FunctionCode> compileProgram(Runtime& rt, const Node& program,
                                              const std::string& sourceName, bool sloppyThis = false);
 
+/// The code of a direct `eval`: a function nested in the one that called it, seeing what `scope` says it sees.
+std::shared_ptr<FunctionCode> compileEval(Runtime& rt, const Node& program, const std::string& sourceName,
+                                          const EvalScope& scope);
+
 }  // namespace dyn
 }  // namespace internal
 }  // namespace script

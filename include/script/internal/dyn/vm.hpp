@@ -148,6 +148,10 @@ Value invokeMethod(Runtime& rt, const Value& object, GCObject* name,
 Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, Frame* parent,
                   bool withPrototype = true);
 
+/// `eval`: of the global scope when `scope` is null, otherwise direct, with what `caller` holds. Not a string, it is
+/// what it was.
+Value evalString(Runtime& rt, const Value& source, Frame* caller, const EvalScope* scope);
+
 /// Run a compiled program in the global scope.
 Value runProgram(Runtime& rt, const std::shared_ptr<const FunctionCode>& code);
 

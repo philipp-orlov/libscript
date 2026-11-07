@@ -28,6 +28,21 @@ bool isIdPart(unsigned char c) noexcept
 {
     return isIdStart(c) || (c >= '0' && c <= '9');
 }
+
+/// Whether a `/` at `at` in a substitution starting at `start` begins a literal: it does after an operator or an opening
+/// bracket, not after something that ends an operand.
+bool regexCanStartAfter(std::string_view src, std::size_t start, std::size_t at) noexcept
+{
+    std::size_t i = at;
+    while (i > start && (src[i - 1] == ' ' || src[i - 1] == '\t' || src[i - 1] == '\n' || src[i - 1] == '\r'))
+        --i;
+    if (i == start)
+        return true;
+    const char c = src[i - 1];
+    if (c == ')' || c == ']' || c == '}' || isIdPart(static_cast<unsigned char>(c)) || c == '"' || c == '\'' || c == '`')
+        return false;
+    return true;
+}
 bool isDigit(char c) noexcept
 {
     return c >= '0' && c <= '9';
@@ -389,6 +404,33 @@ Token Lexer::readTemplate()
                         }
                         ++pos_;
                     }
+                } else if (e == '/' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '/') {
+                    while (pos_ + 1 < src_.size() && src_[pos_ + 1] != '\n')
+                        ++pos_;
+                } else if (e == '/' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '*') {
+                    pos_ += 2;
+                    while (pos_ + 1 < src_.size() && !(src_[pos_] == '*' && src_[pos_ + 1] == '/')) {
+                        if (src_[pos_] == '\n')
+                            ++line_;
+                        ++pos_;
+                    }
+                    ++pos_;
+                } else if (e == '/' && regexCanStartAfter(src_, start, pos_)) {
+                    // A regular expression literal, whose brackets and quotes mean nothing out here.
+                    bool inClass = false;
+                    ++pos_;
+                    while (pos_ < src_.size() && src_[pos_] != '\n') {
+                        const char r = src_[pos_];
+                        if (r == '\\')
+                            ++pos_;
+                        else if (r == '[')
+                            inClass = true;
+                        else if (r == ']')
+                            inClass = false;
+                        else if (r == '/' && !inClass)
+                            break;
+                        ++pos_;
+                    }
                 } else if (e == '\n') {
                     ++line_;
                 }
@@ -448,6 +490,26 @@ Token Lexer::readNumber()
         if (!any)
             fail("missing digits in numeric literal");
         t.number = acc;
+    } else if (peek() == '0' && isDigit(peek(1))) {
+        // `017` is octal and `019` decimal, as old programs wrote them; neither has a fraction or a separator.
+        ++pos_;
+        bool octal = true;
+        double acc = 0;
+        while (pos_ < src_.size() && isDigit(src_[pos_])) {
+            octal = octal && src_[pos_] < '8';
+            ++pos_;
+        }
+        for (std::size_t i = start + 1; i < pos_; ++i)
+            acc = acc * (octal ? 8 : 10) + (src_[i] - '0');
+        if (!octal && peek() == '.') {
+            ++pos_;
+            digits(+[](char c) { return isDigit(c); });
+            acc = base::parseDouble(std::string(src_.substr(start, pos_ - start))).value;
+        }
+        t.number = acc;
+        t.legacyOctal = true;
+        if (peek() == '_' || peek() == 'n' || (octal && peek() == '.'))
+            fail("a legacy octal literal has no separator, fraction or BigInt suffix");
     } else {
         digits(+[](char c) { return isDigit(c); });
         if (peek() == '.') {
@@ -470,6 +532,16 @@ Token Lexer::readNumber()
         t.number = base::parseDouble(text).value;
     }
 
+    // A separator stands between two digits, and never right after a prefix or a leading zero.
+    for (std::size_t i = start; i < pos_; ++i) {
+        if (src_[i] != '_')
+            continue;
+        const auto digit = [&](std::size_t at) { return at >= start && at < pos_ && isHex(src_[at]) && src_[at] != '_'; };
+        const bool afterPrefix = i == start + 2 && src_[start] == '0' && !isDigit(src_[start + 1]);
+        const bool afterLeadingZero = i == start + 1 && src_[start] == '0';
+        if (i == start || !digit(i - 1) || !digit(i + 1) || afterPrefix || afterLeadingZero)
+            fail("a numeric separator must stand between two digits");
+    }
     if (peek() == 'n') {
         std::string text;
         for (std::size_t i = start; i < pos_; ++i) {

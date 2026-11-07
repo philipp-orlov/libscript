@@ -157,6 +157,7 @@ struct Runtime : EngineRuntime
         MapHas,
         SetAdd,
         SetHas,
+        Eval,
         IntrinsicCount
     };
     Ref<GCObject> intrinsics[IntrinsicCount];
@@ -208,6 +209,9 @@ struct Runtime : EngineRuntime
     /// the context holds nothing that points into the dead heap.
     std::vector<std::weak_ptr<Program>> programs;
     void adoptProgram(const std::shared_ptr<Program>& program);
+    /// What `eval` and `new Function` compiled, emptied at teardown as programs are.
+    std::vector<std::weak_ptr<const FunctionCode>> evalCodes;
+    void adoptEvalCode(const std::shared_ptr<const FunctionCode>& code);
 
     /// "at fn (file:line)" lines for the frames that are live right now.
     std::string captureStack() const override;

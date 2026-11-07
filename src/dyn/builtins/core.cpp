@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/parser.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/vm.hpp"
 
@@ -15,6 +16,8 @@ namespace internal {
 namespace dyn {
 
 namespace {
+
+Value functionFromStrings(Runtime& rt, CallInfo& ci, const char* keyword);
 
 Value objectValue(DynObject* o)
 {
@@ -349,9 +352,10 @@ void installFunction(Runtime& rt)
     }, 0);
 
     DynFunction* ctor = rt.makeConstructor("Function", [](CallInfo& ci) -> Value {
-        ci.fail(ErrorCode::TypeError,
-                "the Function constructor is disabled; the engine never compiles from strings at "
-                "runtime");
+        Runtime& rt2 = rtOf(ci);
+        if (!rt2.ctx.options.runtimeCode)
+            ci.fail(ErrorCode::EvalError, "the Function constructor is disabled: the engine runs only the source its host gives it");
+        return functionFromStrings(rt2, ci, "function");
     }, 1, proto);
     rt.functionCtor.reset(ctor);
 }
@@ -498,6 +502,32 @@ void installErrors(Runtime& rt)
     }
 }
 
+/// `new Function(p1, ..., body)` and its kin: the parameters and the body are checked apart, so neither can close what
+/// the other opened, and then compiled together at the top level.
+Value functionFromStrings(Runtime& rt, CallInfo& ci, const char* keyword)
+{
+    String params;
+    for (std::size_t i = 0; i + 1 < ci.size(); ++i) {
+        if (i)
+            params.push_back(u',');
+        params += toStringValue(rt, ci.arg(i));
+    }
+    const String body = ci.size() ? toStringValue(rt, ci.arg(ci.size() - 1)) : String();
+    const auto check = [&](const String& source) {
+        try {
+            const std::string utf8 = toUtf8(source);
+            Parser parser(utf8, "<function>", false);
+            parser.parseProgram();
+        } catch (const Error& e) {
+            throwError(rt, ErrorCode::SyntaxError, e.what());
+        }
+    };
+    check(ascii("(") + ascii(keyword) + ascii(" anonymous(") + params + ascii("\n) {})"));
+    check(ascii("(") + ascii(keyword) + ascii(" anonymous() {\n") + body + ascii("\n})"));
+    const String source = ascii("(") + ascii(keyword) + ascii(" anonymous(") + params + ascii("\n) {\n") + body + ascii("\n})");
+    return evalString(rt, rt.str(source), nullptr, nullptr);
+}
+
 void installGlobals(Runtime& rt)
 {
     DynObject* g = rt.globalObject.get();
@@ -521,6 +551,9 @@ void installGlobals(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         return Value(parseFloatPrefix(toStringValue(rt2, ci.arg(0))));
     }, 1);
+
+    rt.method(g, "eval", [](CallInfo& ci) { return evalString(rtOf(ci), ci.arg(0), nullptr, nullptr); }, 1);
+    rt.intrinsics[Runtime::Eval].reset(detail::Access::ptr(g->findOwn(rt.intern("eval"))->value));
 
     rt.method(g, "isNaN", [](CallInfo& ci) {
         return Value(std::isnan(toNumber(rtOf(ci), ci.arg(0))));

@@ -167,6 +167,8 @@ struct Token
     std::vector<String> raws;
     /// An escape spelled this word, which was then no keyword.
     bool escapedKeyword = false;
+    /// A number written with a leading zero, `017` or `09`.
+    bool legacyOctal = false;
 };
 
 /// A single-pass tokenizer. Division and regular-expression literals are told

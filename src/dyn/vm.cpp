@@ -15,7 +15,9 @@
 #include "script/internal/dyn/jit_helpers.hpp"
 #include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/compiler.hpp"
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/dyn/parser.hpp"
 #include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/stack_guard.hpp"
 
@@ -1442,6 +1444,31 @@ Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, 
     return detail::Access::adopt(Type::Object, fn);
 }
 
+Value evalString(Runtime& rt, const Value& source, Frame* caller, const EvalScope* scope)
+{
+    if (!rt.ctx.options.runtimeCode)
+        throwError(rt, ErrorCode::EvalError, "eval is disabled: the engine runs only the source its host gives it");
+    StringCell* text = asString(source);
+    if (!text)
+        return source;
+    std::shared_ptr<FunctionCode> code;
+    try {
+        const std::string utf8 = toUtf8(text->text());
+        Parser parser(utf8, "<eval>", /*typescript=*/false);
+        NodePtr program = parser.parseProgram();
+        code = scope && caller ? compileEval(rt, *program, "<eval>", *scope) : compileProgram(rt, *program, "<eval>", /*sloppyThis=*/true);
+    } catch (Exception&) {
+        throw;
+    } catch (const Error& e) {
+        throwError(rt, e.code() == ErrorCode::CompileError ? ErrorCode::SyntaxError : e.code(), e.what());
+    }
+    rt.adoptEvalCode(code);
+    if (!scope || !caller)
+        return runProgram(rt, code);
+    Value closure = makeClosure(rt, code, caller, /*withPrototype=*/false);
+    return callValue(rt, closure, caller->thisValue, {});
+}
+
 Value runProgram(Runtime& rt, const std::shared_ptr<const FunctionCode>& code)
 {
     // A program is never `new`ed, so it gets no prototype object: that object
@@ -2283,6 +2310,21 @@ Value execute(Runtime& rt, Frame& frame)
                         }
 #endif
                         sp.push_back(callValue(rt, callee, self, buffer.args));
+                        break;
+                    }
+                    case Op::DirectEval: {
+                        const EvalScope& scope = code.evalScopes[operandAt(pc)];
+                        pc += 4;
+                        ContextImpl::ArgBuffer buffer(rt.ctx);
+                        buffer.args.assign(std::make_move_iterator(sp.end() - scope.argc), std::make_move_iterator(sp.end()));
+                        sp.resize(sp.size() - scope.argc);
+                        Value self = pop();
+                        Value callee = pop();
+                        // Only the real `eval` sees the caller's names; anything else called `eval` is an ordinary call.
+                        if (detail::Access::ptr(callee) == rt.intrinsics[Runtime::Eval].get())
+                            sp.push_back(evalString(rt, buffer.args.empty() ? Value::undefined() : buffer.args[0], &frame, &scope));
+                        else
+                            sp.push_back(callValue(rt, callee, self, buffer.args));
                         break;
                     }
                     case Op::New:

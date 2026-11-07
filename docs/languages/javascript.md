@@ -101,8 +101,15 @@ properties of strings such as `\p{RGI_Emoji}`), `BigInt`, and `ArrayBuffer`
 with the typed arrays, `DataView` and `Atomics` (one thread: nothing ever waits) are
 all there. These are not yet:
 `Proxy`, iterator helpers, `with`,
-modules through `import()`, `Temporal`. `eval` and `new Function` stay out by
-design: the engine runs only what its host gives it.
+modules through `import()`, `Temporal`.
+
+`eval` and `new Function` are there for a host that asks for them with
+`Context::Options::runtimeCode`; by default the engine runs only the source its host
+gives it, and both are an `EvalError`. The command-line tool turns them on (`--no-eval`
+turns them off). A function that calls `eval` directly keeps all its variables in
+cells, where the compiled string finds them, and runs in the interpreter. A `var` that
+such a string declares inside a function stays in the string's own scope, as it would
+in strict code.
 
 Functions that use generators or async, and derived class constructors, run in
 the interpreter. A `for-of` runs in native code only over a plain array, whose

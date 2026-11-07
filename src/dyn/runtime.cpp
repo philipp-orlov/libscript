@@ -31,7 +31,7 @@ const char* opName(Op op) noexcept
         "DeleteElem", "DefField", "DefGetter", "DefSetter", "DefElem", "DefMethod",
         "DefMethodElem", "ObjectRest", "ClassSetup", "SetProtoOf", "GetSuper", "SetSuper",
         "GetSuperElem",
-        "NewObject", "NewArray", "ArrayAppend", "ArraySpread", "ObjectSpread", "Closure", "NewRegExp",
+        "NewObject", "NewArray", "ArrayAppend", "ArraySpread", "ObjectSpread", "Closure", "DirectEval", "NewRegExp",
         "Call", "CallSpread", "New", "NewSpread", "CallSuper", "CallSuperSpread", "Return",
         "ReturnUndefined",
         "Jump", "JumpIfFalse", "JumpIfTrue", "JumpIfFalseKeep", "JumpIfTrueKeep",
@@ -222,6 +222,14 @@ void releaseCode(const FunctionCode& code) noexcept
 
 }  // namespace
 
+void Runtime::adoptEvalCode(const std::shared_ptr<const FunctionCode>& code)
+{
+    if (evalCodes.size() >= 64)
+        evalCodes.erase(std::remove_if(evalCodes.begin(), evalCodes.end(), [](const std::weak_ptr<const FunctionCode>& c) { return c.expired(); }),
+                        evalCodes.end());
+    evalCodes.push_back(code);
+}
+
 void Runtime::adoptProgram(const std::shared_ptr<Program>& program)
 {
     // Forget the ones already gone while we are here, so the list stays the
@@ -241,6 +249,11 @@ void Runtime::releaseRoots() noexcept
         }
     }
     programs.clear();
+    for (const std::weak_ptr<const FunctionCode>& weak : evalCodes) {
+        if (std::shared_ptr<const FunctionCode> code = weak.lock())
+            releaseCode(*code);
+    }
+    evalCodes.clear();
     for (Ref<GCObject>& fn : intrinsics)
         fn.reset();
     for (Ref<GCObject>& c : asciiChars)

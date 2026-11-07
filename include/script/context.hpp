@@ -186,6 +186,9 @@ public:
         CompileOptions compile;              ///< how the C# front end compiles
         CheckOptions check;                  ///< how strictly TypeScript is checked
         JitOptions jit;                      ///< native code generation
+        /// `eval` and `new Function` compile and run strings a program makes. Off, the engine runs only the source its
+        /// host hands it, and both are a TypeError.
+        bool runtimeCode = false;
     };
 
     struct Stats

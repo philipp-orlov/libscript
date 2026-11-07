@@ -1296,6 +1296,25 @@ TEST(bigIntsAreIntegersOfAnySize)
     CHECK_EQ(text("function m(a, b) { return a * b; } for (var i = 0; i < 20000; i++) m(i, 2); String(m(3n, 4n))"), std::string("12"));
 }
 
+TEST(evalIsOffUnlessTheHostTurnsItOn)
+{
+    js::Context off;
+    CHECK_EQ(off.eval("var name; try { eval('1'); } catch (e) { name = e.name; } name", "<test>").toString(), std::string("EvalError"));
+    CHECK_EQ(off.eval("var name2; try { new Function('return 1'); } catch (e) { name2 = e.name; } name2", "<test>").toString(), std::string("EvalError"));
+
+    script::Context::Options options;
+    options.runtimeCode = true;
+    script::Context on(options);
+    const auto text = [&](const char* source) { return on.eval(source, "<test>.js", script::Language::JavaScript).toString(); };
+    CHECK_EQ(text("function f(a) { var b = 10; return eval('a + b'); } String(f(5))"), std::string("15"));
+    CHECK_EQ(text("function g() { var x = 1; eval('x = 42'); return x; } String(g())"), std::string("42"));
+    CHECK_EQ(text("function h() { var x = 3; return function () { return eval('x * 2'); }; } String(h()())"), std::string("6"));
+    CHECK_EQ(text("function t() { return eval('this.k + arguments.length'); } t.call({ k: 'k' }, 1, 2)"), std::string("k2"));
+    CHECK_EQ(text("var indirect = eval; function l() { var q = 1; try { return indirect('q'); } catch (e) { return e.name; } } l()"), std::string("ReferenceError"));
+    CHECK_EQ(text("String(new Function('a', 'b', 'return a * b')(6, 7))"), std::string("42"));
+    CHECK_EQ(text("var n; try { eval('1 +'); } catch (e) { n = e.name; } n"), std::string("SyntaxError"));
+}
+
 TEST(aDelegateOfAnAsyncGeneratorThatThrowsIsTheGeneratorsToCatch)
 {
     script::Context ctx;

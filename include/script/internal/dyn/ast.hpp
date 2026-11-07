@@ -172,6 +172,7 @@ struct Node
     bool isParamProp = false;  ///< a constructor parameter that declares a field
     bool allocatesThis = false;  ///< ClassExpr: Python's way, where `self` exists before the base's `__init__` runs
     bool isMethod = false;     ///< FunctionExpr: a method or accessor, or what runs a field: `super.x` means something
+    bool legacyOctal = false;  ///< NumberLit written as `017`: an error in strict code
     bool isPrivate = false;    ///< a member named `#x`; an Identifier that is such a name
     bool isGenerator = false;  ///< FunctionExpr: `function*`
     bool isAsync = false;      ///< FunctionExpr, ArrowExpr: `async`; ForOf: `for await`

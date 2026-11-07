@@ -1010,6 +1010,17 @@ TEST(capturedVariablesOfEveryKindMadeInNativeCode)
              std::string("18000"));
 }
 
+TEST(aConstructorKnownOnEveryWayIntoAJoinIsKnownAfterIt)
+{
+    CHECK_EQ(run("function P(a, d) { this.a = a; this.d = d; }"
+                 "function build(n) { return n === 0 ? null : new P(n, n & 1 ? new P(-n, null) : build(n - 1)); }"
+                 "function count(p) { var c = 0; while (p) { c += p.a; p = p.d; } return c; }"
+                 "var t = 0; for (var i = 0; i < 3000; i++) t += count(build(i & 15));"
+                 "var Q = P; P = function (a, d) { this.a = 2 * a; this.d = d; }; P.prototype = Q.prototype;"
+                 "t + ',' + count(build(4)) + ',' + (build(3) instanceof Q)"),
+             std::string("10484,8,true"));
+}
+
 TEST(callingThroughCallIsCalling)
 {
     CHECK_EQ(run("function g(a, b) { return this.k + a * b; } function f(o, a) { return g.call(o, a, 2); }"

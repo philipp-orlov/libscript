@@ -1645,6 +1645,11 @@ private:
         Join& join = joins_[target];
         if (!join.seen) {
             join.seen = true;
+            join.sameFunction.assign(stack_.size(), nullptr);
+            for (std::size_t i = 0; i < stack_.size(); ++i) {
+                if (stack_[i].pinned && stack_[i].rep == Rep::Tagged && !stack_[i].isConst)
+                    join.sameFunction[i] = stack_[i].hint;
+            }
             join.entries.resize(stack_.size());
             for (Entry& canonical : join.entries) {
                 canonical = Entry();
@@ -1654,6 +1659,11 @@ private:
             }
         } else if (join.entries.size() != stack_.size()) {
             refuse("the evaluation stack is inconsistent at a join");
+        } else {
+            for (std::size_t i = 0; i < stack_.size(); ++i) {
+                if (!stack_[i].pinned || stack_[i].hint != join.sameFunction[i])
+                    join.sameFunction[i] = nullptr;
+            }
         }
         for (std::size_t i = 0; i < stack_.size(); ++i) {
             Entry& e = stack_[i];
@@ -1669,7 +1679,16 @@ private:
             IrInst& mov = inst(IrOp::Mov);
             mov.d = canonical.r;
             mov.a = payload;
+            // A branch carries on here too, with the same value in the join's registers: what is known of it still is.
+            const bool pinned = e.pinned;
+            const GCObject* hint = e.hint;
             e = canonical;
+            if (pinned) {
+                e.pinned = true;
+                e.hint = hint;
+                e.hasKnownTag = true;
+                e.known = Type::Object;
+            }
         }
     }
     void enterJoin(std::uint32_t pc, bool fallsIn)
@@ -1681,13 +1700,27 @@ private:
             stack_ = joins_[pc].entries;
         else
             stack_.clear();
+        // A function every way in had at this place is that function here too: `new F(a, c ? x : new F(...))` keeps
+        // knowing which `F` it calls. Each way in counted it, so the entry stays owned. Not at a loop head, which a way in
+        // reaches only after this.
+        if (joins_[pc].seen && !loopHead_[pc]) {
+            for (std::size_t i = 0; i < stack_.size() && i < joins_[pc].sameFunction.size(); ++i) {
+                if (const void* fn = joins_[pc].sameFunction[i]) {
+                    stack_[i].pinned = true;
+                    stack_[i].hint = static_cast<const GCObject*>(fn);
+                    stack_[i].hasKnownTag = true;
+                    stack_[i].known = Type::Object;
+                }
+            }
+        }
     }
 
     // ---- the walk ----
     void walk()
     {
         const std::vector<std::uint8_t>& c = code_.code;
-        std::vector<std::uint8_t> loopHead(c.size() + 1, 0);
+        std::vector<std::uint8_t>& loopHead = loopHead_;
+        loopHead.assign(c.size() + 1, 0);
         for (std::size_t pc = 0; pc < c.size();) {
             const Op op = Op(c[pc]);
             if (isBranch(op) && reachable_[pc] && readOperand(c, pc + 1) <= pc)
@@ -6221,6 +6254,8 @@ private:
     {
         bool seen = false;
         std::vector<Entry> entries;
+        /// Per position, the function every way in so far has had there, known and pinned; null where they differ.
+        std::vector<const void*> sameFunction;
     };
 
     Runtime& rt_;
@@ -6261,6 +6296,7 @@ private:
     std::vector<ShapeFact> shapeFacts_;
     /// `protoEpoch` is known to be what the code was compiled against.
     bool epochKnown_ = false;
+    std::vector<std::uint8_t> loopHead_;
     std::vector<std::int32_t> knownArrays_;
     bool intWork_ = false;
     bool argsLazy_ = false;

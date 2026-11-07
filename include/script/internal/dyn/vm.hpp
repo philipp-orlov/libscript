@@ -97,6 +97,10 @@ bool deleteProperty(Runtime& rt, const Value& base, GCObject* key);
 Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly, bool includeSymbols);
 
 Value getIndex(Runtime& rt, const Value& base, std::uint32_t i);
+/// `base[key]` for a number key on an array or a typed array, with no property name made; false when that is not what
+/// this is.
+bool getElementByNumber(Runtime& rt, const Value& base, const Value& key, Value& out);
+bool setElementByNumber(Runtime& rt, const Value& base, const Value& key, const Value& v);
 void setIndex(Runtime& rt, const Value& base, std::uint32_t i, const Value& v);
 std::uint32_t lengthOf(Runtime& rt, const Value& v);
 

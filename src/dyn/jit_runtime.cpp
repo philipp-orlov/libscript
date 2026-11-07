@@ -355,6 +355,9 @@ NativePair scriptDynGetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload
                             std::uint64_t key) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        Value element;
+        if (getElementByNumber(*rt, valueOf(tag, payload), valueOf(keyTag, key), element))
+            return keep(*rt, element);
         Ref<GCObject> k = toPropertyKey(*rt, valueOf(keyTag, key));
         return keep(*rt, getProperty(*rt, valueOf(tag, payload), k.get()));
     });
@@ -364,6 +367,8 @@ void scriptDynSetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std:
                       std::int64_t valueTag, std::uint64_t value) noexcept
 {
     guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        if (setElementByNumber(*rt, valueOf(tag, payload), valueOf(keyTag, key), valueOf(valueTag, value)))
+            return 0;
         Ref<GCObject> k = toPropertyKey(*rt, valueOf(keyTag, key));
         setProperty(*rt, valueOf(tag, payload), k.get(), valueOf(valueTag, value));
         return 0;

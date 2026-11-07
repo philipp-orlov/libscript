@@ -995,6 +995,64 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
     return keys;
 }
 
+bool getElementByNumber(Runtime& rt, const Value& base, const Value& key, Value& out)
+{
+    if (!key.isDouble())
+        return false;
+    DynObject* o = asObject(base);
+    if (!o)
+        return false;
+    const double d = detail::Access::r8(key);
+    if (o->cls == ObjClass::TypedArray) {
+        auto* ta = static_cast<DynTypedArray*>(o);
+        if (d >= 0 && d < double(ta->length) && d == std::floor(d)) {
+            out = typedArrayGet(rt, ta, std::size_t(d));
+            return true;
+        }
+        if (d < 0 || d != std::floor(d) || d >= double(ta->length)) {
+            // Any number is answered by the array itself, as no element.
+            if (!std::isnan(d) && !(d == 0 && std::signbit(d)) && d >= 0) {
+                out = Value::undefined();
+                return true;
+            }
+        }
+        return false;
+    }
+    if (o->cls == ObjClass::Array) {
+        auto* arr = static_cast<DynArray*>(o);
+        if (d >= 0 && d < double(arr->size()) && d == std::floor(d) && arr->hasElement(std::size_t(d))) {
+            out = arr->at(std::size_t(d));
+            return true;
+        }
+    }
+    return false;
+}
+
+bool setElementByNumber(Runtime& rt, const Value& base, const Value& key, const Value& v)
+{
+    if (!key.isDouble())
+        return false;
+    DynObject* o = asObject(base);
+    if (!o)
+        return false;
+    const double d = detail::Access::r8(key);
+    if (o->cls == ObjClass::TypedArray) {
+        if (d >= 0 && d == std::floor(d)) {
+            typedArraySet(rt, static_cast<DynTypedArray*>(o), d, v);
+            return true;
+        }
+        return false;
+    }
+    if (o->cls == ObjClass::Array) {
+        auto* arr = static_cast<DynArray*>(o);
+        if (d >= 0 && d < double(arr->size()) && d == std::floor(d) && arr->hasElement(std::size_t(d)) && !arr->frozen && arr->props.empty()) {
+            arr->put(std::size_t(d), v);
+            return true;
+        }
+    }
+    return false;
+}
+
 Value getIndex(Runtime& rt, const Value& base, std::uint32_t i)
 {
     if (DynArray* arr = asArray(base)) {

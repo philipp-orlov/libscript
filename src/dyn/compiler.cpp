@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <map>
 #include <vector>
@@ -81,6 +82,9 @@ struct FnState
     /// Something in here calls `eval` directly: every name is kept in a cell, where the code it compiles can find it.
     bool boxAll = false;
     bool isEval = false;
+    std::unordered_map<std::uint64_t, std::uint32_t> numberConsts;
+    std::unordered_map<String, std::uint32_t> stringConsts;
+    std::unordered_map<const GCObject*, std::uint32_t> atomSlots;
 };
 
 enum class RefKind
@@ -460,7 +464,20 @@ private:
 
     std::uint32_t constIndex(const Value& v)
     {
+        // By exact bits for a number, so -0 stays -0; by text for a string. A big function has thousands.
         auto& consts = fn_->code->consts;
+        if (v.type() == Type::Double) {
+            auto [it, fresh] = fn_->numberConsts.emplace(detail::Access::u8(v), std::uint32_t(consts.size()));
+            if (fresh)
+                consts.push_back(v);
+            return it->second;
+        }
+        if (StringCell* text = asString(v)) {
+            auto [it, fresh] = fn_->stringConsts.emplace(String(text->text()), std::uint32_t(consts.size()));
+            if (fresh)
+                consts.push_back(v);
+            return it->second;
+        }
         for (std::uint32_t i = 0; i < consts.size(); ++i) {
             if (consts[i].type() == v.type() && strictEquals(consts[i], v))
                 return i;
@@ -471,12 +488,10 @@ private:
     std::uint32_t atomIndex(GCObject* key)
     {
         auto& atoms = fn_->code->atoms;
-        for (std::uint32_t i = 0; i < atoms.size(); ++i) {
-            if (atoms[i].get() == key)
-                return i;
-        }
-        atoms.emplace_back(key);
-        return std::uint32_t(atoms.size() - 1);
+        auto [it, fresh] = fn_->atomSlots.emplace(key, std::uint32_t(atoms.size()));
+        if (fresh)
+            atoms.emplace_back(key);
+        return it->second;
     }
     std::uint32_t atomFor(StringView name)
     {

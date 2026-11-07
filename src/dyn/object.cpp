@@ -572,7 +572,11 @@ void DynArray::appendAll(const Value* items, std::size_t count)
 
 void DynArray::resize(std::size_t n)
 {
-    if (n > store.size_)
+    // Writing one past the end, element by element, grows by half again each time it runs out, as appending does; a
+    // jump to a length further off takes that length exactly.
+    if (n > store.cap_)
+        reserveElements(n <= std::size_t(store.cap_) + 16 ? std::max<std::size_t>(n, std::size_t(store.cap_) + store.cap_ / 2 + 4) : n);
+    else if (n > store.size_)
         reserveElements(n);
     if (numbersOnly) {
         for (std::size_t i = store.size_; i < n; ++i)

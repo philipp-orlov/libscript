@@ -178,6 +178,8 @@ public:
 
     /// Read the next token. `regexAllowed` selects the `/` interpretation.
     Token next(bool regexAllowed = true);
+    /// `slash` was the last token read: back up and read it again as a regular expression literal.
+    Token rescanAsRegex(const Token& slash);
 
     [[noreturn]] void fail(const std::string& message) const;
     [[noreturn]] static void fail(const std::string& sourceName, std::uint32_t line,

@@ -217,6 +217,8 @@ enum class ObjClass : std::uint8_t
     Set,
     Promise,
     Generator,
+    RegExp,
+    RegExpStringIterator,
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.
@@ -533,7 +535,50 @@ struct DynWrapper : DynObject
     Value primitive = Value::undefined();
 
     void children(GcList& out) const override;
-    void clearReferences() override { primitive = Value::undefined(); }
+    void clearReferences() override
+    {
+        DynObject::clearReferences();
+        primitive = Value::undefined();
+    }
+};
+
+namespace regex {
+struct Program;
+}
+
+/// A regular expression: what it was made from, and what that compiled to.
+struct DynRegExp : DynObject
+{
+    Value source = Value::undefined();
+    Value flagText = Value::undefined();
+    std::shared_ptr<const regex::Program> program;
+    unsigned flags = 0;
+
+    void children(GcList& out) const override;
+    void clearReferences() override
+    {
+        DynObject::clearReferences();
+        source = Value::undefined();
+        flagText = Value::undefined();
+    }
+};
+
+/// What `matchAll` hands back.
+struct DynRegExpIterator : DynObject
+{
+    Value regexp = Value::undefined();
+    Value input = Value::undefined();
+    bool global = false;
+    bool pairs = false;
+    bool done = false;
+
+    void children(GcList& out) const override;
+    void clearReferences() override
+    {
+        DynObject::clearReferences();
+        regexp = Value::undefined();
+        input = Value::undefined();
+    }
 };
 
 enum class FnKind : std::uint8_t

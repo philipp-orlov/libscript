@@ -31,7 +31,7 @@ const char* opName(Op op) noexcept
         "DeleteElem", "DefField", "DefGetter", "DefSetter", "DefElem", "DefMethod",
         "DefMethodElem", "ObjectRest", "ClassSetup", "SetProtoOf", "GetSuper", "SetSuper",
         "GetSuperElem",
-        "NewObject", "NewArray", "ArrayAppend", "ArraySpread", "ObjectSpread", "Closure",
+        "NewObject", "NewArray", "ArrayAppend", "ArraySpread", "ObjectSpread", "Closure", "NewRegExp",
         "Call", "CallSpread", "New", "NewSpread", "CallSuper", "CallSuperSpread", "Return",
         "ReturnUndefined",
         "Jump", "JumpIfFalse", "JumpIfTrue", "JumpIfFalseKeep", "JumpIfTrueKeep",
@@ -158,6 +158,14 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     sym.toPrimitive.reset(wellKnown("Symbol.toPrimitive"), true);
     sym.toStringTag.reset(wellKnown("Symbol.toStringTag"), true);
     sym.hasInstance.reset(wellKnown("Symbol.hasInstance"), true);
+    sym.match.reset(wellKnown("Symbol.match"), true);
+    sym.matchAll.reset(wellKnown("Symbol.matchAll"), true);
+    sym.replace.reset(wellKnown("Symbol.replace"), true);
+    sym.search.reset(wellKnown("Symbol.search"), true);
+    sym.split.reset(wellKnown("Symbol.split"), true);
+    sym.species.reset(wellKnown("Symbol.species"), true);
+    sym.unscopables.reset(wellKnown("Symbol.unscopables"), true);
+    sym.isConcatSpreadable.reset(wellKnown("Symbol.isConcatSpreadable"), true);
 
     installBuiltins(*this);
     for (DynObject* builtin : {objectProto.get(), functionProto.get(), arrayProto.get()})
@@ -239,6 +247,7 @@ void Runtime::releaseRoots() noexcept
         c.reset();
     nativeKeepAlive = Value::undefined();
     nativePending = nullptr;
+    regexp.reset();
     if (jitBackend) {
         for (typed::NativeCode* code : jitCodes)
             jitBackend->release(code);
@@ -259,7 +268,7 @@ void Runtime::releaseRoots() noexcept
                               &stringProto, &numberProto, &booleanProto, &symbolProto,
                               &errorProto, &dateProto, &mapProto, &setProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
                               &asyncGeneratorProto, &asyncGeneratorFunctionProto,
-                              &iteratorProto, &arrayIteratorProto})
+                              &iteratorProto, &arrayIteratorProto, &regExpProto, &regExpStringIteratorProto})
         p->reset();
     atom = Atoms{};
     sym = Symbols{};
@@ -465,7 +474,7 @@ void Runtime::method(DynObject* target, const char* name, NativeFunction fn, int
 
 void Runtime::getter(DynObject* target, const char* name, NativeFunction fn)
 {
-    target->putOwn(intern(name), makeFunction(ascii(name), std::move(fn), 0),
+    target->putOwn(intern(name), makeFunction(ascii("get ") + ascii(name), std::move(fn), 0),
                    PropConfigurable | PropAccessor);
 }
 

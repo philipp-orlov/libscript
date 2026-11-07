@@ -97,6 +97,13 @@ void installString(Runtime& rt)
 
     DynFunction* ctor = rt.makeConstructor("String", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
+        // Asked for a string, a symbol has one to give; only an implicit conversion is an error.
+        if (!ci.isConstructorCall() && ci.arg(0).isSymbol()) {
+            String shown = ascii("Symbol(");
+            shown += static_cast<SymbolCell*>(detail::Access::ptr(ci.arg(0)))->description;
+            shown.push_back(u')');
+            return rt2.str(shown);
+        }
         const String text = ci.size() ? toStringValue(rt2, ci.arg(0)) : String();
         if (!ci.isConstructorCall())
             return rt2.str(text);
@@ -354,70 +361,6 @@ void installString(Runtime& rt)
     };
     rt.method(proto, "padStart", [pad](CallInfo& ci) { return pad(ci, true); }, 2);
     rt.method(proto, "padEnd", [pad](CallInfo& ci) { return pad(ci, false); }, 2);
-
-    rt.method(proto, "split", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        const ThisText receiver(ci);
-        const StringView s = receiver.view;
-        Vec<Value> parts;
-        if (ci.arg(0).isUndefined()) {
-            parts.push_back(rt2.str(s));
-            return rt2.makeArray(std::move(parts));
-        }
-        const String sep = toStringValue(rt2, ci.arg(0));
-        if (sep.empty()) {
-            for (Char c : s)
-                parts.push_back(rt2.str(String(1, c)));
-            return rt2.makeArray(std::move(parts));
-        }
-        std::size_t at = 0;
-        for (;;) {
-            const std::size_t hit = s.find(sep, at);
-            if (hit == String::npos) {
-                parts.push_back(rt2.str(s.substr(at)));
-                break;
-            }
-            parts.push_back(rt2.str(s.substr(at, hit - at)));
-            at = hit + sep.size();
-        }
-        return rt2.makeArray(std::move(parts));
-    }, 2);
-
-    auto replace = [](CallInfo& ci, bool all) {
-        Runtime& rt2 = rtOf(ci);
-        const ThisText receiver(ci);
-        const StringView s = receiver.view;
-        const String needle = toStringValue(rt2, ci.arg(0));
-        const Value replacement = ci.arg(1);
-        String out;
-        std::size_t at = 0;
-        for (;;) {
-            const std::size_t hit = needle.empty() && at > 0 ? String::npos : s.find(needle, at);
-            if (hit == String::npos) {
-                out += s.substr(at);
-                break;
-            }
-            out += s.substr(at, hit - at);
-            if (asFunction(replacement)) {
-                out += toStringValue(
-                    rt2, callValue(rt2, replacement, Value::undefined(),
-                                   {rt2.str(needle), Value(double(hit)), rt2.str(s)}));
-            } else {
-                out += toStringValue(rt2, replacement);
-            }
-            at = hit + std::max<std::size_t>(needle.size(), 1);
-            if (at > s.size()) {
-                break;
-            }
-            if (!all) {
-                out += s.substr(at);
-                break;
-            }
-        }
-        return rt2.str(out);
-    };
-    rt.method(proto, "replace", [replace](CallInfo& ci) { return replace(ci, false); }, 2);
-    rt.method(proto, "replaceAll", [replace](CallInfo& ci) { return replace(ci, true); }, 2);
 
     rt.method(proto, "localeCompare", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);

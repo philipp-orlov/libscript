@@ -660,6 +660,24 @@ void DynArray::trimElements()
         moveTo(store.size_);
 }
 
+void DynRegExp::children(GcList& out) const
+{
+    DynObject::children(out);
+    if (GCObject* p = detail::Access::ptr(source))
+        out.push_back(p);
+    if (GCObject* p = detail::Access::ptr(flagText))
+        out.push_back(p);
+}
+
+void DynRegExpIterator::children(GcList& out) const
+{
+    DynObject::children(out);
+    if (GCObject* p = detail::Access::ptr(regexp))
+        out.push_back(p);
+    if (GCObject* p = detail::Access::ptr(input))
+        out.push_back(p);
+}
+
 void DynWrapper::children(GcList& out) const
 {
     DynObject::children(out);

@@ -14,6 +14,7 @@
 #include <map>
 #include <vector>
 
+#include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/compiler.hpp"
 #include "script/internal/dyn/runtime.hpp"
 #include "script/internal/dyn/numconv.hpp"
@@ -1541,6 +1542,10 @@ private:
             case NK::SuperExpr:
                 fail(n.line, "'super' is only valid in a member access or a call");
             case NK::TemplateObject: templateObject(n); return;
+            case NK::RegExpLit:
+                fn_->code->consts.push_back(makeRegExpTemplate(rt_, n.text, n.strs[0]));
+                emitU(Op::NewRegExp, std::uint32_t(fn_->code->consts.size() - 1));
+                return;
             case NK::NewTarget:
                 if (fn_->isArrow)
                     loadVar(ascii(" nt"));

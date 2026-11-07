@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 
+#include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/jit.hpp"
 #include "script/internal/dyn/jit_helpers.hpp"
@@ -493,6 +494,11 @@ GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
 GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return rt->newArray(reserve); });
+}
+
+GCObject* scriptDynNewRegExp(Runtime* rt, GCObject* templateObject) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return newRegExpFromTemplate(*rt, static_cast<DynObject*>(templateObject)); });
 }
 
 void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept

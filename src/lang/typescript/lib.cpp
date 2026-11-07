@@ -84,6 +84,30 @@ interface Array<T> {
     values(): Iterator<T>;
 }
 
+interface RegExpExecArray extends Array<string> {
+    index: number;
+    input: string;
+    groups: any;
+    indices: any;
+}
+
+interface RegExp {
+    lastIndex: number;
+    readonly source: string;
+    readonly flags: string;
+    readonly global: boolean;
+    readonly ignoreCase: boolean;
+    readonly multiline: boolean;
+    readonly dotAll: boolean;
+    readonly unicode: boolean;
+    readonly unicodeSets: boolean;
+    readonly sticky: boolean;
+    readonly hasIndices: boolean;
+    exec(text: string): RegExpExecArray | null;
+    test(text: string): boolean;
+    toString(): string;
+}
+
 interface String {
     readonly length: number;
     [Symbol.iterator](): Iterator<string>;
@@ -101,10 +125,13 @@ interface String {
     padEnd(length: number, pad?: string): string;
     padStart(length: number, pad?: string): string;
     repeat(count: number): string;
-    replace(search: string, replacement: string): string;
-    replaceAll(search: string, replacement: string): string;
+    match(pattern: string | RegExp): RegExpExecArray | null;
+    matchAll(pattern: string | RegExp): Iterator<RegExpExecArray>;
+    replace(search: string | RegExp, replacement: string | ((match: string, ...rest: any[]) => string)): string;
+    replaceAll(search: string | RegExp, replacement: string | ((match: string, ...rest: any[]) => string)): string;
+    search(pattern: string | RegExp): number;
     slice(start?: number, end?: number): string;
-    split(separator?: string, limit?: number): string[];
+    split(separator?: string | RegExp, limit?: number): string[];
     startsWith(search: string, from?: number): boolean;
     substr(start: number, length?: number): string;
     substring(start: number, end?: number): string;
@@ -268,6 +295,13 @@ declare var Date: {
     now(): number;
     parse(text: string): number;
     readonly prototype: Date;
+};
+
+declare var RegExp: {
+    new (pattern: string | RegExp, flags?: string): RegExp;
+    (pattern: string | RegExp, flags?: string): RegExp;
+    readonly prototype: RegExp;
+    escape(text: string): string;
 };
 
 declare var Map: {

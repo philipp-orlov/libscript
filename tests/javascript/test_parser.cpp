@@ -82,7 +82,7 @@ TEST(syntaxErrorsAreReported)
     rejects("a b c");
     rejects("const x");
     rejects("try { }");
-    rejects("/regex/g");
+    rejects("/(/g");
     rejects("1n");
 }
 

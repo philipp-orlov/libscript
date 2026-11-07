@@ -1641,6 +1641,10 @@ const Ty* Checker::checkExpr(const Node& n, const Ty* contextual)
         case NK::StringLit:
         case NK::BoolLit:
         case NK::NullLit: return literalOf(n);
+        case NK::RegExpLit: {
+            TypeBinding* binding = findType(ascii("RegExp"));
+            return binding && binding->type ? binding->type : arena_.anyType();
+        }
         case NK::TemplateLit:
             for (const NodePtr& part : n.list)
                 checkExpr(*part);

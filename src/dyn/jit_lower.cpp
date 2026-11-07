@@ -187,6 +187,7 @@ int operandsOf(Op op) noexcept
         case Op::SetSuper:
         case Op::NewArray:
         case Op::NewObject:
+        case Op::NewRegExp:
         case Op::Closure:
         case Op::Call:
         case Op::New:
@@ -2531,6 +2532,14 @@ private:
                 made.fresh = rt_.rootShapeFor(rt_.objectProto.get());
                 made.freshRoom = std::min<std::uint32_t>(operand(), DynObject::kIndexThreshold);
                 push(made);
+                return true;
+            }
+            case Op::NewRegExp: {
+                secureWeak();
+                const std::int32_t r = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynNewRegExp),
+                         {rtReg(), immReg(std::int64_t(reinterpret_cast<std::intptr_t>(asObject(code_.consts[operand()]))))}, r, -1, true);
+                push(objectEntry(r));
                 return true;
             }
             case Op::NewArray: {

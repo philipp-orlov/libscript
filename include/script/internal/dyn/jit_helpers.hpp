@@ -87,6 +87,7 @@ GCObject* scriptDynNewObject(Runtime* rt, std::uint64_t room) noexcept;
 /// The `this` of a `new` that can go straight to the constructor's native code; null when it has to go the long way.
 GCObject* scriptDynNewThis(Runtime* rt, GCObject* fn) noexcept;
 GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept;
+GCObject* scriptDynNewRegExp(Runtime* rt, GCObject* templateObject) noexcept;
 void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept;
 GCObject* scriptDynNewBox(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;

@@ -45,6 +45,11 @@ if(SCRIPT_PROFILE MATCHES "^(Performance|Compact)$")
     set(SCRIPT_LTO_DEFAULT ON)
 endif()
 option(SCRIPT_JIT_ENV_OVERRIDE "Let SCRIPT_JIT in the environment set the tier of every context: for running the whole test suite against native code" OFF)
+set(SCRIPT_UNICODE_PROPERTIES_DEFAULT ON)
+if(SCRIPT_PROFILE STREQUAL "Compact")
+    set(SCRIPT_UNICODE_PROPERTIES_DEFAULT OFF)
+endif()
+option(SCRIPT_UNICODE_PROPERTIES "The tables behind \\p{...} in a regular expression: 40 KB of data" ${SCRIPT_UNICODE_PROPERTIES_DEFAULT})
 option(SCRIPT_DISABLE_DYN_JIT "Native code for C#, C and C++ only; JavaScript, TypeScript and Python keep interpreting" OFF)
 option(SCRIPT_ENABLE_LTO "Link-time optimization of the library and the tools" ${SCRIPT_LTO_DEFAULT})
 # Profile-guided optimization, in two builds: configure with SCRIPT_PGO=generate, run tools/pgo-train.sh, then
@@ -165,6 +170,9 @@ set(SCRIPT_DYNAMIC_SOURCES
     src/dyn/builtins/collections.cpp
     src/dyn/builtins/generators.cpp
     src/dyn/builtins/reflection.cpp
+    src/dyn/builtins/regexp.cpp
+    src/dyn/regexp.cpp
+    src/dyn/unicode.cpp
     src/lang/ecmascript/lexer.cpp
     src/lang/ecmascript/parser.cpp
 )
@@ -249,7 +257,7 @@ endif()
 # ---- the generated configuration header ---------------------------------------
 foreach(flag SCRIPT_LANG_CSHARP SCRIPT_LANG_TYPESCRIPT SCRIPT_LANG_JAVASCRIPT
              SCRIPT_LANG_PYTHON SCRIPT_LANG_C SCRIPT_LANG_CPP SCRIPT_ENGINE_TYPED
-             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT SCRIPT_ENABLE_DYN_JIT)
+             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT SCRIPT_ENABLE_DYN_JIT SCRIPT_UNICODE_PROPERTIES)
     if(${flag})
         set(${flag}_01 1)
     else()

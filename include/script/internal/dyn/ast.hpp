@@ -54,6 +54,7 @@ enum class NK : std::uint8_t
     Yield,         // a=argument (may be null)               prefix = `yield*`
     Await,         // a=argument
     NewTarget,     //                                        `new.target`
+    RegExpLit,     //                                        text = pattern, strs[0] = flags
     TemplateObject,//                                        strs = cooked, raws: the first argument of a tagged template
     StaticBlock,   // d=block
     FieldInit,     // a=computed key or private name  b=value  text, computed, propKind: what a field or private method does to `this`

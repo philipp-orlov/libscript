@@ -538,6 +538,14 @@ Token Lexer::readIdentifier()
     return t;
 }
 
+Token Lexer::rescanAsRegex(const Token& slash)
+{
+    pos_ -= slash.type == Tok::SlashAssign ? 2 : 1;
+    Token t = next(true);
+    t.newlineBefore = slash.newlineBefore;
+    return t;
+}
+
 Token Lexer::next(bool regexAllowed)
 {
     const bool newlineBefore = skipSpace();
@@ -576,10 +584,16 @@ Token Lexer::readToken(bool regexAllowed)
         while (pos_ < src_.size()) {
             const char e = src_[pos_];
             if (e == '\\') {
+                // A line can no more end after a backslash than anywhere else in a literal.
+                if (pos_ + 1 < src_.size() && (src_[pos_ + 1] == '\n' || src_[pos_ + 1] == '\r'))
+                    break;
                 pos_ += 2;
                 continue;
             }
-            if (e == '\n')
+            if (e == '\n' || e == '\r')
+                break;
+            // U+2028 and U+2029.
+            if (e == '\xe2' && pos_ + 2 < src_.size() && src_[pos_ + 1] == '\x80' && (src_[pos_ + 2] == '\xa8' || src_[pos_ + 2] == '\xa9'))
                 break;
             if (e == '[')
                 inClass = true;

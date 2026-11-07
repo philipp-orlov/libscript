@@ -28,6 +28,7 @@ const char* classTag(ObjClass cls)
         case ObjClass::Function: return "Function";
         case ObjClass::Error: return "Error";
         case ObjClass::Date: return "Date";
+        case ObjClass::RegExp: return "RegExp";
         case ObjClass::StringObject: return "String";
         case ObjClass::NumberObject: return "Number";
         case ObjClass::BooleanObject: return "Boolean";
@@ -395,6 +396,14 @@ void installSymbol(Runtime& rt)
     rt.constant(ctor, "toPrimitive", detail::Access::make(Type::Symbol, rt.sym.toPrimitive.get()));
     rt.constant(ctor, "toStringTag", detail::Access::make(Type::Symbol, rt.sym.toStringTag.get()));
     rt.constant(ctor, "hasInstance", detail::Access::make(Type::Symbol, rt.sym.hasInstance.get()));
+    rt.constant(ctor, "match", detail::Access::make(Type::Symbol, rt.sym.match.get()));
+    rt.constant(ctor, "matchAll", detail::Access::make(Type::Symbol, rt.sym.matchAll.get()));
+    rt.constant(ctor, "replace", detail::Access::make(Type::Symbol, rt.sym.replace.get()));
+    rt.constant(ctor, "search", detail::Access::make(Type::Symbol, rt.sym.search.get()));
+    rt.constant(ctor, "split", detail::Access::make(Type::Symbol, rt.sym.split.get()));
+    rt.constant(ctor, "species", detail::Access::make(Type::Symbol, rt.sym.species.get()));
+    rt.constant(ctor, "unscopables", detail::Access::make(Type::Symbol, rt.sym.unscopables.get()));
+    rt.constant(ctor, "isConcatSpreadable", detail::Access::make(Type::Symbol, rt.sym.isConcatSpreadable.get()));
 
     rt.method(ctor, "for", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
@@ -550,6 +559,7 @@ void installBuiltins(Runtime& rt)
     installCollections(rt);
     installGenerators(rt);
     installReflection(rt);
+    installRegExp(rt);
 }
 
 }  // namespace dyn

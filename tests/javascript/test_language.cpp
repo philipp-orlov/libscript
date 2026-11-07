@@ -1234,6 +1234,44 @@ TEST(asyncFunctionsWaitAndComeBack)
     CHECK_EQ(all, std::string("1,4true,5,6,af2rj,no,sentS,sync"));
 }
 
+TEST(regularExpressionsMatchAsTheLanguageSaysTheyDo)
+{
+    js::Context ctx;
+    const auto text = [&](const char* source) { return ctx.eval(source, "<test>").toString(); };
+    CHECK_EQ(text("String(/a(b+)c/.exec('xabbbc'))"), std::string("abbbc,bbb"));
+    CHECK_EQ(text("String(/(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac'))"), std::string("zaacbbbcac,z,ac,a,,c"));
+    CHECK_EQ(text("/(?<y>\\d{4})-(?<m>\\d\\d)/.exec('on 2026-11').groups.m"), std::string("11"));
+    CHECK_EQ(text("/(?<=\\$)\\d+/.exec('cost $42')[0]"), std::string("42"));
+    CHECK_EQ(text("String(/(?=(a+))a*b\\1/.exec('baaabac'))"), std::string("aba,a"));
+    CHECK_EQ(text("'aBc'.replace(/b/i, '[$&]')"), std::string("a[B]c"));
+    CHECK_EQ(text("'a1b22'.replace(/\\d+/g, m => m.length)"), std::string("a1b2"));
+    CHECK_EQ(text("'a-b_c'.split(/[-_]/).join('+')"), std::string("a+b+c"));
+    CHECK_EQ(text("'abc'.split(/(?:)/).length + ''"), std::string("3"));
+    CHECK_EQ(text("[...'a1b2'.matchAll(/\\d/g)].map(m => m.index).join()"), std::string("1,3"));
+    CHECK_EQ(text("/^.$/u.test('\\u{1F600}') + ',' + /^.$/.test('\\u{1F600}')"), std::string("true,false"));
+#if SCRIPT_UNICODE_PROPERTIES
+    CHECK_EQ(text("/[\\p{L}--[a-z]]/v.test('a') + ',' + /[\\p{L}&&[a-z]]/v.test('a')"), std::string("false,true"));
+#endif
+    CHECK_EQ(text("/(?i:a)b/.test('Ab') + ',' + /(?i:a)b/.test('AB')"), std::string("true,false"));
+    CHECK_EQ(text("var r = /a/g; r.exec('aa'); r.lastIndex + ',' + r.flags + ',' + r"), std::string("1,g,/a/g"));
+    CHECK_EQ(text("var x = 4, g = 2; String(x / 2 / g) + (x /g/ 1)"), std::string("12"));
+    CHECK_EQ(text("var hit = 0; if (x) /re/.test('re') && hit++; {}/re/.test('re') && hit++; hit + ''"), std::string("2"));
+}
+
+TEST(regularExpressionsTheProgramHasInterferedWithDoWhatItAsks)
+{
+    js::Context ctx;
+    CHECK_EQ(ctx.eval("var r = /a/g; r.exec = function () { return null; }; 'aaa'.replace(r, 'b')", "<test>").toString(), std::string("aaa"));
+    CHECK_EQ(ctx.eval("class Upper extends RegExp { exec(s) { var m = super.exec(s); if (m) m[0] = m[0].toUpperCase(); return m; } }"
+                      "'xay'.match(new Upper('a'))[0]", "<test>").toString(), std::string("A"));
+    CHECK_EQ(ctx.eval("var o = /a/; Object.defineProperty(o, 'lastIndex', { writable: false }); var threw = false;"
+                      "try { 'a'.match(/a/g); /a/g.exec('a'); var f = /a/g; Object.freeze(f); f.exec('a'); } catch (e) { threw = e instanceof TypeError; } threw + ''", "<test>").toString(), std::string("true"));
+    CHECK_EQ(ctx.eval("var saved = RegExp.prototype.exec; var calls = 0;"
+                      "RegExp.prototype.exec = function (s) { calls++; return saved.call(this, s); };"
+                      "/a/.test('a'); 'a'.replace(/a/, 'b'); 'a'.split(/a/); RegExp.prototype.exec = saved; String(calls > 2)", "<test>").toString(), std::string("true"));
+    CHECK_EQ(ctx.eval("try { new RegExp('('); } catch (e) { e.name }", "<test>").toString(), std::string("SyntaxError"));
+}
+
 TEST(aDelegateOfAnAsyncGeneratorThatThrowsIsTheGeneratorsToCatch)
 {
     script::Context ctx;

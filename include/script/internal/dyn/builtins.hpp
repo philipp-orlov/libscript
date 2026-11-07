@@ -23,6 +23,11 @@ void installMathJson(Runtime& rt);     // Number, Boolean, Math, JSON, Date
 void installCollections(Runtime& rt);  // Map, Set, Promise, console
 void installReflection(Runtime& rt);   // descriptors, the rest of Object, Reflect
 void installGenerators(Runtime& rt);   // generator and async function objects, async iteration
+void installRegExp(Runtime& rt);       // RegExp and the String methods that use it
+
+/// A regular expression literal: a checked pattern made once into an object, which each evaluation copies.
+Value makeRegExpTemplate(Runtime& rt, StringView pattern, StringView flags);
+DynObject* newRegExpFromTemplate(Runtime& rt, DynObject* templateObject);
 
 /// The one-line rendering `console.log` and `Value::inspect` produce.
 String inspectValue(Runtime& rt, const Value& v, int depth);
@@ -41,6 +46,8 @@ inline void checkLongLoop(Runtime& rt, std::size_t iteration, std::size_t tempBy
     if ((iteration & 1023) == 0)
         checkLongLoopSlow(rt, tempBytes);
 }
+
+bool sameValue(const Value& a, const Value& b);
 
 /// JSON, shared with `Value::toJson` and `Context::parseJson`.
 Value jsonParse(Runtime& rt, StringView text);

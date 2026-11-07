@@ -8,6 +8,7 @@
 
 #include "script/internal/dyn/parser.hpp"
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/dyn/regexp.hpp"
 #include "script/internal/stack_guard.hpp"
 
 namespace script {
@@ -239,12 +240,12 @@ Parser::Parser(std::string_view source, std::string sourceName, bool typescript)
       typescript_(typescript)
 {
     lookaheadLimit_ = 32 * source.size() + 100000;
-    cur_ = lexer_.next(true);
+    cur_ = lexer_.next(false);
 }
 
 void Parser::advance()
 {
-    cur_ = lexer_.next(!operandJustEnded(cur_.type));
+    cur_ = lexer_.next(false);
 }
 
 bool Parser::eat(Tok t)
@@ -2301,7 +2302,24 @@ NodePtr Parser::primary()
         case Tok::Class: return classExpression(false, false);
         case Tok::LBracket: return arrayLiteral();
         case Tok::LBrace: return objectLiteral();
-        case Tok::Regex: fail("regular expression literals are not supported"); break;
+        case Tok::Slash:
+        case Tok::SlashAssign:
+            // Only a parser knows an operand is wanted here: what was read as a division is the start of a literal.
+            cur_ = lexer_.rescanAsRegex(cur_);
+            if (!at(Tok::Regex))
+                fail("unterminated regular expression literal");
+            [[fallthrough]];
+        case Tok::Regex: {
+            const std::size_t close = cur_.text.rfind(u'/');
+            NodePtr n = makeNode(NK::RegExpLit, line);
+            n->text = cur_.text.substr(1, close - 1);
+            n->strs.push_back(cur_.text.substr(close + 1));
+            std::string error;
+            if (regex::literalError(n->text, n->strs[0], error))
+                fail("invalid regular expression: " + error);
+            advance();
+            return n;
+        }
         case Tok::Async:
             if (asyncFunctionAhead())
                 return functionExpression(false);

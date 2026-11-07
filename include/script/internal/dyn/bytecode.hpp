@@ -86,6 +86,7 @@ enum class Op : std::uint8_t
     ArraySpread,  // (arr iterable -> arr)
     ObjectSpread,
     Closure,  // child index
+    NewRegExp,  // constant: the literal's first object, which every evaluation copies
 
     // ---- calls ----
     Call,        // argc          stack: func this arg...

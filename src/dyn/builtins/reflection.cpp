@@ -12,8 +12,6 @@ namespace script {
 namespace internal {
 namespace dyn {
 
-namespace {
-
 bool sameValue(const Value& a, const Value& b)
 {
     if (a.type() == Type::Double && b.type() == Type::Double) {
@@ -24,6 +22,8 @@ bool sameValue(const Value& a, const Value& b)
     }
     return strictEquals(a, b);
 }
+
+namespace {
 
 struct Descriptor
 {

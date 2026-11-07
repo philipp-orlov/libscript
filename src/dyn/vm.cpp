@@ -2041,6 +2041,12 @@ Value execute(Runtime& rt, Frame& frame)
                         sp.push_back(detail::Access::adopt(Type::Object, rt.newObjectSized(rt.objectProto.get(), room)));
                         break;
                     }
+                    case Op::NewRegExp: {
+                        DynObject* made = newRegExpFromTemplate(rt, asObject(code.consts[operandAt(pc)]));
+                        pc += 4;
+                        sp.push_back(detail::Access::adopt(Type::Object, made));
+                        break;
+                    }
                     case Op::NewArray: {
                         DynArray* arr = rt.newArray(operandAt(pc));
                         pc += 4;
@@ -2631,7 +2637,7 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     case Op::Shl:
                         numeric([](double a, double b) {
-                            return double(toInt32(a) << (toUint32(b) & 31));
+                            return double(std::int32_t(toUint32(a) << (toUint32(b) & 31)));
                         });
                         break;
                     case Op::Shr:

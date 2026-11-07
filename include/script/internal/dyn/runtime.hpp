@@ -46,7 +46,7 @@ struct Atoms
 /// The well-known symbols the engine itself uses.
 struct Symbols
 {
-    Ref<SymbolCell> iterator, asyncIterator, toPrimitive, toStringTag, hasInstance;
+    Ref<SymbolCell> iterator, asyncIterator, toPrimitive, toStringTag, hasInstance, match, matchAll, replace, search, split, species, unscopables, isConcatSpreadable;
 };
 
 /// A compiled TypeScript or JavaScript program: what `Assembly` wraps for the
@@ -167,7 +167,9 @@ struct Runtime : EngineRuntime
     Ref<DynObject> objectProto, functionProto, arrayProto, stringProto, numberProto, booleanProto,
         symbolProto, errorProto, dateProto, mapProto, setProto, promiseProto, iteratorProto, generatorProto, generatorFunctionProto, asyncFunctionProto,
         asyncIteratorProto, asyncGeneratorProto, asyncGeneratorFunctionProto,
-        arrayIteratorProto;
+        arrayIteratorProto, regExpProto, regExpStringIteratorProto;
+    /// See builtins/regexp.cpp.
+    std::shared_ptr<struct RegExpState> regexp;
     Ref<DynFunction> objectCtor, arrayCtor, functionCtor, promiseCtor;
     /// Prototype per JavaScript error constructor, indexed by `ErrorCode`.
     std::unordered_map<int, Ref<DynObject>> errorProtos;

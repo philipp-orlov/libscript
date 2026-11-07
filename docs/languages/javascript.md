@@ -95,14 +95,22 @@ through `Symbol.iterator`, and any object that implements it participates.
 
 Generators, async functions, async generators, `for await`, classes with private
 members, static blocks, computed accessors and `new.target`, tagged templates,
-`Reflect` and array-likes in `Array.prototype` are all there. These are not yet:
-regular expressions, `BigInt`, typed arrays, `Proxy`, iterator helpers, `with`,
+`Reflect`, array-likes in `Array.prototype` and regular expressions (lookbehind,
+named groups, modifiers, `\p{...}` and the set notation of `v`, but not the
+properties of strings such as `\p{RGI_Emoji}`) are all there. These are not yet:
+`BigInt`, typed arrays, `Proxy`, iterator helpers, `with`,
 modules through `import()`, `Temporal`. `eval` and `new Function` stay out by
 design: the engine runs only what its host gives it.
 
 Functions that use generators or async, and derived class constructors, run in
 the interpreter. A `for-of` runs in native code only over a plain array, whose
 iterator has nothing to close.
+
+A regular expression runs in a matcher of its own, which backtracks on its own stack
+and interprets a small instruction set: it has no native code, and that is the widest
+remaining gap to engines that do. A Compact build leaves out the 43 KB of tables behind
+`\p{...}`; a pattern that names a property is then a syntax error, apart from `Any`
+and `ASCII`.
 
 ## What is not JavaScript
 

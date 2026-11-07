@@ -129,6 +129,7 @@ struct ContextImpl
         return cell;
     }
     void destroyCell(GCObject* cell) noexcept;
+    void releaseAll(const Value* values, std::size_t count) noexcept;
 
     void link(GCObject* cell) noexcept;
     /// `link` for a cell whose size the caller knows and which is not a string: no virtual call.

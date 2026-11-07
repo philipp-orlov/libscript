@@ -296,6 +296,9 @@ Value toObject(Runtime& rt, const Value& v)
     }
     auto* wrapper = rt.newCell<DynWrapper>();
     wrapper->cls = cls;
+    // Plain is otherwise only ever a bare object, which `destroyCell` frees without asking; this holds more than one has.
+    if (cls == ObjClass::Plain)
+        wrapper->rareOf();
     wrapper->setProto(proto);
     wrapper->primitive = v;
     return detail::Access::adopt(Type::Object, wrapper);

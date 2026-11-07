@@ -204,44 +204,71 @@ ContextImpl::~ContextImpl()
     dyn_.reset();
 }
 
+/// Let go of what `count` values refer to, as a dying cell does: nothing is destroyed from here, so a long chain of them
+/// takes no stack.
+void ContextImpl::releaseAll(const Value* values, std::size_t count) noexcept
+{
+    // A dying tree is far from the cache: ask for every child before the first one is needed.
+    for (std::size_t i = 0; i < count; ++i)
+        if (GCObject* child = detail::Access::ptr(values[i]))
+            __builtin_prefetch(child, 1);
+    const bool inTeardown = tearingDown;
+    for (std::size_t i = 0; i < count; ++i) {
+        GCObject* child = detail::Access::ptr(values[i]);
+        if (!child || --child->rc != 0 || inTeardown)
+            continue;
+        if (!child->rt || !destroying) {
+            detail::destroyUnreferenced(child);
+            continue;
+        }
+        unlink(child);
+        child->pendingNext = pendingFree;
+        pendingFree = child;
+    }
+}
+
 void ContextImpl::destroyCell(GCObject* cell) noexcept
 {
     const std::uint32_t bytes = cell->cellBytes;
-    // The two kinds a program makes by the million get out of the virtual call.
+    // The kinds a program makes by the million get out of the virtual call.
+    switch (cell->kind) {
 #if SCRIPT_ENGINE_TYPED
-    if (cell->kind == CellKind::Instance) {
-        // By hand, not through `~Value` and `decRef`, because a dying tree spends its time here.
-        auto* instance = static_cast<typed::CSInstance*>(cell);
-        Value* slots = instance->slots();
-        const std::uint32_t count = instance->count;
-        const bool inTeardown = tearingDown;
-        // A dying tree is far from the cache: ask for every child before the first one is needed.
-        for (std::uint32_t i = 0; i < count; ++i)
-            if (GCObject* child = detail::Access::ptr(slots[i]))
-                __builtin_prefetch(child, 1);
-        for (std::uint32_t i = 0; i < count; ++i) {
-            GCObject* child = detail::Access::ptr(slots[i]);
-            if (!child || --child->rc != 0 || inTeardown)
-                continue;
-            if (!child->rt || !destroying) {
-                detail::destroyUnreferenced(child);
-                continue;
-            }
-            unlink(child);
-            child->pendingNext = pendingFree;
-            pendingFree = child;
+        case CellKind::Instance: {
+            // By hand, not through `~Value` and `decRef`, because a dying tree spends its time here.
+            auto* instance = static_cast<typed::CSInstance*>(cell);
+            releaseAll(instance->slots(), instance->count);
+            break;
         }
-    } else if (cell->kind == CellKind::Array) {
-        // An array of numbers holds nothing to release, and `~GCObject` does nothing.
-        auto* array = static_cast<typed::CSArray*>(cell);
-        if (array->store == typed::ElemStore::Ref)
-            array->typed::CSArray::~CSArray();
-    }
-    else
-        cell->~GCObject();
-#else
-    cell->~GCObject();
+        case CellKind::Array: {
+            // An array of numbers holds nothing to release, and `~GCObject` does nothing.
+            auto* array = static_cast<typed::CSArray*>(cell);
+            if (array->store == typed::ElemStore::Ref)
+                array->typed::CSArray::~CSArray();
+            break;
+        }
 #endif
+#if SCRIPT_ENGINE_DYNAMIC
+        case CellKind::Object: {
+            // A plain object with nothing unusual about it: its values and its prototype are all it holds.
+            auto* object = static_cast<dyn::DynObject*>(cell);
+            if (object->cls != dyn::ObjClass::Plain || object->rare || object->props.heapCapacity() != 0) {
+                cell->~GCObject();
+                break;
+            }
+            static_assert(sizeof(dyn::Prop) == sizeof(Value));
+            releaseAll(reinterpret_cast<const Value*>(object->props.data()), object->props.size());
+            if (dyn::DynObject* proto = object->proto.get(); proto && !proto->pinned && --proto->rc == 0) {
+                if (tearingDown)
+                    break;
+                unlink(proto);
+                proto->pendingNext = pendingFree;
+                pendingFree = proto;
+            }
+            break;
+        }
+#endif
+        default: cell->~GCObject(); break;
+    }
     if (bytes)
         heap.deallocate(cell, bytes);
     else

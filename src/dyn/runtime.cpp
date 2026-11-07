@@ -334,6 +334,7 @@ DynObject* Runtime::newObject(DynObject* proto)
 }
 
 static_assert(sizeof(DynObject) % alignof(Prop) == 0, "the properties in the cell follow the object directly");
+static_assert(sizeof(DynObject) % 8 == 0, "native code writes a new object a word at a time");
 
 DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
 {
@@ -362,6 +363,25 @@ DynObject* Runtime::newObjectSized(DynObject* proto, std::uint32_t room)
     o->proto.reset(proto);
     o->shape = root;
     return o;
+}
+
+void Runtime::objectImage(DynObject* proto, Shape* root, std::uint32_t room, std::uint64_t* words)
+{
+    const std::size_t bytes = sizeof(DynObject) + std::size_t(room) * sizeof(Prop);
+    DynObject image;
+    image.cellBytes = std::uint32_t(bytes);
+    image.gcBytes = std::uint32_t(bytes);
+    image.rt = &ctx;
+    image.shape = root;
+    if (room) {
+        image.propsInCell = true;
+        image.props.adopt(reinterpret_cast<Prop*>(&image + 1), room);
+    }
+    std::memcpy(words, static_cast<const void*>(&image), sizeof(DynObject));
+    // A prototype named here is pinned, so it is not counted.
+    std::memcpy(words + offsetof(DynObject, proto) / 8, &proto, sizeof proto);
+    // The caller knows where the table will be.
+    words[offsetof(DynObject, props) / 8] = 0;
 }
 
 DynArray* Runtime::newArray(std::size_t reserve)

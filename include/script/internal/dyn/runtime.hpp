@@ -191,6 +191,9 @@ struct Runtime : EngineRuntime
     /// A shape for an object made without one, when its properties fit.
     void giveShape(DynObject* o);
     /// `newObject` with room for this many properties already there.
+    /// What a new object of this prototype and root shape, with this much room, starts out as, a word at a time, for native
+    /// code that makes one itself. All but where its table is, which depends on where it is.
+    void objectImage(DynObject* proto, Shape* root, std::uint32_t room, std::uint64_t* words);
     DynObject* newObjectSized(DynObject* proto, std::uint32_t room);
     DynObject* newObject(DynObject* proto = nullptr);
 

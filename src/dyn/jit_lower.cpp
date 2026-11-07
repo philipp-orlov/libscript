@@ -2215,9 +2215,9 @@ private:
             }
             case Op::NewObject: {
                 secureWeak();
-                const std::int32_t rt = rtReg();
-                const std::int32_t room = immReg(std::int64_t(operand()));
-                const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynNewObject), {rt, room}, true);
+                const std::int32_t r = fn_.newVreg(false);
+                allocateObject(rt_.objectProto.get(), rt_.rootShapeFor(rt_.objectProto.get()), operand(), r,
+                               reinterpret_cast<void*>(&scriptDynNewObject), {rtReg(), immReg(std::int64_t(operand()))}, {});
                 Entry made = objectEntry(r);
                 // Where `newObjectSized` starts it: the shape its prototype's children start from, with this much room.
                 made.fresh = rt_.rootShapeFor(rt_.objectProto.get());
@@ -3890,6 +3890,86 @@ private:
     {
         return callee.pinned ? static_cast<const DynFunction*>(callee.hint) : nullptr;
     }
+    /// A new object of pinned prototype `proto`, starting from `root`, in `result`: popped off its size's free list and
+    /// written here while the heap has one ready and nothing is due; otherwise `helper` makes it, which it also does when
+    /// something about this context or build needs it to.
+    void allocateObject(DynObject* proto, Shape* root, std::uint32_t room, std::int32_t result, void* helper,
+                        std::vector<std::int32_t> helperArgs, const std::vector<Entry>& held)
+    {
+        ContextImpl& ctx = rt_.ctx;
+        constexpr std::size_t kWords = sizeof(DynObject) / 8;
+        if (!mem::LocalHeap::kCanPopInline || ctx.options.memoryLimit || !root || !proto->pinned || room > 32) {
+            coldCall(helper, std::move(helperArgs), result, -1, true, held);
+            return;
+        }
+        const std::size_t bytes = sizeof(DynObject) + std::size_t(room) * sizeof(Prop);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const auto word = [&](std::int32_t base, std::int64_t offset) { return load(base, offset, 8, false, kAliasHeader); };
+        const auto plus = [&](std::int32_t a, std::int64_t imm, std::uint8_t width) {
+            const std::int32_t d = fn_.newVreg(false);
+            IrInst& add = inst(IrOp::Add);
+            add.d = d;
+            add.a = a;
+            add.hasImm = true;
+            add.imm = imm;
+            add.width = width;
+            return d;
+        };
+        const auto branchNotBelow = [&](std::int32_t a, std::int32_t b) {
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = a;
+            test.b = b;
+            test.cond = IrCond::Hs;
+            test.width = 64;
+            test.target = slow;
+        };
+        // What `maybeCollect` asks.
+        const std::int32_t heap = ptrReg(&ctx);
+        const std::int32_t heapBytes = word(heap, std::int64_t(offsetof(ContextImpl, heapBytes)));
+        branchNotBelow(heapBytes, word(heap, std::int64_t(offsetof(ContextImpl, nextGcBytes))));
+        const std::int32_t liveObjects = word(heap, std::int64_t(offsetof(ContextImpl, liveObjects)));
+        const std::int32_t cells = fn_.newVreg(false);
+        {
+            IrInst& add = inst(IrOp::Add);
+            add.d = cells;
+            add.a = liveObjects;
+            add.b = word(heap, std::int64_t(offsetof(ContextImpl, liveStrings)));
+            add.width = 64;
+        }
+        branchNotBelow(cells, word(heap, std::int64_t(offsetof(ContextImpl, nextGcCells))));
+        // What `LocalHeap::allocate` does while the current block has a free slot.
+        const std::int32_t block = word(ptrReg(ctx.heap.currentBlockOf(bytes)), 0);
+        const std::int32_t slot = word(block, std::int64_t(mem::LocalHeap::kBlockFreeOffset));
+        branchCmp(slot, IrCond::Eq, 0, slow, 64);
+        store(block, std::int64_t(mem::LocalHeap::kBlockFreeOffset), word(slot, 0), 8, kAliasHeader);
+        const std::int32_t live = load(block, std::int64_t(mem::LocalHeap::kBlockLiveOffset), 4, false, kAliasHeader);
+        store(block, std::int64_t(mem::LocalHeap::kBlockLiveOffset), plus(live, 1, 32), 4, kAliasHeader);
+        // What the constructors and `linkKnown` do.
+        std::uint64_t image[kWords];
+        rt_.objectImage(proto, root, room, image);
+        for (std::size_t i = 0; i < kWords; ++i)
+            store(slot, std::int64_t(i * 8), immReg(std::int64_t(image[i])), 8, kAliasHeader);
+        if (room)
+            store(slot, kPropsOffset, plus(slot, std::int64_t(sizeof(DynObject)), 64), 8, kAliasHeader);
+        store(heap, std::int64_t(offsetof(ContextImpl, heapBytes)), plus(heapBytes, std::int64_t(bytes), 64), 8, kAliasHeader);
+        const std::int32_t total = word(heap, std::int64_t(offsetof(ContextImpl, totalAllocated)));
+        store(heap, std::int64_t(offsetof(ContextImpl, totalAllocated)), plus(total, std::int64_t(bytes), 64), 8, kAliasHeader);
+        store(heap, std::int64_t(offsetof(ContextImpl, liveObjects)), plus(liveObjects, 1, 64), 8, kAliasHeader);
+        {
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = result;
+            mov.a = slot;
+        }
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        coldCall(helper, std::move(helperArgs), result, -1, true, held);
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        forgetFacts();
+    }
+
     void keepAlive(GCObject* object)
     {
         std::vector<Value>& keep = outermost().jitKeep;
@@ -4452,8 +4532,11 @@ private:
             same.target = slow;
         }
         const std::int32_t self = fn_.newVreg(false);
-        coldCall(reinterpret_cast<void*>(&scriptDynNewOf), {rtReg(), protoNow, immReg(std::int64_t(std::min<std::uint32_t>(root->expect, 32)))},
-                 self, -1, true, held);
+        const std::uint32_t room = std::min<std::uint32_t>(root->expect, 32);
+        // Hot enough to be compiled in place, and its address is in the code from here on.
+        proto->pin();
+        allocateObject(proto, root, room, self, reinterpret_cast<void*>(&scriptDynNewOf), {rtReg(), protoNow, immReg(std::int64_t(room))},
+                       held);
         const std::vector<std::uint8_t> none(fn->code->numLocals + 1, 1);
         std::vector<Entry> heldWithSelf = held;
         heldWithSelf.push_back(objectEntry(self));

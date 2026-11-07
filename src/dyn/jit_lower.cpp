@@ -233,6 +233,135 @@ bool isBranch(Op op) noexcept
     }
 }
 
+/// Which locals the interpreter may still read, at each instruction of a function: a bail need only hand over those.
+/// Worked out per block once, and within a block on demand, which keeps it to a few bits a local a block.
+class LocalLiveness
+{
+public:
+    explicit LocalLiveness(const FunctionCode& code) : code_(code), words_((code.numLocals + 63) / 64)
+    {
+        // Handlers and `finally` subroutines go where no branch says: everything is live in such a function. With no
+        // locals there is nothing to work out.
+        if (!code.handlers.empty() || words_ == 0 || code.code.empty()) {
+            all_ = true;
+            return;
+        }
+        std::vector<std::uint32_t> starts;
+        std::vector<bool> leader(code.code.size() + 1, false);
+        leader[0] = true;
+        for (std::uint32_t pc = 0; pc < code.code.size();) {
+            const Op op = Op(code.code[pc]);
+            const std::uint32_t next = pc + 1 + std::uint32_t(operandsOf(op)) * 4;
+            if (op == Op::JumpSub || op == Op::EndFinally) {
+                all_ = true;
+                return;
+            }
+            if (isBranch(op)) {
+                leader[readOperand(code.code, pc + 1)] = true;
+                leader[next] = true;
+            } else if (endsFlow(op)) {
+                leader[next] = true;
+            }
+            pc = next;
+        }
+        blockOf_.assign(code.code.size(), 0);
+        for (std::uint32_t pc = 0; pc < code.code.size();) {
+            if (leader[pc])
+                starts.push_back(pc);
+            blockOf_[pc] = std::uint32_t(starts.size() - 1);
+            pc += 1 + std::uint32_t(operandsOf(Op(code.code[pc]))) * 4;
+        }
+        starts_ = starts;
+        const std::size_t blocks = starts.size();
+        liveOut_.assign(blocks * words_, 0);
+        std::vector<std::uint64_t> liveIn(blocks * words_, 0);
+        std::vector<std::vector<std::uint32_t>> succ(blocks);
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::uint32_t end = b + 1 < blocks ? starts[b + 1] : std::uint32_t(code.code.size());
+            std::uint32_t last = starts[b];
+            for (std::uint32_t pc = starts[b]; pc < end; pc += 1 + std::uint32_t(operandsOf(Op(code.code[pc]))) * 4)
+                last = pc;
+            const Op op = Op(code.code[last]);
+            if (isBranch(op))
+                succ[b].push_back(blockOf_[readOperand(code.code, last + 1)]);
+            if (!endsFlow(op) && op != Op::Jump && end < code.code.size())
+                succ[b].push_back(std::uint32_t(b + 1));
+        }
+        // Backwards to a fixed point.
+        std::vector<std::uint64_t> work(words_);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::size_t b = blocks; b-- > 0;) {
+                std::uint64_t* out = &liveOut_[b * words_];
+                for (std::uint32_t s : succ[b]) {
+                    const std::uint64_t* in = &liveIn[std::size_t(s) * words_];
+                    for (std::size_t w = 0; w < words_; ++w)
+                        out[w] |= in[w];
+                }
+                std::copy(out, out + words_, work.begin());
+                const std::uint32_t end = b + 1 < blocks ? starts[b + 1] : std::uint32_t(code.code.size());
+                backward(starts[b], end, starts[b], work.data());
+                std::uint64_t* in = &liveIn[b * words_];
+                for (std::size_t w = 0; w < words_; ++w) {
+                    if (in[w] != work[w]) {
+                        in[w] = work[w];
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `slot` may be read from `pc` on, `pc` itself included.
+    bool liveAt(std::uint32_t pc, std::uint32_t slot)
+    {
+        if (all_)
+            return true;
+        if (pc != cachedPc_) {
+            const std::uint32_t b = blockOf_[pc];
+            const std::uint32_t end = b + 1 < starts_.size() ? starts_[b + 1] : std::uint32_t(code_.code.size());
+            cached_.assign(liveOut_.begin() + std::ptrdiff_t(std::size_t(b) * words_), liveOut_.begin() + std::ptrdiff_t(std::size_t(b + 1) * words_));
+            backward(pc, end, pc, cached_.data());
+            cachedPc_ = pc;
+        }
+        return cached_[slot / 64] >> (slot % 64) & 1;
+    }
+
+private:
+    static bool endsFlow(Op op) noexcept
+    {
+        return op == Op::Jump || op == Op::Return || op == Op::ReturnUndefined || op == Op::Throw || op == Op::DerivedReturn;
+    }
+    /// Through the instructions from `from` up to `end`, last first, down to `stop`.
+    void backward(std::uint32_t from, std::uint32_t end, std::uint32_t stop, std::uint64_t* live) const
+    {
+        std::vector<std::uint32_t> pcs;
+        for (std::uint32_t pc = from; pc < end; pc += 1 + std::uint32_t(operandsOf(Op(code_.code[pc]))) * 4)
+            pcs.push_back(pc);
+        for (std::size_t i = pcs.size(); i-- > 0 && pcs[i] >= stop;) {
+            const Op op = Op(code_.code[pcs[i]]);
+            if (op != Op::GetLocal && op != Op::SetLocal)
+                continue;
+            const std::uint32_t slot = readOperand(code_.code, pcs[i] + 1);
+            if (slot >= code_.numLocals)
+                continue;
+            if (op == Op::GetLocal)
+                live[slot / 64] |= std::uint64_t(1) << (slot % 64);
+            else
+                live[slot / 64] &= ~(std::uint64_t(1) << (slot % 64));
+        }
+    }
+
+    const FunctionCode& code_;
+    std::size_t words_;
+    bool all_ = false;
+    std::vector<std::uint32_t> starts_;
+    std::vector<std::uint32_t> blockOf_;
+    std::vector<std::uint64_t> liveOut_;
+    std::vector<std::uint64_t> cached_;
+    std::uint32_t cachedPc_ = ~0u;
+};
+
 class Lowering
 {
 public:
@@ -1439,8 +1568,18 @@ private:
         info->thisTagAt = at(thisTag_);
         info->thisAt = at(thisReg_);
         info->values.reserve(2 * locals + info->stack);
+        if (!liveness_)
+            liveness_ = std::make_unique<LocalLiveness>(code_);
         for (std::uint32_t slot = 0; slot < locals; ++slot) {
             DeoptValue v;
+            // Never read again: the interpreter can have undefined there, unless native code holds a count on it.
+            if (!localOwned_[slot] && slot < code_.numLocals && !(argsLazy_ && slot == code_.argumentsSlot) &&
+                !liveness_->liveAt(pc_, slot)) {
+                v.form = DeoptValue::Constant;
+                v.tag = std::uint8_t(Type::Undefined);
+                info->values.push_back(v);
+                continue;
+            }
             if (argsLazy_ && slot == code_.argumentsSlot) {
                 v.form = DeoptValue::Arguments;
                 v.tag = std::uint8_t(Type::Object);
@@ -1462,7 +1601,10 @@ private:
         for (std::uint32_t slot = 0; slot < locals; ++slot) {
             DeoptValue v;
             v.owned = cellOwned_[slot];
-            v.payloadAt = at(cellReg_[slot]);
+            if (cellReg_[slot] < 0 && !cellOwned_[slot])
+                v.form = DeoptValue::Constant;  // no cell: null
+            else
+                v.payloadAt = at(cellReg_[slot]);
             info->values.push_back(v);
         }
         const auto put = [&](const Entry& e) {
@@ -1640,11 +1782,13 @@ private:
         std::int32_t bail = -1;
         for (std::size_t i = 0; i < n; ++i) {
             const Entry& e = top(i);
-            if (e.rep != Rep::Tagged || (e.hasKnownTag && e.known == Type::Double) || (e.isConst && e.known < Type::BigInt))
+            if (e.rep != Rep::Tagged || ((e.hasKnownTag || e.isConst) && e.known != Type::BigInt))
                 continue;
             if (bail < 0)
                 bail = newLabel();
-            branchCmp(e.isConst ? immReg(std::int64_t(e.known)) : e.t, IrCond::Hs, std::int64_t(Type::BigInt), bail);
+            // Only a bigint itself: a string or an object goes the generic way, which converts it as it should, and an object
+            // whose conversion gives a bigint is the one case left to the conversion's own error.
+            branchCmp(e.isConst ? immReg(std::int64_t(e.known)) : e.t, IrCond::Eq, std::int64_t(Type::BigInt), bail);
         }
         if (bail >= 0)
             emitBail(bail, {});
@@ -3180,11 +3324,23 @@ private:
             if (previousOp_ == Op::PushUndefined && value.isConst && value.rep == Rep::Tagged && value.hasKnownTag &&
                 value.known == Type::Undefined)
                 return;
-            if (!isKnownNumber(value))
-                throw LowerAgain{slot};
+            // A guess about the slot was wrong. The outermost function notes it and carries on, so one more lowering puts
+            // right every slot this one finds; the code made meanwhile is thrown away.
+            if (!isKnownNumber(value)) {
+                if (parent_)
+                    throw LowerAgain{slot};
+                again_.emplace_back(slot, false);
+                release(value);
+                return;
+            }
             if (isIntLocal(slot)) {
-                if (!isIntLike(value))
-                    throw LowerAgain{slot, true};
+                if (!isIntLike(value)) {
+                    if (parent_)
+                        throw LowerAgain{slot, true};
+                    again_.emplace_back(slot, true);
+                    release(value);
+                    return;
+                }
                 // Kept sign-extended, so that reading it needs no extension.
                 const std::int32_t from = wideInt(value);
                 IrInst& mov = inst(IrOp::Mov);
@@ -6750,6 +6906,11 @@ private:
     Runtime& rt_;
     const FunctionCode& code_;
     IrFunction& fn_;
+    std::unique_ptr<LocalLiveness> liveness_;
+public:
+    /// Slots whose guess was wrong, to lower again with: and whether only the guess of whole numbers was.
+    std::vector<std::pair<std::uint32_t, bool>> again_;
+private:
     const std::vector<std::uint8_t>& notNumber_;
     const std::vector<std::uint8_t>& notInt_;
     std::uint32_t pc_ = 0;
@@ -6891,8 +7052,20 @@ bool lowerFunction(Runtime& rt, const FunctionCode& code, IrFunction& out, std::
     for (;;) {
         IrFunction fn;
         try {
+            const std::size_t deoptsBefore = code.jitDeopts.size();
             Lowering lowering(rt, code, fn, notNumber, notInt);
             lowering.run();
+            if (!lowering.again_.empty()) {
+                // What was made goes, with the bail tables made for it.
+                code.jitDeopts.resize(deoptsBefore);
+                for (const auto& [slot, onlyInt] : lowering.again_) {
+                    if (onlyInt)
+                        notInt[slot] = 1;
+                    else
+                        notNumber[slot] = 1;
+                }
+                continue;
+            }
             out = std::move(fn);
             return true;
         } catch (const LowerAgain& again) {

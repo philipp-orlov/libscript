@@ -4,6 +4,8 @@
 // What native code for the dynamic languages calls, and how it is entered.
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -291,6 +293,14 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
     constexpr std::uint32_t kBailLimit = 8;
     if (std::find(code->jitBailedAt.begin(), code->jitBailedAt.end(), pc) == code->jitBailedAt.end())
         code->jitBailedAt.push_back(pc);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* log = std::getenv("SCRIPT_JIT_BAILS")) {
+        if (std::FILE* out = std::fopen(log, "a")) {
+            std::fprintf(out, "%s %u %s\n", code->name.c_str(), pc, opName(Op(code->code[pc])));
+            std::fclose(out);
+        }
+    }
+#endif
     if (++outer->jitBails > kBailLimit && outer->jitEntry) {
         outer->jitEntry = nullptr;
         outer->jitCallEntry = nullptr;

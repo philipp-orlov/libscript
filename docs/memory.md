@@ -88,6 +88,7 @@ with a cache per thread, shared by the contexts of a process. Those buffers are
 single contiguous blocks: property tables, `Dictionary<K,V>` and `Map`/`Set`
 indexes are flat, open-addressed arrays whose tombstones are compacted once they
 outnumber the living, so a table used as a queue does not grow for ever.
+An array of numbers takes 8 bytes an element, and one of up to a few elements keeps them in its own cell.
 Containers that shrink well below their capacity hand it back. Buffers above
 16 KiB, and cells above 8 KiB, are mappings of their own whose idle pages go back
 to the OS; a collection ages them out.

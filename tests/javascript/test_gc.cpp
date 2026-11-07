@@ -18,6 +18,30 @@ TEST(acyclicGarbageGoesAwayWithoutCollecting)
     CHECK(after.gcRuns == before.gcRuns);
 }
 
+TEST(whatThingsWeighStaysWhatItIs)
+{
+    // The memory an embedder pays per object and per element is a promise, so this fails when it grows: a change here is
+    // to be argued for, not noticed in a benchmark afterwards.
+    js::Context ctx;
+    ctx.eval("0");
+    const auto weigh = [&](const char* setup) {
+        const auto before = ctx.stats().heapBytes;
+        ctx.eval(setup);
+        return (ctx.stats().heapBytes - before) / 100000;
+    };
+    // A small object: 80 bytes of header and 16 a property, in the one cell; and the array holding them, about 21 each.
+    CHECK(weigh("globalThis.o = []; function P(a, b) { this.a = a; this.b = b; }"
+                "for (let i = 0; i < 100000; i++) o.push(new P(i, i));") <= 112 + 24);
+    ctx.eval("o = null");
+    // A number in an array: 8 bytes, or at most twice that for the room to grow.
+    CHECK(weigh("globalThis.n = []; for (let i = 0; i < 100000; i++) n.push(i);") <= 24);
+    ctx.eval("n = null");
+    CHECK(weigh("globalThis.h = new Array(100000);") <= 8);
+    ctx.eval("h = null");
+    // A small array: one cell, with its elements in it.
+    CHECK(weigh("globalThis.s = []; for (let i = 0; i < 100000; i++) s.push([i, i]);") <= 96 + 32 + 24);
+}
+
 TEST(cyclesAreReclaimedByTheCollector)
 {
     js::Context ctx;

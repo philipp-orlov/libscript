@@ -268,6 +268,46 @@ TEST(mapAndSetChurnStaysBounded)
     CHECK(after.liveObjects <= base.liveObjects + 1024);
 }
 
+TEST(arraysChangingFormStayBounded)
+{
+    // In a cell and out, numbers turning into values, growing and shrinking: nothing of it may be left behind.
+    js::Context ctx;
+    ctx.eval(R"(
+        globalThis.formsRound = (function round(n) {
+            const small = [];
+            for (let i = 0; i < 64; i++) small.push([i, i + 1]);
+            for (let i = 0; i < 64; i++) small[i].push({ i });
+            const grown = [];
+            for (let i = 0; i < 2000; i++) grown.push(i);
+            grown[17] = 'text';
+            const sparse = new Array(5000);
+            sparse[9] = n;
+            sparse.length = 10;
+            sparse.push({}, undefined, 'x');
+            while (grown.length > 40) grown.pop();
+            grown.sort();
+            const nums = [];
+            for (let i = 0; i < 500; i++) nums.push(500 - i);
+            nums.sort((a, b) => a - b);
+            nums.splice(3, 400, 'y');
+            return nums.concat(grown, sparse).map(x => x).filter(x => x !== 0).length + small.length;
+        });
+    )");
+    for (int i = 0; i < kWarmupRounds; ++i)
+        ctx.eval("formsRound(1)");
+    ctx.collectGarbage();
+    const auto before = ctx.stats();
+    const std::size_t residentBefore = residentBytes();
+    for (int i = 0; i < kSoakRounds; ++i)
+        ctx.eval("formsRound(1)");
+    ctx.collectGarbage();
+    const auto after = ctx.stats();
+    CHECK(after.liveObjects <= before.liveObjects + 8);
+    CHECK(after.heapBytes <= before.heapBytes + 64 * 1024);
+    if (residentBefore)
+        CHECK(residentBytes() <= residentBefore + 4 * 1024 * 1024);
+}
+
 TEST(promiseChurnDrainsCompletely)
 {
     js::Context ctx;

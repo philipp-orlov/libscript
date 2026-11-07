@@ -532,6 +532,17 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     for (std::int32_t r : regs.fpCallerSaved)
         callerFp |= std::uint64_t(1) << r;
     fn.liveAtRelease.clear();
+    // Only values in caller-saved registers count, and only while they are live: going through the code in order, those are
+    // few at any point, however many values a long function has.
+    std::vector<const Interval*> waiting;
+    for (const Interval* iv : order) {
+        const std::int32_t loc = fn.location[std::size_t(iv->vreg)];
+        if (loc >= 0 && ((std::uint64_t(1) << loc) & (fn.vregIsFp[std::size_t(iv->vreg)] ? callerFp : callerInt)))
+            waiting.push_back(iv);
+    }
+    std::sort(waiting.begin(), waiting.end(), [](const Interval* a, const Interval* b) { return a->start < b->start; });
+    std::size_t nextWaiting = 0;
+    std::vector<const Interval*> active;
     for (std::size_t i = 0; i < count; ++i) {
         IrInst& in = fn.code[i];
         const bool isColdCall = in.op == IrOp::Call && fn.calls[std::size_t(in.imm)].cold;
@@ -539,9 +550,12 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             continue;
         IrFunction::LiveRegs live;
         const std::int32_t pos = std::int32_t(i) * 2;
-        for (const Interval* iv : order) {
+        while (nextWaiting < waiting.size() && waiting[nextWaiting]->start <= pos)
+            active.push_back(waiting[nextWaiting++]);
+        active.erase(std::remove_if(active.begin(), active.end(), [&](const Interval* iv) { return iv->end <= pos; }), active.end());
+        for (const Interval* iv : active) {
             const std::int32_t loc = fn.location[std::size_t(iv->vreg)];
-            if (loc < 0 || iv->start > pos || iv->end <= pos || !liveAcross(*iv, pos))
+            if (!liveAcross(*iv, pos))
                 continue;
             if (fn.vregIsFp[std::size_t(iv->vreg)])
                 live.fps |= (std::uint64_t(1) << loc) & callerFp;

@@ -2983,7 +2983,18 @@ private:
 
     void readBox(std::int32_t box)
     {
-        // A cell that was never made reads as undefined.
+        // A cell that was never made reads as undefined. That hardly ever happens, and code that stops there has only one
+        // way on, along which what it knows of the cell holds.
+        if (betHere()) {
+            const std::int32_t bail = newLabel();
+            branchCmp(box, IrCond::Eq, 0, bail, 64);
+            const std::int32_t lt = load(box, kBoxValueOffset, 1);
+            const std::int32_t lr = load(box, kBoxValueOffset + kPayload, 8);
+            emitBail(bail, {});
+            secureWeak();
+            push(taggedEntry(lr, lt, Own::Weak));
+            return;
+        }
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t none = newLabel();
@@ -3021,6 +3032,17 @@ private:
         makeOwned(value);
         const std::int32_t tag = tagReg(value);
         const std::int32_t payload = payloadReg(value);
+        if (betHere()) {
+            const std::int32_t bail = newLabel();
+            branchCmp(box, IrCond::Eq, 0, bail, 64);
+            const std::int32_t oldTag = load(box, kBoxValueOffset, 1);
+            const std::int32_t old = load(box, kBoxValueOffset + kPayload, 8);
+            store(box, kBoxValueOffset, tag, 1);
+            store(box, kBoxValueOffset + kPayload, payload, 8);
+            decRefOf(old, oldTag, false);
+            emitBail(bail, {value});
+            return;
+        }
         const std::int32_t skip = newLabel();
         const std::int32_t done = newLabel();
         // A cell that was never made drops the write, as in the interpreter.
@@ -4124,9 +4146,12 @@ private:
         Entry callee = pop();
         if (mathInPlace(callee, self, args))
             return;
+        // Set when the stack below is not the one the interpreter would see at this instruction.
+        bool viaCall = false;
         // `f.call(x, a)` is `f(a)` on `x`, with everything a call to `f` could have, while `call` is the built-in.
         if (callee.hint && callee.hint == rt_.intrinsics[Runtime::FunctionCall].get() && betHere() && argc >= 1 &&
             callee.rep == Rep::Tagged && !callee.isConst && !args[0].lazyArgs) {
+            viaCall = true;
             const std::int32_t bail = newLabel();
             if (!callee.hasKnownTag)
                 branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), bail);
@@ -4170,8 +4195,32 @@ private:
         const std::int32_t finished = newLabel();
         const bool lazy = !args.empty() && args.back().lazyArgs;
         bool inlined = lazy ? forwardArguments(callee, self, args, r, t, generic, held) : intrinsic(callee, self, args, r, t, generic);
-        if (!inlined && !lazy)
+        const std::size_t bodyStart = fn_.code.size();
+        if (!inlined && !lazy) {
             inlined = inlineCall(callee, self, args, held, r, t, generic, finished);
+            // A function's body in place of the call, and something else turning up instead is for the interpreter to deal
+            // with: no call to come back from here, so what the body leaves known stays known.
+            if (inlined && betHere() && !viaCall) {
+                inst(IrOp::Br).imm = finished;
+                bool guarded = false;
+                for (std::size_t i = bodyStart; i < fn_.code.size() && !guarded; ++i) {
+                    const IrInst& in = fn_.code[i];
+                    guarded = (in.op == IrOp::Br && in.imm == generic) || ((in.op == IrOp::BrCmp || in.op == IrOp::BrFCmp) && in.target == generic);
+                }
+                if (guarded) {
+                    std::vector<Entry> popped = {callee, self};
+                    popped.insert(popped.end(), args.begin(), args.end());
+                    emitBail(generic, popped);
+                }
+                inst(IrOp::Label).imm = finished;
+                for (const Entry& arg : args)
+                    release(arg);
+                release(self);
+                release(callee);
+                push(taggedEntry(r, t, Own::Owned));
+                return;
+            }
+        }
         if (inlined) {
             inst(IrOp::Br).imm = finished;
             inst(IrOp::Label).imm = generic;

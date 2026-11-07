@@ -400,6 +400,67 @@ private:
     IrFunction& fn_;
 };
 
+/// A branch to where execution would go anyway, past cold blocks that are laid out elsewhere, and then labels nothing
+/// goes to: what follows them has one way in, so what was known before them is still known. An inlined function that
+/// returns at its end is most of these.
+class Straighten
+{
+public:
+    explicit Straighten(IrFunction& fn) : fn_(fn) {}
+
+    void run()
+    {
+        std::vector<IrInst>& code = fn_.code;
+        std::vector<std::uint32_t> uses(std::size_t(fn_.labelCount), 0);
+        const auto use = [&](std::int64_t label) {
+            if (label >= 0 && std::size_t(label) < uses.size())
+                ++uses[std::size_t(label)];
+        };
+        for (const IrInst& in : code)
+            use(labelTargetOf(in));
+        for (const IrExit& exit : fn_.exits)
+            use(exit.handlerLabel);
+        for (const IrOsrEntry& entry : fn_.osrEntries)
+            use(entry.label);
+        std::vector<std::uint8_t> removed(code.size(), 0);
+        int cold = 0;
+        for (std::size_t i = 0; i < code.size(); ++i) {
+            if (code[i].op == IrOp::ColdBegin)
+                ++cold;
+            else if (code[i].op == IrOp::ColdEnd)
+                --cold;
+            if (cold || code[i].op != IrOp::Br)
+                continue;
+            std::size_t next = i + 1;
+            int skipping = 0;
+            for (; next < code.size(); ++next) {
+                const IrOp op = code[next].op;
+                if (op == IrOp::ColdBegin)
+                    ++skipping;
+                else if (op == IrOp::ColdEnd)
+                    --skipping;
+                else if (!skipping && !(op == IrOp::Label && code[next].imm != code[i].imm))
+                    break;
+            }
+            if (next < code.size() && code[next].op == IrOp::Label && code[next].imm == code[i].imm) {
+                removed[i] = 1;
+                --uses[std::size_t(code[i].imm)];
+            }
+        }
+        std::vector<IrInst> out;
+        out.reserve(code.size());
+        for (std::size_t i = 0; i < code.size(); ++i) {
+            if (removed[i] || (code[i].op == IrOp::Label && uses[std::size_t(code[i].imm)] == 0))
+                continue;
+            out.push_back(code[i]);
+        }
+        code.swap(out);
+    }
+
+private:
+    IrFunction& fn_;
+};
+
 /// Within a basic block, the same computation twice is one computation and a copy; the same check twice is one check. What
 /// makes a load the same is that nothing between could have written there: a store at that offset, or a call.
 class CommonSubexpressions
@@ -1457,6 +1518,7 @@ private:
 
 void optimizeLoops(IrFunction& fn)
 {
+    Straighten(fn).run();
     CommonSubexpressions(fn).run();
     LoopOptimizer(fn).run();
     LoopInvariants(fn).run();

@@ -952,6 +952,12 @@ TEST(callingThroughCallIsCalling)
     CHECK_EQ(run("function f(o) { return o.call(1, 2); } function g(a) { return a; } for (var i = 0; i < 3000; i++) f(g);"
                  "var r = f({ call: function (x, y) { return x + y; } }); try { f({ call: 5 }); } catch (e) { r += ':' + e.name; } r"),
              std::string("3:TypeError"));
+    // A function called through `call` and put in place of it, then `call` itself replaced.
+    CHECK_EQ(run("function run() { var v = function (a, b) { return String(a) + String(b) + arguments.length; };"
+                 " var c = function () { return v.call(null, {}, 2.5); }; var y; for (var i = 0; i < 300; i++) y = c();"
+                 " v.call = function () { return 'own'; }; return y + ',' + c(); }"
+                 "var r; for (var i = 0; i < 40; i++) r = run(); r"),
+             std::string("[object Object]2.52,own"));
     CHECK_EQ(run("function f(s) { return String.prototype.toUpperCase.call(s); } var y; for (var i = 0; i < 3000; i++) y = f('ab'); y"),
              std::string("AB"));
     CHECK_EQ(run("function g() { return arguments.length; } function f() { return g.call(this, arguments); } var y; for (var i = 0; i < 3000; i++) y = f(1, 2); y"),

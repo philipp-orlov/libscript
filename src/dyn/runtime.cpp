@@ -270,6 +270,7 @@ void Runtime::releaseRoots() noexcept
         c.reset();
     nativeKeepAlive = Value::undefined();
     nativePending = nullptr;
+    finallyPending.clear();
     regexp.reset();
     typed.reset();
     iterators.reset();

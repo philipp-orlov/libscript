@@ -277,6 +277,8 @@ struct Runtime : EngineRuntime
     std::uint64_t jitCompiled = 0;
     std::uint32_t nativeError = 0;
     std::exception_ptr nativePending;
+    /// What native code's `finally` blocks have put aside to raise again when they end, innermost last.
+    std::vector<std::exception_ptr> finallyPending;
     std::uint32_t pollFlag = 0;
     std::uintptr_t nativeStackLimit = 0;
     void* nativeTopFrame = nullptr;

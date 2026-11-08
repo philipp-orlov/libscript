@@ -1712,3 +1712,25 @@ TEST(nativeCodeCatchesWhatItsTryThrows)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1 bad:SyntaxError 101 c1 d xy2true TypeError"));
     }
 }
+
+TEST(nativeCodeRunsFinallyEveryWayOut)
+{
+    // A `finally` is native code: entered from the end of its `try`, a `return`, `break` or `continue` through it, or an
+    // exception, it ends going where that way was going; one entered by an exception raises it again.
+    const char* program =
+        "var log = [];"
+        "function a(i) { try { if (i & 1) throw new Error('e'); return 'r' + i; } finally { log.push('f' + i); } }"
+        "function b() { let s = 0; for (let k = 0; k < 4; k++) { try { if (k === 2) continue; if (k === 3) break; s += k; } finally { s += 10; } } return s; }"
+        "function c(i) { try { try { throw i; } finally { log.push('in'); } } catch (e) { return 'caught' + e; } finally { log.push('out'); } }"
+        "function d() { try { return 1; } finally { return 2; } }"
+        "function g(i) { try { try { return 'x'; } finally { if (i % 2) throw new TypeError('t'); } } catch (z) { return z.name; } }"
+        "let out; for (let k = 0; k < 2000; k++) { log = []; let ra; try { ra = a(k); } catch (err) { ra = err.message; }"
+        "  out = [ra, b(), c(k), d(), g(k), log.join('.')]; } out.join(' ')";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("e 41 caught1999 2 TypeError f1999.in.out"));
+    }
+}

@@ -381,11 +381,7 @@ public:
     void run()
     {
         // A `for-of`'s handler is the one kind native code can do without: see `IterStartLoop`.
-        // A `catch` is native code too (see `catchAt`); a `finally` is not yet, and refuses at its JumpSub.
-        for (const Handler& handler : code_.handlers) {
-            if (handler.kind == HandlerKind::Finally)
-                refuse("the function has a finally block");
-        }
+        // A `catch` and a `finally` are native code too: see `catchAt` and `enterFinally`.
         speculate_ = code_.jitMayGuess() && !code_.isClassConstructor;
         prepare();
         const std::uint32_t arity = std::uint32_t(std::max(code_.arity, 0));
@@ -1155,18 +1151,64 @@ private:
                 if (labels_[target] < 0)
                     labels_[target] = newLabel();
             }
-            if (op == Op::JumpSub || op == Op::EndFinally)
-                refuse("a finally block");
+            if (op == Op::JumpSub && labels_[readOperand(c, pc + 1)] < 0)
+                labels_[readOperand(c, pc + 1)] = newLabel();
             pc += 1 + std::size_t(operandsOf(op)) * 4;
         }
         std::vector<std::uint32_t> work{0};
-        // A `catch` is reached by what is thrown in its `try`: a place to land, with a label of its own.
+        // A `catch` or a `finally` is reached by what is thrown in its `try`: a place to land, with a label of its own.
+        // A `finally` is also a subroutine: each JumpSub to it comes back to the instruction after, by its number, and
+        // its EndFinally is the one that ends the innermost block entered by then, by layout.
         for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
             const Handler& h = code_.handlers[i];
-            if (h.kind != HandlerKind::Catch || parent_)
+            if ((h.kind != HandlerKind::Catch && h.kind != HandlerKind::Finally) || parent_)
                 continue;
+            if (h.kind == HandlerKind::Finally && parent_)
+                refuse("a finally in code inlined into a caller");
             work.push_back(h.target);
             landing_[i] = newLabel();
+            if (h.kind != HandlerKind::Finally)
+                continue;
+            // Where a JumpSub comes back to is met before the block that sends it there; with nothing on the stack, its
+            // way in needs no values settled first. A `try` inside a `switch` or a `for-in` has some.
+            if (h.stackDepth != 0)
+                refuse("a finally with values under it on the stack");
+            contReg_[i] = fn_.newVreg(false);
+            for (std::size_t pc = 0; pc < c.size();) {
+                const Op op = Op(c[pc]);
+                const std::uint32_t next = std::uint32_t(pc + 1 + std::size_t(operandsOf(op)) * 4);
+                if (op == Op::JumpSub && readOperand(c, pc + 1) == h.target) {
+                    subReturns_[i].push_back(next);
+                    if (labels_[next] < 0)
+                        labels_[next] = newLabel();
+                    work.push_back(next);
+                }
+                pc = next;
+            }
+        }
+        // Each EndFinally, and the block it ends: from its target to it, nothing may bail, the interpreter keeping
+        // where each finally returns to in a list of its own that a bail could not fill in.
+        {
+            std::set<std::size_t> ended;
+            for (std::size_t pc = 0; pc < c.size();) {
+                const Op op = Op(c[pc]);
+                if (op == Op::EndFinally) {
+                    std::int32_t best = -1;
+                    for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
+                        const Handler& h = code_.handlers[i];
+                        if (h.kind != HandlerKind::Finally || h.target > pc || ended.count(i))
+                            continue;
+                        if (best < 0 || h.target > code_.handlers[std::size_t(best)].target)
+                            best = std::int32_t(i);
+                    }
+                    if (best < 0)
+                        refuse("an end of a finally with no finally");
+                    ended.insert(std::size_t(best));
+                    endsFinally_[std::uint32_t(pc)] = std::size_t(best);
+                    finallyBodies_.emplace_back(code_.handlers[std::size_t(best)].target, std::uint32_t(pc));
+                }
+                pc += 1 + std::size_t(operandsOf(op)) * 4;
+            }
         }
         while (!work.empty()) {
             std::uint32_t pc = work.back();
@@ -1523,9 +1565,29 @@ private:
             // A for-of's handler closes an iterator native code never has (see IterStartLoop): it lets this go on out.
             if (h.kind == HandlerKind::IterClose)
                 continue;
-            return h.kind == HandlerKind::Catch && landing_.count(i) ? std::int32_t(i) : -1;
+            return (h.kind == HandlerKind::Catch || h.kind == HandlerKind::Finally) && landing_.count(i) ? std::int32_t(i) : -1;
         }
         return -1;
+    }
+
+    /// Where an exception enters the `finally` of handler `i`: with the stack its `try` began with, the exception put aside
+    /// (see scriptDynFinallyEnter), and the block told so by its register. It then runs as if called.
+    void enterFinally(std::size_t i)
+    {
+        const Handler& h = code_.handlers[i];
+        if (!tryStack_.count(i) || tryStack_[i].size() != h.stackDepth)
+            refuse("a finally with no try before it");
+        bindLabel(landing_[i]);
+        stack_ = tryStack_[i];
+        forgetFacts();
+        const std::int32_t number = fn_.newVreg(false);
+        noHandler_ = true;
+        coldCall(reinterpret_cast<void*>(&scriptDynFinallyEnter), {rtReg()}, number, -1, true);
+        noHandler_ = false;
+        IrInst& neg = inst(IrOp::Neg);
+        neg.d = contReg_[i];
+        neg.a = number;
+        neg.width = 64;
     }
 
     /// Whether code here is inside a `try` whose `catch` native code handles: then a call is not inlined, which would
@@ -1892,7 +1954,13 @@ private:
     /// Whether to assume what the interpreter has seen at this instruction: not where that has already been wrong.
     bool betHere() const
     {
-        return speculate_ && std::find(code_.jitBailedAt.begin(), code_.jitBailedAt.end(), pc_) == code_.jitBailedAt.end();
+        if (!speculate_ || std::find(code_.jitBailedAt.begin(), code_.jitBailedAt.end(), pc_) != code_.jitBailedAt.end())
+            return false;
+        for (const auto& [from, to] : finallyBodies_) {
+            if (pc_ >= from && pc_ <= to)
+                return false;
+        }
+        return true;
     }
     void expectEpoch(std::uint64_t epoch, std::int32_t bail)
     {
@@ -2045,10 +2113,13 @@ private:
             if (!parent_) {
                 for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
                     const Handler& h = code_.handlers[i];
-                    if (h.kind != HandlerKind::Catch)
+                    if (h.target != pc)
                         continue;
-                    if (h.target == pc) {
+                    if (h.kind == HandlerKind::Catch) {
                         enterCatch(i);
+                        fallsIn = true;
+                    } else if (h.kind == HandlerKind::Finally) {
+                        enterFinally(i);
                         fallsIn = true;
                     }
                 }
@@ -2072,7 +2143,7 @@ private:
             if (!parent_) {
                 for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
                     const Handler& h = code_.handlers[i];
-                    if (h.kind == HandlerKind::Catch && h.start == pc && !tryStack_.count(i)) {
+                    if ((h.kind == HandlerKind::Catch || h.kind == HandlerKind::Finally) && h.start == pc && !tryStack_.count(i)) {
                         secureWeak();
                         for (Entry& e : stack_)
                             makeOwned(e);
@@ -3184,6 +3255,61 @@ private:
                 release(src);
                 push(taggedEntry(r, t, Own::Owned));
                 return true;
+            }
+            case Op::JumpSub: {
+                // Into a `finally`, to come back to the next instruction: its number in the block's register.
+                const std::uint32_t target = operand();
+                std::int64_t id = 0;
+                for (const auto& [i, returns] : subReturns_) {
+                    if (code_.handlers[i].target != target)
+                        continue;
+                    const auto it = std::find(returns.begin(), returns.end(), pc + 5);
+                    if (it != returns.end()) {
+                        IrInst& set = inst(IrOp::MovImm);
+                        set.d = contReg_[i];
+                        set.imm = std::int64_t(it - returns.begin()) + 1;
+                        id = set.imm;
+                    }
+                }
+                if (!id)
+                    refuse("a JumpSub to no finally");
+                secureWeak();
+                flowTo(target);
+                inst(IrOp::Br).imm = labels_[target];
+                stack_.clear();
+                return false;
+            }
+            case Op::EndFinally: {
+                const auto ends = endsFinally_.find(pc);
+                if (ends == endsFinally_.end())
+                    refuse("an end of a finally with no finally");
+                const std::size_t i = ends->second;
+                const std::int32_t cont = contReg_[i];
+                secureWeak();
+                const std::vector<std::uint32_t>& returns = subReturns_[i];
+                for (std::size_t k = 0; k < returns.size(); ++k) {
+                    const std::int32_t next = newLabel();
+                    IrInst& test = inst(IrOp::BrCmp);
+                    test.a = cont;
+                    test.cond = IrCond::Ne;
+                    test.width = 64;
+                    test.hasImm = true;
+                    test.imm = std::int64_t(k) + 1;
+                    test.target = next;
+                    flowTo(returns[k]);
+                    inst(IrOp::Br).imm = labels_[returns[k]];
+                    inst(IrOp::Label).imm = next;
+                }
+                // Otherwise an exception came in: out with it again, to whatever is around this place.
+                const std::int32_t number = fn_.newVreg(false);
+                IrInst& neg = inst(IrOp::Neg);
+                neg.d = number;
+                neg.a = cont;
+                neg.width = 64;
+                coldCall(reinterpret_cast<void*>(&scriptDynFinallyRethrow), {rtReg(), number}, -1, -1, true);
+                inst(IrOp::Trap);
+                stack_.clear();
+                return false;
             }
             case Op::IterCloseAt: (void)operand(); return true;
             case Op::CallSpread:
@@ -7523,6 +7649,12 @@ private:
     /// For each handler: the label its `catch` is landed on, and the stack as it was where its `try` began.
     std::map<std::size_t, std::int32_t> landing_;
     std::map<std::size_t, std::vector<Entry>> tryStack_;
+    /// For each `finally`: the register saying where it goes when it ends (a JumpSub's number, or minus the number of an
+    /// exception put aside), and the instructions its JumpSubs come back to, numbered from 1.
+    std::map<std::size_t, std::int32_t> contReg_;
+    std::map<std::size_t, std::vector<std::uint32_t>> subReturns_;
+    std::map<std::uint32_t, std::size_t> endsFinally_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> finallyBodies_;
     /// Set while what an exit leads to must be the caller, whatever handler covers the place.
     bool noHandler_ = false;
     std::vector<Join> joins_;

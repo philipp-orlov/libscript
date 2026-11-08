@@ -557,6 +557,38 @@ NativePair scriptDynCatch(Runtime* rt) noexcept
     return take(Value::undefined());
 }
 
+/// Where an exception enters a `finally` in native code: it is put aside, to be raised again where the block ends, and
+/// its number among those put aside comes back. Anything that is no exception of the program's skips the block, as in
+/// the interpreter: 0, with it still pending.
+std::uint64_t scriptDynFinallyEnter(Runtime* rt) noexcept
+{
+    std::exception_ptr pending = std::move(rt->nativePending);
+    rt->nativePending = nullptr;
+    try {
+        if (pending)
+            std::rethrow_exception(pending);
+    } catch (Exception&) {
+        rt->finallyPending.push_back(std::current_exception());
+        rt->nativeError = 0;
+        return rt->finallyPending.size();
+    } catch (...) {
+        rt->nativePending = std::current_exception();
+        return 0;
+    }
+    return 0;
+}
+
+/// The end of a `finally` that an exception entered: number `n` raised again. Any put aside after it belong to blocks
+/// that were left another way.
+void scriptDynFinallyRethrow(Runtime* rt, std::uint64_t number) noexcept
+{
+    if (number == 0 || number > rt->finallyPending.size())
+        return;
+    rt->nativePending = std::move(rt->finallyPending[number - 1]);
+    rt->nativeError = std::uint32_t(ErrorCode::Exception);
+    rt->finallyPending.resize(number - 1);
+}
+
 /// `f(...args)` and `new F(...args)`: the arguments arrive as the array the spread made.
 NativePair scriptDynCallSpread(Runtime* rt, std::int64_t calleeTag, std::uint64_t callee, std::int64_t selfTag, std::uint64_t self,
                                GCObject* array, std::uint64_t construct) noexcept

@@ -259,7 +259,7 @@ std::int32_t scriptDynStrictEquals(std::int64_t ta, std::uint64_t a, std::int64_
 
 NativePair scriptDynTypeOf(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
 {
-    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(rt->str(typeOfName(valueOf(tag, payload)))); });
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(rt->typeOfValue(valueOf(tag, payload))); });
 }
 
 NativePair scriptDynToStringOp(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
@@ -660,7 +660,7 @@ NativePair scriptDynTypeofGlobal(Runtime* rt, GCObject* key) noexcept
         const Value g = detail::Access::make(Type::Object, rt->globalObject.get());
         if (!hasProperty(*rt, g, key))
             return take(rt->str("undefined"));
-        return take(rt->str(typeOfName(getProperty(*rt, g, key))));
+        return take(rt->typeOfValue(getProperty(*rt, g, key)));
     });
 }
 

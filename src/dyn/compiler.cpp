@@ -1875,7 +1875,10 @@ private:
             case NK::StringLit:
                 if (n.legacyOctal && earlyErrors() && inStrictCode())
                     fail(n.line, "an octal escape is not allowed in strict code");
-                emitU(Op::PushConst, constIndex(rt_.str(n.text)));
+                // Short ones interned: compared with what typeof gives, or used as keys, they are the same cell.
+                emitU(Op::PushConst, constIndex(n.text.size() <= ContextImpl::kInternedLength
+                                                    ? detail::Access::make(Type::String, rt_.intern(n.text))
+                                                    : rt_.str(n.text)));
                 return;
             case NK::BoolLit:
                 emit(n.number != 0 ? Op::PushTrue : Op::PushFalse);

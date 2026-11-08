@@ -122,6 +122,11 @@ struct Runtime : EngineRuntime
     Value str(StringView text) { return detail::Access::adopt(Type::String, ctx.newString(text)); }
     Value str(const char* asciiText) { return str(ascii(asciiText)); }
 
+    /// What `typeof` gives, one interned string for each answer, made on first use: `typeof x === "number"` then makes
+    /// nothing and compares two pointers.
+    std::pair<const char*, Ref<StringCell>> typeNames[8];
+    Value typeOfValue(const Value& v);
+
     // ---- atoms and symbols ----
     std::unordered_map<String, SymbolCell*> symbolRegistry;
     Atoms atom;

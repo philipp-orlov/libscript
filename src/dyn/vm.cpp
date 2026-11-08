@@ -2204,7 +2204,7 @@ Value execute(Runtime& rt, Frame& frame)
                             sp.push_back(rt.str("undefined"));
                             break;
                         }
-                        sp.push_back(rt.str(typeOfName(getProperty(rt, g, key))));
+                        sp.push_back(rt.typeOfValue(getProperty(rt, g, key)));
                         break;
                     }
                     case Op::DeleteGlobal: {
@@ -3281,7 +3281,7 @@ Value execute(Runtime& rt, Frame& frame)
                         sp.back() = Value(!toBoolean(sp.back()));
                         break;
                     case Op::TypeOf:
-                        sp.back() = rt.str(typeOfName(sp.back()));
+                        sp.back() = rt.typeOfValue(sp.back());
                         break;
                     default:
                         throwError(rt, ErrorCode::InternalError,

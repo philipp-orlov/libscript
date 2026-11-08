@@ -303,6 +303,8 @@ void Runtime::releaseRoots() noexcept
     sym = Symbols{};
     frames.clear();
     framePool.clear();
+    for (auto& entry : typeNames)
+        entry = {nullptr, Ref<StringCell>()};
     // The registry's own counts.
     std::vector<SymbolCell*> registered;
     for (const auto& [name, symbol] : symbolRegistry)
@@ -490,6 +492,21 @@ Value Runtime::makeArray(Vec<Value> items)
 Value Runtime::makeArray(const std::vector<Value>& items)
 {
     return makeArray(Vec<Value>(items.begin(), items.end()));
+}
+
+Value Runtime::typeOfValue(const Value& v)
+{
+    const char* name = typeOfName(v);
+    for (auto& [known, cell] : typeNames) {
+        if (known == name)
+            return detail::Access::make(Type::String, cell.get());
+        if (!known) {
+            known = name;
+            cell.reset(intern(name));
+            return detail::Access::make(Type::String, cell.get());
+        }
+    }
+    return str(name);
 }
 
 Value Runtime::makeFunction(StringView name, NativeFunction fn, int arity)

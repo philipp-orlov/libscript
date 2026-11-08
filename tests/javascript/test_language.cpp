@@ -1677,3 +1677,16 @@ TEST(anAnchoredPatternTriesOnlyTheStart)
                  " /^a|^b/.test('cab')].join()"),
              std::string("false,true,true,1000,false"));
 }
+
+TEST(typeofAndStringEqualityAgreeEverywhere)
+{
+    // typeof gives shared strings and short constants are interned, so native code compares many strings by pointer;
+    // strings made at run time, which are not interned, still compare by their text.
+    CHECK_EQ(run("function kind(x) { return typeof x === 'number' ? 'n' : typeof x === 'string' ? 's' : typeof x == 'boolean' ? 'b' :"
+                 " typeof x === 'undefined' ? 'u' : typeof x === 'function' ? 'f' : typeof x; }"
+                 " function same(a, b) { return a === b; } let out = '', n = 0;"
+                 " for (let i = 0; i < 3000; i++) { out = [1, 'a', true, undefined, kind, null, {}, 2n].map(kind).join('');"
+                 " if (same('ab', 'a' + (i >= 0 ? 'b' : 'c')) && !same('ab', 'abc'.slice(0, 1)) && same(typeof i, 'num' + 'ber')) n++; }"
+                 " out + ',' + n"),
+             std::string("nsbufobjectobjectbigint,3000"));
+}

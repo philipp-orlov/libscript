@@ -48,6 +48,7 @@ using typed::IrSite;
 constexpr std::int64_t kCellKindOffset = offsetof(GCObject, kind);
 constexpr std::int64_t kClsOffset = offsetof(DynObject, cls);
 constexpr std::int64_t kShapeOffset = offsetof(DynObject, shape);
+constexpr std::int64_t kStringInternedOffset = offsetof(StringCell, interned);
 constexpr std::int64_t kProtoOffset = offsetof(DynObject, proto);  // the first word of a reference is the pointer
 constexpr std::int64_t kPropsOffset = offsetof(DynObject, props);  // the first word of the table is its data
 constexpr std::int64_t kPropsSizeOffset = kPropsOffset + 8;
@@ -3220,14 +3221,52 @@ private:
                 push(boolEntry(d));
                 return true;
             }
-            case Op::TypeOf:
+            case Op::TypeOf: {
+                // The kinds whose tag alone says what typeof is give the runtime's own string for it; an object, which
+                // may be callable, and the rest ask the helper. Either way the result holds a count.
+                Entry a = pop();
+                secureWeak();
+                const std::int32_t tag = tagReg(a);
+                const std::int32_t payload = payloadReg(a);
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                const std::int32_t slow = newLabel();
+                const std::int32_t done = newLabel();
+                const std::pair<Type, Value> known[] = {{Type::Double, rt_.typeOfValue(Value(0.0))},
+                                                        {Type::String, rt_.typeOfValue(rt_.str(""))},
+                                                        {Type::Bool, rt_.typeOfValue(Value(true))},
+                                                        {Type::Undefined, rt_.typeOfValue(Value::undefined())}};
+                for (const auto& [type, name] : known) {
+                    const std::int32_t next = newLabel();
+                    branchCmp(tag, IrCond::Ne, std::int64_t(type), next);
+                    const std::int32_t cell = ptrReg(detail::Access::ptr(name));
+                    IrInst& mr = inst(IrOp::Mov);
+                    mr.d = r;
+                    mr.a = cell;
+                    IrInst& mt = inst(IrOp::MovImm);
+                    mt.d = t;
+                    mt.imm = std::int64_t(Type::String);
+                    incRefOf(r, -1, false);
+                    inst(IrOp::Br).imm = done;
+                    inst(IrOp::Label).imm = next;
+                }
+                inst(IrOp::Br).imm = slow;
+                inst(IrOp::ColdBegin);
+                inst(IrOp::Label).imm = slow;
+                coldCall(reinterpret_cast<void*>(&scriptDynTypeOf), {rtReg(), tag, payload}, r, t, true, {a});
+                inst(IrOp::Br).imm = done;
+                inst(IrOp::ColdEnd);
+                inst(IrOp::Label).imm = done;
+                release(a);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
             case Op::ToString:
             case Op::ToPropertyKey: {
                 Entry a = pop();
                 secureWeak();
-                void* helper = op == Op::TypeOf     ? reinterpret_cast<void*>(&scriptDynTypeOf)
-                               : op == Op::ToString ? reinterpret_cast<void*>(&scriptDynToStringOp)
-                                                    : reinterpret_cast<void*>(&scriptDynToPropertyKeyOp);
+                void* helper = op == Op::ToString ? reinterpret_cast<void*>(&scriptDynToStringOp)
+                                                  : reinterpret_cast<void*>(&scriptDynToPropertyKeyOp);
                 const std::int32_t rt = rtReg();
                 const std::int32_t tag = tagReg(a);
                 const std::int32_t payload = payloadReg(a);
@@ -7203,6 +7242,33 @@ private:
             eq.width = 32;
             inst(IrOp::Br).imm = done;
             inst(IrOp::Label).imm = notBool;
+            // Two strings: the same cell is the same string, and two interned cells that are not the same are different
+            // strings, there being one interned cell for each text. Only the rest needs the characters compared.
+            const std::int32_t notString = newLabel();
+            branchCmp(ta, IrCond::Ne, std::int64_t(Type::String), notString);
+            {
+                const std::int32_t differ = newLabel();
+                IrInst& samePtr = inst(IrOp::BrCmp);
+                samePtr.a = pa;
+                samePtr.b = pb;
+                samePtr.cond = IrCond::Ne;
+                samePtr.width = 64;
+                samePtr.target = differ;
+                IrInst& yes = inst(IrOp::MovImm);
+                yes.d = d;
+                yes.imm = wantEqual ? 1 : 0;
+                inst(IrOp::Br).imm = done;
+                inst(IrOp::Label).imm = differ;
+                const std::int32_t ia = load(pa, kStringInternedOffset, 1, false, kAliasHeader);
+                branchCmp(ia, IrCond::Eq, 0, slow);
+                const std::int32_t ib = load(pb, kStringInternedOffset, 1, false, kAliasHeader);
+                branchCmp(ib, IrCond::Eq, 0, slow);
+                IrInst& no = inst(IrOp::MovImm);
+                no.d = d;
+                no.imm = wantEqual ? 0 : 1;
+                inst(IrOp::Br).imm = done;
+            }
+            inst(IrOp::Label).imm = notString;
             branchCmp(ta, IrCond::Hi, std::int64_t(Type::Null), slow);
             IrInst& always = inst(IrOp::MovImm);
             always.d = d;

@@ -481,7 +481,23 @@ Token Lexer::readTemplate()
                 ++line_;
             ++pos_;
         }
-        chunk += fromUtf8(src_.substr(start, pos_ - start));
+        // The cooked text too has one line ending for CR LF and for CR alone, as the raw text does.
+        const std::string_view piece = src_.substr(start, pos_ - start);
+        if (piece.find('\r') == std::string_view::npos) {
+            chunk += fromUtf8(piece);
+        } else {
+            std::string plain;
+            for (std::size_t i = 0; i < piece.size(); ++i) {
+                if (piece[i] == '\r') {
+                    plain.push_back('\n');
+                    if (i + 1 < piece.size() && piece[i + 1] == '\n')
+                        ++i;
+                } else {
+                    plain.push_back(piece[i]);
+                }
+            }
+            chunk += fromUtf8(plain);
+        }
     }
     return t;
 }

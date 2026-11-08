@@ -1925,7 +1925,7 @@ Value execute(Runtime& rt, Frame& frame)
     // Zero for a fresh call; part way through for one native code handed back.
     std::uint32_t pc = frame.pc;
     std::uint32_t ticks = 0;
-    Vec<Value>& sp = frame.stack;
+    ValueStack& sp = frame.stack;
 #if SCRIPT_ENABLE_DYN_JIT
     // Back edges until this function is worth compiling in the middle of running it.
     std::uint32_t backEdges =

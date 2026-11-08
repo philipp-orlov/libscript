@@ -5,6 +5,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
+#include <new>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -14,6 +17,92 @@
 namespace script {
 namespace internal {
 namespace dyn {
+
+/// A frame's operand stack: what the interpreter pushes and pops more than anything else, so every operation is inline,
+/// which a `std::vector` in a function the size of `execute` does not get. A `Value` is a tag and a pointer, so its
+/// bytes move as they are when the buffer grows.
+class ValueStack
+{
+public:
+    ValueStack() = default;
+    ValueStack(const ValueStack&) = delete;
+    ValueStack& operator=(const ValueStack&) = delete;
+    ~ValueStack()
+    {
+        clear();
+        std::free(data_);
+    }
+
+    [[gnu::always_inline]] void push_back(const Value& v)
+    {
+        if (size_ == cap_) [[unlikely]]
+            grow();
+        new (data_ + size_++) Value(v);
+    }
+    [[gnu::always_inline]] void push_back(Value&& v)
+    {
+        if (size_ == cap_) [[unlikely]]
+            grow();
+        new (data_ + size_++) Value(std::move(v));
+    }
+    template <class... A>
+    [[gnu::always_inline]] Value& emplace_back(A&&... args)
+    {
+        if (size_ == cap_) [[unlikely]]
+            grow();
+        return *new (data_ + size_++) Value(std::forward<A>(args)...);
+    }
+    [[gnu::always_inline]] void pop_back() noexcept { data_[--size_].~Value(); }
+    [[gnu::always_inline]] Value& back() noexcept { return data_[size_ - 1]; }
+    [[gnu::always_inline]] const Value& back() const noexcept { return data_[size_ - 1]; }
+    [[gnu::always_inline]] Value& operator[](std::size_t i) noexcept { return data_[i]; }
+    [[gnu::always_inline]] const Value& operator[](std::size_t i) const noexcept { return data_[i]; }
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    Value* begin() noexcept { return data_; }
+    Value* end() noexcept { return data_ + size_; }
+    const Value* begin() const noexcept { return data_; }
+    const Value* end() const noexcept { return data_ + size_; }
+    Value* data() noexcept { return data_; }
+    void resize(std::size_t n)
+    {
+        while (size_ > n)
+            pop_back();
+        while (size_ < n)
+            emplace_back();
+    }
+    void clear() noexcept
+    {
+        while (size_)
+            pop_back();
+    }
+    void reserve(std::size_t n)
+    {
+        if (n > cap_)
+            reallocate(n);
+    }
+    void swap(ValueStack& other) noexcept
+    {
+        std::swap(data_, other.data_);
+        std::swap(size_, other.size_);
+        std::swap(cap_, other.cap_);
+    }
+
+private:
+    void grow() { reallocate(cap_ ? std::size_t(cap_) * 2 : 16); }
+    void reallocate(std::size_t n)
+    {
+        void* more = std::realloc(static_cast<void*>(data_), n * sizeof(Value));
+        if (!more)
+            throw std::bad_alloc();
+        data_ = static_cast<Value*>(more);
+        cap_ = std::uint32_t(n);
+    }
+
+    Value* data_ = nullptr;
+    std::uint32_t size_ = 0;
+    std::uint32_t cap_ = 0;
+};
 
 /// One activation of a bytecode function. Frames live on the C++ stack; the
 /// context keeps raw pointers to them so a stack trace can be captured.
@@ -29,7 +118,7 @@ struct Frame
     std::uint32_t pc = 0;
     Vec<Value> locals;
     Vec<Ref<Box>> cells;
-    Vec<Value> stack;
+    ValueStack stack;
     Vec<std::uint32_t> subStack;  ///< `finally` return addresses
     Value thisValue = Value::undefined();
     Value pendingException = Value::undefined();

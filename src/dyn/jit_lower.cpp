@@ -19,6 +19,7 @@
 
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/jit.hpp"
+#include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/dyn/jit_helpers.hpp"
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/dyn/runtime.hpp"
@@ -75,6 +76,11 @@ constexpr std::int64_t kPayload = 8;
 /// A cell's kind and, in an object, its class, read together.
 static_assert(offsetof(DynObject, cls) == offsetof(GCObject, kind) + 1);
 constexpr std::int64_t kKindAndClassOfArray = std::int64_t(CellKind::Object) | std::int64_t(ObjClass::Array) << 8;
+constexpr std::int64_t kKindAndClassOfTypedArray = std::int64_t(CellKind::Object) | std::int64_t(ObjClass::TypedArray) << 8;
+constexpr std::int64_t kTypedElementsOffset = std::int64_t(offsetof(DynTypedArray, elements));
+constexpr std::int64_t kTypedLengthOffset = std::int64_t(offsetof(DynTypedArray, length));
+constexpr std::int64_t kTypedKindOffset = std::int64_t(offsetof(DynTypedArray, element));
+static_assert(sizeof(DynTypedArray::length) == 8, "the length is read as a word");
 constexpr std::uint8_t kAliasHeader = 1;
 constexpr std::uint8_t kAliasValue = 2;
 
@@ -4223,10 +4229,151 @@ private:
         return i;
     }
 
+    /// How an element of a typed array of this kind is loaded and stored: bytes, whether signed, whether a float; false for
+    /// the kinds native code leaves to the helpers.
+    static bool typedAccess(int kind, std::uint8_t& bytes, std::uint8_t& scale, bool& isSigned, bool& isFloat)
+    {
+        isSigned = isFloat = false;
+        switch (ElementKind(kind)) {
+            case ElementKind::Int8: bytes = 1, scale = 0, isSigned = true; return true;
+            case ElementKind::Uint8: bytes = 1, scale = 0; return true;
+            case ElementKind::Int16: bytes = 2, scale = 1, isSigned = true; return true;
+            case ElementKind::Uint16: bytes = 2, scale = 1; return true;
+            case ElementKind::Int32: bytes = 4, scale = 2, isSigned = true; return true;
+            case ElementKind::Uint32: bytes = 4, scale = 2; return true;
+            case ElementKind::Float32: bytes = 4, scale = 2, isFloat = true; return true;
+            case ElementKind::Float64: bytes = 8, scale = 3, isFloat = true; return true;
+            default: return false;  // clamped, half floats and bigints
+        }
+    }
+
+    /// The typed array, of `kind`, and index `i` within its length; otherwise to `slow`. What its elements are at.
+    std::int32_t typedElements(const Entry& base, int kind, std::int32_t i, std::int32_t slow)
+    {
+        if (!base.hasKnownTag)
+            branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), slow);
+        else if (base.known != Type::Object)
+            inst(IrOp::Br).imm = slow;
+        const std::int32_t both = load(base.r, kCellKindOffset, 2, false, kAliasHeader);
+        branchCmp(both, IrCond::Ne, kKindAndClassOfTypedArray, slow);
+        const std::int32_t kindHere = load(base.r, kTypedKindOffset, 1, false, kAliasHeader);
+        branchCmp(kindHere, IrCond::Ne, std::int64_t(kind), slow);
+        // A buffer that is detached or resized changes these, which is why they are read each time.
+        const std::int32_t length = load(base.r, kTypedLengthOffset, 8, false, kAliasHeader);
+        IrInst& bound = inst(IrOp::BrCmp);
+        bound.a = i;
+        bound.b = length;
+        bound.cond = IrCond::Hs;
+        bound.width = 64;
+        bound.target = slow;
+        return load(base.r, kTypedElementsOffset, 8, false, kAliasHeader);
+    }
+
+    bool getTypedElem(Entry& base, Entry& key, int kind)
+    {
+        std::uint8_t bytes, scale;
+        bool isSigned, isFloat;
+        if (!typedAccess(kind, bytes, scale, isSigned, isFloat))
+            return false;
+        const std::int32_t slow = newLabel();
+        const std::int32_t i = arrayIndex(key, slow);
+        const std::int32_t data = typedElements(base, kind, i, slow);
+        const std::int32_t d = fn_.newVreg(isFloat);
+        IrInst& loadOne = inst(IrOp::LoadIdx);
+        loadOne.d = d;
+        loadOne.a = data;
+        loadOne.b = i;
+        loadOne.scale = scale;
+        loadOne.width = bytes;
+        loadOne.isSigned = isSigned;
+        loadOne.alias = kAliasValue;
+        emitBail(slow, {base, key});
+        release(key);
+        release(base);
+        if (isFloat) {
+            if (bytes == 8) {
+                push(doubleEntry(d));
+                return true;
+            }
+            const std::int32_t wide = fn_.newVreg(true);
+            IrInst& conv = inst(IrOp::FConvert);
+            conv.d = wide;
+            conv.a = d;
+            conv.width = 64;
+            push(doubleEntry(wide));
+            return true;
+        }
+        if (ElementKind(kind) == ElementKind::Uint32) {
+            const std::int32_t fp = fn_.newVreg(true);
+            IrInst& conv = inst(IrOp::IntToFp);
+            conv.d = fp;
+            conv.a = d;
+            conv.srcWidth = 64;
+            conv.width = 64;
+            push(doubleEntry(fp));
+            return true;
+        }
+        push(intEntry(d));
+        return true;
+    }
+
+    bool setTypedElem(Entry& base, Entry& key, Entry& value, int kind)
+    {
+        std::uint8_t bytes, scale;
+        bool isSigned, isFloat;
+        if (!typedAccess(kind, bytes, scale, isSigned, isFloat))
+            return false;
+        const std::int32_t slow = newLabel();
+        const std::int32_t i = arrayIndex(key, slow);
+        const std::int32_t data = typedElements(base, kind, i, slow);
+        std::int32_t stored;
+        if (!isFloat && value.rep == Rep::Int32) {
+            stored = value.r;
+        } else {
+            std::int32_t fp;
+            if (isKnownNumber(value)) {
+                fp = doubleReg(value);
+            } else {
+                if (value.hasKnownTag || value.isConst || value.rep != Rep::Tagged)
+                    inst(IrOp::Br).imm = slow;
+                else
+                    branchCmp(value.t, IrCond::Ne, std::int64_t(Type::Double), slow);
+                fp = fn_.newVreg(true);
+                IrInst& bits = inst(IrOp::BitsToFp);
+                bits.d = fp;
+                bits.a = payloadReg(value);
+                bits.width = 64;
+            }
+            if (!isFloat) {
+                stored = int32OfDouble(fp);
+            } else if (bytes == 4) {
+                stored = fn_.newVreg(true);
+                IrInst& conv = inst(IrOp::FConvert);
+                conv.d = stored;
+                conv.a = fp;
+                conv.width = 32;
+            } else {
+                stored = fp;
+            }
+        }
+        IrInst& store = inst(IrOp::StoreIdx);
+        store.a = data;
+        store.b = i;
+        store.c = stored;
+        store.scale = scale;
+        store.width = bytes;
+        store.alias = kAliasValue;
+        emitBail(slow, {base, key, value});
+        return true;
+    }
+
     void getElem(std::uint32_t elemOperand)
     {
         Entry key = pop();
         Entry base = pop();
+        if (betHere() && ElemSite::typedOnly(code_.elemSaw[elemOperand]) >= 0 && !base.isConst && base.rep == Rep::Tagged &&
+            getTypedElem(base, key, ElemSite::typedOnly(code_.elemSaw[elemOperand])))
+            return;
         // Where the interpreter takes over rather than the code carrying on from a getter, nothing can have changed.
         if (!betHere())
             secureWeak();
@@ -4386,6 +4533,15 @@ private:
         Entry value = pop();
         Entry key = pop();
         Entry base = pop();
+        if (betHere() && ElemSite::typedOnly(code_.elemSaw[elemOperand]) >= 0 && !base.isConst && base.rep == Rep::Tagged) {
+            // The value is what the expression gives, whether or not it fits the element.
+            if (setTypedElem(base, key, value, ElemSite::typedOnly(code_.elemSaw[elemOperand]))) {
+                release(key);
+                release(base);
+                push(value);
+                return;
+            }
+        }
         secureWeak();
         makeOwned(value);
         if (base.rep != Rep::Tagged || base.isConst) {

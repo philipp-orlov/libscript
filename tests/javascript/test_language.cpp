@@ -1281,6 +1281,13 @@ TEST(typedArraysAreViewsOfOneBuffer)
     CHECK_EQ(text("var f = new Float64Array(2); f[5] = 1; f[1] = 0.5; [f[5], f.join('|'), 5 in f].join()"), std::string(",0|0.5,false"));
     CHECK_EQ(text("var r = new ArrayBuffer(4, { maxByteLength: 16 }); var t = new Uint8Array(r); r.resize(8); var n = r.transfer(); [t.length, r.detached, n.byteLength].join()"), std::string("0,true,8"));
     CHECK_EQ(text("String(new BigInt64Array([1n, -2n])) + new Uint8Array([72, 105]).toHex()"), std::string("1,-24869"));
+    // Native code reads and writes each kind, and finds a buffer that shrank or went away.
+    CHECK_EQ(text("function rd(x, i) { return x[i]; } function wr(x, i, v) { x[i] = v; }"
+                  "var kinds = [Int8Array, Uint8Array, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];"
+                  "var out = []; for (var k of kinds) { var a = new k(4); for (var r = 0; r < 3000; r++) { wr(a, r & 3, r - 1500.5); rd(a, r & 3); } out.push(rd(a, 3)); } out.join()"),
+             std::string("-38,218,1498,1498,1498,1498,1498.5,1498.5"));
+    CHECK_EQ(text("var rb = new ArrayBuffer(16, { maxByteLength: 32 }); var iv = new Int32Array(rb); iv[3] = 9;"
+                  "for (var r = 0; r < 3000; r++) rd(iv, 3); rb.resize(4); String(rd(iv, 3)) + iv.length"), std::string("undefined1"));
     CHECK_EQ(text("function sum(x) { var s = 0; for (var k = 0; k < x.length; k++) s += x[k]; return s; }"
                   "var big = new Float64Array(100).fill(2); for (var q = 0; q < 3000; q++) sum(big); sum(big) + ',' + sum([4, 5])"), std::string("200,9"));
 }

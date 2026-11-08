@@ -249,7 +249,18 @@ struct ElemSite
     static constexpr std::uint8_t kNumbers = 1;  ///< an element of an array of bare numbers
     static constexpr std::uint8_t kValues = 2;   ///< an element of an array of values
     static constexpr std::uint8_t kOther = 4;    ///< anything else: no array, no such element, a key that is no index
+    /// An element of a typed array, of the kind in the top four bits. Two kinds at one site are `kOther`.
+    static constexpr std::uint8_t kTyped = 8;
     static std::uint8_t of(const DynArray* array) noexcept;
+    static void noteTyped(std::uint8_t& saw, int kind) noexcept
+    {
+        if ((saw & kTyped) && (saw >> 4) != kind)
+            saw |= kOther;
+        else
+            saw |= std::uint8_t(kTyped | (kind << 4));
+    }
+    /// The one typed kind a site has met, or -1.
+    static int typedOnly(std::uint8_t saw) noexcept { return (saw & 0x0f) == kTyped ? saw >> 4 : -1; }
 };
 
 /// What one property access in the code has seen: an inline cache, for the last shape only.

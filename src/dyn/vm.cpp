@@ -2123,7 +2123,6 @@ Value execute(Runtime& rt, Frame& frame)
                                 break;
                             }
                         }
-                        note(ElemSite::kOther);
                         {
                             const std::size_t n = sp.size();
                             DynObject* holder = asObject(sp[n - 2]);
@@ -2131,6 +2130,7 @@ Value execute(Runtime& rt, Frame& frame)
                                 const double d = detail::Access::r8(sp[n - 1]);
                                 auto* ta = static_cast<DynTypedArray*>(holder);
                                 if (d >= 0 && d < double(ta->length) && d == std::floor(d)) {
+                                    ElemSite::noteTyped(elemSaw, int(ta->element));
                                     Value r = typedArrayGet(rt, ta, std::size_t(d));
                                     sp.pop_back();
                                     sp.back() = std::move(r);
@@ -2138,6 +2138,7 @@ Value execute(Runtime& rt, Frame& frame)
                                 }
                             }
                         }
+                        note(ElemSite::kOther);
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
                         sp.push_back(getProperty(rt, base, key.get()));
@@ -2185,13 +2186,17 @@ Value execute(Runtime& rt, Frame& frame)
                                 break;
                             }
                         }
-                        note(ElemSite::kOther);
                         {
                             const std::size_t n = sp.size();
                             DynObject* holder = asObject(sp[n - 3]);
                             if (holder && holder->cls == ObjClass::TypedArray && sp[n - 2].isDouble()) {
                                 const double d = detail::Access::r8(sp[n - 2]);
                                 if (d >= 0 && d == std::floor(d)) {
+                                    auto* ta = static_cast<DynTypedArray*>(holder);
+                                    if (d < double(ta->length) && sp[n - 1].isDouble())
+                                        ElemSite::noteTyped(elemSaw, int(ta->element));
+                                    else
+                                        note(ElemSite::kOther);
                                     typedArraySet(rt, static_cast<DynTypedArray*>(holder), d, sp[n - 1]);
                                     Value v = std::move(sp[n - 1]);
                                     sp.resize(n - 3);
@@ -2200,6 +2205,7 @@ Value execute(Runtime& rt, Frame& frame)
                                 }
                             }
                         }
+                        note(ElemSite::kOther);
                         Value v = pop();
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();

@@ -102,7 +102,7 @@ bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
 | --- | --- | --- | --- |
 | **C#** | typed engine + JIT | static checking, reified generics, records, patterns, tuples, ranges | [csharp.md](docs/languages/csharp.md) |
 | **TypeScript** | dynamic engine | a structural type checker, then erased; generics, narrowing, `strict` mode | [typescript.md](docs/languages/typescript.md) |
-| **JavaScript** | dynamic engine + JIT | ES2024 and more: classes, generators, async, regular expressions, `BigInt`, typed arrays, `Proxy`; 74% of test262 | [javascript.md](docs/languages/javascript.md) |
+| **JavaScript** | dynamic engine + JIT | ES2024 and more: classes, generators, async, regular expressions, `BigInt`, typed arrays, `Proxy`, `WeakMap`; 76% of test262 | [javascript.md](docs/languages/javascript.md) |
 | **Python** | dynamic engine | the everyday core of Python 3: functions, classes, dicts, lambdas | [python.md](docs/languages/python.md) |
 | **C** | typed engine + JIT | a sandboxed C with a `libc` of natives; no ambient file or OS access | [c.md](docs/languages/c.md) |
 | **C++** | typed engine + JIT | classes, virtual dispatch, exceptions, the standard containers | [cpp.md](docs/languages/cpp.md) |
@@ -275,6 +275,11 @@ $ libscript --native program.cs         # C#: compile to machine code up front
 $ libscript --jit program.cs            # C#: compile methods once they get hot
 $ libscript --stack 256 --memory 64 program.js
 ```
+
+A JavaScript program run by the tool has what programs written for a shell such as `jsc` or `d8` look for: `argv`,
+`print`, `printErr`, `read(path)` (`read(path, "binary")` for bytes), `readFile`, `load(path)`, `loadString(source)`,
+`preciseTime()`, `setTimeout`, `clearTimeout` and `gc()`. They belong to the tool, not the library: an embedding
+gives a script only what its host binds.
 
 ## 🎯 Examples
 

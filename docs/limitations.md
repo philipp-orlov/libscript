@@ -193,10 +193,10 @@ machine.
 |---|---|---|
 | **Modules (`import` / `export`, `import()`)** | Module resolution is a host policy question, not an engine one. | Evaluate each file with `eval`; declarations land on the global object. `examples/javascript/plugin.cpp` shows a registration-based host. |
 | **`with`** | Legacy, and it defeats static name resolution, which everything fast here depends on. | -- |
-| **`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`** | Reference counting frees on the last release; weak tables need the collector to report each release, which it does not yet. | A `Map` keyed by an id the host hands out. |
 | **`Temporal`, `Intl`, locale-aware formatting** | Would pull in time zone and locale databases. | `toLocaleString` falls back to the plain form. |
 | **`Array.fromAsync`, `Iterator.zip`, `Iterator.prototype.chunks` and similar recent proposals** | Not yet. | -- |
-| **Timers, file system, network, `process`** | Not the engine's job. | Expose exactly the host capabilities you intend to grant. |
+| **Timers, file system, network, `process`** | Not the engine's job. | Expose exactly the host capabilities you intend to grant. The `libscript` tool has the few a JavaScript shell does: `print`, `read`, `load`, `setTimeout`. |
+| **Realms** (a fresh global object with its own built-ins) | One global per context. | One context per realm. |
 
 `eval` and `new Function(source)` exist but are **off by default**: compiling text a script makes is what a sandbox
 is usually for preventing. A host that wants them sets `Context::Options::runtimeCode = true`; until then both raise
@@ -217,7 +217,8 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
   throwing a `ReferenceError`.
 - **`const` at the top level is not enforced.** Top-level declarations become
   global object properties, and the write barrier lives on the binding, not the
-  property. `const` inside a function is enforced at compile time.
+  property. `const` inside a function is enforced: assigning to it is a
+  `TypeError` when the assignment runs.
 - **A namespace exports by value** (TypeScript): the object a namespace
   evaluates to is built once, so reassigning an exported `var` later is not
   visible through it.
@@ -227,10 +228,21 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
   elements past the end raises a `RangeError` instead of switching to a sparse
   representation. Holes are real: `delete a[i]` makes one, and `in`, the keys
   and the methods that skip holes see it.
-- **`Date` is minimal:** `Date.now`, construction from epoch milliseconds,
-  `getTime`, `getFullYear`, `toISOString`, `toJSON`, `valueOf`. There is no
-  parsing, no local timezone and no component setters.
-- **`arguments.callee`** is not the function.
+- **`Date` has no `Intl`:** local time is the host's time zone, and the
+  `toLocale...String` methods give en-US forms (`2/1/2022, 12:00:00 AM`).
+  `Date.parse` reads the standard format, what `toString` and `toUTCString`
+  write, and the common English shapes (`Feb 1, 2022 10:00`), not every
+  format a browser guesses at.
+- **`WeakRef` holds its target, and `FinalizationRegistry` never calls back.**
+  Both are allowed by the specification, which promises neither collection
+  nor cleanup. `WeakMap` and `WeakSet` are truly weak: a value is kept on its
+  key and goes with it, even when it refers back to the key.
+- **`arguments`** is an Arguments object to the program, but its prototype is
+  one that holds only `Symbol.iterator` rather than `Object.prototype` itself,
+  and `arguments.callee` is not the function.
+- **A function made inside a template literal's `${...}`** shows
+  `{ [native code] }` to `Function.prototype.toString`; every other function
+  shows its source text.
 - **A host wrapper has no own properties.** `shared.x = 1` on an object the
   host or C# handed over is a `TypeError` unless `x` is a bound field with a
   setter; wrappers made by a JavaScript `new` are ordinary objects.

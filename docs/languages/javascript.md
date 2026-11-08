@@ -60,10 +60,12 @@ through `Symbol.iterator`, and any object that implements it participates.
 | `Math` | `PI` `E` `LN2` `LN10` `LOG2E` `LOG10E` `SQRT2` `SQRT1_2`, `abs` `floor` `ceil` `round` `trunc` `sign` `sqrt` `cbrt` `exp` `expm1` `log` `log2` `log10` `log1p` `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `pow` `hypot` `fround` `max` `min` `random` |
 | `JSON` | `parse` `stringify(value, replacer, space)`, honouring `toJSON` |
 | `Map`, `Set` | `size` `get` `set` `add` `has` `delete` `clear` `forEach` `keys` `values` `entries` `[Symbol.iterator]`, with SameValueZero keys |
-| `Symbol` | `Symbol(description)` `Symbol.for`, `iterator` `asyncIterator` `toPrimitive` `toStringTag` `hasInstance`, `description`, `toString` |
+| `Symbol` | `Symbol(description)` `Symbol.for` `Symbol.keyFor`, `iterator` `asyncIterator` `toPrimitive` `toStringTag` `hasInstance`, `description`, `toString` |
 | `Promise` | `resolve` `reject` `all` `allSettled` `any` `race` `withResolvers` `try`, for subclasses too; prototype: `then` `catch` `finally` |
 | `Error` | `Error` `TypeError` `RangeError` `SyntaxError` `ReferenceError` `EvalError` `URIError` `InternalError`, each with `name`, `message` and `stack` |
-| `Date` | `now`; prototype: `getTime` `getFullYear` `toISOString` `toJSON` `toString` `valueOf` |
+| `Date` | `now` `parse` `UTC`; prototype: every `get`/`set` method, local and UTC, `getTimezoneOffset` `getYear` `setYear` `toString` `toDateString` `toTimeString` `toUTCString` `toGMTString` `toISOString` `toJSON` `toLocaleString` `toLocaleDateString` `toLocaleTimeString` (en-US) `valueOf` `[Symbol.toPrimitive]` |
+| `WeakMap` `WeakSet` | `get` `set` `has` `delete` `add` `getOrInsert` `getOrInsertComputed`; truly weak, values kept on their keys |
+| `WeakRef` `FinalizationRegistry` | `deref`; `register` `unregister` (see limitations) |
 | `RegExp` | literals and `new RegExp`, flags `dgimsuvy`; `exec` `test` `toString` `compile`, `[Symbol.match]` `[Symbol.matchAll]` `[Symbol.replace]` `[Symbol.search]` `[Symbol.split]`, `RegExp.escape`, the legacy `RegExp.$1` statics; `String.prototype` `match` `matchAll` `search` `replace` `replaceAll` `split` hand over to it |
 | `BigInt` | literals `1n`, arithmetic of any size, `asIntN` `asUintN`; prototype: `toString(radix)` `toLocaleString` `valueOf` |
 | `ArrayBuffer`, `SharedArrayBuffer` | resizable, `transfer`, `slice`, `isView`, `detached` |

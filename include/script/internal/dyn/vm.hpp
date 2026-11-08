@@ -203,6 +203,8 @@ std::uint32_t lengthOf(Runtime& rt, const Value& v);
 bool looseEquals(Runtime& rt, const Value& a, const Value& b);
 /// A promise reaction or an await's continuation, from the job queue.
 void runPromiseJob(Runtime& rt, Job& job);
+/// `{...src}`: `src`'s own enumerable properties onto `target`.
+void objectSpread(Runtime& rt, DynObject* target, const Value& src);
 /// A function's `arguments`, with a count that is the caller's.
 DynArray* newArgumentsObject(Runtime& rt, const Value* args, std::size_t count);
 bool instanceOf(Runtime& rt, const Value& obj, const Value& ctor);

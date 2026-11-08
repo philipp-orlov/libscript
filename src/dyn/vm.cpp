@@ -1239,6 +1239,19 @@ bool looseEquals(Runtime& rt, const Value& a, const Value& b)
     return false;
 }
 
+void objectSpread(Runtime& rt, DynObject* target, const Value& src)
+{
+    if (DynObject* from = asObject(src)) {
+        for (const Value& key : ownKeys(rt, from, true, false)) {
+            Ref<GCObject> k = toPropertyKey(rt, key);
+            target->putOwn(k.get(), getProperty(rt, src, k.get()));
+        }
+    } else if (StringCell* s = asString(src)) {
+        for (std::uint32_t i = 0; i < s->text().size(); ++i)
+            target->putOwn(rt.intern(numberToString(i)), rt.str(s->text().substr(i, 1)));
+    }
+}
+
 DynArray* newArgumentsObject(Runtime& rt, const Value* args, std::size_t count)
 {
     DynArray* out = rt.newArray(count);
@@ -2448,17 +2461,7 @@ Value execute(Runtime& rt, Frame& frame)
                     }
                     case Op::ObjectSpread: {
                         Value src = pop();
-                        DynObject* target = asObject(sp.back());
-                        if (DynObject* from = asObject(src)) {
-                            for (const Value& key : ownKeys(rt, from, true, false)) {
-                                Ref<GCObject> k = toPropertyKey(rt, key);
-                                target->putOwn(k.get(), getProperty(rt, src, k.get()));
-                            }
-                        } else if (StringCell* s = asString(src)) {
-                            for (std::uint32_t i = 0; i < s->text().size(); ++i)
-                                target->putOwn(rt.intern(numberToString(i)),
-                                               rt.str(s->text().substr(i, 1)));
-                        }
+                        objectSpread(rt, asObject(sp.back()), src);
                         break;
                     }
                     case Op::ObjectRest: {

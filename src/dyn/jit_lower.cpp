@@ -3084,6 +3084,63 @@ private:
                 return true;
             }
             case Op::IterCloseAt: (void)operand(); return true;
+            case Op::ArraySpread:
+            case Op::ObjectSpread: {
+                // Into the literal being made, which stays on the stack.
+                Entry src = pop();
+                secureWeak();
+                Entry& target = stack_.back();
+                target.fresh = nullptr;
+                coldCall(reinterpret_cast<void*>(op == Op::ArraySpread ? &scriptDynArraySpread : &scriptDynObjectSpread),
+                         {rtReg(), payloadReg(target), tagReg(src), payloadReg(src)}, -1, -1, true, {src});
+                release(src);
+                return true;
+            }
+            case Op::IterRest: {
+                // iterator -> iterator array
+                secureWeak();
+                const Entry& iterator = top();
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynIterRest), {rtReg(), tagReg(iterator), iterator.r}, r, t, true);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
+            case Op::IterNextOpt: {
+                // iterator -> iterator item: the next item, or undefined once it is done (destructuring).
+                secureWeak();
+                const Entry& iterator = top();
+                fn_.frameAreaBytes = std::max<std::uint32_t>(fn_.frameAreaBytes, 16);
+                const std::int32_t out = fn_.newVreg(false);
+                IrInst& addr = inst(IrOp::FrameAddr);
+                addr.d = out;
+                addr.imm = 0;
+                const std::int32_t more = callCold(reinterpret_cast<void*>(&scriptDynIterNext), {rtReg(), tagReg(iterator), iterator.r, out}, true);
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                const std::int32_t none = newLabel();
+                const std::int32_t done = newLabel();
+                branchCmp(more, IrCond::Eq, 0, none);
+                const std::int32_t lr = load(out, 0, 8);
+                const std::int32_t lt = load(out, 8, 8);
+                IrInst& mr = inst(IrOp::Mov);
+                mr.d = r;
+                mr.a = lr;
+                IrInst& mt = inst(IrOp::Mov);
+                mt.d = t;
+                mt.a = lt;
+                inst(IrOp::Br).imm = done;
+                inst(IrOp::Label).imm = none;
+                IrInst& ur = inst(IrOp::MovImm);
+                ur.d = r;
+                ur.imm = 0;
+                IrInst& ut = inst(IrOp::MovImm);
+                ut.d = t;
+                ut.imm = std::int64_t(Type::Undefined);
+                inst(IrOp::Label).imm = done;
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
             case Op::IterNext: {
                 const std::uint32_t target = operand();
                 secureWeak();

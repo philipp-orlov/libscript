@@ -537,6 +537,39 @@ void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_
     });
 }
 
+/// `[...src]` in an array literal: what iterating `src` gives, onto the array being made.
+void scriptDynArraySpread(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        const Vec<Value> items = iterableToVector(*rt, valueOf(tag, payload));
+        static_cast<DynArray*>(array)->appendAll(items.data(), items.size());
+        return 0;
+    });
+}
+
+/// `[a, ...rest] = it`: what is left of the iterator, as an array.
+NativePair scriptDynIterRest(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        DynArray* rest = rt->newArray();
+        Value out = detail::Access::adopt(Type::Object, rest);
+        const Value iterator = valueOf(tag, payload);
+        Value item = Value::undefined();
+        while (iteratorStep(*rt, iterator, item))
+            rest->append(item);
+        return take(std::move(out));
+    });
+}
+
+/// `{...src}` in an object literal: `src`'s own enumerable properties, onto the object being made.
+void scriptDynObjectSpread(Runtime* rt, GCObject* object, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        objectSpread(*rt, static_cast<DynObject*>(object), valueOf(tag, payload));
+        return 0;
+    });
+}
+
 /// `#x = v` in a class body, or a private method: a member the object must not have yet.
 void scriptDynDefPrivate(Runtime* rt, GCObject* object, GCObject* name, std::int64_t tag, std::uint64_t payload, std::uint64_t method) noexcept
 {

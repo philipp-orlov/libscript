@@ -557,6 +557,31 @@ NativePair scriptDynCatch(Runtime* rt) noexcept
     return take(Value::undefined());
 }
 
+/// `break` out of a `for-of`, or `return` through one: the iterator's `return()`, if it has one.
+void scriptDynIterCloseAt(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        const Value iterator = valueOf(tag, payload);
+        const Value fn = getProperty(*rt, iterator, rt->intern("return"));
+        if (!fn.isNullish() && !callValue(*rt, fn, iterator, {}).isObject())
+            throwError(*rt, ErrorCode::TypeError, "the iterator's return() did not give an object");
+        return 0;
+    });
+}
+
+/// An exception leaving a `for-of`: the iterator closed, whatever closing it throws, and the exception raised again.
+void scriptDynIterCloseThrow(Runtime* rt, std::int64_t iterTag, std::uint64_t iter, std::int64_t thrownTag, std::uint64_t thrown) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        try {
+            iteratorClose(*rt, valueOf(iterTag, iter));
+        } catch (const Exception&) {
+            // The reason for leaving stands.
+        }
+        throwValue(*rt, valueOf(thrownTag, thrown));
+    });
+}
+
 /// Where an exception enters a `finally` in native code: it is put aside, to be raised again where the block ends, and
 /// its number among those put aside comes back. Anything that is no exception of the program's skips the block, as in
 /// the interpreter: 0, with it still pending.

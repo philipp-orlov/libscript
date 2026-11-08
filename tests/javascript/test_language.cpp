@@ -1734,3 +1734,25 @@ TEST(nativeCodeRunsFinallyEveryWayOut)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("e 41 caught1999 2 TypeError f1999.in.out"));
     }
 }
+
+TEST(nativeForOfClosesWhatItLeaves)
+{
+    // A for-of over anything is native code: a `break` or `return` out of it calls the iterator's return(), and an
+    // exception closes it on the way out.
+    const char* program =
+        "var log = [];"
+        "function* gen(n) { try { for (let i = 0; i < n; i++) yield i; } finally { log.push('c' + n); } }"
+        "function sum(it) { let s = 0; for (const x of it) s += x; return s; }"
+        "function firstOver(it, k) { for (const x of it) if (x > k) return x; return -1; }"
+        "function brk(it) { let s = 0; for (const x of it) { if (x === 2) break; s += x; } return s; }"
+        "function thr(it) { try { for (const x of it) { if (x === 1) throw new Error('boom'); } } catch (e) { return e.message; } }"
+        "let out; for (let k = 0; k < 2000; k++) { log = []; out = [sum([1, 2, 3]), sum(new Set([4, 5])), sum(gen(4)), firstOver(gen(5), 1),"
+        "  brk(gen(6)), thr(gen(7)), log.join(',')]; } out.join(' ')";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("6 9 6 2 1 boom c4,c5,c6,c7"));
+    }
+}

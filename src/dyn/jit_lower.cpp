@@ -1161,7 +1161,7 @@ private:
         // its EndFinally is the one that ends the innermost block entered by then, by layout.
         for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
             const Handler& h = code_.handlers[i];
-            if ((h.kind != HandlerKind::Catch && h.kind != HandlerKind::Finally) || parent_)
+            if (parent_)
                 continue;
             if (h.kind == HandlerKind::Finally && parent_)
                 refuse("a finally in code inlined into a caller");
@@ -1562,10 +1562,7 @@ private:
             const Handler& h = code_.handlers[i];
             if (pc_ < h.start || pc_ >= h.end)
                 continue;
-            // A for-of's handler closes an iterator native code never has (see IterStartLoop): it lets this go on out.
-            if (h.kind == HandlerKind::IterClose)
-                continue;
-            return (h.kind == HandlerKind::Catch || h.kind == HandlerKind::Finally) && landing_.count(i) ? std::int32_t(i) : -1;
+            return landing_.count(i) ? std::int32_t(i) : -1;
         }
         return -1;
     }
@@ -1588,6 +1585,20 @@ private:
         neg.d = contReg_[i];
         neg.a = number;
         neg.width = 64;
+    }
+
+    /// How deep the stack under the handlers native code lands on at `pc` reaches: what is below it stays put there.
+    std::size_t protectedDepth(std::uint32_t pc) const noexcept
+    {
+        std::size_t depth = 0;
+        if (parent_)
+            return 0;
+        for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
+            const Handler& h = code_.handlers[i];
+            if (pc >= h.start && pc < h.end && landing_.count(i))
+                depth = std::max<std::size_t>(depth, h.stackDepth);
+        }
+        return depth;
     }
 
     /// Whether code here is inside a `try` whose `catch` native code handles: then a call is not inlined, which would
@@ -2013,10 +2024,20 @@ private:
                 join.sameTag[i] = knownTagOf(stack_[i]);
             }
             join.entries.resize(stack_.size());
-            for (Entry& canonical : join.entries) {
+            // Under a handler's depth, inside its range, the stack stays in the registers it had when the `try` began,
+            // which its landing counts on: a join there keeps them.
+            // From inside the range too: the way on from here carries on in what the join settles on.
+            const std::size_t keep = std::min(std::max(protectedDepth(target), protectedDepth(pc_)), stack_.size());
+            for (std::size_t i = 0; i < join.entries.size(); ++i) {
+                Entry& canonical = join.entries[i];
                 canonical = Entry();
-                canonical.r = fn_.newVreg(false);
-                canonical.t = fn_.newVreg(false);
+                if (i < keep && stack_[i].rep == Rep::Tagged && stack_[i].own == Own::Owned && !stack_[i].isConst) {
+                    canonical.r = stack_[i].r;
+                    canonical.t = stack_[i].t;
+                } else {
+                    canonical.r = fn_.newVreg(false);
+                    canonical.t = fn_.newVreg(false);
+                }
                 canonical.own = Own::Owned;
             }
         } else if (join.entries.size() != stack_.size()) {
@@ -2115,7 +2136,8 @@ private:
                     const Handler& h = code_.handlers[i];
                     if (h.target != pc)
                         continue;
-                    if (h.kind == HandlerKind::Catch) {
+                    // A for-of's handler is a catch whose block closes the iterator and raises the exception again.
+                    if (h.kind == HandlerKind::Catch || h.kind == HandlerKind::IterClose) {
                         enterCatch(i);
                         fallsIn = true;
                     } else if (h.kind == HandlerKind::Finally) {
@@ -2143,11 +2165,12 @@ private:
             if (!parent_) {
                 for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
                     const Handler& h = code_.handlers[i];
-                    if ((h.kind == HandlerKind::Catch || h.kind == HandlerKind::Finally) && h.start == pc && !tryStack_.count(i)) {
+                    // Only what is under the handler's depth: a for-of's range begins with the item still on top.
+                    if (h.start == pc && !tryStack_.count(i) && stack_.size() >= h.stackDepth) {
                         secureWeak();
                         for (Entry& e : stack_)
                             makeOwned(e);
-                        tryStack_[i] = stack_;
+                        tryStack_[i] = std::vector<Entry>(stack_.begin(), stack_.begin() + std::ptrdiff_t(h.stackDepth));
                     }
                 }
             }
@@ -3237,18 +3260,10 @@ private:
                 return true;
             }
             case Op::IterStartLoop: {
-                // Only over what needs no closing, an array as it comes, is leaving the loop no different from dropping the
-                // iterator. Anything else is the interpreter's, here and in what this function is compiled to next.
-                if (!betHere())
-                    refuse("a for-of over what may need closing");
-                Entry src = top();
+                // Over anything: leaving the loop by `break` or `return` closes the iterator (IterCloseAt), by an
+                // exception through its handler (IterCloseThrow).
+                Entry src = pop();
                 secureWeak();
-                src = top();
-                const std::int32_t bail = newLabel();
-                const std::int32_t plain = callCold(reinterpret_cast<void*>(&scriptDynIterIsPlain), {rtReg(), tagReg(src), payloadReg(src)}, true, {}, false);
-                branchCmp(plain, IrCond::Eq, 0, bail);
-                pop();
-                emitBail(bail, {src});
                 const std::int32_t r = fn_.newVreg(false);
                 const std::int32_t t = fn_.newVreg(false);
                 coldCall(reinterpret_cast<void*>(&scriptDynGetIterator), {rtReg(), tagReg(src), payloadReg(src)}, r, t, true, {src});
@@ -3311,7 +3326,25 @@ private:
                 stack_.clear();
                 return false;
             }
-            case Op::IterCloseAt: (void)operand(); return true;
+            case Op::IterCloseAt: {
+                const std::uint32_t at = operand();
+                if (at >= stack_.size())
+                    refuse("an iterator to close that is not on the stack");
+                secureWeak();
+                const Entry& iterator = stack_[at];
+                coldCall(reinterpret_cast<void*>(&scriptDynIterCloseAt), {rtReg(), tagReg(iterator), payloadReg(iterator)}, -1, -1, true);
+                return true;
+            }
+            case Op::IterCloseThrow: {
+                Entry thrown = pop();
+                Entry iterator = pop();
+                secureWeak();
+                coldCall(reinterpret_cast<void*>(&scriptDynIterCloseThrow),
+                         {rtReg(), tagReg(iterator), payloadReg(iterator), tagReg(thrown), payloadReg(thrown)}, -1, -1, true, {iterator, thrown});
+                inst(IrOp::Trap);
+                stack_.clear();
+                return false;
+            }
             case Op::CallSpread:
             case Op::NewSpread: {
                 // callee [this] array -> result: the array is the one the spread just made, so it is an array.

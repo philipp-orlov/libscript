@@ -90,6 +90,7 @@ GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept;
 GCObject* scriptDynNewRegExp(Runtime* rt, GCObject* templateObject) noexcept;
 void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept;
+NativePair scriptDynCatch(Runtime* rt) noexcept;
 NativePair scriptDynIterRest(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynArraySpread(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynObjectSpread(Runtime* rt, GCObject* object, std::int64_t tag, std::uint64_t payload) noexcept;

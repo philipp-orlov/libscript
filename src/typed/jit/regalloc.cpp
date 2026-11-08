@@ -452,8 +452,12 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             }, [](std::int32_t) {});
             if (in.op == IrOp::Call && !fn.calls[std::size_t(in.imm)].cold)
                 callPositions.push_back(i * 2);
-            // Raising on the way to a handler in this method calls the runtime, and the handler carries on after it.
+            // Raising on the way to a handler in this method calls the runtime, and the handler carries on after it: so
+            // does a cold call whose exit leads to one, the cleanup on the way being a call that keeps nothing.
             else if (in.op == IrOp::ExitCmp && fn.exits[std::size_t(in.target)].handlerLabel >= 0)
+                callPositions.push_back(i * 2);
+            else if (in.op == IrOp::Call && fn.calls[std::size_t(in.imm)].exit >= 0 &&
+                     fn.exits[std::size_t(fn.calls[std::size_t(in.imm)].exit)].handlerLabel >= 0)
                 callPositions.push_back(i * 2);
         }
         // What is still open is what is live into the block.

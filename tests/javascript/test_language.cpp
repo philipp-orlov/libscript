@@ -1690,3 +1690,25 @@ TEST(typeofAndStringEqualityAgreeEverywhere)
                  " out + ',' + n"),
              std::string("nsbufobjectobjectbigint,3000"));
 }
+
+TEST(nativeCodeCatchesWhatItsTryThrows)
+{
+    // A `try`/`catch` is native code: what a call or a `throw` in it raises lands in the `catch`, with the locals and
+    // whatever a `switch` or a loop around it keeps on the stack as they were; what the `catch` itself throws goes on out.
+    const char* program =
+        "function parse(s) { try { return JSON.parse(s).v; } catch (e) { return 'bad:' + e.name; } }"
+        "function nested(i) { let r = 0; try { try { if (i % 3 === 0) throw new Error('a' + i); r += 1; } catch (e) { r += 10;"
+        "  if (i % 6 === 0) throw e; } r += 100; } catch (e2) { r += 1000 + e2.message.length; } return r; }"
+        "function sw(k) { switch (k) { case 1: try { throw k; } catch (e) { return 'c' + e; } default: return 'd'; } }"
+        "function keeps() { let a = 'x', b = [1]; try { a = a + 'y'; b.push(2); undefinedFn(); } catch (e) { return a + b.length + (e instanceof ReferenceError); } }"
+        "function rethrows() { try { throw { w: null }; } catch ({ w: { x, y } }) {} }"
+        "let out; for (let k = 0; k < 2000; k++) { let r; try { rethrows(); } catch (e) { r = e.name; }"
+        "  out = [parse('{\"v\":1}'), parse('{'), nested(k), sw(1), sw(2), keeps(), r]; } out.join(' ')";
+    for (const char* mode : {"tiered", "eager"}) {
+        script::Context::Options options;
+        if (std::string(mode) == "eager")
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1 bad:SyntaxError 101 c1 d xy2true TypeError"));
+    }
+}

@@ -537,6 +537,26 @@ void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_
     });
 }
 
+/// Where a `catch` in native code begins: what was thrown, taken from where the helper that raised left it. Anything but
+/// an exception of the program's stays pending, for the caller.
+NativePair scriptDynCatch(Runtime* rt) noexcept
+{
+    std::exception_ptr pending = std::move(rt->nativePending);
+    rt->nativePending = nullptr;
+    try {
+        if (pending)
+            std::rethrow_exception(pending);
+    } catch (Exception& e) {
+        rt->nativeError = 0;
+        return take(e.value());
+    } catch (...) {
+        rt->nativePending = std::current_exception();
+        return take(Value::undefined());
+    }
+    rt->nativeError = 0;
+    return take(Value::undefined());
+}
+
 /// `[...src]` in an array literal: what iterating `src` gives, onto the array being made.
 void scriptDynArraySpread(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept
 {

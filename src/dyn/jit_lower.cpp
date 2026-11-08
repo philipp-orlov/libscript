@@ -381,9 +381,10 @@ public:
     void run()
     {
         // A `for-of`'s handler is the one kind native code can do without: see `IterStartLoop`.
+        // A `catch` is native code too (see `catchAt`); a `finally` is not yet, and refuses at its JumpSub.
         for (const Handler& handler : code_.handlers) {
-            if (handler.kind != HandlerKind::IterClose)
-                refuse("the function has exception handlers");
+            if (handler.kind == HandlerKind::Finally)
+                refuse("the function has a finally block");
         }
         speculate_ = code_.jitMayGuess() && !code_.isClassConstructor;
         prepare();
@@ -887,6 +888,8 @@ public:
     bool inlineCall(const Entry& callee, const Entry& self, const std::vector<Entry>& args, const std::vector<Entry>& held,
                     std::int32_t r, std::int32_t t, std::int32_t generic, std::int32_t done)
     {
+        if (protectedHere())
+            return false;
         if (depth_ >= 3 || callee.rep != Rep::Tagged || callee.isConst)
             return false;
         if (!callee.hint)
@@ -938,6 +941,8 @@ public:
     bool inlineSeen(const Entry& callee, const Entry& self, const std::vector<Entry>& args, const std::vector<Entry>& held,
                     std::int32_t r, std::int32_t t, std::int32_t generic, std::int32_t done)
     {
+        if (protectedHere())
+            return false;
         std::shared_ptr<const FunctionCode> code;
         for (const FunctionCode::CallTarget& known : code_.jitCallTargets) {
             if (known.pc == pc_ && known.seen)
@@ -1155,6 +1160,14 @@ private:
             pc += 1 + std::size_t(operandsOf(op)) * 4;
         }
         std::vector<std::uint32_t> work{0};
+        // A `catch` is reached by what is thrown in its `try`: a place to land, with a label of its own.
+        for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
+            const Handler& h = code_.handlers[i];
+            if (h.kind != HandlerKind::Catch || parent_)
+                continue;
+            work.push_back(h.target);
+            landing_[i] = newLabel();
+        }
         while (!work.empty()) {
             std::uint32_t pc = work.back();
             work.pop_back();
@@ -1497,6 +1510,47 @@ private:
     }
 
     // ---- exits ----
+    /// The handler whose `catch` takes what is thrown here, as the interpreter would pick it, or -1. Code inlined into a
+    /// caller has none, and none is inlined where one could apply.
+    std::int32_t catchAt() const noexcept
+    {
+        if (parent_ || noHandler_)
+            return -1;
+        for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
+            const Handler& h = code_.handlers[i];
+            if (pc_ < h.start || pc_ >= h.end)
+                continue;
+            // A for-of's handler closes an iterator native code never has (see IterStartLoop): it lets this go on out.
+            if (h.kind == HandlerKind::IterClose)
+                continue;
+            return h.kind == HandlerKind::Catch && landing_.count(i) ? std::int32_t(i) : -1;
+        }
+        return -1;
+    }
+
+    /// Whether code here is inside a `try` whose `catch` native code handles: then a call is not inlined, which would
+    /// make an exit through the callee's frame.
+    bool protectedHere() const noexcept { return catchAt() >= 0; }
+
+    /// Where the `catch` of handler `i` begins: reached only from exits, with the stack its `try` began with and what was
+    /// thrown on top, taken from where the helper left it. Something that is no exception of the program's, which no
+    /// `catch` takes, leaves through an exit to the caller.
+    void enterCatch(std::size_t i)
+    {
+        const Handler& h = code_.handlers[i];
+        if (!tryStack_.count(i) || tryStack_[i].size() != h.stackDepth)
+            refuse("a catch with no try before it");
+        bindLabel(landing_[i]);
+        stack_ = tryStack_[i];
+        forgetFacts();
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        noHandler_ = true;
+        coldCall(reinterpret_cast<void*>(&scriptDynCatch), {rtReg()}, r, t, true);
+        noHandler_ = false;
+        push(taggedEntry(r, t, Own::Owned));
+    }
+
     std::int32_t makeExit(std::uint32_t code, const std::vector<Entry>& popped = {})
     {
         IrExit exit;
@@ -1510,6 +1564,26 @@ private:
             else
                 exit.cleanupTagged.push_back({e.r, e.t});
         };
+        // Inside a `try`: only what was pushed since it began goes, and the `catch` carries on with the rest.
+        if (const std::int32_t h = catchAt(); h >= 0) {
+            const Handler& handler = code_.handlers[std::size_t(h)];
+            const std::vector<Entry>& before = tryStack_[std::size_t(h)];
+            if (stack_.size() < handler.stackDepth || before.size() != handler.stackDepth)
+                refuse("a try entered with another stack");
+            for (std::size_t i = 0; i < handler.stackDepth; ++i) {
+                if (stack_[i].r != before[i].r || stack_[i].t != before[i].t || stack_[i].own != before[i].own ||
+                    stack_[i].rep != before[i].rep)
+                    refuse("a try whose outer stack changes inside it");
+            }
+            for (std::size_t i = handler.stackDepth; i < stack_.size(); ++i)
+                add(stack_[i]);
+            for (const Entry& e : popped)
+                add(e);
+            exit.handlerLabel = landing_[std::size_t(h)];
+            fn_.maxCleanup = std::max(fn_.maxCleanup, std::uint32_t(exit.cleanup.size() + exit.cleanupTagged.size()));
+            fn_.exits.push_back(std::move(exit));
+            return std::int32_t(fn_.exits.size()) - 1;
+        }
         for (std::size_t slot = 0; slot < localReg_.size(); ++slot) {
             if (localOwned_[slot] && localTag_[slot] >= 0)
                 exit.cleanupTagged.push_back({localReg_[slot], localTag_[slot]});
@@ -1968,6 +2042,17 @@ private:
                 continue;
             }
             pc_ = pc;
+            if (!parent_) {
+                for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
+                    const Handler& h = code_.handlers[i];
+                    if (h.kind != HandlerKind::Catch)
+                        continue;
+                    if (h.target == pc) {
+                        enterCatch(i);
+                        fallsIn = true;
+                    }
+                }
+            }
             if (labels_[pc] >= 0) {
                 previousOp_ = Op::Nop;
                 // A loop entered from above is entered through what it can then count on all the way round; so is it when
@@ -1981,6 +2066,19 @@ private:
                 enterJoin(pc, fallsIn);
                 if (loopHead[pc] && stack_.empty())
                     addOsrEntry(pc, entry);
+            }
+            // Where a `try` begins: what is below it on the stack stays as it is all the way through, in registers that
+            // hold their own counts.
+            if (!parent_) {
+                for (std::size_t i = 0; i < code_.handlers.size(); ++i) {
+                    const Handler& h = code_.handlers[i];
+                    if (h.kind == HandlerKind::Catch && h.start == pc && !tryStack_.count(i)) {
+                        secureWeak();
+                        for (Entry& e : stack_)
+                            makeOwned(e);
+                        tryStack_[i] = stack_;
+                    }
+                }
             }
             fallsIn = true;
             if (betHere())
@@ -3701,8 +3799,11 @@ private:
     {
         if (!e.hint || e.own != Own::Weak || e.rep != Rep::Tagged || e.isConst || !betHere())
             return;
+        // The kind first: a host object is a cell too, and no DynObject.
+        if (static_cast<const GCObject*>(e.hint)->kind != CellKind::Object)
+            return;
         const auto* target = static_cast<const DynObject*>(e.hint);
-        if (target->kind != CellKind::Object || target->cls != ObjClass::Function)
+        if (target->cls != ObjClass::Function)
             return;
         const auto* fn = static_cast<const DynFunction*>(target);
         if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isClassConstructor)
@@ -6369,6 +6470,8 @@ private:
     /// is not that.
     bool constructInPlace(const Entry& callee, const std::vector<Entry>& args, const std::vector<Entry>& held)
     {
+        if (protectedHere())
+            return false;
         if (!callee.pinned || depth_ >= 2)
             return false;
         auto* fn = const_cast<DynFunction*>(static_cast<const DynFunction*>(callee.hint));
@@ -7389,6 +7492,11 @@ private:
     std::vector<std::int32_t> localReg_, localTag_, cellReg_;
     std::vector<std::uint8_t> localOwned_, cellOwned_, assigned_, reachable_;
     std::vector<std::int32_t> labels_;
+    /// For each handler: the label its `catch` is landed on, and the stack as it was where its `try` began.
+    std::map<std::size_t, std::int32_t> landing_;
+    std::map<std::size_t, std::vector<Entry>> tryStack_;
+    /// Set while what an exit leads to must be the caller, whatever handler covers the place.
+    bool noHandler_ = false;
     std::vector<Join> joins_;
     std::vector<Entry> stack_;
     std::set<std::int32_t> nonNullLocals_;

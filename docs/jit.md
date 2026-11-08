@@ -156,8 +156,17 @@ The allocator is by live range with holes, most-used value first, uses in cold c
 slots shared; the optimizer works through cold blocks, keeps object headers and values apart, forwards stores to loads, folds
 branches on known constants, moves constants out of call-free loops and removes dead values.
 
-It refuses a function with exception handlers or a `finally`, which keeps running in the interpreter. `--dump-native` lists what
-it skipped.
+`try`/`catch`, `try`/`finally` and `for-of` over any iterator are native code. Inside a `try`, an exit releases only what was
+pushed since the `try` began and branches to a landing block: a `catch` takes the exception from where the raising helper left
+it, and a `finally` puts it aside under a continuation number to raise again when the block ends. A `for-of`'s handler is
+such a landing, closing the iterator. Nothing is inlined inside a protected range, and nothing bails inside a `finally` body.
+What stays in the interpreter: generator and async functions, a `try`/`finally` with values under it on the stack (inside a
+`switch` or a `for-in`), and a function with a bigint literal. `--dump-native` lists what it skipped.
+
+A computed-key access, `o[k]` with a key that is no index (a symbol, a string, a private name such as `this.#x`), has an
+inline cache of one key, shape and slot, in the interpreter and in native code; a key a shape names is pinned by it.
+`typeof` gives one interned string per answer, picked inline, and native equality settles two strings by pointer when
+both are interned.
 
 Measured the same way as the table above, against JavaScriptCore running identical programs (`bench/kernels/js`):
 

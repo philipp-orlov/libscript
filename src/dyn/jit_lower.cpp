@@ -2693,6 +2693,26 @@ private:
             case Op::SetProp: setProp(operand()); return true;
             case Op::GetElem: getElem(operand()); return true;
             case Op::SetElem: setElem(operand()); return true;
+            case Op::DefPrivate:
+            case Op::DefPrivateMethod: {
+                // The object stays; the name is a private symbol, the object one this code made or was given as `this`.
+                Entry value = pop();
+                Entry name = pop();
+                Entry& object = stack_.back();
+                secureWeak();
+                object.fresh = nullptr;
+                const std::int32_t rt = rtReg();
+                const std::int32_t objectReg = payloadReg(object);
+                const std::int32_t nameReg = payloadReg(name);
+                const std::int32_t tag = tagReg(value);
+                const std::int32_t payload = payloadReg(value);
+                const std::int32_t method = immReg(op == Op::DefPrivateMethod ? 1 : 0);
+                coldCall(reinterpret_cast<void*>(&scriptDynDefPrivate), {rt, objectReg, nameReg, tag, payload, method}, -1, -1, true,
+                         {name, value});
+                release(value);
+                release(name);
+                return true;
+            }
             case Op::DefField: {
                 Entry value = pop();
                 Entry& object = stack_.back();
@@ -4377,12 +4397,82 @@ private:
         return true;
     }
 
+    /// `o[k]` where the site has only met keys that are no index, and has learned one key and shape (`KeyedSite`): that
+    /// key on an object of that shape is a load from the slot; anything else, the generic helper.
+    bool getKeyed(Entry& base, Entry& key, std::uint32_t elemOperand)
+    {
+        if (code_.elemSaw[elemOperand] != ElemSite::kOther || elemOperand >= code_.elemKeyed.size())
+            return false;
+        const KeyedSite& k = code_.elemKeyed[elemOperand];
+        if (!k.key || base.rep != Rep::Tagged || base.isConst || key.rep != Rep::Tagged)
+            return false;
+        secureWeak();
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        const Type keyType = k.key->kind == CellKind::Symbol ? Type::Symbol : Type::String;
+        if (key.isConst || !key.hasKnownTag || key.known != keyType)
+            branchCmp(tagReg(key), IrCond::Ne, std::int64_t(keyType), slow);
+        {
+            // Operands first: each emits, and `inst` hands back a place in a vector that may move.
+            const std::int32_t got = payloadReg(key);
+            const std::int32_t want = ptrReg(k.key);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = got;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = slow;
+        }
+        const std::int32_t have = shapeOf(base, slow);
+        {
+            const std::int32_t want = ptrReg(k.shape);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = have;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = slow;
+        }
+        const std::int32_t props = loadHeader(base.r, kPropsOffset);
+        const std::int64_t at = std::int64_t(k.index) * std::int64_t(sizeof(Prop)) + kPropValueOffset;
+        const std::int32_t loadedTag = load(props, at, 1, false, kAliasValue);
+        const std::int32_t loaded = load(props, at + kPayload, 8, false, kAliasValue);
+        IrInst& mt = inst(IrOp::Mov);
+        mt.d = t;
+        mt.a = loadedTag;
+        IrInst& mr = inst(IrOp::Mov);
+        mr.d = r;
+        mr.a = loaded;
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        coldCall(reinterpret_cast<void*>(&scriptDynGetElem), {rtReg(), tagReg(base), base.r, tagReg(key), payloadReg(key)}, r, t, true,
+                 {base, key});
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        Entry result = taggedEntry(r, t, Own::Weak);
+        // Borrowed from the object, which may go when `base` or `key` is let go: a count of its own then.
+        if (base.own == Own::Owned || key.own == Own::Owned) {
+            makeOwned(result);
+            push(result);
+            release(key);
+            release(base);
+        } else {
+            push(result);
+        }
+        return true;
+    }
+
     void getElem(std::uint32_t elemOperand)
     {
         Entry key = pop();
         Entry base = pop();
         if (betHere() && ElemSite::typedOnly(code_.elemSaw[elemOperand]) >= 0 && !base.isConst && base.rep == Rep::Tagged &&
             getTypedElem(base, key, ElemSite::typedOnly(code_.elemSaw[elemOperand])))
+            return;
+        if (getKeyed(base, key, elemOperand))
             return;
         // Where the interpreter takes over rather than the code carrying on from a getter, nothing can have changed.
         if (!betHere())
@@ -4563,6 +4653,69 @@ private:
         const std::int32_t vr = payloadReg(value);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
+        // `o[k] = v` with the key and shape the site has learned (`KeyedSite`): a store into the slot, the value it had
+        // losing its count. The shape says the property is a writable one of the object's own.
+        if (code_.elemSaw[elemOperand] == ElemSite::kOther && elemOperand < code_.elemKeyed.size() &&
+            code_.elemKeyed[elemOperand].key && key.rep == Rep::Tagged) {
+            const KeyedSite& k = code_.elemKeyed[elemOperand];
+            const Type keyType = k.key->kind == CellKind::Symbol ? Type::Symbol : Type::String;
+            if (key.isConst || !key.hasKnownTag || key.known != keyType)
+                branchCmp(tagReg(key), IrCond::Ne, std::int64_t(keyType), slow);
+            {
+                const std::int32_t got = payloadReg(key);
+                const std::int32_t want = ptrReg(k.key);
+                IrInst& same = inst(IrOp::BrCmp);
+                same.a = got;
+                same.b = want;
+                same.cond = IrCond::Ne;
+                same.width = 64;
+                same.target = slow;
+            }
+            const std::int32_t have = shapeOf(base, slow);
+            {
+                const std::int32_t want = ptrReg(k.shape);
+                IrInst& same = inst(IrOp::BrCmp);
+                same.a = have;
+                same.b = want;
+                same.cond = IrCond::Ne;
+                same.width = 64;
+                same.target = slow;
+            }
+            // Something may inherit from it now: then a store has to be seen, and goes the long way.
+            const std::int32_t isProto = load(base.r, kIsProtoOffset, 1, false, kAliasHeader);
+            branchCmp(isProto, IrCond::Ne, 0, slow);
+            const std::int32_t frozen = load(base.r, kFrozenOffset, 1, false, kAliasHeader);
+            branchCmp(frozen, IrCond::Ne, 0, slow);
+            const std::int64_t at = std::int64_t(k.index) * std::int64_t(sizeof(Prop));
+            const std::int32_t props = loadHeader(base.r, kPropsOffset);
+            const std::int32_t oldTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
+            const std::int32_t old = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
+            store(props, at + kPropValueOffset, vt, 1);
+            store(props, at + kPropValueOffset + kPayload, vr, 8);
+            decRefOf(old, oldTag, false);
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = slow;
+            coldCall(reinterpret_cast<void*>(&scriptDynSetElem), {rtReg(), tagReg(base), base.r, tagReg(key), payloadReg(key), vt, vr}, -1, -1,
+                     true, {base, key, value});
+            // The helper took its own count, so the one made above goes.
+            if (value.own == Own::Owned && !value.isConst && !(value.hasKnownTag && value.known < Type::String))
+                decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
+            release(key);
+            release(base);
+            if (value.rep != Rep::Tagged) {
+                push(value);
+                return;
+            }
+            Entry result = value;
+            if (result.own == Own::Owned)
+                result.own = Own::Weak;
+            result.local = -1;
+            push(result);
+            return;
+        }
         guardArray(base, slow, betHere());
         // Frozen, or with named properties that might include an index: the long way.
         const std::int32_t frozen = load(base.r, kFrozenOffset, 1, false, kAliasHeader);

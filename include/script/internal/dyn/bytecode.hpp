@@ -265,6 +265,16 @@ struct ElemSite
     static int typedOnly(std::uint8_t saw) noexcept { return (saw & 0x0f) == kTyped ? saw >> 4 : -1; }
 };
 
+/// What one computed-key access, `o[k]`, last met for a key that is no index: the key, the receiver's shape and where the
+/// key is among its own data properties. The key is one a shape names, which a shape pins, so it cannot go and another
+/// come to be at its address. `key` null means nothing learned.
+struct KeyedSite
+{
+    const GCObject* key = nullptr;
+    const Shape* shape = nullptr;
+    std::uint32_t index = 0;
+};
+
 /// What one property access in the code has seen: an inline cache, for the last shape only.
 struct PropertySite
 {
@@ -400,6 +410,8 @@ struct FunctionCode
 {
     /// One for each `GetElem`, `GetElemDup` and `SetElem`, whose operand says which.
     mutable Vec<std::uint8_t> elemSaw;
+    /// Parallel to `elemSaw` once an access with a key that is no index has been made through any of them.
+    mutable Vec<KeyedSite> elemKeyed;
     std::string name;
     String wideName;  ///< what every closure over this code answers to
     void setName(std::string text)

@@ -1649,3 +1649,22 @@ TEST(superPropertiesCanBeAssigned)
                  " new A().m()"),
              std::string("6,2,1,6"));
 }
+
+TEST(aComputedKeyCacheStaysRight)
+{
+    // `o[k]` and `#x` learn one key and one shape; another key, another shape, a frozen object or one that has become a
+    // prototype goes the long way, and the answers stay those of the language.
+    CHECK_EQ(run("const s1 = Symbol('a'), s2 = Symbol('b');"
+                 " function get(o, k) { return o[k]; } function put(o, k, v) { o[k] = v; return o[k]; }"
+                 " const a = { [s1]: 1, [s2]: 2 }, b = { x: 0, [s1]: 3, [s2]: 4 }; let t = 0;"
+                 " for (let i = 0; i < 3000; i++) t += get(a, s1) + get(i & 1 ? a : b, i & 2 ? s1 : s2) + put(a, s1, i) - i;"
+                 " const f = Object.freeze({ [s1]: 5 }); for (let i = 0; i < 10; i++) put(f, s1, 9);"
+                 " const p = { [s1]: 1 }; const child = Object.create(p); put(p, s1, 7);"
+                 " [t, get(f, s1), child[s1]].join()"),
+             std::string("5627252,5,7"));
+    CHECK_EQ(run("class C { #x = 1; static has(o) { return #x in o; } get(o) { return o.#x; } set(o, v) { o.#x = v; } }"
+                 " class D { #x = 2; get(o) { return o.#x; } } const c = new C(), d = new D(); let t = 0;"
+                 " for (let i = 0; i < 3000; i++) { c.set(c, i); t += c.get(c) + d.get(d); }"
+                 " let threw = false; try { c.get(d); } catch (e) { threw = e instanceof TypeError; } [t, threw, C.has(d)].join()"),
+             std::string("4504500,true,false"));
+}

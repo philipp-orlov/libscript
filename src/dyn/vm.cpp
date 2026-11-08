@@ -1888,6 +1888,36 @@ std::uint64_t osrWorkPerByte()
 }  // namespace
 #endif
 
+/// The keyed cache of a `GetElem` or `SetElem` site: `o[k]` for the key and shape it last met is the own data property at
+/// a known place. `forWrite` wants it writable, and an object nothing inherits from, whose writes no cache has to see.
+static Prop* keyedHit(const FunctionCode& code, std::uint32_t site, const Value& base, const Value& key) noexcept
+{
+    if (site >= code.elemKeyed.size())
+        return nullptr;
+    const KeyedSite& k = code.elemKeyed[site];
+    DynObject* o = asObject(base);
+    if (!k.key || !o || o->shape != k.shape || detail::Access::ptr(key) != k.key || !(key.isSymbol() || key.isString()))
+        return nullptr;
+    return &o->props[k.index];
+}
+
+static void keyedLearn(const FunctionCode& code, std::uint32_t site, const Value& base, GCObject* key, bool forWrite)
+{
+    DynObject* o = asObject(base);
+    if (!o || !o->shape || o->fnKindIsProxy() || (forWrite && (o->isProto || o->frozen)))
+        return;
+    const Prop* p = o->findOwn(key);
+    if (!p || !o->shape)
+        return;
+    const std::size_t index = std::size_t(p - o->props.data());
+    const std::uint8_t attrs = o->attrsAt(index);
+    if ((attrs & PropAccessor) || (forWrite && !(attrs & PropWritable)))
+        return;
+    if (code.elemKeyed.size() < code.elemSaw.size())
+        code.elemKeyed.resize(code.elemSaw.size());
+    code.elemKeyed[site] = {key, o->shape, std::uint32_t(index)};
+}
+
 Value execute(Runtime& rt, Frame& frame)
 {
     const FunctionCode& code = *frame.code;
@@ -2260,9 +2290,17 @@ Value execute(Runtime& rt, Frame& frame)
                             }
                         }
                         note(ElemSite::kOther);
+                        const std::uint32_t site = operandAt(pc - 4);
+                        if (Prop* p = keyedHit(code, site, sp[sp.size() - 2], sp.back())) {
+                            Value r = p->value;
+                            sp.pop_back();
+                            sp.back() = std::move(r);
+                            break;
+                        }
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
                         sp.push_back(getProperty(rt, base, key.get()));
+                        keyedLearn(code, site, base, key.get(), false);
                         break;
                     }
                     case Op::GetElemDup: {
@@ -2327,10 +2365,20 @@ Value execute(Runtime& rt, Frame& frame)
                             }
                         }
                         note(ElemSite::kOther);
+                        const std::uint32_t site = operandAt(pc - 4);
+                        if (Prop* p = keyedHit(code, site, sp[sp.size() - 3], sp[sp.size() - 2]);
+                            p && !asObject(sp[sp.size() - 3])->frozen && !asObject(sp[sp.size() - 3])->isProto) {
+                            p->value = sp.back();
+                            Value v = pop();
+                            sp.pop_back();
+                            sp.back() = std::move(v);
+                            break;
+                        }
                         Value v = pop();
                         Ref<GCObject> key = toPropertyKey(rt, pop());
                         Value base = pop();
                         setProperty(rt, base, key.get(), v);
+                        keyedLearn(code, site, base, key.get(), true);
                         sp.push_back(std::move(v));
                         break;
                     }

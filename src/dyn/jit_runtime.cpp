@@ -537,6 +537,18 @@ void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_
     });
 }
 
+/// `#x = v` in a class body, or a private method: a member the object must not have yet.
+void scriptDynDefPrivate(Runtime* rt, GCObject* object, GCObject* name, std::int64_t tag, std::uint64_t payload, std::uint64_t method) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        auto* o = static_cast<DynObject*>(object);
+        if (o->findOwn(name))
+            throwError(*rt, ErrorCode::TypeError, "this object has that private member already");
+        o->putOwn(name, valueOf(tag, payload), method ? std::uint8_t(0) : std::uint8_t(PropWritable));
+        return 0;
+    });
+}
+
 GCObject* scriptDynNewBox(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* {

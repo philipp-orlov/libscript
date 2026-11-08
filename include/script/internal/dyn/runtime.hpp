@@ -30,10 +30,24 @@ struct Frame;
 
 /// A queued promise reaction. Jobs run to completion, one at a time, in FIFO
 /// order, exactly like a browser microtask queue.
+/// One job on the queue: a call, or one of a promise's reactions, which are made by the thousand and so carry what
+/// they need rather than being made into functions to call.
 struct Job
 {
+    enum class Kind : std::uint8_t
+    {
+        Call,        ///< `fn(...args)`
+        Reaction,    ///< `handler` on `result`, settling the promise `target`
+        Capability,  ///< `handler` on `result`, through another constructor's `resolve` and `reject`
+        Await,       ///< an awaiting coroutine `handler` goes on with `result`
+    };
     Value fn;
     std::vector<Value> args;
+    Kind kind = Kind::Call;
+    bool fulfilled = false;
+    Value result = Value::undefined();
+    Value target = Value::undefined();
+    Value reject = Value::undefined();
 };
 
 /// The frequently used property names, interned once.

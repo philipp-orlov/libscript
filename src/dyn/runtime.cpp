@@ -499,8 +499,12 @@ Value Runtime::makeFunction(StringView name, NativeFunction fn, int arity)
     f->native = std::move(fn);
     f->name = String(name);
     f->arity = arity;
+    // Made by the thousand when promises are (a resolve and a reject for each): room for both properties at once, and
+    // a short name, the empty one above all, shared rather than a string of its own each time.
+    f->props.reserve(2);
     f->putOwn(atom.length.get(), Value(double(arity)), PropConfigurable);
-    f->putOwn(atom.name.get(), str(name), PropConfigurable);
+    f->putOwn(atom.name.get(), name.size() <= ContextImpl::kInternedLength ? detail::Access::make(Type::String, intern(name)) : str(name),
+              PropConfigurable);
     return detail::Access::adopt(Type::Object, f);
 }
 
@@ -754,7 +758,10 @@ std::string Runtime::captureStack() const
 
 void Runtime::enqueue(Value fn, std::vector<Value> args)
 {
-    jobs.push_back(Job{std::move(fn), std::move(args)});
+    Job job;
+    job.fn = std::move(fn);
+    job.args = std::move(args);
+    jobs.push_back(std::move(job));
 }
 
 std::size_t Runtime::runJobs()
@@ -765,7 +772,10 @@ std::size_t Runtime::runJobs()
         jobs.pop_front();
         ++ran;
         try {
-            callValue(*this, job.fn, Value::undefined(), job.args);
+            if (job.kind == Job::Kind::Call)
+                callValue(*this, job.fn, Value::undefined(), job.args);
+            else
+                runPromiseJob(*this, job);
         } catch (const Exception& e) {
             if (ctx.unhandledRejection)
                 ctx.unhandledRejection(e.value());

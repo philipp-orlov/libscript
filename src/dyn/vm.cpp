@@ -3338,72 +3338,24 @@ void scheduleReactions(Runtime& rt, DynPromise* p)
 {
     const bool fulfilled = p->state == DynPromise::State::Fulfilled;
     for (DynPromise::Reaction& r : p->reactions) {
+        Job job;
+        job.fulfilled = fulfilled;
+        job.result = p->result;
         if (r.coroutine) {
-            const Value co = detail::Access::make(Type::Object, r.coroutine.get());
-            const Value settled = p->result;
-            rt.enqueue(rt.makeFunction(ascii(""),
-                                       [co, settled, fulfilled](CallInfo&) -> Value {
-                                           settledAwait(*runtimeOf(co), static_cast<DynCoroutine*>(asObject(co)), fulfilled, settled);
-                                           return Value::undefined();
-                                       },
-                                       0),
-                       {});
-            continue;
-        }
-        const Value handler = fulfilled ? r.onFulfilled : r.onRejected;
-        Value result = p->result;
-        const bool isFulfilled = fulfilled;
-        if (!r.next) {
+            job.kind = Job::Kind::Await;
+            job.fn = detail::Access::make(Type::Object, r.coroutine.get());
+        } else if (!r.next) {
             // Another constructor's promise: what the handler gives goes to its resolve, what it throws to its reject.
-            const Value resolve = r.capResolve;
-            const Value reject = r.capReject;
-            rt.enqueue(rt.makeFunction(ascii(""),
-                                       [handler, resolve, reject, result, isFulfilled](CallInfo& ci) -> Value {
-                                           Runtime& rtc = rtOf(ci);
-                                           if (!asFunction(handler)) {
-                                               if (asFunction(isFulfilled ? resolve : reject))
-                                                   callValue(rtc, isFulfilled ? resolve : reject, Value::undefined(), {result});
-                                               return Value::undefined();
-                                           }
-                                           Value out;
-                                           try {
-                                               out = callValue(rtc, handler, Value::undefined(), {result});
-                                           } catch (Exception& e) {
-                                               if (asFunction(reject))
-                                                   callValue(rtc, reject, Value::undefined(), {e.value()});
-                                               return Value::undefined();
-                                           }
-                                           if (asFunction(resolve))
-                                               callValue(rtc, resolve, Value::undefined(), {out});
-                                           return Value::undefined();
-                                       },
-                                       0),
-                       {});
-            continue;
+            job.kind = Job::Kind::Capability;
+            job.fn = fulfilled ? r.onFulfilled : r.onRejected;
+            job.target = r.capResolve;
+            job.reject = r.capReject;
+        } else {
+            job.kind = Job::Kind::Reaction;
+            job.fn = fulfilled ? r.onFulfilled : r.onRejected;
+            job.target = detail::Access::make(Type::Object, r.next.get());
         }
-        Value next = detail::Access::make(Type::Object, r.next.get());
-        rt.enqueue(rt.makeFunction(ascii(""),
-                                   [handler, next, result, isFulfilled](CallInfo& ci) -> Value {
-                                       Runtime& rtc = *runtimeOf(next);
-                                       auto* target = static_cast<DynPromise*>(asObject(next));
-                                       (void)ci;
-                                       if (!asFunction(handler)) {
-                                           if (isFulfilled)
-                                               resolvePromise(rtc, target, result);
-                                           else
-                                               rejectPromise(rtc, target, result);
-                                           return Value::undefined();
-                                       }
-                                       try {
-                                           Value out = callValue(rtc, handler, Value::undefined(), {result});
-                                           resolvePromise(rtc, target, out);
-                                       } catch (Exception& e) {
-                                           rejectPromise(rtc, target, e.value());
-                                       }
-                                       return Value::undefined();
-                                   },
-                                   0),
-                   {});
+        rt.jobs.push_back(std::move(job));
     }
     p->reactions.clear();
 }
@@ -3739,6 +3691,58 @@ Value startCoroutine(Runtime& rt, Frame& frame, std::uint32_t pc)
 }
 
 }  // namespace
+
+void runPromiseJob(Runtime& rt, Job& job)
+{
+    const Value& handler = job.fn;
+    const Value& result = job.result;
+    switch (job.kind) {
+        case Job::Kind::Await:
+            settledAwait(rt, static_cast<DynCoroutine*>(asObject(handler)), job.fulfilled, result);
+            return;
+        case Job::Kind::Capability: {
+            const Value& resolve = job.target;
+            const Value& reject = job.reject;
+            if (!asFunction(handler)) {
+                if (asFunction(job.fulfilled ? resolve : reject))
+                    callValue(rt, job.fulfilled ? resolve : reject, Value::undefined(), {result});
+                return;
+            }
+            Value out;
+            try {
+                out = callValue(rt, handler, Value::undefined(), {result});
+            } catch (Exception& e) {
+                if (asFunction(reject))
+                    callValue(rt, reject, Value::undefined(), {e.value()});
+                return;
+            }
+            if (asFunction(resolve))
+                callValue(rt, resolve, Value::undefined(), {out});
+            return;
+        }
+        case Job::Kind::Reaction: {
+            auto* target = static_cast<DynPromise*>(asObject(job.target));
+            if (!asFunction(handler)) {
+                if (job.fulfilled)
+                    resolvePromise(rt, target, result);
+                else
+                    rejectPromise(rt, target, result);
+                return;
+            }
+            try {
+                Value out = callValue(rt, handler, Value::undefined(), {result});
+                resolvePromise(rt, target, out);
+            } catch (Exception& e) {
+                rejectPromise(rt, target, e.value());
+            }
+            return;
+        }
+        case Job::Kind::Call:
+            callValue(rt, handler, Value::undefined(), job.args);
+            return;
+    }
+}
+
 
 Value generatorResume(Runtime& rt, DynCoroutine* g, DynCoroutine::Resume mode, const Value& value)
 {

@@ -557,6 +557,22 @@ NativePair scriptDynCatch(Runtime* rt) noexcept
     return take(Value::undefined());
 }
 
+/// `f(...args)` and `new F(...args)`: the arguments arrive as the array the spread made.
+NativePair scriptDynCallSpread(Runtime* rt, std::int64_t calleeTag, std::uint64_t callee, std::int64_t selfTag, std::uint64_t self,
+                               GCObject* array, std::uint64_t construct) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        const auto* items = static_cast<const DynArray*>(array);
+        ContextImpl::ArgBuffer buffer(rt->ctx);
+        buffer.args.reserve(items->size());
+        for (std::size_t i = 0; i < items->size(); ++i)
+            buffer.args.push_back(items->at(i));
+        if (construct)
+            return take(constructValue(*rt, valueOf(calleeTag, callee), buffer.args));
+        return take(callValue(*rt, valueOf(calleeTag, callee), valueOf(selfTag, self), buffer.args));
+    });
+}
+
 /// `[...src]` in an array literal: what iterating `src` gives, onto the array being made.
 void scriptDynArraySpread(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept
 {

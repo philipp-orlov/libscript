@@ -2572,6 +2572,10 @@ private:
                     push(constDouble(detail::Access::r8(k)));
                 } else if (k.isString()) {
                     push(constTagged(Type::String, reinterpret_cast<std::uint64_t>(detail::Access::ptr(k))));
+                } else if (detail::Access::ptr(k) && k.type() >= Type::String && k.type() != Type::BigInt) {
+                    // Another cell the code's constants keep alive for as long as the code lives. Not a bigint: arithmetic
+                    // here takes a constant to be a number.
+                    push(constTagged(k.type(), reinterpret_cast<std::uint64_t>(detail::Access::ptr(k))));
                 } else {
                     refuse("a constant of an unusual type");
                 }
@@ -3182,6 +3186,30 @@ private:
                 return true;
             }
             case Op::IterCloseAt: (void)operand(); return true;
+            case Op::CallSpread:
+            case Op::NewSpread: {
+                // callee [this] array -> result: the array is the one the spread just made, so it is an array.
+                Entry array = pop();
+                Entry self = op == Op::CallSpread ? pop() : Entry();
+                Entry callee = pop();
+                secureWeak();
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                const std::int32_t selfTag = op == Op::CallSpread ? tagReg(self) : immReg(std::int64_t(Type::Undefined));
+                const std::int32_t selfPayload = op == Op::CallSpread ? payloadReg(self) : immReg(0);
+                std::vector<Entry> held{callee, array};
+                if (op == Op::CallSpread)
+                    held.push_back(self);
+                coldCall(reinterpret_cast<void*>(&scriptDynCallSpread),
+                         {rtReg(), tagReg(callee), payloadReg(callee), selfTag, selfPayload, payloadReg(array), immReg(op == Op::NewSpread ? 1 : 0)},
+                         r, t, true, held);
+                release(array);
+                if (op == Op::CallSpread)
+                    release(self);
+                release(callee);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
             case Op::ArraySpread:
             case Op::ObjectSpread: {
                 // Into the literal being made, which stays on the stack.

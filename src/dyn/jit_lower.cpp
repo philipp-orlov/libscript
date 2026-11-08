@@ -2253,7 +2253,13 @@ private:
         IrOsrEntry entry;
         entry.bytecodePc = pc;
         entry.label = label;
+        if (!liveness_)
+            liveness_ = std::make_unique<LocalLiveness>(code_);
         for (std::uint32_t slot = 0; slot < localReg_.size(); ++slot) {
+            // What the loop never reads before writing need not come over, unless a count comes with it.
+            if (!localOwned_[slot] && !cellOwned_[slot] && slot < code_.numLocals && !(argsLazy_ && slot == code_.argumentsSlot) &&
+                !liveness_->liveAt(pc, slot))
+                continue;
             IrOsrEntry::Slot out;
             out.vreg = localReg_[slot];
             out.slot = slot;

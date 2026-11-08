@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/vm.hpp"
@@ -242,6 +243,15 @@ void Runtime::adoptProgram(const std::shared_ptr<Program>& program)
 
 void Runtime::releaseRoots() noexcept
 {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (!interpretedCodes.empty()) {
+        std::sort(interpretedCodes.begin(), interpretedCodes.end(), [](const FunctionCode* a, const FunctionCode* b) { return a->interpreted > b->interpreted; });
+        for (std::size_t i = 0; i < interpretedCodes.size() && i < 12; ++i)
+            std::fprintf(stderr, "interpreted %8llu x4096  %s  native:%s refused:%d gen:%u bails at %zu places\n", (unsigned long long)interpretedCodes[i]->interpreted,
+                         interpretedCodes[i]->name.c_str(), interpretedCodes[i]->jitEntry ? "yes" : "no", int(interpretedCodes[i]->jitRefused), unsigned(interpretedCodes[i]->jitGeneration),
+                         interpretedCodes[i]->jitBailedAt.size());
+    }
+#endif
     for (const std::weak_ptr<Program>& weak : programs) {
         if (std::shared_ptr<Program> program = weak.lock()) {
             if (program->code)

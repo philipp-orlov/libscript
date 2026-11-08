@@ -130,7 +130,7 @@ struct JitOptions
     /// Calls (or loop back-edges) before a method is handed to the back end.
     std::uint32_t threshold = 200;
     /// Cap on the code cache, in bytes; 0 means unbounded.
-    std::size_t codeCacheLimit = 8u << 20;
+    std::size_t codeCacheLimit = 32u << 20;
     /// Write the generated code to the print handler, for debugging.
     bool dumpCode = false;
 };

@@ -15,6 +15,7 @@
 //
 // A method that raises records the error in the runtime and returns; its caller checks after the call. Nothing unwinds.
 #include <algorithm>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -180,11 +181,19 @@ public:
     {
         const std::int32_t delta = std::int32_t(target) - std::int32_t(at);
         std::uint32_t& instruction = code_[at];
-        if ((instruction & 0xFC000000u) == 0x14000000u)
+        if ((instruction & 0xFC000000u) == 0x14000000u) {
+            if (delta < -(1 << 25) || delta >= (1 << 25))
+                rangeLost_ = true;
             instruction = 0x14000000u | (std::uint32_t(delta) & 0x03FFFFFFu);
-        else
+        } else {
+            // What did not reach is noted, and the whole function is tried again with long branches.
+            if (delta < -(1 << 18) || delta >= (1 << 18))
+                rangeLost_ = true;
             instruction = (instruction & 0xFF00001Fu) | ((std::uint32_t(delta) & 0x7FFFFu) << 5);
+        }
     }
+    bool rangeLost() const noexcept { return rangeLost_; }
+    bool rangeLost_ = false;
 
     // ---- what the optimizing tier adds ----
     void loadMem(Reg t, Reg n, std::uint32_t off, std::uint32_t bytes, bool isSigned)
@@ -237,6 +246,29 @@ public:
     }
     void addImm(Reg d, Reg n, std::uint32_t imm, bool wide) { word((wide ? 0x91000000u : 0x11000000u) | (imm << 10) | (n << 5) | d); }
     void subImm(Reg d, Reg n, std::uint32_t imm, bool wide) { word((wide ? 0xD1000000u : 0x51000000u) | (imm << 10) | (n << 5) | d); }
+    /// The same of up to 24 bits, as a shifted part and the rest: a frame larger than the 12 bits one takes.
+    void addLarge(Reg d, Reg n, std::uint32_t imm)
+    {
+        if (imm >> 12) {
+            word(0x91400000u | ((imm >> 12) << 10) | (n << 5) | d);
+            n = d;
+            imm &= 0xfffu;
+            if (!imm)
+                return;
+        }
+        addImm(d, n, imm, true);
+    }
+    void subLarge(Reg d, Reg n, std::uint32_t imm)
+    {
+        if (imm >> 12) {
+            word(0xD1400000u | ((imm >> 12) << 10) | (n << 5) | d);
+            n = d;
+            imm &= 0xfffu;
+            if (!imm)
+                return;
+        }
+        subImm(d, n, imm, true);
+    }
     void subsImm(Reg d, Reg n, std::uint32_t imm, bool wide) { word((wide ? 0xF1000000u : 0x71000000u) | (imm << 10) | (n << 5) | d); }
     void cmpImm(Reg n, std::uint32_t imm, bool wide) { subsImm(XZR, n, imm, wide); }
     void cmnImm(Reg n, std::uint32_t imm, bool wide) { word((wide ? 0xB100001Fu : 0x3100001Fu) | (imm << 10) | (n << 5)); }
@@ -397,8 +429,11 @@ public:
     bool run()
     {
         layoutFrame();
-        if (frameBytes_ > 4000)
+        // A spill slot is reached with a scaled 12-bit offset: 32 KB.
+        if (frameBytes_ > 32000) {
+            why_ = "frame of " + std::to_string(frameBytes_) + " bytes";
             return false;
+        }
         labels_.assign(std::size_t(fn_.labelCount) + 1, std::size_t(-1));
         emitPrologue(true);
         emitParameters();
@@ -410,6 +445,7 @@ public:
             else if (!cold)
                 emit(in);
         }
+        const std::size_t hotWords = a_.here();
         // Falling off the end only happens after a raise, which never comes back.
         a_.brk();
         cold = false;
@@ -419,8 +455,19 @@ public:
             else if (cold)
                 emit(in);
         }
+        const std::size_t coldWords = a_.here();
         emitCold();
+        const std::size_t padWords = a_.here();
         emitOsrEntries();
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("SCRIPT_JIT_SIZES") && a_.here() > 50000)
+            std::fprintf(stderr, "sizes: hot %zu cold %zu pads %zu osr %zu words, %zu exits, %zu osr entries\n", hotWords, coldWords - hotWords, padWords - coldWords,
+                         a_.here() - padWords, fn_.exits.size(), fn_.osrEntries.size());
+#else
+        (void)hotWords;
+        (void)coldWords;
+        (void)padWords;
+#endif
         if (saverWanted_) {
             labels_[std::size_t(fn_.labelCount)] = a_.here();
             a_.addImm(X16, kRt, std::uint32_t(config_.savedRegs), true);
@@ -431,13 +478,27 @@ public:
             a_.ret();
         }
         for (const LabelFixup& fixup : labelFixups_) {
-            if (labels_[std::size_t(fixup.label)] == std::size_t(-1) ||
-                !a_.patchChecked(fixup.at, labels_[std::size_t(fixup.label)]))
+            if (labels_[std::size_t(fixup.label)] == std::size_t(-1)) {
+                why_ = "a label never placed";
                 return false;
+            }
+            if (!a_.patchChecked(fixup.at, labels_[std::size_t(fixup.label)])) {
+                why_ = "label branch out of range: word " + std::to_string(a_.code()[fixup.at]) + " at " + std::to_string(fixup.at) + " to " + std::to_string(labels_[std::size_t(fixup.label)]) + (longBranches_ ? " long" : "");
+                outOfRange_ = true;
+                return false;
+            }
         }
         for (const LabelFixup& fixup : exitFixups_) {
-            if (!a_.patchChecked(fixup.at, exitPads_[std::size_t(fixup.label)]))
+            if (!a_.patchChecked(fixup.at, exitPads_[std::size_t(fixup.label)])) {
+                why_ = "exit branch out of range: word " + std::to_string(a_.code()[fixup.at]) + (longBranches_ ? " long" : "");
+                outOfRange_ = true;
                 return false;
+            }
+        }
+        if (a_.rangeLost()) {
+            why_ = std::string("an out-of-line branch out of range") + (longBranches_ ? " long" : "");
+            outOfRange_ = true;
+            return false;
         }
         return true;
     }
@@ -538,10 +599,10 @@ private:
         if (checkStack && fn_.makesCalls) {
             a_.ldrX(X16, kRt, std::uint32_t(config_.stackLimit));
             a_.cmpSp(X16);
-            overflowBranch_ = a_.bcond(LS);
+            overflowBranch_ = lengthen(a_.bcond(LS));
             needsOverflowPad_ = true;
         }
-        a_.subImm(Reg(31), Reg(31), frameBytes_, true);
+        a_.subLarge(Reg(31), Reg(31), frameBytes_);
         // `stp` reaches only 504 bytes.
         if (frameBytes_ - 16 <= 504) {
             a_.stpX(X29, X30, Reg(31), std::int32_t(frameBytes_ - 16));
@@ -549,7 +610,7 @@ private:
             a_.strX(X29, Reg(31), frameBytes_ - 16);
             a_.strX(X30, Reg(31), frameBytes_ - 8);
         }
-        a_.addImm(X29, Reg(31), frameBytes_ - 16, true);
+        a_.addLarge(X29, Reg(31), frameBytes_ - 16);
         std::uint32_t at = saveBase_;
         for (std::size_t i = 0; i < savedInt_.size(); ++i) {
             if (i + 1 < savedInt_.size() && at <= 496) {
@@ -594,7 +655,7 @@ private:
             a_.ldrX(X29, Reg(31), frameBytes_ - 16);
             a_.ldrX(X30, Reg(31), frameBytes_ - 8);
         }
-        a_.addImm(Reg(31), Reg(31), frameBytes_, true);
+        a_.addLarge(Reg(31), Reg(31), frameBytes_);
         a_.ret();
     }
 
@@ -822,14 +883,41 @@ private:
     }
 
     // ---- exits ----
+    /// In a function too big for a conditional branch to reach across, one just made becomes its inverse over an
+    /// unconditional one, which reaches 128 MB: what is to be patched is then that.
+    std::size_t lengthen(std::size_t at)
+    {
+        if (!longBranches_ || at + 1 != a_.here())
+            return at;
+        std::vector<std::uint32_t>& code = a_.mutableCode();
+        std::uint32_t& op = code[at];
+        const std::uint32_t top = op & 0xFC000000u;
+        if (top == 0x14000000u || top == 0x94000000u)
+            return at;  // b and bl reach far already
+        if ((op & 0xFF000010u) == 0x54000000u) {
+            if ((op & 0xFu) >= 14)
+                return at;
+            op = (op & 0xFF00001Fu) ^ 1u;  // the other condition
+            op |= 2u << 5;
+        } else if ((op & 0x7E000000u) == 0x34000000u) {
+            op = ((op & 0xFF00001Fu) ^ 0x01000000u) | (2u << 5);  // cbz and cbnz
+        } else if ((op & 0x7E000000u) == 0x36000000u) {
+            op = ((op & 0xFFF8001Fu) ^ 0x01000000u) | (2u << 5);  // tbz and tbnz
+        } else {
+            return at;
+        }
+        return a_.b();
+    }
+
     void branchToExit(std::size_t at, std::int32_t exit)
     {
+        at = lengthen(at);
         exitFixups_.push_back({at, exit});
         usedExits_.resize(std::max(usedExits_.size(), std::size_t(exit) + 1), 0);
         usedExits_[std::size_t(exit)] = 1;
     }
 
-    void branchToLabel(std::size_t at, std::int32_t label) { labelFixups_.push_back({at, label}); }
+    void branchToLabel(std::size_t at, std::int32_t label) { labelFixups_.push_back({lengthen(at), label}); }
 
     void callAbsolute(const void* target)
     {
@@ -868,9 +956,41 @@ private:
             a_.patch(a_.b(), cold.back);
         }
         exitPads_.assign(fn_.exits.size(), 0);
+        // An exit that raises nothing of its own -- a helper raised -- is the same code wherever what it releases is the
+        // same, since a value is in one place for its whole life: one pad serves all of them.
+        std::map<std::vector<std::int64_t>, std::size_t> shared;
         for (std::size_t i = 0; i < fn_.exits.size(); ++i) {
-            if (i < usedExits_.size() && usedExits_[i])
+            if (i >= usedExits_.size() || !usedExits_[i])
+                continue;
+            const IrExit& exit = fn_.exits[i];
+            if (exit.code == 0 && hasFrame_) {
+                std::vector<std::int64_t> key;
+                key.push_back(exit.handlerLabel);
+                key.push_back(std::int64_t(exit.writeBacks.size()));
+                for (const IrExit::WriteBack& back : exit.writeBacks) {
+                    key.push_back(back.base);
+                    key.push_back(back.offset);
+                    key.push_back(back.vreg);
+                    key.push_back(back.width);
+                }
+                key.push_back(-1);
+                for (std::int32_t v : exit.cleanup)
+                    key.push_back(isUnused(v) ? -2 : v);
+                key.push_back(-1);
+                for (const auto& tagged : exit.cleanupTagged) {
+                    key.push_back(isUnused(tagged.first) || isUnused(tagged.second) ? -2 : tagged.first);
+                    key.push_back(tagged.second);
+                }
+                auto found = shared.find(key);
+                if (found != shared.end()) {
+                    exitPads_[i] = found->second;
+                    continue;
+                }
                 emitExitPad(i);
+                shared.emplace(std::move(key), exitPads_[i]);
+                continue;
+            }
+            emitExitPad(i);
         }
         if (needsOverflowPad_) {
             a_.patch(overflowBranch_, a_.here());
@@ -1808,7 +1928,7 @@ private:
                 a_.ldrW(X16, a, std::uint32_t(kCellRefCountOffset));
                 a_.subsImm(X16, X16, 1, false);
                 a_.strW(X16, a, std::uint32_t(kCellRefCountOffset));
-                const std::size_t cold = a_.bcond(EQ);
+                const std::size_t cold = lengthen(a_.bcond(EQ));
                 // A spilled cell was loaded into x17, which the cold path overwrites only after copying it.
                 coldDecRefs_.push_back({cold, a, a_.here(), std::int32_t(in.target)});
                 if (in.isNullable)
@@ -1842,7 +1962,7 @@ private:
                 a_.ldrW(X16, a, std::uint32_t(kCellRefCountOffset));
                 a_.subsImm(X16, X16, 1, false);
                 a_.strW(X16, a, std::uint32_t(kCellRefCountOffset));
-                const std::size_t cold = a_.bcond(EQ);
+                const std::size_t cold = lengthen(a_.bcond(EQ));
                 coldDecRefs_.push_back({cold, a, a_.here(), std::int32_t(in.target)});
                 if (in.isNullable)
                     a_.patch(skip, a_.here());
@@ -1861,7 +1981,7 @@ private:
             }
             case IrOp::Poll: {
                 a_.ldrW(X16, kRt, std::uint32_t(config_.pollFlag));
-                const std::size_t cold = a_.cbnzW(X16);
+                const std::size_t cold = lengthen(a_.cbnzW(X16));
                 coldPolls_.push_back({cold, in.target, a_.here()});
                 return;
             }
@@ -1894,7 +2014,7 @@ private:
             case IrOp::Trap: a_.brk(); return;
             case IrOp::FrameAddr: {
                 const Reg d = def(in.d, X16);
-                a_.addImm(d, Reg(31), areaBase_ + std::uint32_t(in.imm), true);
+                a_.addLarge(d, Reg(31), areaBase_ + std::uint32_t(in.imm));
                 commit(in.d, d);
                 return;
             }
@@ -1944,6 +2064,15 @@ private:
     std::uint32_t coldSaveBase_ = 0;
     std::uint32_t saveBase_ = 0;
     std::uint32_t frameBytes_ = 0;
+    bool longBranches_ = false;
+    bool outOfRange_ = false;
+
+public:
+    void useLongBranches() noexcept { longBranches_ = true; }
+    bool outOfRange() const noexcept { return outOfRange_; }
+    std::string why_ = "out of branch range";
+
+private:
     bool hasFrame_ = false;
     bool needsOverflowPad_ = false;
     std::size_t overflowBranch_ = 0;
@@ -2167,13 +2296,28 @@ public:
         }
 #endif
         static const std::unordered_map<const MethodInfo*, std::size_t> kNoSession;
-        Emitter emitter(fn, config, kNoSession);
-        if (!emitter.run())
-            return nullptr;
+        Emitter first(fn, config, kNoSession);
+        std::unique_ptr<Emitter> again;
+        Emitter* chosen = &first;
+        if (!first.run()) {
+            refusal_ = first.why_;
+            if (!first.outOfRange())
+                return nullptr;
+            again = std::make_unique<Emitter>(fn, config, kNoSession);
+            again->useLongBranches();
+            if (!again->run()) {
+                refusal_ = again->why_;
+                return nullptr;
+            }
+            chosen = again.get();
+        }
+        Emitter& emitter = *chosen;
         const std::size_t bytes = emitter.code().size() * sizeof(std::uint32_t);
         void* block = cache_.reserve(bytes);
-        if (!block)
+        if (!block) {
+            refusal_ = "the code cache has no room for " + std::to_string(bytes) + " bytes";
             return nullptr;
+        }
         std::memcpy(block, emitter.code().data(), bytes);
         if (!cache_.commit(block, bytes)) {
             cache_.release(block, bytes);

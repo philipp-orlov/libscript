@@ -1092,6 +1092,8 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
     typed::NativeCode* compiled = rt.jitBackend->compileFunction(fn, config);
     if (!compiled) {
         code.jitRefused = true;
+        if (rt.ctx.options.jit.dumpCode)
+            rt.ctx.write(fromUtf8("jit: the code generator refused " + code.name + ": " + rt.jitBackend->lastRefusal() + "\n"), false);
         return false;
     }
     // Where each bail's values ended up, now that that is decided.

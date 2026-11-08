@@ -212,6 +212,8 @@ struct Runtime : EngineRuntime
     void adoptProgram(const std::shared_ptr<Program>& program);
     /// What `eval` and `new Function` compiled, emptied at teardown as programs are.
     std::vector<std::weak_ptr<const FunctionCode>> evalCodes;
+    /// What the interpreter spent time in, for SCRIPT_INTERP_PROFILE.
+    std::vector<const FunctionCode*> interpretedCodes;
     void adoptEvalCode(const std::shared_ptr<const FunctionCode>& code);
 
     /// "at fn (file:line)" lines for the frames that are live right now.

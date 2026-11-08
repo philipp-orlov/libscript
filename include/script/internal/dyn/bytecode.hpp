@@ -439,10 +439,14 @@ struct FunctionCode
     mutable std::uint32_t jitHotness = 0;
     /// Times native code has handed a call back to the interpreter part way through, since it was last compiled.
     mutable std::uint32_t jitBails = 0;
+    /// Blocks of 4096 instructions the interpreter ran of this; counted only in a build with SCRIPT_JIT_ENV_OVERRIDE.
+    mutable std::uint64_t interpreted = 0;
     /// Times native code has been thrown away for bailing too often. Past what `jitMayGuess` allows, nothing is assumed.
     mutable std::uint8_t jitGeneration = 0;
     /// A compile costs what the function's size does, and each teaches one more place not to guess.
-    bool jitMayGuess() const noexcept { return jitGeneration < (code.size() < 1024 ? 12u : 3u); }
+    /// Each round guesses nowhere it was wrong before, so rounds converge; a large function needs them most, since what it
+    /// compiles to without a single guess is many times bigger.
+    bool jitMayGuess() const noexcept { return jitGeneration < 12u; }
     /// Parameters, of the first 32, that some interpreted call has been given something other than a number for.
     mutable std::uint32_t argsNotNumber = 0;
     /// Of those, the ones given a number that is not an int32.

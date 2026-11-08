@@ -8,6 +8,9 @@
 // are placed most-touched first, uses weighted by loop depth and next to nothing in cold code, so what a loop works on
 // gets a register and what only a bail block reads takes what is left.
 #include <algorithm>
+#include <functional>
+#include <queue>
+#include <set>
 #include <cstdio>
 #include <string>
 
@@ -172,7 +175,6 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         block.last = std::int32_t(j - 1);
         for (std::size_t k = i; k < j; ++k)
             blockOfInst[k] = std::int32_t(blocks.size());
-        block.use = block.def = block.liveIn = block.liveOut = BitSet(vregs);
         blocks.push_back(std::move(block));
         i = j;
     }
@@ -217,6 +219,83 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         return nullptr;
     };
 
+    // ---- which values cross blocks ----
+    // A value seen in one block only, and written there before it is read, never is live into or out of one: the sets
+    // below are only over the others, which in a long function are a small part of all.
+    std::vector<std::int32_t> globalOf(vregs, -1);
+    std::vector<std::int32_t> globalVreg;
+    {
+        std::vector<std::int32_t> home(vregs, -1);
+        std::vector<std::int32_t> definedIn(vregs, -1);
+        std::vector<std::uint8_t> crosses(vregs, 0);
+        for (std::size_t b = 0; b < blocks.size(); ++b) {
+            const std::int32_t bi = std::int32_t(b);
+            const auto see = [&](std::int32_t v) {
+                if (home[std::size_t(v)] < 0)
+                    home[std::size_t(v)] = bi;
+                else if (home[std::size_t(v)] != bi)
+                    crosses[std::size_t(v)] = 1;
+            };
+            const auto read = [&](std::int32_t v) {
+                if (v < 0)
+                    return;
+                see(v);
+                if (definedIn[std::size_t(v)] != bi)
+                    crosses[std::size_t(v)] = 1;
+            };
+            for (std::int32_t i = blocks[b].first; i <= blocks[b].last; ++i) {
+                const IrInst& in = fn.code[std::size_t(i)];
+                visitOperands(fn, in, read, [](std::int32_t) {});
+                if (const IrExit* exit = exitOf(in)) {
+                    for (std::int32_t v : exit->cleanup)
+                        read(v);
+                    for (const auto& tagged : exit->cleanupTagged) {
+                        read(tagged.first);
+                        read(tagged.second);
+                    }
+                    read(exit->indexVreg);
+                    for (const IrExit::WriteBack& back : exit->writeBacks) {
+                        read(back.base);
+                        read(back.vreg);
+                    }
+                }
+                visitOperands(fn, in, [](std::int32_t) {}, [&](std::int32_t v) {
+                    see(v);
+                    definedIn[std::size_t(v)] = bi;
+                });
+            }
+        }
+        // What arrives from outside is live from before the first block.
+        const auto fromOutside = [&](std::int32_t v) {
+            if (v >= 0)
+                crosses[std::size_t(v)] = 1;
+        };
+        for (std::int32_t p : fn.params)
+            fromOutside(p);
+        for (std::int32_t c : fn.captures)
+            fromOutside(c);
+        for (std::int32_t z : fn.osrZero)
+            fromOutside(z);
+        for (std::int32_t z : fn.osrArguments)
+            fromOutside(z);
+        for (const IrOsrEntry& entry : fn.osrEntries) {
+            for (const IrOsrEntry::Slot& slot : entry.slots) {
+                fromOutside(slot.vreg);
+                fromOutside(slot.tagVreg);
+            }
+            for (const IrOsrEntry::Slot& slot : entry.pointers)
+                fromOutside(slot.vreg);
+        }
+        for (std::size_t v = 0; v < vregs; ++v) {
+            if (crosses[v]) {
+                globalOf[v] = std::int32_t(globalVreg.size());
+                globalVreg.push_back(std::int32_t(v));
+            }
+        }
+    }
+    for (Block& block : blocks)
+        block.use = block.def = block.liveIn = block.liveOut = BitSet(globalVreg.size());
+
     // ---- liveness ----
     for (Block& block : blocks) {
         for (std::int32_t i = block.first; i <= block.last; ++i) {
@@ -224,14 +303,16 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             visitOperands(
                 fn, in,
                 [&](std::int32_t v) {
-                    if (!block.def.test(std::size_t(v)))
-                        block.use.set(std::size_t(v));
+                    const std::int32_t g = globalOf[std::size_t(v)];
+                    if (g >= 0 && !block.def.test(std::size_t(g)))
+                        block.use.set(std::size_t(g));
                 },
                 [](std::int32_t) {});
             if (const IrExit* exit = exitOf(in)) {
                 const auto read = [&](std::int32_t v) {
-                    if (!block.def.test(std::size_t(v)))
-                        block.use.set(std::size_t(v));
+                    const std::int32_t g = v >= 0 ? globalOf[std::size_t(v)] : -1;
+                    if (g >= 0 && !block.def.test(std::size_t(g)))
+                        block.use.set(std::size_t(g));
                 };
                 for (std::int32_t v : exit->cleanup)
                     read(v);
@@ -246,17 +327,43 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
                     read(back.vreg);
                 }
             }
-            visitOperands(fn, in, [](std::int32_t) {}, [&](std::int32_t v) { block.def.set(std::size_t(v)); });
+            visitOperands(fn, in, [](std::int32_t) {}, [&](std::int32_t v) {
+                if (globalOf[std::size_t(v)] >= 0)
+                    block.def.set(std::size_t(globalOf[std::size_t(v)]));
+            });
         }
     }
-    for (bool changed = true; changed;) {
-        changed = false;
-        for (std::size_t b = blocks.size(); b-- > 0;) {
-            Block& block = blocks[b];
+    // A worklist: a block is looked at again only when what is live into one of its successors grew. Sweeping all of them
+    // until nothing changes costs a pass over every block's sets each time, which a function of many blocks and many
+    // values cannot afford.
+    {
+        std::vector<std::vector<std::int32_t>> preds(blocks.size());
+        for (std::size_t b = 0; b < blocks.size(); ++b) {
+            for (std::int32_t s : blocks[b].successors)
+                preds[std::size_t(s)].push_back(std::int32_t(b));
+        }
+        std::vector<std::int32_t> work;
+        std::vector<std::uint8_t> queued(blocks.size(), 1);
+        work.reserve(blocks.size());
+        for (std::size_t b = 0; b < blocks.size(); ++b)
+            work.push_back(std::int32_t(b));  // popped from the back: the last block first
+        while (!work.empty()) {
+            const std::int32_t b = work.back();
+            work.pop_back();
+            queued[std::size_t(b)] = 0;
+            Block& block = blocks[std::size_t(b)];
             for (std::int32_t s : block.successors)
-                changed = block.liveOut.merge(blocks[std::size_t(s)].liveIn) || changed;
-            changed = block.liveIn.merge(block.use) || changed;
-            changed = block.liveIn.mergeMinus(block.liveOut, block.def) || changed;
+                block.liveOut.merge(blocks[std::size_t(s)].liveIn);
+            bool grew = block.liveIn.merge(block.use);
+            grew = block.liveIn.mergeMinus(block.liveOut, block.def) || grew;
+            if (!grew)
+                continue;
+            for (std::int32_t p : preds[std::size_t(b)]) {
+                if (!queued[std::size_t(p)]) {
+                    queued[std::size_t(p)] = 1;
+                    work.push_back(p);
+                }
+            }
         }
     }
 
@@ -307,7 +414,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         const Block& block = blocks[bi];
         const std::int32_t from = block.first * 2;
         const std::int32_t to = block.last * 2 + 1;
-        block.liveOut.forEach([&](std::size_t v) { endOf[v] = to; });
+        block.liveOut.forEach([&](std::size_t g) { endOf[std::size_t(globalVreg[g])] = to; });
         const auto use = [&](std::int32_t v, std::int32_t pos) {
             if (endOf[std::size_t(v)] < 0)
                 endOf[std::size_t(v)] = pos;
@@ -350,7 +457,8 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
                 callPositions.push_back(i * 2);
         }
         // What is still open is what is live into the block.
-        block.liveIn.forEach([&](std::size_t v) {
+        block.liveIn.forEach([&](std::size_t g) {
+            const std::size_t v = std::size_t(globalVreg[g]);
             if (endOf[v] >= 0)
                 intervals[v].ranges.push_back({from, endOf[v]});
             endOf[v] = -1;
@@ -390,13 +498,15 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     for (IrOsrEntry& entry : fn.osrEntries) {
         const std::int32_t at = labelAt[std::size_t(entry.label)];
         const BitSet& liveIn = blocks[std::size_t(blockOfInst[std::size_t(at)])].liveIn;
+        const auto isLive = [&](std::int32_t v) {
+            return v >= 0 && globalOf[std::size_t(v)] >= 0 && liveIn.test(std::size_t(globalOf[std::size_t(v)]));
+        };
         entry.pointers.erase(std::remove_if(entry.pointers.begin(), entry.pointers.end(),
-                                            [&](const IrOsrEntry::Slot& s) { return !liveIn.test(std::size_t(s.vreg)); }),
+                                            [&](const IrOsrEntry::Slot& s) { return !isLive(s.vreg); }),
                              entry.pointers.end());
         entry.slots.erase(std::remove_if(entry.slots.begin(), entry.slots.end(),
                                          [&](const IrOsrEntry::Slot& s) {
-                                             return !liveIn.test(std::size_t(s.vreg)) &&
-                                                    (s.tagVreg < 0 || !liveIn.test(std::size_t(s.tagVreg)));
+                                             return !isLive(s.vreg) && (s.tagVreg < 0 || !isLive(s.tagVreg));
                                          }),
                           entry.slots.end());
     }
@@ -474,25 +584,29 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     std::stable_sort(order.begin(), order.end(), [](const Interval* a, const Interval* b) { return a->weight > b->weight; });
 
     fn.location.assign(vregs, IrFunction::kUnused);
-    // What each machine register holds, as sorted, disjoint ranges.
-    std::vector<std::vector<Range>> busyInt(64), busyFp(64);
-    const auto fits = [](const std::vector<Range>& busy, const Interval& iv) {
+    // What each machine register holds, as disjoint ranges in order: a tree, since a long function puts tens of
+    // thousands in each, in no particular order.
+    std::vector<std::set<Range>> busyInt(64), busyFp(64);
+    const auto fits = [](const std::set<Range>& busy, const Interval& iv) {
         for (const Range& r : iv.ranges) {
-            // The first busy range ending at or after r.from: it overlaps unless it starts after r.to.
-            auto it = std::lower_bound(busy.begin(), busy.end(), r.from, [](const Range& b, std::int32_t at) { return b.to < at; });
+            // The ranges either side of where r.from would go: the one after must start beyond r.to, the one before end
+            // short of r.from.
+            auto it = busy.upper_bound(Range{r.from, 0x7fffffff});
             if (it != busy.end() && it->from <= r.to)
+                return false;
+            if (it != busy.begin() && std::prev(it)->to >= r.from)
                 return false;
         }
         return true;
     };
-    const auto occupy = [](std::vector<Range>& busy, const Interval& iv) {
+    const auto occupy = [](std::set<Range>& busy, const Interval& iv) {
         for (const Range& r : iv.ranges)
-            busy.insert(std::upper_bound(busy.begin(), busy.end(), r), r);
+            busy.insert(r);
     };
-    std::vector<std::vector<Range>> busySlots;
+    std::vector<Interval*> spilled;
     for (Interval* iv : order) {
         const bool fp = fn.vregIsFp[std::size_t(iv->vreg)] != 0;
-        std::vector<std::vector<Range>>& busy = fp ? busyFp : busyInt;
+        std::vector<std::set<Range>>& busy = fp ? busyFp : busyInt;
         const std::vector<std::int32_t>& callerOrder = fp ? regs.fpCallerSaved : regs.intCallerSaved;
         const std::vector<std::int32_t>& calleeOrder = fp ? regs.fpCalleeSaved : regs.intCalleeSaved;
         std::int32_t chosen = -1;
@@ -525,21 +639,38 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
             }
         }
         if (chosen < 0) {
-            // Memory is shared the same way, or a large function runs out of the frame it can reach.
-            std::size_t slot = 0;
-            while (slot < busySlots.size() && !fits(busySlots[slot], *iv))
-                ++slot;
-            if (slot == busySlots.size())
-                busySlots.emplace_back();
-            occupy(busySlots[slot], *iv);
-            fn.location[std::size_t(iv->vreg)] = -std::int32_t(slot) - 1;
+            // A slot is found for it below; meanwhile it is in memory, which is all a partner asks.
+            fn.location[std::size_t(iv->vreg)] = -1;
+            spilled.push_back(iv);
             continue;
         }
         occupy(busy[std::size_t(chosen)], *iv);
         fn.location[std::size_t(iv->vreg)] = chosen;
         (fp ? fn.usedFpRegs : fn.usedIntRegs) |= std::uint64_t(1) << chosen;
     }
-    fn.spillSlots = std::uint32_t(busySlots.size());
+    // Slots, shared by what does not overlap from first use to last: in order of where each begins, a slot is free again
+    // once what had it has ended. Holes in a life are not used, which a long function cannot afford the search for.
+    std::sort(spilled.begin(), spilled.end(), [](const Interval* a, const Interval* b) { return a->start < b->start; });
+    using Ending = std::pair<std::int32_t, std::uint32_t>;  // (end, slot)
+    std::priority_queue<Ending, std::vector<Ending>, std::greater<Ending>> ending;
+    std::vector<std::uint32_t> freeSlots;
+    std::uint32_t slots = 0;
+    for (Interval* iv : spilled) {
+        while (!ending.empty() && ending.top().first < iv->start) {
+            freeSlots.push_back(ending.top().second);
+            ending.pop();
+        }
+        std::uint32_t slot;
+        if (!freeSlots.empty()) {
+            slot = freeSlots.back();
+            freeSlots.pop_back();
+        } else {
+            slot = slots++;
+        }
+        ending.emplace(iv->end, slot);
+        fn.location[std::size_t(iv->vreg)] = -std::int32_t(slot) - 1;
+    }
+    fn.spillSlots = slots;
 
     // What a release's cold path has to keep: registers of values live past it. Callee-saved ones keep themselves.
     std::uint64_t callerInt = 0, callerFp = 0;

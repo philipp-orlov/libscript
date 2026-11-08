@@ -1896,6 +1896,10 @@ Value execute(Runtime& rt, Frame& frame)
                 frame.pc = pc;
                 if (++ticks >= kInterruptInterval) {
                     ticks = 0;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+                    if (!code.interpreted++ && std::getenv("SCRIPT_INTERP_PROFILE"))
+                        rt.interpretedCodes.push_back(&code);
+#endif
                     if (rt.ctx.interruptAsked())
                         throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
                     // A loop that only grows containers it already owns never

@@ -306,7 +306,7 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
         outer->jitCallEntry = nullptr;
         outer->jitCode = nullptr;
         // It was hot a moment ago, and what it just learnt is no more use the longer it waits.
-        outer->jitHotness = rt->ctx.options.jit.threshold - std::min<std::uint32_t>(rt->ctx.options.jit.threshold, 16);
+        outer->jitHotness = outer->jitThreshold(rt->ctx.options.jit.threshold) - std::min<std::uint32_t>(outer->jitThreshold(rt->ctx.options.jit.threshold), 16);
         outer->jitBails = 0;
         if (outer->jitGeneration < 255)
             ++outer->jitGeneration;
@@ -456,7 +456,7 @@ NativePair scriptDynEntryMiss(Runtime* rt, const FunctionCode* code, DynFunction
         code->jitEntry = nullptr;
         code->jitCallEntry = nullptr;
         code->jitCode = nullptr;
-        code->jitHotness = rt->ctx.options.jit.threshold - std::min<std::uint32_t>(rt->ctx.options.jit.threshold, 16);
+        code->jitHotness = code->jitThreshold(rt->ctx.options.jit.threshold) - std::min<std::uint32_t>(code->jitThreshold(rt->ctx.options.jit.threshold), 16);
         ContextImpl::ArgBuffer buffer(rt->ctx);
         buffer.args.assign(args, args + argc);
         return take(callValue(*rt, detail::Access::make(Type::Object, fn), valueOf(thisTag, self), buffer.args));

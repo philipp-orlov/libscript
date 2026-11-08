@@ -447,6 +447,13 @@ struct FunctionCode
     /// Each round guesses nowhere it was wrong before, so rounds converge; a large function needs them most, since what it
     /// compiles to without a single guess is many times bigger.
     bool jitMayGuess() const noexcept { return jitGeneration < 12u; }
+    /// Calls or back edges before this is compiled: more for a bigger function, whose compile costs more, to the point
+    /// where it pays back.
+    std::uint32_t jitThreshold(std::uint32_t base) const noexcept
+    {
+        const std::uint32_t scale = 1 + std::uint32_t(std::min<std::size_t>(code.size() / 8192, 7));
+        return base * scale;
+    }
     /// Parameters, of the first 32, that some interpreted call has been given something other than a number for.
     mutable std::uint32_t argsNotNumber = 0;
     /// Of those, the ones given a number that is not an int32.

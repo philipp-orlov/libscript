@@ -1234,7 +1234,7 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
     if (code.jitEntry)
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
     if (!code.jitRefused && rt.ctx.options.jit.mode != JitOptions::Mode::Off &&
-        (rt.ctx.options.jit.mode == JitOptions::Mode::Eager || ++code.jitHotness >= rt.ctx.options.jit.threshold) &&
+        (rt.ctx.options.jit.mode == JitOptions::Mode::Eager || ++code.jitHotness >= code.jitThreshold(rt.ctx.options.jit.threshold)) &&
         compileNative(rt, code))
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
 #endif
@@ -1808,7 +1808,7 @@ Value execute(Runtime& rt, Frame& frame)
 #if SCRIPT_ENABLE_DYN_JIT
     // Back edges until this function is worth compiling in the middle of running it.
     std::uint32_t backEdges =
-        !code.jitRefused && rt.jitBackend && rt.ctx.options.jit.mode != JitOptions::Mode::Off ? rt.ctx.options.jit.threshold : 0;
+        !code.jitRefused && rt.jitBackend && rt.ctx.options.jit.mode != JitOptions::Mode::Off ? code.jitThreshold(rt.ctx.options.jit.threshold) : 0;
     const auto loopBack = [&](std::uint32_t target, Value& result) {
         if (backEdges == 0 || --backEdges != 0)
             return false;

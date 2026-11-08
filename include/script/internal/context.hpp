@@ -13,6 +13,7 @@
 #include <new>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -213,6 +214,9 @@ struct ContextImpl
     /// Moves whenever an object something inherits from changes what it has: what a site learned about a property found
     /// on a prototype holds for as long as this does not move.
     std::uint64_t protoEpoch = 0;
+    /// The ids of the WeakMaps and WeakSets alive: what a key still holds for one that is gone, it drops.
+    std::unordered_set<std::uint64_t> liveWeakIds;
+    std::uint64_t nextWeakId = 1;
     /// Call depth across both engines, so `stackLimit` holds however the
     /// languages nest.
     std::size_t callDepth = 0;

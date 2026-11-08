@@ -45,6 +45,29 @@ void installObject(Runtime& rt)
 {
     DynObject* proto = rt.objectProto.get();
 
+    // Annex B's `__proto__`: an accessor on Object.prototype that reads and writes the prototype.
+    {
+        GCObject* key = rt.intern("__proto__");
+        proto->putOwn(key, rt.makeFunction(ascii("get __proto__"), [](CallInfo& ci) -> Value {
+            Runtime& rt2 = rtOf(ci);
+            const Value held = toObject(rt2, ci.thisValue());
+            DynObject* self = asObject(held);
+            return self ? getPrototypeOf(rt2, self) : Value::null();
+        }, 0), PropConfigurable | PropAccessor);
+        proto->setSetterOf(key, rt.makeFunction(ascii("set __proto__"), [](CallInfo& ci) -> Value {
+            Runtime& rt2 = rtOf(ci);
+            if (ci.thisValue().isNullish())
+                ci.fail(ErrorCode::TypeError, "Object.prototype.__proto__ called on null or undefined");
+            const Value& next = ci.arg(0);
+            DynObject* self = asObject(ci.thisValue());
+            if (!self || (!next.isNull() && !asObject(next)))
+                return Value::undefined();
+            if (!setPrototypeOf(rt2, self, asObject(next)))
+                ci.fail(ErrorCode::TypeError, "the prototype cannot be set");
+            return Value::undefined();
+        }, 1));
+    }
+
     rt.method(proto, "hasOwnProperty", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(0));
@@ -427,8 +450,15 @@ void installSymbol(Runtime& rt)
         auto* s = rt2.newCell<SymbolCell>();
         s->description = key;
         s->registered = true;
+        // The registry holds a count of its own, which `afterCollect` drops once it is the only one.
         rt2.symbolRegistry.emplace(key, s);
-        return detail::Access::adopt(Type::Symbol, s);
+        return detail::Access::make(Type::Symbol, s);
+    }, 1);
+    rt.method(ctor, "keyFor", [](CallInfo& ci) {
+        if (!ci.arg(0).isSymbol())
+            ci.fail(ErrorCode::TypeError, "Symbol.keyFor: not a symbol");
+        const auto* s = static_cast<const SymbolCell*>(detail::Access::ptr(ci.arg(0)));
+        return s->registered ? rtOf(ci).str(s->description) : Value::undefined();
     }, 1);
 }
 

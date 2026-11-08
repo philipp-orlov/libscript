@@ -598,10 +598,202 @@ String inspectValue(Runtime& rt, const Value& v, int depth)
     return first ? prefix + ascii("{}") : out + ascii(" }");
 }
 
+// ---- WeakMap and WeakSet ----
+// What they hold is on the key (`DynObject::Rare::weak`), tagged with the collection's id: see DynWeakCollection.
+
+/// An object, or a symbol that `Symbol.for` did not make: what may be a weak key.
+bool canBeHeldWeakly(Runtime& rt, const Value& v)
+{
+    if (asObject(v))
+        return true;
+    if (!v.isSymbol())
+        return false;
+    for (const auto& [name, symbol] : rt.symbolRegistry) {
+        if (symbol == detail::Access::ptr(v))
+            return false;
+    }
+    return true;
+}
+
+DynWeakCollection* thisWeak(CallInfo& ci, ObjClass expected)
+{
+    DynObject* o = asObject(ci.thisValue());
+    if (!o || o->cls != expected)
+        ci.fail(ErrorCode::TypeError, expected == ObjClass::WeakMap ? "not a WeakMap" : "not a WeakSet");
+    return static_cast<DynWeakCollection*>(o);
+}
+
+const Value* weakFind(DynWeakCollection* c, const Value& key)
+{
+    if (DynObject* o = asObject(key)) {
+        if (o->rare) {
+            for (const DynObject::Rare::WeakSlot& w : o->rare->weak) {
+                if (w.id == c->id)
+                    return &w.value;
+            }
+        }
+        return nullptr;
+    }
+    for (const auto& [k, v] : c->symbols) {
+        if (detail::Access::ptr(k) == detail::Access::ptr(key))
+            return &v;
+    }
+    return nullptr;
+}
+
+void weakPut(Runtime& rt, DynWeakCollection* c, const Value& key, const Value& value)
+{
+    if (DynObject* o = asObject(key)) {
+        Vec<DynObject::Rare::WeakSlot>& weak = o->rareOf().weak;
+        for (DynObject::Rare::WeakSlot& w : weak) {
+            if (w.id == c->id) {
+                w.value = value;
+                return;
+            }
+        }
+        // What collections that have gone held for it goes now.
+        const auto& live = rt.ctx.liveWeakIds;
+        weak.erase(std::remove_if(weak.begin(), weak.end(), [&live](const DynObject::Rare::WeakSlot& w) { return !live.count(w.id); }),
+                   weak.end());
+        weak.push_back({c->id, value});
+        return;
+    }
+    for (auto& [k, v] : c->symbols) {
+        if (detail::Access::ptr(k) == detail::Access::ptr(key)) {
+            v = value;
+            return;
+        }
+    }
+    c->symbols.push_back({key, value});
+}
+
+bool weakErase(DynWeakCollection* c, const Value& key)
+{
+    if (DynObject* o = asObject(key)) {
+        if (!o->rare)
+            return false;
+        Vec<DynObject::Rare::WeakSlot>& weak = o->rare->weak;
+        for (std::size_t i = 0; i < weak.size(); ++i) {
+            if (weak[i].id == c->id) {
+                weak.erase(weak.begin() + std::ptrdiff_t(i));
+                return true;
+            }
+        }
+        return false;
+    }
+    for (std::size_t i = 0; i < c->symbols.size(); ++i) {
+        if (detail::Access::ptr(c->symbols[i].first) == detail::Access::ptr(key)) {
+            c->symbols.erase(c->symbols.begin() + std::ptrdiff_t(i));
+            return true;
+        }
+    }
+    return false;
+}
+
+void installWeakCollection(Runtime& rt, ObjClass cls)
+{
+    const bool isMap = cls == ObjClass::WeakMap;
+    const char* name = isMap ? "WeakMap" : "WeakSet";
+    DynObject* proto = rt.newObject(rt.objectProto.get());
+    (isMap ? rt.weakMapProto : rt.weakSetProto).reset(proto, true);
+    proto->putOwn(rt.sym.toStringTag.get(), rt.str(ascii(name)), PropConfigurable);
+    rt.makeConstructor(name, [isMap, name](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        if (!ci.isConstructorCall())
+            ci.fail(ErrorCode::TypeError, std::string(name) + " must be called with 'new'");
+        auto* c = rt2.newCell<DynWeakCollection>();
+        c->cls = isMap ? ObjClass::WeakMap : ObjClass::WeakSet;
+        c->setProto((isMap ? rt2.weakMapProto : rt2.weakSetProto).get());
+        c->id = rt2.ctx.nextWeakId++;
+        rt2.ctx.liveWeakIds.insert(c->id);
+        Value result = detail::Access::adopt(Type::Object, c);
+        if (!ci.arg(0).isNullish()) {
+            // Through `set` or `add` as the program sees them, which it may have replaced.
+            const Value adder = getProperty(rt2, result, rt2.intern(isMap ? "set" : "add"));
+            if (!asFunction(adder))
+                ci.fail(ErrorCode::TypeError, std::string(name) + (isMap ? ".prototype.set" : ".prototype.add") + " is not a function");
+            // One at a time, and an abrupt step closes the iterator.
+            const Value iterator = getIterator(rt2, ci.arg(0));
+            Value item;
+            while (iteratorStep(rt2, iterator, item)) {
+                try {
+                    if (isMap) {
+                        if (!item.isObject())
+                            ci.fail(ErrorCode::TypeError, "WeakMap entries must be objects");
+                        const Value key = getIndex(rt2, item, 0);
+                        const Value value = getIndex(rt2, item, 1);
+                        callValue(rt2, adder, result, {key, value});
+                    } else {
+                        callValue(rt2, adder, result, {item});
+                    }
+                } catch (...) {
+                    try {
+                        iteratorClose(rt2, iterator);
+                    } catch (...) {
+                    }
+                    throw;
+                }
+            }
+        }
+        return result;
+    }, 0, proto);
+    if (isMap) {
+        rt.method(proto, "get", [](CallInfo& ci) {
+            const Value* v = weakFind(thisWeak(ci, ObjClass::WeakMap), ci.arg(0));
+            return v ? *v : Value::undefined();
+        }, 1);
+        rt.method(proto, "set", [](CallInfo& ci) {
+            Runtime& rt2 = rtOf(ci);
+            DynWeakCollection* c = thisWeak(ci, ObjClass::WeakMap);
+            if (!canBeHeldWeakly(rt2, ci.arg(0)))
+                ci.fail(ErrorCode::TypeError, "invalid value used as a WeakMap key");
+            weakPut(rt2, c, ci.arg(0), ci.arg(1));
+            return ci.thisValue();
+        }, 2);
+        rt.method(proto, "getOrInsert", [](CallInfo& ci) {
+            Runtime& rt2 = rtOf(ci);
+            DynWeakCollection* c = thisWeak(ci, ObjClass::WeakMap);
+            if (!canBeHeldWeakly(rt2, ci.arg(0)))
+                ci.fail(ErrorCode::TypeError, "invalid value used as a WeakMap key");
+            if (const Value* v = weakFind(c, ci.arg(0)))
+                return *v;
+            weakPut(rt2, c, ci.arg(0), ci.arg(1));
+            return ci.arg(1);
+        }, 2);
+        rt.method(proto, "getOrInsertComputed", [](CallInfo& ci) {
+            Runtime& rt2 = rtOf(ci);
+            DynWeakCollection* c = thisWeak(ci, ObjClass::WeakMap);
+            if (!canBeHeldWeakly(rt2, ci.arg(0)))
+                ci.fail(ErrorCode::TypeError, "invalid value used as a WeakMap key");
+            if (!asFunction(ci.arg(1)))
+                ci.fail(ErrorCode::TypeError, "WeakMap.prototype.getOrInsertComputed: the callback is not a function");
+            if (const Value* v = weakFind(c, ci.arg(0)))
+                return *v;
+            const Value value = callValue(rt2, ci.arg(1), Value::undefined(), {ci.arg(0)});
+            // Whatever the callback stored under the key is overwritten.
+            weakPut(rt2, c, ci.arg(0), value);
+            return value;
+        }, 2);
+    } else {
+        rt.method(proto, "add", [](CallInfo& ci) {
+            Runtime& rt2 = rtOf(ci);
+            DynWeakCollection* c = thisWeak(ci, ObjClass::WeakSet);
+            if (!canBeHeldWeakly(rt2, ci.arg(0)))
+                ci.fail(ErrorCode::TypeError, "invalid value used in a WeakSet");
+            weakPut(rt2, c, ci.arg(0), Value(true));
+            return ci.thisValue();
+        }, 1);
+    }
+    rt.method(proto, "has", [cls](CallInfo& ci) { return Value(weakFind(thisWeak(ci, cls), ci.arg(0)) != nullptr); }, 1);
+    rt.method(proto, "delete", [cls](CallInfo& ci) { return Value(weakErase(thisWeak(ci, cls), ci.arg(0))); }, 1);
+}
+
 void installCollections(Runtime& rt)
 {
     installMap(rt);
     installSet(rt);
+    installWeakCollection(rt, ObjClass::WeakMap);
+    installWeakCollection(rt, ObjClass::WeakSet);
     installPromise(rt);
     installConsole(rt);
 }

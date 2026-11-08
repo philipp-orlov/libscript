@@ -222,7 +222,8 @@ bool setPrototypeOf(Runtime& rt, DynObject* o, DynObject* proto)
     if (!p) {
         if (o->proto.get() == proto)
             return true;
-        if (!o->extensible)
+        // Object.prototype's prototype is null for good: an immutable prototype exotic object.
+        if (!o->extensible || o == rt.objectProto.get())
             return false;
         for (DynObject* up = proto; up; up = up->proto.get()) {
             if (up == o)

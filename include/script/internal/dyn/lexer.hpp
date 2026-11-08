@@ -200,6 +200,8 @@ private:
     Token readTemplate();
     Token readIdentifier();
     void readEscape(String& out);
+    /// The last escape was a legacy octal one, or `\8` or `\9`: fine in sloppy code, an error in strict code or a template.
+    bool sawLegacyEscape_ = false;
 
     bool unicodeSpace(bool& sawNewline);
     std::string_view src_;

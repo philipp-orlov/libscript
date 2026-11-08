@@ -176,6 +176,7 @@ int operandsOf(Op op) noexcept
         case Op::SetGlobal:
         case Op::TypeofGlobal:
         case Op::DeleteGlobal:
+        case Op::ThrowConstAssign:
         case Op::GetElem:
         case Op::SetElem:
         case Op::GetElemDup:

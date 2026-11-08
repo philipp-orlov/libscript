@@ -3,6 +3,7 @@
 
 // libscript -- run, check, compile and inspect a program in any language the
 // build contains. The language comes from the file's extension or `--lang`.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -123,6 +124,38 @@ int repl(script::Context& ctx, script::Language language)
 
 }  // namespace
 
+/// `setTimeout`'s queue: run once the program and its promise jobs are done, earliest first, each followed by the jobs it
+/// makes, as an event loop would.
+struct Timer
+{
+    double due;
+    std::uint64_t id;
+    script::Value fn;
+    std::vector<script::Value> args;
+};
+std::vector<Timer> gTimers;
+std::uint64_t gNextTimer = 1;
+
+double nowMs()
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void runTimers(script::Context& ctx)
+{
+    while (!gTimers.empty()) {
+        std::size_t next = 0;
+        for (std::size_t i = 1; i < gTimers.size(); ++i) {
+            if (gTimers[i].due < gTimers[next].due || (gTimers[i].due == gTimers[next].due && gTimers[i].id < gTimers[next].id))
+                next = i;
+        }
+        Timer timer = std::move(gTimers[next]);
+        gTimers.erase(gTimers.begin() + std::ptrdiff_t(next));
+        timer.fn.call(timer.args);
+        ctx.runJobs();
+    }
+}
+
 /// What a JavaScript shell such as JavaScriptCore's `jsc` has, which programs made for shells look for: `read(path)`, a
 /// file's text, or with "binary" its bytes as a string of char codes 0 to 255; `load(path)` and `loadString(source)`,
 /// each run as a script of its own in the global scope; `print`, `printErr`, `preciseTime()` in seconds, and `gc()`.
@@ -183,6 +216,20 @@ void installShell(script::Context& ctx, script::Language language)
         const auto now = std::chrono::steady_clock::now().time_since_epoch();
         return script::Value(std::chrono::duration<double>(now).count());
     }, 0));
+    ctx.global().set("setTimeout", ctx.function("setTimeout", [](script::CallInfo& ci) -> script::Value {
+        if (!ci.arg(0).isFunction())
+            ci.fail(script::ErrorCode::TypeError, "setTimeout: not a function");
+        const double delay = ci.size() > 1 ? ci.arg(1).toDouble() : 0;
+        std::vector<script::Value> rest(ci.args().begin() + std::min<std::size_t>(ci.size(), 2), ci.args().end());
+        const std::uint64_t id = gNextTimer++;
+        gTimers.push_back({nowMs() + (delay > 0 ? delay : 0), id, ci.arg(0), std::move(rest)});
+        return script::Value(double(id));
+    }, 2));
+    ctx.global().set("clearTimeout", ctx.function("clearTimeout", [](script::CallInfo& ci) -> script::Value {
+        const auto id = std::uint64_t(ci.arg(0).isNumber() ? ci.arg(0).toDouble() : 0);
+        gTimers.erase(std::remove_if(gTimers.begin(), gTimers.end(), [id](const Timer& t) { return t.id == id; }), gTimers.end());
+        return script::Value();
+    }, 1));
     ctx.global().set("gc", ctx.function("gc", [](script::CallInfo& ci) -> script::Value {
         ci.context().collectGarbage();
         return script::Value();
@@ -374,6 +421,8 @@ int main(int argc, char** argv)
 
         printResult(ctx.run(assembly, argv2));
         ctx.runJobs();
+        runTimers(ctx);
+        gTimers.clear();
         if (stats)
             printStats(ctx);
         return 0;

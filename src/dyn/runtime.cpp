@@ -30,13 +30,13 @@ const char* opName(Op op) noexcept
         "SetUpval", "GetGlobal", "SetGlobal", "DefGlobal", "TypeofGlobal", "DeleteGlobal",
         "GetProp", "SetProp", "GetPropDup", "GetPropBound", "GetElem", "SetElem", "GetElemDup", "DeleteProp",
         "DeleteElem", "DefField", "DefGetter", "DefSetter", "DefElem", "DefMethod",
-        "DefMethodElem", "ObjectRest", "ClassSetup", "SetProtoOf", "GetSuper", "SetSuper",
+        "DefMethodElem", "ObjectRest", "ClassSetup", "SetProtoOf", "GetSuper", "SetSuper", "SetSuperElem",
         "GetSuperElem",
         "NewObject", "NewArray", "ArrayAppend", "ArraySpread", "ObjectSpread", "Closure", "DirectEval", "NewRegExp",
         "Call", "CallSpread", "New", "NewSpread", "CallSuper", "CallSuperSpread", "Return",
         "ReturnUndefined",
         "Jump", "JumpIfFalse", "JumpIfTrue", "JumpIfFalseKeep", "JumpIfTrueKeep",
-        "JumpIfNullishKeep", "JumpIfNotNullishKeep", "JumpSub", "EndFinally", "Throw",
+        "JumpIfNullishKeep", "JumpIfNotNullishKeep", "JumpSub", "EndFinally", "Throw", "ThrowConstAssign",
         "ForInStart", "ForInNext", "IterStart", "IterNext", "IterNextOpt", "IterRest",
         "IterClose", "IterStartLoop", "IterCloseAt", "IterCloseThrow", "NewPrivateName", "PrivateIn", "DefPrivate", "DefPrivateMethod", "DefPrivateAccessor", "DefAccessorElem", "CheckThis", "DerivedReturn", "PushNewTarget", "CallSuperVia", "CallSuperViaSpread", "SetFieldInit", "CallStaticInit", "SetHome", "CoStart", "Yield", "Await", "DelegateStart", "DelegateCall", "DelegateCheck", "DelegateDone", "AsyncIterStart", "AsyncIterCall", "AsyncIterCheck", "AsyncIterClose",
         "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Neg", "Pos", "BitAnd", "BitOr", "BitXor",
@@ -295,7 +295,7 @@ void Runtime::releaseRoots() noexcept
     promiseCtor.reset();
     for (Ref<DynObject>* p : {&globalObject, &objectProto, &functionProto, &arrayProto,
                               &stringProto, &numberProto, &booleanProto, &symbolProto,
-                              &errorProto, &dateProto, &mapProto, &setProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
+                              &errorProto, &dateProto, &mapProto, &setProto, &weakMapProto, &weakSetProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
                               &asyncGeneratorProto, &asyncGeneratorFunctionProto,
                               &iteratorProto, &arrayIteratorProto, &regExpProto, &regExpStringIteratorProto, &bigintProto})
         p->reset();
@@ -303,7 +303,15 @@ void Runtime::releaseRoots() noexcept
     sym = Symbols{};
     frames.clear();
     framePool.clear();
+    // The registry's own counts.
+    std::vector<SymbolCell*> registered;
+    for (const auto& [name, symbol] : symbolRegistry)
+        registered.push_back(symbol);
     symbolRegistry.clear();
+    for (SymbolCell* symbol : registered) {
+        symbol->registered = false;
+        detail::decRef(symbol);
+    }
 }
 
 /// A registered symbol whose only reference is the registry itself is not

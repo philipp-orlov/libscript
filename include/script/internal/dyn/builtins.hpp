@@ -20,6 +20,7 @@ void installCore(Runtime& rt);         // Object, Function, Symbol, Error, globa
 void installArray(Runtime& rt);        // Array and the array iterator
 void installString(Runtime& rt);       // String
 void installMathJson(Runtime& rt);     // Number, Boolean, Math, JSON, Date
+void installDate(Runtime& rt);         // Date, installed by installMathJson
 void installCollections(Runtime& rt);  // Map, Set, Promise, console
 void installReflection(Runtime& rt);   // descriptors, the rest of Object, Reflect
 void installGenerators(Runtime& rt);   // generator and async function objects, async iteration

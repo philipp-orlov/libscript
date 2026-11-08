@@ -316,6 +316,12 @@ void DynObject::children(GcList& out) const
                 out.push_back(s);
         }
     }
+    if (rare) {
+        for (const Rare::WeakSlot& w : rare->weak) {
+            if (GCObject* v = detail::Access::ptr(w.value))
+                out.push_back(v);
+        }
+    }
 }
 
 void DynObject::setSetterOf(GCObject* key, Value fn)
@@ -356,6 +362,8 @@ void DynObject::clearReferences()
         rare->index.clear();
         rare->index.shrink_to_fit();
         rare->setters.reset();
+        rare->weak.clear();
+        rare->weak.shrink_to_fit();
     }
 }
 
@@ -882,6 +890,29 @@ void DynMap::children(GcList& out) const
         if (GCObject* p = detail::Access::ptr(e.value))
             out.push_back(p);
     }
+}
+
+DynWeakCollection::~DynWeakCollection()
+{
+    if (rt)
+        rt->liveWeakIds.erase(id);
+}
+
+void DynWeakCollection::children(GcList& out) const
+{
+    DynObject::children(out);
+    for (const auto& [key, value] : symbols) {
+        if (GCObject* p = detail::Access::ptr(key))
+            out.push_back(p);
+        if (GCObject* p = detail::Access::ptr(value))
+            out.push_back(p);
+    }
+}
+
+void DynWeakCollection::clearReferences()
+{
+    DynObject::clearReferences();
+    symbols.clear();
 }
 
 void DynMap::clearReferences()

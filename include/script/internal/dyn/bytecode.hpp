@@ -77,6 +77,7 @@ enum class Op : std::uint8_t
     SetProtoOf,
     GetSuper,  // atom
     SetSuper,  // atom
+    SetSuperElem,  // key value -> value: `super[key] = value`
     GetSuperElem,
 
     // ---- creation ----
@@ -112,6 +113,7 @@ enum class Op : std::uint8_t
     JumpSub,               // target: run a finally block, then come back
     EndFinally,
     Throw,
+    ThrowConstAssign,  // atom: value -> : a TypeError, for an assignment to a `const` that runs
 
     // ---- iteration ----
     ForInStart,  // obj -> keysArray index

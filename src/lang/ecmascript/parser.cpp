@@ -1800,17 +1800,26 @@ bool Parser::looksLikeArrow()
 {
     Lexer probe = lexer_;
     int depth = 1;
-    Token t = probe.next(true);
-    while (t.type != Tok::Eof) {
-        if (++lookahead_ > lookaheadLimit_)
-            fail("source is too deeply parenthesised to parse");
-        if (t.type == Tok::LParen) {
-            ++depth;
-        } else if (t.type == Tok::RParen) {
-            if (--depth == 0)
-                break;
+    Token t;
+    // The scan guesses at `/` after `}` without knowing whether a block or an object literal ended there; when it guesses
+    // a division and the rest is a regular expression that does not lex as tokens, what it scanned was no parameter list.
+    try {
+        t = probe.next(true);
+        while (t.type != Tok::Eof) {
+            if (++lookahead_ > lookaheadLimit_)
+                fail("source is too deeply parenthesised to parse");
+            if (t.type == Tok::LParen) {
+                ++depth;
+            } else if (t.type == Tok::RParen) {
+                if (--depth == 0)
+                    break;
+            }
+            t = probe.next(!operandJustEnded(t.type));
         }
-        t = probe.next(!operandJustEnded(t.type));
+    } catch (const Error&) {
+        if (lookahead_ > lookaheadLimit_)
+            throw;
+        return false;
     }
     if (t.type != Tok::RParen)
         return false;
@@ -2231,6 +2240,7 @@ NodePtr Parser::objectLiteral()
         } else if (kind != PropKind::Init) {
             fail("an accessor needs a parameter list");
         } else if (eat(Tok::Colon)) {
+            p->setsProto = !p->computed && p->text == u"__proto__";
             p->b = assignment();
         } else {
             // `{ x }` is a read of the variable x, which a keyword cannot be.
@@ -2289,6 +2299,7 @@ NodePtr Parser::primary()
         case Tok::StringLit: {
             NodePtr n = makeNode(NK::StringLit, line);
             n->text = cur_.text;
+            n->legacyOctal = cur_.legacyOctal;
             advance();
             return n;
         }

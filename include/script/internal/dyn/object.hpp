@@ -236,6 +236,8 @@ enum class ObjClass : std::uint8_t
     DataView,
     Proxy,  ///< a DynProxy over something that cannot be called
     IteratorHelper,
+    WeakMap,
+    WeakSet,
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.
@@ -365,6 +367,14 @@ struct DynObject : GCObject
         std::unique_ptr<Vec<std::pair<Ref<GCObject>, Value>>> setters;
         /// The shape an object with this one as its prototype starts from.
         Shape* childRoot = nullptr;
+        /// What WeakMaps and WeakSets hold for this object as their key, by the collection's id: kept here, the value
+        /// lives exactly as long as the key does, and is no edge from the collection that would keep the key alive.
+        struct WeakSlot
+        {
+            std::uint64_t id;
+            Value value;
+        };
+        Vec<WeakSlot> weak;
     };
     std::unique_ptr<Rare> rare;
     Rare& rareOf()
@@ -707,6 +717,18 @@ struct DynMap : DynObject
 private:
     void rehash(std::size_t wanted);
     void place(std::uint32_t at);
+};
+
+/// A WeakMap or WeakSet. What it holds is on its keys (`Rare::weak`); a symbol, which has nowhere to hold it, is kept
+/// here, for as long as the collection lives.
+struct DynWeakCollection : DynObject
+{
+    std::uint64_t id = 0;
+    Vec<std::pair<Value, Value>> symbols;
+
+    ~DynWeakCollection() override;
+    void children(GcList& out) const override;
+    void clearReferences() override;
 };
 
 struct DynPromise : DynObject

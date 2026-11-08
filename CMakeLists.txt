@@ -168,6 +168,7 @@ set(SCRIPT_DYNAMIC_SOURCES
     src/dyn/builtins/array.cpp
     src/dyn/builtins/string.cpp
     src/dyn/builtins/math_json.cpp
+    src/dyn/builtins/date.cpp
     src/dyn/builtins/collections.cpp
     src/dyn/builtins/generators.cpp
     src/dyn/builtins/reflection.cpp

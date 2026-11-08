@@ -381,9 +381,11 @@ void installReflection(Runtime& rt)
     }, 1);
     rt.method(object, "hasOwn", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
+        // HasOwnProperty itself: not a `hasOwnProperty` the object may lack (one made with a null prototype) or replace.
         const Value target = toObject(rt2, ci.arg(0));
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(1));
-        return invokeMethod(rt2, target, rt2.intern("hasOwnProperty"), {detail::Access::make(key->kind == CellKind::Symbol ? Type::Symbol : Type::String, key.get())});
+        Descriptor d;
+        return Value(getOwnProperty(rt2, asObject(target), key.get(), d));
     }, 2);
     rt.method(object, "preventExtensions", [](CallInfo& ci) {
         if (DynObject* self = asObject(ci.arg(0))) {

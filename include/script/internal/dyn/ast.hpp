@@ -160,6 +160,8 @@ struct Node
     PropKind propKind = PropKind::Init;
     Visibility visibility = Visibility::Public;
     bool computed = false;
+    /// `__proto__: value` in an object literal, which sets the prototype rather than making a property.
+    bool setsProto = false;
     bool isStatic = false;
     bool prefix = false;
     bool bindMethod = false;  ///< a Member: reading a method makes a bound method, as Python says

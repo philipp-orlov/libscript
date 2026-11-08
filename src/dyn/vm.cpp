@@ -2092,6 +2092,13 @@ Value execute(Runtime& rt, Frame& frame)
                     }
                     case Op::GetUpval: {
                         const Ref<Box>& cell = frame.fn->upvalues[operandAt(pc)];
+                        if (static bool dbg = std::getenv("DBG_UPVAL") != nullptr; dbg && cell) {
+                            GCObject* p = detail::Access::ptr(cell->value);
+                            if (p && p->rc == 0) {
+                                std::fprintf(stderr, "DEAD upval %u in %s at pc %u line %u, box rc %u\n", operandAt(pc), code.name.c_str(), pc, code.lineAt(pc), unsigned(cell->rc));
+                                std::abort();
+                            }
+                        }
                         sp.push_back(cell ? cell->value : Value::undefined());
                         pc += 4;
                         break;
@@ -2407,9 +2414,14 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
                     case Op::SetProtoOf: {
+                        // `__proto__: v` in a literal: an object or null becomes the prototype, anything else is ignored.
                         Value proto = pop();
-                        if (DynObject* target = asObject(sp.back()))
+                        if (DynObject* target = asObject(sp.back()); target && (proto.isNull() || asObject(proto))) {
                             target->setProto(asObject(proto));
+                            // Still a fresh literal: it can have a shape again, from its new prototype's.
+                            if (!target->shape)
+                                rt.giveShape(target);
+                        }
                         break;
                     }
 
@@ -2430,11 +2442,24 @@ Value execute(Runtime& rt, Frame& frame)
                             getPropertyOfObject(rt, base, key.get(), frame.thisValue));
                         break;
                     }
-                    case Op::SetSuper: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
+                    case Op::SetSuper:
+                    case Op::SetSuperElem: {
+                        // [[Set]] on the home object's prototype, with `this` as the receiver: a setter there runs, and
+                        // a plain property lands on `this`.
                         Value v = pop();
-                        setProperty(rt, frame.thisValue, key, v);
+                        Ref<GCObject> key;
+                        if (op == Op::SetSuper) {
+                            key.reset(code.atoms[operandAt(pc)].get());
+                            pc += 4;
+                        } else {
+                            key = toPropertyKey(rt, pop());
+                        }
+                        DynObject* home = frame.fn->homeObject.get();
+                        DynObject* base = home ? home->proto.get() : nullptr;
+                        if (!base)
+                            throwError(rt, ErrorCode::TypeError, "'super' has no base object");
+                        if (!setWithReceiver(rt, base, key.get(), v, frame.thisValue) && !code.sloppyThis)
+                            throwError(rt, ErrorCode::TypeError, "cannot assign to a property through 'super'");
                         sp.push_back(std::move(v));
                         break;
                     }
@@ -2762,6 +2787,10 @@ Value execute(Runtime& rt, Frame& frame)
                     case Op::Throw: {
                         Value v = pop();
                         throwValue(rt, v);
+                    }
+                    case Op::ThrowConstAssign: {
+                        const auto* name = static_cast<const StringCell*>(code.atoms[operandAt(pc)].get());
+                        throwError(rt, ErrorCode::TypeError, "assignment to a constant: " + toUtf8(name->text()));
                     }
 
                     case Op::ForInStart: {

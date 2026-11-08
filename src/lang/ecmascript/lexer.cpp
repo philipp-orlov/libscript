@@ -246,11 +246,34 @@ void Lexer::readEscape(String& out)
         case 'f': out.push_back(u'\f'); return;
         case 'v': out.push_back(u'\v'); return;
         case '0':
-            if (!isDigit(peek())) {
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7': {
+            if (c == '0' && !isDigit(peek())) {
                 out.push_back(u'\0');
                 return;
             }
-            fail("octal escapes are not supported");
+            // Annex B's legacy octal escape: up to three digits, and no more than 0377. An error in strict code, which
+            // the compiler knows and this does not.
+            unsigned value = unsigned(c - '0');
+            const int most = c <= '3' ? 2 : 1;
+            for (int i = 0; i < most && peek() >= '0' && peek() <= '7'; ++i) {
+                value = value * 8 + unsigned(peek() - '0');
+                ++pos_;
+            }
+            out.push_back(Char(value));
+            sawLegacyEscape_ = true;
+            return;
+        }
+        case '8':
+        case '9':
+            // `\8` and `\9` are the digits themselves, in sloppy code.
+            out.push_back(Char(c));
+            sawLegacyEscape_ = true;
             return;
         case '\n': ++line_; return;  // line continuation
         case 'x': {
@@ -312,6 +335,10 @@ Token Lexer::readString(char quote)
         if (c == '\\') {
             ++pos_;
             readEscape(t.text);
+            if (sawLegacyEscape_) {
+                t.legacyOctal = true;
+                sawLegacyEscape_ = false;
+            }
             continue;
         }
         std::size_t start = pos_;
@@ -359,6 +386,8 @@ Token Lexer::readTemplate()
         if (c == '\\') {
             ++pos_;
             readEscape(chunk);
+            if (sawLegacyEscape_)
+                fail("an octal escape is not allowed in a template");
             continue;
         }
         if (c == '$' && peek(1) == '{') {

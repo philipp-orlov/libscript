@@ -113,15 +113,11 @@ TEST(closuresSeeBindingsDeclaredBelowThem)
     CHECK_EQ(run("let r = []; { const g = () => x; const x = 1; r.push(g()); }"
                  " { const g = () => x; const x = 2; r.push(g()); } r.join(',')"),
              std::string("1,2"));
-    // A `const` is enforced even for a closure compiled above its declaration.
-    js::Context ctx;
-    bool threw = false;
-    try {
-        ctx.eval("function f() { const g = () => { c = 2; }; const c = 1; g(); } f()", "<test>");
-    } catch (const js::Error& e) {
-        threw = e.code() == js::ErrorCode::SyntaxError;
-    }
-    CHECK(threw);
+    // A `const` is enforced even for a closure compiled above its declaration: a TypeError when the assignment runs, and
+    // nothing when it does not.
+    CHECK_EQ(run("function f() { const g = () => { c = 2; }; const c = 1; try { g(); } catch (e) { return e.name + c; } } f()"),
+             std::string("TypeError1"));
+    CHECK_EQ(run("function f(x) { const c = 1; if (x) c = 2; return c; } String(f(false))"), std::string("1"));
 }
 
 TEST(blockFunctionsShadowInsideTheirBlock)
@@ -1581,4 +1577,16 @@ TEST(aFunctionInlinedByIdentityStaysThatFunction)
         js::Context ctx(options);
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("same"));
     }
+}
+
+TEST(aRegisteredSymbolOutlivesACollection)
+{
+    // The registry holds a count of its own: a collection that drops the registry's does not drop the program's.
+    js::Context ctx;
+    ctx.eval("const BRAND = Symbol.for('brand'); var tagged = {}; tagged[BRAND] = 1;", "<test>");
+    ctx.collectGarbage();
+    ctx.eval("for (var i = 0; i < 1000; i++) ({ junk: [i] });", "<test>");
+    ctx.collectGarbage();
+    CHECK_EQ(ctx.eval("String(tagged[BRAND] === 1 && BRAND === Symbol.for('brand') && Symbol.keyFor(BRAND) === 'brand')", "<test>").toString(),
+             std::string("true"));
 }

@@ -762,9 +762,16 @@ private:
 
     void storeVar(StringView name, std::uint32_t line)
     {
+        // A private name on its own is no variable: `#x = 1` and `for (#x in o)` are early errors.
+        if (!name.empty() && name[0] == u'#')
+            fail(line, "a private name is not something to assign to");
         const VarRef ref = resolve(name);
-        if (ref.isConst)
-            fail(line, "assignment to a constant: " + toUtf8(name));
+        // An error when it runs, not when it compiles: the assignment may never run.
+        if (ref.isConst) {
+            (void)line;
+            emitU(Op::ThrowConstAssign, atomFor(name));
+            return;
+        }
         switch (ref.kind) {
             case RefKind::Local: emitU(Op::SetLocal, ref.index); break;
             case RefKind::Box: emitU(Op::SetCell, ref.index); break;
@@ -1278,6 +1285,17 @@ private:
                 storeVar(target.text, target.line);
                 return;
             case NK::Member: {
+                if (isSuperMember(target)) {
+                    checkSuperHere(target.line);
+                    if (target.computed) {
+                        superKey(target);
+                        emit(Op::Swap);
+                        emit(Op::SetSuperElem);
+                    } else {
+                        emitU(Op::SetSuper, atomFor(target.text));
+                    }
+                    return;
+                }
                 // stack: value  ->  obj value / obj key value
                 expr(*target.a);
                 if (target.computed) {
@@ -1734,6 +1752,13 @@ private:
 
         // The cases share one scope. Its bindings are made here, before the
         // dispatch jumps, so that every case body lands past the slot setup.
+        // One scope, so a name declared in two cases is declared twice.
+        std::vector<const Node*> body;
+        for (const NodePtr& c : n.list) {
+            for (const NodePtr& s : c->list)
+                body.push_back(s.get());
+        }
+        checkDeclarations(body, false);
         beginScope();
         for (const NodePtr& c : n.list)
             predeclareLexical(c->list);
@@ -1783,6 +1808,8 @@ private:
                 emitU(Op::PushConst, constIndex(Value(n.number)));
                 return;
             case NK::StringLit:
+                if (n.legacyOctal && earlyErrors() && inStrictCode())
+                    fail(n.line, "an octal escape is not allowed in strict code");
                 emitU(Op::PushConst, constIndex(rt_.str(n.text)));
                 return;
             case NK::BoolLit:
@@ -1968,6 +1995,11 @@ private:
                     emit(Op::DefElem);
                 continue;
             }
+            if (p->setsProto) {
+                expr(*p->b);
+                emit(Op::SetProtoOf);
+                continue;
+            }
             if (p->propKind == PropKind::Init && p->text != u"__proto__")
                 exprNamed(*p->b, p->text);
             else
@@ -2089,6 +2121,33 @@ private:
         // The result is parked in a scratch slot: the receiver sits under the
         // value, so it cannot be shuffled out of the way cheaply.
         const std::uint32_t slot = temp();
+        if (isSuperMember(target)) {
+            checkSuperHere(n.line);
+            if (target.computed) {
+                superKey(target);
+                emit(Op::Dup);
+                emit(Op::GetSuperElem);
+            } else {
+                emitU(Op::GetSuper, atomFor(target.text));
+            }
+            emit(Op::ToNumber);
+            if (!n.prefix) {
+                emit(Op::Dup);
+                emitU(Op::SetLocal, slot);
+            }
+            emit(step);
+            if (n.prefix) {
+                emit(Op::Dup);
+                emitU(Op::SetLocal, slot);
+            }
+            if (target.computed)
+                emit(Op::SetSuperElem);
+            else
+                emitU(Op::SetSuper, atomFor(target.text));
+            emit(Op::Pop);
+            emitU(Op::GetLocal, slot);
+            return;
+        }
         expr(*target.a);
         if (target.computed) {
             expr(*target.b);
@@ -2125,8 +2184,65 @@ private:
         patchHere(done);
     }
 
+    static bool isSuperMember(const Node& target) noexcept
+    {
+        return target.kind == NK::Member && target.a && target.a->kind == NK::SuperExpr;
+    }
+
+    /// `super.x` or `super[k]` as somewhere to store: a method's, or an arrow's inside one.
+    void checkSuperHere(std::uint32_t line)
+    {
+        if (!earlyErrors())
+            return;
+        const FnState* owner = fn_;
+        while (owner->isArrow && owner->parent)
+            owner = owner->parent;
+        if (!owner->isMethod)
+            fail(line, "'super' is only valid in a method");
+    }
+
+    /// Pushes the key of `super[k]`, as a property key, for a store after it.
+    void superKey(const Node& target)
+    {
+        expr(*target.b);
+        emit(Op::ToPropertyKey);
+    }
+
     void assign(const Node& n)
     {
+        if (n.op == Tok::Assign && isSuperMember(*n.a)) {
+            const Node& target = *n.a;
+            checkSuperHere(n.line);
+            if (target.computed) {
+                superKey(target);
+                expr(*n.b);
+                emit(Op::SetSuperElem);
+            } else {
+                expr(*n.b);
+                emitU(Op::SetSuper, atomFor(target.text));
+            }
+            return;
+        }
+        if (n.op != Tok::Assign && n.op != Tok::AndAssign && n.op != Tok::OrAssign && n.op != Tok::NullishAssign &&
+            isSuperMember(*n.a)) {
+            const Node& target = *n.a;
+            checkSuperHere(n.line);
+            const Op op = compoundOp(n.op, n.line);
+            if (target.computed) {
+                superKey(target);
+                emit(Op::Dup);
+                emit(Op::GetSuperElem);
+                expr(*n.b);
+                emit(op);
+                emit(Op::SetSuperElem);
+            } else {
+                emitU(Op::GetSuper, atomFor(target.text));
+                expr(*n.b);
+                emit(op);
+                emitU(Op::SetSuper, atomFor(target.text));
+            }
+            return;
+        }
         if (n.op == Tok::Assign) {
             const Node& target = *n.a;
             if (target.kind == NK::ArrayPattern || target.kind == NK::ObjectPattern) {
@@ -2204,6 +2320,18 @@ private:
         }
         if (target.kind != NK::Member)
             fail(line, "invalid assignment target");
+        if (isSuperMember(target)) {
+            checkSuperHere(line);
+            if (target.computed) {
+                superKey(target);
+                emit(Op::Swap);
+                emit(Op::SetSuperElem);
+            } else {
+                emitU(Op::SetSuper, atomFor(target.text));
+            }
+            emit(Op::Pop);
+            return;
+        }
         expr(*target.a);
         if (target.computed) {
             expr(*target.b);
@@ -2544,7 +2672,17 @@ private:
     /// code that is not strict.
     void checkDeclarations(const std::vector<NodePtr>& statements, bool functionTop, const std::vector<String>* params = nullptr)
     {
-        if (!earlyErrors())
+        std::vector<const Node*> plain;
+        plain.reserve(statements.size());
+        for (const NodePtr& s : statements)
+            plain.push_back(s.get());
+        checkDeclarations(plain, functionTop, params);
+    }
+
+    /// The same for the statements of one scope given apart, such as every case of a `switch`.
+    void checkDeclarations(const std::vector<const Node*>& statements, bool functionTop, const std::vector<String>* params = nullptr)
+    {
+        if (!earlyErrors() || statements.empty())
             return;
         std::set<String> lexical;
         std::set<String> plainFunctions;
@@ -2553,7 +2691,7 @@ private:
             if (!lexical.insert(name).second)
                 fail(line, "a name is declared twice: " + toUtf8(name));
         };
-        for (const NodePtr& s : statements) {
+        for (const Node* s : statements) {
             std::vector<String> names;
             if (s->kind == NK::VarDecl && s->varKind != VarKind::Var) {
                 for (const NodePtr& d : s->list) {

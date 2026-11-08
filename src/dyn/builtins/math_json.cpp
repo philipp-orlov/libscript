@@ -33,26 +33,6 @@ double thisNumber(CallInfo& ci)
     ci.fail(ErrorCode::TypeError, "Number.prototype method called on a non-number");
 }
 
-double thisDate(CallInfo& ci)
-{
-    DynObject* o = asObject(ci.thisValue());
-    if (!o || o->cls != ObjClass::Date)
-        ci.fail(ErrorCode::TypeError, "not a Date");
-    return numberOf(static_cast<DynWrapper*>(o)->primitive);
-}
-
-std::tm utcOf(double millis)
-{
-    const std::time_t t = std::time_t(std::floor(millis / 1000));
-    std::tm out{};
-#if defined(_WIN32)
-    gmtime_s(&out, &t);
-#else
-    gmtime_r(&t, &out);
-#endif
-    return out;
-}
-
 void installNumber(Runtime& rt)
 {
     DynObject* proto = rt.newObject(rt.objectProto.get());
@@ -282,57 +262,6 @@ void installMath(Runtime& rt)
         static thread_local std::mt19937_64 engine{std::random_device{}()};
         static thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
         return Value(dist(engine));
-    }, 0);
-}
-
-void installDate(Runtime& rt)
-{
-    DynObject* proto = rt.newObject(rt.objectProto.get());
-    rt.dateProto.reset(proto, true);
-
-    auto nowMillis = []() {
-        using namespace std::chrono;
-        return double(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
-    };
-
-    DynFunction* ctor = rt.makeConstructor("Date", [nowMillis](CallInfo& ci) -> Value {
-        Runtime& rt2 = rtOf(ci);
-        double millis = nowMillis();
-        if (ci.size() == 1)
-            millis = ci.arg(0).isString() ? std::nan("") : toNumber(rt2, ci.arg(0));
-        if (!ci.isConstructorCall())
-            return rt2.str(ascii("Date(") + numberToString(millis) + ascii(")"));
-        auto* d = rt2.newCell<DynWrapper>();
-        d->cls = ObjClass::Date;
-        d->setProto(rt2.dateProto.get());
-        d->primitive = Value(millis);
-        return detail::Access::adopt(Type::Object, d);
-    }, 7, proto);
-
-    rt.method(ctor, "now", [nowMillis](CallInfo&) { return Value(nowMillis()); }, 0);
-
-    rt.method(proto, "getTime", [](CallInfo& ci) { return Value(thisDate(ci)); }, 0);
-    rt.method(proto, "valueOf", [](CallInfo& ci) { return Value(thisDate(ci)); }, 0);
-    rt.method(proto, "getFullYear", [](CallInfo& ci) {
-        return Value(double(utcOf(thisDate(ci)).tm_year + 1900));
-    }, 0);
-    rt.method(proto, "toISOString", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        const double millis = thisDate(ci);
-        const std::tm out = utcOf(millis);
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", out.tm_year + 1900,
-                      out.tm_mon + 1, out.tm_mday, out.tm_hour, out.tm_min, out.tm_sec,
-                      int(std::fmod(millis, 1000.0)));
-        return rt2.str(buf);
-    }, 0);
-    rt.method(proto, "toString", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        return invokeMethod(rt2, ci.thisValue(), rt2.intern("toISOString"), {});
-    }, 0);
-    rt.method(proto, "toJSON", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        return invokeMethod(rt2, ci.thisValue(), rt2.intern("toISOString"), {});
     }, 0);
 }
 

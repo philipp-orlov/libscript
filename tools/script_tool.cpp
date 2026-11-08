@@ -3,6 +3,7 @@
 
 // libscript -- run, check, compile and inspect a program in any language the
 // build contains. The language comes from the file's extension or `--lang`.
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -121,6 +122,72 @@ int repl(script::Context& ctx, script::Language language)
 }
 
 }  // namespace
+
+/// What a JavaScript shell such as JavaScriptCore's `jsc` has, which programs made for shells look for: `read(path)`, a
+/// file's text, or with "binary" its bytes as a string of char codes 0 to 255; `load(path)` and `loadString(source)`,
+/// each run as a script of its own in the global scope; `print`, `printErr`, `preciseTime()` in seconds, and `gc()`.
+void installShell(script::Context& ctx, script::Language language)
+{
+    const auto fileText = [](script::CallInfo& ci, const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            ci.fail(script::ErrorCode::TypeError, "cannot read " + path);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    ctx.global().set("read", ctx.function("read", [fileText](script::CallInfo& ci) -> script::Value {
+        const std::string text = fileText(ci, ci.arg(0).toString());
+        if (ci.size() > 1 && ci.arg(1).toString() == "binary") {
+            // Each byte a character of its own: Latin-1, spelled in UTF-8.
+            std::string latin1;
+            latin1.reserve(text.size() * 2);
+            for (const char c : text) {
+                const auto b = static_cast<unsigned char>(c);
+                if (b < 0x80) {
+                    latin1 += char(b);
+                } else {
+                    latin1 += char(0xC0 | (b >> 6));
+                    latin1 += char(0x80 | (b & 0x3F));
+                }
+            }
+            return ci.context().str(latin1);
+        }
+        return ci.context().str(text);
+    }, 1));
+    ctx.global().set("readFile", ctx.function("readFile", [fileText](script::CallInfo& ci) -> script::Value {
+        return ci.context().str(fileText(ci, ci.arg(0).toString()));
+    }, 1));
+    if (language != script::Language::JavaScript)
+        return;
+    ctx.global().set("load", ctx.function("load", [fileText](script::CallInfo& ci) -> script::Value {
+        const std::string path = ci.arg(0).toString();
+        return ci.context().eval(fileText(ci, path), path, script::Language::JavaScript);
+    }, 1));
+    ctx.global().set("loadString", ctx.function("loadString", [](script::CallInfo& ci) -> script::Value {
+        return ci.context().eval(ci.arg(0).toString(), "<loadString>", script::Language::JavaScript);
+    }, 1));
+    ctx.global().set("print", ctx.function("print", [](script::CallInfo& ci) -> script::Value {
+        std::string line;
+        for (std::size_t i = 0; i < ci.size(); ++i)
+            line += (i ? " " : "") + ci.arg(i).toString();
+        std::printf("%s\n", line.c_str());
+        return script::Value();
+    }, 0));
+    ctx.global().set("printErr", ctx.function("printErr", [](script::CallInfo& ci) -> script::Value {
+        std::string line;
+        for (std::size_t i = 0; i < ci.size(); ++i)
+            line += (i ? " " : "") + ci.arg(i).toString();
+        std::fprintf(stderr, "%s\n", line.c_str());
+        return script::Value();
+    }, 0));
+    ctx.global().set("preciseTime", ctx.function("preciseTime", [](script::CallInfo&) -> script::Value {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        return script::Value(std::chrono::duration<double>(now).count());
+    }, 0));
+    ctx.global().set("gc", ctx.function("gc", [](script::CallInfo& ci) -> script::Value {
+        ci.context().collectGarbage();
+        return script::Value();
+    }, 0));
+}
 
 int main(int argc, char** argv)
 {
@@ -265,15 +332,7 @@ int main(int argc, char** argv)
             script::supported(script::Language::Python)) {
             try {
                 ctx.global().set("argv", ctx.array(argv2));
-                // What a JavaScript shell has: `read(path)`, a file's text, which programs made for shells look for.
-                ctx.global().set("read", ctx.function("read", [](script::CallInfo& ci) -> script::Value {
-                    const std::string path = ci.arg(0).toString();
-                    std::ifstream in(path, std::ios::binary);
-                    if (!in)
-                        ci.fail(script::ErrorCode::TypeError, "cannot read " + path);
-                    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-                    return ci.context().str(text);
-                }, 1));
+                installShell(ctx, language);
             } catch (const script::Error&) {
             }
         }

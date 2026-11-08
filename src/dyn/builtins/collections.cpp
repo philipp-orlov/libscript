@@ -475,10 +475,15 @@ void installConsole(Runtime& rt)
         rt2.ctx.write(line, isError);
         return Value::undefined();
     };
+    // Enumerable, as console's members are everywhere else (it is a WebIDL namespace, not an ECMAScript built-in): a copy
+    // made with `Object.assign({}, console)` has them.
+    const auto member = [&rt, console](const char* name, NativeFunction fn) {
+        console->putOwn(rt.intern(name), rt.makeFunction(ascii(name), std::move(fn), 0), PropWritable | PropEnumerable | PropConfigurable);
+    };
     for (const char* name : {"log", "info", "debug", "trace"})
-        rt.method(console, name, [emit](CallInfo& ci) { return emit(ci, false); }, 0);
+        member(name, [emit](CallInfo& ci) { return emit(ci, false); });
     for (const char* name : {"warn", "error"})
-        rt.method(console, name, [emit](CallInfo& ci) { return emit(ci, true); }, 0);
+        member(name, [emit](CallInfo& ci) { return emit(ci, true); });
 }
 
 }  // namespace

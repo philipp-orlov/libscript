@@ -2273,14 +2273,14 @@ public:
         return rootCode;
     }
 
-    NativeCode* compileFunction(IrFunction& fn, const NativeConfig& config) override
+    bool buildFunction(IrFunction& fn, const NativeConfig& config, BuiltCode& out) const override
     {
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (const char* path = std::getenv("SCRIPT_JIT_IR_BEFORE")) {
-            if (std::FILE* out = std::fopen(path, "a")) {
+            if (std::FILE* file = std::fopen(path, "a")) {
                 const std::string text = dumpIr(fn);
-                std::fwrite(text.data(), 1, text.size(), out);
-                std::fclose(out);
+                std::fwrite(text.data(), 1, text.size(), file);
+                std::fclose(file);
             }
         }
 #endif
@@ -2288,10 +2288,10 @@ public:
         allocateRegisters(fn, regs_);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (const char* path = std::getenv("SCRIPT_JIT_IR")) {
-            if (std::FILE* out = std::fopen(path, "a")) {
+            if (std::FILE* file = std::fopen(path, "a")) {
                 const std::string text = dumpIr(fn);
-                std::fwrite(text.data(), 1, text.size(), out);
-                std::fclose(out);
+                std::fwrite(text.data(), 1, text.size(), file);
+                std::fclose(file);
             }
         }
 #endif
@@ -2300,46 +2300,27 @@ public:
         std::unique_ptr<Emitter> again;
         Emitter* chosen = &first;
         if (!first.run()) {
-            refusal_ = first.why_;
+            out.refusal = first.why_;
             if (!first.outOfRange())
-                return nullptr;
+                return false;
             again = std::make_unique<Emitter>(fn, config, kNoSession);
             again->useLongBranches();
             if (!again->run()) {
-                refusal_ = again->why_;
-                return nullptr;
+                out.refusal = again->why_;
+                return false;
             }
             chosen = again.get();
         }
-        Emitter& emitter = *chosen;
+        const Emitter& emitter = *chosen;
         const std::size_t bytes = emitter.code().size() * sizeof(std::uint32_t);
-        void* block = cache_.reserve(bytes);
-        if (!block) {
-            refusal_ = "the code cache has no room for " + std::to_string(bytes) + " bytes";
-            return nullptr;
-        }
-        std::memcpy(block, emitter.code().data(), bytes);
-        if (!cache_.commit(block, bytes)) {
-            cache_.release(block, bytes);
-            return nullptr;
-        }
-        auto* code = new NativeCode();
-        code->codeStart = block;
-        code->codeBytes = bytes;
-        code->backend = "arm64";
-        code->fastEntry = block;
-        for (const Emitter::OsrOut& osr : emitter.osr()) {
-            NativeCode::Osr out;
-            out.pc = osr.pc;
-            out.entry = static_cast<std::uint8_t*>(block) + osr.at * 4;
-            out.ownedSlots = osr.owned;
-            out.ownedPointers = osr.ownedPointers;
-            code->osr.push_back(std::move(out));
-        }
-        code->sites = emitter.sites();
+        out.bytes.resize(bytes);
+        std::memcpy(out.bytes.data(), emitter.code().data(), bytes);
+        for (const Emitter::OsrOut& osr : emitter.osr())
+            out.osr.push_back({osr.pc, osr.at * 4, osr.owned, osr.ownedPointers});
+        out.sites = emitter.sites();
         for (const IrSite& site : fn.sites)
-            code->sourceSites.push_back({site.method, site.pc, site.parent});
-        return code;
+            out.sourceSites.push_back({site.method, site.pc, site.parent});
+        return true;
     }
 
     void release(NativeCode* code) noexcept override

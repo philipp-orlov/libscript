@@ -2167,40 +2167,23 @@ public:
         return rootCode;
     }
 
-    NativeCode* compileFunction(IrFunction& fn, const NativeConfig& config) override
+    bool buildFunction(IrFunction& fn, const NativeConfig& config, BuiltCode& out) const override
     {
         optimizeLoops(fn);
         allocateRegisters(fn, regs_);
         static const std::unordered_map<const MethodInfo*, std::size_t> kNoSession;
         Emitter emitter(fn, config, kNoSession);
-        if (!emitter.run())
-            return nullptr;
-        const std::size_t bytes = emitter.code().size();
-        void* block = cache_.reserve(bytes);
-        if (!block)
-            return nullptr;
-        std::memcpy(block, emitter.code().data(), bytes);
-        if (!cache_.commit(block, bytes)) {
-            cache_.release(block, bytes);
-            return nullptr;
+        if (!emitter.run()) {
+            out.refusal = "the code generator refused";
+            return false;
         }
-        auto* code = new NativeCode();
-        code->codeStart = block;
-        code->codeBytes = bytes;
-        code->backend = "x86-64";
-        code->fastEntry = block;
-        for (const Emitter::OsrOut& osr : emitter.osr()) {
-            NativeCode::Osr out;
-            out.pc = osr.pc;
-            out.entry = static_cast<std::uint8_t*>(block) + osr.at;
-            out.ownedSlots = osr.owned;
-            out.ownedPointers = osr.ownedPointers;
-            code->osr.push_back(std::move(out));
-        }
-        code->sites = emitter.sites();
+        out.bytes = emitter.code();
+        for (const Emitter::OsrOut& osr : emitter.osr())
+            out.osr.push_back({osr.pc, osr.at, osr.owned, osr.ownedPointers});
+        out.sites = emitter.sites();
         for (const IrSite& site : fn.sites)
-            code->sourceSites.push_back({site.method, site.pc, site.parent});
-        return code;
+            out.sourceSites.push_back({site.method, site.pc, site.parent});
+        return true;
     }
 
     void release(NativeCode* code) noexcept override

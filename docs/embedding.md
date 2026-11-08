@@ -431,6 +431,13 @@ sequence atomic; `Options::threadSafe = false` drops the locking for a context
 confined to one thread. Contexts share nothing, so one per thread scales
 linearly.
 
+A context running JavaScript, TypeScript or Python with native code starts one
+thread of its own, the first time a large function gets hot: the code
+generator runs there over the function while the interpreter goes on with it.
+The thread touches nothing but the function's IR, and stops with the context.
+`options.jit.background = false`, or a build with `-DSCRIPT_JIT_THREAD=OFF`,
+keeps everything on the caller's thread.
+
 Values and assemblies belong to their Context and are not locked on their own:
 copying or dropping a `Value`, or dropping an `Assembly`, touches the heap.
 Do it on the thread that owns the Context, or inside a `Context::Lock`.

@@ -51,6 +51,7 @@ if(SCRIPT_PROFILE STREQUAL "Compact")
 endif()
 option(SCRIPT_UNICODE_PROPERTIES "The tables behind \\p{...} in a regular expression: 40 KB of data" ${SCRIPT_UNICODE_PROPERTIES_DEFAULT})
 option(SCRIPT_DISABLE_DYN_JIT "Native code for C#, C and C++ only; JavaScript, TypeScript and Python keep interpreting" OFF)
+option(SCRIPT_JIT_THREAD "JavaScript, TypeScript, Python: a large function is compiled on a thread of its own while it goes on being interpreted" ON)
 option(SCRIPT_ENABLE_LTO "Link-time optimization of the library and the tools" ${SCRIPT_LTO_DEFAULT})
 # Profile-guided optimization, in two builds: configure with SCRIPT_PGO=generate, run tools/pgo-train.sh, then
 # reconfigure the same tree with SCRIPT_PGO=use.
@@ -242,6 +243,11 @@ if(SCRIPT_ENGINE_DYNAMIC AND SCRIPT_ENGINE_TYPED AND SCRIPT_ENABLE_JIT AND NOT S
 else()
     set(SCRIPT_ENABLE_DYN_JIT OFF)
 endif()
+if(SCRIPT_ENABLE_DYN_JIT AND SCRIPT_JIT_THREAD)
+    set(SCRIPT_ENABLE_JIT_THREAD ON)
+else()
+    set(SCRIPT_ENABLE_JIT_THREAD OFF)
+endif()
 
 # The code generators, and the whole optimizing tier with them: a build without them has interpreters and nothing else.
 if(SCRIPT_ENGINE_TYPED AND SCRIPT_ENABLE_JIT)
@@ -261,7 +267,7 @@ endif()
 # ---- the generated configuration header ---------------------------------------
 foreach(flag SCRIPT_LANG_CSHARP SCRIPT_LANG_TYPESCRIPT SCRIPT_LANG_JAVASCRIPT
              SCRIPT_LANG_PYTHON SCRIPT_LANG_C SCRIPT_LANG_CPP SCRIPT_ENGINE_TYPED
-             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT SCRIPT_ENABLE_DYN_JIT SCRIPT_UNICODE_PROPERTIES)
+             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT SCRIPT_ENABLE_DYN_JIT SCRIPT_ENABLE_JIT_THREAD SCRIPT_UNICODE_PROPERTIES)
     if(${flag})
         set(${flag}_01 1)
     else()

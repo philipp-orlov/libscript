@@ -47,6 +47,8 @@ struct LoopCtx
     String label;
     bool continuable = true;
     std::size_t finallyDepth = 0;
+    /// Values statements around it keep on the stack, which a jump to its ends expects there and no more.
+    std::uint32_t stackDepth = 0;
 };
 
 /// A `finally` block that pending exits have to run on their way out.
@@ -56,6 +58,8 @@ struct FinallyCtx
     /// Not a `finally` but a `for-of`, whose iterator at this place in the stack is closed by whatever jumps out of it.
     std::uint32_t iterDepth = kNoSlot;
     bool asyncIter = false;
+    /// What is on the stack where it starts: anything a jump out of it has above that goes first.
+    std::uint32_t stackDepth = 0;
 };
 
 struct FnState
@@ -1375,6 +1379,7 @@ private:
         loop.label = label;
         loop.continuable = continuable;
         loop.finallyDepth = fn_->finallys.size();
+        loop.stackDepth = fn_->stmtDepth;
         return loop;
     }
     void popLoop(std::uint32_t breakTarget, std::uint32_t continueTarget)
@@ -1469,6 +1474,7 @@ private:
         FinallyCtx closes;
         closes.iterDepth = iterDepth;
         closes.asyncIter = isAwait;
+        closes.stackDepth = fn_->stmtDepth;
         if (isOf)
             fn_->finallys.push_back(&closes);
         pushLoop(label, true);
@@ -1592,8 +1598,17 @@ private:
                 continue;
             if (!isBreak && !loop.continuable)
                 fail(n.line, "'continue' must target a loop");
-            for (std::size_t i = fn_->finallys.size(); i-- > loop.finallyDepth;)
+            // A `switch` or a `for-in` in between keeps values on the stack that this way out leaves behind.
+            std::uint32_t depth = fn_->stmtDepth;
+            const auto popTo = [&](std::uint32_t wanted) {
+                for (; depth > wanted; --depth)
+                    emit(Op::Pop);
+            };
+            for (std::size_t i = fn_->finallys.size(); i-- > loop.finallyDepth;) {
+                popTo(fn_->finallys[i]->stackDepth);
                 emitFinallyCall(*fn_->finallys[i]);
+            }
+            popTo(loop.stackDepth);
             const std::size_t site = emitJump(Op::Jump);
             (isBreak ? loop.breaks : loop.continues).push_back(site);
             return;
@@ -1637,8 +1652,13 @@ private:
         if (fn_->retvalSlot == kNoSlot)
             fn_->retvalSlot = hiddenSlot();
         emitU(Op::SetLocal, fn_->retvalSlot);
-        for (std::size_t i = fn_->finallys.size(); i-- > 0;)
+        // Each `finally` runs on the stack it was written for.
+        std::uint32_t depth = fn_->stmtDepth;
+        for (std::size_t i = fn_->finallys.size(); i-- > 0;) {
+            for (; depth > fn_->finallys[i]->stackDepth; --depth)
+                emit(Op::Pop);
             emitFinallyCall(*fn_->finallys[i]);
+        }
         emitU(Op::GetLocal, fn_->retvalSlot);
         emitFinalReturn();
     }
@@ -1649,6 +1669,7 @@ private:
         const bool hasFinally = n.d != nullptr;
         const bool hasCatch = n.c != nullptr;
         const std::uint32_t stackDepth = fn_->stmtDepth;
+        finallyCtx.stackDepth = stackDepth;
 
         const std::uint32_t tryStart = here();
         if (hasFinally)

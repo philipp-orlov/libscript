@@ -3,6 +3,7 @@
 
 // What native code for the dynamic languages calls, and how it is entered.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1055,37 +1056,15 @@ bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& resul
     return true;
 }
 
-bool compileNative(Runtime& rt, const FunctionCode& code)
+namespace {
+
+/// The code `fn` was built into goes in place for `code`: false when there is none, and then none is tried again.
+bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunction& fn, typed::NativeCode* compiled)
 {
-    if (code.jitEntry)
-        return true;
-    if (code.jitRefused || !rt.jitBackend || !rt.jitBackend->available() ||
-        rt.ctx.options.jit.mode == JitOptions::Mode::Off)
-        return false;
-    typed::IrFunction fn;
-    std::string why;
-    if (!lowerFunction(rt, code, fn, &why)) {
-        code.jitRefused = true;
-        if (rt.ctx.options.jit.dumpCode)
-            rt.ctx.write(fromUtf8("jit: skipping " + code.name + ": " + why + "\n"), false);
-        return false;
-    }
-    typed::NativeConfig config;
-    const auto offset = [&rt](const auto& field) {
-        return std::int32_t(reinterpret_cast<std::uintptr_t>(&field) - reinterpret_cast<std::uintptr_t>(&rt));
-    };
-    config.nativeError = offset(rt.nativeError);
-    config.pollFlag = offset(rt.pollFlag);
-    config.stackLimit = offset(rt.nativeStackLimit);
-    config.topFrame = offset(rt.nativeTopFrame);
-    config.savedRegs = offset(rt.bailRegs[0]);
-    config.raise = reinterpret_cast<const void*>(&scriptDynRaise);
-    config.poll = reinterpret_cast<const void*>(&scriptDynPoll);
-    typed::NativeCode* compiled = rt.jitBackend->compileFunction(fn, config);
     if (!compiled) {
         code.jitRefused = true;
         if (rt.ctx.options.jit.dumpCode)
-            rt.ctx.write(fromUtf8("jit: the code generator refused " + code.name + ": " + rt.jitBackend->lastRefusal() + "\n"), false);
+            rt.ctx.write(fromUtf8("jit: the code generator refused " + code.name + ": " + rt.jitBackend->functionRefusal() + "\n"), false);
         return false;
     }
     // Where each bail's values ended up, now that that is decided.
@@ -1115,6 +1094,143 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
         code.jitCallEntry = compiled->fastEntry;
     code.jitEntry = compiled->fastEntry;
     return true;
+}
+
+#if SCRIPT_ENABLE_JIT_THREAD
+/// IR instructions below which a compile is quick enough to wait for: the call that made the function hot gets its code.
+constexpr std::size_t kBackgroundIr = 3000;
+
+bool backgroundWanted(const Runtime& rt, const typed::IrFunction& fn)
+{
+    const JitOptions& options = rt.ctx.options.jit;
+    if (!options.background || options.mode == JitOptions::Mode::Eager || options.dumpCode)
+        return false;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* v = std::getenv("SCRIPT_JIT_BACKGROUND"))
+        return v[0] != '0' && fn.code.size() >= std::size_t(std::atol(v));
+#endif
+    return fn.code.size() >= kBackgroundIr;
+}
+#endif
+
+}  // namespace
+
+#if SCRIPT_ENABLE_JIT_THREAD
+JitWorker::JitWorker(const typed::JitBackend& backend) : backend_(backend), thread_([this] { run(); }) {}
+
+JitWorker::~JitWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_ = true;
+        queue_.clear();
+    }
+    wake_.notify_one();
+    thread_.join();
+}
+
+void JitWorker::submit(std::shared_ptr<JitJob> job)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push_back(std::move(job));
+    }
+    wake_.notify_one();
+}
+
+void JitWorker::run()
+{
+    for (;;) {
+        std::shared_ptr<JitJob> job;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            wake_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+            if (stop_)
+                return;
+            job = std::move(queue_.front());
+            queue_.pop_front();
+        }
+        // The function this was for may be gone already, with only this left holding the job.
+        if (job.use_count() > 1)
+            job->ok = backend_.buildFunction(job->fn, job->config, job->built);
+        job->done.store(true, std::memory_order_release);
+    }
+}
+#endif
+
+bool compileNative(Runtime& rt, const FunctionCode& code)
+{
+    if (code.jitEntry)
+        return true;
+#if SCRIPT_ENABLE_JIT_THREAD
+    if (code.jitJob) {
+        if (!code.jitJob->done.load(std::memory_order_acquire))
+            return false;
+        const std::shared_ptr<JitJob> job = std::move(code.jitJob);
+        code.jitJob = nullptr;
+        if (!job->ok) {
+            code.jitRefused = true;
+            if (rt.ctx.options.jit.dumpCode)
+                rt.ctx.write(fromUtf8("jit: the code generator refused " + code.name + ": " + job->built.refusal + "\n"), false);
+            return false;
+        }
+        return installNative(rt, code, job->fn, rt.jitBackend->install(job->built));
+    }
+#endif
+    if (code.jitRefused || !rt.jitBackend || !rt.jitBackend->available() ||
+        rt.ctx.options.jit.mode == JitOptions::Mode::Off)
+        return false;
+#if SCRIPT_ENABLE_JIT_THREAD
+    auto job = std::make_shared<JitJob>();
+    typed::IrFunction& fn = job->fn;
+#else
+    typed::IrFunction fn;
+#endif
+    std::string why;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    const auto started = std::chrono::steady_clock::now();
+#endif
+    if (!lowerFunction(rt, code, fn, &why)) {
+        code.jitRefused = true;
+        if (rt.ctx.options.jit.dumpCode)
+            rt.ctx.write(fromUtf8("jit: skipping " + code.name + ": " + why + "\n"), false);
+        return false;
+    }
+    typed::NativeConfig config;
+    const auto offset = [&rt](const auto& field) {
+        return std::int32_t(reinterpret_cast<std::uintptr_t>(&field) - reinterpret_cast<std::uintptr_t>(&rt));
+    };
+    config.nativeError = offset(rt.nativeError);
+    config.pollFlag = offset(rt.pollFlag);
+    config.stackLimit = offset(rt.nativeStackLimit);
+    config.topFrame = offset(rt.nativeTopFrame);
+    config.savedRegs = offset(rt.bailRegs[0]);
+    config.raise = reinterpret_cast<const void*>(&scriptDynRaise);
+    config.poll = reinterpret_cast<const void*>(&scriptDynPoll);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SCRIPT_JIT_SIZES"))
+        std::fprintf(stderr, "compile %s (%zu bytecode, %zu ir, gen %u)\n", code.name.c_str(), code.code.size(), fn.code.size(), unsigned(code.jitGeneration));
+    const auto lowered = std::chrono::steady_clock::now();
+#endif
+#if SCRIPT_ENABLE_JIT_THREAD
+    if (backgroundWanted(rt, fn)) {
+        job->config = config;
+        if (!rt.jitWorker)
+            rt.jitWorker = std::make_unique<JitWorker>(*rt.jitBackend);
+        code.jitJob = job;
+        rt.jitWorker->submit(std::move(job));
+        return false;
+    }
+#endif
+    typed::NativeCode* compiled = rt.jitBackend->compileFunction(fn, config);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SCRIPT_JIT_SIZES")) {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        std::fprintf(stderr, "compiled %s: lower %.1f ms, back end %.1f ms\n", code.name.c_str(), ms(lowered - started),
+                     ms(std::chrono::steady_clock::now() - lowered));
+    }
+#endif
+    return installNative(rt, code, fn, compiled);
 }
 
 std::string describeNativeFrames(const Runtime& rt, void* topFrame, const void* topPc, int& shown)

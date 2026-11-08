@@ -48,7 +48,9 @@ void installObject(Runtime& rt)
     rt.method(proto, "hasOwnProperty", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         Ref<GCObject> key = toPropertyKey(rt2, ci.arg(0));
-        DynObject* self = asObject(toObject(rt2, ci.thisValue()));
+        // Kept, since for a primitive it is the only count on the wrapper made for it.
+        const Value held = toObject(rt2, ci.thisValue());
+        DynObject* self = asObject(held);
         if (!self)
             return Value(false);
         if (self->fnKindIsProxy()) {
@@ -185,7 +187,8 @@ void installObject(Runtime& rt)
 
     rt.method(ctor, "getPrototypeOf", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
-        DynObject* self = asObject(toObject(rt2, ci.arg(0)));
+        const Value held = toObject(rt2, ci.arg(0));
+        DynObject* self = asObject(held);
         return self && self->proto ? objectValue(self->proto.get()) : Value::null();
     }, 1);
 

@@ -239,6 +239,7 @@ target_link_libraries(my_app PRIVATE script::script)
 | `SCRIPT_LANG_C` | ON | the C front end and the typed engine |
 | `SCRIPT_LANG_CPP` | ON | the C++ dialect of the C front end and the typed engine |
 | `SCRIPT_ENABLE_JIT` | ON | the arm64 and x86-64 code generators (needs the typed engine) |
+| `SCRIPT_JIT_THREAD` | ON | JavaScript, TypeScript, Python: a large function compiles on a thread of its own while it is interpreted |
 | `SCRIPT_UNICODE_PROPERTIES` | ON (OFF in Compact) | the 43 KB of tables behind `\p{...}` in regular expressions |
 | `SCRIPT_BUILD_TESTS` | ON | the test suites, one executable per suite |
 | `SCRIPT_BUILD_EXAMPLES` | ON | the examples |

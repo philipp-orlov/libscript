@@ -126,6 +126,43 @@ extern "C" int scriptJitPoll(Runtime* rt) noexcept
 
 // -------------------------------------------------------------- backend ---
 
+NativeCode* JitBackend::compileFunction(IrFunction& fn, const NativeConfig& config)
+{
+    BuiltCode built;
+    if (!buildFunction(fn, config, built)) {
+        functionRefusal_ = std::move(built.refusal);
+        return nullptr;
+    }
+    return install(built);
+}
+
+NativeCode* JitBackend::install(BuiltCode& built)
+{
+    const std::size_t bytes = built.bytes.size();
+    void* block = cache_.reserve(bytes);
+    if (!block) {
+        functionRefusal_ = "the code cache has no room for " + std::to_string(bytes) + " bytes";
+        return nullptr;
+    }
+    std::memcpy(block, built.bytes.data(), bytes);
+    if (!cache_.commit(block, bytes)) {
+        cache_.release(block, bytes);
+        functionRefusal_ = "the code cache could not make the code runnable";
+        return nullptr;
+    }
+    auto* code = new NativeCode();
+    code->codeStart = block;
+    code->codeBytes = bytes;
+    code->backend = name();
+    code->fastEntry = block;
+    code->osr.reserve(built.osr.size());
+    for (BuiltCode::Osr& osr : built.osr)
+        code->osr.push_back({osr.pc, static_cast<std::uint8_t*>(block) + osr.offset, std::move(osr.ownedSlots), std::move(osr.ownedPointers)});
+    code->sites = std::move(built.sites);
+    code->sourceSites = std::move(built.sourceSites);
+    return code;
+}
+
 std::string JitBackend::dump(const NativeCode* code) const
 {
     if (!code || !code->codeStart)

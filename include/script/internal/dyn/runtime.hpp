@@ -69,6 +69,8 @@ struct HostBinding
     Ref<DynObject> prototype;
 };
 
+class JitWorker;
+
 struct Runtime : EngineRuntime
 {
     explicit Runtime(ContextImpl& context);
@@ -240,6 +242,10 @@ struct Runtime : EngineRuntime
 
     // ---- native code; see dyn/jit.hpp ----
     std::unique_ptr<typed::JitBackend> jitBackend;
+#if SCRIPT_ENABLE_JIT_THREAD
+    /// Declared after the back end it uses, so that it stops first.
+    std::unique_ptr<JitWorker> jitWorker;
+#endif
     std::vector<typed::NativeCode*> jitCodes;
     std::uint64_t jitCompiled = 0;
     std::uint32_t nativeError = 0;

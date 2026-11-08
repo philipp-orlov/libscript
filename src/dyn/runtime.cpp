@@ -273,6 +273,9 @@ void Runtime::releaseRoots() noexcept
     regexp.reset();
     typed.reset();
     iterators.reset();
+#if SCRIPT_ENABLE_JIT_THREAD
+    jitWorker.reset();
+#endif
     if (jitBackend) {
         for (typed::NativeCode* code : jitCodes)
             jitBackend->release(code);

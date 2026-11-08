@@ -17,6 +17,7 @@ options.jit.mode = script::JitOptions::Mode::Tiered;  // or Eager, or Off
 options.jit.threshold = 200;                      // calls or loop iterations before compiling
 options.jit.codeCacheLimit = 32u << 20;  // the default
 options.jit.dumpCode = false;
+options.jit.background = true;   // JavaScript, TypeScript, Python: big compiles on a thread of their own
 
 script::Context ctx(options);
 std::puts(ctx.jitBackend());            // "arm64", "x86-64" or "interpreter"
@@ -180,8 +181,8 @@ Measured the same way as the table above, against JavaScriptCore running identic
 | `map_dict` | 0.968 | 0.570 | 0.392 | 0.553 |
 
 That is 1.19x JSC's time overall and 0.17x the time of JSC with its JIT off. `int_loop`, `float_mandel` and `method_call` are
-ahead of JSC and `fib_calls` level with it; its top tier is still ahead on the rest. On Octane the gap is 6.7x (it was 125x before
-any native code), with `earley-boyer` and `raytrace` furthest behind, at 14x and 11x. Memory goes the other way: JSC uses 6x as
+ahead of JSC and `fib_calls` level with it; its top tier is still ahead on the rest. On Octane the gap is 6.4x (it was 125x before
+any native code), with `pdfjs` and `gbemu` furthest behind, at 14.5x and 13x. Memory goes the other way: JSC uses 6x as
 much on these kernels and 8.5x on Octane, which `tests/javascript/test_gc.cpp` and `harness/mem_gate.py` are there to keep so.
 
 `tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several
@@ -253,8 +254,16 @@ instructions, and `List`, `Dictionary` and `StringBuilder` have direct helpers.
 
 `Mode::Tiered` is the default: a method compiles after `threshold` calls or back edges (200). A JavaScript, TypeScript or
 Python function waits one more threshold for each 8 KB of its bytecode, up to eight, since its compile costs that much more. A hot loop in a method called
-once enters native code at the loop head, with its locals read out of the interpreter's frame. `Mode::Off` and `--interpret`
-ask for none.
+once enters native code at the loop head, with its locals read out of the interpreter's frame. For that, the loops of the
+call also have to have run 64 bytes of loop body for each byte of the function: a short loop in a long function, such as an
+initializer, would not pay back a compile of the whole of it. `Mode::Off` and `--interpret` ask for none.
+
+A function whose IR is 3000 instructions or more is lowered on the calling thread, which is where the profile and the heap
+are, and handed to the context's one worker thread for the rest: loop optimization, register allocation and the machine
+code, which read nothing else. The interpreter goes on with the function meanwhile, and the next call or every 256th back
+edge looks whether the code is ready, and puts it in place. Native code checks what it assumes as it runs, so code that
+comes a little later than the profile it was made from is as safe as code that has been running a while. Mandreel, whose
+largest functions take 50 to 300 ms each to compile, scores 3.5x what it did with every compile done in line.
 
 ## Testing it
 

@@ -98,6 +98,24 @@ struct NativeCode
     std::vector<SourceSite> sourceSites;
 };
 
+/// Machine code for a function that is not yet anywhere it can run: offsets where `NativeCode` has addresses.
+struct BuiltCode
+{
+    std::vector<std::uint8_t> bytes;
+    struct Osr
+    {
+        std::uint32_t pc;
+        std::size_t offset;
+        std::vector<std::uint32_t> ownedSlots;
+        std::vector<std::uint32_t> ownedPointers;
+    };
+    std::vector<Osr> osr;
+    std::vector<NativeCode::Site> sites;
+    std::vector<NativeCode::SourceSite> sourceSites;
+    /// Why there is none, when there is none.
+    std::string refusal;
+};
+
 /// Where a `Value`'s tag and payload sit, discovered rather than assumed. A
 /// back end that finds a layout it was not built for reports itself
 /// unavailable instead of generating nonsense.
@@ -190,13 +208,21 @@ public:
     /// error and must not throw. A back end that compiled other methods along
     /// with this one, because it calls them, adds them to `others`.
     virtual NativeCode* compile(Runtime& rt, MethodInfo& method, std::vector<NativeCode*>& others) = 0;
-    /// Generate code for one function already in IR, on behalf of any engine. Returns null to mean "keep interpreting".
-    virtual NativeCode* compileFunction(IrFunction& fn, const NativeConfig& config)
+    /// Generate code for one function already in IR, on behalf of any engine. Returns null to mean "keep interpreting",
+    /// and `functionRefusal` says why.
+    NativeCode* compileFunction(IrFunction& fn, const NativeConfig& config);
+    /// The first half of that: what it reads and writes is `fn` and `out` and nothing else, so it can run on any thread,
+    /// with another in the back end at the same time. False when there is no code, with `out.refusal` saying why.
+    virtual bool buildFunction(IrFunction& fn, const NativeConfig& config, BuiltCode& out) const
     {
         (void)fn;
         (void)config;
-        return nullptr;
+        out.refusal = "this back end compiles no functions in IR";
+        return false;
     }
+    /// The second half, on the thread that runs the code: into the cache with it. Null when the cache has no room.
+    NativeCode* install(BuiltCode& built);
+    const std::string& functionRefusal() const noexcept { return functionRefusal_; }
     virtual void release(NativeCode* code) noexcept = 0;
     /// What `compile` refused the last method for, for the dump.
     virtual const std::string& lastRefusal() const noexcept
@@ -211,6 +237,7 @@ public:
 
 protected:
     CodeCache cache_;
+    std::string functionRefusal_;
 };
 
 /// The back end for the architecture this build targets, or a stub that is

@@ -29,6 +29,10 @@ namespace dyn {
 namespace {
 constexpr std::uint32_t kRethrow = 0xffffffffu;
 constexpr std::uint32_t kInterruptInterval = 4096;
+/// See osrWorkPerByte.
+constexpr std::uint64_t kOsrWorkPerByte = 64;
+/// Back edges between asking whether a compile on another thread is done.
+constexpr std::uint32_t kAskAgainEdges = 256;
 }  // namespace
 
 void checkLongLoopSlow(Runtime& rt, std::size_t tempBytes)
@@ -1842,6 +1846,24 @@ Value superCall(Runtime& rt, DynFunction* ctor, DynFunction* newTarget, const st
     return made;
 }
 
+#if SCRIPT_ENABLE_DYN_JIT
+namespace {
+/// Bytes of loop body a call has to run, per byte of the function, before it is compiled in the middle of running.
+std::uint64_t osrWorkPerByte()
+{
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    static const std::uint64_t perByte = [] {
+        const char* v = std::getenv("SCRIPT_JIT_OSR_WORK");
+        return v ? std::uint64_t(std::atol(v)) : std::uint64_t(kOsrWorkPerByte);
+    }();
+    return perByte;
+#else
+    return kOsrWorkPerByte;
+#endif
+}
+}  // namespace
+#endif
+
 Value execute(Runtime& rt, Frame& frame)
 {
     const FunctionCode& code = *frame.code;
@@ -1854,14 +1876,33 @@ Value execute(Runtime& rt, Frame& frame)
     // Back edges until this function is worth compiling in the middle of running it.
     std::uint32_t backEdges =
         !code.jitRefused && rt.jitBackend && rt.ctx.options.jit.mode != JitOptions::Mode::Off ? code.jitThreshold(rt.ctx.options.jit.threshold) : 0;
-    const auto loopBack = [&](std::uint32_t target, Value& result) {
-        if (backEdges == 0 || --backEdges != 0)
+    // And the work those loops did, in bytes of their bodies run: a compile costs what the whole function's size does,
+    // which a short loop in a long function, run a few thousand times, does not earn back. Code already compiled is free.
+    std::uint64_t loopWork = 0;
+    const std::uint64_t workWanted = std::uint64_t(code.code.size()) * osrWorkPerByte();
+    const auto loopBack = [&](std::uint32_t target, std::uint32_t from, Value& result) {
+        if (backEdges == 0)
             return false;
+        loopWork += from - target;
+        if (backEdges > 1) {
+            --backEdges;
+            return false;
+        }
+        if (loopWork < workWanted && !code.jitCode)
+            return false;
+        backEdges = 0;
         frame.pc = target;
-        return enterNativeAtLoop(rt, frame, target, result);
+        if (enterNativeAtLoop(rt, frame, target, result))
+            return true;
+#if SCRIPT_ENABLE_JIT_THREAD
+        // Being compiled elsewhere: asked again a while on.
+        if (code.jitJob)
+            backEdges = kAskAgainEdges;
+#endif
+        return false;
     };
 #else
-    const auto loopBack = [](std::uint32_t, Value&) { return false; };
+    const auto loopBack = [](std::uint32_t, std::uint32_t, Value&) { return false; };
 #endif
 
     auto pop = [&sp]() -> Value {
@@ -2643,7 +2684,7 @@ Value execute(Runtime& rt, Frame& frame)
                         const std::uint32_t target = operandAt(pc);
                         if (target < pc) {
                             Value result;
-                            if (loopBack(target, result))
+                            if (loopBack(target, pc, result))
                                 return result;
                         }
                         pc = target;
@@ -2664,7 +2705,7 @@ Value execute(Runtime& rt, Frame& frame)
                             break;
                         if (target < pc) {
                             Value result;
-                            if (loopBack(target, result))
+                            if (loopBack(target, pc, result))
                                 return result;
                         }
                         pc = target;

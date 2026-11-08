@@ -355,6 +355,8 @@ inline constexpr std::uint32_t kNoSite = 0xFFFu;
 /// One compiled function. Immutable once the compiler is done, shared by every
 /// closure made from it.
 struct FunctionCode;
+/// A compile of one on another thread; see dyn/jit.hpp.
+struct JitJob;
 
 /// One local, cell or stack entry of a bail: how to make the interpreter's value of it from what native code holds.
 struct DeoptValue
@@ -492,6 +494,8 @@ struct FunctionCode
     mutable std::vector<std::unique_ptr<DeoptInfo>> jitDeopts;
     /// What native code takes to stay alive without counting it: the functions its call sites guard they are calling.
     mutable std::vector<Value> jitKeep;
+    /// The compile going on on another thread, whose code is not in place yet.
+    mutable std::shared_ptr<JitJob> jitJob;
     std::vector<Value> consts;         ///< PushConst operands
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;

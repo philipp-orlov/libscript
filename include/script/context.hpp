@@ -133,6 +133,10 @@ struct JitOptions
     std::size_t codeCacheLimit = 32u << 20;
     /// Write the generated code to the print handler, for debugging.
     bool dumpCode = false;
+    /// JavaScript, TypeScript, Python: compile a large function on a thread of its own, the context's one other thread,
+    /// while the function goes on being interpreted. Without it, or in a build without SCRIPT_JIT_THREAD, the call that
+    /// made it hot waits for the compile.
+    bool background = true;
 };
 
 // ---------------------------------------------------------- host members ---

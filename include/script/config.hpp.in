@@ -22,6 +22,8 @@
 /// 1 when the arm64 / x86-64 code generators are compiled in.
 #define SCRIPT_ENABLE_JIT @SCRIPT_ENABLE_JIT_01@
 #define SCRIPT_ENABLE_DYN_JIT @SCRIPT_ENABLE_DYN_JIT_01@
+/// 1 when a large function of a dynamic language can be compiled on a thread of its own.
+#define SCRIPT_ENABLE_JIT_THREAD @SCRIPT_ENABLE_JIT_THREAD_01@
 
 /// 1 when the tables behind `\p{...}` in a regular expression are compiled in.
 #define SCRIPT_UNICODE_PROPERTIES @SCRIPT_UNICODE_PROPERTIES_01@

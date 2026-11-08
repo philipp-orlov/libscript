@@ -13,8 +13,18 @@
 // arguments as `Value`s, how many. A `Value` comes back as a payload and a tag. The caller's arguments are borrowed.
 #pragma once
 
+#include "script/config.hpp"
+
 #include <cstdint>
 #include <string>
+#if SCRIPT_ENABLE_JIT_THREAD
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+#endif
 
 #include "script/internal/typed/jit.hpp"
 #include "script/internal/typed/jit_ir.hpp"
@@ -39,6 +49,42 @@ struct NativePair
 bool compileNative(Runtime& rt, const FunctionCode& code);
 /// Lower to IR. False, with `why` set, for a function native code does not handle.
 bool lowerFunction(Runtime& rt, const FunctionCode& code, typed::IrFunction& out, std::string* why);
+
+#if SCRIPT_ENABLE_JIT_THREAD
+/// A function handed to the worker: its IR going in, its machine code coming out. Only `done` is shared while it is out;
+/// the rest is the worker's until `done`, and the runtime's after.
+struct JitJob
+{
+    typed::IrFunction fn;
+    typed::NativeConfig config;
+    typed::BuiltCode built;
+    bool ok = false;
+    std::atomic<bool> done{false};
+};
+
+/// A runtime's one other thread, started by its first large compile: the back end runs there over a function's IR while
+/// the interpreter goes on with the function. What it finishes is put in place by the runtime's own thread, the next time
+/// the function is called or goes round a loop.
+class JitWorker
+{
+public:
+    explicit JitWorker(const typed::JitBackend& backend);
+    ~JitWorker();
+    JitWorker(const JitWorker&) = delete;
+    JitWorker& operator=(const JitWorker&) = delete;
+    void submit(std::shared_ptr<JitJob> job);
+
+private:
+    void run();
+
+    const typed::JitBackend& backend_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<std::shared_ptr<JitJob>> queue_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+#endif
 
 /// Call a compiled function from C++.
 Value enterNative(Runtime& rt, DynFunction* fn, const FunctionCode& code, const Value& thisValue, const Value* args,

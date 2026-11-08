@@ -1506,3 +1506,48 @@ TEST(aCheckWithAWayRoundItProvesNothingAfterwards)
                  " var y, s = { n: 0, push: function () { this.n++; }, length: 7 }; for (var c = 0; c < 4000; c++) y = h(c & 1 ? s : [], c); y"),
              std::string("7"));
 }
+
+TEST(aJumpOutOfASwitchLeavesNothingOfItBehind)
+{
+    // The value a `switch` tests, and what a `for-in` walks, stay on the stack while they run: a `break` or `continue` that
+    // goes past them takes them off, in the interpreter and in native code alike.
+    const char* program =
+        "function f(n) { var out = [];"
+        "  outer: for (var i = 0; i < n; i++) { for (var k in { a: 1, b: 2 }) { switch (i % 4) {"
+        "    case 0: out.push('c' + k); continue outer;"
+        "    case 1: out.push('b' + k); break outer;"
+        "    case 2: try { switch (k) { case 'a': return out.join() + 'r'; } } finally { out.push('f'); } } } }"
+        "  return out.join(); }"
+        "function g(it) { for (var x of it) { switch (x) { case 2: for (var y of [7]) { switch (y) { case 7: return x * y; } } } } return -1; }"
+        "var s = 0, t = 0; for (var j = 0; j < 3000; j++) { s += f(j % 3).length; t += g([1, 2, 3]); }"
+        "[f(1), f(2), f(3), s, t].join(' ')";
+    CHECK_EQ(run(program), std::string("ca ca,ba ca,ba 7000 42000"));
+}
+
+TEST(aLargeFunctionCompiledElsewhereGivesTheSameAnswers)
+{
+    // Long enough that its compile goes to the other thread, while the calls go on being interpreted.
+    std::string body = "function big(n) { var s = n | 0;";
+    for (int i = 0; i < 800; ++i)
+        body += " s = (s * 31 + " + std::to_string(i) + " + (n & " + std::to_string(i & 15) + ")) | 0;";
+    body += " return s; } var total = 0; function batch() { for (var i = 0; i < 500; i++) total = (total + big(i)) | 0; return total; }";
+    script::Context::Options off;
+    off.jit.mode = script::JitOptions::Mode::Off;
+    js::Context interpreted(off);
+    interpreted.eval(body.c_str(), "<test>");
+    js::Context ctx;
+    ctx.eval(body.c_str(), "<test>");
+    bool same = true;
+    for (int round = 0; round < 200 && same; ++round) {
+        same = interpreted.eval("String(batch())", "<test>").toString() == ctx.eval("String(batch())", "<test>").toString();
+        if (ctx.stats().methodsCompiled > 0 && round > 20)
+            break;
+    }
+    CHECK(same);
+    // A context can go while its compile is still under way.
+    for (int i = 0; i < 4; ++i) {
+        js::Context brief;
+        brief.eval(body.c_str(), "<test>");
+        brief.eval("batch()", "<test>");
+    }
+}

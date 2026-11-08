@@ -175,7 +175,8 @@ class Gen:
     def hotElements(self, s, p, k):
         """Long enough to be compiled. What is indexed changes kind, or changes under the code, part of the way through."""
         v = self.var(); i = self.var(); r = self.var(); e = self.expr(s, 1)
-        kinds = ["'abcd'", '[1, 2, 3, 4]', "[1, 'x', {}, null]", 'new Array(4)', "{0: 'p', 1: 'q'}", '[1.5]', '[]', f'[{e}, 2]']
+        kinds = ["'abcd'", '[1, 2, 3, 4]', "[1, 'x', {}, null]", 'new Array(4)', "{0: 'p', 1: 'q'}", '[1.5]', '[]', f'[{e}, 2]',
+                 'new Int8Array([1, -2, 3, 4])', 'new Uint32Array([5, 6, 7, 8])', 'new Float32Array([0.1, 2, 3, 4])', 'new Float64Array(4)']
         if k == 29:
             chosen = [self.r.choice(kinds) for _ in range(self.r.randint(1, 3))]
             read = self.pick('o[n] + ":" + o[n]', 'o[n]', '"%" + o[n & 1] + o[n]', 'o[n] === o[n + 1]')
@@ -184,8 +185,11 @@ class Gen:
                     f"{p}log({r});"]
         if k == 30:
             late = self.pick("'s'", '{}', 'undefined', 'null', '2.5', e)
-            return [f"{p}var {v} = {self.r.choice(['[1, 2, 3, 4]', 'new Array(4)', '[0, 0, 0, 0]'])};",
-                    f"{p}for (var {i} = 0; {i} < 500; {i}++) {{ {v}[{i} & 3] = {self.pick(i, f'{i} * 0.5', e)}; if ({i} === {self.r.randint(0, 499)}) {v}[{self.r.randint(0, 3)}] = {late}; }}",
+            base = self.r.choice(['[1, 2, 3, 4]', 'new Array(4)', '[0, 0, 0, 0]', 'new Int16Array(4)', 'new Uint8Array(4)', 'new Float64Array(4)', 'new Int32Array(4)'])
+            # Partway through, a typed array's buffer may be detached under the compiled loop.
+            change = f'{v}[{self.r.randint(0, 3)}] = {late}' if not base.startswith('new I') and not base.startswith('new U') and not base.startswith('new F') or self.r.random() < 0.5 else f'{v}.buffer.transfer()'
+            return [f"{p}var {v} = {base};",
+                    f"{p}for (var {i} = 0; {i} < 500; {i}++) {{ {v}[{i} & 3] = {self.pick(i, f'{i} * 0.5', e)}; if ({i} === {self.r.randint(0, 499)}) {change}; }}",
                     f"{p}log({v}.join()); log({v}.pop()); {v}.push({late}); log({v}.length); log(String({v}[3]));"]
         start = self.pick('{}', "'s'", 'null', '1', e)
         return [f"{p}var {v} = {{x: {start}, y: 1}}, {r} = 0;",

@@ -15,7 +15,7 @@ options.compile.native = true;
 // Or on demand: interpret until a method has earned it.
 options.jit.mode = script::JitOptions::Mode::Tiered;  // or Eager, or Off
 options.jit.threshold = 200;                      // calls or loop iterations before compiling
-options.jit.codeCacheLimit = 8u << 20;
+options.jit.codeCacheLimit = 32u << 20;  // the default
 options.jit.dumpCode = false;
 
 script::Context ctx(options);
@@ -187,6 +187,29 @@ much on these kernels and 8.5x on Octane, which `tests/javascript/test_gc.cpp` a
 `tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several
 thresholds.
 
+### Typed arrays
+
+An element read or write at a site that has only met one kind of typed array is a load or store of that kind's width,
+after checking the class, the kind and the current length -- read each time, since a buffer can be detached or resized
+under the loop. `Float16Array`, `Uint8ClampedArray` and the BigInt kinds, and a site that has met several kinds, call a
+helper that reads the index as a number without making a property name of it.
+
+### Large functions
+
+A function of tens of thousands of instructions, as Emscripten writes them, needs:
+
+- **Frames:** on arm64 a frame may be up to 32 KB.
+- **Branches:** a function too big for the ±1 MB conditional branches is emitted again with each conditional branch to a
+  label turned into its inverse over an unconditional one.
+- **Exit pads:** identical exit pads, those of helpers that raised, are shared.
+- **Bail records:** a bail, and a loop entry, carries only the locals the interpreter can still read.
+- **One retry for wrong guesses:** a wrong guess about what a local holds is noted while lowering carries on, so one more
+  lowering puts right every slot it found.
+- **Allocation:** the register allocator keeps each register's occupied ranges in a tree, hands out spill slots by a
+  linear scan, and works out liveness with a worklist over only the values that cross blocks.
+- **Guessing rounds:** a function may be recompiled with fewer guesses up to twelve times, whatever its size. Without
+  any guesses a large function compiles to many times the code.
+
 ### Array callbacks
 
 `forEach`, `map`, `filter` and `reduce` with an initial value are emitted as a loop where the built-in is known, and call the
@@ -228,7 +251,8 @@ instructions, and `List`, `Dictionary` and `StringBuilder` have direct helpers.
 
 ## Tiering
 
-`Mode::Tiered` is the default: a method compiles after `threshold` calls or back edges (200). A hot loop in a method called
+`Mode::Tiered` is the default: a method compiles after `threshold` calls or back edges (200). A JavaScript, TypeScript or
+Python function waits one more threshold for each 8 KB of its bytecode, up to eight, since its compile costs that much more. A hot loop in a method called
 once enters native code at the loop head, with its locals read out of the interpreter's frame. `Mode::Off` and `--interpret`
 ask for none.
 

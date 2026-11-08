@@ -34,6 +34,7 @@ options.compile.checkedArithmetic = true;              // C#
 options.compile.native = true;                         // C#: machine code where possible
 options.jit.mode = script::JitOptions::Mode::Tiered;  // C#: or compile only what gets hot
 options.check = script::CheckOptions::strict();       // TypeScript: strictNullChecks, noImplicitAny
+options.runtimeCode = false;                          // JavaScript: eval and new Function stay EvalErrors (the default)
 script::Context ctx(options);
 ```
 

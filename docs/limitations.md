@@ -191,18 +191,21 @@ machine.
 
 | Missing | Why | What to do instead |
 |---|---|---|
-| **Regular expressions** | A correct, non-backtracking-explosive engine is comparable in size to the rest of the engine, and it is the classic denial-of-service vector in a sandbox. | `String.prototype` has `includes`, `startsWith`, `endsWith`, `indexOf`, `split`, `replace` and `replaceAll` with string patterns. Expose a host matcher for anything more. |
-| **Generators and `yield`** | Suspending and resuming a frame means the interpreter cannot use the C++ stack, which is what keeps the VM small and native interop simple. | Return an object with a `next()` method: the iterator protocol is fully supported, so it works with `for..of` and spread. |
-| **`async` / `await`** | Same reason: `await` is a suspension point. | `Promise` and the microtask queue are supported. Use `.then()` chains and `Context::runJobs()`. |
-| **Modules (`import` / `export`)** | Module resolution is a host policy question, not an engine one. | Evaluate each file with `eval`; declarations land on the global object. `examples/javascript/plugin.cpp` shows a registration-based host. |
-| **`eval` and `new Function(source)`** | Compiling attacker-supplied text from inside a sandbox is exactly what a sandbox is for preventing. | Call `Context::eval` from the host, where you control the source. |
-| **`Proxy` and `Reflect`** | Every property access would have to go through a trap check. | -- |
-| **Private class members (`#field`)** | Needs a parallel, non-property slot mechanism on every object. | TypeScript's `private`, or a `Map` closed over by the class. |
-| **Tagged template literals** | Rarely used outside libraries that also want regular expressions. | Call an ordinary function with the interpolated string. |
-| **Typed arrays, `ArrayBuffer`, `BigInt`, `WeakMap`, `WeakRef`** | Not needed by the configuration, scripting and plugin workloads the engine targets. | Bind a C++ buffer type with `script::Class<T>`. |
-| **`with`, labelled blocks, `arguments.callee`** | Legacy. | -- |
+| **Modules (`import` / `export`, `import()`)** | Module resolution is a host policy question, not an engine one. | Evaluate each file with `eval`; declarations land on the global object. `examples/javascript/plugin.cpp` shows a registration-based host. |
+| **`with`** | Legacy, and it defeats static name resolution, which everything fast here depends on. | -- |
+| **`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`** | Reference counting frees on the last release; weak tables need the collector to report each release, which it does not yet. | A `Map` keyed by an id the host hands out. |
+| **`Temporal`, `Intl`, locale-aware formatting** | Would pull in time zone and locale databases. | `toLocaleString` falls back to the plain form. |
+| **`Array.fromAsync`, `Iterator.zip`, `Iterator.prototype.chunks` and similar recent proposals** | Not yet. | -- |
 | **Timers, file system, network, `process`** | Not the engine's job. | Expose exactly the host capabilities you intend to grant. |
-| **`Intl`, locale-aware formatting** | Would pull in a Unicode database. | `toLocaleString` falls back to the plain form. |
+
+`eval` and `new Function(source)` exist but are **off by default**: compiling text a script makes is what a sandbox
+is usually for preventing. A host that wants them sets `Context::Options::runtimeCode = true`; until then both raise
+an `EvalError`. The command-line tool turns them on (`--no-eval` turns them off). A function that calls `eval`
+directly keeps its variables in cells and runs in the interpreter; a `var` declared by such a string inside a function
+stays in the string's own scope, as in strict code.
+
+Regular expressions backtrack, as every engine's do, so a pattern can take exponential time on a crafted input. The
+matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a host can bound it like any other loop.
 
 ### Approximations
 
@@ -220,22 +223,14 @@ machine.
   visible through it.
 - **Block-scoped function declarations** are hoisted to the enclosing function
   rather than to the block.
-- **Arrays are dense.** An assignment more than about four million elements
-  past the end raises a `RangeError` instead of switching to a sparse
-  representation. `delete a[i]` leaves `undefined` and does not shorten the
-  array.
-- **Case conversion covers ASCII and Latin-1.** `toUpperCase` on Greek or
-  Cyrillic text returns it unchanged.
+- **Arrays are dense, with holes.** An assignment more than about four million
+  elements past the end raises a `RangeError` instead of switching to a sparse
+  representation. Holes are real: `delete a[i]` makes one, and `in`, the keys
+  and the methods that skip holes see it.
 - **`Date` is minimal:** `Date.now`, construction from epoch milliseconds,
   `getTime`, `getFullYear`, `toISOString`, `toJSON`, `valueOf`. There is no
   parsing, no local timezone and no component setters.
-- **`Symbol.toStringTag` is stored but not consulted** by
-  `Object.prototype.toString`, which reports the internal class.
-- **Subclassing a builtin** (`class M extends Map`) inherits the prototype
-  methods but not the exotic internal state, because the native constructor
-  returns its own object.
-- **Computed accessor names** (`get [key]() {}`) are rejected at compile time;
-  computed method names are supported.
+- **`arguments.callee`** is not the function.
 - **A host wrapper has no own properties.** `shared.x = 1` on an object the
   host or C# handed over is a `TypeError` unless `x` is a bound field with a
   setter; wrappers made by a JavaScript `new` are ordinary objects.

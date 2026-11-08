@@ -102,7 +102,7 @@ bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
 | --- | --- | --- | --- |
 | **C#** | typed engine + JIT | static checking, reified generics, records, patterns, tuples, ranges | [csharp.md](docs/languages/csharp.md) |
 | **TypeScript** | dynamic engine | a structural type checker, then erased; generics, narrowing, `strict` mode | [typescript.md](docs/languages/typescript.md) |
-| **JavaScript** | dynamic engine | prototypes, closures, classes, promises, `Map`/`Set`, JSON | [javascript.md](docs/languages/javascript.md) |
+| **JavaScript** | dynamic engine + JIT | ES2024 and more: classes, generators, async, regular expressions, `BigInt`, typed arrays, `Proxy`; 74% of test262 | [javascript.md](docs/languages/javascript.md) |
 | **Python** | dynamic engine | the everyday core of Python 3: functions, classes, dicts, lambdas | [python.md](docs/languages/python.md) |
 | **C** | typed engine + JIT | a sandboxed C with a `libc` of natives; no ambient file or OS access | [c.md](docs/languages/c.md) |
 | **C++** | typed engine + JIT | classes, virtual dispatch, exceptions, the standard containers | [cpp.md](docs/languages/cpp.md) |
@@ -161,15 +161,16 @@ C++ signature, and the dynamic languages see the same functions on the same obje
 
 ### 🏎️ Two machines, one heap
 C#, C and C++ compile to typed bytecode, with arm64 and x86-64 back ends around 10× faster than interpreting for the
-arithmetic-and-loops core of a method. TypeScript, JavaScript and Python run on a prototype-based stack machine.
+arithmetic-and-loops core of a method. TypeScript, JavaScript and Python run on a prototype-based stack machine,
+with hidden classes, inline caches and the same back ends compiling hot functions.
 [More](docs/design.md)
 
 </td>
 <td valign="top">
 
 ### 🛡️ A sandbox by construction
-No file system, no network, no reflection, no `eval` from inside a script. A program reaches exactly what the host
-hands it, while `memoryLimit`, `stackLimit` and an interrupt hook bound what it can spend, across every language in the
+No file system, no network, no reflection, and no `eval` from inside a script unless the host turns it on. A program
+reaches exactly what the host hands it, while `memoryLimit`, `stackLimit` and an interrupt hook bound what it can spend, across every language in the
 context at once.
 
 </td>
@@ -238,6 +239,7 @@ target_link_libraries(my_app PRIVATE script::script)
 | `SCRIPT_LANG_C` | ON | the C front end and the typed engine |
 | `SCRIPT_LANG_CPP` | ON | the C++ dialect of the C front end and the typed engine |
 | `SCRIPT_ENABLE_JIT` | ON | the arm64 and x86-64 code generators (needs the typed engine) |
+| `SCRIPT_UNICODE_PROPERTIES` | ON (OFF in Compact) | the 43 KB of tables behind `\p{...}` in regular expressions |
 | `SCRIPT_BUILD_TESTS` | ON | the test suites, one executable per suite |
 | `SCRIPT_BUILD_EXAMPLES` | ON | the examples |
 | `SCRIPT_BUILD_TOOLS` | ON | the `libscript` command line |

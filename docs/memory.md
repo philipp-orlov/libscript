@@ -49,6 +49,20 @@ Both budgets are re-armed from what survived, so a program that legitimately
 grows is not punished with ever more frequent collections, and one that churns
 in place collects at a fixed rate however long it runs.
 
+Most collections are **minor**: they look only at the cells made since the last
+collection. Trial deletion is sound on any subset of the heap -- a reference
+from outside the subset simply counts as one from outside -- so a cycle among
+young cells that nothing older refers to is found and freed, and the old part
+of the heap is not walked. A full collection runs when the heap has doubled
+since the last one, when it is over `memoryLimit`, and whenever the host asks.
+
+Two cycles the engine itself used to make are gone at the source. A function's
+`prototype` object, whose `constructor` points back at it, is made only when
+something first asks for it, so a closure that is never `new`ed makes none. And
+a closure that is the only value its variable ever has -- `loop = function ()
+{ ... loop(...) ... }` -- calls itself as the callee rather than through the
+variable's cell, so the closure and the cell do not hold each other.
+
 `Context::collectGarbage()` forces a collection. Most programs never need to
 call it; a host with an idle point may call it there to hand back arenas after
 a spike.

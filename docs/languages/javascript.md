@@ -52,7 +52,7 @@ through `Symbol.iterator`, and any object that implements it participates.
 | Global | Members |
 |---|---|
 | `Object` | `keys` `values` `entries` `fromEntries` `assign` `create` `freeze` `isFrozen` `preventExtensions` `is` `defineProperty` `getOwnPropertyDescriptor` `getOwnPropertyNames` `getPrototypeOf` `setPrototypeOf`; prototype: `hasOwnProperty` `isPrototypeOf` `propertyIsEnumerable` `toString` `valueOf` |
-| `Function` | prototype: `call` `apply` `bind` `toString` |
+| `Function` | `new Function(...)` when the host allows it; prototype: `call` `apply` `bind` `toString` |
 | `Array` | `isArray` `from` `of`; prototype: `push` `pop` `shift` `unshift` `splice` `slice` `concat` `join` `reverse` `fill` `sort` `at` `indexOf` `lastIndexOf` `includes` `find` `findIndex` `forEach` `map` `filter` `some` `every` `reduce` `reduceRight` `flat` `flatMap` `keys` `values` `entries` `toString` |
 | `String` | `fromCharCode` `fromCodePoint`; prototype: `charAt` `charCodeAt` `codePointAt` `at` `concat` `indexOf` `lastIndexOf` `includes` `startsWith` `endsWith` `slice` `substring` `substr` `toUpperCase` `toLowerCase` `trim` `trimStart` `trimEnd` `repeat` `padStart` `padEnd` `split` `replace` `replaceAll` `localeCompare` `normalize` `toString` `valueOf` |
 | `Number` | `MAX_SAFE_INTEGER` `MIN_SAFE_INTEGER` `MAX_VALUE` `MIN_VALUE` `EPSILON` `POSITIVE_INFINITY` `NEGATIVE_INFINITY` `NaN` `isInteger` `isSafeInteger` `isFinite` `isNaN` `parseInt` `parseFloat`; prototype: `toString(radix)` `toFixed` `toPrecision` `toExponential` `valueOf` |
@@ -61,11 +61,18 @@ through `Symbol.iterator`, and any object that implements it participates.
 | `JSON` | `parse` `stringify(value, replacer, space)`, honouring `toJSON` |
 | `Map`, `Set` | `size` `get` `set` `add` `has` `delete` `clear` `forEach` `keys` `values` `entries` `[Symbol.iterator]`, with SameValueZero keys |
 | `Symbol` | `Symbol(description)` `Symbol.for`, `iterator` `asyncIterator` `toPrimitive` `toStringTag` `hasInstance`, `description`, `toString` |
-| `Promise` | `resolve` `reject` `all` `race`; prototype: `then` `catch` `finally` |
+| `Promise` | `resolve` `reject` `all` `allSettled` `any` `race` `withResolvers` `try`, for subclasses too; prototype: `then` `catch` `finally` |
 | `Error` | `Error` `TypeError` `RangeError` `SyntaxError` `ReferenceError` `EvalError` `URIError` `InternalError`, each with `name`, `message` and `stack` |
 | `Date` | `now`; prototype: `getTime` `getFullYear` `toISOString` `toJSON` `toString` `valueOf` |
+| `RegExp` | literals and `new RegExp`, flags `dgimsuvy`; `exec` `test` `toString` `compile`, `[Symbol.match]` `[Symbol.matchAll]` `[Symbol.replace]` `[Symbol.search]` `[Symbol.split]`, `RegExp.escape`, the legacy `RegExp.$1` statics; `String.prototype` `match` `matchAll` `search` `replace` `replaceAll` `split` hand over to it |
+| `BigInt` | literals `1n`, arithmetic of any size, `asIntN` `asUintN`; prototype: `toString(radix)` `toLocaleString` `valueOf` |
+| `ArrayBuffer`, `SharedArrayBuffer` | resizable, `transfer`, `slice`, `isView`, `detached` |
+| typed arrays | all twelve kinds with `Float16Array`; every `%TypedArray%.prototype` method; `Uint8Array.fromBase64` `fromHex` and `toBase64` `toHex` |
+| `DataView`, `Atomics` | every getter and setter; `Atomics` for one thread, so nothing ever waits |
+| `Proxy`, `Reflect` | every trap with its invariants, `Proxy.revocable`; every `Reflect` method |
+| `Iterator` | `from` `concat`; prototype: `map` `filter` `take` `drop` `flatMap` `reduce` `toArray` `forEach` `some` `every` `find` |
 | `console` | `log` `info` `debug` `trace` `warn` `error`, routed through the host print handler |
-| globals | `globalThis` `undefined` `NaN` `Infinity` `parseInt` `parseFloat` `isNaN` `isFinite` `structuredClone` |
+| globals | `globalThis` `undefined` `NaN` `Infinity` `parseInt` `parseFloat` `isNaN` `isFinite` `structuredClone` `encodeURI` `encodeURIComponent` `decodeURI` `decodeURIComponent` `escape` `unescape`, and `eval` when the host allows it |
 
 ## Semantics worth knowing
 
@@ -95,7 +102,7 @@ through `Symbol.iterator`, and any object that implements it participates.
 
 Generators, async functions, async generators, `for await`, classes with private
 members, static blocks, computed accessors and `new.target`, tagged templates,
-`Reflect`, array-likes in `Array.prototype` and regular expressions (lookbehind,
+`Reflect`, array-likes in `Array.prototype`, `Iterator` and its helpers, and regular expressions (lookbehind,
 named groups, modifiers, `\p{...}` and the set notation of `v`, but not the
 properties of strings such as `\p{RGI_Emoji}`), `BigInt`, and `ArrayBuffer`
 with the typed arrays, `DataView` and `Atomics` (one thread: nothing ever waits), and

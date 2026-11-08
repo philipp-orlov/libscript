@@ -704,9 +704,10 @@ NativePair scriptDynAppendIfLocal(Runtime* rt, std::int64_t ta, std::uint64_t a,
                                   std::uint64_t local) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
-        // The local and the copy native code holds are the two counts there are when nothing else sees the string.
+        // The local, the copy native code holds and the one made here are the counts there are when nothing else sees the
+        // string.
         if (ta == std::int64_t(Type::String) && lt == ta && local == a)
-            return take(appendForLocal(*rt, valueOf(ta, a), valueOf(tb, b), 2));
+            return take(appendForLocal(*rt, valueOf(ta, a), valueOf(tb, b), 3));
         return take(add(*rt, valueOf(ta, a), valueOf(tb, b)));
     });
 }
@@ -715,8 +716,9 @@ NativePair scriptDynAppendIfCell(Runtime* rt, std::int64_t ta, std::uint64_t a, 
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
         const Box* box = static_cast<const Box*>(cell);
+        // The same three: the cell's, native code's copy and this one.
         if (ta == std::int64_t(Type::String) && box && detail::Access::ptr(box->value) == reinterpret_cast<GCObject*>(a))
-            return take(appendForLocal(*rt, valueOf(ta, a), valueOf(tb, b), 2));
+            return take(appendForLocal(*rt, valueOf(ta, a), valueOf(tb, b), 3));
         return take(add(*rt, valueOf(ta, a), valueOf(tb, b)));
     });
 }
@@ -1188,6 +1190,10 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
 #endif
     std::string why;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* skip = std::getenv("SCRIPT_JIT_SKIP"); skip && (std::string(",") + skip + ",").find("," + code.name + ",") != std::string::npos) {
+        code.jitRefused = true;
+        return false;
+    }
     const auto started = std::chrono::steady_clock::now();
 #endif
     if (!lowerFunction(rt, code, fn, &why)) {

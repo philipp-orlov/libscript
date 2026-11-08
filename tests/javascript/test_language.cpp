@@ -1551,3 +1551,34 @@ TEST(aLargeFunctionCompiledElsewhereGivesTheSameAnswers)
         brief.eval("batch()", "<test>");
     }
 }
+
+TEST(appendingToACapturedStringInNativeCodeGrowsItInPlace)
+{
+    // `s` is a cell, since a closure shares it; native code appending to it holds a copy of its own, which is no reason to
+    // copy the string. Copying would allocate the square of its length.
+    js::Context ctx;
+    ctx.eval("function f(n) { var s = ''; for (var i = 0; i < n; i++) s += String.fromCharCode(65 + i % 26);"
+             " var g = function () { return s.length; }; return g(); }"
+             "for (var r = 0; r < 300; r++) f(64);", "<test>");
+    const std::uint64_t before = ctx.stats().totalAllocated;
+    CHECK_EQ(ctx.eval("String(f(20000))", "<test>").toString(), std::string("20000"));
+    CHECK(ctx.stats().totalAllocated - before < (8u << 20));
+}
+
+TEST(aFunctionInlinedByIdentityStaysThatFunction)
+{
+    // `init` is read through a prototype that goes away when `N.prototype` is replaced, and native code for `N` has a
+    // copy of the first one in it. Another function made later must not come to be at its address and pass for it.
+    const char* program =
+        "var out = [];"
+        "function run() { function N(a) { this.init(a); } N.prototype.init = function (x) { this.x = x; }; var o;"
+        "  for (var v = 0; v < 300; v++) { if (v === 24) N.prototype = { init: function (x) { this.x = 'L' + x; } }; o = new N(v); }"
+        "  out.push(o.x); }"
+        "for (var i = 0; i < 40; i++) run(); out.every(function (x) { return x === 'L299'; }) ? 'same' : out.join()";
+    for (std::uint32_t threshold : {2u, 50u}) {
+        script::Context::Options options;
+        options.jit.threshold = threshold;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("same"));
+    }
+}

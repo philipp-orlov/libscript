@@ -909,6 +909,8 @@ public:
         if (!callee.pinned) {
             if (!callee.hasKnownTag)
                 branchCmp(callee.t, IrCond::Ne, std::int64_t(Type::Object), generic);
+            // Kept alive, or another function could come to be at that address and pass for it.
+            keepAlive(const_cast<DynFunction*>(fn));
             const std::int32_t want = ptrReg(fn);
             IrInst& same = inst(IrOp::BrCmp);
             same.a = callee.r;
@@ -958,6 +960,9 @@ public:
         const std::int32_t cls = load(callee.r, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), generic);
         const std::int32_t have = load(callee.r, kFnCodeOffset, 8, false, kAliasHeader);
+        // The same for the code, which the bails in its copy also name.
+        if (std::find(outermost().jitKeepCodes.begin(), outermost().jitKeepCodes.end(), code) == outermost().jitKeepCodes.end())
+            outermost().jitKeepCodes.push_back(code);
         const std::int32_t want = ptrReg(code.get());
         IrInst& same = inst(IrOp::BrCmp);
         same.a = have;

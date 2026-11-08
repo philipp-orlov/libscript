@@ -364,6 +364,8 @@ Ref<GCObject> toPropertyKey(Runtime& rt, const Value& v)
 {
     if (v.isSymbol())
         return Ref<GCObject>(detail::Access::ptr(v));
+    if (v.isString() && asString(v)->interned)
+        return Ref<GCObject>(detail::Access::ptr(v));
     return Ref<GCObject>(rt.intern(toStringValue(rt, v)));
 }
 

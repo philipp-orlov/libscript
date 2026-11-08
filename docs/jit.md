@@ -181,8 +181,8 @@ Measured the same way as the table above, against JavaScriptCore running identic
 | `map_dict` | 0.968 | 0.570 | 0.392 | 0.553 |
 
 That is 1.19x JSC's time overall and 0.17x the time of JSC with its JIT off. `int_loop`, `float_mandel` and `method_call` are
-ahead of JSC and `fib_calls` level with it; its top tier is still ahead on the rest. On Octane the gap is 6.4x (it was 125x before
-any native code), with `pdfjs` and `gbemu` furthest behind, at 14.5x and 13x. Memory goes the other way: JSC uses 6x as
+ahead of JSC and `fib_calls` level with it; its top tier is still ahead on the rest. On Octane the gap is 6.1x (it was 125x before
+any native code), with `earley-boyer` and `gbemu` furthest behind, at 12.4x and 11.7x. Memory goes the other way: JSC uses 6x as
 much on these kernels and 8.5x on Octane, which `tests/javascript/test_gc.cpp` and `harness/mem_gate.py` are there to keep so.
 
 `tools/js_jit_fuzz.py` is the dynamic engine's fuzzer, run against a build with `SCRIPT_JIT_ENV_OVERRIDE` at several

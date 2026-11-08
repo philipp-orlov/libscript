@@ -494,6 +494,8 @@ struct FunctionCode
     mutable std::vector<std::unique_ptr<DeoptInfo>> jitDeopts;
     /// What native code takes to stay alive without counting it: the functions its call sites guard they are calling.
     mutable std::vector<Value> jitKeep;
+    /// The same for the code of functions it has a copy of, known by their code alone.
+    mutable std::vector<std::shared_ptr<const FunctionCode>> jitKeepCodes;
     /// The compile going on on another thread, whose code is not in place yet.
     mutable std::shared_ptr<JitJob> jitJob;
     std::vector<Value> consts;         ///< PushConst operands

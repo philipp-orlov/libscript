@@ -1207,6 +1207,8 @@ Context::Options withEnvironment(const Context::Options& options)
         } else if (std::strncmp(mode, "tiered:", 7) == 0) {
             out.jit.mode = JitOptions::Mode::Tiered;
             out.jit.threshold = std::uint32_t(std::atoi(mode + 7));
+        } else if (std::strcmp(mode, "off") == 0) {
+            out.jit.mode = JitOptions::Mode::Off;
         }
     }
 #endif

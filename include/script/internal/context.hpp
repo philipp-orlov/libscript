@@ -153,7 +153,11 @@ struct ContextImpl
     void noteLarge(GCObject* cell);
     void forgetLarge(GCObject* cell) noexcept;
     /// Break unreachable reference cycles. Everything else is freed eagerly.
-    void collectCycles();
+    /// `minor` looks only at what was made since the last collection: a cycle among those that nothing older or outside
+    /// refers to is garbage, and survivors become old.
+    void collectCycles(bool minor = false);
+    /// What the heap held after the last full collection.
+    std::uint64_t bytesAfterFull = 0;
     /// Collect if either budget has been passed. Throws `OutOfMemory` when the
     /// heap is still over its limit afterwards, so it may only be called where
     /// the interpreter can unwind: cell allocation and the instruction tick.

@@ -1345,6 +1345,30 @@ TEST(arraysHaveHolesAndPropertiesAtIndices)
     CHECK_EQ(text("String([3, , 1, undefined].sort().length)"), std::string("4"));
 }
 
+TEST(aFunctionsPrototypeIsMadeWhenFirstAskedFor)
+{
+    js::Context ctx;
+    const auto text = [&](const char* source) { return ctx.eval(source, "<test>").toString(); };
+    CHECK_EQ(text("function F(a) { this.a = a; } var f = new F(1); [f instanceof F, F.prototype.constructor === F, f.a].join()"), std::string("true,true,1"));
+    CHECK_EQ(text("Object.getOwnPropertyNames(function g() {}).join()"), std::string("length,name,prototype"));
+    CHECK_EQ(text("String((function () {}).hasOwnProperty('prototype'))"), std::string("true"));
+    CHECK_EQ(text("Object.defineProperty(Function.prototype, 'prototype', { get() { return 100; }, configurable: true });"
+                  "var p = (function () {}).prototype; delete Function.prototype.prototype; String(p !== 100)"), std::string("true"));
+    CHECK_EQ(text("function H() {} H.prototype.m = function () { return 7; }; String(new H().m())"), std::string("7"));
+}
+
+TEST(aClosureThatCallsItselfKeepsNoCycle)
+{
+    js::Context ctx;
+    ctx.eval("function run() { var out = 0; for (var i = 0; i < 3; i++) { var loop = function (n) { return n ? loop(n - 1) + 1 : i; }; out += loop(2); } return out; }"
+             "for (var r = 0; r < 20000; r++) run();", "<test>");
+    CHECK_EQ(ctx.eval("String(run())", "<test>").toString(), std::string("9"));
+    CHECK(ctx.stats().gcRuns == 0);
+    // Kept past its loop, it is still itself.
+    CHECK_EQ(ctx.eval("function keep() { var kept = []; for (var i = 0; i < 3; i++) { var q = function () { return q; }; kept.push(q); } return kept[0]() === kept[2]; } String(keep())", "<test>").toString(),
+             std::string("true"));
+}
+
 TEST(aDelegateOfAnAsyncGeneratorThatThrowsIsTheGeneratorsToCatch)
 {
     script::Context ctx;

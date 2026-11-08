@@ -394,8 +394,19 @@ bool arrayElementKey(DynArray* arr, GCObject* key, std::uint32_t& index)
 
 }  // namespace
 
+void makePendingPrototype(Runtime& rt, DynFunction* fn)
+{
+    fn->prototypePending = false;
+    DynObject* proto = rt.newObject(rt.objectProto.get());
+    Value protoValue = detail::Access::adopt(Type::Object, proto);
+    proto->putOwn(rt.atom.constructor.get(), detail::Access::make(Type::Object, fn), PropWritable | PropConfigurable);
+    fn->putOwn(rt.atom.prototype.get(), protoValue, PropWritable);
+}
+
 Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Value& receiver)
 {
+    if (key == rt.atom.prototype.get())
+        ensurePrototype(rt, obj);
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
         if (cursor->fnKindIsProxy())
             return proxyGet(rt, asProxy(cursor), key, receiver);
@@ -544,6 +555,8 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
         return;  // primitives silently ignore writes, as in sloppy mode
     }
 
+    if (key == rt.atom.prototype.get())
+        ensurePrototype(rt, obj);
     // An accessor anywhere on the prototype chain wins over a plain own write.
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
         if (cursor->fnKindIsProxy()) {
@@ -637,6 +650,9 @@ inline PropertySite* siteOf(const FunctionCode& code, std::uint32_t site) noexce
 Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, PropertySite* site)
 {
     DynObject* obj = asObject(base);
+    // A pending prototype is made before anything up the chain could answer in its place.
+    if (key == rt.atom.prototype.get())
+        ensurePrototype(rt, obj);
     if (!site || !obj || !obj->shape || key->kind != CellKind::String) {
         if (site)
             ++site->misses;
@@ -844,6 +860,8 @@ bool hasProperty(Runtime& rt, const Value& base, GCObject* key)
             throwError(rt, ErrorCode::TypeError, "'in' needs an object on the right");
         return false;
     }
+    if (key == rt.atom.prototype.get())
+        ensurePrototype(rt, obj);
     for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
         if (cursor->fnKindIsProxy())
             return proxyHas(rt, asProxy(cursor), key);
@@ -880,6 +898,8 @@ bool deleteProperty(Runtime& rt, const Value& base, GCObject* key)
         return true;
     if (obj->fnKindIsProxy())
         return proxyDelete(rt, asProxy(obj), key);
+    if (key == rt.atom.prototype.get())
+        ensurePrototype(rt, obj);
     if (obj->cls == ObjClass::Array && key->kind == CellKind::String) {
         auto* arr = static_cast<DynArray*>(obj);
         std::uint32_t index = 0;
@@ -908,6 +928,7 @@ Vec<Value> ownKeys(Runtime& rt, DynObject* obj, bool enumerableOnly,
                            bool includeSymbols)
 {
     Vec<Value> keys;
+    ensurePrototype(rt, obj);
     if (obj->fnKindIsProxy()) {
         for (const Value& k : ownPropertyKeys(rt, obj)) {
             if (k.isSymbol() && !includeSymbols)
@@ -1239,6 +1260,7 @@ bool instanceOf(Runtime& rt, const Value& object, const Value& ctor)
     DynObject* start = obj ? obj->proto.get() : hostProtoOf(rt, object);
     if (!start)
         return false;
+    ensurePrototype(rt, fn);
     const Prop* own = plain ? fn->findOwn(rt.atom.prototype.get()) : nullptr;
     Value proto = own && !fn->accessorOf(*own) ? own->value : getPropertyOfObject(rt, fn, rt.atom.prototype.get(), ctor);
     DynObject* target = asObject(proto);
@@ -1538,12 +1560,8 @@ Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode
         fn->homeObject = parent->homeObject;
     fn->putOwn(rt.atom.length.get(), Value(double(code->arity)), PropConfigurable);
     fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
-    if (!setUpCoroutineFunction(rt, fn, *code) && !code->isArrow && !code->isClassConstructor) {
-        DynObject* proto = rt.newObject(rt.objectProto.get());
-        Value protoValue = detail::Access::adopt(Type::Object, proto);
-        proto->putOwn(rt.atom.constructor.get(), handle, PropWritable | PropConfigurable);
-        fn->putOwn(rt.atom.prototype.get(), protoValue, PropWritable);
-    }
+    if (!setUpCoroutineFunction(rt, fn, *code) && !code->isArrow && !code->isClassConstructor)
+        fn->prototypePending = true;
     return handle;
 }
 
@@ -1576,13 +1594,8 @@ Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, 
 
     fn->putOwn(rt.atom.length.get(), Value(double(code->arity)), PropConfigurable);
     fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
-    if (!setUpCoroutineFunction(rt, fn, *code) && withPrototype && !code->isArrow && !code->isClassConstructor) {
-        DynObject* proto = rt.newObject(rt.objectProto.get());
-        Value protoValue = detail::Access::adopt(Type::Object, proto);
-        proto->putOwn(rt.atom.constructor.get(), detail::Access::make(Type::Object, fn),
-                      PropWritable | PropConfigurable);
-        fn->putOwn(rt.atom.prototype.get(), protoValue, PropWritable);
-    }
+    if (!setUpCoroutineFunction(rt, fn, *code) && withPrototype && !code->isArrow && !code->isClassConstructor)
+        fn->prototypePending = true;
     return detail::Access::adopt(Type::Object, fn);
 }
 

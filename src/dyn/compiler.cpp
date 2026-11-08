@@ -82,6 +82,8 @@ struct FnState
     /// Something in here calls `eval` directly: every name is kept in a cell, where the code it compiles can find it.
     bool boxAll = false;
     bool isEval = false;
+    /// The variable of the enclosing function this function is the only value of: reading it is reading the callee.
+    String selfName;
     std::unordered_map<std::uint64_t, std::uint32_t> numberConsts;
     std::unordered_map<String, std::uint32_t> stringConsts;
     std::unordered_map<const GCObject*, std::uint32_t> atomSlots;
@@ -173,6 +175,151 @@ void collectCaptured(const Node& n, std::set<String>& out)
         return;
     }
     forEachChild(n, [&](const Node& kid) { collectCaptured(kid, out); });
+}
+
+/// The locals of a function that hold one function for good: written once, by storing a function expression or by
+/// declaring it, at a place that runs once a call (not in a loop), and nowhere else, not even from a nested function.
+/// Such a function can name itself by being the callee, and then holds no cell of its own variable, which would be a
+/// cycle with it.
+struct SelfBound
+{
+    std::map<String, int> writes;
+    std::map<String, const Node*> site;
+    std::set<String> inLoop;  ///< whose one write is in a loop: then only being called keeps it right
+    std::set<String> declared;
+
+    static bool isFunction(const Node* n) noexcept { return n && (n->kind == NK::FunctionExpr || n->kind == NK::ArrowExpr); }
+    void write(const String& name, const Node* fn, bool once, bool nested)
+    {
+        ++writes[name];
+        if (fn && !nested && isFunction(fn)) {
+            site[name] = fn;
+            if (!once)
+                inLoop.insert(name);
+        }
+    }
+    void patternWrites(const Node& p)
+    {
+        std::set<String> names;
+        collectNames(p, names, false);
+        for (const String& name : names)
+            ++writes[name];
+    }
+    void walk(const Node& n, int loops, bool nested)
+    {
+        checkNativeStack();
+        switch (n.kind) {
+            case NK::FunctionExpr:
+            case NK::ArrowExpr:
+            case NK::ClassExpr:
+                forEachChild(n, [&](const Node& kid) { walk(kid, 0, true); });
+                return;
+            case NK::Assign:
+                if (n.a && n.a->kind == NK::Identifier)
+                    write(n.a->text, n.op == Tok::Assign ? n.b.get() : nullptr, loops == 0, nested);
+                else if (n.a && n.a->kind != NK::Member)
+                    patternWrites(*n.a);
+                if (n.b)
+                    walk(*n.b, loops, nested);
+                if (n.a && n.a->kind == NK::Member)
+                    walk(*n.a, loops, nested);
+                return;
+            case NK::Update:
+                if (n.a && n.a->kind == NK::Identifier)
+                    ++writes[n.a->text];
+                break;
+            case NK::Declarator:
+                if (n.a && n.a->kind == NK::Identifier) {
+                    if (!nested)
+                        declared.insert(n.a->text);
+                    if (n.b)
+                        write(n.a->text, n.b.get(), loops == 0, nested);
+                } else if (n.a) {
+                    patternWrites(*n.a);
+                }
+                if (n.b)
+                    walk(*n.b, loops, nested);
+                return;
+            case NK::FunctionDecl:
+                if (!nested)
+                    declared.insert(n.text);
+                write(n.text, n.a.get(), loops == 0, nested);
+                if (n.a)
+                    walk(*n.a, loops, nested);
+                return;
+            case NK::ClassDecl:
+                ++writes[n.text];
+                break;
+            case NK::ForIn:
+            case NK::ForOf:
+                if (n.a)
+                    patternWrites(*n.a);
+                if (n.b)
+                    walk(*n.b, loops, nested);
+                if (n.d)
+                    walk(*n.d, loops + 1, nested);
+                return;
+            case NK::For:
+                if (n.a)
+                    walk(*n.a, loops, nested);
+                for (const NodePtr* p : {&n.b, &n.c, &n.d}) {
+                    if (*p)
+                        walk(**p, loops + 1, nested);
+                }
+                return;
+            case NK::While:
+            case NK::DoWhile:
+                forEachChild(n, [&](const Node& kid) { walk(kid, loops + 1, nested); });
+                return;
+            case NK::Try:
+                if (n.b)
+                    patternWrites(*n.b);
+                break;
+            default:
+                break;
+        }
+        forEachChild(n, [&](const Node& kid) { walk(kid, loops, nested); });
+    }
+};
+
+/// Whether `name` is read only as what a call calls, never as a value that could be kept: then whichever function it
+/// holds is done before a loop gives it another.
+bool onlyCalled(const Node& n, const String& name)
+{
+    checkNativeStack();
+    if (n.kind == NK::Identifier)
+        return n.text != name;
+    if (n.kind == NK::Assign && n.a && n.a->kind == NK::Identifier && n.a->text == name)
+        return !n.b || onlyCalled(*n.b, name);
+    if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == name) {
+        for (const NodePtr& arg : n.list) {
+            if (arg && !onlyCalled(*arg, name))
+                return false;
+        }
+        return true;
+    }
+    if (n.kind == NK::Declarator && n.a && n.a->kind == NK::Identifier && n.a->text == name)
+        return !n.b || onlyCalled(*n.b, name);
+    // A member access spells a property name, which is no read of a variable.
+    if (n.kind == NK::Member && !n.computed)
+        return !n.a || onlyCalled(*n.a, name);
+    bool ok = true;
+    forEachChild(n, [&](const Node& kid) { ok = ok && onlyCalled(kid, name); });
+    return ok;
+}
+
+/// Whether `fn` reads `name` from a function nested in it, which would then need the cell after all.
+bool namedInNested(const Node& n, const String& name, bool inside)
+{
+    checkNativeStack();
+    if (inside && (n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr)) {
+        std::set<String> names;
+        collectNames(n, names, n.kind == NK::ArrowExpr);
+        return names.count(name) != 0;
+    }
+    bool found = false;
+    forEachChild(n, [&](const Node& kid) { found = found || namedInNested(kid, name, true); });
+    return found;
 }
 
 /// A call of `eval` by that name, here or in any function nested here.
@@ -596,6 +743,10 @@ private:
 
     void loadVar(StringView name)
     {
+        if (!fn_->selfName.empty() && name == fn_->selfName && !findLocal(*fn_, name)) {
+            emit(Op::PushCallee);
+            return;
+        }
         const VarRef ref = resolve(name);
         switch (ref.kind) {
             case RefKind::Local: emitU(Op::GetLocal, ref.index); break;
@@ -758,6 +909,31 @@ private:
         fs.boxAll = containsDirectEval(*node.d);
         for (const NodePtr& p : node.list)
             fs.boxAll = fs.boxAll || containsDirectEval(*p);
+        if (auto it = selfNames_.find(&node); it != selfNames_.end())
+            fs.selfName = it->second;
+        // Which functions made here hold themselves through a variable of this one.
+        if (!fs.boxAll && node.d) {
+            SelfBound bound;
+            for (const NodePtr& p : node.list)
+                bound.patternWrites(*p);
+            bound.walk(*node.d, 0, false);
+            for (const auto& [name, site] : bound.site) {
+                if (bound.writes[name] != 1 || !bound.declared.count(name) || !site->d)
+                    continue;
+                if (bound.inLoop.count(name) && !onlyCalled(*node.d, name))
+                    continue;
+                if (namedInNested(*site->d, name, false) || containsDirectEval(*site->d))
+                    continue;
+                bool inParams = false;
+                for (const NodePtr& p : site->list) {
+                    std::set<String> names;
+                    collectNames(*p, names, false);
+                    inParams = inParams || names.count(name) != 0;
+                }
+                if (!inParams)
+                    selfNames_[site] = name;
+            }
+        }
         if (fs.boxAll)
             fs.code->jitRefused = true;
 
@@ -2657,6 +2833,7 @@ private:
     Runtime& rt_;
     std::shared_ptr<const std::string> sourceName_;
     String classNameHint_;
+    std::map<const Node*, String> selfNames_;
     FnState* fn_ = nullptr;
     std::vector<std::set<String>> privateScopes_;
     bool sloppyThis_ = false;

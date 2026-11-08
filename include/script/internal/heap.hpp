@@ -75,6 +75,8 @@ struct GCObject
     std::uint8_t gcColor : 1;
     /// Holders do not count references to this: something keeps it for as long as the context lasts.
     std::uint8_t pinned : 1;
+    /// Made since the last collection: what a minor collection looks at.
+    std::uint8_t young : 1;
     /// Last, so that the first thing a derived class keeps here comes right after it: native code reads both at once.
     CellKind kind = CellKind::Object;
 
@@ -87,7 +89,7 @@ struct GCObject
         }
     }
 
-    GCObject() : gcColor(0), pinned(0) {}
+    GCObject() : gcColor(0), pinned(0), young(1) {}
     GCObject(const GCObject&) = delete;
     GCObject& operator=(const GCObject&) = delete;
     virtual ~GCObject();

@@ -55,6 +55,8 @@ void installObject(Runtime& rt)
             Descriptor d;
             return Value(getOwnProperty(rt2, self, key.get(), d));
         }
+        if (key.get() == rt2.atom.prototype.get())
+            ensurePrototype(rt2, self);
         if (self->cls == ObjClass::Array && key->kind == CellKind::String) {
             std::uint32_t index = 0;
             if (arrayIndexOf(static_cast<StringCell*>(key.get())->text(), index))

@@ -88,6 +88,13 @@ bool arrayIndexOf(const StringView& key, std::uint32_t& out) noexcept;
 /// The prototype a host wrapper cell (`NativeCell`) reads through, or null
 /// when `v` is not one.
 DynObject* hostProtoOf(Runtime& rt, const Value& v);
+/// Make a function's pending `prototype`, when it has one.
+void makePendingPrototype(Runtime& rt, DynFunction* fn);
+inline void ensurePrototype(Runtime& rt, DynObject* o)
+{
+    if (o && o->cls == ObjClass::Function && static_cast<DynFunction*>(o)->prototypePending)
+        makePendingPrototype(rt, static_cast<DynFunction*>(o));
+}
 Value getProperty(Runtime& rt, const Value& base, GCObject* key);
 Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Value& receiver);
 void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v);

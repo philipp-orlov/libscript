@@ -495,7 +495,8 @@ GCObject* scriptDynNewOf(Runtime* rt, GCObject* proto, std::uint64_t room) noexc
 GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
 {
     auto* fn = static_cast<DynFunction*>(cell);
-    if (fn->fnKind != FnKind::Bytecode || fn->isArrow)
+    // A prototype still to make is made by the long way, which can allocate.
+    if (fn->fnKind != FnKind::Bytecode || fn->isArrow || fn->prototypePending)
         return nullptr;
     const Prop* prototype = fn->findOwn(rt->atom.prototype.get());
     if (!prototype || fn->accessorOf(*prototype))

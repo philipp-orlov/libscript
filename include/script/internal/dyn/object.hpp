@@ -655,6 +655,9 @@ struct DynFunction : DynObject
     bool isNativeConstructor = false;  ///< a built-in `new` means something for
     bool isDerivedConstructor = false;
     bool isArrow = false;
+    /// Its `prototype` object is made when something first asks for it: a closure that is never `new`ed, which is most
+    /// of them, then makes no cycle with its prototype's `constructor` for the collector to find.
+    bool prototypePending = false;
     int arity = 0;
     String name;
 

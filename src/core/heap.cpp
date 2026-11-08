@@ -6,8 +6,6 @@
 #include "script/internal/context.hpp"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 
 #if SCRIPT_ENGINE_TYPED
 #include "script/internal/typed/runtime.hpp"
@@ -391,7 +389,10 @@ void ContextImpl::collectIfDue()
     if (!overBudget && heapBytes < nextGcBytes && cells < nextGcCells)
         return;
 
-    collectCycles();
+    // Mostly the cells made since the last time: cycles of a closure and its own cell die young. All of it when the heap
+    // has doubled since it last was looked at whole, or is over its limit.
+    const bool full = overBudget || heapBytes > std::max<std::uint64_t>(bytesAfterFull * 2, 4u << 20);
+    collectCycles(!full);
 
     // Both budgets are re-armed from the size that survived, so a program that
     // legitimately grows is not punished with ever more frequent collections.
@@ -402,13 +403,26 @@ void ContextImpl::collectIfDue()
         throw Error(ErrorCode::OutOfMemory, "the context exceeded its memory limit");
 }
 
-void ContextImpl::collectCycles()
+void ContextImpl::collectCycles(bool minor)
 {
     ++gcRuns;
     GcList kids;
 
     GcList all;
     allCells(all);
+    // A minor collection's world is the young cells. What an old one refers to counts as a reference from outside, which
+    // keeps it -- sound, since what is found is still only what nothing outside the set refers to.
+    if (minor) {
+        std::size_t kept = 0;
+        for (GCObject* cell : all) {
+            if (cell->young)
+                all[kept++] = cell;
+        }
+        all.resize(kept);
+    } else {
+        for (GCObject* cell : all)
+            cell->young = 1;
+    }
 
     // 1. Assume every reference is internal, then subtract the ones we can see.
     for (GCObject* cell : all) {
@@ -419,7 +433,7 @@ void ContextImpl::collectCycles()
         kids.clear();
         cell->children(kids);
         for (GCObject* kid : kids) {
-            if (kid && kid->rt == this)
+            if (kid && kid->rt == this && kid->young)
                 --kid->gcRef;
         }
     }
@@ -438,7 +452,7 @@ void ContextImpl::collectCycles()
         kids.clear();
         cell->children(kids);
         for (GCObject* kid : kids) {
-            if (kid && !kid->gcColor) {
+            if (kid && kid->young && !kid->gcColor) {
                 kid->gcColor = 1;
                 work.push_back(kid);
             }
@@ -453,20 +467,30 @@ void ContextImpl::collectCycles()
     GcList garbage;
     std::uint64_t bytes = 0;
     for (GCObject* cell : all) {
+        const std::uint32_t was = cell->gcBytes;
         cell->gcBytes = std::uint32_t(cell->heapSize());
         bytes += cell->gcBytes;
+        // Survivors are old from here on.
+        cell->young = 0;
         if (!cell->gcColor) {
             ++cell->rc;
             garbage.push_back(cell);
+        } else if (minor) {
+            // A minor collection sees part of the heap: what it learns of a cell's size it adds as a change.
+            heapBytes += cell->gcBytes;
+            heapBytes -= std::min<std::uint64_t>(heapBytes, was);
         }
     }
-    heapBytes = bytes;
+    if (!minor)
+        heapBytes = bytes;
     gcFreed += garbage.size();
     GcList().swap(all);
     for (GCObject* cell : garbage)
         cell->clearReferences();
     for (GCObject* cell : garbage)
         detail::decRef(cell);
+    if (!minor)
+        bytesAfterFull = heapBytes;
 
     // In this order: an engine dropping what it held may leave strings nothing names.
     for (std::size_t i = 0; i < runtimeCount_; ++i)

@@ -120,6 +120,8 @@ static bool defineOnArray(Runtime& rt, DynArray* array, GCObject* key, const Des
 /// `[[DefineOwnProperty]]`: false where what is there does not allow it.
 bool ordinaryDefineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descriptor& d)
 {
+    if (key == rt.atom.prototype.get())
+        ensurePrototype(rt, self);
     if (self->cls == ObjClass::TypedArray) {
         auto* ta = static_cast<DynTypedArray*>(self);
         double index = 0;
@@ -192,6 +194,8 @@ bool ordinaryDefineOwn(Runtime& rt, DynObject* self, GCObject* key, const Descri
 
 bool ordinaryGetOwn(Runtime& rt, DynObject* self, GCObject* key, Descriptor& out)
 {
+    if (key == rt.atom.prototype.get())
+        ensurePrototype(rt, self);
     out = Descriptor();
     const auto data = [&](const Value& v, bool writable, bool enumerable, bool configurable) {
         out.hasValue = out.hasWritable = out.hasEnumerable = out.hasConfigurable = true;

@@ -246,7 +246,7 @@ enum class ObjClass : std::uint8_t
 /// looked up by name from then on. Shapes live as long as their runtime, and `Runtime::newShape` caps how many there are.
 struct Shape
 {
-    static constexpr std::uint32_t kMaxProperties = 128;
+    static constexpr std::uint32_t kMaxProperties = 1024;
     /// How many different properties may follow a shape when they are names worked out at run time. An object used as a
     /// dictionary stops there, and has no shape. Names in the source have no such limit: a program has only so many,
     /// and a large one has more than this many classes with a static member, or literals starting differently.

@@ -1668,3 +1668,12 @@ TEST(aComputedKeyCacheStaysRight)
                  " let threw = false; try { c.get(d); } catch (e) { threw = e instanceof TypeError; } [t, threw, C.has(d)].join()"),
              std::string("4504500,true,false"));
 }
+
+TEST(anAnchoredPatternTriesOnlyTheStart)
+{
+    // `/^#/` on a long input that does not start with `#`: one try, not a scan of the input for a `#` further on, which
+    // made a lexer that slices its input a token at a time quadratic. The answers are the same either way.
+    CHECK_EQ(run("var s = 'x'.repeat(1000) + '#'; [/^#/.test(s), /^x+#/.test(s), /^#/m.test('a\\n#'), s.match(/^(x+)#/)[1].length,"
+                 " /^a|^b/.test('cab')].join()"),
+             std::string("false,true,true,1000,false"));
+}

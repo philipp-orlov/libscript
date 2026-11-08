@@ -2205,7 +2205,9 @@ bool exec(const Program& program, std::u16string_view input, std::size_t start, 
     matcher.registers.resize(program.registers);
     std::int32_t* const regs = matcher.registers.data();
     Run run{program, matcher, s, length, pairs, matcher.stack.data(), matcher.stack.size()};
-    const bool once = (program.flags & kSticky) != 0;
+    // `^` without `m` can only match where it starts: one try, with no scan ahead for a likely first character, which
+    // on a long input would make every failed `/^.../` cost the length of the input.
+    const bool once = (program.flags & kSticky) != 0 || (program.anchored && !(program.flags & kMultiline));
     const CodeSet* first = !once && program.firstSet >= 0 ? &program.sets[std::size_t(program.firstSet)] : nullptr;
     for (;;) {
         if (first) {

@@ -9,6 +9,7 @@
 // close open upvalues later.
 
 #include <algorithm>
+#include <list>
 #include <set>
 #include <unordered_map>
 #include <string>
@@ -62,6 +63,73 @@ struct FinallyCtx
     std::uint32_t stackDepth = 0;
 };
 
+/// A set of names, as views of the syntax tree's text (or of literals and of strings it keeps itself), which lives as
+/// long as the compile. Adding is appending; the first look sorts and drops repeats, so filling one costs no
+/// allocation per name.
+class NameSet
+{
+public:
+    void add(StringView name)
+    {
+        names_.push_back(name);
+        settle();
+    }
+    void addAll(const NameSet& other)
+    {
+        other.seal();
+        if (names_.empty()) {
+            names_ = other.names_;
+            sortedEnd_ = names_.size();
+            return;
+        }
+        names_.insert(names_.end(), other.names_.begin(), other.names_.end());
+        settle();
+    }
+    /// A name made during the compile, which the set keeps.
+    void addOwned(const String& name)
+    {
+        if (!count(name))
+            add(owned_.emplace_back(name));
+    }
+    bool count(StringView name) const
+    {
+        seal();
+        return std::binary_search(names_.begin(), names_.end(), name);
+    }
+    auto begin() const
+    {
+        seal();
+        return names_.begin();
+    }
+    auto end() const { return names_.end(); }
+    std::size_t size() const
+    {
+        seal();
+        return names_.size();
+    }
+
+private:
+    /// Repeats are dropped once what is unsorted outgrows what is, so the set stays near its size.
+    void settle()
+    {
+        if (names_.size() - sortedEnd_ > sortedEnd_ + 32)
+            seal();
+    }
+    void seal() const
+    {
+        if (sortedEnd_ == names_.size())
+            return;
+        const auto middle = names_.begin() + std::ptrdiff_t(sortedEnd_);
+        std::sort(middle, names_.end());
+        std::inplace_merge(names_.begin(), middle, names_.end());
+        names_.erase(std::unique(names_.begin(), names_.end()), names_.end());
+        sortedEnd_ = names_.size();
+    }
+    mutable std::vector<StringView> names_;
+    mutable std::size_t sortedEnd_ = 0;  ///< how much of the front is sorted and without repeats
+    std::list<String> owned_;  ///< a list, which costs nothing while empty and never moves what it holds
+};
+
 struct FnState
 {
     FnState* parent = nullptr;
@@ -69,7 +137,7 @@ struct FnState
     std::vector<Local> locals;
     std::vector<String> upvalNames;
     std::vector<bool> upvalConst;  ///< parallel to upvalNames: the binding is a `const`
-    std::set<String> captured;      ///< names a nested function mentions
+    NameSet captured;               ///< names a nested function mentions
     std::set<const Node*> hoistedFuncs;  ///< function declarations `hoist` compiled
     std::vector<LoopCtx> loops;
     std::vector<FinallyCtx*> finallys;
@@ -128,11 +196,29 @@ void forEachChild(const Node& n, F&& visit)
 /// asks about everything nested in it, so without this a function nested d deep is looked at d times.
 struct Analysis
 {
-    std::unordered_map<const Node*, std::set<String>> names[2];  ///< collectNames of a function node, by `inArrow`
+    std::unordered_map<const Node*, NameSet> names[2];         ///< collectNames of a function node, by `inArrow`
     std::unordered_map<const Node*, bool> eval;                   ///< containsDirectEval of a function node
-    std::unordered_map<const Node*, std::map<String, int>> writes;  ///< SelfBound's counts for a nested function node
+    std::unordered_map<const Node*, std::vector<std::pair<StringView, int>>> writes;  ///< SelfBound's counts for a nested function node, by name
 };
 thread_local Analysis* gAnalysis = nullptr;
+
+/// While a function made up during the compile is compiled, the analysis is off: its nodes go before the compile ends,
+/// and another node at the same address must not be taken for one of them.
+class MadeUp
+{
+public:
+    explicit MadeUp(bool on = true) : saved_(gAnalysis)
+    {
+        if (on)
+            gAnalysis = nullptr;
+    }
+    ~MadeUp() { gAnalysis = saved_; }
+    MadeUp(const MadeUp&) = delete;
+    MadeUp& operator=(const MadeUp&) = delete;
+
+private:
+    Analysis* saved_;
+};
 
 bool isTypeofAnswer(StringView text) noexcept
 {
@@ -150,47 +236,47 @@ bool isFunctionNode(const Node& n) noexcept
     return n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr;
 }
 
-void collectNamesUncached(const Node& n, std::set<String>& out, bool inArrow);
+void collectNamesUncached(const Node& n, NameSet& out, bool inArrow);
 
 /// Every name mentioned inside `n`. `inArrow` tracks whether `this` still
 /// refers to the function we are compiling.
-void collectNames(const Node& n, std::set<String>& out, bool inArrow)
+void collectNames(const Node& n, NameSet& out, bool inArrow)
 {
     if (gAnalysis && isFunctionNode(n)) {
         auto& cache = gAnalysis->names[inArrow ? 1 : 0];
         auto it = cache.find(&n);
         if (it == cache.end()) {
-            std::set<String> mine;
+            NameSet mine;
             collectNamesUncached(n, mine, inArrow);
             it = cache.emplace(&n, std::move(mine)).first;
         }
-        out.insert(it->second.begin(), it->second.end());
+        out.addAll(it->second);
         return;
     }
     collectNamesUncached(n, out, inArrow);
 }
 
-void collectNamesUncached(const Node& n, std::set<String>& out, bool inArrow)
+void collectNamesUncached(const Node& n, NameSet& out, bool inArrow)
 {
     checkNativeStack();
     switch (n.kind) {
         case NK::Identifier:
-            out.insert(n.text);
+            out.add(n.text);
             break;
         case NK::ThisExpr:
             if (inArrow)
-                out.insert(ascii("this"));
+                out.add(u"this");
             break;
         case NK::SuperExpr:
             if (inArrow) {
-                out.insert(ascii("this"));
-                out.insert(ascii(" ctor"));
-                out.insert(ascii(" nt"));
+                out.add(u"this");
+                out.add(u" ctor");
+                out.add(u" nt");
             }
             break;
         case NK::NewTarget:
             if (inArrow)
-                out.insert(ascii(" nt"));
+                out.add(u" nt");
             break;
         case NK::FunctionExpr:
             inArrow = false;
@@ -216,7 +302,7 @@ void collectNamesUncached(const Node& n, std::set<String>& out, bool inArrow)
 }
 
 /// Names captured by functions nested inside `n`, not entering `n` itself.
-void collectCaptured(const Node& n, std::set<String>& out)
+void collectCaptured(const Node& n, NameSet& out)
 {
     checkNativeStack();
     if (n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr) {
@@ -232,27 +318,46 @@ void collectCaptured(const Node& n, std::set<String>& out)
 /// cycle with it.
 struct SelfBound
 {
-    std::map<String, int> writes;
-    std::map<String, const Node*> site;
-    std::set<String> inLoop;  ///< whose one write is in a loop: then only being called keeps it right
-    std::set<String> declared;
+    std::vector<std::pair<StringView, int>> writes;  ///< names and how often they are written, sorted by `finish`
+    std::map<StringView, const Node*> site;
+    NameSet inLoop;  ///< whose one write is in a loop: then only being called keeps it right
+    NameSet declared;
 
     static bool isFunction(const Node* n) noexcept { return n && (n->kind == NK::FunctionExpr || n->kind == NK::ArrowExpr); }
-    void write(const String& name, const Node* fn, bool once, bool nested)
+    /// How often `name` is written, once the walk is done.
+    int writesOf(StringView name) const
     {
-        ++writes[name];
+        const auto it = std::lower_bound(writes.begin(), writes.end(), name, [](const auto& w, StringView n) { return w.first < n; });
+        return it != writes.end() && it->first == name ? it->second : 0;
+    }
+    /// Sorts the counts and adds up those of one name.
+    void finish()
+    {
+        std::sort(writes.begin(), writes.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::size_t out = 0;
+        for (std::size_t i = 0; i < writes.size(); ++i) {
+            if (out && writes[out - 1].first == writes[i].first)
+                writes[out - 1].second += writes[i].second;
+            else
+                writes[out++] = writes[i];
+        }
+        writes.resize(out);
+    }
+    void write(StringView name, const Node* fn, bool once, bool nested)
+    {
+        writes.emplace_back(name, 1);
         if (fn && !nested && isFunction(fn)) {
             site[name] = fn;
             if (!once)
-                inLoop.insert(name);
+                inLoop.add(name);
         }
     }
     void patternWrites(const Node& p)
     {
-        std::set<String> names;
+        NameSet names;
         collectNames(p, names, false);
-        for (const String& name : names)
-            ++writes[name];
+        for (StringView name : names)
+            writes.emplace_back(name, 1);
     }
     void walk(const Node& n, int loops, bool nested)
     {
@@ -270,10 +375,10 @@ struct SelfBound
                 if (it == gAnalysis->writes.end()) {
                     SelfBound inner;
                     forEachChild(n, [&](const Node& kid) { inner.walk(kid, 0, true); });
+                    inner.finish();
                     it = gAnalysis->writes.emplace(&n, std::move(inner.writes)).first;
                 }
-                for (const auto& [name, count] : it->second)
-                    writes[name] += count;
+                writes.insert(writes.end(), it->second.begin(), it->second.end());
                 return;
             }
             case NK::Assign:
@@ -288,12 +393,12 @@ struct SelfBound
                 return;
             case NK::Update:
                 if (n.a && n.a->kind == NK::Identifier)
-                    ++writes[n.a->text];
+                    writes.emplace_back(n.a->text, 1);
                 break;
             case NK::Declarator:
                 if (n.a && n.a->kind == NK::Identifier) {
                     if (!nested)
-                        declared.insert(n.a->text);
+                        declared.add(n.a->text);
                     if (n.b)
                         write(n.a->text, n.b.get(), loops == 0, nested);
                 } else if (n.a) {
@@ -304,13 +409,13 @@ struct SelfBound
                 return;
             case NK::FunctionDecl:
                 if (!nested)
-                    declared.insert(n.text);
+                    declared.add(n.text);
                 write(n.text, n.a.get(), loops == 0, nested);
                 if (n.a)
                     walk(*n.a, loops, nested);
                 return;
             case NK::ClassDecl:
-                ++writes[n.text];
+                writes.emplace_back(n.text, 1);
                 break;
             case NK::ForIn:
             case NK::ForOf:
@@ -346,7 +451,7 @@ struct SelfBound
 
 /// Whether `name` is read only as what a call calls, never as a value that could be kept: then whichever function it
 /// holds is done before a loop gives it another.
-bool onlyCalled(const Node& n, const String& name)
+bool onlyCalled(const Node& n, StringView name)
 {
     checkNativeStack();
     if (n.kind == NK::Identifier)
@@ -371,11 +476,11 @@ bool onlyCalled(const Node& n, const String& name)
 }
 
 /// Whether `fn` reads `name` from a function nested in it, which would then need the cell after all.
-bool namedInNested(const Node& n, const String& name, bool inside)
+bool namedInNested(const Node& n, StringView name, bool inside)
 {
     checkNativeStack();
     if (inside && (n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr)) {
-        std::set<String> names;
+        NameSet names;
         collectNames(n, names, n.kind == NK::ArrowExpr);
         return names.count(name) != 0;
     }
@@ -421,7 +526,7 @@ void collectHoisted(const Node& n, std::vector<String>& vars, std::vector<const 
         case NK::VarDecl:
             if (n.varKind == VarKind::Var) {
                 for (const NodePtr& d : n.list) {
-                    std::set<String> names;
+                    NameSet names;
                     if (d->a)
                         collectNames(*d->a, names, false);
                     vars.insert(vars.end(), names.begin(), names.end());
@@ -439,7 +544,7 @@ bool mentionsArguments(const Node& n)
     checkNativeStack();
     if (n.kind == NK::FunctionExpr)
         return false;
-    if (n.kind == NK::Identifier && n.text == ascii("arguments"))
+    if (n.kind == NK::Identifier && n.text == StringView(u"arguments"))
         return true;
     bool found = false;
     forEachChild(n, [&](const Node& kid) { found = found || mentionsArguments(kid); });
@@ -1004,8 +1109,9 @@ private:
             for (const NodePtr& p : node.list)
                 bound.patternWrites(*p);
             bound.walk(*node.d, 0, false);
+            bound.finish();
             for (const auto& [name, site] : bound.site) {
-                if (bound.writes[name] != 1 || !bound.declared.count(name) || !site->d)
+                if (bound.writesOf(name) != 1 || !bound.declared.count(name) || !site->d)
                     continue;
                 if (bound.inLoop.count(name) && !onlyCalled(*node.d, name))
                     continue;
@@ -1013,12 +1119,12 @@ private:
                     continue;
                 bool inParams = false;
                 for (const NodePtr& p : site->list) {
-                    std::set<String> names;
+                    NameSet names;
                     collectNames(*p, names, false);
                     inParams = inParams || names.count(name) != 0;
                 }
                 if (!inParams)
-                    selfNames_[site] = name;
+                    selfNames_[site] = String(name);
             }
         }
         if (fs.boxAll)
@@ -1047,17 +1153,17 @@ private:
 
         // Arrow functions inside this one read `this` from a box. It is made
         // before the parameters are bound so a default value can use it.
-        if (!fs.isArrow && (fs.boxAll || fs.captured.count(ascii("this")))) {
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(u"this"))) {
             const std::uint32_t slot = declareLocal(ascii("this"), false);
             emit(Op::PushThis);
             emitU(Op::SetCell, slot);
         }
-        if (!fs.isArrow && (fs.boxAll || fs.captured.count(ascii(" ctor")))) {
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(u" ctor"))) {
             const std::uint32_t slot = declareLocal(ascii(" ctor"), false);
             emit(Op::PushCallee);
             emitU(Op::SetCell, slot);
         }
-        if (!fs.isArrow && (fs.boxAll || fs.captured.count(ascii(" nt")))) {
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(u" nt"))) {
             const std::uint32_t slot = declareLocal(ascii(" nt"), false);
             emit(Op::PushNewTarget);
             emitU(Op::SetCell, slot);
@@ -2865,7 +2971,7 @@ private:
         privateScopes_.push_back({});
         for (const auto& entry : privateKinds) {
             privateScopes_.back().insert(entry.first);
-            fn_->captured.insert(entry.first);
+            fn_->captured.addOwned(entry.first);
             const std::uint32_t slot = declareLocal(entry.first, true);
             emitU(Op::NewPrivateName, atomFor(entry.first));
             emitU(fn_->locals.back().boxed ? Op::SetCell : Op::SetLocal, slot);
@@ -2917,7 +3023,10 @@ private:
         const std::uint32_t ctorStart = ctor->srcStart, ctorEnd = ctor->srcEnd;
         ctor->srcStart = n.srcStart;
         ctor->srcEnd = n.srcEnd;
-        function(*ctor, n.text.empty() ? className : n.text);
+        {
+            MadeUp madeUp(synthesized != nullptr);
+            function(*ctor, n.text.empty() ? className : n.text);
+        }
         ctor->srcStart = ctorStart;
         ctor->srcEnd = ctorEnd;
         ctor->isStatic = false;
@@ -2930,7 +3039,7 @@ private:
         std::vector<NodePtr> statics;
         std::uint32_t hidden = 0;
         const auto hiddenVar = [&](const String& name) {
-            fn_->captured.insert(name);
+            fn_->captured.addOwned(name);
             declareLocal(name, false);
             return &fn_->locals.back();
         };
@@ -3023,6 +3132,7 @@ private:
         }
 
         if (!instanceInit->d->list.empty()) {
+            const MadeUp madeUp;
             function(*instanceInit, ascii(""));
             emit(Op::SetFieldInit);
         }
@@ -3031,6 +3141,7 @@ private:
             emitU(innerBoxed ? Op::SetCell : Op::SetLocal, std::uint32_t(innerName));
         }
         for (const NodePtr& fn : statics) {
+            const MadeUp madeUp;
             function(*fn, ascii(""));
             emit(Op::CallStaticInit);
         }

@@ -112,6 +112,8 @@ void setIndex(Runtime& rt, const Value& base, std::uint32_t i, const Value& v);
 std::uint32_t lengthOf(Runtime& rt, const Value& v);
 
 bool looseEquals(Runtime& rt, const Value& a, const Value& b);
+/// A function's `arguments`, with a count that is the caller's.
+DynArray* newArgumentsObject(Runtime& rt, const Value* args, std::size_t count);
 bool instanceOf(Runtime& rt, const Value& obj, const Value& ctor);
 Value add(Runtime& rt, const Value& a, const Value& b);
 /// `x + y` for a result that goes straight back where `x` came from, which with `x` holds `counts` counts: the string

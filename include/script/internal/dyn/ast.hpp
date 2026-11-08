@@ -159,6 +159,9 @@ struct Node
     VarKind varKind = VarKind::Var;
     PropKind propKind = PropKind::Init;
     Visibility visibility = Visibility::Public;
+    /// A function's or class's text in the source, in bytes, for `Function.prototype.toString`; both 0 when unknown.
+    std::uint32_t srcStart = 0;
+    std::uint32_t srcEnd = 0;
     bool computed = false;
     /// `__proto__: value` in an object literal, which sets the prototype rather than making a property.
     bool setsProto = false;

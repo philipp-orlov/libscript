@@ -408,6 +408,11 @@ struct FunctionCode
         name = std::move(text);
     }
     std::shared_ptr<const std::string> sourceName;
+    /// The text of the script this came from, shared by all its functions, and this one's part of it in bytes: what
+    /// `Function.prototype.toString` gives. Null for code with no text to give.
+    std::shared_ptr<const std::string> sourceText;
+    std::uint32_t srcStart = 0;
+    std::uint32_t srcEnd = 0;
     int arity = 0;
     bool isArrow = false;
     bool hasRest = false;
@@ -496,8 +501,6 @@ struct FunctionCode
     mutable std::vector<std::unique_ptr<DeoptInfo>> jitDeopts;
     /// What native code takes to stay alive without counting it: the functions its call sites guard they are calling.
     mutable std::vector<Value> jitKeep;
-    /// The same for the code of functions it has a copy of, known by their code alone.
-    mutable std::vector<std::shared_ptr<const FunctionCode>> jitKeepCodes;
     /// The compile going on on another thread, whose code is not in place yet.
     mutable std::shared_ptr<JitJob> jitJob;
     std::vector<Value> consts;         ///< PushConst operands

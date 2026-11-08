@@ -840,6 +840,12 @@ void installArray(Runtime& rt)
     proto->putOwn(rt.sym.iterator.get(), proto->findOwn(rt.intern("values"))->value,
                   PropWritable | PropConfigurable);
     keepIntrinsic(Runtime::ArrayValues, "values");
+
+    // What an `arguments` object inherits: Object.prototype's, and the iteration it has as an own property in the
+    // specification, held here once rather than on every one of them.
+    DynObject* argumentsProto = rt.newObject(rt.objectProto.get());
+    rt.argumentsProto.reset(argumentsProto, true);
+    argumentsProto->putOwn(rt.sym.iterator.get(), proto->findOwn(rt.intern("values"))->value, PropWritable | PropConfigurable);
 }
 
 }  // namespace dyn

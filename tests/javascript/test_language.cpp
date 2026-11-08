@@ -1590,3 +1590,62 @@ TEST(aRegisteredSymbolOutlivesACollection)
     CHECK_EQ(ctx.eval("String(tagged[BRAND] === 1 && BRAND === Symbol.for('brand') && Symbol.keyFor(BRAND) === 'brand')", "<test>").toString(),
              std::string("true"));
 }
+
+TEST(aSpreadInsideAClosureSeesTheVariablesAroundIt)
+{
+    // `{ ...o }` in an arrow: `o` and `this` are captured like any other mention.
+    CHECK_EQ(run("class L { constructor(p) { this.r = 5; this.v = p.map(x => typeof x === 'object' ? { ...x, ...x.prep(this.r) } : x); } }"
+                 " function f() { const o = { a: 1 }; return () => ({ ...o, b: 2 }); }"
+                 " JSON.stringify([new L([{ prep: r => ({ r }) }, 3]).v, f()()])"),
+             std::string("[[{\"r\":5},3],{\"a\":1,\"b\":2}]"));
+}
+
+TEST(aFunctionIsItsSourceText)
+{
+    CHECK_EQ(run("function add(a, b) { return a + b; } class K { m() { return 1; } } const o = { get p() { return 1; } };"
+                 " [add, K, K.prototype.m, x => x * 2, Object.getOwnPropertyDescriptor(o, 'p').get, Math.max].map(String).join('|')"),
+             std::string("function add(a, b) { return a + b; }|class K { m() { return 1; } }|m() { return 1; }|x => x * 2|get p() { return 1; }|"
+                         "function max() { [native code] }"));
+}
+
+TEST(argumentsIsAnArgumentsObject)
+{
+    CHECK_EQ(run("function f() { return [Object.prototype.toString.call(arguments), Array.isArray(arguments), typeof arguments.push,"
+                 " [...arguments].join(), JSON.stringify(arguments)].join(' '); } f(1, 2)"),
+             std::string("[object Arguments] false undefined 1,2 {\"0\":1,\"1\":2}"));
+}
+
+TEST(weakCollectionsHoldWhatTheirKeysHold)
+{
+    js::Context ctx;
+    CHECK_EQ(ctx.eval("var wm = new WeakMap(), ws = new WeakSet(), k = {}; wm.set(k, 1); ws.add(k);"
+                      " [wm.get(k), wm.has({}), ws.has(k), wm.delete(k), wm.has(k), wm.getOrInsert(k, 7)].join()", "<test>").toString(),
+             std::string("1,false,true,true,false,7"));
+    // A value that refers back to its key goes with it.
+    ctx.eval("for (var i = 0; i < 20000; i++) { var key = { i: i }; wm.set(key, { back: key, pad: [1, 2, 3] }); } key = null;", "<test>");
+    ctx.collectGarbage();
+    CHECK(ctx.stats().liveObjects < 5000);
+}
+
+TEST(aDateHasItsCalendar)
+{
+    CHECK_EQ(run("var d = new Date(Date.UTC(2024, 1, 29, 13, 5, 9, 7)); d.setUTCDate(d.getUTCDate() + 1);"
+                 " [d.toISOString(), d.getUTCDay(), Date.parse('2020-01-01'), Date.UTC(2020, 0, 1), new Date(NaN) + '',"
+                 " new Date(8.64e15 + 1).getTime(), d.toUTCString()].join('|')"),
+             std::string("2024-03-01T13:05:09.007Z|5|1577836800000|1577836800000|Invalid Date|NaN|Fri, 01 Mar 2024 13:05:09 GMT"));
+}
+
+TEST(objectLiteralProtoSetsThePrototype)
+{
+    CHECK_EQ(run("var base = { hi() { return 'hi'; } }; var a = { __proto__: base, x: 1 }, c = { ['__proto__']: base };"
+                 " [a.hi(), Object.keys(a).join(), Object.keys(c).join(), ({}).__proto__ === Object.prototype].join()"),
+             std::string("hi,x,__proto__,true"));
+}
+
+TEST(superPropertiesCanBeAssigned)
+{
+    CHECK_EQ(run("var log = []; class B { set x(v) { log.push(v); this._x = v; } get x() { return this._x || 10; } }"
+                 " class A extends B { m() { super.x = 1; super.x += 5; super['y'] = 2; return [this._x, this.y, log.join()].join(); } }"
+                 " new A().m()"),
+             std::string("6,2,1,6"));
+}

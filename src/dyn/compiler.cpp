@@ -162,7 +162,8 @@ void collectNames(const Node& n, std::set<String>& out, bool inArrow)
             collectNames(*n.b, out, inArrow);
         return;
     }
-    if (n.kind == NK::Property && !n.computed) {
+    // A property's name is no variable either; but a spread's operand, in `a`, is an expression.
+    if (n.kind == NK::Property && !n.computed && n.propKind != PropKind::Spread) {
         if (n.b)
             collectNames(*n.b, out, inArrow);
         return;
@@ -444,8 +445,8 @@ public:
     }
 
 
-    Compiler(Runtime& rt, std::string sourceName)
-        : rt_(rt), sourceName_(std::make_shared<std::string>(std::move(sourceName)))
+    Compiler(Runtime& rt, std::string sourceName, std::shared_ptr<const std::string> sourceText = nullptr)
+        : rt_(rt), sourceName_(std::make_shared<std::string>(std::move(sourceName))), sourceText_(std::move(sourceText))
     {}
 
     std::shared_ptr<FunctionCode> program(const Node& node)
@@ -877,6 +878,11 @@ private:
         fs.code = std::make_shared<FunctionCode>();
         fs.code->setName(toUtf8(name));
         fs.code->sourceName = sourceName_;
+        if (sourceText_ && node.srcEnd > node.srcStart && node.srcEnd <= sourceText_->size()) {
+            fs.code->sourceText = sourceText_;
+            fs.code->srcStart = node.srcStart;
+            fs.code->srcEnd = node.srcEnd;
+        }
         fs.code->isArrow = node.kind == NK::ArrowExpr;
         fs.isArrow = fs.code->isArrow;
         fs.code->isClassConstructor = node.propKind == PropKind::Constructor;
@@ -2834,7 +2840,13 @@ private:
         }
         ctor->propKind = PropKind::Constructor;
         ctor->isStatic = derived && !n.allocatesThis;  // read back as isDerivedConstructor
+        // The class is its constructor: its text is the whole class's.
+        const std::uint32_t ctorStart = ctor->srcStart, ctorEnd = ctor->srcEnd;
+        ctor->srcStart = n.srcStart;
+        ctor->srcEnd = n.srcEnd;
         function(*ctor, n.text.empty() ? className : n.text);
+        ctor->srcStart = ctorStart;
+        ctor->srcEnd = ctorEnd;
         ctor->isStatic = false;
         ctor->propKind = PropKind::Init;
 
@@ -2991,6 +3003,7 @@ private:
 
     Runtime& rt_;
     std::shared_ptr<const std::string> sourceName_;
+    std::shared_ptr<const std::string> sourceText_;
     String classNameHint_;
     std::map<const Node*, String> selfNames_;
     FnState* fn_ = nullptr;
@@ -3002,17 +3015,18 @@ private:
 }  // namespace
 
 std::shared_ptr<FunctionCode> compileProgram(Runtime& rt, const Node& program,
-                                             const std::string& sourceName, bool sloppyThis)
+                                             const std::string& sourceName, bool sloppyThis,
+                                             std::shared_ptr<const std::string> sourceText)
 {
-    Compiler compiler(rt, sourceName);
+    Compiler compiler(rt, sourceName, std::move(sourceText));
     compiler.setSloppyThis(sloppyThis);
     return compiler.program(program);
 }
 
 std::shared_ptr<FunctionCode> compileEval(Runtime& rt, const Node& program, const std::string& sourceName,
-                                          const EvalScope& scope)
+                                          const EvalScope& scope, std::shared_ptr<const std::string> sourceText)
 {
-    Compiler compiler(rt, sourceName);
+    Compiler compiler(rt, sourceName, std::move(sourceText));
     compiler.setSloppyThis(true);
     return compiler.evalCode(program, scope);
 }

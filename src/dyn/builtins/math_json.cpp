@@ -630,7 +630,7 @@ bool stringifyValue(Runtime& rt, const Value& v, const Value& replacer, const St
     const String open = indent.empty() ? String() : ascii("\n") + inner;
     const String close = indent.empty() ? String() : ascii("\n") + current;
 
-    if (DynArray* arr = asArray(v)) {
+    if (DynArray* arr = asArray(v); arr && !rt.isArgumentsObject(arr)) {
         out.push_back(u'[');
         for (std::size_t i = 0; i < arr->size(); ++i) {
             if (i)

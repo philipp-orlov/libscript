@@ -663,8 +663,11 @@ Token Lexer::rescanAsRegex(const Token& slash)
 Token Lexer::next(bool regexAllowed)
 {
     const bool newlineBefore = skipSpace();
+    const auto start = std::uint32_t(pos_);
     Token t = readToken(regexAllowed);
     t.newlineBefore = newlineBefore;
+    t.start = start;
+    t.end = std::uint32_t(pos_);
     return t;
 }
 

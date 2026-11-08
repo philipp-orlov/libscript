@@ -169,6 +169,9 @@ struct Token
     bool escapedKeyword = false;
     /// A number written with a leading zero, `017` or `09`.
     bool legacyOctal = false;
+    /// Where it is in the source, in bytes: from its first character to just past its last.
+    std::uint32_t start = 0;
+    std::uint32_t end = 0;
 };
 
 /// A single-pass tokenizer. Division and regular-expression literals are told

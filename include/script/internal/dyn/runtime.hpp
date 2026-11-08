@@ -169,7 +169,7 @@ struct Runtime : EngineRuntime
     /// One-character strings below 128, made on first use.
     Ref<GCObject> asciiChars[128];
     Ref<DynObject> objectProto, functionProto, arrayProto, stringProto, numberProto, booleanProto,
-        symbolProto, errorProto, dateProto, mapProto, setProto, weakMapProto, weakSetProto, promiseProto, iteratorProto, generatorProto, generatorFunctionProto, asyncFunctionProto,
+        symbolProto, errorProto, dateProto, mapProto, setProto, weakMapProto, weakSetProto, argumentsProto, promiseProto, iteratorProto, generatorProto, generatorFunctionProto, asyncFunctionProto,
         asyncIteratorProto, asyncGeneratorProto, asyncGeneratorFunctionProto,
         arrayIteratorProto, regExpProto, regExpStringIteratorProto, bigintProto;
     /// See builtins/regexp.cpp.
@@ -240,6 +240,10 @@ struct Runtime : EngineRuntime
     DynObject* newObjectSized(DynObject* proto, std::uint32_t room);
     DynObject* newObject(DynObject* proto = nullptr);
 
+    /// A function's `arguments` is an array whose prototype is `argumentsProto`: elements like an array's, but to the
+    /// program an Arguments object, which `Array.isArray` says is no array.
+    bool isArgumentsObject(const DynObject* o) const noexcept { return o && argumentsProto && o->proto.get() == argumentsProto.get(); }
+
     // ---- native code; see dyn/jit.hpp ----
     std::unique_ptr<typed::JitBackend> jitBackend;
 #if SCRIPT_ENABLE_JIT_THREAD
@@ -247,6 +251,10 @@ struct Runtime : EngineRuntime
     std::unique_ptr<JitWorker> jitWorker;
 #endif
     std::vector<typed::NativeCode*> jitCodes;
+    /// The code of functions native code has a copy of, known by their code alone: kept while the runtime lives, since
+    /// that copy's bails name it. Held here rather than by the code that has the copy, where two functions copied into
+    /// each other would keep each other.
+    std::unordered_map<const FunctionCode*, std::shared_ptr<const FunctionCode>> jitHeldCodes;
     std::uint64_t jitCompiled = 0;
     std::uint32_t nativeError = 0;
     std::exception_ptr nativePending;

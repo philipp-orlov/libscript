@@ -126,6 +126,19 @@ private:
 
     Lexer lexer_;
     Token cur_;
+    /// Where the token before `cur_` ended, in bytes: the end of whatever was parsed last.
+    std::uint32_t prevEnd_ = 0;
+    /// Parsing a piece of a template literal, whose offsets are not the source's.
+    bool noSourceRanges_ = false;
+    /// Records `n`'s text as running from `start` to the end of the last token, unless offsets mean nothing here.
+    NodePtr withSource(NodePtr n, std::uint32_t start)
+    {
+        if (!noSourceRanges_ && n) {
+            n->srcStart = start;
+            n->srcEnd = prevEnd_;
+        }
+        return n;
+    }
     std::string name_;
     std::string_view source_;
     std::size_t depth_ = 0;  ///< guards against pathological nesting

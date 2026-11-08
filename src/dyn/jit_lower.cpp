@@ -598,8 +598,7 @@ public:
         }
         if (code_.argumentsSlot != FunctionCode::kNoSlot && !argsLazy_) {
             const std::int32_t rt = rtReg();
-            const std::int32_t from = immReg(0);
-            const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynArgsArray), {rt, args, argc, from}, true);
+            const std::int32_t r = callCold(reinterpret_cast<void*>(&scriptDynArguments), {rt, args, argc}, true);
             const std::uint32_t slot = code_.argumentsSlot;
             if (code_.argumentsBoxed) {
                 const std::int32_t tag = immReg(std::int64_t(Type::Object));
@@ -962,8 +961,7 @@ public:
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), generic);
         const std::int32_t have = load(callee.r, kFnCodeOffset, 8, false, kAliasHeader);
         // The same for the code, which the bails in its copy also name.
-        if (std::find(outermost().jitKeepCodes.begin(), outermost().jitKeepCodes.end(), code) == outermost().jitKeepCodes.end())
-            outermost().jitKeepCodes.push_back(code);
+        rt_.jitHeldCodes.emplace(code.get(), code);
         const std::int32_t want = ptrReg(code.get());
         IrInst& same = inst(IrOp::BrCmp);
         same.a = have;
@@ -4818,7 +4816,7 @@ private:
         // Anything but the call it was kept for wants the array after all.
         Entry made;
         if (lazy) {
-            const std::int32_t array = callCold(reinterpret_cast<void*>(&scriptDynArgsArray), {rtReg(), argsReg_, argcReg_, immReg(0)}, true);
+            const std::int32_t array = callCold(reinterpret_cast<void*>(&scriptDynArguments), {rtReg(), argsReg_, argcReg_}, true);
             made = objectEntry(array);
             args.back() = made;
             held.push_back(made);

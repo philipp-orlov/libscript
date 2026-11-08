@@ -229,6 +229,7 @@ void installMap(Runtime& rt)
 {
     DynObject* proto = rt.newObject(rt.objectProto.get());
     rt.mapProto.reset(proto, true);
+    proto->putOwn(rt.sym.toStringTag.get(), rt.str("Map"), PropConfigurable);
     installCollectionCommon(rt, proto, ObjClass::Map);
 
     rt.makeConstructor("Map", [](CallInfo& ci) -> Value {
@@ -285,6 +286,7 @@ void installSet(Runtime& rt)
 {
     DynObject* proto = rt.newObject(rt.objectProto.get());
     rt.setProto.reset(proto, true);
+    proto->putOwn(rt.sym.toStringTag.get(), rt.str("Set"), PropConfigurable);
     installCollectionCommon(rt, proto, ObjClass::Set);
 
     rt.makeConstructor("Set", [](CallInfo& ci) -> Value {
@@ -339,6 +341,7 @@ void installPromise(Runtime& rt)
 {
     DynObject* proto = rt.newObject(rt.objectProto.get());
     rt.promiseProto.reset(proto, true);
+    proto->putOwn(rt.sym.toStringTag.get(), rt.str("Promise"), PropConfigurable);
 
     DynFunction* ctor = rt.makeConstructor("Promise", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
@@ -788,12 +791,96 @@ void installWeakCollection(Runtime& rt, ObjClass cls)
     rt.method(proto, "delete", [cls](CallInfo& ci) { return Value(weakErase(thisWeak(ci, cls), ci.arg(0))); }, 1);
 }
 
+/// WeakRef and FinalizationRegistry, as far as a reference-counted heap gives them cheaply: a WeakRef holds its target,
+/// which the specification allows (an engine may keep any target alive), and a registry records what is registered but
+/// never calls back, which it allows too (cleanup is never guaranteed). Code that uses them as caches works; code that
+/// counts on being told an object is gone is not told.
+void installWeakRefs(Runtime& rt)
+{
+    DynObject* refProto = rt.newObject(rt.objectProto.get());
+    refProto->putOwn(rt.sym.toStringTag.get(), rt.str("WeakRef"), PropConfigurable);
+    rt.makeConstructor("WeakRef", [refProto](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        if (!ci.isConstructorCall())
+            ci.fail(ErrorCode::TypeError, "WeakRef must be called with 'new'");
+        if (!canBeHeldWeakly(rt2, ci.arg(0)))
+            ci.fail(ErrorCode::TypeError, "WeakRef: the target must be an object or a symbol");
+        auto* r = rt2.newCell<DynWrapper>();
+        r->cls = ObjClass::WeakRef;
+        r->setProto(refProto);
+        r->primitive = ci.arg(0);
+        return detail::Access::adopt(Type::Object, r);
+    }, 1, refProto);
+    rt.method(refProto, "deref", [](CallInfo& ci) {
+        DynObject* o = asObject(ci.thisValue());
+        if (!o || o->cls != ObjClass::WeakRef)
+            ci.fail(ErrorCode::TypeError, "WeakRef.prototype.deref: not a WeakRef");
+        return static_cast<DynWrapper*>(o)->primitive;
+    }, 0);
+
+    DynObject* registryProto = rt.newObject(rt.objectProto.get());
+    registryProto->putOwn(rt.sym.toStringTag.get(), rt.str("FinalizationRegistry"), PropConfigurable);
+    rt.makeConstructor("FinalizationRegistry", [registryProto](CallInfo& ci) -> Value {
+        Runtime& rt2 = rtOf(ci);
+        if (!ci.isConstructorCall())
+            ci.fail(ErrorCode::TypeError, "FinalizationRegistry must be called with 'new'");
+        if (!asFunction(ci.arg(0)))
+            ci.fail(ErrorCode::TypeError, "FinalizationRegistry: the cleanup callback is not a function");
+        // The unregister tokens, each with how many registrations name it, in `symbols`.
+        auto* r = rt2.newCell<DynWeakCollection>();
+        r->cls = ObjClass::FinalizationRegistry;
+        r->setProto(registryProto);
+        return detail::Access::adopt(Type::Object, r);
+    }, 1, registryProto);
+    const auto thisRegistry = [](CallInfo& ci) {
+        DynObject* o = asObject(ci.thisValue());
+        if (!o || o->cls != ObjClass::FinalizationRegistry)
+            ci.fail(ErrorCode::TypeError, "not a FinalizationRegistry");
+        return static_cast<DynWeakCollection*>(o);
+    };
+    rt.method(registryProto, "register", [thisRegistry](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        DynWeakCollection* r = thisRegistry(ci);
+        if (!canBeHeldWeakly(rt2, ci.arg(0)))
+            ci.fail(ErrorCode::TypeError, "FinalizationRegistry.prototype.register: the target must be an object or a symbol");
+        if (sameValue(ci.arg(0), ci.arg(1)))
+            ci.fail(ErrorCode::TypeError, "FinalizationRegistry.prototype.register: the target and the held value are the same");
+        const Value& token = ci.arg(2);
+        if (!token.isUndefined()) {
+            if (!canBeHeldWeakly(rt2, token))
+                ci.fail(ErrorCode::TypeError, "FinalizationRegistry.prototype.register: the token must be an object or a symbol");
+            for (auto& [k, count] : r->symbols) {
+                if (detail::Access::ptr(k) == detail::Access::ptr(token)) {
+                    count = Value(numberOf(count) + 1);
+                    return Value::undefined();
+                }
+            }
+            r->symbols.push_back({token, Value(1.0)});
+        }
+        return Value::undefined();
+    }, 2);
+    rt.method(registryProto, "unregister", [thisRegistry](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
+        DynWeakCollection* r = thisRegistry(ci);
+        if (!canBeHeldWeakly(rt2, ci.arg(0)))
+            ci.fail(ErrorCode::TypeError, "FinalizationRegistry.prototype.unregister: the token must be an object or a symbol");
+        for (std::size_t i = 0; i < r->symbols.size(); ++i) {
+            if (detail::Access::ptr(r->symbols[i].first) == detail::Access::ptr(ci.arg(0))) {
+                r->symbols.erase(r->symbols.begin() + std::ptrdiff_t(i));
+                return Value(true);
+            }
+        }
+        return Value(false);
+    }, 1);
+}
+
 void installCollections(Runtime& rt)
 {
     installMap(rt);
     installSet(rt);
     installWeakCollection(rt, ObjClass::WeakMap);
     installWeakCollection(rt, ObjClass::WeakSet);
+    installWeakRefs(rt);
     installPromise(rt);
     installConsole(rt);
 }

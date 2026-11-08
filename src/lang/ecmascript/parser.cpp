@@ -247,6 +247,7 @@ Parser::Parser(std::string_view source, std::string sourceName, bool typescript)
 
 void Parser::advance()
 {
+    prevEnd_ = cur_.end;
     cur_ = lexer_.next(false);
 }
 
@@ -1484,6 +1485,7 @@ NodePtr Parser::assignment()
     NestingScope nest(exprDepth_);
     if (nest.tooDeep())
         fail("expression is nested too deeply");
+    const std::uint32_t exprStart = cur_.start;
     if (at(Tok::Yield) && inGenerator_) {
         if (inParameters_)
             fail("'yield' cannot be used in a generator's parameters");
@@ -1525,7 +1527,7 @@ NodePtr Parser::assignment()
         NodePtr returnType = at(Tok::Colon) ? typeAnnotation() : nullptr;
         expect(Tok::Arrow, "'=>'");
         arrowIsAsync_ = true;
-        return arrowFromParams(std::move(params), std::move(returnType), line);
+        return withSource(arrowFromParams(std::move(params), std::move(returnType), line), exprStart);
     }
 
     // `x => ...` and `(a, b) => ...`
@@ -1539,7 +1541,7 @@ NodePtr Parser::assignment()
             advance();
             std::vector<NodePtr> params;
             params.push_back(std::move(param));
-            return arrowFromParams(std::move(params), nullptr, line);
+            return withSource(arrowFromParams(std::move(params), nullptr, line), exprStart);
         }
     }
     if ((at(Tok::LParen) && looksLikeArrow()) || (at(Tok::Lt) && looksLikeGenericArrow())) {
@@ -1550,7 +1552,7 @@ NodePtr Parser::assignment()
         std::vector<NodePtr> params = parameterList();
         NodePtr returnType = typeAnnotation();
         expect(Tok::Arrow, "'=>'");
-        NodePtr arrow = arrowFromParams(std::move(params), std::move(returnType), line);
+        NodePtr arrow = withSource(arrowFromParams(std::move(params), std::move(returnType), line), exprStart);
         arrow->typeParams = std::move(generics);
         return arrow;
     }
@@ -1943,6 +1945,7 @@ std::vector<NodePtr> Parser::parameterList(bool allowModifiers)
 
 NodePtr Parser::functionExpression(bool isDeclaration)
 {
+    const std::uint32_t start = cur_.start;
     NodePtr n = makeNode(NK::FunctionExpr, cur_.line);
     n->isAsync = eat(Tok::Async);
     expect(Tok::Function, "'function'");
@@ -1965,11 +1968,12 @@ NodePtr Parser::functionExpression(bool isDeclaration)
         return n;
     }
     n->d = block();
-    return n;
+    return withSource(std::move(n), start);
 }
 
 NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
 {
+    const std::uint32_t start = cur_.start;
     NodePtr n = makeNode(NK::ClassExpr, cur_.line);
     n->isAbstract = isAbstract;
     expect(Tok::Class, "'class'");
@@ -2034,6 +2038,8 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             advance();
         }
 
+        // A method's text starts here: after `static`, with `async`, `get` or `*` and the name.
+        const std::uint32_t memberStart = cur_.start;
         if (isStatic && at(Tok::LBrace)) {
             NodePtr staticBlock = makeNode(NK::StaticBlock, cur_.line);
             staticBlock->isStatic = true;
@@ -2113,6 +2119,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
                 semicolon();
             } else {
                 fn->d = block();
+                fn = withSource(std::move(fn), memberStart);
             }
 
             NodePtr m = makeNode(NK::MethodDef, line);
@@ -2149,7 +2156,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
         n->list.push_back(std::move(f));
     }
     advance();
-    return n;
+    return withSource(std::move(n), start);
 }
 
 NodePtr Parser::arrayLiteral()
@@ -2192,6 +2199,7 @@ NodePtr Parser::objectLiteral()
             continue;
         }
 
+        const std::uint32_t propStart = cur_.start;
         const bool memberAsync = at(Tok::Async) && asyncMethodAhead();
         if (memberAsync)
             advance();
@@ -2232,7 +2240,7 @@ NodePtr Parser::objectLiteral()
             fn->list = parameterList();
             fn->type = typeAnnotation();
             fn->d = block();
-            p->b = std::move(fn);
+            p->b = withSource(std::move(fn), propStart);
             if (kind == PropKind::Init)
                 p->propKind = PropKind::Method;
         } else if (memberAsync || memberGenerator) {
@@ -2275,6 +2283,7 @@ NodePtr Parser::templateLiteral()
     n->strs = cur_.parts;
     for (const std::string& raw : cur_.exprs) {
         Parser sub(raw, name_);
+        sub.noSourceRanges_ = true;
         sub.inGenerator_ = inGenerator_;
         sub.inAsync_ = inAsync_;
         NodePtr e = sub.expression();

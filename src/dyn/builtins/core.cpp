@@ -120,7 +120,10 @@ void installObject(Runtime& rt)
         const Value named = getProperty(rt2, object, rt2.sym.toStringTag.get());
         if (named.type() == Type::String)
             return rt2.str(ascii("[object ") + toStringValue(rt2, named) + ascii("]"));
-        return rt2.str(ascii(std::string("[object ") + classTag(asObject(object)->cls) + "]"));
+        const DynObject* self = asObject(object);
+        if (self->cls == ObjClass::Array && rt2.isArgumentsObject(self))
+            return rt2.str("[object Arguments]");
+        return rt2.str(ascii(std::string("[object ") + (isArray(rt2, object) ? "Array" : classTag(self->cls)) + "]"));
     }, 0);
 
     rt.method(proto, "valueOf", [](CallInfo& ci) { return ci.thisValue(); }, 0);
@@ -379,8 +382,12 @@ void installFunction(Runtime& rt)
     rt.method(proto, "toString", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynFunction* self = asFunction(ci.thisValue());
-        const String name = self ? self->name : String();
-        return rt2.str(ascii("function ") + name + ascii("() { [native code] }"));
+        if (!self)
+            ci.fail(ErrorCode::TypeError, "Function.prototype.toString called on something not a function");
+        // A function written in the source is its text there; anything else says it is native.
+        if (const FunctionCode* code = self->code.get(); code && code->sourceText && code->srcEnd > code->srcStart)
+            return rt2.str(fromUtf8(std::string_view(*code->sourceText).substr(code->srcStart, code->srcEnd - code->srcStart)));
+        return rt2.str(ascii("function ") + self->name + ascii("() { [native code] }"));
     }, 0);
 
     DynFunction* ctor = rt.makeConstructor("Function", [](CallInfo& ci) -> Value {
@@ -413,15 +420,17 @@ void installSymbol(Runtime& rt)
     rt.getter(proto, "description", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
         SymbolCell* self = asSymbol(ci.thisValue());
-        return self ? rt2.str(self->description) : Value::undefined();
+        return self && self->hasDescription ? rt2.str(self->description) : Value::undefined();
     });
+    proto->putOwn(rt.sym.toStringTag.get(), rt.str("Symbol"), PropConfigurable);
 
     DynFunction* ctor = rt.makeConstructor("Symbol", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
         if (ci.isConstructorCall())
             ci.fail(ErrorCode::TypeError, "Symbol is not a constructor");
         auto* s = rt2.newCell<SymbolCell>();
-        if (!ci.arg(0).isUndefined())
+        s->hasDescription = !ci.arg(0).isUndefined();
+        if (s->hasDescription)
             s->description = toStringValue(rt2, ci.arg(0));
         return detail::Access::adopt(Type::Symbol, s);
     }, 1, proto);

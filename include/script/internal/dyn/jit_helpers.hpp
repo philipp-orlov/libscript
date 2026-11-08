@@ -100,6 +100,7 @@ std::int32_t scriptDynIterNext(Runtime* rt, std::int64_t tag, std::uint64_t payl
 void scriptDynIterClose(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 NativePair scriptDynGlobalThis(Runtime* rt) noexcept;
 GCObject* scriptDynArgsArray(Runtime* rt, const Value* args, std::uint64_t argc, std::uint64_t from) noexcept;
+GCObject* scriptDynArguments(Runtime* rt, const Value* args, std::uint64_t argc) noexcept;
 std::int32_t scriptDynInstanceOf(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept;
 std::int32_t scriptDynIn(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept;
 std::int32_t scriptDynDeleteProp(Runtime* rt, std::int64_t tag, std::uint64_t payload, GCObject* key) noexcept;

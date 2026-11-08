@@ -24,12 +24,14 @@ std::shared_ptr<CompiledUnit> compileJavaScript(ContextImpl& ctx, std::string_vi
 {
     Runtime& rt = ctx.dyn();
     rt.syncHostClasses();
-    Parser parser(source, std::string(name), /*typescript=*/false);
+    // Kept with the code: Function.prototype.toString gives a function's text.
+    auto text = std::make_shared<const std::string>(source);
+    Parser parser(*text, std::string(name), /*typescript=*/false);
     NodePtr program = parser.parseProgram();
     auto unit = std::make_shared<Program>();
     unit->language = Language::JavaScript;
     unit->name = std::string(name);
-    unit->code = compileProgram(rt, *program, std::string(name), /*sloppyThis=*/true);
+    unit->code = compileProgram(rt, *program, std::string(name), /*sloppyThis=*/true, std::move(text));
     rt.adoptProgram(unit);
     return unit;
 }

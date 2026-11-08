@@ -424,7 +424,7 @@ NativePair scriptDynBail(Runtime* rt, const DeoptInfo* info, const char* frame) 
         slot[1] = v.owned;
         std::uint64_t payload = v.bits;
         if (v.form == DeoptValue::Arguments) {
-            payload = reinterpret_cast<std::uint64_t>(scriptDynArgsArray(rt, reinterpret_cast<const Value*>(word(v.payloadAt)), word(std::int32_t(v.bits)), 0));
+            payload = reinterpret_cast<std::uint64_t>(scriptDynArguments(rt, reinterpret_cast<const Value*>(word(v.payloadAt)), word(std::int32_t(v.bits))));
         } else if (v.form != DeoptValue::Constant) {
             payload = word(v.payloadAt);
             if (v.form == DeoptValue::Int32 || v.form == DeoptValue::Int64) {
@@ -600,6 +600,11 @@ GCObject* scriptDynArgsArray(Runtime* rt, const Value* args, std::uint64_t argc,
         detail::incRef(out);
         return out;
     });
+}
+
+GCObject* scriptDynArguments(Runtime* rt, const Value* args, std::uint64_t argc) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return newArgumentsObject(*rt, args, std::size_t(argc)); });
 }
 
 std::int32_t scriptDynInstanceOf(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept

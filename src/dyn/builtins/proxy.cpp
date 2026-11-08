@@ -324,8 +324,8 @@ Vec<Value> ownPropertyKeys(Runtime& rt, DynObject* o)
 
 bool isArray(Runtime& rt, const Value& v)
 {
-    if (asArray(v))
-        return true;
+    if (DynArray* a = asArray(v))
+        return !rt.isArgumentsObject(a);
     if (DynProxy* p = asProxy(asObject(v))) {
         if (p->handler.isNull())
             throwError(rt, ErrorCode::TypeError, "a revoked proxy cannot be used");

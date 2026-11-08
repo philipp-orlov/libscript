@@ -217,7 +217,6 @@ void releaseCode(const FunctionCode& code) noexcept
     mutableCode.consts.clear();
     mutableCode.atoms.clear();
     mutableCode.jitKeep.clear();
-    mutableCode.jitKeepCodes.clear();
     for (const auto& child : mutableCode.children)
         releaseCode(*child);
 }
@@ -282,6 +281,7 @@ void Runtime::releaseRoots() noexcept
             jitBackend->release(code);
     }
     jitCodes.clear();
+    jitHeldCodes.clear();
     jitBackend.reset();
     shapes.clear();
     nullProtoRoot = nullptr;
@@ -295,7 +295,7 @@ void Runtime::releaseRoots() noexcept
     promiseCtor.reset();
     for (Ref<DynObject>* p : {&globalObject, &objectProto, &functionProto, &arrayProto,
                               &stringProto, &numberProto, &booleanProto, &symbolProto,
-                              &errorProto, &dateProto, &mapProto, &setProto, &weakMapProto, &weakSetProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
+                              &errorProto, &dateProto, &mapProto, &setProto, &weakMapProto, &weakSetProto, &argumentsProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
                               &asyncGeneratorProto, &asyncGeneratorFunctionProto,
                               &iteratorProto, &arrayIteratorProto, &regExpProto, &regExpStringIteratorProto, &bigintProto})
         p->reset();

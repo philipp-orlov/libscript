@@ -1239,11 +1239,32 @@ bool looseEquals(Runtime& rt, const Value& a, const Value& b)
     return false;
 }
 
+DynArray* newArgumentsObject(Runtime& rt, const Value* args, std::size_t count)
+{
+    DynArray* out = rt.newArray(count);
+    for (std::size_t i = 0; i < count; ++i)
+        out->append(args[i]);
+    if (rt.argumentsProto)
+        out->setProto(rt.argumentsProto.get());
+    return out;
+}
+
 bool instanceOf(Runtime& rt, const Value& object, const Value& ctor)
 {
     DynFunction* fn = asFunction(ctor);
-    if (!fn)
+    if (!fn) {
+        // Any object may answer for itself through `Symbol.hasInstance`; only without one does it have to be callable.
+        DynObject* target = asObject(ctor);
+        if (!target)
+            throwError(rt, ErrorCode::TypeError, "the right side of 'instanceof' is not an object");
+        const Value custom = getPropertyOfObject(rt, target, rt.sym.hasInstance.get(), ctor);
+        if (!custom.isNullish()) {
+            if (!asFunction(custom))
+                throwError(rt, ErrorCode::TypeError, "Symbol.hasInstance is not a function");
+            return toBoolean(callValue(rt, custom, ctor, {object}));
+        }
         throwError(rt, ErrorCode::TypeError, "the right side of 'instanceof' is not callable");
+    }
     // A function straight off Function.prototype, with nothing on that chain defining `Symbol.hasInstance` since the
     // prototypes last changed, has no custom test to call.
     bool plain = false;
@@ -1344,7 +1365,7 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
             detail::decRef(rest);
     }
     if (code.argumentsSlot != FunctionCode::kNoSlot) {
-        Value v = rt.makeArray(args);
+        Value v = detail::Access::adopt(Type::Object, newArgumentsObject(rt, args.data(), args.size()));
         if (code.argumentsBoxed) {
             auto* cell = rt.newCell<Box>();
             cell->value = v;
@@ -1614,10 +1635,11 @@ Value evalString(Runtime& rt, const Value& source, Frame* caller, const EvalScop
         return source;
     std::shared_ptr<FunctionCode> code;
     try {
-        const std::string utf8 = toUtf8(text->text());
-        Parser parser(utf8, "<eval>", /*typescript=*/false);
+        auto utf8 = std::make_shared<const std::string>(toUtf8(text->text()));
+        Parser parser(*utf8, "<eval>", /*typescript=*/false);
         NodePtr program = parser.parseProgram();
-        code = scope && caller ? compileEval(rt, *program, "<eval>", *scope) : compileProgram(rt, *program, "<eval>", /*sloppyThis=*/true);
+        code = scope && caller ? compileEval(rt, *program, "<eval>", *scope, utf8)
+                               : compileProgram(rt, *program, "<eval>", /*sloppyThis=*/true, utf8);
     } catch (Exception&) {
         throw;
     } catch (const Error& e) {

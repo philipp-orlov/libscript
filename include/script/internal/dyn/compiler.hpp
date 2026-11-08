@@ -21,11 +21,12 @@ struct Runtime;
 /// the completion value of the last expression statement. `sloppyThis` is JavaScript's non-strict rule for `this` in a
 /// plain call, for code that no "use strict" directive or class body covers.
 std::shared_ptr<FunctionCode> compileProgram(Runtime& rt, const Node& program,
-                                             const std::string& sourceName, bool sloppyThis = false);
+                                             const std::string& sourceName, bool sloppyThis = false,
+                                             std::shared_ptr<const std::string> sourceText = nullptr);
 
 /// The code of a direct `eval`: a function nested in the one that called it, seeing what `scope` says it sees.
 std::shared_ptr<FunctionCode> compileEval(Runtime& rt, const Node& program, const std::string& sourceName,
-                                          const EvalScope& scope);
+                                          const EvalScope& scope, std::shared_ptr<const std::string> sourceText = nullptr);
 
 }  // namespace dyn
 }  // namespace internal

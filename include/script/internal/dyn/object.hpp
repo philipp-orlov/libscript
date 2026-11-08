@@ -24,6 +24,7 @@ struct Runtime;
 struct SymbolCell : GCObject
 {
     String description;
+    bool hasDescription = true;  ///< false for `Symbol()`, whose description is undefined rather than ""
     bool registered = false;  ///< created through Symbol.for, held by the registry
     bool isPrivate = false;   ///< a class's `#x`: no reflection sees it, and only its own object has it
 
@@ -238,6 +239,8 @@ enum class ObjClass : std::uint8_t
     IteratorHelper,
     WeakMap,
     WeakSet,
+    WeakRef,
+    FinalizationRegistry,
 };
 
 /// What objects with the same properties, added in the same order, on the same prototype, have in common: a hidden class.

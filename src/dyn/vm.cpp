@@ -1092,6 +1092,38 @@ std::uint32_t lengthOf(Runtime& rt, const Value& v)
 
 // ----------------------------------------------------------- operators ---
 
+Value appendForLocal(Runtime& rt, const Value& x, const Value& y, std::uint32_t counts)
+{
+    if (x.isString() && (y.isString() || y.isNumber())) {
+        StringCell* s = asString(x);
+        String digits;
+        StringView tail;
+        if (y.isString()) {
+            tail = asString(y)->text();
+        } else {
+            digits = numberToString(numberOf(y));
+            tail = digits;
+        }
+        const std::size_t length = std::size_t(s->length) + tail.size();
+        if (length > 0xFFFFFFF0u)
+            return add(rt, x, y);
+        // The local and `x` hold the only counts, so the old value is not seen again once the result is stored over it.
+        if (!s->interned && s->rc == counts && s->capacity() >= length) {
+            std::memmove(s->mutableChars() + s->length, tail.data(), tail.size() * sizeof(Char));
+            s->length = std::uint32_t(length);
+            s->hash_ = 0;
+            return x;
+        }
+        // Room for as much again: a loop that appends takes linear time, not square.
+        if (length >= 32) {
+            rt.ctx.reserve(length * 2 * sizeof(Char));
+            StringCell* grown = rt.ctx.newStringRoom(s->text(), tail, length * 2);
+            return detail::Access::adopt(Type::String, grown);
+        }
+    }
+    return add(rt, x, y);
+}
+
 Value add(Runtime& rt, const Value& a, const Value& b)
 {
     const Value pa = toPrimitive(rt, a, 0);
@@ -2897,10 +2929,32 @@ Value execute(Runtime& rt, Frame& frame)
                         }
                         Value b = pop();
                         Value a = pop();
-                        if (a.isNumber() && b.isNumber())
+                        if (a.isNumber() && b.isNumber()) {
                             sp.emplace_back(numberOf(a) + numberOf(b));
-                        else
-                            sp.push_back(add(rt, a, b));
+                            break;
+                        }
+                        // `s += x` into the local `s` came from: what is in the local is `a`, so it can grow in place.
+                        if (a.isString() && !asString(a)->interned) {
+                            std::uint32_t at = pc;
+                            if (at < code.code.size() && Op(c[at]) == Op::Dup)
+                                ++at;
+                            if (at + 4 < code.code.size() && Op(c[at]) == Op::SetLocal) {
+                                const std::uint32_t slot = operandAt(at + 1);
+                                if (slot < frame.locals.size() && detail::Access::ptr(frame.locals[slot]) == detail::Access::ptr(a)) {
+                                    sp.push_back(appendForLocal(rt, a, b, 2));
+                                    break;
+                                }
+                            }
+                            // The same for a variable a closure shares, in its cell.
+                            if (at + 4 < code.code.size() && Op(c[at]) == Op::SetCell) {
+                                const std::uint32_t slot = operandAt(at + 1);
+                                if (slot < frame.cells.size() && frame.cells[slot] && detail::Access::ptr(frame.cells[slot]->value) == detail::Access::ptr(a)) {
+                                    sp.push_back(appendForLocal(rt, a, b, 2));
+                                    break;
+                                }
+                            }
+                        }
+                        sp.push_back(add(rt, a, b));
                         break;
                     }
                     case Op::Sub:

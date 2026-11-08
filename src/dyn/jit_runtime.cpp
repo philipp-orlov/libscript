@@ -698,39 +698,30 @@ NativePair scriptDynGetSuper(Runtime* rt, GCObject* fn, std::int64_t thisTag, st
     });
 }
 
-NativePair scriptDynAppendLocal(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept
+NativePair scriptDynAppendIfLocal(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b, std::int64_t lt,
+                                  std::uint64_t local) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
-        const Value x = valueOf(ta, a), y = valueOf(tb, b);
-        if (x.isString() && (y.isString() || y.isNumber())) {
-            StringCell* s = asString(x);
-            String digits;
-            StringView tail;
-            if (y.isString()) {
-                tail = asString(y)->text();
-            } else {
-                digits = numberToString(numberOf(y));
-                tail = digits;
-            }
-            const std::size_t length = std::size_t(s->length) + tail.size();
-            if (length > 0xFFFFFFF0u)
-                return take(add(*rt, x, y));
-            // The local holds the only count (`x` the other), so the old value is not seen again once the result is
-            // stored over it.
-            if (!s->interned && s->rc == 2 && s->capacity() >= length) {
-                std::memmove(s->mutableChars() + s->length, tail.data(), tail.size() * sizeof(Char));
-                s->length = std::uint32_t(length);
-                s->hash_ = 0;
-                return take(x);
-            }
-            if (length >= 32) {
-                rt->ctx.reserve(length * 2 * sizeof(Char));
-                StringCell* grown = rt->ctx.newStringRoom(s->text(), tail, length * 2);
-                return take(detail::Access::adopt(Type::String, grown));
-            }
-        }
-        return take(add(*rt, x, y));
+        // The local and the copy native code holds are the two counts there are when nothing else sees the string.
+        if (ta == std::int64_t(Type::String) && lt == ta && local == a)
+            return take(appendForLocal(*rt, valueOf(ta, a), valueOf(tb, b), 2));
+        return take(add(*rt, valueOf(ta, a), valueOf(tb, b)));
     });
+}
+
+NativePair scriptDynAppendIfCell(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b, GCObject* cell) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        const Box* box = static_cast<const Box*>(cell);
+        if (ta == std::int64_t(Type::String) && box && detail::Access::ptr(box->value) == reinterpret_cast<GCObject*>(a))
+            return take(appendForLocal(*rt, valueOf(ta, a), valueOf(tb, b), 2));
+        return take(add(*rt, valueOf(ta, a), valueOf(tb, b)));
+    });
+}
+
+NativePair scriptDynAppendLocal(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(appendForLocal(*rt, valueOf(ta, a), valueOf(tb, b), 2)); });
 }
 
 NativePair scriptDynFromCharCode(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept

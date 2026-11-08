@@ -3086,7 +3086,7 @@ private:
                 release(iterator);
                 return true;
             }
-            case Op::Add: lowerAdd(appendsToLocal(pc)); return true;
+            case Op::Add: lowerAdd(appendsToLocal(pc), appendTargetSlot(pc)); return true;
             case Op::Sub:
             case Op::Mul:
             case Op::Div: arithmetic(op); return true;
@@ -6244,7 +6244,27 @@ private:
         return true;
     }
 
-    void lowerAdd(bool appendsToLocal = false)
+    /// The local `s += x` stores back into, when the left side was read from it but is a copy by now: a call in between
+    /// takes local reads for copies. The helper then checks the two are still the same string.
+    std::int32_t appendTargetSlot(std::uint32_t pc) const
+    {
+        const std::vector<std::uint8_t>& c = code_.code;
+        std::uint32_t at = pc + 1;
+        if (at < c.size() && Op(c[at]) == Op::Dup)
+            ++at;
+        if (at + 4 >= c.size())
+            return -1;
+        const std::uint32_t slot = readOperand(c, at + 1);
+        if (Op(c[at]) == Op::SetCell)
+            return slot < cellReg_.size() && cellReg_[slot] >= 0 ? -2 - std::int32_t(slot) : -1;
+        if (Op(c[at]) != Op::SetLocal)
+            return -1;
+        if (slot >= localOwned_.size() || !localOwned_[slot] || isNumberLocal(slot) || localTag_[slot] < 0)
+            return -1;
+        return std::int32_t(slot);
+    }
+
+    void lowerAdd(bool appendsToLocal = false, std::int32_t targetSlot = -1)
     {
         Entry b = pop();
         Entry a = pop();
@@ -6300,8 +6320,15 @@ private:
         inst(IrOp::ColdBegin);
         inst(IrOp::Label).imm = slow;
         const std::int32_t rt = rtReg();
-        coldCall(appendsToLocal ? reinterpret_cast<void*>(&scriptDynAppendLocal) : reinterpret_cast<void*>(&scriptDynAdd),
-                 {rt, ta, pa, tb, pb}, r, t, true, {a, b});
+        if (appendsToLocal)
+            coldCall(reinterpret_cast<void*>(&scriptDynAppendLocal), {rt, ta, pa, tb, pb}, r, t, true, {a, b});
+        else if (targetSlot <= -2 && a.own == Own::Owned)
+            coldCall(reinterpret_cast<void*>(&scriptDynAppendIfCell), {rt, ta, pa, tb, pb, cellReg_[std::size_t(-2 - targetSlot)]}, r, t, true, {a, b});
+        else if (targetSlot >= 0 && a.own == Own::Owned)
+            coldCall(reinterpret_cast<void*>(&scriptDynAppendIfLocal),
+                     {rt, ta, pa, tb, pb, localTag_[std::size_t(targetSlot)], localReg_[std::size_t(targetSlot)]}, r, t, true, {a, b});
+        else
+            coldCall(reinterpret_cast<void*>(&scriptDynAdd), {rt, ta, pa, tb, pb}, r, t, true, {a, b});
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;

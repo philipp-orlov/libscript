@@ -107,6 +107,9 @@ std::uint32_t lengthOf(Runtime& rt, const Value& v);
 bool looseEquals(Runtime& rt, const Value& a, const Value& b);
 bool instanceOf(Runtime& rt, const Value& obj, const Value& ctor);
 Value add(Runtime& rt, const Value& a, const Value& b);
+/// `x + y` for a result that goes straight back where `x` came from, which with `x` holds `counts` counts: the string
+/// grows in place when nothing else can see it.
+Value appendForLocal(Runtime& rt, const Value& x, const Value& y, std::uint32_t counts);
 /// Relational comparison; `result` is -1, 0, 1 or 2 for "undefined".
 int compare(Runtime& rt, const Value& a, const Value& b);
 

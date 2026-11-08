@@ -134,6 +134,17 @@ struct Analysis
 };
 thread_local Analysis* gAnalysis = nullptr;
 
+bool isTypeofAnswer(StringView text) noexcept
+{
+    if (text.size() < 6 || text.size() > 9)
+        return false;
+    for (std::string_view name : {"number", "string", "boolean", "undefined", "object", "function", "symbol", "bigint"}) {
+        if (name.size() == text.size() && std::equal(name.begin(), name.end(), text.begin(), [](char a, Char b) { return Char(a) == b; }))
+            return true;
+    }
+    return false;
+}
+
 bool isFunctionNode(const Node& n) noexcept
 {
     return n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr;
@@ -1875,10 +1886,10 @@ private:
             case NK::StringLit:
                 if (n.legacyOctal && earlyErrors() && inStrictCode())
                     fail(n.line, "an octal escape is not allowed in strict code");
-                // Short ones interned: compared with what typeof gives, or used as keys, they are the same cell.
-                emitU(Op::PushConst, constIndex(n.text.size() <= ContextImpl::kInternedLength
-                                                    ? detail::Access::make(Type::String, rt_.intern(n.text))
-                                                    : rt_.str(n.text)));
+                // What typeof gives is interned, and so is a constant spelling one of its answers: `typeof x === 'number'`
+                // then compares two cells. Interning every short constant cost more than it gave.
+                emitU(Op::PushConst, constIndex(isTypeofAnswer(n.text) ? detail::Access::make(Type::String, rt_.intern(n.text))
+                                                                       : rt_.str(n.text)));
                 return;
             case NK::BoolLit:
                 emit(n.number != 0 ? Op::PushTrue : Op::PushFalse);

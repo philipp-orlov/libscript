@@ -124,6 +124,16 @@ void forEachChild(const Node& n, F&& visit)
     }
 }
 
+/// What the passes below work out for a whole function, kept for the compile of one program: compiling each function
+/// asks about everything nested in it, so without this a function nested d deep is looked at d times.
+struct Analysis
+{
+    std::unordered_map<const Node*, std::set<String>> names[2];  ///< collectNames of a function node, by `inArrow`
+    std::unordered_map<const Node*, bool> eval;                   ///< containsDirectEval of a function node
+    std::unordered_map<const Node*, std::map<String, int>> writes;  ///< SelfBound's counts for a nested function node
+};
+thread_local Analysis* gAnalysis = nullptr;
+
 bool isTypeofAnswer(StringView text) noexcept
 {
     if (text.size() < 6 || text.size() > 9)
@@ -135,9 +145,32 @@ bool isTypeofAnswer(StringView text) noexcept
     return false;
 }
 
+bool isFunctionNode(const Node& n) noexcept
+{
+    return n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr;
+}
+
+void collectNamesUncached(const Node& n, std::set<String>& out, bool inArrow);
+
 /// Every name mentioned inside `n`. `inArrow` tracks whether `this` still
 /// refers to the function we are compiling.
 void collectNames(const Node& n, std::set<String>& out, bool inArrow)
+{
+    if (gAnalysis && isFunctionNode(n)) {
+        auto& cache = gAnalysis->names[inArrow ? 1 : 0];
+        auto it = cache.find(&n);
+        if (it == cache.end()) {
+            std::set<String> mine;
+            collectNamesUncached(n, mine, inArrow);
+            it = cache.emplace(&n, std::move(mine)).first;
+        }
+        out.insert(it->second.begin(), it->second.end());
+        return;
+    }
+    collectNamesUncached(n, out, inArrow);
+}
+
+void collectNamesUncached(const Node& n, std::set<String>& out, bool inArrow)
 {
     checkNativeStack();
     switch (n.kind) {
@@ -227,9 +260,22 @@ struct SelfBound
         switch (n.kind) {
             case NK::FunctionExpr:
             case NK::ArrowExpr:
-            case NK::ClassExpr:
-                forEachChild(n, [&](const Node& kid) { walk(kid, 0, true); });
+            case NK::ClassExpr: {
+                // Inside a nested function only how often each name is written counts, the same wherever it is nested.
+                if (!gAnalysis) {
+                    forEachChild(n, [&](const Node& kid) { walk(kid, 0, true); });
+                    return;
+                }
+                auto it = gAnalysis->writes.find(&n);
+                if (it == gAnalysis->writes.end()) {
+                    SelfBound inner;
+                    forEachChild(n, [&](const Node& kid) { inner.walk(kid, 0, true); });
+                    it = gAnalysis->writes.emplace(&n, std::move(inner.writes)).first;
+                }
+                for (const auto& [name, count] : it->second)
+                    writes[name] += count;
                 return;
+            }
             case NK::Assign:
                 if (n.a && n.a->kind == NK::Identifier)
                     write(n.a->text, n.op == Tok::Assign ? n.b.get() : nullptr, loops == 0, nested);
@@ -344,8 +390,15 @@ bool containsDirectEval(const Node& n)
     checkNativeStack();
     if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval")
         return true;
+    const bool cacheHere = gAnalysis && isFunctionNode(n);
+    if (cacheHere) {
+        if (auto it = gAnalysis->eval.find(&n); it != gAnalysis->eval.end())
+            return it->second;
+    }
     bool found = false;
     forEachChild(n, [&](const Node& kid) { found = found || containsDirectEval(kid); });
+    if (cacheHere)
+        gAnalysis->eval.emplace(&n, found);
     return found;
 }
 
@@ -458,7 +511,13 @@ public:
 
     Compiler(Runtime& rt, std::string sourceName, std::shared_ptr<const std::string> sourceText = nullptr)
         : rt_(rt), sourceName_(std::make_shared<std::string>(std::move(sourceName))), sourceText_(std::move(sourceText))
-    {}
+    {
+        outerAnalysis_ = gAnalysis;
+        gAnalysis = &analysis_;
+    }
+    ~Compiler() { gAnalysis = outerAnalysis_; }
+    Compiler(const Compiler&) = delete;
+    Compiler& operator=(const Compiler&) = delete;
 
     std::shared_ptr<FunctionCode> program(const Node& node)
     {
@@ -3018,6 +3077,8 @@ private:
     Runtime& rt_;
     std::shared_ptr<const std::string> sourceName_;
     std::shared_ptr<const std::string> sourceText_;
+    Analysis analysis_;
+    Analysis* outerAnalysis_ = nullptr;
     String classNameHint_;
     std::map<const Node*, String> selfNames_;
     FnState* fn_ = nullptr;

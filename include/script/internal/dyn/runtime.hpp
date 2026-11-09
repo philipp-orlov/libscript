@@ -40,6 +40,7 @@ struct Job
         Reaction,    ///< `handler` on `result`, settling the promise `target`
         Capability,  ///< `handler` on `result`, through another constructor's `resolve` and `reject`
         Await,       ///< an awaiting coroutine `handler` goes on with `result`
+        Adopt,       ///< the promise `target` takes on the outcome of the promise `fn`, whose `then` is the built-in one
     };
     Value fn;
     std::vector<Value> args;
@@ -179,6 +180,7 @@ struct Runtime : EngineRuntime
         SetAdd,
         SetHas,
         Eval,
+        PromiseThen,
         IntrinsicCount
     };
     Ref<GCObject> intrinsics[IntrinsicCount];

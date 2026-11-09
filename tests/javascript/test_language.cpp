@@ -1863,3 +1863,17 @@ TEST(aCoroutinesLoopsRunInNativeCodeInItsOwnFrame)
         CHECK_EQ(got + " " + ctx.eval("String(fromAsync)", "<test>").toString(), std::string("449998 5998 129935200 at 8002000 -89970000"));
     }
 }
+
+TEST(aPromiseResolvedWithAPromiseTakesItsTicks)
+{
+    // Resolving with a promise of the engine's own, whose `then` is the built-in one, is a reaction made by a job: the
+    // same ticks as calling `then` with resolving functions, which a subclass still gets.
+    js::Context ctx;
+    ctx.eval("var log = []; const a = Promise.resolve(1); const b = new Promise(r => r(a)); b.then(v => log.push('b' + v));"
+             "a.then(v => log.push('a1')).then(() => log.push('a2')).then(() => log.push('a3'));"
+             "const c = Promise.reject(new Error('x')); const d = new Promise(r => r(c)); d.catch(e => log.push('d:' + e.message));"
+             "class P2 extends Promise {} const e = P2.resolve(5); const f = new Promise(r => r(e)); f.then(v => log.push('f' + v));"
+             "(async () => { const v = await new Promise(r => r(Promise.resolve(7))); log.push('w' + v); })();", "<test>");
+    ctx.runJobs();
+    CHECK_EQ(ctx.eval("log.join(' ')", "<test>").toString(), std::string("a1 a2 b1 a3 d:x f5 w7"));
+}

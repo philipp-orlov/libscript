@@ -379,6 +379,7 @@ void installPromise(Runtime& rt)
         addReaction(rt2, self, std::move(reaction));
         return cap.promise;
     }, 2);
+    rt.intrinsics[Runtime::PromiseThen].reset(detail::Access::ptr(proto->findOwn(rt.intern("then"))->value));
 
     rt.method(proto, "catch", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);

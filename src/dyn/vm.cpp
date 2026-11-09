@@ -3541,6 +3541,16 @@ void resolvePromise(Runtime& rt, DynPromise* p, const Value& value)
         }
         if (asFunction(then)) {
             const Value self = detail::Access::make(Type::Object, p);
+            // A promise of this engine's with the built-in `then`: the job calling `then` with p's resolving functions
+            // is a reaction that hands the outcome on to p, made when the job runs.
+            if (detail::Access::ptr(then) == rt.intrinsics[Runtime::PromiseThen].get() && asObject(value)->cls == ObjClass::Promise) {
+                Job job;
+                job.kind = Job::Kind::Adopt;
+                job.fn = value;
+                job.target = self;
+                rt.jobs.push_back(std::move(job));
+                return;
+            }
             // One of the two counts, once: what the thenable does after that is ignored.
             auto done = std::make_shared<bool>(false);
             Value onOk = rt.makeFunction(String(), [self, done](CallInfo& ci) -> Value {
@@ -3860,6 +3870,31 @@ void runPromiseJob(Runtime& rt, Job& job)
         case Job::Kind::Await:
             settledAwait(rt, static_cast<DynCoroutine*>(asObject(handler)), job.fulfilled, result);
             return;
+        case Job::Kind::Adopt: {
+            auto* source = static_cast<DynPromise*>(asObject(handler));
+            auto* target = static_cast<DynPromise*>(asObject(job.target));
+            // What the built-in `then` asks first; a constructor of another kind gets `then` called as written.
+            Value ctor;
+            try {
+                ctor = speciesConstructor(rt, handler, detail::Access::make(Type::Object, rt.promiseCtor.get()));
+            } catch (Exception& e) {
+                rejectPromise(rt, target, e.value());
+                return;
+            }
+            if (detail::Access::ptr(ctor) != rt.promiseCtor.get()) {
+                try {
+                    callValue(rt, detail::Access::make(Type::Object, rt.intrinsics[Runtime::PromiseThen].get()), handler,
+                              {makeSettler(rt, job.target, false), makeSettler(rt, job.target, true)});
+                } catch (Exception& e) {
+                    rejectPromise(rt, target, e.value());
+                }
+                return;
+            }
+            DynPromise::Reaction reaction;
+            reaction.next.reset(target);
+            addReaction(rt, source, std::move(reaction));
+            return;
+        }
         case Job::Kind::Capability: {
             const Value& resolve = job.target;
             const Value& reject = job.reject;

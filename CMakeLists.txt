@@ -160,6 +160,7 @@ set(SCRIPT_TYPED_SOURCES
 
 set(SCRIPT_DYNAMIC_SOURCES
     src/dyn/runtime.cpp
+    src/dyn/ast.cpp
     src/dyn/numconv.cpp
     src/dyn/object.cpp
     src/dyn/vm.cpp

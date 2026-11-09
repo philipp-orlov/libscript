@@ -151,7 +151,7 @@ enum class Visibility : std::uint8_t
 struct Node;
 using NodePtr = std::unique_ptr<Node>;
 
-struct Node
+struct Node final
 {
     NK kind = NK::Empty;
     std::uint32_t line = 0;
@@ -196,6 +196,11 @@ struct Node
     std::vector<NodePtr> typeParams;
 
     explicit Node(NK k, std::uint32_t ln = 0) : kind(k), line(ln) {}
+
+    /// Nodes come by the hundred thousand and go together, so they are carved from blocks of their own instead of each
+    /// being a `malloc`; a block goes back when the last node in it does.
+    static void* operator new(std::size_t size);
+    static void operator delete(void* p) noexcept;
 };
 
 inline NodePtr makeNode(NK k, std::uint32_t line = 0)

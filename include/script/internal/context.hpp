@@ -193,6 +193,7 @@ struct ContextImpl
     StringTable stringTable;
     /// Strings up to this long are interned by `str`.
     static constexpr std::size_t kInternedLength = 32;
+    static constexpr std::size_t kRopeLength = 64;
     /// The interned cell for `text`. Its initial reference is the table's own,
     /// so a string nothing else names has a count of exactly one and
     /// `sweepStrings` can recognise it.
@@ -208,6 +209,8 @@ struct ContextImpl
     Value str(const char* asciiText) { return str(ascii(asciiText)); }
     /// `str` of `head` and `tail` joined.
     Value concat(StringView head, StringView tail);
+    /// `head + tail`, as a rope when it is long enough to be worth not copying.
+    Value concat(StringCell* head, StringCell* tail);
     Box* newBox(Value v);
 
     // ---- shared vm state ----

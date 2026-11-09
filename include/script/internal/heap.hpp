@@ -137,10 +137,23 @@ using detail::GcList;
 /// A string: immutable, its characters in the cell itself, so a string is one
 /// allocation. Interned strings double as property names in the dynamic engine,
 /// where key comparison is then pointer comparison.
+///
+/// A long concatenation makes a rope instead: a cell that holds a count of each
+/// of its two halves where the characters would be, so `a + b` copies nothing.
+/// The first look at its characters copies them once into a buffer of its own
+/// and lets the halves go, which makes building a string piece by piece linear.
+/// Strings hold no objects, so the counts alone free a rope.
 struct StringCell : GCObject
 {
+    enum Bits : std::uint8_t
+    {
+        kInSource = 1,   ///< a name some compiled program spells out; there are only as many of those as the source has
+        kRope = 2,       ///< two halves follow the cell, not yet joined
+        kFlattened = 4,  ///< a rope whose characters are in a buffer of its own
+        kOutOfLine = kRope | kFlattened,  ///< the characters are not after the cell: what native code tests
+    };
     bool interned = false;  ///< also present in the context's string table
-    bool inSource = false;  ///< a name some compiled program spells out; there are only as many of those as the source has
+    std::uint8_t bits = 0;  ///< `Bits`; one byte, so a string still fits the padding of its header
     std::uint32_t length;
     std::size_t hash_ = 0;  ///< 0 until someone asks
 
@@ -153,9 +166,23 @@ struct StringCell : GCObject
         if (!b.empty())
             std::memcpy(chars + a.size(), b.data(), b.size() * sizeof(Char));
     }
+    /// A rope of two strings, each of which it holds a count of.
+    StringCell(StringCell* head, StringCell* tail) : bits(kRope), length(head->length + tail->length)
+    {
+        kind = CellKind::String;
+        detail::incRef(head);
+        detail::incRef(tail);
+        halves()[0] = head;
+        halves()[1] = tail;
+    }
     ~StringCell() override;
 
-    StringView text() const noexcept { return StringView(reinterpret_cast<const Char*>(this + 1), length); }
+    StringView text() const noexcept
+    {
+        if (!(bits & kOutOfLine)) [[likely]]
+            return StringView(reinterpret_cast<const Char*>(this + 1), length);
+        return const_cast<StringCell*>(this)->outOfLine();
+    }
     std::size_t hash() noexcept
     {
         if (!hash_)
@@ -164,14 +191,38 @@ struct StringCell : GCObject
     }
     std::size_t heapSize() const override
     {
+        if (bits & kRope)
+            return cellBytes;
+        if (bits & kFlattened)
+            return cellBytes + length * sizeof(Char);
         return std::max<std::size_t>(cellBytes, sizeof(*this) + length * sizeof(Char));
     }
     /// How many characters fit in the cell as allocated: more than `length` for one made to be appended to.
     std::size_t capacity() const noexcept
     {
+        if (bits & kOutOfLine)
+            return length;
         return cellBytes > sizeof(*this) ? (cellBytes - sizeof(*this)) / sizeof(Char) : length;
     }
     Char* mutableChars() noexcept { return reinterpret_cast<Char*>(this + 1); }
+    static constexpr std::size_t kRopeBytes = 2 * sizeof(void*);
+    bool inSource() const noexcept { return bits & kInSource; }
+    void markInSource() noexcept { bits |= kInSource; }
+    /// A rope's halves are let go at teardown, before any cell is destroyed.
+    void clearReferences() override;
+    /// The buffer of a flattened rope, which its context frees: the cell no longer names it.
+    Char* takeBuffer() noexcept
+    {
+        Char* chars = bits & kFlattened ? buffer() : nullptr;
+        bits &= std::uint8_t(~kFlattened);
+        return chars;
+    }
+
+private:
+    StringCell** halves() noexcept { return reinterpret_cast<StringCell**>(this + 1); }
+    Char*& buffer() noexcept { return *reinterpret_cast<Char**>(this + 1); }
+    /// The characters of a rope, joined on the first call.
+    StringView outOfLine() noexcept;
 };
 static_assert(alignof(StringCell) >= alignof(Char));
 

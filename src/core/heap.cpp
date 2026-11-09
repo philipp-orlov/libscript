@@ -103,6 +103,60 @@ StringCell::~StringCell()
 {
     if (interned && rt)
         rt->stringTable.erase(this);
+    if (bits & kRope) {
+        // Onto the context's worklist when they die too, so a long chain of halves frees without recursing.
+        detail::decRef(halves()[0]);
+        detail::decRef(halves()[1]);
+    }
+}
+
+void StringCell::clearReferences()
+{
+    if (!(bits & kRope))
+        return;
+    StringCell* head = halves()[0];
+    StringCell* tail = halves()[1];
+    halves()[0] = halves()[1] = nullptr;
+    detail::decRef(head);
+    detail::decRef(tail);
+}
+
+StringView StringCell::outOfLine() noexcept
+{
+    if (bits & kRope) {
+        // From the payload pool, not the cell heap, whose slots are all taken for cells.
+        const std::size_t bytes = std::size_t(length) * sizeof(Char);
+        auto* chars = static_cast<Char*>(bytes <= payload_cache::kMaxBytes ? payload_cache::take(bytes)
+                                                                            : payload_cache::takeLarge(bytes));
+        // Left to right with a stack of what is still to copy: a rope built by appending is as deep as it is long.
+        std::vector<const StringCell*> pending{halves()[1], halves()[0]};
+        std::size_t at = 0;
+        while (!pending.empty()) {
+            const StringCell* piece = pending.back();
+            pending.pop_back();
+            if (piece->bits & kRope) {
+                auto* const* parts = reinterpret_cast<StringCell* const*>(piece + 1);
+                pending.push_back(parts[1]);
+                pending.push_back(parts[0]);
+                continue;
+            }
+            const StringView text = piece->text();
+            if (!text.empty())
+                std::memcpy(chars + at, text.data(), text.size() * sizeof(Char));
+            at += text.size();
+        }
+        StringCell* head = halves()[0];
+        StringCell* tail = halves()[1];
+        buffer() = chars;
+        halves()[1] = nullptr;
+        bits = std::uint8_t((bits & ~kRope) | kFlattened);
+        const std::uint32_t was = gcBytes;
+        gcBytes = std::uint32_t(heapSize());
+        rt->heapBytes += gcBytes - was;
+        detail::decRef(head);
+        detail::decRef(tail);
+    }
+    return StringView(buffer(), length);
 }
 
 StringCell* StringTable::find(StringView text, std::size_t hash) const noexcept
@@ -296,6 +350,18 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
             break;
         }
 #endif
+        case CellKind::String: {
+            auto* text = static_cast<StringCell*>(cell);
+            if (Char* chars = text->takeBuffer()) {
+                const std::size_t bytes = std::size_t(text->length) * sizeof(Char);
+                if (bytes <= payload_cache::kMaxBytes)
+                    payload_cache::give(chars, bytes);
+                else
+                    payload_cache::giveLarge(chars, bytes);
+            }
+            cell->~GCObject();
+            break;
+        }
         default: cell->~GCObject(); break;
     }
     if (bytes)
@@ -551,6 +617,17 @@ Value ContextImpl::str(StringView text)
     if (text.size() <= kInternedLength)
         return detail::Access::make(Type::String, intern(text));
     return detail::Access::adopt(Type::String, newString(text));
+}
+
+Value ContextImpl::concat(StringCell* head, StringCell* tail)
+{
+    // A rope only past a length where copying starts to cost more than the cell; short ones are interned as before.
+    const std::size_t total = std::size_t(head->length) + tail->length;
+    if (total < kRopeLength || head->length == 0 || tail->length == 0)
+        return concat(head->text(), tail->text());
+    if (total > 0xFFFFFFF0u)
+        throw Error(ErrorCode::OutOfMemory, "string too long");
+    return detail::Access::adopt(Type::String, newCellSized<StringCell>(StringCell::kRopeBytes, head, tail));
 }
 
 Value ContextImpl::concat(StringView head, StringView tail)

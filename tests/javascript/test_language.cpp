@@ -1877,3 +1877,16 @@ TEST(aPromiseResolvedWithAPromiseTakesItsTicks)
     ctx.runJobs();
     CHECK_EQ(ctx.eval("log.join(' ')", "<test>").toString(), std::string("a1 a2 b1 a3 d:x f5 w7"));
 }
+
+TEST(aStringBuiltPieceByPieceIsJoinedOnce)
+{
+    // A long `+` makes a rope; reading it, from the interpreter or native code, as a key or in a comparison joins it.
+    js::Context ctx;
+    ctx.eval("var o = { out: '' }; function emit(t) { o.out = o.out + t; }"
+             "for (var i = 0; i < 30000; i++) emit('<li>' + i + '</li>');"
+             "function sum(s) { var h = 0; for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }"
+             "var a = 'x'.repeat(40), b = a + 'y'.repeat(40), c = b + b, m = {}; m[c] = 1;"
+             "var r = [o.out.length, sum(o.out), sum(c), c === b + b, m['x'.repeat(40) + 'y'.repeat(40) + b],"
+             "         o.out.slice(-11), c[79] + c[80]].join(' ');", "<test>");
+    CHECK_EQ(ctx.eval("r", "<test>").toString(), std::string("408890 1705946264 1838404864 true 1 >29999</li> yx"));
+}

@@ -356,7 +356,7 @@ Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
 {
     if (Shape* known = from->after(key, attrs))
         return known;
-    const bool named = key->kind == CellKind::String && static_cast<StringCell*>(key)->inSource;
+    const bool named = key->kind == CellKind::String && static_cast<StringCell*>(key)->inSource();
     if (from->count >= Shape::kMaxProperties || (!named && from->count >= Shape::kMaxMadeNames) ||
         (!named && from->transitions.size() >= Shape::kMaxTransitions) ||
         shapes.size() >= kMaxShapes)

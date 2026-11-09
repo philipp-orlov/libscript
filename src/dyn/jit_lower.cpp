@@ -59,6 +59,7 @@ constexpr std::int64_t kExtensibleOffset = offsetof(DynObject, extensible);
 constexpr std::int64_t kRcOffset = offsetof(GCObject, rc);
 constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
 constexpr std::int64_t kStringCharsOffset = sizeof(StringCell);
+constexpr std::int64_t kStringFormOffset = offsetof(StringCell, bits);
 constexpr std::int64_t kRareOffset = offsetof(DynObject, rare);
 constexpr std::int64_t kPropValueOffset = offsetof(Prop, value);
 constexpr std::int64_t kElementsOffset = offsetof(DynArray, store);  // a pointer, then two 32-bit counts
@@ -6568,6 +6569,18 @@ private:
             bound.cond = IrCond::Hs;
             bound.width = index.rep == Rep::Int32 && !index.isConst ? 32 : 64;
             bound.target = generic;
+        }
+        // A rope has no characters in its cell until something joins them.
+        {
+            const std::int32_t bits = load(cell, kStringFormOffset, 1, false, kAliasHeader);
+            const std::int32_t outOfLine = fn_.newVreg(false);
+            IrInst& mask = inst(IrOp::And);
+            mask.d = outOfLine;
+            mask.a = bits;
+            mask.hasImm = true;
+            mask.imm = StringCell::kOutOfLine;
+            mask.width = 32;
+            branchCmp(outOfLine, IrCond::Ne, 0, generic);
         }
         const std::int32_t code = fn_.newVreg(false);
         IrInst& ld = inst(IrOp::LoadIdx);

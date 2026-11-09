@@ -846,7 +846,7 @@ private:
     std::uint32_t atomFor(StringView name)
     {
         StringCell* key = rt_.intern(name);
-        key->inSource = true;
+        key->markInSource();
         return atomIndex(key);
     }
     /// The operand of an instruction with an inline cache.

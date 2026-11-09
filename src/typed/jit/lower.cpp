@@ -2759,6 +2759,29 @@ private:
                 IrInst& ext = inst(IrOp::Zext32);
                 ext.d = wide;
                 ext.a = i;
+                // A rope a dynamic language made has its characters out of the cell until they are joined.
+                const std::int32_t form = fn_.newVreg(false);
+                IrInst& lf = inst(IrOp::Load);
+                lf.d = form;
+                lf.a = args[0].vreg;
+                lf.imm = kStringFormOffset;
+                lf.width = 1;
+                const std::int32_t rope = newLabel();
+                const std::int32_t done = newLabel();
+                const std::int32_t outOfLine = fn_.newVreg(false);
+                IrInst& mask = inst(IrOp::And);
+                mask.d = outOfLine;
+                mask.a = form;
+                mask.hasImm = true;
+                mask.imm = StringCell::kOutOfLine;
+                mask.width = 32;
+                IrInst& test = inst(IrOp::BrCmp);
+                test.a = outOfLine;
+                test.cond = IrCond::Ne;
+                test.width = 32;
+                test.hasImm = true;
+                test.imm = 0;
+                test.target = rope;
                 const std::int32_t d = fn_.newVreg(false);
                 IrInst& ch = inst(IrOp::LoadIdx);
                 ch.d = d;
@@ -2767,6 +2790,14 @@ private:
                 ch.scale = 1;
                 ch.imm = kStringDataOffset;
                 ch.width = 2;
+                inst(IrOp::Br).imm = done;
+                bindLabel(rope);
+                const std::int32_t joined =
+                    callHelper(reinterpret_cast<void*>(&scriptJitStringCharAt), {args[0].vreg, wide}, true);
+                IrInst& mov = inst(IrOp::Mov);
+                mov.d = d;
+                mov.a = joined;
+                bindLabel(done);
                 push(valueEntry(d, core_.charType));
                 release(args[0]);
                 return true;

@@ -1275,9 +1275,10 @@ Value add(Runtime& rt, const Value& a, const Value& b)
     const Value pb = toPrimitive(rt, b, 0);
     if (pa.isString() || pb.isString())
     {
-        if (pa.isString() && pb.isString())
-            return rt.ctx.concat(asString(pa)->text(), asString(pb)->text());
-        return rt.str(toStringValue(rt, pa) + toStringValue(rt, pb));
+        // The other side as a string of its own, so a long string plus a number is a rope too and nothing is copied.
+        const Value sa = pa.isString() ? pa : rt.str(toStringValue(rt, pa));
+        const Value sb = pb.isString() ? pb : rt.str(toStringValue(rt, pb));
+        return rt.ctx.concat(asString(sa), asString(sb));
     }
     if (pa.isBigInt() || pb.isBigInt())
         return numericSlow(rt, bigint::BinaryOp::Add, pa, pb);

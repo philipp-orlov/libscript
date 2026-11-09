@@ -232,6 +232,11 @@ const MethodInfo* scriptJitResolveInterface(Runtime* rt, GCObject* receiver, con
                    [&]() -> const MethodInfo* { return resolveInterface(*rt, valueOfCell(receiver), declared); });
 }
 
+std::int64_t scriptJitStringCharAt(StringCell* text, std::int64_t index) noexcept
+{
+    return std::int64_t(text->text()[std::size_t(index)]);
+}
+
 std::int32_t scriptJitStringEquals(GCObject* a, GCObject* b) noexcept
 {
     if (a == b)

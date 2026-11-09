@@ -31,6 +31,7 @@ inline constexpr std::int64_t kArrayDataOffset = sizeof(CSArray);
 inline constexpr std::int64_t kBoxValueOffset = offsetof(Box, value);
 inline constexpr std::int64_t kStringLengthOffset = offsetof(StringCell, length);
 inline constexpr std::int64_t kStringDataOffset = sizeof(StringCell);
+inline constexpr std::int64_t kStringFormOffset = offsetof(StringCell, bits);
 inline constexpr std::int64_t kDelegateMethodOffset = offsetof(CSDelegate, method);
 inline constexpr std::int64_t kDelegateNextOffset = offsetof(CSDelegate, next);
 inline constexpr std::int64_t kDelegateTargetOffset = offsetof(CSDelegate, target);
@@ -77,6 +78,8 @@ std::int64_t scriptJitSubOvf(Runtime* rt, std::int64_t a, std::int64_t b) noexce
 std::int64_t scriptJitMulOvf(Runtime* rt, std::int64_t a, std::int64_t b) noexcept;
 
 // ---- strings; `tag` is the value's tag, or -1 for "read it off the cell" ----
+/// A character of a string whose characters are not in its cell: a rope, joined here.
+std::int64_t scriptJitStringCharAt(StringCell* text, std::int64_t index) noexcept;
 GCObject* scriptJitConcat(Runtime* rt, std::int64_t count, std::int64_t tag0, std::uint64_t payload0, std::int64_t tag1,
                           std::uint64_t payload1, std::int64_t tag2, std::uint64_t payload2) noexcept;
 GCObject* scriptJitToString(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;

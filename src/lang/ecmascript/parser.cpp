@@ -1591,6 +1591,19 @@ NodePtr Parser::conditional()
 
 NodePtr Parser::binary(int minPrecedence)
 {
+    // `-a ** b` is ambiguous and so an early error; `(-a) ** b` and `++a ** b` begin with something else.
+    bool unaryLeft = false;
+    switch (cur_.type) {
+        case Tok::Bang:
+        case Tok::Tilde:
+        case Tok::Plus:
+        case Tok::Minus:
+        case Tok::TypeOf:
+        case Tok::Void:
+        case Tok::Delete: unaryLeft = true; break;
+        case Tok::Await: unaryLeft = inAsync_; break;
+        default: break;
+    }
     NodePtr left = unary();
     std::size_t links = 0;
     for (;;) {
@@ -1607,6 +1620,7 @@ NodePtr Parser::binary(int minPrecedence)
             n->a = std::move(left);
             n->type = typeExpr();
             left = std::move(n);
+            unaryLeft = false;
             continue;
         }
         const int prec = precedenceOf(cur_.type);
@@ -1615,6 +1629,9 @@ NodePtr Parser::binary(int minPrecedence)
         if (noIn_ && cur_.type == Tok::In)
             return left;  // the `in` of a for-in head, not the operator
         const Tok op = cur_.type;
+        if (op == Tok::StarStar && unaryLeft)
+            fail("a unary operator needs parentheses before '**'");
+        unaryLeft = false;
         advance();
         // `**` is the only right-associative binary operator.
         NodePtr right = binary(op == Tok::StarStar ? prec : prec + 1);

@@ -2040,6 +2040,24 @@ TEST(htmlLikeCommentsAreComments)
     CHECK_EQ(run("var s = '<!-- not a comment'; var u = '-->'; s.length + u.length"), std::string("21"));
 }
 
+TEST(aUnaryOperatorBeforeExponentiationIsASyntaxError)
+{
+    // `-2 ** 2` is an early error; parentheses, an update expression or a unary operator on the right are fine.
+    CHECK_EQ(run("var a = 1; [(-2) ** 2, 2 ** -1, ++a ** 2, -(2 ** 2), 2 ** 3 ** 2, (typeof 2) ** 2, a-- ** 2].join()"),
+             std::string("4,0.5,4,-4,512,NaN,4"));
+    for (const char* source : {"-2 ** 2", "typeof 2 ** 2", "!1 ** 2", "~1 ** 2", "+1 ** 2", "void 0 ** 2",
+                               "delete a.b ** 2", "2 * -3 ** 0", "1 + -2 ** 2", "(async () => await 1 ** 2)"}) {
+        bool refused = false;
+        try {
+            js::Context ctx;
+            ctx.eval(source, "<test>");
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        CHECK_EQ(refused, true);
+    }
+}
+
 TEST(aGeneratorIsSteppedWithoutAResultObject)
 {
     // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the

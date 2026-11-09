@@ -89,8 +89,13 @@ private:
 /// Call a compiled function from C++.
 Value enterNative(Runtime& rt, DynFunction* fn, const FunctionCode& code, const Value& thisValue, const Value* args,
                   std::size_t argc);
-/// At a loop head with an empty stack: carry on in native code, if there is an entry for here.
-bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result);
+/// Whether the loop whose head is at `head` can suspend the coroutine it is in on its way round: a `yield` or an
+/// `await` in it.
+bool loopSuspends(const FunctionCode& code, std::uint32_t head);
+/// At a loop head with an empty stack: carry on in native code, if there is an entry for here. 0: there is none; 1: the
+/// call is done and `result` is what it returned; 2: a coroutine's code handed back, and the interpreter goes on in the
+/// frame from `frame.pc`, its stack filled in.
+int enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result);
 /// Carry on with a call in the interpreter from `pc`, the frame filled in by `fill`: where native code that assumed too
 /// much hands over.
 Value resumeInterpreter(Runtime& rt, DynFunction* fn, const FunctionCode& code, const Value& thisValue, std::uint32_t pc,

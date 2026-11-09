@@ -403,6 +403,8 @@ struct DeoptValue
 /// What a bail needs to know, which it used to write out in code at every place it could happen.
 struct DeoptInfo
 {
+    /// Not a guess gone wrong but where native code always hands over, as a coroutine does where it suspends.
+    bool planned = false;
     const FunctionCode* code = nullptr;
     const FunctionCode* outer = nullptr;
     std::uint32_t pc = 0;

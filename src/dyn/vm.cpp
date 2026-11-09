@@ -1460,7 +1460,7 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
 #if SCRIPT_ENABLE_DYN_JIT
     if (code.jitEntry)
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
-    if (!code.jitRefused && rt.ctx.options.jit.mode != JitOptions::Mode::Off &&
+    if (!code.jitRefused && !code.isGenerator && !code.isAsync && rt.ctx.options.jit.mode != JitOptions::Mode::Off &&
         (rt.ctx.options.jit.mode == JitOptions::Mode::Eager || ++code.jitHotness >= code.jitThreshold(rt.ctx.options.jit.threshold)) &&
         compileNative(rt, code))
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
@@ -2080,7 +2080,8 @@ Value execute(Runtime& rt, Frame& frame)
     // which a short loop in a long function, run a few thousand times, does not earn back. Code already compiled is free.
     std::uint64_t loopWork = 0;
     const std::uint64_t workWanted = std::uint64_t(code.code.size()) * osrWorkPerByte();
-    const auto loopBack = [&](std::uint32_t target, std::uint32_t from, Value& result) {
+    // 0: carry on; 1: the call is done, with `result`; 2: native code handed the coroutine back, at `frame.pc`.
+    const auto loopBack = [&](std::uint32_t target, std::uint32_t from, Value& result) -> int {
         if (backEdges == 0)
             return false;
         loopWork += from - target;
@@ -2088,12 +2089,13 @@ Value execute(Runtime& rt, Frame& frame)
             --backEdges;
             return false;
         }
-        if (loopWork < workWanted && !code.jitCode)
+        // A coroutine's frame comes into native code only at a loop, on each resume: only one that has done the work.
+        if (loopWork < workWanted && (!code.jitCode || frame.coroutine))
             return false;
         backEdges = 0;
         frame.pc = target;
-        if (enterNativeAtLoop(rt, frame, target, result))
-            return true;
+        if (const int entered = enterNativeAtLoop(rt, frame, target, result))
+            return entered;
 #if SCRIPT_ENABLE_JIT_THREAD
         // Being compiled elsewhere: asked again a while on.
         if (code.jitJob)
@@ -2102,7 +2104,7 @@ Value execute(Runtime& rt, Frame& frame)
         return false;
     };
 #else
-    const auto loopBack = [](std::uint32_t, std::uint32_t, Value&) { return false; };
+    const auto loopBack = [](std::uint32_t, std::uint32_t, Value&) -> int { return 0; };
 #endif
 
     auto pop = [&sp]() -> Value {
@@ -2931,8 +2933,12 @@ Value execute(Runtime& rt, Frame& frame)
                         const std::uint32_t target = operandAt(pc);
                         if (target < pc) {
                             Value result;
-                            if (loopBack(target, pc, result))
-                                return result;
+                            if (const int entered = loopBack(target, pc, result)) {
+                                if (entered == 1)
+                                    return result;
+                                pc = frame.pc;
+                                break;
+                            }
                         }
                         pc = target;
                         break;
@@ -2952,8 +2958,12 @@ Value execute(Runtime& rt, Frame& frame)
                             break;
                         if (target < pc) {
                             Value result;
-                            if (loopBack(target, pc, result))
-                                return result;
+                            if (const int entered = loopBack(target, pc, result)) {
+                                if (entered == 1)
+                                    return result;
+                                pc = frame.pc;
+                                break;
+                            }
                         }
                         pc = target;
                         break;

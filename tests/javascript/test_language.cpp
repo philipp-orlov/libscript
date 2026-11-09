@@ -1835,3 +1835,31 @@ TEST(nativeCodeDoesBigIntArithmetic)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("392460006,800087529,false,false,bigint,343,25,1 44550 TypeError TypeError"));
     }
 }
+
+TEST(aCoroutinesLoopsRunInNativeCodeInItsOwnFrame)
+{
+    // A loop in a generator or an async function that does not suspend is compiled; native code hands the coroutine back
+    // to the interpreter where it suspends, with every local it has, as `yield*` in a loop needs.
+    const char* program =
+        "function* fill() { let c = 1; while (true) { let s = 0; for (let i = 0; i < 3000; i++) s += (i + c) % 7; c++;"
+        "  const got = yield s; if (got === 'stop') { for (let j = 0; j < 3000; j++) s -= 1; return s; } } }"
+        "const g = fill(); let t = 0; for (let k = 0; k < 50; k++) t += g.next().value; const last = g.next('stop').value;"
+        "const step = { *process(st) { st.n++; let w = 0; for (let i = 0; i < 2000; i++) w += i; if (st.n % 3 == 0) yield w; } };"
+        "function* program(st) { let max = 40; while (st.line != null) { if (st.line > max) { st.line = null; continue; }"
+        "  st.line++; let x = 0; for (let i = 0; i < 2000; i++) x ^= i; yield* step.process(st); } }"
+        "let u = 0; for (let r = 0; r < 5; r++) { const st = { line: 1, n: 0 }; for (const v of program(st)) u += v; u += st.n; }"
+        "function* thrower() { let a = 0; for (let i = 0; i < 5000; i++) { a += i; if (i == 4000) throw new Error('at ' + a); } yield a; }"
+        "let caught = ''; try { thrower().next(); } catch (e) { caught = e.message; }"
+        "async function af(n) { let s = 0; for (let i = 0; i < n; i++) s += i; await null; for (let i = 0; i < n; i++) s -= 2 * i; return s; }"
+        "let fromAsync = 0; (async () => { for (let k = 0; k < 20; k++) fromAsync += await af(3000); })();"
+        "[t, last, u, caught].join(' ')";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        const std::string got = ctx.eval(program, "<test>").toString();
+        ctx.runJobs();
+        CHECK_EQ(got + " " + ctx.eval("String(fromAsync)", "<test>").toString(), std::string("449998 5998 129935200 at 8002000 -89970000"));
+    }
+}

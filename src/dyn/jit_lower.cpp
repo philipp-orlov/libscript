@@ -251,7 +251,9 @@ public:
     {
         // Handlers and `finally` subroutines go where no branch says: everything is live in such a function. With no
         // locals there is nothing to work out.
-        if (!code.handlers.empty() || words_ == 0 || code.code.empty()) {
+        // A coroutine's suspensions branch where no instruction here says, by what they resume with: everything is live
+        // in one of those too.
+        if (!code.handlers.empty() || words_ == 0 || code.code.empty() || code.isGenerator || code.isAsync) {
             all_ = true;
             return;
         }
@@ -787,7 +789,8 @@ public:
     static bool inlinable(const FunctionCode& c, bool asConstructor = false)
     {
         if (c.code.size() > 160 || !c.handlers.empty() || c.hasRest || c.argumentsSlot != FunctionCode::kNoSlot ||
-            (c.isClassConstructor && !asConstructor) || c.isDerivedConstructor || c.numLocals > 8 || !c.boxedParams.empty())
+            (c.isClassConstructor && !asConstructor) || c.isDerivedConstructor || c.isGenerator || c.isAsync || c.numLocals > 8 ||
+            !c.boxedParams.empty())
             return false;
         bool returns = false;
         for (std::uint32_t pc = 0; pc < c.code.size();) {
@@ -1718,6 +1721,7 @@ private:
         outermost().jitDeopts.push_back(std::move(owned));
         info->code = &code_;
         info->outer = &outermost();
+        info->planned = std::exchange(plannedBail_, false);
         info->pc = pc_;
         info->stack = std::uint32_t(stack_.size() + popped.size());
         std::vector<std::int32_t> places;
@@ -2708,6 +2712,25 @@ private:
         const auto operand = [&]() { return readOperand(c, pc + 1); };
         switch (op) {
             case Op::Nop: return true;
+            case Op::CoStart:
+            case Op::Yield:
+            case Op::Await:
+            case Op::DelegateStart:
+            case Op::DelegateCall:
+            case Op::DelegateCheck:
+            case Op::DelegateDone:
+            case Op::AsyncIterStart:
+            case Op::AsyncIterCall:
+            case Op::AsyncIterCheck:
+            case Op::AsyncIterClose: {
+                // Where a coroutine starts or suspends: the interpreter does that, in the coroutine's frame, where native
+                // code always hands over. That is no guess gone wrong.
+                if (parent_ || !(code_.isGenerator || code_.isAsync))
+                    refuse("a coroutine's suspension inlined");
+                plannedBail_ = true;
+                leaveForTheInterpreter({});
+                return false;
+            }
             case Op::PushUndefined: push(constTagged(Type::Undefined)); return true;
             case Op::PushNull: push(constTagged(Type::Null)); return true;
             case Op::PushTrue: push(constTagged(Type::Bool, 1)); return true;
@@ -7925,6 +7948,7 @@ private:
     bool thisIsCell_ = false;
     /// Inlined as a constructor: the shape `this` starts with.
     const Shape* startShape_ = nullptr;
+    bool plannedBail_ = false;  ///< the next bail is where the code always hands over
     /// `this` is the object `constructInPlace` made, with room for so many properties, and nothing has seen it yet.
     bool freshThis_ = false;
     std::uint32_t freshRoom_ = 0;
@@ -8005,6 +8029,28 @@ std::vector<std::uint8_t> readsBeforeWrite(const FunctionCode& code)
 }
 
 }  // namespace
+
+bool loopSuspends(const FunctionCode& code, std::uint32_t head)
+{
+    const std::vector<std::uint8_t>& c = code.code;
+    // The loop runs from its head to the last jump back to it.
+    std::uint32_t end = head;
+    for (std::uint32_t pc = head; pc < c.size(); pc += 1 + std::uint32_t(operandsOf(Op(c[pc]))) * 4) {
+        const Op op = Op(c[pc]);
+        if (isBranch(op) && readOperand(c, pc + 1) == head)
+            end = pc;
+    }
+    for (std::uint32_t pc = head; pc <= end && pc < c.size(); pc += 1 + std::uint32_t(operandsOf(Op(c[pc]))) * 4) {
+        switch (Op(c[pc])) {
+            case Op::Yield:
+            case Op::Await:
+            case Op::DelegateStart:
+            case Op::AsyncIterStart: return true;
+            default: break;
+        }
+    }
+    return false;
+}
 
 bool lowerFunction(Runtime& rt, const FunctionCode& code, IrFunction& out, std::string* why)
 {

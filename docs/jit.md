@@ -160,8 +160,20 @@ branches on known constants, moves constants out of call-free loops and removes 
 pushed since the `try` began and branches to a landing block: a `catch` takes the exception from where the raising helper left
 it, and a `finally` puts it aside under a continuation number to raise again when the block ends. A `for-of`'s handler is
 such a landing, closing the iterator. Nothing is inlined inside a protected range, and nothing bails inside a `finally` body.
-What stays in the interpreter: generator and async functions, a `try`/`finally` with values under it on the stack (inside a
-`switch` or a `for-in`), and a function with a bigint literal. `--dump-native` lists what it skipped.
+A generator or async function is compiled for its loops. Native code is entered at a loop head in the coroutine's own frame,
+once the loop has done enough work on that resume, and only at a loop that cannot suspend on its way round. Where the code
+reaches a `yield`, an `await` or a `yield*`, it hands the frame back to the interpreter, which suspends there. A bail in a
+coroutine's code goes back to its frame the same way. A coroutine whose code has a `finally` stays in the interpreter.
+
+Bigint arithmetic is native code too: a constant bigint is held in registers, and an operator whose operand is known to be a
+bigint, or that has bailed before, calls the interpreter's arithmetic.
+
+The fields of a class are defined through a property site that learns up to four shapes, so a base class's fields go on in
+place on objects of every class derived from it. `new` of a class goes in place too: its field initialiser first, then the
+constructor body.
+
+What stays in the interpreter: a coroutine's suspensions themselves, a `try`/`finally` with values under it on the stack
+(inside a `switch` or a `for-in`), and a derived class's constructor. `--dump-native` lists what it skipped.
 
 A computed-key access, `o[k]` with a key that is no index (a symbol, a string, a private name such as `this.#x`), has an
 inline cache of one key, shape and slot, in the interpreter and in native code; a key a shape names is pinned by it.

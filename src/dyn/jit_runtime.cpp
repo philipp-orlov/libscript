@@ -287,7 +287,8 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
     std::uint64_t where = 0;
     std::memcpy(&where, header, sizeof where);
     const auto pc = std::uint32_t(where);
-    const auto stackCount = std::uint32_t(where >> 32);
+    const auto stackCount = std::uint32_t(where >> 32) & 0x7fffffffu;
+    const bool planned = (where >> 63) != 0;
     const FunctionCode* outer = nullptr;
     std::memcpy(&outer, header + 8, sizeof outer);
     if (!outer)
@@ -297,7 +298,7 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
     // and after a few rounds of that, nothing. The bail is the instruction's, in whichever function it is, but the code
     // to throw away is that of the function it was compiled into.
     constexpr std::uint32_t kBailLimit = 8;
-    if (std::find(code->jitBailedAt.begin(), code->jitBailedAt.end(), pc) == code->jitBailedAt.end())
+    if (!planned && std::find(code->jitBailedAt.begin(), code->jitBailedAt.end(), pc) == code->jitBailedAt.end())
         code->jitBailedAt.push_back(pc);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* log = std::getenv("SCRIPT_JIT_BAILS")) {
@@ -307,7 +308,7 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
         }
     }
 #endif
-    if (++outer->jitBails > kBailLimit && outer->jitEntry) {
+    if (!planned && ++outer->jitBails > kBailLimit && (outer->jitEntry || outer->jitCode)) {
         outer->jitEntry = nullptr;
         outer->jitCallEntry = nullptr;
         outer->jitCode = nullptr;
@@ -345,6 +346,17 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
         for (std::uint32_t i = 0; i < in.stack; ++i)
             frame.stack.push_back(at(2 * in.locals + i));
     };
+    // A coroutine's own code, entered at a loop in its frame: that frame takes the values, and the interpreter goes on in
+    // it, where it can suspend.
+    if ((code->isGenerator || code->isAsync) && outer == code && !rt->nativeCoroutines.empty() &&
+        rt->nativeCoroutines.back()->code == code) {
+        Frame& frame = *rt->nativeCoroutines.back();
+        frame.stack.clear();
+        fill(frame, &state);
+        frame.pc = pc;
+        rt->coroutineHandedBack = true;
+        return take(Value::undefined());
+    }
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
         return take(resumeInterpreter(*rt, fn, *code, valueOf(thisTag, thisPayload), pc, fill, &state));
     });
@@ -419,7 +431,7 @@ NativePair scriptDynBail(Runtime* rt, const DeoptInfo* info, const char* frame) 
     const std::size_t count = info->values.size();
     auto* buffer = static_cast<std::uint8_t*>(__builtin_alloca(16 + count * 16));
     std::memset(buffer, 0, 16 + count * 16);
-    const std::uint64_t where = std::uint64_t(info->pc) | (std::uint64_t(info->stack) << 32);
+    const std::uint64_t where = std::uint64_t(info->pc) | (std::uint64_t(info->stack) << 32) | (info->planned ? std::uint64_t(1) << 63 : 0);
     std::memcpy(buffer, &where, sizeof where);
     std::memcpy(buffer + 8, &info->outer, sizeof info->outer);
     for (std::size_t i = 0; i < count; ++i) {
@@ -1118,11 +1130,19 @@ Value CallbackLoop::enter(const void* entry, std::int64_t thisTag, std::uint64_t
     return resultValue(results);
 }
 
-bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result)
+int enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result)
 {
     const FunctionCode& code = *frame.code;
-    if (!frame.stack.empty() || !compileNative(rt, code) || !code.jitCode)
-        return false;
+    if (!frame.stack.empty() || !frame.subStack.empty())
+        return 0;
+    // A coroutine goes back to its frame when native code hands over, with no way yet to say what a `finally` was doing.
+    if (frame.coroutine && std::any_of(code.handlers.begin(), code.handlers.end(), [](const Handler& h) { return h.kind == HandlerKind::Finally; }))
+        return 0;
+    // A loop that suspends each time round would go into native code and straight back out on every resume.
+    if (frame.coroutine && loopSuspends(code, pc))
+        return 0;
+    if (!compileNative(rt, code) || !code.jitCode)
+        return 0;
     const typed::NativeCode::Osr* entry = nullptr;
     for (const typed::NativeCode::Osr& candidate : code.jitCode->osr) {
         if (candidate.pc == pc)
@@ -1204,11 +1224,30 @@ bool enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& resul
     armNativeRun(rt, reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)));
     std::uint64_t results[2] = {0, 0};
     double fpResult = 0;
+    // A coroutine's frame is where a bail in its code goes back to, to suspend there.
+    const bool coroutine = frame.coroutine != nullptr;
+    if (coroutine)
+        rt.nativeCoroutines.push_back(&frame);
+    struct PopCoroutine
+    {
+        Runtime& rt;
+        bool active;
+        ~PopCoroutine()
+        {
+            if (active)
+                rt.nativeCoroutines.pop_back();
+        }
+    } popCoroutine{rt, coroutine};
     typed::scriptJitEnter(reinterpret_cast<typed::Runtime*>(&rt), entry->entry, ints, fps, nullptr, 0, nullptr, results,
                           &fpResult);
     raisePending(rt);
     result = resultValue(results);
-    return true;
+    if (coroutine && rt.coroutineHandedBack) {
+        rt.coroutineHandedBack = false;
+        result = Value::undefined();
+        return 2;
+    }
+    return 1;
 }
 
 namespace {
@@ -1245,6 +1284,9 @@ bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunctio
                               std::to_string(code.lineAt(0)) + " inlined " + std::to_string(fn.inlinedMethods) + "\n" +
                               rt.jitBackend->dump(compiled)),
                      false);
+    // A coroutine's code is entered at its loops only: a call of it makes the coroutine, which the interpreter does.
+    if (code.isGenerator || code.isAsync)
+        return true;
     if (!code.isClassConstructor)
         code.jitCallEntry = compiled->fastEntry;
     code.jitEntry = compiled->fastEntry;
@@ -1315,7 +1357,7 @@ void JitWorker::run()
 
 bool compileNative(Runtime& rt, const FunctionCode& code)
 {
-    if (code.jitEntry)
+    if (code.jitEntry || code.jitCode)
         return true;
 #if SCRIPT_ENABLE_JIT_THREAD
     if (code.jitJob) {

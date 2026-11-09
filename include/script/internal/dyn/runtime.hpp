@@ -219,6 +219,10 @@ struct Runtime : EngineRuntime
 
     // ---- vm ----
     std::vector<Frame*> frames;
+    /// Coroutine frames native code was entered in at a loop, innermost last: a bail in such code goes back to its frame.
+    std::vector<Frame*> nativeCoroutines;
+    /// Set by a bail that went back to the innermost of those, for the entry to see.
+    bool coroutineHandedBack = false;
     /// One reusable frame per call depth; see `Frame`.
     std::vector<std::unique_ptr<Frame>> framePool;
 

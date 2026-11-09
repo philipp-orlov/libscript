@@ -1183,9 +1183,9 @@ private:
         fs.code->length = lengthOf(node);
         fs.code->isGenerator = node.isGenerator;
         fs.code->isAsync = node.isAsync;
-        // A coroutine lives in a frame of its own, which is the interpreter's to resume.
-        // And what `super()` binds `this` to is known only in the frame.
-        if (node.isGenerator || node.isAsync || fs.isDerivedCtor)
+        // What `super()` binds `this` to is known only in the frame. A coroutine is compiled for its loops only, which
+        // native code runs in the coroutine's own frame.
+        if (fs.isDerivedCtor)
             fs.code->jitRefused = true;
         const StrictScope strictBody(*this, node.d && hasUseStrict(*node.d));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;

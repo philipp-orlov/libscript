@@ -250,6 +250,14 @@ struct Access
     /// Retag in place. Used where the static type says the payload is already
     /// right, e.g. `(long)someInt` is a widening the compiler proved.
     static void retag(Value& v, Type t) noexcept { v.tag_ = t; }
+    /// Move without releasing what `dst` held, field by field: the way it was most likely written, so the load of what
+    /// was just stored is forwarded from the store.
+    static void moveRaw(Value& dst, Value& src) noexcept
+    {
+        dst.tag_ = src.tag_;
+        dst.long_ = src.long_;
+        src.tag_ = Type::Null;
+    }
 
     /// Wrap a cell, adding a reference.
     static Value make(Type t, GCObject* o) noexcept

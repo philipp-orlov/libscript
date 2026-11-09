@@ -110,7 +110,7 @@ const char* opName(Op op) noexcept
         "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Neg", "Pos", "BitAnd", "BitOr", "BitXor",
         "BitNot", "Shl", "Shr", "UShr", "Eq", "Ne", "StrictEq", "StrictNe", "Lt", "Le", "Gt",
         "Ge", "In", "InstanceOf", "Not", "TypeOf", "Inc", "Dec", "ToNumber", "ToString",
-        "ToObject", "ToPropertyKey", "Void", "QCompareJump", "QGetLocal2", "QGetLocalConst", "QSetLocalPop", "QGetLocalProp", "QThisProp",
+        "ToObject", "ToPropertyKey", "Void", "QCompareJump", "QGetLocal2", "QGetLocalConst", "QSetLocalPop", "QGetLocalProp", "QThisProp", "QIncLocal", "QDecLocal",
     };
     static_assert(sizeof(names) / sizeof(names[0]) == std::size_t(Op::OpCount),
                   "every opcode needs a name");

@@ -1957,3 +1957,25 @@ TEST(anInlinedFunctionGivesItsCallerAnInt32)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), a + " | " + a + " | " + a + " | " + b + " | " + b + " | " + b);
     }
 }
+
+TEST(theInterpreterRunsCallsInItsOwnLoop)
+{
+    // A call from interpreted code to interpreted code is entered by the same loop: the function called may live only on
+    // the caller's stack, an exception goes back through the frames until one has a handler, deep recursion uses no
+    // native stack, and a loop counter in a local steps in place.
+    const char* program =
+        "function d(v) { return (() => v)(); }"
+        "function thrower(n) { if (n === 0) throw new Error('deep'); return thrower(n - 1) + 1; }"
+        "function catcher(n) { try { return thrower(n); } catch (e) { return e.message + n; } }"
+        "function depth(n) { return n === 0 ? 0 : 1 + depth(n - 1); }"
+        "function count(n) { var t = 0; for (var i = 0; i < n; i++) t++; for (var j = n; j > 0; j--) t--; return t; }"
+        "function self() { return this === undefined ? 'u' : typeof this; }"
+        "[d(7), catcher(20), depth(400), count(50), self(), [1, 2, 3].map(x => d(x * 2)).join('')].join(',')";
+    for (bool off : {true, false}) {
+        script::Context::Options options;
+        if (off)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("7,deep20,400,0,object,246"));
+    }
+}

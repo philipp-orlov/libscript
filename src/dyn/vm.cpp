@@ -72,6 +72,7 @@ void Frame::end() noexcept
     newTarget.reset();
     coroutine = nullptr;
     left = Left::Finished;
+    inlineCall = false;
 }
 
 // ------------------------------------------------------------- errors ---
@@ -1453,13 +1454,50 @@ void compileLazyBody(Runtime& rt, const FunctionCode& code)
     }
 }
 
-/// Push a frame, run it, pop it. `newTarget` is set for construction.
-Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
-                     const std::vector<Value>& args, DynFunction* newTarget)
+/// What native code compiled later may take the parameters to be.
+inline void noteArguments(const FunctionCode& code, const Value* args, std::size_t argc) noexcept
 {
+#if SCRIPT_ENABLE_DYN_JIT
+    if (code.argsNotNumber == ~0u)
+        return;
+    const std::size_t arity = std::min<std::size_t>(std::size_t(std::max(code.arity, 0)), 32);
+    for (std::size_t i = 0; i < arity; ++i) {
+        if (i >= argc || !args[i].isDouble()) {
+            code.argsNotNumber |= 1u << i;
+        } else {
+            const double d = detail::Access::r8(args[i]);
+            if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d)))
+                code.argsNotInt |= 1u << i;
+        }
+    }
+#else
+    (void)code;
+    (void)args;
+    (void)argc;
+#endif
+}
+
+/// Arguments as a pointer and a count, read the way a vector of them is.
+struct ArgView
+{
+    const Value* p;
+    std::size_t n;
+    std::size_t size() const noexcept { return n; }
+    const Value* data() const noexcept { return p; }
+    const Value& operator[](std::size_t i) const noexcept { return p[i]; }
+};
+
+/// Push a frame, run it, pop it. `newTarget` is set for construction. With `take`, the arguments are the caller's to
+/// give away: they move into the frame instead of being copied.
+Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue, Value* argv, std::size_t argc,
+                     DynFunction* newTarget, bool take)
+{
+    const ArgView args{argv, argc};
     if (fn->code->lazy)
         compileLazyBody(rt, *fn->code);
     const FunctionCode& code = *fn->code;
+    // What a rest parameter or `arguments` is made of is read after the parameters are set.
+    take = take && !code.hasRest && code.argumentsSlot == FunctionCode::kNoSlot;
 #if SCRIPT_ENABLE_DYN_JIT
     if (code.jitEntry)
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
@@ -1468,21 +1506,7 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
         compileNative(rt, code))
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
 #endif
-#if SCRIPT_ENABLE_DYN_JIT
-    // What native code compiled later may take the parameters to be.
-    if (code.argsNotNumber != ~0u) {
-        const std::size_t arity = std::min<std::size_t>(std::size_t(std::max(code.arity, 0)), 32);
-        for (std::size_t i = 0; i < arity; ++i) {
-            if (i >= args.size() || !args[i].isDouble()) {
-                code.argsNotNumber |= 1u << i;
-            } else {
-                const double d = detail::Access::r8(args[i]);
-                if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d)))
-                    code.argsNotInt |= 1u << i;
-            }
-        }
-    }
-#endif
+    noteArguments(code, args.data(), args.size());
     Frame& frame = rt.acquireFrame(rt.frames.size());
     frame.begin(fn, &code, thisValue, newTarget);
     rt.frames.push_back(&frame);
@@ -1499,8 +1523,13 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
 
     const std::size_t plain = std::min<std::size_t>(
         code.hasRest ? std::size_t(code.arity) : args.size(), code.numLocals);
-    for (std::size_t i = 0; i < plain && i < args.size(); ++i)
-        frame.locals[i] = args[i];
+    if (take) {
+        for (std::size_t i = 0; i < plain && i < args.size(); ++i)
+            frame.locals[i] = std::move(argv[i]);
+    } else {
+        for (std::size_t i = 0; i < plain && i < args.size(); ++i)
+            frame.locals[i] = args[i];
+    }
     if (code.hasRest) {
         DynArray* rest = rt.newArray(args.size() > std::size_t(code.arity)
                                         ? args.size() - std::size_t(code.arity)
@@ -1525,6 +1554,12 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
     }
 
     return execute(rt, frame);
+}
+
+Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue, const std::vector<Value>& args,
+                     DynFunction* newTarget)
+{
+    return invokeBytecode(rt, fn, thisValue, const_cast<Value*>(args.data()), args.size(), newTarget, false);
 }
 
 Value callNative(Runtime& rt, DynFunction* fn, const Value& thisValue,
@@ -2126,6 +2161,15 @@ const std::uint8_t* quickened(const FunctionCode& code)
                     code.quick[pc] = std::uint8_t(Op::QCompareJump);
                 break;
             case Op::GetLocal:
+                if (then == Op::ToNumber && pc + 13 < c.size() && Op(c[pc + 8]) == Op::SetLocal && Op(c[pc + 13]) == Op::Pop &&
+                    readOperand(c, pc + 9) == readOperand(c, pc + 1)) {
+                    const Op a = Op(c[pc + 6]), b = Op(c[pc + 7]);
+                    const Op step = a == Op::Dup ? b : b == Op::Dup ? a : Op::Nop;
+                    if (step == Op::Inc || step == Op::Dec) {
+                        code.quick[pc] = std::uint8_t(step == Op::Inc ? Op::QIncLocal : Op::QDecLocal);
+                        break;
+                    }
+                }
                 if (then == Op::GetLocal)
                     code.quick[pc] = std::uint8_t(Op::QGetLocal2);
                 else if (then == Op::PushConst)
@@ -2148,49 +2192,20 @@ const std::uint8_t* quickened(const FunctionCode& code)
     return code.quick.data();
 }
 
-Value execute(Runtime& rt, Frame& frame)
+/// What one instruction run the long way did: go on at `frame.pc`, or leave the call with the value given.
+enum class Step : std::uint8_t
+{
+    Next,
+    Leave,
+};
+
+/// One instruction, at `frame.pc`, with the frame's stack as it is: everything the interpreter does not do in its
+/// own loop, and what it does there when the quick way does not apply.
+[[gnu::noinline]] Step slowStep(Runtime& rt, Frame& frame, Op op, Value& leaving)
 {
     const FunctionCode& code = *frame.code;
-    const std::uint8_t* c = quickened(code);
-    // Zero for a fresh call; part way through for one native code handed back.
-    std::uint32_t pc = frame.pc;
-    std::uint32_t ticks = 0;
+    std::uint32_t pc = frame.pc + 1;
     ValueStack& sp = frame.stack;
-#if SCRIPT_ENABLE_DYN_JIT
-    // Back edges until this function is worth compiling in the middle of running it.
-    std::uint32_t backEdges =
-        !code.jitRefused && rt.jitBackend && rt.ctx.options.jit.mode != JitOptions::Mode::Off ? code.jitThreshold(rt.ctx.options.jit.threshold) : 0;
-    // And the work those loops did, in bytes of their bodies run: a compile costs what the whole function's size does,
-    // which a short loop in a long function, run a few thousand times, does not earn back. Code already compiled is free.
-    std::uint64_t loopWork = 0;
-    const std::uint64_t workWanted = std::uint64_t(code.code.size()) * osrWorkPerByte();
-    // 0: carry on; 1: the call is done, with `result`; 2: native code handed the coroutine back, at `frame.pc`.
-    const auto loopBack = [&](std::uint32_t target, std::uint32_t from, Value& result) -> int {
-        if (backEdges == 0)
-            return false;
-        loopWork += from - target;
-        if (backEdges > 1) {
-            --backEdges;
-            return false;
-        }
-        // A coroutine's frame comes into native code only at a loop, on each resume: only one that has done the work.
-        if (loopWork < workWanted && (!code.jitCode || frame.coroutine))
-            return false;
-        backEdges = 0;
-        frame.pc = target;
-        if (const int entered = enterNativeAtLoop(rt, frame, target, result))
-            return entered;
-#if SCRIPT_ENABLE_JIT_THREAD
-        // Being compiled elsewhere: asked again a while on.
-        if (code.jitJob)
-            backEdges = kAskAgainEdges;
-#endif
-        return false;
-    };
-#else
-    const auto loopBack = [](std::uint32_t, std::uint32_t, Value&) -> int { return 0; };
-#endif
-
     auto pop = [&sp]() -> Value {
         Value v = std::move(sp.back());
         sp.pop_back();
@@ -2254,1394 +2269,2208 @@ Value execute(Runtime& rt, Frame& frame)
         sp.emplace_back(f(numberOf(x), numberOf(y)));
     };
 
-    for (;;) {
-        try {
-            // Resumed by `throw`, or by an `await` of what was rejected: thrown from where it stopped.
-            if (frame.coroutine && frame.coroutine->throwOnResume) {
-                frame.coroutine->throwOnResume = false;
-                frame.pc = pc - 1;
-                const Value thrown = std::move(frame.coroutine->received);
-                frame.coroutine->received = Value::undefined();
-                throwValue(rt, thrown);
+    switch (op) {
+            case Op::Nop:
+                break;
+            case Op::PushUndefined:
+                sp.push_back(Value::undefined());
+                break;
+            case Op::PushNull:
+                sp.emplace_back(nullptr);
+                break;
+            case Op::PushTrue:
+                sp.emplace_back(true);
+                break;
+            case Op::PushFalse:
+                sp.emplace_back(false);
+                break;
+            case Op::PushConst:
+                sp.push_back(code.consts[operandAt(pc)]);
+                pc += 4;
+                break;
+            case Op::PushThis:
+                if (code.sloppyThis && frame.thisValue.isNullish())
+                    sp.push_back(detail::Access::make(Type::Object, rt.globalObject.get()));
+                else
+                    sp.push_back(frame.thisValue);
+                break;
+            case Op::PushCallee:
+                sp.push_back(frame.fn ? detail::Access::make(Type::Object, frame.fn)
+                                      : Value::undefined());
+                break;
+            case Op::Pop:
+                sp.pop_back();
+                break;
+            case Op::PopN:
+                sp.resize(sp.size() - operandAt(pc));
+                pc += 4;
+                break;
+            case Op::Dup: {
+                Value top = sp.back();
+                sp.push_back(std::move(top));
+                break;
             }
-            for (;;) {
-                frame.pc = pc;
-                if (++ticks >= kInterruptInterval) {
-                    ticks = 0;
-#if defined(SCRIPT_JIT_ENV_OVERRIDE)
-                    if (!code.interpreted++ && std::getenv("SCRIPT_INTERP_PROFILE"))
-                        rt.interpretedCodes.push_back(&code);
-#endif
-                    if (rt.ctx.interruptAsked())
-                        throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
-                    // A loop that only grows containers it already owns never
-                    // reaches cell allocation, so budgets are checked here too.
-                    rt.maybeCollect();
+            case Op::Dup2: {
+                Value low = sp[sp.size() - 2];
+                Value high = sp.back();
+                sp.push_back(std::move(low));
+                sp.push_back(std::move(high));
+                break;
+            }
+            case Op::Swap:
+                std::swap(sp[sp.size() - 1], sp[sp.size() - 2]);
+                break;
+            case Op::Rot3: {
+                Value top = pop();
+                Value mid = pop();
+                Value low = pop();
+                sp.push_back(std::move(top));
+                sp.push_back(std::move(low));
+                sp.push_back(std::move(mid));
+                break;
+            }
+
+            case Op::GetLocal:
+                sp.push_back(frame.locals[operandAt(pc)]);
+                pc += 4;
+                break;
+            case Op::SetLocal:
+                frame.locals[operandAt(pc)] = pop();
+                pc += 4;
+                break;
+            case Op::GetCell: {
+                const Ref<Box>& cell = frame.cells[operandAt(pc)];
+                sp.push_back(cell ? cell->value : Value::undefined());
+                pc += 4;
+                break;
+            }
+            case Op::SetCell: {
+                const Ref<Box>& cell = frame.cells[operandAt(pc)];
+                if (cell)
+                    cell->value = pop();
+                else
+                    sp.pop_back();
+                pc += 4;
+                break;
+            }
+            case Op::NewCell:
+            case Op::RenewCell: {
+                const std::uint32_t slot = operandAt(pc);
+                auto* cell = rt.newCell<Box>();
+                cell->value = op == Op::RenewCell && frame.cells[slot]
+                                  ? frame.cells[slot]->value
+                                  : Value::undefined();
+                frame.cells[slot].reset(cell, true);
+                pc += 4;
+                break;
+            }
+            case Op::GetUpval: {
+                const Ref<Box>& cell = frame.fn->upvalues[operandAt(pc)];
+                sp.push_back(cell ? cell->value : Value::undefined());
+                pc += 4;
+                break;
+            }
+            case Op::SetUpval: {
+                const Ref<Box>& cell = frame.fn->upvalues[operandAt(pc)];
+                if (cell)
+                    cell->value = pop();
+                else
+                    sp.pop_back();
+                pc += 4;
+                break;
+            }
+
+            case Op::GetGlobal: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                pc += 4;
+                const Prop* p = rt.globalObject->findOwn(key);
+                if (p && !rt.globalObject->accessorOf(*p)) {
+                    sp.push_back(p->value);
+                    break;
                 }
-                Op op = Op(c[pc++]);
-#if defined(SCRIPT_JIT_ENV_OVERRIDE)
-                if (opPairs()) {
-                    static std::uint8_t previous = 0;
-                    ++opPairCounts()[previous][std::uint8_t(op)];
-                    previous = std::uint8_t(op);
+                const Value g = detail::Access::make(Type::Object, rt.globalObject.get());
+                if (!p && !hasProperty(rt, g, key))
+                    throwError(rt, ErrorCode::ReferenceError,
+                               toUtf8(static_cast<StringCell*>(key)->text()) +
+                                   " is not defined");
+                sp.push_back(getProperty(rt, g, key));
+                break;
+            }
+            case Op::SetGlobal: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                pc += 4;
+                setProperty(rt, detail::Access::make(Type::Object, rt.globalObject.get()),
+                            key, pop());
+                break;
+            }
+            case Op::DefGlobal: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                const std::uint32_t attrs = operandAt(pc + 4);
+                pc += 8;
+                if (!rt.globalObject->findOwn(key))
+                    rt.globalObject->putOwn(key, Value::undefined(), std::uint8_t(attrs));
+                break;
+            }
+            case Op::TypeofGlobal: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                pc += 4;
+                const Value g = detail::Access::make(Type::Object, rt.globalObject.get());
+                if (!hasProperty(rt, g, key)) {
+                    sp.push_back(rt.str("undefined"));
+                    break;
                 }
-#endif
-            redispatch:
-                switch (op) {
-                    case Op::Nop:
-                        break;
-                    // A pair in one go, for the common case; anything else is the first of them as it was.
-                    case Op::QGetLocal2:
-                        sp.push_back(frame.locals[operandAt(pc)]);
-                        sp.push_back(frame.locals[operandAt(pc + 5)]);
-                        pc += 9;
-                        break;
-                    case Op::QGetLocalConst:
-                        sp.push_back(frame.locals[operandAt(pc)]);
-                        sp.push_back(code.consts[operandAt(pc + 5)]);
-                        pc += 9;
-                        break;
-                    case Op::QSetLocalPop: {
-                        Value& slot = frame.locals[operandAt(pc + 1)];
-                        slot = std::move(sp.back());
-                        sp.pop_back();
-                        pc += 6;
-                        break;
-                    }
-                    case Op::QGetLocalProp:
-                        // The read as it is, with its own instruction's place for what it may throw.
-                        sp.push_back(frame.locals[operandAt(pc)]);
-                        pc += 5;
-                        frame.pc = pc - 1;
-                        op = Op::GetProp;
-                        goto redispatch;
-                    case Op::QThisProp:
-                        if (code.sloppyThis && frame.thisValue.isNullish())
-                            sp.push_back(detail::Access::make(Type::Object, rt.globalObject.get()));
-                        else
-                            sp.push_back(frame.thisValue);
-                        pc += 1;
-                        frame.pc = pc - 1;
-                        op = Op::GetProp;
-                        goto redispatch;
-                    case Op::QCompareJump: {
-                        const Op compare = Op(code.code[pc - 1]);
-                        const std::size_t n = sp.size();
-                        const Value& fa = sp[n - 2];
-                        const Value& fb = sp[n - 1];
-                        if (fa.type() != Type::Double || fb.type() != Type::Double) {
-                            // Strict equality has no side effects to order, whatever the operands.
-                            if (compare != Op::StrictEq && compare != Op::StrictNe) {
-                                op = compare;
-                                goto redispatch;
-                            }
-                            const bool same = strictEquals(fa, fb) == (compare == Op::StrictEq);
-                            sp.pop_back();
-                            sp.pop_back();
-                            const bool onTrue = Op(code.code[pc]) == Op::JumpIfTrue;
-                            const std::uint32_t target = operandAt(pc + 1);
-                            pc += 5;
-                            if (same != onTrue)
-                                break;
-                            if (target < pc) {
-                                Value result;
-                                if (const int entered = loopBack(target, pc, result)) {
-                                    if (entered == 1)
-                                        return result;
-                                    pc = frame.pc;
-                                    break;
-                                }
-                            }
-                            pc = target;
-                            break;
-                        }
-                        const double x = detail::Access::r8(fa), y = detail::Access::r8(fb);
-                        bool holds;
-                        switch (compare) {
-                            case Op::Lt: holds = x < y; break;
-                            case Op::Le: holds = x <= y; break;
-                            case Op::Gt: holds = x > y; break;
-                            case Op::Ge: holds = x >= y; break;
-                            case Op::Eq:
-                            case Op::StrictEq: holds = x == y; break;
-                            default: holds = x != y; break;
-                        }
-                        sp.pop_back();
-                        sp.pop_back();
-                        const bool onTrue = Op(code.code[pc]) == Op::JumpIfTrue;
-                        const std::uint32_t target = operandAt(pc + 1);
-                        pc += 5;
-                        if (holds != onTrue)
-                            break;
-                        if (target < pc) {
-                            Value result;
-                            if (const int entered = loopBack(target, pc, result)) {
-                                if (entered == 1)
-                                    return result;
-                                pc = frame.pc;
-                                break;
-                            }
-                        }
-                        pc = target;
-                        break;
-                    }
-                    case Op::PushUndefined:
-                        sp.push_back(Value::undefined());
-                        break;
-                    case Op::PushNull:
-                        sp.emplace_back(nullptr);
-                        break;
-                    case Op::PushTrue:
-                        sp.emplace_back(true);
-                        break;
-                    case Op::PushFalse:
-                        sp.emplace_back(false);
-                        break;
-                    case Op::PushConst:
-                        sp.push_back(code.consts[operandAt(pc)]);
-                        pc += 4;
-                        break;
-                    case Op::PushThis:
-                        if (code.sloppyThis && frame.thisValue.isNullish())
-                            sp.push_back(detail::Access::make(Type::Object, rt.globalObject.get()));
-                        else
-                            sp.push_back(frame.thisValue);
-                        break;
-                    case Op::PushCallee:
-                        sp.push_back(frame.fn ? detail::Access::make(Type::Object, frame.fn)
-                                              : Value::undefined());
-                        break;
-                    case Op::Pop:
-                        sp.pop_back();
-                        break;
-                    case Op::PopN:
-                        sp.resize(sp.size() - operandAt(pc));
-                        pc += 4;
-                        break;
-                    case Op::Dup: {
-                        Value top = sp.back();
-                        sp.push_back(std::move(top));
-                        break;
-                    }
-                    case Op::Dup2: {
-                        Value low = sp[sp.size() - 2];
-                        Value high = sp.back();
-                        sp.push_back(std::move(low));
-                        sp.push_back(std::move(high));
-                        break;
-                    }
-                    case Op::Swap:
-                        std::swap(sp[sp.size() - 1], sp[sp.size() - 2]);
-                        break;
-                    case Op::Rot3: {
-                        Value top = pop();
-                        Value mid = pop();
-                        Value low = pop();
-                        sp.push_back(std::move(top));
-                        sp.push_back(std::move(low));
-                        sp.push_back(std::move(mid));
-                        break;
-                    }
+                sp.push_back(rt.typeOfValue(getProperty(rt, g, key)));
+                break;
+            }
+            case Op::DeleteGlobal: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                pc += 4;
+                sp.emplace_back(rt.globalObject->deleteOwn(key));
+                break;
+            }
 
-                    case Op::GetLocal:
-                        sp.push_back(frame.locals[operandAt(pc)]);
-                        pc += 4;
-                        break;
-                    case Op::SetLocal:
-                        frame.locals[operandAt(pc)] = pop();
-                        pc += 4;
-                        break;
-                    case Op::GetCell: {
-                        const Ref<Box>& cell = frame.cells[operandAt(pc)];
-                        sp.push_back(cell ? cell->value : Value::undefined());
-                        pc += 4;
-                        break;
-                    }
-                    case Op::SetCell: {
-                        const Ref<Box>& cell = frame.cells[operandAt(pc)];
-                        if (cell)
-                            cell->value = pop();
-                        else
-                            sp.pop_back();
-                        pc += 4;
-                        break;
-                    }
-                    case Op::NewCell:
-                    case Op::RenewCell: {
-                        const std::uint32_t slot = operandAt(pc);
-                        auto* cell = rt.newCell<Box>();
-                        cell->value = op == Op::RenewCell && frame.cells[slot]
-                                          ? frame.cells[slot]->value
-                                          : Value::undefined();
-                        frame.cells[slot].reset(cell, true);
-                        pc += 4;
-                        break;
-                    }
-                    case Op::GetUpval: {
-                        const Ref<Box>& cell = frame.fn->upvalues[operandAt(pc)];
-                        if (static bool dbg = std::getenv("DBG_UPVAL") != nullptr; dbg && cell) {
-                            GCObject* p = detail::Access::ptr(cell->value);
-                            if (p && p->rc == 0) {
-                                std::fprintf(stderr, "DEAD upval %u in %s at pc %u line %u, box rc %u\n", operandAt(pc), code.name.c_str(), pc, code.lineAt(pc), unsigned(cell->rc));
-                                std::abort();
-                            }
-                        }
-                        sp.push_back(cell ? cell->value : Value::undefined());
-                        pc += 4;
-                        break;
-                    }
-                    case Op::SetUpval: {
-                        const Ref<Box>& cell = frame.fn->upvalues[operandAt(pc)];
-                        if (cell)
-                            cell->value = pop();
-                        else
-                            sp.pop_back();
-                        pc += 4;
-                        break;
-                    }
-
-                    case Op::GetGlobal: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
-                        const Prop* p = rt.globalObject->findOwn(key);
-                        if (p && !rt.globalObject->accessorOf(*p)) {
-                            sp.push_back(p->value);
-                            break;
-                        }
-                        const Value g = detail::Access::make(Type::Object, rt.globalObject.get());
-                        if (!p && !hasProperty(rt, g, key))
-                            throwError(rt, ErrorCode::ReferenceError,
-                                       toUtf8(static_cast<StringCell*>(key)->text()) +
-                                           " is not defined");
-                        sp.push_back(getProperty(rt, g, key));
-                        break;
-                    }
-                    case Op::SetGlobal: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
-                        setProperty(rt, detail::Access::make(Type::Object, rt.globalObject.get()),
-                                    key, pop());
-                        break;
-                    }
-                    case Op::DefGlobal: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        const std::uint32_t attrs = operandAt(pc + 4);
-                        pc += 8;
-                        if (!rt.globalObject->findOwn(key))
-                            rt.globalObject->putOwn(key, Value::undefined(), std::uint8_t(attrs));
-                        break;
-                    }
-                    case Op::TypeofGlobal: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
-                        const Value g = detail::Access::make(Type::Object, rt.globalObject.get());
-                        if (!hasProperty(rt, g, key)) {
-                            sp.push_back(rt.str("undefined"));
-                            break;
-                        }
-                        sp.push_back(rt.typeOfValue(getProperty(rt, g, key)));
-                        break;
-                    }
-                    case Op::DeleteGlobal: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
-                        sp.emplace_back(rt.globalObject->deleteOwn(key));
-                        break;
-                    }
-
-                    case Op::GetProp: {
-                        const std::uint32_t operand = operandAt(pc);
-                        pc += 4;
-                        Value r = getPropertySite(rt, code, sp.back(), code.atoms[operand & kAtomMask].get(),
-                                                  operand >> kSiteShift);
+            case Op::GetProp: {
+                const std::uint32_t operand = operandAt(pc);
+                pc += 4;
+                Value r = getPropertySite(rt, code, sp.back(), code.atoms[operand & kAtomMask].get(),
+                                          operand >> kSiteShift);
+                sp.back() = std::move(r);
+                break;
+            }
+            case Op::GetPropBound: {
+                GCObject* key = code.atoms[operandAt(pc) & kAtomMask].get();
+                pc += 4;
+                Value base = pop();
+                Value read = getProperty(rt, base, key);
+                // Data attributes pay for one tag check; only a method read as a value goes further,
+                // or a Python method JavaScript has no spelling of, which reads as undefined.
+                if (asFunction(read) || read.isUndefined()) {
+                    const Value py = getProperty(rt, detail::Access::make(Type::Object, rt.globalObject.get()), rt.intern(u"__py"));
+                    const Value hook = py.isObject() ? getProperty(rt, py, rt.intern(u"bindRead")) : Value::undefined();
+                    if (asFunction(hook))
+                        read = callValue(rt, hook, Value::undefined(), {base, detail::Access::make(Type::String, key), read});
+                }
+                sp.push_back(std::move(read));
+                break;
+            }
+            case Op::GetPropDup: {
+                const std::uint32_t operand = operandAt(pc);
+                pc += 4;
+                Value fn = getPropertySite(rt, code, sp.back(), code.atoms[operand & kAtomMask].get(),
+                                           operand >> kSiteShift);
+                sp.push_back(std::move(fn));
+                std::swap(sp[sp.size() - 1], sp[sp.size() - 2]);
+                break;
+            }
+            case Op::SetProp: {
+                const std::uint32_t operand = operandAt(pc);
+                pc += 4;
+                const std::size_t n = sp.size();
+                setPropertySite(rt, code, sp[n - 2], code.atoms[operand & kAtomMask].get(), sp[n - 1],
+                                operand >> kSiteShift);
+                // Leaves the value, as an assignment expression does.
+                std::swap(sp[n - 2], sp[n - 1]);
+                sp.pop_back();
+                break;
+            }
+            case Op::GetElem: {
+                std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
+                pc += 4;
+                const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
+                {
+                    DynArray* arr = nullptr;
+                    std::uint32_t index = 0;
+                    const std::size_t n = sp.size();
+                    if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
+                        note(ElemSite::of(arr));
+                        Value r = arr->at(index);
+                        sp.pop_back();
                         sp.back() = std::move(r);
                         break;
                     }
-                    case Op::GetPropBound: {
-                        GCObject* key = code.atoms[operandAt(pc) & kAtomMask].get();
-                        pc += 4;
-                        Value base = pop();
-                        Value read = getProperty(rt, base, key);
-                        // Data attributes pay for one tag check; only a method read as a value goes further,
-                        // or a Python method JavaScript has no spelling of, which reads as undefined.
-                        if (asFunction(read) || read.isUndefined()) {
-                            const Value py = getProperty(rt, detail::Access::make(Type::Object, rt.globalObject.get()), rt.intern(u"__py"));
-                            const Value hook = py.isObject() ? getProperty(rt, py, rt.intern(u"bindRead")) : Value::undefined();
-                            if (asFunction(hook))
-                                read = callValue(rt, hook, Value::undefined(), {base, detail::Access::make(Type::String, key), read});
-                        }
-                        sp.push_back(std::move(read));
-                        break;
-                    }
-                    case Op::GetPropDup: {
-                        const std::uint32_t operand = operandAt(pc);
-                        pc += 4;
-                        Value fn = getPropertySite(rt, code, sp.back(), code.atoms[operand & kAtomMask].get(),
-                                                   operand >> kSiteShift);
-                        sp.push_back(std::move(fn));
-                        std::swap(sp[sp.size() - 1], sp[sp.size() - 2]);
-                        break;
-                    }
-                    case Op::SetProp: {
-                        const std::uint32_t operand = operandAt(pc);
-                        pc += 4;
-                        const std::size_t n = sp.size();
-                        setPropertySite(rt, code, sp[n - 2], code.atoms[operand & kAtomMask].get(), sp[n - 1],
-                                        operand >> kSiteShift);
-                        // Leaves the value, as an assignment expression does.
-                        std::swap(sp[n - 2], sp[n - 1]);
-                        sp.pop_back();
-                        break;
-                    }
-                    case Op::GetElem: {
-                        std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
-                        pc += 4;
-                        const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
-                        {
-                            DynArray* arr = nullptr;
-                            std::uint32_t index = 0;
-                            const std::size_t n = sp.size();
-                            if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
-                                note(ElemSite::of(arr));
-                                Value r = arr->at(index);
-                                sp.pop_back();
-                                sp.back() = std::move(r);
-                                break;
-                            }
-                        }
-                        {
-                            const std::size_t n = sp.size();
-                            DynObject* holder = asObject(sp[n - 2]);
-                            if (holder && holder->cls == ObjClass::TypedArray && sp[n - 1].isDouble()) {
-                                const double d = detail::Access::r8(sp[n - 1]);
-                                auto* ta = static_cast<DynTypedArray*>(holder);
-                                if (d >= 0 && d < double(ta->length) && d == std::floor(d)) {
-                                    ElemSite::noteTyped(elemSaw, int(ta->element));
-                                    Value r = typedArrayGet(rt, ta, std::size_t(d));
-                                    sp.pop_back();
-                                    sp.back() = std::move(r);
-                                    break;
-                                }
-                            }
-                        }
-                        note(ElemSite::kOther);
-                        const std::uint32_t site = operandAt(pc - 4);
-                        if (Prop* p = keyedHit(code, site, sp[sp.size() - 2], sp.back())) {
-                            Value r = p->value;
+                }
+                {
+                    const std::size_t n = sp.size();
+                    DynObject* holder = asObject(sp[n - 2]);
+                    if (holder && holder->cls == ObjClass::TypedArray && sp[n - 1].isDouble()) {
+                        const double d = detail::Access::r8(sp[n - 1]);
+                        auto* ta = static_cast<DynTypedArray*>(holder);
+                        if (d >= 0 && d < double(ta->length) && d == std::floor(d)) {
+                            ElemSite::noteTyped(elemSaw, int(ta->element));
+                            Value r = typedArrayGet(rt, ta, std::size_t(d));
                             sp.pop_back();
                             sp.back() = std::move(r);
                             break;
                         }
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        Value base = pop();
-                        sp.push_back(getProperty(rt, base, key.get()));
-                        keyedLearn(code, site, base, key.get(), false);
+                    }
+                }
+                note(ElemSite::kOther);
+                const std::uint32_t site = operandAt(pc - 4);
+                if (Prop* p = keyedHit(code, site, sp[sp.size() - 2], sp.back())) {
+                    Value r = p->value;
+                    sp.pop_back();
+                    sp.back() = std::move(r);
+                    break;
+                }
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                Value base = pop();
+                sp.push_back(getProperty(rt, base, key.get()));
+                keyedLearn(code, site, base, key.get(), false);
+                break;
+            }
+            case Op::GetElemDup: {
+                std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
+                pc += 4;
+                const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
+                {
+                    DynArray* arr = nullptr;
+                    std::uint32_t index = 0;
+                    const std::size_t n = sp.size();
+                    if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
+                        note(ElemSite::of(arr));
+                        Value r = arr->at(index);
+                        Value base = sp[n - 2];
+                        sp[n - 2] = std::move(r);
+                        sp[n - 1] = std::move(base);
                         break;
                     }
-                    case Op::GetElemDup: {
-                        std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
-                        pc += 4;
-                        const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
-                        {
-                            DynArray* arr = nullptr;
-                            std::uint32_t index = 0;
-                            const std::size_t n = sp.size();
-                            if (fastIndex(sp[n - 2], sp[n - 1], arr, index)) {
-                                note(ElemSite::of(arr));
-                                Value r = arr->at(index);
-                                Value base = sp[n - 2];
-                                sp[n - 2] = std::move(r);
-                                sp[n - 1] = std::move(base);
-                                break;
-                            }
-                        }
-                        note(ElemSite::kOther);
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        Value base = sp.back();
-                        sp.back() = getProperty(rt, base, key.get());
-                        sp.push_back(std::move(base));
+                }
+                note(ElemSite::kOther);
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                Value base = sp.back();
+                sp.back() = getProperty(rt, base, key.get());
+                sp.push_back(std::move(base));
+                break;
+            }
+            case Op::SetElem: {
+                std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
+                pc += 4;
+                const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
+                {
+                    DynArray* arr = nullptr;
+                    std::uint32_t index = 0;
+                    const std::size_t n = sp.size();
+                    // With an own property in the table, "0" may be there with attributes of its own.
+                    if (fastIndex(sp[n - 3], sp[n - 2], arr, index) && !arr->frozen && arr->props.empty()) {
+                        note(ElemSite::of(arr));
+                        arr->put(index, sp[n - 1]);
+                        Value v = std::move(sp[n - 1]);
+                        sp.resize(n - 3);
+                        sp.push_back(std::move(v));
                         break;
                     }
-                    case Op::SetElem: {
-                        std::uint8_t& elemSaw = code.elemSaw[operandAt(pc)];
-                        pc += 4;
-                        const auto note = [&elemSaw](std::uint8_t what) { elemSaw |= what; };
-                        {
-                            DynArray* arr = nullptr;
-                            std::uint32_t index = 0;
-                            const std::size_t n = sp.size();
-                            // With an own property in the table, "0" may be there with attributes of its own.
-                            if (fastIndex(sp[n - 3], sp[n - 2], arr, index) && !arr->frozen && arr->props.empty()) {
-                                note(ElemSite::of(arr));
-                                arr->put(index, sp[n - 1]);
-                                Value v = std::move(sp[n - 1]);
-                                sp.resize(n - 3);
-                                sp.push_back(std::move(v));
-                                break;
-                            }
-                        }
-                        {
-                            const std::size_t n = sp.size();
-                            DynObject* holder = asObject(sp[n - 3]);
-                            if (holder && holder->cls == ObjClass::TypedArray && sp[n - 2].isDouble()) {
-                                const double d = detail::Access::r8(sp[n - 2]);
-                                if (d >= 0 && d == std::floor(d)) {
-                                    auto* ta = static_cast<DynTypedArray*>(holder);
-                                    if (d < double(ta->length) && sp[n - 1].isDouble())
-                                        ElemSite::noteTyped(elemSaw, int(ta->element));
-                                    else
-                                        note(ElemSite::kOther);
-                                    typedArraySet(rt, static_cast<DynTypedArray*>(holder), d, sp[n - 1]);
-                                    Value v = std::move(sp[n - 1]);
-                                    sp.resize(n - 3);
-                                    sp.push_back(std::move(v));
-                                    break;
-                                }
-                            }
-                        }
-                        note(ElemSite::kOther);
-                        const std::uint32_t site = operandAt(pc - 4);
-                        if (Prop* p = keyedHit(code, site, sp[sp.size() - 3], sp[sp.size() - 2]);
-                            p && !asObject(sp[sp.size() - 3])->frozen && !asObject(sp[sp.size() - 3])->isProto) {
-                            p->value = sp.back();
-                            Value v = pop();
-                            sp.pop_back();
-                            sp.back() = std::move(v);
+                }
+                {
+                    const std::size_t n = sp.size();
+                    DynObject* holder = asObject(sp[n - 3]);
+                    if (holder && holder->cls == ObjClass::TypedArray && sp[n - 2].isDouble()) {
+                        const double d = detail::Access::r8(sp[n - 2]);
+                        if (d >= 0 && d == std::floor(d)) {
+                            auto* ta = static_cast<DynTypedArray*>(holder);
+                            if (d < double(ta->length) && sp[n - 1].isDouble())
+                                ElemSite::noteTyped(elemSaw, int(ta->element));
+                            else
+                                note(ElemSite::kOther);
+                            typedArraySet(rt, static_cast<DynTypedArray*>(holder), d, sp[n - 1]);
+                            Value v = std::move(sp[n - 1]);
+                            sp.resize(n - 3);
+                            sp.push_back(std::move(v));
                             break;
                         }
-                        Value v = pop();
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        Value base = pop();
-                        setProperty(rt, base, key.get(), v);
-                        keyedLearn(code, site, base, key.get(), true);
-                        sp.push_back(std::move(v));
-                        break;
                     }
-                    case Op::DeleteProp: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
-                        Value base = pop();
-                        sp.emplace_back(deleteProperty(rt, base, key));
-                        break;
-                    }
-                    case Op::DeleteElem: {
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        Value base = pop();
-                        sp.emplace_back(deleteProperty(rt, base, key.get()));
-                        break;
-                    }
+                }
+                note(ElemSite::kOther);
+                const std::uint32_t site = operandAt(pc - 4);
+                if (Prop* p = keyedHit(code, site, sp[sp.size() - 3], sp[sp.size() - 2]);
+                    p && !asObject(sp[sp.size() - 3])->frozen && !asObject(sp[sp.size() - 3])->isProto) {
+                    p->value = sp.back();
+                    Value v = pop();
+                    sp.pop_back();
+                    sp.back() = std::move(v);
+                    break;
+                }
+                Value v = pop();
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                Value base = pop();
+                setProperty(rt, base, key.get(), v);
+                keyedLearn(code, site, base, key.get(), true);
+                sp.push_back(std::move(v));
+                break;
+            }
+            case Op::DeleteProp: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                pc += 4;
+                Value base = pop();
+                sp.emplace_back(deleteProperty(rt, base, key));
+                break;
+            }
+            case Op::DeleteElem: {
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                Value base = pop();
+                sp.emplace_back(deleteProperty(rt, base, key.get()));
+                break;
+            }
 
-                    case Op::DefField: {
-                        const std::uint32_t operand = operandAt(pc);
-                        pc += 4;
-                        Value v = pop();
-                        defineFieldAt(rt, siteOf(code, operand >> kSiteShift), asObject(sp.back()),
-                                      code.atoms[operand & kAtomMask].get(), std::move(v));
-                        break;
-                    }
-                    case Op::DefMethod: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
-                        Value v = pop();
-                        DynObject* target = asObject(sp.back());
-                        if (op == Op::DefMethod) {
-                            if (DynFunction* m = asFunction(v))
-                                m->homeObject.reset(target);
-                            target->putOwn(key, v, PropWritable | PropConfigurable);
-                        } else {
-                            target->putOwn(key, v);
+            case Op::DefField: {
+                const std::uint32_t operand = operandAt(pc);
+                pc += 4;
+                Value v = pop();
+                defineFieldAt(rt, siteOf(code, operand >> kSiteShift), asObject(sp.back()),
+                              code.atoms[operand & kAtomMask].get(), std::move(v));
+                break;
+            }
+            case Op::DefMethod: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                pc += 4;
+                Value v = pop();
+                DynObject* target = asObject(sp.back());
+                if (op == Op::DefMethod) {
+                    if (DynFunction* m = asFunction(v))
+                        m->homeObject.reset(target);
+                    target->putOwn(key, v, PropWritable | PropConfigurable);
+                } else {
+                    target->putOwn(key, v);
+                }
+                break;
+            }
+            case Op::DefMethodElem: {
+                Value v = pop();
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                DynObject* target = asObject(sp.back());
+                if (DynFunction* m = asFunction(v))
+                    m->homeObject.reset(target);
+                target->putOwn(key.get(), v, PropWritable | PropConfigurable);
+                break;
+            }
+            case Op::DefElem: {
+                Value v = pop();
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                DynObject* target = asObject(sp.back());
+                target->putOwn(key.get(), v);
+                break;
+            }
+            case Op::DefGetter:
+            case Op::DefSetter: {
+                GCObject* key = code.atoms[operandAt(pc)].get();
+                pc += 4;
+                Value fn = pop();
+                DynObject* target = asObject(sp.back());
+                if (DynFunction* m = asFunction(fn))
+                    m->homeObject.reset(target);
+                Prop* existing = target->findOwn(key);
+                if (!existing || !target->accessorOf(*existing))
+                    existing = &target->putOwn(key, Value::undefined(),
+                                               PropEnumerable | PropConfigurable |
+                                                   PropAccessor);
+                if (op == Op::DefGetter)
+                    existing->value = fn;
+                else
+                    target->setSetter(*existing, fn);
+                break;
+            }
+            case Op::ObjectSpread: {
+                Value src = pop();
+                objectSpread(rt, asObject(sp.back()), src);
+                break;
+            }
+            case Op::ObjectRest: {
+                Value excluded = pop();
+                Value src = pop();
+                DynObject* out = rt.newObject(rt.objectProto.get());
+                Value result = detail::Access::adopt(Type::Object, out);
+                if (DynObject* from = asObject(src)) {
+                    DynArray* skip = asArray(excluded);
+                    for (const Value& key : ownKeys(rt, from, true, false)) {
+                        bool drop = false;
+                        if (skip) {
+                            for (std::size_t i = 0; i < skip->size(); ++i)
+                                drop = drop || strictEquals(skip->at(i), key);
                         }
-                        break;
+                        if (drop)
+                            continue;
+                        Ref<GCObject> k = toPropertyKey(rt, key);
+                        out->putOwn(k.get(), getProperty(rt, src, k.get()));
                     }
-                    case Op::DefMethodElem: {
-                        Value v = pop();
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        DynObject* target = asObject(sp.back());
-                        if (DynFunction* m = asFunction(v))
-                            m->homeObject.reset(target);
-                        target->putOwn(key.get(), v, PropWritable | PropConfigurable);
-                        break;
-                    }
-                    case Op::DefElem: {
-                        Value v = pop();
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        DynObject* target = asObject(sp.back());
-                        target->putOwn(key.get(), v);
-                        break;
-                    }
-                    case Op::DefGetter:
-                    case Op::DefSetter: {
-                        GCObject* key = code.atoms[operandAt(pc)].get();
-                        pc += 4;
-                        Value fn = pop();
-                        DynObject* target = asObject(sp.back());
-                        if (DynFunction* m = asFunction(fn))
-                            m->homeObject.reset(target);
-                        Prop* existing = target->findOwn(key);
-                        if (!existing || !target->accessorOf(*existing))
-                            existing = &target->putOwn(key, Value::undefined(),
-                                                       PropEnumerable | PropConfigurable |
-                                                           PropAccessor);
-                        if (op == Op::DefGetter)
-                            existing->value = fn;
-                        else
-                            target->setSetter(*existing, fn);
-                        break;
-                    }
-                    case Op::ObjectSpread: {
-                        Value src = pop();
-                        objectSpread(rt, asObject(sp.back()), src);
-                        break;
-                    }
-                    case Op::ObjectRest: {
-                        Value excluded = pop();
-                        Value src = pop();
-                        DynObject* out = rt.newObject(rt.objectProto.get());
-                        Value result = detail::Access::adopt(Type::Object, out);
-                        if (DynObject* from = asObject(src)) {
-                            DynArray* skip = asArray(excluded);
-                            for (const Value& key : ownKeys(rt, from, true, false)) {
-                                bool drop = false;
-                                if (skip) {
-                                    for (std::size_t i = 0; i < skip->size(); ++i)
-                                        drop = drop || strictEquals(skip->at(i), key);
-                                }
-                                if (drop)
-                                    continue;
-                                Ref<GCObject> k = toPropertyKey(rt, key);
-                                out->putOwn(k.get(), getProperty(rt, src, k.get()));
-                            }
-                        }
-                        sp.push_back(std::move(result));
-                        break;
-                    }
-                    case Op::SetProtoOf: {
-                        // `__proto__: v` in a literal: an object or null becomes the prototype, anything else is ignored.
-                        Value proto = pop();
-                        if (DynObject* target = asObject(sp.back()); target && (proto.isNull() || asObject(proto))) {
-                            target->setProto(asObject(proto));
-                            // Still a fresh literal: it can have a shape again, from its new prototype's.
-                            if (!target->shape)
-                                rt.giveShape(target);
-                        }
-                        break;
-                    }
+                }
+                sp.push_back(std::move(result));
+                break;
+            }
+            case Op::SetProtoOf: {
+                // `__proto__: v` in a literal: an object or null becomes the prototype, anything else is ignored.
+                Value proto = pop();
+                if (DynObject* target = asObject(sp.back()); target && (proto.isNull() || asObject(proto))) {
+                    target->setProto(asObject(proto));
+                    // Still a fresh literal: it can have a shape again, from its new prototype's.
+                    if (!target->shape)
+                        rt.giveShape(target);
+                }
+                break;
+            }
 
-                    case Op::GetSuper:
-                    case Op::GetSuperElem: {
-                        Ref<GCObject> key;
-                        if (op == Op::GetSuper) {
-                            key.reset(code.atoms[operandAt(pc)].get());
-                            pc += 4;
-                        } else {
-                            key = toPropertyKey(rt, pop());
-                        }
-                        DynObject* home = frame.fn->homeObject.get();
-                        DynObject* base = home ? home->proto.get() : nullptr;
-                        if (!base)
-                            throwError(rt, ErrorCode::TypeError, "'super' has no base object");
-                        sp.push_back(
-                            getPropertyOfObject(rt, base, key.get(), frame.thisValue));
-                        break;
-                    }
-                    case Op::SetSuper:
-                    case Op::SetSuperElem: {
-                        // [[Set]] on the home object's prototype, with `this` as the receiver: a setter there runs, and
-                        // a plain property lands on `this`.
-                        Value v = pop();
-                        Ref<GCObject> key;
-                        if (op == Op::SetSuper) {
-                            key.reset(code.atoms[operandAt(pc)].get());
-                            pc += 4;
-                        } else {
-                            key = toPropertyKey(rt, pop());
-                        }
-                        DynObject* home = frame.fn->homeObject.get();
-                        DynObject* base = home ? home->proto.get() : nullptr;
-                        if (!base)
-                            throwError(rt, ErrorCode::TypeError, "'super' has no base object");
-                        if (!setWithReceiver(rt, base, key.get(), v, frame.thisValue) && !code.sloppyThis)
-                            throwError(rt, ErrorCode::TypeError, "cannot assign to a property through 'super'");
-                        sp.push_back(std::move(v));
-                        break;
-                    }
+            case Op::GetSuper:
+            case Op::GetSuperElem: {
+                Ref<GCObject> key;
+                if (op == Op::GetSuper) {
+                    key.reset(code.atoms[operandAt(pc)].get());
+                    pc += 4;
+                } else {
+                    key = toPropertyKey(rt, pop());
+                }
+                DynObject* home = frame.fn->homeObject.get();
+                DynObject* base = home ? home->proto.get() : nullptr;
+                if (!base)
+                    throwError(rt, ErrorCode::TypeError, "'super' has no base object");
+                sp.push_back(
+                    getPropertyOfObject(rt, base, key.get(), frame.thisValue));
+                break;
+            }
+            case Op::SetSuper:
+            case Op::SetSuperElem: {
+                // [[Set]] on the home object's prototype, with `this` as the receiver: a setter there runs, and
+                // a plain property lands on `this`.
+                Value v = pop();
+                Ref<GCObject> key;
+                if (op == Op::SetSuper) {
+                    key.reset(code.atoms[operandAt(pc)].get());
+                    pc += 4;
+                } else {
+                    key = toPropertyKey(rt, pop());
+                }
+                DynObject* home = frame.fn->homeObject.get();
+                DynObject* base = home ? home->proto.get() : nullptr;
+                if (!base)
+                    throwError(rt, ErrorCode::TypeError, "'super' has no base object");
+                if (!setWithReceiver(rt, base, key.get(), v, frame.thisValue) && !code.sloppyThis)
+                    throwError(rt, ErrorCode::TypeError, "cannot assign to a property through 'super'");
+                sp.push_back(std::move(v));
+                break;
+            }
 
-                    case Op::NewObject: {
-                        const std::uint32_t room = operandAt(pc);
-                        pc += 4;
-                        sp.push_back(detail::Access::adopt(Type::Object, rt.newObjectSized(rt.objectProto.get(), room)));
-                        break;
-                    }
-                    case Op::NewRegExp: {
-                        DynObject* made = newRegExpFromTemplate(rt, asObject(code.consts[operandAt(pc)]));
-                        pc += 4;
-                        sp.push_back(detail::Access::adopt(Type::Object, made));
-                        break;
-                    }
-                    case Op::NewArray: {
-                        DynArray* arr = rt.newArray(operandAt(pc));
-                        pc += 4;
-                        sp.push_back(detail::Access::adopt(Type::Object, arr));
-                        break;
-                    }
-                    case Op::ArrayAppend: {
-                        Value v = pop();
-                        asArray(sp.back())->append(std::move(v));
-                        break;
-                    }
-                    case Op::ArraySpread: {
-                        Value src = pop();
-                        const Vec<Value> items = iterableToVector(rt, src);
-                        asArray(sp.back())->appendAll(items.data(), items.size());
-                        break;
-                    }
-                    case Op::Closure: {
-                        const std::uint32_t index = operandAt(pc);
-                        pc += 4;
-                        sp.push_back(makeClosure(rt, code.children[index], &frame));
-                        break;
-                    }
-                    case Op::ClassSetup: {
-                        const bool hasSuper = operandAt(pc) != 0;
-                        const bool allocatesThis = operandAt(pc) == 3;
-                        pc += 4;
-                        Value ctorValue = pop();
-                        Value superValue = Value::undefined();
-                        if (hasSuper)
-                            superValue = pop();
-                        DynFunction* ctor = asFunction(ctorValue);
-                        DynFunction* super = asFunction(superValue);
-                        if (hasSuper && !super && !superValue.isNull())
-                            throwError(rt, ErrorCode::TypeError,
-                                       "a class can only extend a constructor or null");
-                        DynObject* protoParent =
-                            super ? asObject(getPropertyOfObject(rt, super,
-                                                                 rt.atom.prototype.get(),
-                                                                 superValue))
-                                  : (hasSuper ? nullptr : rt.objectProto.get());
-                        DynObject* proto = rt.newObject(protoParent);
-                        Value protoValue = detail::Access::adopt(Type::Object, proto);
-                        proto->putOwn(rt.atom.constructor.get(), ctorValue,
-                                      PropWritable | PropConfigurable);
-                        ctor->putOwn(rt.atom.prototype.get(), protoValue, 0);
-                        ctor->homeObject.reset(proto);
-                        ctor->isClassConstructor = true;
-                        ctor->isDerivedConstructor = hasSuper && !allocatesThis;
-                        if (super)
-                            ctor->setProto(super);
-                        sp.push_back(std::move(ctorValue));
-                        break;
-                    }
+            case Op::NewObject: {
+                const std::uint32_t room = operandAt(pc);
+                pc += 4;
+                sp.push_back(detail::Access::adopt(Type::Object, rt.newObjectSized(rt.objectProto.get(), room)));
+                break;
+            }
+            case Op::NewRegExp: {
+                DynObject* made = newRegExpFromTemplate(rt, asObject(code.consts[operandAt(pc)]));
+                pc += 4;
+                sp.push_back(detail::Access::adopt(Type::Object, made));
+                break;
+            }
+            case Op::NewArray: {
+                DynArray* arr = rt.newArray(operandAt(pc));
+                pc += 4;
+                sp.push_back(detail::Access::adopt(Type::Object, arr));
+                break;
+            }
+            case Op::ArrayAppend: {
+                Value v = pop();
+                asArray(sp.back())->append(std::move(v));
+                break;
+            }
+            case Op::ArraySpread: {
+                Value src = pop();
+                const Vec<Value> items = iterableToVector(rt, src);
+                asArray(sp.back())->appendAll(items.data(), items.size());
+                break;
+            }
+            case Op::Closure: {
+                const std::uint32_t index = operandAt(pc);
+                pc += 4;
+                sp.push_back(makeClosure(rt, code.children[index], &frame));
+                break;
+            }
+            case Op::ClassSetup: {
+                const bool hasSuper = operandAt(pc) != 0;
+                const bool allocatesThis = operandAt(pc) == 3;
+                pc += 4;
+                Value ctorValue = pop();
+                Value superValue = Value::undefined();
+                if (hasSuper)
+                    superValue = pop();
+                DynFunction* ctor = asFunction(ctorValue);
+                DynFunction* super = asFunction(superValue);
+                if (hasSuper && !super && !superValue.isNull())
+                    throwError(rt, ErrorCode::TypeError,
+                               "a class can only extend a constructor or null");
+                DynObject* protoParent =
+                    super ? asObject(getPropertyOfObject(rt, super,
+                                                         rt.atom.prototype.get(),
+                                                         superValue))
+                          : (hasSuper ? nullptr : rt.objectProto.get());
+                DynObject* proto = rt.newObject(protoParent);
+                Value protoValue = detail::Access::adopt(Type::Object, proto);
+                proto->putOwn(rt.atom.constructor.get(), ctorValue,
+                              PropWritable | PropConfigurable);
+                ctor->putOwn(rt.atom.prototype.get(), protoValue, 0);
+                ctor->homeObject.reset(proto);
+                ctor->isClassConstructor = true;
+                ctor->isDerivedConstructor = hasSuper && !allocatesThis;
+                if (super)
+                    ctor->setProto(super);
+                sp.push_back(std::move(ctorValue));
+                break;
+            }
 
-                    case Op::Call:
-                    case Op::CallSpread: {
-                        ContextImpl::ArgBuffer buffer(rt.ctx);
-                        popArgs(buffer.args, op == Op::CallSpread);
-                        Value self = pop();
-                        Value callee = pop();
+            case Op::Call:
+            case Op::CallSpread: {
+                ContextImpl::ArgBuffer buffer(rt.ctx);
+                popArgs(buffer.args, op == Op::CallSpread);
+                Value self = pop();
+                Value callee = pop();
 #if SCRIPT_ENABLE_DYN_JIT
-                        if (op == Op::Call) {
-                            if (DynFunction* target = asFunction(callee); target && target->fnKind == FnKind::Bytecode && target->code)
-                                code.noteCall(pc - 5, target->code);
-                        }
+                if (op == Op::Call) {
+                    if (DynFunction* target = asFunction(callee); target && target->fnKind == FnKind::Bytecode && target->code)
+                        code.noteCall(pc - 5, target->code);
+                }
 #endif
-                        sp.push_back(callValue(rt, callee, self, buffer.args));
-                        break;
-                    }
-                    case Op::DirectEval: {
-                        const EvalScope& scope = code.evalScopes[operandAt(pc)];
-                        pc += 4;
-                        ContextImpl::ArgBuffer buffer(rt.ctx);
-                        buffer.args.assign(std::make_move_iterator(sp.end() - scope.argc), std::make_move_iterator(sp.end()));
-                        sp.resize(sp.size() - scope.argc);
-                        Value self = pop();
-                        Value callee = pop();
-                        // Only the real `eval` sees the caller's names; anything else called `eval` is an ordinary call.
-                        if (detail::Access::ptr(callee) == rt.intrinsics[Runtime::Eval].get())
-                            sp.push_back(evalString(rt, buffer.args.empty() ? Value::undefined() : buffer.args[0], &frame, &scope));
-                        else
-                            sp.push_back(callValue(rt, callee, self, buffer.args));
-                        break;
-                    }
-                    case Op::New:
-                    case Op::NewSpread: {
-                        ContextImpl::ArgBuffer buffer(rt.ctx);
-                        popArgs(buffer.args, op == Op::NewSpread);
-                        Value callee = pop();
-                        sp.push_back(constructValue(rt, callee, buffer.args));
-                        break;
-                    }
-                    case Op::CallSuper:
-                    case Op::CallSuperSpread: {
-                        ContextImpl::ArgBuffer buffer(rt.ctx);
-                        popArgs(buffer.args, op == Op::CallSuperSpread);
-                        // `self` is there already, for the base's `__init__` to work on.
-                        if (!code.isDerivedConstructor) {
-                            DynFunction* base = frame.fn->proto ? asFunction(detail::Access::make(Type::Object, frame.fn->proto.get())) : nullptr;
-                            if (!base || base == rt.functionProto.get())
-                                throwError(rt, ErrorCode::TypeError, "the class has no base to call");
-                            callInternal(rt, base, frame.thisValue, buffer.args, true, base);
-                            sp.push_back(Value::undefined());
-                            break;
-                        }
-                        Value made = superCall(rt, frame.fn, frame.newTarget.get(), buffer.args, frame.thisValue);
-                        frame.thisValue = made;
-                        runFieldInit(rt, frame.fn, made);
-                        sp.push_back(std::move(made));
-                        break;
-                    }
-                    case Op::CallSuperVia:
-                    case Op::CallSuperViaSpread: {
-                        ContextImpl::ArgBuffer buffer(rt.ctx);
-                        popArgs(buffer.args, op == Op::CallSuperViaSpread);
-                        const Value thisNow = pop();
-                        const Value target = pop();
-                        const Value ctorValue = pop();
-                        DynFunction* ctor = asFunction(ctorValue);
-                        Value made = superCall(rt, ctor, asFunction(target), buffer.args, thisNow);
-                        runFieldInit(rt, ctor, made);
-                        sp.push_back(std::move(made));
-                        break;
-                    }
-                    case Op::CheckThis:
-                        if (sp.back().isUndefined())
-                            throwError(rt, ErrorCode::ReferenceError, "'this' is not there until super() has been called");
-                        break;
-                    case Op::DerivedReturn: {
-                        const Value self = pop();
-                        if (sp.back().isObject())
-                            break;
-                        if (!sp.back().isUndefined())
-                            throwError(rt, ErrorCode::TypeError, "a derived constructor can only return an object or undefined");
-                        if (self.isUndefined())
-                            throwError(rt, ErrorCode::ReferenceError, "a derived constructor did not call super()");
-                        sp.back() = self;
-                        break;
-                    }
-                    case Op::PushNewTarget:
-                        sp.push_back(frame.newTarget ? detail::Access::make(Type::Object, frame.newTarget.get()) : Value::undefined());
-                        break;
-                    case Op::NewPrivateName: {
-                        auto* name = rt.newCell<SymbolCell>();
-                        name->isPrivate = true;
-                        name->description = asString(detail::Access::make(Type::String, code.atoms[operandAt(pc)].get()))->text();
-                        pc += 4;
-                        sp.push_back(detail::Access::adopt(Type::Symbol, name));
-                        break;
-                    }
-                    case Op::PrivateIn: {
-                        const Value name = pop();
-                        const Value object = pop();
-                        DynObject* o = asObject(object);
-                        if (!o)
-                            throwError(rt, ErrorCode::TypeError, "the right of 'in' with a private name must be an object");
-                        sp.emplace_back(o->findOwn(detail::Access::ptr(name)) != nullptr);
-                        break;
-                    }
-                    case Op::DefPrivate: {
-                        PropertySite* site = siteOf(code, operandAt(pc));
-                        pc += 4;
-                        Value value = pop();
-                        const Value name = pop();
-                        definePrivateAt(rt, site, asObject(sp.back()), detail::Access::ptr(name), std::move(value));
-                        break;
-                    }
-                    case Op::DefPrivateMethod: {
-                        const Value value = pop();
-                        const Value name = pop();
-                        DynObject* o = asObject(sp.back());
-                        GCObject* key = detail::Access::ptr(name);
-                        if (o->findOwn(key))
-                            throwError(rt, ErrorCode::TypeError, "this object has that private member already");
-                        o->putOwn(key, value, op == Op::DefPrivate ? std::uint8_t(PropWritable) : std::uint8_t(0));
-                        break;
-                    }
-                    case Op::DefPrivateAccessor: {
-                        const bool setter = operandAt(pc) != 0;
-                        pc += 4;
-                        const Value fn = pop();
-                        const Value name = pop();
-                        DynObject* o = asObject(sp.back());
-                        GCObject* key = detail::Access::ptr(name);
-                        Prop* existing = o->findOwn(key);
-                        if (!existing)
-                            existing = &o->putOwn(key, Value::undefined(), PropAccessor);
-                        if (setter)
-                            o->setSetter(*existing, fn);
-                        else
-                            existing->value = fn;
-                        break;
-                    }
-                    case Op::DefAccessorElem: {
-                        const std::uint32_t flags = operandAt(pc);
-                        pc += 4;
-                        const Value fn = pop();
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        DynObject* target = asObject(sp.back());
-                        if (DynFunction* m = asFunction(fn))
-                            m->homeObject.reset(target);
-                        Prop* existing = target->findOwn(key.get());
-                        if (!existing || !target->accessorOf(*existing))
-                            existing = &target->putOwn(key.get(), Value::undefined(),
-                                                       std::uint8_t((flags & 2 ? 0 : PropEnumerable) | PropConfigurable | PropAccessor));
-                        if (flags & 1)
-                            target->setSetter(*existing, fn);
-                        else
-                            existing->value = fn;
-                        break;
-                    }
-                    case Op::SetFieldInit: {
-                        const Value fn = pop();
-                        DynFunction* ctor = asFunction(sp.back());
-                        DynFunction* init = asFunction(fn);
-                        init->homeObject = ctor->homeObject;
-                        ctor->fieldInit.reset(init);
-                        break;
-                    }
-                    case Op::CallStaticInit: {
-                        const Value fn = pop();
-                        asFunction(fn)->homeObject.reset(asObject(sp.back()));
-                        const Value self = sp.back();
-                        callInternal(rt, asFunction(fn), self, {}, false, nullptr);
-                        break;
-                    }
-                    case Op::SetHome: {
-                        const Value fn = pop();
-                        asFunction(fn)->homeObject.reset(asObject(sp.back()));
-                        sp.back() = fn;
-                        break;
-                    }
-                    case Op::Return:
-                        return pop();
-                    case Op::ReturnUndefined:
-                        return Value::undefined();
+                sp.push_back(callValue(rt, callee, self, buffer.args));
+                break;
+            }
+            case Op::DirectEval: {
+                const EvalScope& scope = code.evalScopes[operandAt(pc)];
+                pc += 4;
+                ContextImpl::ArgBuffer buffer(rt.ctx);
+                buffer.args.assign(std::make_move_iterator(sp.end() - scope.argc), std::make_move_iterator(sp.end()));
+                sp.resize(sp.size() - scope.argc);
+                Value self = pop();
+                Value callee = pop();
+                // Only the real `eval` sees the caller's names; anything else called `eval` is an ordinary call.
+                if (detail::Access::ptr(callee) == rt.intrinsics[Runtime::Eval].get())
+                    sp.push_back(evalString(rt, buffer.args.empty() ? Value::undefined() : buffer.args[0], &frame, &scope));
+                else
+                    sp.push_back(callValue(rt, callee, self, buffer.args));
+                break;
+            }
+            case Op::New:
+            case Op::NewSpread: {
+                ContextImpl::ArgBuffer buffer(rt.ctx);
+                popArgs(buffer.args, op == Op::NewSpread);
+                Value callee = pop();
+                sp.push_back(constructValue(rt, callee, buffer.args));
+                break;
+            }
+            case Op::CallSuper:
+            case Op::CallSuperSpread: {
+                ContextImpl::ArgBuffer buffer(rt.ctx);
+                popArgs(buffer.args, op == Op::CallSuperSpread);
+                // `self` is there already, for the base's `__init__` to work on.
+                if (!code.isDerivedConstructor) {
+                    DynFunction* base = frame.fn->proto ? asFunction(detail::Access::make(Type::Object, frame.fn->proto.get())) : nullptr;
+                    if (!base || base == rt.functionProto.get())
+                        throwError(rt, ErrorCode::TypeError, "the class has no base to call");
+                    callInternal(rt, base, frame.thisValue, buffer.args, true, base);
+                    sp.push_back(Value::undefined());
+                    break;
+                }
+                Value made = superCall(rt, frame.fn, frame.newTarget.get(), buffer.args, frame.thisValue);
+                frame.thisValue = made;
+                runFieldInit(rt, frame.fn, made);
+                sp.push_back(std::move(made));
+                break;
+            }
+            case Op::CallSuperVia:
+            case Op::CallSuperViaSpread: {
+                ContextImpl::ArgBuffer buffer(rt.ctx);
+                popArgs(buffer.args, op == Op::CallSuperViaSpread);
+                const Value thisNow = pop();
+                const Value target = pop();
+                const Value ctorValue = pop();
+                DynFunction* ctor = asFunction(ctorValue);
+                Value made = superCall(rt, ctor, asFunction(target), buffer.args, thisNow);
+                runFieldInit(rt, ctor, made);
+                sp.push_back(std::move(made));
+                break;
+            }
+            case Op::CheckThis:
+                if (sp.back().isUndefined())
+                    throwError(rt, ErrorCode::ReferenceError, "'this' is not there until super() has been called");
+                break;
+            case Op::DerivedReturn: {
+                const Value self = pop();
+                if (sp.back().isObject())
+                    break;
+                if (!sp.back().isUndefined())
+                    throwError(rt, ErrorCode::TypeError, "a derived constructor can only return an object or undefined");
+                if (self.isUndefined())
+                    throwError(rt, ErrorCode::ReferenceError, "a derived constructor did not call super()");
+                sp.back() = self;
+                break;
+            }
+            case Op::PushNewTarget:
+                sp.push_back(frame.newTarget ? detail::Access::make(Type::Object, frame.newTarget.get()) : Value::undefined());
+                break;
+            case Op::NewPrivateName: {
+                auto* name = rt.newCell<SymbolCell>();
+                name->isPrivate = true;
+                name->description = asString(detail::Access::make(Type::String, code.atoms[operandAt(pc)].get()))->text();
+                pc += 4;
+                sp.push_back(detail::Access::adopt(Type::Symbol, name));
+                break;
+            }
+            case Op::PrivateIn: {
+                const Value name = pop();
+                const Value object = pop();
+                DynObject* o = asObject(object);
+                if (!o)
+                    throwError(rt, ErrorCode::TypeError, "the right of 'in' with a private name must be an object");
+                sp.emplace_back(o->findOwn(detail::Access::ptr(name)) != nullptr);
+                break;
+            }
+            case Op::DefPrivate: {
+                PropertySite* site = siteOf(code, operandAt(pc));
+                pc += 4;
+                Value value = pop();
+                const Value name = pop();
+                definePrivateAt(rt, site, asObject(sp.back()), detail::Access::ptr(name), std::move(value));
+                break;
+            }
+            case Op::DefPrivateMethod: {
+                const Value value = pop();
+                const Value name = pop();
+                DynObject* o = asObject(sp.back());
+                GCObject* key = detail::Access::ptr(name);
+                if (o->findOwn(key))
+                    throwError(rt, ErrorCode::TypeError, "this object has that private member already");
+                o->putOwn(key, value, op == Op::DefPrivate ? std::uint8_t(PropWritable) : std::uint8_t(0));
+                break;
+            }
+            case Op::DefPrivateAccessor: {
+                const bool setter = operandAt(pc) != 0;
+                pc += 4;
+                const Value fn = pop();
+                const Value name = pop();
+                DynObject* o = asObject(sp.back());
+                GCObject* key = detail::Access::ptr(name);
+                Prop* existing = o->findOwn(key);
+                if (!existing)
+                    existing = &o->putOwn(key, Value::undefined(), PropAccessor);
+                if (setter)
+                    o->setSetter(*existing, fn);
+                else
+                    existing->value = fn;
+                break;
+            }
+            case Op::DefAccessorElem: {
+                const std::uint32_t flags = operandAt(pc);
+                pc += 4;
+                const Value fn = pop();
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                DynObject* target = asObject(sp.back());
+                if (DynFunction* m = asFunction(fn))
+                    m->homeObject.reset(target);
+                Prop* existing = target->findOwn(key.get());
+                if (!existing || !target->accessorOf(*existing))
+                    existing = &target->putOwn(key.get(), Value::undefined(),
+                                               std::uint8_t((flags & 2 ? 0 : PropEnumerable) | PropConfigurable | PropAccessor));
+                if (flags & 1)
+                    target->setSetter(*existing, fn);
+                else
+                    existing->value = fn;
+                break;
+            }
+            case Op::SetFieldInit: {
+                const Value fn = pop();
+                DynFunction* ctor = asFunction(sp.back());
+                DynFunction* init = asFunction(fn);
+                init->homeObject = ctor->homeObject;
+                ctor->fieldInit.reset(init);
+                break;
+            }
+            case Op::CallStaticInit: {
+                const Value fn = pop();
+                asFunction(fn)->homeObject.reset(asObject(sp.back()));
+                const Value self = sp.back();
+                callInternal(rt, asFunction(fn), self, {}, false, nullptr);
+                break;
+            }
+            case Op::SetHome: {
+                const Value fn = pop();
+                asFunction(fn)->homeObject.reset(asObject(sp.back()));
+                sp.back() = fn;
+                break;
+            }
+            case Op::Return:
+                leaving = pop();
+                return Step::Leave;
+            case Op::ReturnUndefined:
+                leaving = Value::undefined();
+                return Step::Leave;
 
-                    case Op::Jump: {
-                        const std::uint32_t target = operandAt(pc);
-                        if (target < pc) {
-                            Value result;
-                            if (const int entered = loopBack(target, pc, result)) {
-                                if (entered == 1)
-                                    return result;
-                                pc = frame.pc;
-                                break;
-                            }
-                        }
-                        pc = target;
-                        break;
-                    }
-                    case Op::JumpIfFalse:
-                    case Op::JumpIfTrue: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        bool truthy;
-                        if (sp.back().type() == Type::Bool) {
-                            truthy = detail::Access::boolean(sp.back());
-                            sp.pop_back();
-                        } else {
-                            truthy = toBoolean(pop());
-                        }
-                        if (truthy != (op == Op::JumpIfTrue))
-                            break;
-                        if (target < pc) {
-                            Value result;
-                            if (const int entered = loopBack(target, pc, result)) {
-                                if (entered == 1)
-                                    return result;
-                                pc = frame.pc;
-                                break;
-                            }
-                        }
-                        pc = target;
-                        break;
-                    }
-                    case Op::JumpIfFalseKeep: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        if (!toBoolean(sp.back()))
-                            pc = target;
-                        break;
-                    }
-                    case Op::JumpIfTrueKeep: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        if (toBoolean(sp.back()))
-                            pc = target;
-                        break;
-                    }
-                    case Op::JumpIfNullishKeep: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        if (sp.back().isNullish())
-                            pc = target;
-                        break;
-                    }
-                    case Op::JumpIfNotNullishKeep: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        if (!sp.back().isNullish())
-                            pc = target;
-                        break;
-                    }
-                    case Op::JumpSub: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        frame.subStack.push_back(pc);
-                        pc = target;
-                        break;
-                    }
-                    case Op::EndFinally: {
-                        const std::uint32_t back = frame.subStack.back();
-                        frame.subStack.pop_back();
-                        if (back == kRethrow) {
-                            Value pending = frame.pendingException;
-                            frame.pendingException = Value::undefined();
-                            throwValue(rt, pending);
-                        }
-                        pc = back;
-                        break;
-                    }
-                    case Op::Throw: {
-                        Value v = pop();
-                        throwValue(rt, v);
-                    }
-                    case Op::ThrowConstAssign: {
-                        const auto* name = static_cast<const StringCell*>(code.atoms[operandAt(pc)].get());
-                        throwError(rt, ErrorCode::TypeError, "assignment to a constant: " + toUtf8(name->text()));
-                    }
+            case Op::JumpIfFalseKeep: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                if (!toBoolean(sp.back()))
+                    pc = target;
+                break;
+            }
+            case Op::JumpIfTrueKeep: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                if (toBoolean(sp.back()))
+                    pc = target;
+                break;
+            }
+            case Op::JumpIfNullishKeep: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                if (sp.back().isNullish())
+                    pc = target;
+                break;
+            }
+            case Op::JumpIfNotNullishKeep: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                if (!sp.back().isNullish())
+                    pc = target;
+                break;
+            }
+            case Op::JumpSub: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                frame.subStack.push_back(pc);
+                pc = target;
+                break;
+            }
+            case Op::EndFinally: {
+                const std::uint32_t back = frame.subStack.back();
+                frame.subStack.pop_back();
+                if (back == kRethrow) {
+                    Value pending = frame.pendingException;
+                    frame.pendingException = Value::undefined();
+                    throwValue(rt, pending);
+                }
+                pc = back;
+                break;
+            }
+            case Op::Throw: {
+                Value v = pop();
+                throwValue(rt, v);
+            }
+            case Op::ThrowConstAssign: {
+                const auto* name = static_cast<const StringCell*>(code.atoms[operandAt(pc)].get());
+                throwError(rt, ErrorCode::TypeError, "assignment to a constant: " + toUtf8(name->text()));
+            }
 
-                    case Op::ForInStart: {
-                        Value src = pop();
-                        DynArray* keys = rt.newArray();
-                        Value keysValue = detail::Access::adopt(Type::Object, keys);
-                        if (DynObject* obj = asObject(src)) {
-                            GcList seen;
-                            for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
-                                for (const Value& k : ownKeys(rt, cursor, true, false)) {
-                                    GCObject* atom = rt.intern(asString(k)->text());
-                                    if (std::find(seen.begin(), seen.end(), atom) != seen.end())
-                                        continue;
-                                    seen.push_back(atom);
-                                    keys->append(k);
-                                }
-                            }
-                        } else if (StringCell* s = asString(src)) {
-                            for (std::uint32_t i = 0; i < s->text().size(); ++i)
-                                keys->append(rt.str(numberToString(i)));
+            case Op::ForInStart: {
+                Value src = pop();
+                DynArray* keys = rt.newArray();
+                Value keysValue = detail::Access::adopt(Type::Object, keys);
+                if (DynObject* obj = asObject(src)) {
+                    GcList seen;
+                    for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+                        for (const Value& k : ownKeys(rt, cursor, true, false)) {
+                            GCObject* atom = rt.intern(asString(k)->text());
+                            if (std::find(seen.begin(), seen.end(), atom) != seen.end())
+                                continue;
+                            seen.push_back(atom);
+                            keys->append(k);
                         }
-                        sp.push_back(std::move(keysValue));
-                        sp.emplace_back(0.0);
-                        break;
                     }
-                    case Op::ForInNext: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        DynArray* keys = asArray(sp[sp.size() - 2]);
-                        const std::size_t index = std::size_t(numberOf(sp.back()));
-                        if (index >= keys->size()) {
-                            pc = target;
-                            break;
-                        }
-                        sp.back() = Value(double(index + 1));
-                        sp.push_back(keys->at(index));
-                        break;
-                    }
-                    case Op::IterStart: {
-                        Value src = pop();
-                        sp.push_back(getIterator(rt, src));
-                        break;
-                    }
-                    case Op::IterNext: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        Value item = Value::undefined();
-                        if (!iteratorStep(rt, sp.back(), item)) {
-                            pc = target;
-                            break;
-                        }
-                        sp.push_back(std::move(item));
-                        break;
-                    }
-                    case Op::IterNextOpt: {
-                        Value item = Value::undefined();
-                        if (!iteratorStep(rt, sp.back(), item))
-                            item = Value::undefined();
-                        sp.push_back(std::move(item));
-                        break;
-                    }
-                    case Op::IterRest: {
-                        DynArray* rest = rt.newArray();
-                        Value restValue = detail::Access::adopt(Type::Object, rest);
-                        Value item = Value::undefined();
-                        while (iteratorStep(rt, sp.back(), item))
-                            rest->append(item);
-                        sp.push_back(std::move(restValue));
-                        break;
-                    }
-                    case Op::IterClose: {
-                        Value iterator = pop();
+                } else if (StringCell* s = asString(src)) {
+                    for (std::uint32_t i = 0; i < s->text().size(); ++i)
+                        keys->append(rt.str(numberToString(i)));
+                }
+                sp.push_back(std::move(keysValue));
+                sp.emplace_back(0.0);
+                break;
+            }
+            case Op::ForInNext: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                DynArray* keys = asArray(sp[sp.size() - 2]);
+                const std::size_t index = std::size_t(numberOf(sp.back()));
+                if (index >= keys->size()) {
+                    pc = target;
+                    break;
+                }
+                sp.back() = Value(double(index + 1));
+                sp.push_back(keys->at(index));
+                break;
+            }
+            case Op::IterStart: {
+                Value src = pop();
+                sp.push_back(getIterator(rt, src));
+                break;
+            }
+            case Op::IterNext: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                Value item = Value::undefined();
+                if (!iteratorStep(rt, sp.back(), item)) {
+                    pc = target;
+                    break;
+                }
+                sp.push_back(std::move(item));
+                break;
+            }
+            case Op::IterNextOpt: {
+                Value item = Value::undefined();
+                if (!iteratorStep(rt, sp.back(), item))
+                    item = Value::undefined();
+                sp.push_back(std::move(item));
+                break;
+            }
+            case Op::IterRest: {
+                DynArray* rest = rt.newArray();
+                Value restValue = detail::Access::adopt(Type::Object, rest);
+                Value item = Value::undefined();
+                while (iteratorStep(rt, sp.back(), item))
+                    rest->append(item);
+                sp.push_back(std::move(restValue));
+                break;
+            }
+            case Op::IterClose: {
+                Value iterator = pop();
+                iteratorClose(rt, iterator);
+                break;
+            }
+            case Op::IterStartLoop: {
+                Value src = pop();
+                sp.push_back(getIterator(rt, src));
+                break;
+            }
+            case Op::IterCloseAt: {
+                const Value iterator = sp[operandAt(pc)];
+                pc += 4;
+                const Value fn = getProperty(rt, iterator, rt.intern("return"));
+                if (!fn.isNullish() && !callValue(rt, fn, iterator, {}).isObject())
+                    throwError(rt, ErrorCode::TypeError, "the iterator's return() did not give an object");
+                break;
+            }
+            case Op::IterCloseThrow: {
+                const Value thrown = pop();
+                const Value iterator = pop();
+                try {
+                    iteratorClose(rt, iterator);
+                } catch (const Exception&) {
+                    // The reason for leaving stands.
+                }
+                throwValue(rt, thrown);
+            }
+            case Op::CoStart: {
+                leaving = startCoroutine(rt, frame, pc);
+                return Step::Leave;
+            }
+            case Op::Yield: {
+                frame.coroutine->returnPc = operandAt(pc);
+                pc += 4;
+                frame.pc = pc;
+                frame.left = Frame::Left::Yielded;
+                leaving = pop();
+                return Step::Leave;
+            }
+            case Op::Await: {
+                frame.pc = pc;
+                frame.left = Frame::Left::Awaiting;
+                leaving = pop();
+                return Step::Leave;
+            }
+            case Op::DelegateStart:
+                frame.coroutine->mode = DynCoroutine::Resume::Next;
+                frame.coroutine->received = Value::undefined();
+                break;
+            case Op::DelegateCall: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                DynCoroutine* co = frame.coroutine;
+                co->delegating = false;
+                const Value iterator = sp.back();
+                const Value sent = co->received;
+                if (co->mode == DynCoroutine::Resume::Next) {
+                    sp.push_back(invokeMethod(rt, iterator, rt.atom.next.get(), {sent}));
+                } else if (co->mode == DynCoroutine::Resume::Throw) {
+                    const Value fn = getProperty(rt, iterator, rt.intern("throw"));
+                    if (fn.isNullish()) {
                         iteratorClose(rt, iterator);
+                        throwError(rt, ErrorCode::TypeError, "the iterator has no throw method");
+                    }
+                    sp.push_back(callValue(rt, fn, iterator, {sent}));
+                } else {
+                    const Value fn = getProperty(rt, iterator, rt.intern("return"));
+                    if (fn.isNullish()) {
+                        sp.back() = sent;
+                        pc = target;
                         break;
                     }
-                    case Op::IterStartLoop: {
-                        Value src = pop();
-                        sp.push_back(getIterator(rt, src));
-                        break;
-                    }
-                    case Op::IterCloseAt: {
-                        const Value iterator = sp[operandAt(pc)];
-                        pc += 4;
-                        const Value fn = getProperty(rt, iterator, rt.intern("return"));
-                        if (!fn.isNullish() && !callValue(rt, fn, iterator, {}).isObject())
-                            throwError(rt, ErrorCode::TypeError, "the iterator's return() did not give an object");
-                        break;
-                    }
-                    case Op::IterCloseThrow: {
-                        const Value thrown = pop();
-                        const Value iterator = pop();
-                        try {
-                            iteratorClose(rt, iterator);
-                        } catch (const Exception&) {
-                            // The reason for leaving stands.
-                        }
-                        throwValue(rt, thrown);
-                    }
-                    case Op::CoStart: {
-                        Value made = startCoroutine(rt, frame, pc);
-                        return made;
-                    }
-                    case Op::Yield: {
-                        frame.coroutine->returnPc = operandAt(pc);
-                        pc += 4;
-                        frame.pc = pc;
-                        frame.left = Frame::Left::Yielded;
-                        return pop();
-                    }
-                    case Op::Await: {
-                        frame.pc = pc;
-                        frame.left = Frame::Left::Awaiting;
-                        return pop();
-                    }
-                    case Op::DelegateStart:
-                        frame.coroutine->mode = DynCoroutine::Resume::Next;
-                        frame.coroutine->received = Value::undefined();
-                        break;
-                    case Op::DelegateCall: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        DynCoroutine* co = frame.coroutine;
-                        co->delegating = false;
-                        const Value iterator = sp.back();
-                        const Value sent = co->received;
-                        if (co->mode == DynCoroutine::Resume::Next) {
-                            sp.push_back(invokeMethod(rt, iterator, rt.atom.next.get(), {sent}));
-                        } else if (co->mode == DynCoroutine::Resume::Throw) {
-                            const Value fn = getProperty(rt, iterator, rt.intern("throw"));
-                            if (fn.isNullish()) {
-                                iteratorClose(rt, iterator);
-                                throwError(rt, ErrorCode::TypeError, "the iterator has no throw method");
-                            }
-                            sp.push_back(callValue(rt, fn, iterator, {sent}));
-                        } else {
-                            const Value fn = getProperty(rt, iterator, rt.intern("return"));
-                            if (fn.isNullish()) {
-                                sp.back() = sent;
-                                pc = target;
-                                break;
-                            }
-                            sp.push_back(callValue(rt, fn, iterator, {sent}));
-                        }
-                        break;
-                    }
-                    case Op::DelegateCheck: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        const Value result = pop();
-                        if (!result.isObject())
-                            throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
-                        if (toBoolean(getProperty(rt, result, rt.atom.done.get()))) {
-                            sp.back() = getProperty(rt, result, rt.atom.value.get());
-                            pc = target;
-                            break;
-                        }
-                        // Only once nothing more can throw: what is thrown from here on is the generator's own.
-                        Value out = code.isAsync ? getProperty(rt, result, rt.atom.value.get()) : result;
-                        frame.coroutine->delegating = true;
-                        frame.pc = pc;
-                        frame.left = code.isAsync ? Frame::Left::Yielded : Frame::Left::YieldedResult;
-                        return out;
-                    }
-                    case Op::DelegateDone: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        if (frame.coroutine->mode == DynCoroutine::Resume::Return)
-                            pc = target;
-                        break;
-                    }
-                    case Op::AsyncIterStart: {
-                        Value src = pop();
-                        const Value method = getProperty(rt, src, rt.sym.asyncIterator.get());
-                        if (method.isNullish()) {
-                            sp.push_back(asyncFromSyncIterator(rt, getIterator(rt, src)));
-                        } else {
-                            Value iterator = callValue(rt, method, src, {});
-                            if (!iterator.isObject())
-                                throwError(rt, ErrorCode::TypeError, "the async iterator is not an object");
-                            sp.push_back(std::move(iterator));
-                        }
-                        break;
-                    }
-                    case Op::AsyncIterCall: {
-                        const Value iterator = sp.back();
-                        sp.push_back(invokeMethod(rt, iterator, rt.atom.next.get(), {}));
-                        break;
-                    }
-                    case Op::AsyncIterCheck: {
-                        const std::uint32_t target = operandAt(pc);
-                        pc += 4;
-                        const Value result = pop();
-                        if (!result.isObject())
-                            throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
-                        if (toBoolean(getProperty(rt, result, rt.atom.done.get()))) {
-                            pc = target;
-                            break;
-                        }
-                        sp.push_back(getProperty(rt, result, rt.atom.value.get()));
-                        break;
-                    }
-                    case Op::AsyncIterClose: {
-                        const Value iterator = sp[operandAt(pc)];
-                        pc += 4;
-                        const Value fn = getProperty(rt, iterator, rt.intern("return"));
-                        sp.push_back(fn.isNullish() ? Value::undefined() : callValue(rt, fn, iterator, {}));
-                        break;
-                    }
+                    sp.push_back(callValue(rt, fn, iterator, {sent}));
+                }
+                break;
+            }
+            case Op::DelegateCheck: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                const Value result = pop();
+                if (!result.isObject())
+                    throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
+                if (toBoolean(getProperty(rt, result, rt.atom.done.get()))) {
+                    sp.back() = getProperty(rt, result, rt.atom.value.get());
+                    pc = target;
+                    break;
+                }
+                // Only once nothing more can throw: what is thrown from here on is the generator's own.
+                Value out = code.isAsync ? getProperty(rt, result, rt.atom.value.get()) : result;
+                frame.coroutine->delegating = true;
+                frame.pc = pc;
+                frame.left = code.isAsync ? Frame::Left::Yielded : Frame::Left::YieldedResult;
+                leaving = std::move(out);
+                return Step::Leave;
+            }
+            case Op::DelegateDone: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                if (frame.coroutine->mode == DynCoroutine::Resume::Return)
+                    pc = target;
+                break;
+            }
+            case Op::AsyncIterStart: {
+                Value src = pop();
+                const Value method = getProperty(rt, src, rt.sym.asyncIterator.get());
+                if (method.isNullish()) {
+                    sp.push_back(asyncFromSyncIterator(rt, getIterator(rt, src)));
+                } else {
+                    Value iterator = callValue(rt, method, src, {});
+                    if (!iterator.isObject())
+                        throwError(rt, ErrorCode::TypeError, "the async iterator is not an object");
+                    sp.push_back(std::move(iterator));
+                }
+                break;
+            }
+            case Op::AsyncIterCall: {
+                const Value iterator = sp.back();
+                sp.push_back(invokeMethod(rt, iterator, rt.atom.next.get(), {}));
+                break;
+            }
+            case Op::AsyncIterCheck: {
+                const std::uint32_t target = operandAt(pc);
+                pc += 4;
+                const Value result = pop();
+                if (!result.isObject())
+                    throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
+                if (toBoolean(getProperty(rt, result, rt.atom.done.get()))) {
+                    pc = target;
+                    break;
+                }
+                sp.push_back(getProperty(rt, result, rt.atom.value.get()));
+                break;
+            }
+            case Op::AsyncIterClose: {
+                const Value iterator = sp[operandAt(pc)];
+                pc += 4;
+                const Value fn = getProperty(rt, iterator, rt.intern("return"));
+                sp.push_back(fn.isNullish() ? Value::undefined() : callValue(rt, fn, iterator, {}));
+                break;
+            }
 
-                    case Op::Add: {
-                        {
-                            const std::size_t n = sp.size();
-                            Value& fa = sp[n - 2];
-                            Value& fb = sp[n - 1];
-                            if (fa.type() == Type::Double && fb.type() == Type::Double) {
-                                const double r = detail::Access::r8(fa) + detail::Access::r8(fb);
-                                sp.pop_back();
-                                fa = Value(r);
-                                break;
-                            }
-                        }
-                        Value b = pop();
-                        Value a = pop();
-                        if (a.isNumber() && b.isNumber()) {
-                            sp.emplace_back(numberOf(a) + numberOf(b));
+            case Op::Add: {
+                {
+                    const std::size_t n = sp.size();
+                    Value& fa = sp[n - 2];
+                    Value& fb = sp[n - 1];
+                    if (fa.type() == Type::Double && fb.type() == Type::Double) {
+                        const double r = detail::Access::r8(fa) + detail::Access::r8(fb);
+                        sp.pop_back();
+                        fa = Value(r);
+                        break;
+                    }
+                }
+                Value b = pop();
+                Value a = pop();
+                if (a.isNumber() && b.isNumber()) {
+                    sp.emplace_back(numberOf(a) + numberOf(b));
+                    break;
+                }
+                // Read from the code as compiled: the interpreter's copy has pairs marked.
+                // `s += x` into the local `s` came from: what is in the local is `a`, so it can grow in place.
+                if (a.isString() && !asString(a)->interned) {
+                    std::uint32_t at = pc;
+                    if (at < code.code.size() && Op(code.code[at]) == Op::Dup)
+                        ++at;
+                    if (at + 4 < code.code.size() && Op(code.code[at]) == Op::SetLocal) {
+                        const std::uint32_t slot = operandAt(at + 1);
+                        if (slot < frame.locals.size() && detail::Access::ptr(frame.locals[slot]) == detail::Access::ptr(a)) {
+                            sp.push_back(appendForLocal(rt, a, b, 2));
                             break;
                         }
-                        // Read from the code as compiled: the interpreter's copy has pairs marked.
-                        // `s += x` into the local `s` came from: what is in the local is `a`, so it can grow in place.
-                        if (a.isString() && !asString(a)->interned) {
-                            std::uint32_t at = pc;
-                            if (at < code.code.size() && Op(code.code[at]) == Op::Dup)
-                                ++at;
-                            if (at + 4 < code.code.size() && Op(code.code[at]) == Op::SetLocal) {
-                                const std::uint32_t slot = operandAt(at + 1);
-                                if (slot < frame.locals.size() && detail::Access::ptr(frame.locals[slot]) == detail::Access::ptr(a)) {
-                                    sp.push_back(appendForLocal(rt, a, b, 2));
-                                    break;
-                                }
-                            }
-                            // The same for a variable a closure shares, in its cell.
-                            if (at + 4 < code.code.size() && Op(code.code[at]) == Op::SetCell) {
-                                const std::uint32_t slot = operandAt(at + 1);
-                                if (slot < frame.cells.size() && frame.cells[slot] && detail::Access::ptr(frame.cells[slot]->value) == detail::Access::ptr(a)) {
-                                    sp.push_back(appendForLocal(rt, a, b, 2));
-                                    break;
-                                }
-                            }
+                    }
+                    // The same for a variable a closure shares, in its cell.
+                    if (at + 4 < code.code.size() && Op(code.code[at]) == Op::SetCell) {
+                        const std::uint32_t slot = operandAt(at + 1);
+                        if (slot < frame.cells.size() && frame.cells[slot] && detail::Access::ptr(frame.cells[slot]->value) == detail::Access::ptr(a)) {
+                            sp.push_back(appendForLocal(rt, a, b, 2));
+                            break;
                         }
-                        sp.push_back(add(rt, a, b));
+                    }
+                }
+                sp.push_back(add(rt, a, b));
+                break;
+            }
+            case Op::Sub:
+                numeric(bigint::BinaryOp::Sub, [](double a, double b) { return a - b; });
+                break;
+            case Op::Mul:
+                numeric(bigint::BinaryOp::Mul, [](double a, double b) { return a * b; });
+                break;
+            case Op::Div:
+                numeric(bigint::BinaryOp::Div, [](double a, double b) { return a / b; });
+                break;
+            case Op::Mod:
+                numeric(bigint::BinaryOp::Mod, [](double a, double b) {
+                    if (a > 0 && b > 0 && a <= 2147483647.0 && b <= 2147483647.0) {
+                        const std::int32_t ia = std::int32_t(a), ib = std::int32_t(b);
+                        if (double(ia) == a && double(ib) == b)
+                            return double(ia % ib);
+                    }
+                    return std::fmod(a, b);
+                });
+                break;
+            case Op::Pow:
+                numeric(bigint::BinaryOp::Pow, [](double a, double b) { return numberPow(a, b); });
+                break;
+            case Op::Neg: {
+                const Value operand = toNumeric(rt, sp.back());
+                if (operand.isBigInt())
+                    sp.back() = bigint::negate(rt, bigint::cellOf(operand));
+                else
+                    sp.back() = Value(-numberOf(operand));
+                break;
+            }
+            case Op::Pos:
+                sp.back() = Value(toNumber(rt, sp.back()));
+                break;
+            case Op::ToNumber:  // ToNumeric: what `x++` starts with
+                sp.back() = toNumeric(rt, sp.back());
+                break;
+            case Op::ToString:
+                sp.back() = rt.str(toStringValue(rt, sp.back()));
+                break;
+            case Op::ToObject:
+                sp.back() = toObject(rt, sp.back());
+                break;
+            case Op::ToPropertyKey: {
+                Ref<GCObject> key = toPropertyKey(rt, sp.back());
+                sp.back() = detail::Access::make(
+                    key->kind == CellKind::Symbol ? Type::Symbol : Type::String,
+                    key.get());
+                break;
+            }
+            case Op::Inc:
+            case Op::Dec: {
+                const Value operand = toNumeric(rt, sp.back());
+                if (operand.isBigInt())
+                    sp.back() = bigint::increment(rt, bigint::cellOf(operand), op == Op::Inc ? 1 : -1);
+                else
+                    sp.back() = Value(numberOf(operand) + (op == Op::Inc ? 1 : -1));
+                break;
+            }
+            case Op::Void:
+                sp.back() = Value::undefined();
+                break;
+            case Op::BitAnd:
+                numeric(bigint::BinaryOp::And, [](double a, double b) { return double(toInt32(a) & toInt32(b)); });
+                break;
+            case Op::BitOr:
+                numeric(bigint::BinaryOp::Or, [](double a, double b) { return double(toInt32(a) | toInt32(b)); });
+                break;
+            case Op::BitXor:
+                numeric(bigint::BinaryOp::Xor, [](double a, double b) { return double(toInt32(a) ^ toInt32(b)); });
+                break;
+            case Op::BitNot: {
+                const Value operand = toNumeric(rt, sp.back());
+                if (operand.isBigInt())
+                    sp.back() = bigint::bitNot(rt, bigint::cellOf(operand));
+                else
+                    sp.back() = Value(double(~toInt32(numberOf(operand))));
+                break;
+            }
+            case Op::Shl:
+                numeric(bigint::BinaryOp::Shl, [](double a, double b) {
+                    return double(std::int32_t(toUint32(a) << (toUint32(b) & 31)));
+                });
+                break;
+            case Op::Shr:
+                numeric(bigint::BinaryOp::Shr, [](double a, double b) {
+                    return double(toInt32(a) >> (toUint32(b) & 31));
+                });
+                break;
+            case Op::UShr: {
+                const Value right = pop();
+                const Value left = pop();
+                const Value x = toNumeric(rt, left);
+                const Value y = toNumeric(rt, right);
+                if (x.isBigInt() || y.isBigInt())
+                    throwError(rt, ErrorCode::TypeError, "BigInts have no unsigned right shift");
+                sp.emplace_back(double(toUint32(numberOf(x)) >> (toUint32(numberOf(y)) & 31)));
+                break;
+            }
+            case Op::Eq: {
+                Value b = pop();
+                Value a = pop();
+                sp.emplace_back(looseEquals(rt, a, b));
+                break;
+            }
+            case Op::Ne: {
+                Value b = pop();
+                Value a = pop();
+                sp.emplace_back(!looseEquals(rt, a, b));
+                break;
+            }
+            case Op::StrictEq: {
+                Value b = pop();
+                Value a = pop();
+                sp.emplace_back(strictEquals(a, b));
+                break;
+            }
+            case Op::StrictNe: {
+                Value b = pop();
+                Value a = pop();
+                sp.emplace_back(!strictEquals(a, b));
+                break;
+            }
+            case Op::Lt:
+            case Op::Le:
+            case Op::Gt:
+            case Op::Ge: {
+                {
+                    const std::size_t n = sp.size();
+                    Value& fa = sp[n - 2];
+                    Value& fb = sp[n - 1];
+                    if (fa.type() == Type::Double && fb.type() == Type::Double) {
+                        const double x = detail::Access::r8(fa), y = detail::Access::r8(fb);
+                        const bool res = op == Op::Lt ? x < y : op == Op::Le ? x <= y : op == Op::Gt ? x > y : x >= y;
+                        sp.pop_back();
+                        fa = Value(res);
                         break;
                     }
-                    case Op::Sub:
-                        numeric(bigint::BinaryOp::Sub, [](double a, double b) { return a - b; });
-                        break;
-                    case Op::Mul:
-                        numeric(bigint::BinaryOp::Mul, [](double a, double b) { return a * b; });
-                        break;
-                    case Op::Div:
-                        numeric(bigint::BinaryOp::Div, [](double a, double b) { return a / b; });
-                        break;
-                    case Op::Mod:
-                        numeric(bigint::BinaryOp::Mod, [](double a, double b) {
-                            if (a > 0 && b > 0 && a <= 2147483647.0 && b <= 2147483647.0) {
-                                const std::int32_t ia = std::int32_t(a), ib = std::int32_t(b);
-                                if (double(ia) == a && double(ib) == b)
-                                    return double(ia % ib);
-                            }
-                            return std::fmod(a, b);
-                        });
-                        break;
-                    case Op::Pow:
-                        numeric(bigint::BinaryOp::Pow, [](double a, double b) { return numberPow(a, b); });
-                        break;
-                    case Op::Neg: {
-                        const Value operand = toNumeric(rt, sp.back());
-                        if (operand.isBigInt())
-                            sp.back() = bigint::negate(rt, bigint::cellOf(operand));
-                        else
-                            sp.back() = Value(-numberOf(operand));
-                        break;
+                }
+                Value b = pop();
+                Value a = pop();
+                const int r = compare(rt, a, b);
+                bool result = false;
+                if (r != 2) {
+                    switch (op) {
+                        case Op::Lt: result = r < 0; break;
+                        case Op::Le: result = r <= 0; break;
+                        case Op::Gt: result = r > 0; break;
+                        default: result = r >= 0; break;
                     }
-                    case Op::Pos:
-                        sp.back() = Value(toNumber(rt, sp.back()));
-                        break;
-                    case Op::ToNumber:  // ToNumeric: what `x++` starts with
-                        sp.back() = toNumeric(rt, sp.back());
-                        break;
-                    case Op::ToString:
-                        sp.back() = rt.str(toStringValue(rt, sp.back()));
-                        break;
-                    case Op::ToObject:
-                        sp.back() = toObject(rt, sp.back());
-                        break;
-                    case Op::ToPropertyKey: {
-                        Ref<GCObject> key = toPropertyKey(rt, sp.back());
-                        sp.back() = detail::Access::make(
-                            key->kind == CellKind::Symbol ? Type::Symbol : Type::String,
-                            key.get());
-                        break;
-                    }
-                    case Op::Inc:
-                    case Op::Dec: {
-                        const Value operand = toNumeric(rt, sp.back());
-                        if (operand.isBigInt())
-                            sp.back() = bigint::increment(rt, bigint::cellOf(operand), op == Op::Inc ? 1 : -1);
-                        else
-                            sp.back() = Value(numberOf(operand) + (op == Op::Inc ? 1 : -1));
-                        break;
-                    }
-                    case Op::Void:
-                        sp.back() = Value::undefined();
-                        break;
-                    case Op::BitAnd:
-                        numeric(bigint::BinaryOp::And, [](double a, double b) { return double(toInt32(a) & toInt32(b)); });
-                        break;
-                    case Op::BitOr:
-                        numeric(bigint::BinaryOp::Or, [](double a, double b) { return double(toInt32(a) | toInt32(b)); });
-                        break;
-                    case Op::BitXor:
-                        numeric(bigint::BinaryOp::Xor, [](double a, double b) { return double(toInt32(a) ^ toInt32(b)); });
-                        break;
-                    case Op::BitNot: {
-                        const Value operand = toNumeric(rt, sp.back());
-                        if (operand.isBigInt())
-                            sp.back() = bigint::bitNot(rt, bigint::cellOf(operand));
-                        else
-                            sp.back() = Value(double(~toInt32(numberOf(operand))));
-                        break;
-                    }
-                    case Op::Shl:
-                        numeric(bigint::BinaryOp::Shl, [](double a, double b) {
-                            return double(std::int32_t(toUint32(a) << (toUint32(b) & 31)));
-                        });
-                        break;
-                    case Op::Shr:
-                        numeric(bigint::BinaryOp::Shr, [](double a, double b) {
-                            return double(toInt32(a) >> (toUint32(b) & 31));
-                        });
-                        break;
-                    case Op::UShr: {
-                        const Value right = pop();
-                        const Value left = pop();
-                        const Value x = toNumeric(rt, left);
-                        const Value y = toNumeric(rt, right);
-                        if (x.isBigInt() || y.isBigInt())
-                            throwError(rt, ErrorCode::TypeError, "BigInts have no unsigned right shift");
-                        sp.emplace_back(double(toUint32(numberOf(x)) >> (toUint32(numberOf(y)) & 31)));
-                        break;
-                    }
-                    case Op::Eq: {
-                        Value b = pop();
-                        Value a = pop();
-                        sp.emplace_back(looseEquals(rt, a, b));
-                        break;
-                    }
-                    case Op::Ne: {
-                        Value b = pop();
-                        Value a = pop();
-                        sp.emplace_back(!looseEquals(rt, a, b));
-                        break;
-                    }
-                    case Op::StrictEq: {
-                        Value b = pop();
-                        Value a = pop();
-                        sp.emplace_back(strictEquals(a, b));
-                        break;
-                    }
-                    case Op::StrictNe: {
-                        Value b = pop();
-                        Value a = pop();
-                        sp.emplace_back(!strictEquals(a, b));
-                        break;
-                    }
-                    case Op::Lt:
-                    case Op::Le:
-                    case Op::Gt:
-                    case Op::Ge: {
-                        {
-                            const std::size_t n = sp.size();
-                            Value& fa = sp[n - 2];
-                            Value& fb = sp[n - 1];
-                            if (fa.type() == Type::Double && fb.type() == Type::Double) {
-                                const double x = detail::Access::r8(fa), y = detail::Access::r8(fb);
-                                const bool res = op == Op::Lt ? x < y : op == Op::Le ? x <= y : op == Op::Gt ? x > y : x >= y;
-                                sp.pop_back();
-                                fa = Value(res);
-                                break;
-                            }
-                        }
-                        Value b = pop();
-                        Value a = pop();
-                        const int r = compare(rt, a, b);
-                        bool result = false;
-                        if (r != 2) {
-                            switch (op) {
-                                case Op::Lt: result = r < 0; break;
-                                case Op::Le: result = r <= 0; break;
-                                case Op::Gt: result = r > 0; break;
-                                default: result = r >= 0; break;
-                            }
-                        }
-                        sp.emplace_back(result);
-                        break;
-                    }
-                    case Op::In: {
-                        Value container = pop();
-                        Ref<GCObject> key = toPropertyKey(rt, pop());
-                        sp.emplace_back(hasProperty(rt, container, key.get()));
-                        break;
-                    }
-                    case Op::InstanceOf: {
-                        Value ctor = pop();
-                        Value obj = pop();
-                        sp.emplace_back(instanceOf(rt, obj, ctor));
-                        break;
-                    }
-                    case Op::Not:
-                        sp.back() = Value(!toBoolean(sp.back()));
-                        break;
-                    case Op::TypeOf:
-                        sp.back() = rt.typeOfValue(sp.back());
-                        break;
-                    default:
-                        throwError(rt, ErrorCode::InternalError,
-                                   std::string("unimplemented opcode ") + opName(op));
+                }
+                sp.emplace_back(result);
+                break;
+            }
+            case Op::In: {
+                Value container = pop();
+                Ref<GCObject> key = toPropertyKey(rt, pop());
+                sp.emplace_back(hasProperty(rt, container, key.get()));
+                break;
+            }
+            case Op::InstanceOf: {
+                Value ctor = pop();
+                Value obj = pop();
+                sp.emplace_back(instanceOf(rt, obj, ctor));
+                break;
+            }
+            case Op::Not:
+                sp.back() = Value(!toBoolean(sp.back()));
+                break;
+            case Op::TypeOf:
+                sp.back() = rt.typeOfValue(sp.back());
+                break;
+            default:
+                throwError(rt, ErrorCode::InternalError,
+                           std::string("unimplemented opcode ") + opName(op));
+    }
+    frame.pc = pc;
+    return Step::Next;
+}
+
+/// A 32-bit operand of the instruction stream, which is little-endian, as every host this runs on is.
+[[gnu::always_inline]] inline std::uint32_t operandOf(const std::uint8_t* at) noexcept
+{
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    std::uint32_t v;
+    std::memcpy(&v, at, 4);
+    return v;
+#else
+    return std::uint32_t(at[0]) | std::uint32_t(at[1]) << 8 | std::uint32_t(at[2]) << 16 | std::uint32_t(at[3]) << 24;
+#endif
+}
+
+/// `src` into `dst`, which lets go of what it held; `src` is left with nothing that needs letting go.
+[[gnu::always_inline]] inline void moveInto(Value& dst, Value& src) noexcept
+{
+    GCObject* old = detail::Access::ptr(dst);
+    detail::Access::moveRaw(dst, src);
+    if (old)
+        detail::decRef(old);
+}
+
+[[gnu::always_inline]] inline void copyInto(Value& dst, const Value& src) noexcept
+{
+    Value copy(src);
+    moveInto(dst, copy);
+}
+
+/// A slot whose value holds no reference, overwritten.
+[[gnu::always_inline]] inline void putDouble(Value& v, double d) noexcept
+{
+    new (&v) Value(d);
+}
+
+[[gnu::always_inline]] inline std::int32_t int32Of(double d) noexcept
+{
+    if (d >= -2147483648.0 && d <= 2147483647.0)
+        return std::int32_t(d);
+    return toInt32(d);
+}
+
+/// The property a `GetProp` site knows for `base`, when it knows it as a plain data property; null otherwise.
+[[gnu::always_inline]] inline const Value* cachedRead(Runtime& rt, const FunctionCode& code, const Value& base,
+                                                     std::uint32_t operand) noexcept
+{
+    const std::uint32_t index = operand >> kSiteShift;
+    if (index == kNoSite || code.sites.empty() || base.type() != Type::Object)
+        return nullptr;
+    GCObject* cell = detail::Access::ptr(base);
+    if (cell->kind != CellKind::Object)
+        return nullptr;
+    auto* obj = static_cast<DynObject*>(cell);
+    PropertySite& site = code.sites[index];
+    if (!obj->shape || obj->shape != site.shape)
+        return nullptr;
+    const Value* found;
+    if (!site.holder)
+        found = &obj->props[site.index].value;
+    else if (site.epoch == rt.ctx.protoEpoch && !site.getter)
+        found = &site.holder->props[site.index].value;
+    else
+        return nullptr;
+    site.see(*found);
+    return found;
+}
+
+/// The interpreter's loop counters, for a frame it begins running.
+inline void startLoops(Runtime& rt, Frame& frame) noexcept
+{
+#if SCRIPT_ENABLE_DYN_JIT
+    const FunctionCode& code = *frame.code;
+    // Back edges until this function is worth compiling in the middle of running it.
+    frame.backEdges =
+        !code.jitRefused && rt.jitBackend && rt.ctx.options.jit.mode != JitOptions::Mode::Off ? code.jitThreshold(rt.ctx.options.jit.threshold) : 0;
+    // And the work those loops did, in bytes of their bodies run: a compile costs what the whole function's size does,
+    // which a short loop in a long function, run a few thousand times, does not earn back. Code already compiled is free.
+    frame.loopWork = 0;
+#else
+    (void)rt;
+    (void)frame;
+#endif
+}
+
+/// Whether a call from the interpreter can enter `code` in the interpreter's own loop: a plain function with nothing to
+/// make of its arguments, that no compile is due for, within the depth limit. Anything else takes the long way, which
+/// also counts the call towards compiling it.
+inline bool inlineCallable(Runtime& rt, const FunctionCode& code) noexcept
+{
+    if (code.lazy || code.hasRest || code.argumentsSlot != FunctionCode::kNoSlot || code.isGenerator || code.isAsync ||
+        rt.ctx.callDepth + 1 > rt.ctx.options.stackLimit)
+        return false;
+#if SCRIPT_ENABLE_DYN_JIT
+    if (code.jitEntry)
+        return false;
+    if (!code.jitRefused && rt.ctx.options.jit.mode != JitOptions::Mode::Off) {
+        if (rt.ctx.options.jit.mode == JitOptions::Mode::Eager || code.jitHotness + 1 >= code.jitThreshold(rt.ctx.options.jit.threshold))
+            return false;
+        ++code.jitHotness;
+    }
+#endif
+    return true;
+}
+
+/// Back from a frame the interpreter entered itself to the one that called it.
+inline void leaveInline(Runtime& rt, Frame*& frame) noexcept
+{
+    rt.frames.pop_back();
+    frame->end();
+    --rt.ctx.callDepth;
+    frame = rt.frames.back();
+}
+
+/// The interpreter. The instructions it does often are each a few machine instructions here, with where it is in the
+/// code, the top of the stack and the locals kept in registers, and each going straight on to the next. The rest run in
+/// `slowStep`, with the frame's state written back for them first: what can throw, call out or look at the frame does
+/// so with the frame as it would be between instructions.
+Value execute(Runtime& rt, Frame& entry)
+{
+    // The frame running, and its code: the one called from C++, or one this loop entered on a call from the one below.
+    Frame* frame = &entry;
+    const FunctionCode* code = entry.code;
+    const std::uint8_t* c = quickened(*code);
+    startLoops(rt, entry);
+    std::uint32_t ticks = 0;
+    // A jump back: where to, and the end of the jump.
+    std::uint32_t jumpTo = 0;
+    std::uint32_t jumpFrom = 0;
+
+    static const void* const kHandlers[] = {
+        &&L_Nop,
+        &&L_PushUndefined,
+        &&L_PushNull,
+        &&L_PushTrue,
+        &&L_PushFalse,
+        &&L_PushConst,
+        &&L_PushThis,
+        &&L_PushCallee,
+        &&L_Pop,
+        &&L_PopN,
+        &&L_Dup,
+        &&L_Dup2,
+        &&L_Swap,
+        &&L_Rot3,
+        &&L_GetLocal,
+        &&L_SetLocal,
+        &&L_GetCell,
+        &&L_SetCell,
+        &&L_NewCell,
+        &&L_RenewCell,
+        &&L_GetUpval,
+        &&L_SetUpval,
+        &&L_GetGlobal,
+        &&L_SetGlobal,
+        &&L_DefGlobal,
+        &&L_TypeofGlobal,
+        &&L_DeleteGlobal,
+        &&L_GetProp,
+        &&L_SetProp,
+        &&L_GetPropDup,
+        &&L_GetPropBound,
+        &&L_GetElem,
+        &&L_SetElem,
+        &&L_GetElemDup,
+        &&L_DeleteProp,
+        &&L_DeleteElem,
+        &&L_DefField,
+        &&L_DefGetter,
+        &&L_DefSetter,
+        &&L_DefElem,
+        &&L_DefMethod,
+        &&L_DefMethodElem,
+        &&L_ObjectRest,
+        &&L_ClassSetup,
+        &&L_SetProtoOf,
+        &&L_GetSuper,
+        &&L_SetSuper,
+        &&L_SetSuperElem,
+        &&L_GetSuperElem,
+        &&L_NewObject,
+        &&L_NewArray,
+        &&L_ArrayAppend,
+        &&L_ArraySpread,
+        &&L_ObjectSpread,
+        &&L_Closure,
+        &&L_DirectEval,
+        &&L_NewRegExp,
+        &&L_Call,
+        &&L_CallSpread,
+        &&L_New,
+        &&L_NewSpread,
+        &&L_CallSuper,
+        &&L_CallSuperSpread,
+        &&L_Return,
+        &&L_ReturnUndefined,
+        &&L_Jump,
+        &&L_JumpIfFalse,
+        &&L_JumpIfTrue,
+        &&L_JumpIfFalseKeep,
+        &&L_JumpIfTrueKeep,
+        &&L_JumpIfNullishKeep,
+        &&L_JumpIfNotNullishKeep,
+        &&L_JumpSub,
+        &&L_EndFinally,
+        &&L_Throw,
+        &&L_ThrowConstAssign,
+        &&L_ForInStart,
+        &&L_ForInNext,
+        &&L_IterStart,
+        &&L_IterNext,
+        &&L_IterNextOpt,
+        &&L_IterRest,
+        &&L_IterClose,
+        &&L_IterStartLoop,
+        &&L_IterCloseAt,
+        &&L_IterCloseThrow,
+        &&L_NewPrivateName,
+        &&L_PrivateIn,
+        &&L_DefPrivate,
+        &&L_DefPrivateMethod,
+        &&L_DefPrivateAccessor,
+        &&L_DefAccessorElem,
+        &&L_CheckThis,
+        &&L_DerivedReturn,
+        &&L_PushNewTarget,
+        &&L_CallSuperVia,
+        &&L_CallSuperViaSpread,
+        &&L_SetFieldInit,
+        &&L_CallStaticInit,
+        &&L_SetHome,
+        &&L_CoStart,
+        &&L_Yield,
+        &&L_Await,
+        &&L_DelegateStart,
+        &&L_DelegateCall,
+        &&L_DelegateCheck,
+        &&L_DelegateDone,
+        &&L_AsyncIterStart,
+        &&L_AsyncIterCall,
+        &&L_AsyncIterCheck,
+        &&L_AsyncIterClose,
+        &&L_Add,
+        &&L_Sub,
+        &&L_Mul,
+        &&L_Div,
+        &&L_Mod,
+        &&L_Pow,
+        &&L_Neg,
+        &&L_Pos,
+        &&L_BitAnd,
+        &&L_BitOr,
+        &&L_BitXor,
+        &&L_BitNot,
+        &&L_Shl,
+        &&L_Shr,
+        &&L_UShr,
+        &&L_Eq,
+        &&L_Ne,
+        &&L_StrictEq,
+        &&L_StrictNe,
+        &&L_Lt,
+        &&L_Le,
+        &&L_Gt,
+        &&L_Ge,
+        &&L_In,
+        &&L_InstanceOf,
+        &&L_Not,
+        &&L_TypeOf,
+        &&L_Inc,
+        &&L_Dec,
+        &&L_ToNumber,
+        &&L_ToString,
+        &&L_ToObject,
+        &&L_ToPropertyKey,
+        &&L_Void,
+        &&L_QCompareJump,
+        &&L_QGetLocal2,
+        &&L_QGetLocalConst,
+        &&L_QSetLocalPop,
+        &&L_QGetLocalProp,
+        &&L_QThisProp,
+        &&L_QIncLocal,
+        &&L_QDecLocal,
+    };
+    static_assert(sizeof(kHandlers) / sizeof(kHandlers[0]) == std::size_t(Op::OpCount), "a handler for every instruction");
+
+    const std::uint8_t* ip = c;
+    Value* top = nullptr;
+    Value* limit = nullptr;
+    Value* locals = nullptr;
+    Value leaving;
+    bool starting = true;
+
+#define LS_LOAD() (top = frame->stack.end(), limit = frame->stack.data() + frame->stack.capacity(), locals = frame->locals.data())
+#define LS_SAVE() (frame->pc = std::uint32_t(ip - c), frame->stack.setEnd(top))
+#define LS_DISPATCH() goto* kHandlers[*ip]
+#define LS_NEXT(n)     \
+    do {               \
+        ip += (n);     \
+        LS_DISPATCH(); \
+    } while (false)
+#define LS_ROOM(n)                            \
+    do {                                      \
+        if (limit - top < (n)) [[unlikely]] \
+            goto grow;                        \
+    } while (false)
+#define LS_OPERAND(at) operandOf(ip + (at))
+#define LS_PUSH(v) new (top++) Value(v)
+#define LS_JUMP(target, end)                     \
+    do {                                         \
+        const std::uint32_t to_ = (target);      \
+        if (to_ < std::uint32_t(ip - c) + 1) {   \
+            jumpTo = to_;                        \
+            jumpFrom = std::uint32_t(ip - c) + (end); \
+            goto backward;                       \
+        }                                        \
+        ip = c + to_;                            \
+        LS_DISPATCH();                           \
+    } while (false)
+
+    for (;;) {
+        try {
+            if (starting) {
+                starting = false;
+                // Resumed by `throw`, or by an `await` of what was rejected: thrown from where it stopped.
+                if (frame->coroutine && frame->coroutine->throwOnResume) {
+                    frame->coroutine->throwOnResume = false;
+                    frame->pc = frame->pc - 1;
+                    const Value thrown = std::move(frame->coroutine->received);
+                    frame->coroutine->received = Value::undefined();
+                    throwValue(rt, thrown);
+                }
+                // Each call counts towards the checks a loop makes, for code that recurses instead.
+                if (++rt.interpTicks >= kInterruptInterval / 16) {
+                    rt.interpTicks = 0;
+                    if (rt.ctx.interruptAsked())
+                        throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
                 }
             }
+            LS_LOAD();
+            ip = c + frame->pc;
+            LS_DISPATCH();
+
+        slow: {
+            // The instruction as compiled, not the pair the interpreter's copy may have it beginning.
+            LS_SAVE();
+            if (slowStep(rt, *frame, Op(code->code[frame->pc]), leaving) == Step::Leave) {
+                if (frame == &entry)
+                    return leaving;
+                goto returnInline;
+            }
+            LS_LOAD();
+            ip = c + frame->pc;
+            LS_DISPATCH();
+        }
+        grow:
+            LS_SAVE();
+            frame->stack.reserve(frame->stack.capacity() * 2 + 16);
+            LS_LOAD();
+            LS_DISPATCH();
+        backward: {
+            if (++ticks >= kInterruptInterval / 16) [[unlikely]] {
+                ticks = 0;
+                LS_SAVE();
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+                if (!code->interpreted++ && std::getenv("SCRIPT_INTERP_PROFILE"))
+                    rt.interpretedCodes.push_back(code);
+#endif
+                if (rt.ctx.interruptAsked())
+                    throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
+                // A loop that only grows containers it already owns never reaches cell allocation, so budgets are
+                // checked here too.
+                rt.maybeCollect();
+            }
+#if SCRIPT_ENABLE_DYN_JIT
+            if (frame->backEdges) {
+                frame->loopWork += jumpFrom - jumpTo;
+                if (frame->backEdges > 1) {
+                    --frame->backEdges;
+                    // A coroutine's frame comes into native code only at a loop, on each resume: only one that has done the work.
+                } else if (frame->loopWork >= std::uint64_t(code->code.size()) * osrWorkPerByte() || (code->jitCode && !frame->coroutine)) {
+                    frame->backEdges = 0;
+                    LS_SAVE();
+                    frame->pc = jumpTo;
+                    if (const int entered = enterNativeAtLoop(rt, *frame, jumpTo, leaving)) {
+                        if (entered == 1) {
+                            if (frame == &entry)
+                                return leaving;
+                            goto returnInline;
+                        }
+                        LS_LOAD();
+                        ip = c + frame->pc;
+                        LS_DISPATCH();
+                    }
+#if SCRIPT_ENABLE_JIT_THREAD
+                    // Being compiled elsewhere: asked again a while on.
+                    if (code->jitJob)
+                        frame->backEdges = kAskAgainEdges;
+#endif
+                }
+            }
+#endif
+            ip = c + jumpTo;
+            LS_DISPATCH();
+        }
+
+        // ------------------------------------------------------------ the stack ---
+        L_Nop:
+            LS_NEXT(1);
+        L_PushUndefined:
+            LS_ROOM(1);
+            LS_PUSH(Value::undefined());
+            LS_NEXT(1);
+        L_PushNull:
+            LS_ROOM(1);
+            LS_PUSH(nullptr);
+            LS_NEXT(1);
+        L_PushTrue:
+            LS_ROOM(1);
+            LS_PUSH(true);
+            LS_NEXT(1);
+        L_PushFalse:
+            LS_ROOM(1);
+            LS_PUSH(false);
+            LS_NEXT(1);
+        L_PushConst:
+            LS_ROOM(1);
+            LS_PUSH(code->consts[LS_OPERAND(1)]);
+            LS_NEXT(5);
+        L_PushThis:
+            if (code->sloppyThis && frame->thisValue.isNullish())
+                goto slow;
+            LS_ROOM(1);
+            LS_PUSH(frame->thisValue);
+            LS_NEXT(1);
+        L_Pop:
+            (--top)->~Value();
+            LS_NEXT(1);
+        L_Dup:
+            LS_ROOM(1);
+            new (top) Value(top[-1]);
+            ++top;
+            LS_NEXT(1);
+        L_Swap:
+            top[-1].swap(top[-2]);
+            LS_NEXT(1);
+
+        // -------------------------------------------------------- variables ---
+        L_GetLocal:
+            LS_ROOM(1);
+            LS_PUSH(locals[LS_OPERAND(1)]);
+            LS_NEXT(5);
+        L_SetLocal:
+            --top;
+            moveInto(locals[LS_OPERAND(1)], *top);
+            LS_NEXT(5);
+        L_GetCell: {
+            const Ref<Box>& cell = frame->cells[LS_OPERAND(1)];
+            if (!cell)
+                goto slow;
+            LS_ROOM(1);
+            LS_PUSH(cell->value);
+            LS_NEXT(5);
+        }
+        L_SetCell: {
+            const Ref<Box>& cell = frame->cells[LS_OPERAND(1)];
+            if (!cell)
+                goto slow;
+            --top;
+            moveInto(cell->value, *top);
+            LS_NEXT(5);
+        }
+        L_GetUpval: {
+            const Ref<Box>& cell = frame->fn->upvalues[LS_OPERAND(1)];
+            if (!cell)
+                goto slow;
+            LS_ROOM(1);
+            LS_PUSH(cell->value);
+            LS_NEXT(5);
+        }
+        L_SetUpval: {
+            const Ref<Box>& cell = frame->fn->upvalues[LS_OPERAND(1)];
+            if (!cell)
+                goto slow;
+            --top;
+            moveInto(cell->value, *top);
+            LS_NEXT(5);
+        }
+        L_GetGlobal: {
+            const Prop* p = rt.globalObject->findOwn(code->atoms[LS_OPERAND(1)].get());
+            if (!p || rt.globalObject->accessorOf(*p))
+                goto slow;
+            LS_ROOM(1);
+            LS_PUSH(p->value);
+            LS_NEXT(5);
+        }
+
+        // ------------------------------------------------------- properties ---
+        L_QThisProp:
+            // `this.x`: `this`, then the read.
+            if (code->sloppyThis && frame->thisValue.isNullish())
+                goto slow;
+            LS_ROOM(1);
+            LS_PUSH(frame->thisValue);
+            ip += 1;
+            goto L_GetProp;
+        L_QGetLocalProp:
+            LS_ROOM(1);
+            LS_PUSH(locals[LS_OPERAND(1)]);
+            ip += 5;
+            goto L_GetProp;
+        L_GetProp: {
+            const Value* found = cachedRead(rt, *code, top[-1], LS_OPERAND(1));
+            if (!found)
+                goto slow;
+            copyInto(top[-1], *found);
+            LS_NEXT(5);
+        }
+        L_GetPropDup: {
+            // obj -> function obj
+            LS_ROOM(1);
+            const Value* found = cachedRead(rt, *code, top[-1], LS_OPERAND(1));
+            if (!found)
+                goto slow;
+            new (top) Value(std::move(top[-1]));
+            new (&top[-1]) Value(*found);
+            ++top;
+            LS_NEXT(5);
+        }
+        L_SetProp: {
+            // obj value -> value
+            const std::uint32_t operand = LS_OPERAND(1);
+            const std::uint32_t index = operand >> kSiteShift;
+            Value& base = top[-2];
+            if (index == kNoSite || code->sites.empty() || base.type() != Type::Object)
+                goto slow;
+            GCObject* cell = detail::Access::ptr(base);
+            if (cell->kind != CellKind::Object)
+                goto slow;
+            auto* obj = static_cast<DynObject*>(cell);
+            const PropertySite& site = code->sites[index];
+            if (!obj->shape || obj->shape != site.shape)
+                goto slow;
+            if (!site.addTo) {
+                copyInto(obj->props[site.index].value, top[-1]);
+            } else {
+                if (site.epoch != rt.ctx.protoEpoch)
+                    goto slow;
+                LS_SAVE();
+                obj->appendKnown(top[-1], site.addTo);
+            }
+            --top;
+            moveInto(base, *top);
+            LS_NEXT(5);
+        }
+        L_GetElem: {
+            const Value& key = top[-1];
+            DynObject* obj = asObject(top[-2]);
+            if (key.type() != Type::Double || !obj || obj->cls != ObjClass::Array)
+                goto slow;
+            const double d = detail::Access::r8(key);
+            if (!(d >= 0 && d < 4294967295.0))
+                goto slow;
+            const std::uint32_t i = std::uint32_t(d);
+            auto* arr = static_cast<DynArray*>(obj);
+            if (double(i) != d || i >= arr->size() || !arr->hasElement(i))
+                goto slow;
+            code->elemSaw[LS_OPERAND(1)] |= ElemSite::of(arr);
+            Value r = arr->at(i);
+            --top;
+            moveInto(top[-1], r);
+            LS_NEXT(5);
+        }
+        L_SetElem: {
+            // arr key value -> value
+            const Value& key = top[-2];
+            DynObject* obj = asObject(top[-3]);
+            if (key.type() != Type::Double || !obj || obj->cls != ObjClass::Array || obj->frozen || !obj->props.empty())
+                goto slow;
+            const double d = detail::Access::r8(key);
+            if (!(d >= 0 && d < 4294967295.0))
+                goto slow;
+            const std::uint32_t i = std::uint32_t(d);
+            auto* arr = static_cast<DynArray*>(obj);
+            if (double(i) != d || i >= arr->size() || !arr->hasElement(i))
+                goto slow;
+            code->elemSaw[LS_OPERAND(1)] |= ElemSite::of(arr);
+            LS_SAVE();
+            arr->put(i, top[-1]);
+            // The key is a number, with nothing to let go of.
+            moveInto(top[-3], top[-1]);
+            top -= 2;
+            LS_NEXT(5);
+        }
+
+        // ---------------------------------------------------------- control ---
+        L_Return: {
+            Value result = std::move(*--top);
+            frame->stack.setEnd(top);
+            if (frame == &entry)
+                return result;
+            leaving = std::move(result);
+            goto returnInline;
+        }
+        L_ReturnUndefined:
+            frame->stack.setEnd(top);
+            if (frame == &entry)
+                return Value::undefined();
+            leaving = Value::undefined();
+            goto returnInline;
+        returnInline:
+            // `leaving` goes back to the frame below, whose call entered this one in this loop.
+            leaveInline(rt, frame);
+            code = frame->code;
+            c = quickened(*code);
+            LS_LOAD();
+            ip = c + frame->pc;
+            // The call's function, `this` and arguments, given up only now, for the result.
+            for (std::uint32_t n = LS_OPERAND(1) + 2; n; --n)
+                (--top)->~Value();
+            new (top++) Value(std::move(leaving));
+            LS_NEXT(5);
+        L_Jump:
+            LS_JUMP(LS_OPERAND(1), 5);
+        L_JumpIfFalse:
+        L_JumpIfTrue: {
+            const Value& v = top[-1];
+            bool truthy;
+            if (v.type() == Type::Bool) {
+                truthy = detail::Access::boolean(v);
+            } else if (v.type() == Type::Double) {
+                const double d = detail::Access::r8(v);
+                truthy = d == d && d != 0;
+            } else {
+                truthy = toBoolean(v);
+            }
+            (--top)->~Value();
+            if (truthy != (Op(*ip) == Op::JumpIfTrue))
+                LS_NEXT(5);
+            LS_JUMP(LS_OPERAND(1), 5);
+        }
+        L_JumpIfFalseKeep:
+            if (!toBoolean(top[-1])) {
+                ip = c + LS_OPERAND(1);
+                LS_DISPATCH();
+            }
+            LS_NEXT(5);
+        L_JumpIfTrueKeep:
+            if (toBoolean(top[-1])) {
+                ip = c + LS_OPERAND(1);
+                LS_DISPATCH();
+            }
+            LS_NEXT(5);
+        L_JumpIfNullishKeep:
+            if (top[-1].isNullish()) {
+                ip = c + LS_OPERAND(1);
+                LS_DISPATCH();
+            }
+            LS_NEXT(5);
+        L_JumpIfNotNullishKeep:
+            if (!top[-1].isNullish()) {
+                ip = c + LS_OPERAND(1);
+                LS_DISPATCH();
+            }
+            LS_NEXT(5);
+
+        // -------------------------------------------------------- operators ---
+#define LS_BOTH_DOUBLE() (top[-2].type() == Type::Double && top[-1].type() == Type::Double)
+#define LS_A detail::Access::r8(top[-2])
+#define LS_B detail::Access::r8(top[-1])
+#define LS_ARITH(expr)            \
+    if (!LS_BOTH_DOUBLE())        \
+        goto slow;                \
+    putDouble(top[-2], (expr));   \
+    --top;                        \
+    LS_NEXT(1)
+#define LS_RELATION(expr)                \
+    if (!LS_BOTH_DOUBLE())               \
+        goto slow;                       \
+    new (&top[-2]) Value(bool(expr));    \
+    --top;                               \
+    LS_NEXT(1)
+        L_Add:
+            LS_ARITH(LS_A + LS_B);
+        L_Sub:
+            LS_ARITH(LS_A - LS_B);
+        L_Mul:
+            LS_ARITH(LS_A * LS_B);
+        L_Div:
+            LS_ARITH(LS_A / LS_B);
+        L_Mod: {
+            if (!LS_BOTH_DOUBLE())
+                goto slow;
+            const double a = LS_A, b = LS_B;
+            double r;
+            if (a > 0 && b > 0 && a <= 2147483647.0 && b <= 2147483647.0 && double(std::int32_t(a)) == a &&
+                double(std::int32_t(b)) == b)
+                r = double(std::int32_t(a) % std::int32_t(b));
+            else
+                r = std::fmod(a, b);
+            putDouble(top[-2], r);
+            --top;
+            LS_NEXT(1);
+        }
+        L_BitAnd:
+            LS_ARITH(double(int32Of(LS_A) & int32Of(LS_B)));
+        L_BitOr:
+            LS_ARITH(double(int32Of(LS_A) | int32Of(LS_B)));
+        L_BitXor:
+            LS_ARITH(double(int32Of(LS_A) ^ int32Of(LS_B)));
+        L_Shl:
+            LS_ARITH(double(std::int32_t(std::uint32_t(int32Of(LS_A)) << (std::uint32_t(int32Of(LS_B)) & 31))));
+        L_Shr:
+            LS_ARITH(double(int32Of(LS_A) >> (std::uint32_t(int32Of(LS_B)) & 31)));
+        L_UShr:
+            LS_ARITH(double(std::uint32_t(int32Of(LS_A)) >> (std::uint32_t(int32Of(LS_B)) & 31)));
+        L_Lt:
+            LS_RELATION(LS_A < LS_B);
+        L_Le:
+            LS_RELATION(LS_A <= LS_B);
+        L_Gt:
+            LS_RELATION(LS_A > LS_B);
+        L_Ge:
+            LS_RELATION(LS_A >= LS_B);
+        L_StrictEq:
+        L_StrictNe: {
+            const bool same = LS_BOTH_DOUBLE() ? LS_A == LS_B : strictEquals(top[-2], top[-1]);
+            (--top)->~Value();
+            top[-1].~Value();
+            new (&top[-1]) Value(same == (Op(*ip) == Op::StrictEq));
+            LS_NEXT(1);
+        }
+        L_Inc:
+            if (top[-1].type() != Type::Double)
+                goto slow;
+            putDouble(top[-1], detail::Access::r8(top[-1]) + 1);
+            LS_NEXT(1);
+        L_Dec:
+            if (top[-1].type() != Type::Double)
+                goto slow;
+            putDouble(top[-1], detail::Access::r8(top[-1]) - 1);
+            LS_NEXT(1);
+        L_Neg:
+            if (top[-1].type() != Type::Double)
+                goto slow;
+            putDouble(top[-1], -detail::Access::r8(top[-1]));
+            LS_NEXT(1);
+        L_Not: {
+            const bool truthy = toBoolean(top[-1]);
+            top[-1].~Value();
+            new (&top[-1]) Value(!truthy);
+            LS_NEXT(1);
+        }
+
+        // ------------------------------------------------------------ calls ---
+        L_Call: {
+            // func this arg... -> result. A function of bytecode is entered straight from here, its arguments moved
+            // into its frame->
+            const std::uint32_t argc = LS_OPERAND(1);
+            Value* const args = top - argc;
+            DynObject* const callee = asObject(args[-2]);
+            if (!callee || callee->cls != ObjClass::Function)
+                goto slow;
+            auto* const fn = static_cast<DynFunction*>(callee);
+            if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isClassConstructor)
+                goto slow;
+            LS_SAVE();
+#if SCRIPT_ENABLE_DYN_JIT
+            code->noteCall(frame->pc, fn->code);
+#endif
+            const FunctionCode& target = *fn->code;
+            if (!inlineCallable(rt, target)) {
+                Value result;
+                {
+                    DepthGuard guard(rt);
+                    result = invokeBytecode(rt, fn, args[-1], args, argc, nullptr, true);
+                }
+                while (top != args - 2)
+                    (--top)->~Value();
+                new (top++) Value(std::move(result));
+                LS_NEXT(5);
+            }
+            if (++rt.interpTicks >= kInterruptInterval / 16) [[unlikely]] {
+                rt.interpTicks = 0;
+                if (rt.ctx.interruptAsked())
+                    throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
+            }
+            // Into the callee's frame, run by this same loop, which goes back to this one when it returns.
+            noteArguments(target, args, argc);
+            Frame& next = rt.acquireFrame(rt.frames.size());
+            next.begin(fn, &target, args[-1], nullptr);
+            const std::size_t plain = std::min<std::size_t>(argc, target.numLocals);
+            for (std::size_t i = 0; i < plain; ++i)
+                moveInto(next.locals[i], args[i]);
+            // The callee stays on this stack, with `this` and what is left of the arguments, until the call returns:
+            // it may be the only reference to the function running.
+            frame->stack.setEnd(top);
+            next.inlineCall = true;
+            rt.frames.push_back(&next);
+            ++rt.ctx.callDepth;
+            frame = &next;
+            code = &target;
+            c = quickened(target);
+            startLoops(rt, next);
+            LS_LOAD();
+            ip = c;
+            LS_DISPATCH();
+        }
+
+        // ------------------------------------------- pairs done in one go ---
+        L_QGetLocal2:
+            LS_ROOM(2);
+            LS_PUSH(locals[LS_OPERAND(1)]);
+            LS_PUSH(locals[LS_OPERAND(6)]);
+            LS_NEXT(10);
+        L_QGetLocalConst:
+            LS_ROOM(2);
+            LS_PUSH(locals[LS_OPERAND(1)]);
+            LS_PUSH(code->consts[LS_OPERAND(6)]);
+            LS_NEXT(10);
+        L_QSetLocalPop:
+            // Dup, SetLocal, Pop
+            --top;
+            moveInto(locals[LS_OPERAND(2)], *top);
+            LS_NEXT(7);
+        L_QIncLocal:
+        L_QDecLocal: {
+            Value& v = locals[LS_OPERAND(1)];
+            if (v.type() != Type::Double)
+                goto slow;
+            putDouble(v, detail::Access::r8(v) + (Op(*ip) == Op::QIncLocal ? 1 : -1));
+            LS_NEXT(14);
+        }
+        L_ToNumber:
+            if (top[-1].type() != Type::Double)
+                goto slow;
+            LS_NEXT(1);
+        L_QCompareJump: {
+            // A comparison, then JumpIfFalse or JumpIfTrue at ip + 1.
+            const Op compare = Op(code->code[ip - c]);
+            bool holds;
+            if (LS_BOTH_DOUBLE()) {
+                const double x = LS_A, y = LS_B;
+                switch (compare) {
+                    case Op::Lt: holds = x < y; break;
+                    case Op::Le: holds = x <= y; break;
+                    case Op::Gt: holds = x > y; break;
+                    case Op::Ge: holds = x >= y; break;
+                    case Op::Eq:
+                    case Op::StrictEq: holds = x == y; break;
+                    default: holds = x != y; break;
+                }
+            } else if (compare == Op::StrictEq || compare == Op::StrictNe) {
+                // Strict equality has no side effects to order, whatever the operands.
+                holds = strictEquals(top[-2], top[-1]) == (compare == Op::StrictEq);
+            } else {
+                goto slow;
+            }
+            (--top)->~Value();
+            (--top)->~Value();
+            if (holds != (Op(ip[1]) == Op::JumpIfTrue))
+                LS_NEXT(6);
+            ++ip;
+            LS_JUMP(LS_OPERAND(1), 5);
+        }
+
+        // ------------------------------------------- everything else ---
+        L_PushCallee:
+        L_PopN:
+        L_Dup2:
+        L_Rot3:
+        L_NewCell:
+        L_RenewCell:
+        L_SetGlobal:
+        L_DefGlobal:
+        L_TypeofGlobal:
+        L_DeleteGlobal:
+        L_GetPropBound:
+        L_GetElemDup:
+        L_DeleteProp:
+        L_DeleteElem:
+        L_DefField:
+        L_DefGetter:
+        L_DefSetter:
+        L_DefElem:
+        L_DefMethod:
+        L_DefMethodElem:
+        L_ObjectRest:
+        L_ClassSetup:
+        L_SetProtoOf:
+        L_GetSuper:
+        L_SetSuper:
+        L_SetSuperElem:
+        L_GetSuperElem:
+        L_NewObject:
+        L_NewArray:
+        L_ArrayAppend:
+        L_ArraySpread:
+        L_ObjectSpread:
+        L_Closure:
+        L_DirectEval:
+        L_NewRegExp:
+        L_CallSpread:
+        L_New:
+        L_NewSpread:
+        L_CallSuper:
+        L_CallSuperSpread:
+        L_JumpSub:
+        L_EndFinally:
+        L_Throw:
+        L_ThrowConstAssign:
+        L_ForInStart:
+        L_ForInNext:
+        L_IterStart:
+        L_IterNext:
+        L_IterNextOpt:
+        L_IterRest:
+        L_IterClose:
+        L_IterStartLoop:
+        L_IterCloseAt:
+        L_IterCloseThrow:
+        L_NewPrivateName:
+        L_PrivateIn:
+        L_DefPrivate:
+        L_DefPrivateMethod:
+        L_DefPrivateAccessor:
+        L_DefAccessorElem:
+        L_CheckThis:
+        L_DerivedReturn:
+        L_PushNewTarget:
+        L_CallSuperVia:
+        L_CallSuperViaSpread:
+        L_SetFieldInit:
+        L_CallStaticInit:
+        L_SetHome:
+        L_CoStart:
+        L_Yield:
+        L_Await:
+        L_DelegateStart:
+        L_DelegateCall:
+        L_DelegateCheck:
+        L_DelegateDone:
+        L_AsyncIterStart:
+        L_AsyncIterCall:
+        L_AsyncIterCheck:
+        L_AsyncIterClose:
+        L_Pow:
+        L_Pos:
+        L_BitNot:
+        L_Eq:
+        L_Ne:
+        L_In:
+        L_InstanceOf:
+        L_TypeOf:
+        L_ToString:
+        L_ToObject:
+        L_ToPropertyKey:
+        L_Void:
+            goto slow;
         } catch (Exception& e) {
-            if (!findHandler(frame, e.value()))
-                throw;
-            pc = frame.pc;
+            // Whatever threw had the frame's state written back first. The frames this loop entered itself are left one
+            // by one until one of them has a handler; the one called from C++ throws on.
+            while (!findHandler(*frame, e.value())) {
+                if (frame == &entry)
+                    throw;
+                leaveInline(rt, frame);
+            }
+            code = frame->code;
+            c = quickened(*code);
+        } catch (...) {
+            while (frame != &entry)
+                leaveInline(rt, frame);
+            throw;
         }
     }
+#undef LS_LOAD
+#undef LS_SAVE
+#undef LS_DISPATCH
+#undef LS_NEXT
+#undef LS_ROOM
+#undef LS_OPERAND
+#undef LS_PUSH
+#undef LS_JUMP
+#undef LS_BOTH_DOUBLE
+#undef LS_A
+#undef LS_B
+#undef LS_ARITH
+#undef LS_RELATION
 }
 
 }  // namespace

@@ -58,6 +58,9 @@ public:
     [[gnu::always_inline]] Value& operator[](std::size_t i) noexcept { return data_[i]; }
     [[gnu::always_inline]] const Value& operator[](std::size_t i) const noexcept { return data_[i]; }
     std::size_t size() const noexcept { return size_; }
+    std::size_t capacity() const noexcept { return cap_; }
+    /// The interpreter keeps the top in a register, and says where it is before anything else looks.
+    [[gnu::always_inline]] void setEnd(Value* end) noexcept { size_ = std::uint32_t(end - data_); }
     bool empty() const noexcept { return size_ == 0; }
     Value* begin() noexcept { return data_; }
     Value* end() noexcept { return data_ + size_; }
@@ -104,6 +107,67 @@ private:
     std::uint32_t cap_ = 0;
 };
 
+/// A frame's locals or cells: filled on every call and emptied on every return, so all of it is inline, and the buffer
+/// stays with the pooled frame from one call to the next.
+template <class T>
+class SlotArray
+{
+public:
+    SlotArray() = default;
+    SlotArray(const SlotArray&) = delete;
+    SlotArray& operator=(const SlotArray&) = delete;
+    ~SlotArray()
+    {
+        clear();
+        std::free(data_);
+    }
+
+    [[gnu::always_inline]] void assign(std::size_t n, const T& v)
+    {
+        clear();
+        if (n > cap_) [[unlikely]]
+            reallocate(n);
+        for (std::size_t i = 0; i < n; ++i)
+            new (data_ + i) T(v);
+        size_ = std::uint32_t(n);
+    }
+    [[gnu::always_inline]] void clear() noexcept
+    {
+        while (size_)
+            data_[--size_].~T();
+    }
+    void swap(SlotArray& other) noexcept
+    {
+        std::swap(data_, other.data_);
+        std::swap(size_, other.size_);
+        std::swap(cap_, other.cap_);
+    }
+    [[gnu::always_inline]] T& operator[](std::size_t i) noexcept { return data_[i]; }
+    [[gnu::always_inline]] const T& operator[](std::size_t i) const noexcept { return data_[i]; }
+    std::size_t size() const noexcept { return size_; }
+    T* data() noexcept { return data_; }
+    const T* data() const noexcept { return data_; }
+    T* begin() noexcept { return data_; }
+    T* end() noexcept { return data_ + size_; }
+    const T* begin() const noexcept { return data_; }
+    const T* end() const noexcept { return data_ + size_; }
+
+private:
+    void reallocate(std::size_t n)
+    {
+        void* more = std::malloc(n * sizeof(T));
+        if (!more)
+            throw std::bad_alloc();
+        std::free(data_);
+        data_ = static_cast<T*>(more);
+        cap_ = std::uint32_t(n);
+    }
+
+    T* data_ = nullptr;
+    std::uint32_t size_ = 0;
+    std::uint32_t cap_ = 0;
+};
+
 /// One activation of a bytecode function. Frames live on the C++ stack; the
 /// context keeps raw pointers to them so a stack trace can be captured.
 ///
@@ -116,8 +180,8 @@ struct Frame
     DynFunction* fn = nullptr;
     const FunctionCode* code = nullptr;
     std::uint32_t pc = 0;
-    Vec<Value> locals;
-    Vec<Ref<Box>> cells;
+    SlotArray<Value> locals;
+    SlotArray<Ref<Box>> cells;
     ValueStack stack;
     Vec<std::uint32_t> subStack;  ///< `finally` return addresses
     Value thisValue = Value::undefined();
@@ -137,6 +201,11 @@ struct Frame
     /// This frame stands for a run of native frames, which a stack trace finds by walking from the innermost one. It
     /// remembers where that was when the run began.
     bool nativeRun = false;
+    /// Entered by the interpreter's loop on a call from the frame below, which it goes back to on returning.
+    bool inlineCall = false;
+    /// The interpreter's back edges to go until it asks for native code, and the loop work done towards that.
+    std::uint32_t backEdges = 0;
+    std::uint64_t loopWork = 0;
     void* savedTopFrame = nullptr;
     const void* savedTopPc = nullptr;
 

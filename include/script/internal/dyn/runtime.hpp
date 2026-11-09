@@ -241,6 +241,8 @@ struct Runtime : EngineRuntime
     std::vector<std::weak_ptr<const FunctionCode>> evalCodes;
     /// What the interpreter spent time in, for SCRIPT_INTERP_PROFILE.
     std::vector<const FunctionCode*> interpretedCodes;
+    /// Calls the interpreter has begun since it last asked whether to stop: code that recurses instead of looping.
+    std::uint32_t interpTicks = 0;
     void adoptEvalCode(const std::shared_ptr<const FunctionCode>& code);
 
     /// "at fn (file:line)" lines for the frames that are live right now.

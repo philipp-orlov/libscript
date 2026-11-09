@@ -200,6 +200,8 @@ enum class Op : std::uint8_t
     QSetLocalPop,    // Dup, SetLocal, Pop: an assignment as a statement
     QGetLocalProp,   // GetLocal, GetProp
     QThisProp,       // PushThis, GetProp
+    QIncLocal,       // GetLocal x, ToNumber, then Dup Inc or Inc Dup, SetLocal x, Pop: `x++` as a statement
+    QDecLocal,       // the same with Dec
 
     OpCount,
 };

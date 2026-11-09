@@ -100,6 +100,22 @@ TEST(numberFormattingRoundsTiesAwayFromZero)
              std::string("3e+0 1.3e+0 1e+1 0.00e+0 -1.23e+4"));
 }
 
+TEST(errorCauseComesFromTheOptionsArgument)
+{
+    CHECK_EQ(run("const e = new TypeError('m', { cause: 1 });"
+                 " [e.cause, 'cause' in e, Object.keys(e).length, e.message].join(' ')"),
+             std::string("1 true 0 m"));
+    CHECK_EQ(run("const o = Object.create({ cause: 'up' }); const e = new Error('m', o);"
+                 " [e.cause, Object.hasOwn(e, 'cause')].join(' ')"),
+             std::string("up true"));
+    CHECK_EQ(run("[('cause' in new Error('m')), ('cause' in new Error('m', {})),"
+                 " ('cause' in new Error('m', 5)), new Error('m', { cause: undefined }).hasOwnProperty('cause')].join(' ')"),
+             std::string("false false false true"));
+    CHECK_EQ(run("const a = new AggregateError([1, 2], 'm', { cause: 'c' });"
+                 " [a.cause, a.errors.length, a.message].join(' ')"),
+             std::string("c 2 m"));
+}
+
 TEST(jsonRoundTrips)
 {
     CHECK_EQ(run("JSON.stringify({ a: [1, 'two', null, true], b: { c: 3 } })"),

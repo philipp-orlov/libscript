@@ -471,6 +471,16 @@ void installSymbol(Runtime& rt)
     }, 1);
 }
 
+/// ES2022: an options object with a `cause` property, own or inherited, gives the error a non-enumerable `cause`.
+void installErrorCause(Runtime& rt, DynObject* error, const Value& options)
+{
+    if (!asObject(options))
+        return;
+    StringCell* cause = rt.intern("cause");
+    if (hasProperty(rt, options, cause))
+        error->putOwn(cause, getProperty(rt, options, cause), PropWritable | PropConfigurable);
+}
+
 void installErrors(Runtime& rt)
 {
     auto define = [&rt](const char* name, ErrorCode code, DynObject* parentProto,
@@ -492,6 +502,7 @@ void installErrors(Runtime& rt)
             if (!ci.arg(0).isUndefined())
                 obj->putOwn(rt2.atom.message.get(), rt2.str(toStringValue(rt2, ci.arg(0))),
                             PropWritable | PropConfigurable);
+            installErrorCause(rt2, obj, ci.arg(1));
             obj->putOwn(rt2.atom.stack.get(), rt2.str(fromUtf8(rt2.captureStack())),
                         PropWritable | PropConfigurable);
             return self;
@@ -541,6 +552,7 @@ void installErrors(Runtime& rt)
             obj->cls = ObjClass::Error;
             if (!ci.arg(1).isUndefined())
                 obj->putOwn(rt2.atom.message.get(), rt2.str(toStringValue(rt2, ci.arg(1))), PropWritable | PropConfigurable);
+            installErrorCause(rt2, obj, ci.arg(2));
             const Vec<Value> errors = iterableToVector(rt2, ci.arg(0));
             obj->putOwn(rt2.intern("errors"), rt2.makeArray(std::vector<Value>(errors.begin(), errors.end())), PropWritable | PropConfigurable);
             obj->putOwn(rt2.atom.stack.get(), rt2.str(fromUtf8(rt2.captureStack())), PropWritable | PropConfigurable);

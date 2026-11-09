@@ -124,6 +124,15 @@ TEST(dateParsingRefusesADayThatTheMonthLacks)
              std::string("NaN NaN NaN NaN NaN NaN NaN 1588204800000 1614470400000 NaN 951782400000 1609372800000"));
 }
 
+TEST(objectAssignCopiesTheIndicesOfAString)
+{
+    CHECK_EQ(run("JSON.stringify(Object.assign({}, 'ab'))"), std::string("{\"0\":\"a\",\"1\":\"b\"}"));
+    CHECK_EQ(run("JSON.stringify(Object.assign({ 1: 'x', k: 1 }, 'a', 5, true, null, undefined, 'cd', ''))"),
+             std::string("{\"0\":\"c\",\"1\":\"d\",\"k\":1}"));
+    CHECK_EQ(run("Object.keys(Object.assign([], 'xyz')).join() + ' ' + Object.assign([], 'xyz').length"),
+             std::string("0,1,2 3"));
+}
+
 TEST(jsonRoundTrips)
 {
     CHECK_EQ(run("JSON.stringify({ a: [1, 'two', null, true], b: { c: 3 } })"),

@@ -184,6 +184,15 @@ void installObject(Runtime& rt)
             const Value& src = ci.args()[i];
             if (src.isNullish())
                 continue;
+            // A string source acts as a String object, whose own enumerable keys are its indices.
+            if (StringCell* text = asString(src)) {
+                const StringView chars = text->text();
+                for (std::size_t n = 0; n < chars.size(); ++n) {
+                    Ref<GCObject> key = toPropertyKey(rt2, Value(double(n)));
+                    setProperty(rt2, target, key.get(), rt2.str(chars.substr(n, 1)));
+                }
+                continue;
+            }
             DynObject* from = asObject(src);
             if (!from)
                 continue;

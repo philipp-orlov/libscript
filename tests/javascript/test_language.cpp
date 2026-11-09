@@ -1933,3 +1933,27 @@ TEST(nativeHigherOrderLoopsSkipHoles)
                  std::string("3456e3e4e5e6 7 false true :::2:4:10:8 2:[object Object]:4 12 02e0e2 3 true false 14::16 7:8 15"));
     }
 }
+
+TEST(anInlinedFunctionGivesItsCallerAnInt32)
+{
+    // A small function inlined whose every return is an int32 gives the caller that int32, with no double in between;
+    // a bail in its body that comes back with anything else, an overflow, minus zero, a string, an exception, has the
+    // interpreter carry on from after the call. Parameters it never writes take numbers as the caller has them.
+    const char* program =
+        "function add(a, b) { return a + b; } function half(a) { return a / 2; } function neg(a) { return -a; }"
+        "function pick(a, b) { if (a > 1000) throw new Error('big ' + a); return a - b; }"
+        "function run(n, big) { var t = 0, h = 0, s = '', z = 0, caught = 0, objs = 0;"
+        "  for (var i = 0; i < n; i++) { t = add(t, i) & 1023; h += add(i, big) | 0; if (i === n - 3) s = add('x', i);"
+        "    z = neg(i & 1 ? 0 : 0); try { objs += pick(i & 2047, 1); } catch (e) { caught++; } h += half(i) & 3; }"
+        "  return [t, h, s, 1 / z, caught, objs, add(2147483647, 1), add(1.5, 2), add({ valueOf() { return 7; } }, 1)].join(','); }"
+        "var out = []; for (var k = 0; k < 6; k++) out.push(run(3000, k < 3 ? 1 : 2147483000)); out.join(' | ')";
+    const std::string a = "68,4506000,x2997,-Infinity,1047,951223,2147483648,3.5,8";
+    const std::string b = "68,-3659309577192,x2997,-Infinity,1047,951223,2147483648,3.5,8";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), a + " | " + a + " | " + a + " | " + b + " | " + b + " | " + b);
+    }
+}

@@ -700,7 +700,27 @@ public:
         cellReg_.assign(slots, -1);
         cellOwned_.assign(slots, 0);
         numberParam_.assign(slots, 0);
+        // A parameter the body never writes holds what it was given, and nothing else: given a number the caller has as one,
+        // it is a number local with no guess in it, and the body's arithmetic on it needs no tag. An int32 stays one.
+        inlineNumber_.assign(slots, 0);
+        // Not where `arguments` is: in sloppy code it and the parameters are the same variables.
+        for (std::uint32_t slot = 0; code_.argumentsSlot == FunctionCode::kNoSlot && slot < std::min<std::size_t>(arity, args.size()) && slot < slots; ++slot) {
+            const Entry& given = args[slot];
+            if (assigned_[slot] || given.rep == Rep::Tagged || given.lazyArgs || slot == code_.argumentsSlot ||
+                std::find(code_.boxedParams.begin(), code_.boxedParams.end(), slot) != code_.boxedParams.end())
+                continue;
+            inlineNumber_[slot] = given.rep == Rep::Int32 && !given.isConst ? 2 : 1;
+        }
         for (std::uint32_t slot = 0; slot < slots; ++slot) {
+            if (slot < inlineNumber_.size() && inlineNumber_[slot]) {
+                const bool asInt = inlineNumber_[slot] == 2;
+                const std::int32_t value = asInt ? wideInt(args[slot]) : doubleReg(args[slot]);
+                localReg_[slot] = fn_.newVreg(!asInt);
+                IrInst& mv = inst(IrOp::Mov);
+                mv.d = localReg_[slot];
+                mv.a = value;
+                continue;
+            }
             localReg_[slot] = fn_.newVreg(false);
             localTag_[slot] = fn_.newVreg(false);
             std::int32_t tag = -1, payload = -1;
@@ -929,8 +949,12 @@ public:
         const std::vector<std::uint8_t> none(fn->code->numLocals + 1, 1);
         try {
             Lowering inner(*this, *fn->code, none, held, at);
+            inner.inlineIntR_ = inlineIntWanted_;
+            inner.inlineBailReturn_ = inlineBailWanted_;
             inner.runInline(ptrReg(fn), self, args, r, t, done);
             inlinedReturnTag_ = inner.returnTag_;
+            inlinedInt_ = inner.inlineIntR_ >= 0 && inner.returnsInt_;
+            inlinedBailReturned_ = inner.bailReturned_;
         } catch (const Refuse&) {
             rollBack(before);
             return false;
@@ -981,8 +1005,12 @@ public:
         const std::vector<std::uint8_t> none(code->numLocals + 1, 1);
         try {
             Lowering inner(*this, *code, none, held, at);
+            inner.inlineIntR_ = inlineIntWanted_;
+            inner.inlineBailReturn_ = inlineBailWanted_;
             inner.runInline(callee.r, self, args, r, t, done);
             inlinedReturnTag_ = inner.returnTag_;
+            inlinedInt_ = inner.inlineIntR_ >= 0 && inner.returnsInt_;
+            inlinedBailReturned_ = inner.bailReturned_;
         } catch (const Refuse&) {
             rollBack(before);
             return false;
@@ -1240,6 +1268,8 @@ private:
     /// when that is known at compile time, makes it a double local.
     bool isIntLocal(std::uint32_t slot) const noexcept
     {
+        if (slot < inlineNumber_.size() && inlineNumber_[slot])
+            return inlineNumber_[slot] == 2;
         if (!speculate_ || notInt_[slot] || !isNumberLocal(slot))
             return false;
         return slot >= std::uint32_t(std::max(code_.arity, 0)) || (intWork_ && !((code_.argsNotInt >> slot) & 1));
@@ -1247,6 +1277,8 @@ private:
 
     bool isNumberLocal(std::uint32_t slot) const noexcept
     {
+        if (slot < inlineNumber_.size() && inlineNumber_[slot])
+            return true;
         if (notNumber_[slot])
             return false;
         if (slot < std::uint32_t(std::max(code_.arity, 0)) && !(slot < numberParam_.size() && numberParam_[slot]))
@@ -1853,15 +1885,21 @@ private:
         fn_.calls.push_back(std::move(call));
         inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
         if (inlineDone_ >= 0) {
-            noteReturn(-1);
-            // What the call came to, for the caller to carry on with in native code.
+            // What the call came to, for the caller to carry on with in native code: by way of a place of the caller's
+            // own when it has one, which finds out whether it is what the caller took the call to give.
+            if (inlineBailReturn_ >= 0) {
+                bailReturned_ = true;
+            } else {
+                noteReturn(-1);
+                returnsInt_ = false;
+            }
             IrInst& movTag = inst(IrOp::Mov);
             movTag.d = inlineT_;
             movTag.a = t;
             IrInst& mov = inst(IrOp::Mov);
             mov.d = inlineR_;
             mov.a = r;
-            inst(IrOp::Br).imm = inlineDone_;
+            inst(IrOp::Br).imm = inlineBailReturn_ >= 0 ? inlineBailReturn_ : inlineDone_;
         } else {
             IrInst& ret = inst(IrOp::Ret);
             ret.a = r;
@@ -3291,6 +3329,20 @@ private:
             case Op::ReturnUndefined: {
                 Entry value = op == Op::Return ? pop() : constTagged(Type::Undefined);
                 noteReturn(knownTagOf(value));
+                // An int32 goes to the caller as one as well: if every return has one, that is what the call gives.
+                if (inlineIntR_ >= 0) {
+                    const bool int32 = value.rep == Rep::Int32 ||
+                                       (value.isConst && value.rep != Rep::Tagged && value.number == double(std::int32_t(value.number)) &&
+                                        !(value.number == 0 && std::signbit(value.number)));
+                    if (int32) {
+                        const std::int32_t wide = wideInt(value);
+                        IrInst& mv = inst(IrOp::Mov);
+                        mv.d = inlineIntR_;
+                        mv.a = wide;
+                    } else {
+                        returnsInt_ = false;
+                    }
+                }
                 // The count moves with the value; a read of an owned local gives that local's away.
                 std::int32_t keep = -1;
                 if (value.own == Own::Local && value.local >= 0 && localOwned_[std::size_t(value.local)]) {
@@ -5512,9 +5564,101 @@ private:
         const bool lazy = !args.empty() && args.back().lazyArgs;
         bool inlined = lazy ? forwardArguments(callee, self, args, r, t, generic, held) : intrinsic(callee, self, args, r, t, generic);
         const std::size_t bodyStart = fn_.code.size();
+        std::int32_t bailReturn = -1;
+        inlinedBailReturned_ = false;
         if (!inlined && !lazy) {
             inlinedReturnTag_ = -1;
+            inlinedInt_ = false;
+            inlinedBailReturned_ = false;
+            const std::int32_t asInt = fn_.newVreg(false);
+            bailReturn = newLabel();
+            inlineIntWanted_ = asInt;
+            inlineBailWanted_ = bailReturn;
             inlined = inlineCall(callee, self, args, held, r, t, generic, finished);
+            inlineIntWanted_ = -1;
+            inlineBailWanted_ = -1;
+            // Not once that has been found wrong here: the bail it makes is recorded at the instruction after the call.
+            const std::uint32_t afterCall = pc_ + 1 + std::uint32_t(operandsOf(Op(code_.code[pc_]))) * 4;
+            const bool asIntResult = inlined && inlinedInt_ && inlinedReturnTag_ == std::int16_t(Type::Double) &&
+                                     std::find(code_.jitBailedAt.begin(), code_.jitBailedAt.end(), afterCall) == code_.jitBailedAt.end();
+            // A bail in the body that came back gives whatever the interpreter made of the call: anything at all, unless
+            // the caller goes on with an int32, in which case it is checked to be one.
+            if (inlined && inlinedBailReturned_ && !asIntResult)
+                inlinedReturnTag_ = -1;
+            const auto placeBailReturn = [&](const std::vector<Entry>& popped) {
+                if (!inlinedBailReturned_)
+                    return;
+                inst(IrOp::ColdBegin);
+                inst(IrOp::Label).imm = bailReturn;
+                if (!asIntResult) {
+                    inst(IrOp::Br).imm = finished;
+                    inst(IrOp::ColdEnd);
+                    return;
+                }
+                const std::int32_t notInt = newLabel();
+                const std::int32_t bailAfter = newLabel();
+                branchCmp(t, IrCond::Ne, std::int64_t(Type::Double), notInt);
+                {
+                    const std::int32_t minusZero = immReg(std::numeric_limits<std::int64_t>::min());
+                    IrInst& test = inst(IrOp::BrCmp);
+                    test.a = r;
+                    test.b = minusZero;
+                    test.cond = IrCond::Eq;
+                    test.width = 64;
+                    test.target = notInt;
+                }
+                const std::int32_t fp = fn_.newVreg(true);
+                {
+                    IrInst& in = inst(IrOp::BitsToFp);
+                    in.d = fp;
+                    in.a = r;
+                }
+                const std::int32_t whole = fn_.newVreg(false);
+                {
+                    IrInst& conv = inst(IrOp::FpToIntRaw);
+                    conv.d = whole;
+                    conv.a = fp;
+                    conv.width = 64;
+                }
+                const std::int32_t back = fn_.newVreg(true);
+                {
+                    IrInst& again = inst(IrOp::IntToFp);
+                    again.d = back;
+                    again.a = whole;
+                    again.srcWidth = 64;
+                    again.width = 64;
+                }
+                {
+                    IrInst& exact = inst(IrOp::BrFCmp);
+                    exact.a = fp;
+                    exact.b = back;
+                    exact.cond = IrCond::Ne;
+                    exact.width = 64;
+                    exact.target = notInt;
+                }
+                expectInt32(whole, notInt);
+                {
+                    IrInst& mv = inst(IrOp::Mov);
+                    mv.d = asInt;
+                    mv.a = whole;
+                }
+                inst(IrOp::Br).imm = finished;
+                // Something else: the interpreter goes on from after the call, with what it came to on the stack. What the
+                // call held is let go here, as the way through `finished` would have.
+                inst(IrOp::Label).imm = notInt;
+                for (const Entry& e : popped) {
+                    if (e.own == Own::Owned && !e.isConst && e.rep == Rep::Tagged && !(e.hasKnownTag && e.known < Type::String))
+                        decRefOf(e.r, e.hasKnownTag ? -1 : e.t, false);
+                }
+                inst(IrOp::Br).imm = bailAfter;
+                inst(IrOp::ColdEnd);
+                const std::uint32_t callPc = pc_;
+                pc_ = callPc + 1 + std::uint32_t(operandsOf(Op(code_.code[callPc]))) * 4;
+                stack_.push_back(taggedEntry(r, t, Own::Owned));
+                emitBail(bailAfter, {});
+                stack_.pop_back();
+                pc_ = callPc;
+            };
             // A function's body in place of the call, and something else turning up instead is for the interpreter to deal
             // with: no call to come back from here, so what the body leaves known stays known.
             if (inlined && betHere() && !viaCall) {
@@ -5524,16 +5668,21 @@ private:
                     const IrInst& in = fn_.code[i];
                     guarded = (in.op == IrOp::Br && in.imm == generic) || ((in.op == IrOp::BrCmp || in.op == IrOp::BrFCmp) && in.target == generic);
                 }
-                if (guarded) {
-                    std::vector<Entry> popped = {callee, self};
-                    popped.insert(popped.end(), args.begin(), args.end());
+                std::vector<Entry> popped = {callee, self};
+                popped.insert(popped.end(), args.begin(), args.end());
+                if (guarded)
                     emitBail(generic, popped);
-                }
+                placeBailReturn(popped);
                 inst(IrOp::Label).imm = finished;
                 for (const Entry& arg : args)
                     release(arg);
                 release(self);
                 release(callee);
+                // Every return an int32: the caller has it as one, with no double to make and take apart.
+                if (asIntResult) {
+                    push(intEntry(asInt, true));
+                    return;
+                }
                 // What every return of the body knew of the value's tag, the caller knows.
                 Entry result = taggedEntry(r, t, Own::Owned);
                 if (inlinedReturnTag_ >= 0) {
@@ -5548,6 +5697,10 @@ private:
         }
         if (inlined) {
             inst(IrOp::Br).imm = finished;
+            if (inlinedBailReturned_) {
+                inst(IrOp::Label).imm = bailReturn;
+                inst(IrOp::Br).imm = finished;
+            }
             inst(IrOp::Label).imm = generic;
         }
         // Anything but the call it was kept for wants the array after all.
@@ -7964,6 +8117,18 @@ private:
     std::int16_t returnTag_ = -2;
     /// What the last function inlined here had for that, once done.
     std::int16_t inlinedReturnTag_ = -1;
+    /// Calling: the register an inlined body puts an int32 result in as well, and whether every return of it did.
+    std::int32_t inlineIntWanted_ = -1;
+    bool inlinedInt_ = false;
+    /// Calling: where a bail in an inlined body comes back to, and whether one did.
+    std::int32_t inlineBailWanted_ = -1;
+    bool inlinedBailReturned_ = false;
+    /// Inlined: the caller's place for a bail to come back to, and whether there was such a bail.
+    std::int32_t inlineBailReturn_ = -1;
+    bool bailReturned_ = false;
+    /// Inlined: where an int32 result goes, and whether every return so far had one.
+    std::int32_t inlineIntR_ = -1;
+    bool returnsInt_ = true;
     void noteReturn(std::int16_t tag) noexcept { returnTag_ = returnTag_ == -2 || returnTag_ == tag ? tag : -1; }
     int depth_ = 0;
     /// Whether code may assume what the interpreter has seen so far, and hand the call back to it when that stops being so.
@@ -7981,6 +8146,8 @@ private:
     std::vector<std::uint8_t> loopHead_;
     std::vector<std::int32_t> knownArrays_;
     bool intWork_ = false;
+    /// Inlined: the parameters that are number locals, 1 for a double and 2 for an int32, by what the caller passed.
+    std::vector<std::uint8_t> inlineNumber_;
     bool argsLazy_ = false;
     std::int32_t argsReg_ = -1;
     std::int32_t argcReg_ = -1;

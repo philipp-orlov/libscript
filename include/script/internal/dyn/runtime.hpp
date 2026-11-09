@@ -170,6 +170,7 @@ struct Runtime : EngineRuntime
         ArrayReduce,
         ArrayValues,
         ArrayIteratorNext,
+        GeneratorNext,
         StringCharCodeAt,
         StringFromCharCode,
         FunctionApply,
@@ -306,6 +307,15 @@ struct Runtime : EngineRuntime
     static constexpr std::size_t kMaxShapes = 1u << 16;
     std::vector<std::unique_ptr<Shape>> shapes;
     Shape* nullProtoRoot = nullptr;
+    /// `{ value, done }` on Object.prototype: the shape it starts from, with `value`, and with both. Worked out on first
+    /// use by `iterResult`, which makes these by the million in generator code.
+    /// One more than the `protoEpoch` at which `next` was found at `generatorNextIndex` in the generators' prototype;
+    /// zero for never.
+    std::uint64_t generatorNextEpoch = 0;
+    std::uint32_t generatorNextIndex = 0;
+    Shape* iterRootShape = nullptr;
+    Shape* iterValueShape = nullptr;
+    Shape* iterDoneShape = nullptr;
     DynArray* newArray(std::size_t reserve = 0);
     DynFunction* newFunction();
     Value makeArray(Vec<Value> items);

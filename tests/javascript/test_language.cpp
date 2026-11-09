@@ -2006,3 +2006,28 @@ TEST(aLongPieceOfAStringSharesItsCharacters)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("120000,0,200,140,166,en6 token7 token8 to,32,true,168,139979,1"));
     }
 }
+
+TEST(aGeneratorIsSteppedWithoutAResultObject)
+{
+    // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the
+    // generators' prototype, on the function's or on the generator itself is called as it should be, and yield*,
+    // break, throw and destructuring behave as ever.
+    const char* program =
+        "var out = []; function* g(n) { for (let i = 0; i < n; i++) yield i; return 'r'; }"
+        "function* d() { yield 'a'; const r = yield* g(2); yield r; } out.push([...d()].join());"
+        "function* h() { try { yield 1; yield 2; } finally { out.push('fin'); } } for (const x of h()) { out.push(x); break; }"
+        "function* t() { yield 1; throw new Error('boom'); } try { for (const x of t()) out.push(x); } catch (e) { out.push(e.message); }"
+        "var gp = Object.getPrototypeOf(g).prototype, saved = gp.next;"
+        "gp.next = function () { var r = saved.call(this); if (!r.done) r.value *= 10; return r; };"
+        "out.push([...g(3)].join()); gp.next = saved; out.push([...g(3)].join());"
+        "g.prototype.next = function () { return { done: true }; }; out.push([...g(3)].join() + '|'); delete g.prototype.next;"
+        "var inst = g(3); inst.next = function () { return { done: true }; }; out.push([...inst].join() + '|', [...g(2)].join());"
+        "const [p, q, ...rest] = g(5); out.push(p, q, rest.join('')); out.join(' ')";
+    for (bool off : {true, false}) {
+        script::Context::Options options;
+        if (off)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("a,0,1,r 1 fin 1 boom 0,10,20 0,1,2 | | 0,1 0 1 234"));
+    }
+}

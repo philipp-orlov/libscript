@@ -1874,9 +1874,55 @@ bool iteratorStep(Runtime& rt, const Value& iterator, Value& out)
         if (next && detail::Access::ptr(next->value) == rt.intrinsics[Runtime::ArrayIteratorNext].get())
             return arrayIteratorStep(rt, static_cast<DynArrayIterator*>(o), out);
     }
+    // A generator whose `next` is the one generators start with is resumed here, with no result object between.
+    if (DynObject* o = asObject(iterator); o && o->cls == ObjClass::Generator && o->props.empty() && o->proto &&
+                                           static_cast<DynCoroutine*>(o)->coKind == DynCoroutine::Kind::Generator) {
+        // The generator function's own prototype object, with nothing in it, then the generators' prototype, whose
+        // `next` is checked again only when some prototype has changed.
+        DynObject* proto = o->proto.get();
+        bool plain = proto->props.empty() && proto->proto.get() == rt.generatorProto.get();
+        if (plain && rt.generatorNextEpoch != rt.ctx.protoEpoch + 1) {
+            // Where `next` is stays so until some prototype gains or loses a property; what is there may change.
+            const Prop* next = rt.generatorProto->findOwn(rt.atom.next.get());
+            plain = next != nullptr;
+            if (plain) {
+                rt.generatorNextIndex = std::uint32_t(next - rt.generatorProto->props.data());
+                rt.generatorNextEpoch = rt.ctx.protoEpoch + 1;
+            }
+        }
+        if (plain) {
+            const Prop& next = rt.generatorProto->props[rt.generatorNextIndex];
+            plain = !rt.generatorProto->accessorOf(next) &&
+                    detail::Access::ptr(next.value) == rt.intrinsics[Runtime::GeneratorNext].get();
+        }
+        if (plain) {
+            Value step;
+            switch (generatorStep(rt, static_cast<DynCoroutine*>(o), DynCoroutine::Resume::Next, Value::undefined(), step)) {
+                case GeneratorStep::Done:
+                    return false;
+                case GeneratorStep::Yielded:
+                    out = std::move(step);
+                    return true;
+                default:
+                    if (!step.isObject())
+                        throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
+                    if (toBoolean(getProperty(rt, step, rt.atom.done.get())))
+                        return false;
+                    out = getProperty(rt, step, rt.atom.value.get());
+                    return true;
+            }
+        }
+    }
     const Value result = invokeMethod(rt, iterator, rt.atom.next.get(), {});
     if (!result.isObject())
         throwError(rt, ErrorCode::TypeError, "the iterator result is not an object");
+    // One `iterResult` made, as a generator's are: both are plain properties where it put them.
+    if (DynObject* r = asObject(result); r && r->shape && r->shape == rt.iterDoneShape) {
+        if (toBoolean(r->props[1].value))
+            return false;
+        out = r->props[0].value;
+        return true;
+    }
     if (toBoolean(getProperty(rt, result, rt.atom.done.get())))
         return false;
     out = getProperty(rt, result, rt.atom.value.get());
@@ -4749,8 +4795,23 @@ void DynCoroutine::clearReferences()
 
 Value iterResult(Runtime& rt, const Value& value, bool done)
 {
-    DynObject* out = rt.newObject(rt.objectProto.get());
+    if (!rt.iterDoneShape) {
+        Shape* root = rt.rootShapeFor(rt.objectProto.get());
+        Shape* withValue = root ? rt.shapeAfter(root, rt.atom.value.get(), PropDefault) : nullptr;
+        Shape* withDone = withValue ? rt.shapeAfter(withValue, rt.atom.done.get(), PropDefault) : nullptr;
+        if (withDone) {
+            rt.iterRootShape = root;
+            rt.iterValueShape = withValue;
+            rt.iterDoneShape = withDone;
+        }
+    }
+    DynObject* out = rt.newObjectSized(rt.objectProto.get(), 2);
     Value handle = detail::Access::adopt(Type::Object, out);
+    if (rt.iterDoneShape && out->shape == rt.iterRootShape) {
+        out->appendKnown(value, rt.iterValueShape);
+        out->appendKnown(Value(done), rt.iterDoneShape);
+        return handle;
+    }
     out->putOwn(rt.atom.value.get(), value);
     out->putOwn(rt.atom.done.get(), Value(done));
     return handle;
@@ -5011,7 +5072,7 @@ void runPromiseJob(Runtime& rt, Job& job)
 }
 
 
-Value generatorResume(Runtime& rt, DynCoroutine* g, DynCoroutine::Resume mode, const Value& value)
+GeneratorStep generatorStep(Runtime& rt, DynCoroutine* g, DynCoroutine::Resume mode, const Value& value, Value& out)
 {
     if (g->state == DynCoroutine::State::Running)
         throwError(rt, ErrorCode::TypeError, "the generator is already running");
@@ -5020,9 +5081,9 @@ Value generatorResume(Runtime& rt, DynCoroutine* g, DynCoroutine::Resume mode, c
     if (g->state == DynCoroutine::State::Completed) {
         if (mode == DynCoroutine::Resume::Throw)
             throwValue(rt, value);
-        return iterResult(rt, mode == DynCoroutine::Resume::Return ? value : Value::undefined(), true);
+        out = mode == DynCoroutine::Resume::Return ? value : Value::undefined();
+        return GeneratorStep::Done;
     }
-    Value out;
     try {
         out = runCoroutine(rt, g, mode, value);
     } catch (...) {
@@ -5032,14 +5093,24 @@ Value generatorResume(Runtime& rt, DynCoroutine* g, DynCoroutine::Resume mode, c
     const Frame::Left left = g->frame->left;
     if (left == Frame::Left::YieldedResult) {
         g->state = DynCoroutine::State::SuspendedYield;
-        return out;
+        return GeneratorStep::Result;
     }
     if (left == Frame::Left::Yielded) {
         g->state = DynCoroutine::State::SuspendedYield;
-        return iterResult(rt, out, false);
+        return GeneratorStep::Yielded;
     }
     finishCoroutine(g);
-    return iterResult(rt, out, true);
+    return GeneratorStep::Done;
+}
+
+Value generatorResume(Runtime& rt, DynCoroutine* g, DynCoroutine::Resume mode, const Value& value)
+{
+    Value out;
+    switch (generatorStep(rt, g, mode, value, out)) {
+        case GeneratorStep::Result: return out;
+        case GeneratorStep::Yielded: return iterResult(rt, out, false);
+        default: return iterResult(rt, out, true);
+    }
 }
 
 Value asyncGeneratorRequest(Runtime& rt, const Value& self, DynCoroutine::Resume mode, const Value& value)

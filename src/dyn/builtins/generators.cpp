@@ -122,6 +122,7 @@ void installGenerators(Runtime& rt)
     generator->putOwn(rt.atom.constructor.get(), detail::Access::make(Type::Object, generatorFunction), PropConfigurable);
     generator->putOwn(rt.sym.toStringTag.get(), rt.str(ascii("Generator")), PropConfigurable);
     rt.method(generator, "next", [](CallInfo& ci) { return generatorResume(rtOf(ci), thisGenerator(ci), DynCoroutine::Resume::Next, ci.arg(0)); }, 1);
+    rt.intrinsics[Runtime::GeneratorNext].reset(detail::Access::ptr(generator->findOwn(rt.atom.next.get())->value));
     rt.method(generator, "return", [](CallInfo& ci) { return generatorResume(rtOf(ci), thisGenerator(ci), DynCoroutine::Resume::Return, ci.arg(0)); }, 1);
     rt.method(generator, "throw", [](CallInfo& ci) { return generatorResume(rtOf(ci), thisGenerator(ci), DynCoroutine::Resume::Throw, ci.arg(0)); }, 1);
 

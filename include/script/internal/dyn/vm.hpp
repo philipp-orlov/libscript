@@ -369,6 +369,15 @@ void addReaction(Runtime& rt, DynPromise* p, DynPromise::Reaction reaction);
 
 /// `{ value, done }`.
 Value iterResult(Runtime& rt, const Value& value, bool done);
+/// What resuming a generator came to: a value yielded, the generator done with a value, or the iterator result its
+/// `yield*` delegate gave, passed on as it is.
+enum class GeneratorStep : std::uint8_t
+{
+    Yielded,
+    Done,
+    Result,
+};
+GeneratorStep generatorStep(Runtime& rt, DynCoroutine* generator, DynCoroutine::Resume mode, const Value& value, Value& out);
 Value generatorResume(Runtime& rt, DynCoroutine* generator, DynCoroutine::Resume mode, const Value& value);
 /// `next`, `return` or `throw` of an async generator: the promise for its answer.
 Value asyncGeneratorRequest(Runtime& rt, const Value& self, DynCoroutine::Resume mode, const Value& value);

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 #include "base/ascii.hpp"
@@ -83,53 +84,143 @@ String numberToStringRadix(double d, int radix)
 }
 
 namespace {
-String formatted(const char* spec, int digits, double d)
+
+/// Adds one to a string of decimal digits; a carry out of the first digit
+/// grows the string by a leading 1.
+void incrementDigits(std::string& digits)
+{
+    for (std::size_t i = digits.size(); i-- > 0;) {
+        if (digits[i] != '9') {
+            ++digits[i];
+            return;
+        }
+        digits[i] = '0';
+    }
+    digits.insert(digits.begin(), '1');
+}
+
+/// Whether the exact digits `rest` that follow a cut round the kept digits up.
+/// glibc prints the exact binary value, so `rest` is an exact tie only when it
+/// is a 5 followed by zeros.
+bool roundsUp(std::string_view rest, char lastKept, RoundTies ties)
+{
+    if (rest.empty() || rest[0] < '5')
+        return false;
+    if (rest[0] > '5' || ties == RoundTies::AwayFromZero)
+        return true;
+    for (std::size_t i = 1; i < rest.size(); ++i)
+        if (rest[i] != '0')
+            return true;
+    return (lastKept - '0') % 2 != 0;
+}
+
+/// The decimal digits of |d| rounded to `count` significant digits. `exp10` is
+/// the exponent of the first digit.
+std::string significantDigits(double d, int count, int& exp10, RoundTies ties)
 {
     base::ClassicLocale classic;
-    char buf[512];
-    std::snprintf(buf, sizeof buf, spec, digits, d);
-    return ascii(buf);
+    char buf[1024];
+    std::snprintf(buf, sizeof buf, "%.800e", std::fabs(d));
+    std::string digits(1, buf[0]);
+    const char* p = buf + 2;
+    for (; *p != 'e'; ++p)
+        digits += *p;
+    exp10 = std::atoi(p + 1);
+    const std::size_t n = std::size_t(count);
+    const bool up = n < digits.size() && roundsUp(std::string_view(digits).substr(n), digits[n - 1], ties);
+    digits.resize(n, '0');
+    if (up) {
+        incrementDigits(digits);
+        if (digits.size() > n) {
+            digits.pop_back();
+            ++exp10;
+        }
+    }
+    return digits;
 }
+
+String exponentialForm(const std::string& digits, int exp10, bool negative)
+{
+    std::string out = negative ? "-" : "";
+    out += digits[0];
+    if (digits.size() > 1) {
+        out += '.';
+        out.append(digits, 1, std::string::npos);
+    }
+    out += exp10 < 0 ? "e-" : "e+";
+    out += std::to_string(std::abs(exp10));
+    return ascii(out.c_str());
+}
+
+/// |d| with `fraction` digits after the point.
+std::string fixedDigits(double d, int fraction, RoundTies ties)
+{
+    base::ClassicLocale classic;
+    char buf[1500];
+    std::snprintf(buf, sizeof buf, "%.1100f", std::fabs(d));
+    const char* point = std::strchr(buf, '.');
+    std::string digits(buf, std::size_t(point - buf));
+    digits.append(point + 1, std::size_t(fraction));
+    if (roundsUp(point + 1 + fraction, digits.back(), ties))
+        incrementDigits(digits);
+    const std::size_t intLength = digits.size() - std::size_t(fraction);
+    if (fraction == 0)
+        return digits;
+    return digits.substr(0, intLength) + '.' + digits.substr(intLength);
+}
+
 }  // namespace
 
-String numberToFixed(double d, int digits)
+String numberToFixed(double d, int digits, RoundTies ties)
 {
     if (std::isnan(d))
         return ascii("NaN");
     if (std::fabs(d) >= 1e21 || std::isinf(d))
         return numberToString(d);
-    return formatted("%.*f", digits, d);
+    std::string out = fixedDigits(d, digits, ties);
+    if (d < 0)
+        out.insert(out.begin(), '-');
+    return ascii(out.c_str());
 }
 
-String numberToExponential(double d, int digits)
+String numberToExponential(double d, int digits, RoundTies ties)
 {
     if (std::isnan(d))
         return ascii("NaN");
     if (std::isinf(d))
         return numberToString(d);
-    String s = formatted("%.*e", digits, d);
-    // C prints at least two exponent digits; JavaScript prints the minimum.
-    const std::size_t e = s.find(u'e');
-    if (e != String::npos) {
-        std::size_t p = e + 2;
-        std::size_t z = p;
-        while (z + 1 < s.size() && s[z] == u'0')
-            ++z;
-        s.erase(p, z - p);
-    }
-    return s;
+    if (d == 0)
+        return exponentialForm(std::string(std::size_t(digits) + 1, '0'), 0, false);
+    int exp10 = 0;
+    const std::string sig = significantDigits(d, digits + 1, exp10, ties);
+    return exponentialForm(sig, exp10, d < 0);
 }
 
-String numberToPrecision(double d, int digits)
+String numberToPrecision(double d, int digits, RoundTies ties)
 {
     if (std::isnan(d))
         return ascii("NaN");
-    if (std::isinf(d) || d == 0)
-        return d == 0 ? numberToFixed(d, digits - 1) : numberToString(d);
-    const int e = int(std::floor(std::log10(std::fabs(d))));
-    if (e < -6 || e >= digits)
-        return numberToExponential(d, digits - 1);
-    return formatted("%.*f", digits - 1 - e, d);
+    if (std::isinf(d))
+        return numberToString(d);
+    if (d == 0)
+        return numberToFixed(0.0, digits - 1);
+    int exp10 = 0;
+    const std::string sig = significantDigits(d, digits, exp10, ties);
+    if (exp10 < -6 || exp10 >= digits)
+        return exponentialForm(sig, exp10, d < 0);
+    std::string out = d < 0 ? "-" : "";
+    if (exp10 >= 0) {
+        out.append(sig, 0, std::size_t(exp10) + 1);
+        if (std::size_t(exp10) + 1 < sig.size()) {
+            out += '.';
+            out.append(sig, std::size_t(exp10) + 1, std::string::npos);
+        }
+    } else {
+        out += "0.";
+        out.append(std::size_t(-exp10 - 1), '0');
+        out += sig;
+    }
+    return ascii(out.c_str());
 }
 
 double stringToNumber(StringView s)

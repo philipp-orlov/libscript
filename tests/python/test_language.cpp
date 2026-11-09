@@ -113,6 +113,7 @@ TEST(stringsAndFStrings)
     CHECK_EQ(text("'{} and {}'.format(1, 'b')"), "1 and b");
     CHECK_EQ(text("'{1}{0}{name}'.format('a', 'b', name='c')"), "bac");
     CHECK_EQ(text("'{:>4}|{:.1f}'.format(1, 2.25)"), "   1|2.2");
+    CHECK_EQ(text("'{:.0f} {:.0f} {:.0f} {:.0e}'.format(0.5, 2.5, 3.5, 2.5)"), "0 2 4 2e+00");
 }
 
 TEST(strConversions)

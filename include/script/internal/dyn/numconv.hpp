@@ -17,9 +17,12 @@ namespace dyn {
 
 /// `String(number)` is `internal::numberToString`.
 String numberToStringRadix(double d, int radix);
-String numberToFixed(double d, int digits);
-String numberToPrecision(double d, int digits);
-String numberToExponential(double d, int digits);
+/// How a digit string is cut when the cut falls on an exact tie: JavaScript
+/// takes the larger number, Python's formatting the even one.
+enum class RoundTies { AwayFromZero, ToEven };
+String numberToFixed(double d, int digits, RoundTies ties = RoundTies::AwayFromZero);
+String numberToPrecision(double d, int digits, RoundTies ties = RoundTies::AwayFromZero);
+String numberToExponential(double d, int digits, RoundTies ties = RoundTies::AwayFromZero);
 
 /// `Number(string)`: full literal grammar, NaN when the text is not a number.
 double stringToNumber(StringView s);

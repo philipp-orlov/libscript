@@ -13,6 +13,7 @@
 
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/compiler.hpp"
+#include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/parser.hpp"
 #include "script/internal/dyn/runtime.hpp"
 #include "script/internal/dyn/vm.hpp"
@@ -174,6 +175,20 @@ Value write(CallInfo& ci)
     Runtime& rt = rtOf(ci);
     rt.ctx.write(toStringValue(rt, ci.arg(0)), false);
     return Value::undefined();
+}
+
+/// `__py.fixed(x, digits)` and `__py.exponential(x, digits)`: Python cuts an
+/// exact tie to the even digit, where Number.prototype.toFixed takes the larger.
+Value fixed(CallInfo& ci)
+{
+    Runtime& rt = rtOf(ci);
+    return rt.str(numberToFixed(toNumber(rt, ci.arg(0)), int(toNumber(rt, ci.arg(1))), RoundTies::ToEven));
+}
+
+Value exponential(CallInfo& ci)
+{
+    Runtime& rt = rtOf(ci);
+    return rt.str(numberToExponential(toNumber(rt, ci.arg(0)), int(toNumber(rt, ci.arg(1))), RoundTies::ToEven));
 }
 
 Value input(CallInfo& ci)
@@ -520,9 +535,9 @@ var __name__ = "__main__";
     var formatNumber = function (v, type, precision, alt) {
         var a = Math.abs(v);
         switch (type) {
-            case 'f': case 'F': return a.toFixed(precision < 0 ? 6 : precision);
+            case 'f': case 'F': return __py.fixed(a, precision < 0 ? 6 : precision);
             case 'e': case 'E': {
-                var s = fixExponent(a.toExponential(precision < 0 ? 6 : precision));
+                var s = fixExponent(__py.exponential(a, precision < 0 ? 6 : precision));
                 return type === 'E' ? s.toUpperCase() : s;
             }
             case 'g': case 'G': {
@@ -531,7 +546,7 @@ var __name__ = "__main__";
                 var exp = Math.floor(Math.log10(a));
                 var s2;
                 if (exp < -4 || exp >= p) {
-                    s2 = fixExponent(a.toExponential(p - 1));
+                    s2 = fixExponent(__py.exponential(a, p - 1));
                     if (!alt) {
                         var ePos = s2.indexOf('e'), mant = s2.slice(0, ePos), rest = s2.slice(ePos);
                         if (mant.indexOf('.') >= 0) {
@@ -541,7 +556,7 @@ var __name__ = "__main__";
                         s2 = mant + rest;
                     }
                 } else {
-                    s2 = a.toFixed(Math.max(p - 1 - exp, 0));
+                    s2 = __py.fixed(a, Math.max(p - 1 - exp, 0));
                     if (!alt && s2.indexOf('.') >= 0) {
                         while (s2[s2.length - 1] === '0') s2 = s2.slice(0, -1);
                         if (s2[s2.length - 1] === '.') s2 = s2.slice(0, -1);
@@ -549,7 +564,7 @@ var __name__ = "__main__";
                 }
                 return type === 'G' ? s2.toUpperCase() : s2;
             }
-            case '%': return (a * 100).toFixed(precision < 0 ? 6 : precision) + '%';
+            case '%': return __py.fixed(a * 100, precision < 0 ? 6 : precision) + '%';
             case 'd': case 'n': return String(Math.trunc(a));
             case 'x': return (alt ? '0x' : '') + Math.trunc(a).toString(16);
             case 'X': return (alt ? '0X' : '') + Math.trunc(a).toString(16).toUpperCase();
@@ -1209,6 +1224,8 @@ void installPrelude(Runtime& rt)
     rt.method(py, "write", &write, 1);
     rt.method(py, "input", &input, 0);
     rt.method(py, "new", &construct, 1);
+    rt.method(py, "fixed", &fixed, 2);
+    rt.method(py, "exponential", &exponential, 2);
     rt.constant(global, "__py", pyValue);
     if (!global->findOwn(rt.intern("globalThis")))
         rt.constant(global, "globalThis", detail::Access::make(Type::Object, global));

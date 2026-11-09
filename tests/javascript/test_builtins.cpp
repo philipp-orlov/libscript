@@ -85,6 +85,21 @@ TEST(numberAndMath)
     CHECK_EQ(run("const r = Math.random(); r >= 0 && r < 1"), std::string("true"));
 }
 
+TEST(numberFormattingRoundsTiesAwayFromZero)
+{
+    CHECK_EQ(run("[(2.5).toFixed(0), (-2.5).toFixed(0), (0.5).toFixed(0), (1.25).toFixed(1),"
+                 " (8.345).toFixed(2), (1.005).toFixed(2), (-0).toFixed(1), (-0.0001).toFixed(2),"
+                 " (0.9).toFixed(0), (99.5).toFixed(0)].join(' ')"),
+             std::string("3 -3 1 1.3 8.35 1.00 0.0 -0.00 1 100"));
+    CHECK_EQ(run("[(2.5).toPrecision(1), (1.25).toPrecision(2), (9.99).toPrecision(2),"
+                 " (123456).toPrecision(2), (0.000123).toPrecision(2), (0).toPrecision(3),"
+                 " (-1.5).toPrecision(1)].join(' ')"),
+             std::string("3 1.3 10 1.2e+5 0.00012 0.00 -2"));
+    CHECK_EQ(run("[(2.5).toExponential(0), (1.25).toExponential(1), (9.5).toExponential(0),"
+                 " (0).toExponential(2), (-12345).toExponential(2)].join(' ')"),
+             std::string("3e+0 1.3e+0 1e+1 0.00e+0 -1.23e+4"));
+}
+
 TEST(jsonRoundTrips)
 {
     CHECK_EQ(run("JSON.stringify({ a: [1, 'two', null, true], b: { c: 3 } })"),

@@ -117,6 +117,8 @@ void installNumber(Runtime& rt)
     rt.method(proto, "toExponential", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         const int digits = ci.arg(0).isUndefined() ? 6 : int(toNumber(rt2, ci.arg(0)));
+        if (digits < 0 || digits > 100)
+            ci.fail(ErrorCode::RangeError, "toExponential digits must be between 0 and 100");
         return rt2.str(numberToExponential(thisNumber(ci), digits));
     }, 1);
 

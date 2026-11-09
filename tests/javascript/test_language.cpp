@@ -2007,6 +2007,28 @@ TEST(aLongPieceOfAStringSharesItsCharacters)
     }
 }
 
+TEST(theNameOfAFunctionExpressionIsReadOnly)
+{
+    // The binding is immutable: a write is ignored in sloppy code and throws in strict code; a declaration is no
+    // such binding, and a parameter or a var of the same name hides it.
+    const char* program =
+        "var out = [];"
+        "var a = function me() { me = 1; me += 2; me++; return typeof me; }; out.push(a());"
+        "var b = function me() { 'use strict'; try { me = 1; return 'no'; } catch (e) { return e.constructor.name; } }; out.push(b());"
+        "var c = function me() { return (() => { me = 1; return typeof me; })(); }; out.push(c());"
+        "function decl() { decl = 1; return typeof decl; } out.push(decl());"
+        "var d = function me(me) { me = 1; return typeof me; }; out.push(d(0));"
+        "var e = function me() { var me = 1; me = 2; return me; }; out.push(e());"
+        "var f = function me(n) { return n ? me(n - 1) + 1 : 0; }; out.push(f(3));"
+        "out.join(' ')";
+    for (auto mode : {script::JitOptions::Mode::Off, script::JitOptions::Mode::Eager}) {
+        script::Context::Options options;
+        options.jit.mode = mode;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("function TypeError function number number 2 3"));
+    }
+}
+
 TEST(aGeneratorIsSteppedWithoutAResultObject)
 {
     // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the

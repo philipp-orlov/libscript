@@ -47,6 +47,7 @@ struct Local
     int depth = 0;
     bool boxed = false;
     bool isConst = false;
+    bool silentConst = false;  ///< a function expression's own name: a write is ignored unless the code is strict
 };
 
 struct LoopCtx
@@ -959,6 +960,16 @@ private:
         }
     }
 
+    /// Whether the nearest binding of `name`, here or in an enclosing function, is a function expression's own name.
+    bool isSilentConst(StringView name) const
+    {
+        for (const FnState* f = fn_; f; f = f->parent) {
+            if (const Local* local = findLocal(*f, name))
+                return local->silentConst;
+        }
+        return false;
+    }
+
     void storeVar(StringView name, std::uint32_t line)
     {
         // A private name on its own is no variable: `#x = 1` and `for (#x in o)` are early errors.
@@ -968,6 +979,10 @@ private:
         // An error when it runs, not when it compiles: the assignment may never run.
         if (ref.isConst) {
             (void)line;
+            if (!inStrictCode() && isSilentConst(name)) {
+                emit(Op::Pop);
+                return;
+            }
             emitU(Op::ThrowConstAssign, atomFor(name));
             return;
         }
@@ -1319,7 +1334,8 @@ private:
                 std::any_of(funcs.begin(), funcs.end(),
                             [&](const Node* f) { return f->text == node.text; });
             if (!claimed) {
-                const std::uint32_t slot = declareLocal(node.text, false);
+                const std::uint32_t slot = declareLocal(node.text, true);
+                fn_->locals.back().silentConst = true;
                 emit(Op::PushCallee);
                 emitU(fn_->locals.back().boxed ? Op::SetCell : Op::SetLocal, slot);
             }

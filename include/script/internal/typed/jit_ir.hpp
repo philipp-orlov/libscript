@@ -171,6 +171,10 @@ struct IrCall
     std::int32_t abiArgs = -1;
     /// What the engine wants to know of those places, once they are known.
     void* readsPlaces = nullptr;
+    /// A bail out of the method, the one call there is in a cold block ending in its result's return. Its one argument
+    /// is `readsPlaces`; the runtime and the frame are the same for every bail, so the back end passes those, and the call
+    /// and return, from one place in the method that each such block branches to. Only for a back end that says it can.
+    bool bailTail = false;
     std::vector<std::int32_t> passed() const
     {
         return abiArgs < 0 ? args : std::vector<std::int32_t>(args.begin(), args.begin() + abiArgs);

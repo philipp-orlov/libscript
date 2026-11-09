@@ -1912,3 +1912,24 @@ TEST(nativeCodeNoFunctionEntersIsFreed)
     // some code a while longer, and more of that in a sanitizer's larger frames.
     CHECK(ctx.stats().methodsCompiled >= 390);
 }
+
+TEST(nativeHigherOrderLoopsSkipHoles)
+{
+    // `map`, `forEach`, `filter` and `reduce` in native code do not call the callback for a hole, in an array of numbers
+    // or of values, and `map` leaves the hole in its result: the first element as much as any.
+    const char* program =
+        "function f(a) { var seen = []; var m = a.map(function (x, i) { seen.push(i); return x * 2; });"
+        "  a.forEach(function (x, i) { seen.push('e' + i); }); var fl = a.filter(function (x) { return x > 1; });"
+        "  var r = a.reduce(function (s, x) { return s + x; }, 0);"
+        "  return [seen.join(''), m.length, 0 in m, 3 in m, m.join(':'), fl.join(':'), r].join(' '); }"
+        "var out; for (var k = 0; k < 3000; k++) { var a = new Array(3); a.push(1, 2);"
+        "  if (k & 1) a.push({ valueOf: function () { return 5; } }); a[6] = 4; out = f(a) + ' ' + f([7, , 8]); } out";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("3456e3e4e5e6 7 false true :::2:4:10:8 2:[object Object]:4 12 02e0e2 3 true false 14::16 7:8 15"));
+    }
+}

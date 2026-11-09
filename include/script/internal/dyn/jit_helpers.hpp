@@ -91,6 +91,8 @@ GCObject* scriptDynNewThis(Runtime* rt, GCObject* fn) noexcept;
 GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept;
 GCObject* scriptDynNewRegExp(Runtime* rt, GCObject* templateObject) noexcept;
 void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
+/// A hole at the end of an array: what `map` makes where its source has one.
+void scriptDynArrayAppendHole(Runtime* rt, GCObject* array) noexcept;
 void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload, PropertySite* site) noexcept;
 NativePair scriptDynCatch(Runtime* rt) noexcept;
 void scriptDynIterCloseAt(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;

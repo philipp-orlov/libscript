@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+#include <unistd.h>
+#endif
 
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/numconv.hpp"
@@ -532,6 +535,11 @@ GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept
 GCObject* scriptDynNewRegExp(Runtime* rt, GCObject* templateObject) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* { return newRegExpFromTemplate(*rt, static_cast<DynObject*>(templateObject)); });
+}
+
+void scriptDynArrayAppendHole(Runtime* rt, GCObject* array) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&] { static_cast<DynArray*>(array)->appendHole(); });
 }
 
 void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept
@@ -1271,6 +1279,17 @@ bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunctio
     }
     code.jitCode = compiled;
     rt.jitCodes.push_back(compiled);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    // For perf: the code's name, which a profile then shows in place of an address.
+    if (std::getenv("SCRIPT_PERF_MAP")) {
+        static std::FILE* map = std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "a");
+        if (map) {
+            std::fprintf(map, "%llx %zx js:%s:%u#%u\n", (unsigned long long)reinterpret_cast<std::uintptr_t>(compiled->codeStart),
+                         compiled->codeBytes, code.name.empty() ? "<anon>" : code.name.c_str(), code.lineAt(0), unsigned(code.jitGeneration));
+            std::fflush(map);
+        }
+    }
+#endif
     ++rt.jitCompiled;
     if (rt.ctx.options.jit.dumpCode)
         rt.ctx.write(fromUtf8("jit: " + code.name + " (" + std::to_string(compiled->codeBytes) + " bytes) at " +
@@ -1373,6 +1392,10 @@ void sweepRetiredNative(Runtime& rt) noexcept
 {
     if (rt.jitRetired.empty() || !rt.jitBackend)
         return;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SCRIPT_JIT_NO_SWEEP"))
+        return;
+#endif
     const std::uintptr_t ceiling = nativeStackCeiling();
     if (!ceiling)
         return;

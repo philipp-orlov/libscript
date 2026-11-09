@@ -13,6 +13,7 @@
 //   * a floating point constant is materialized once before the loop.
 //
 // A loop head an on-stack replacement enters is handled by moving the entry to the new preheader.
+#include <cstdlib>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -1786,13 +1787,26 @@ private:
 
 void optimizeLoops(IrFunction& fn)
 {
-    Straighten(fn).run();
-    CommonSubexpressions(fn).run();
-    LoopOptimizer(fn).run();
-    LoopInvariants(fn).run();
-    LoopRotation(fn).run();
-    CopyPropagation(fn).run();
-    FpMemory(fn).run();
+    unsigned skip = 0;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    // A bit for each pass to leave out, in the order below: for finding which one a wrong result comes from.
+    if (const char* mask = std::getenv("SCRIPT_JIT_SKIP_PASSES"))
+        skip = unsigned(std::strtoul(mask, nullptr, 0));
+#endif
+    if (!(skip & 1))
+        Straighten(fn).run();
+    if (!(skip & 2))
+        CommonSubexpressions(fn).run();
+    if (!(skip & 4))
+        LoopOptimizer(fn).run();
+    if (!(skip & 8))
+        LoopInvariants(fn).run();
+    if (!(skip & 16))
+        LoopRotation(fn).run();
+    if (!(skip & 32))
+        CopyPropagation(fn).run();
+    if (!(skip & 64))
+        FpMemory(fn).run();
 }
 
 }  // namespace typed

@@ -434,7 +434,7 @@ public:
             why_ = "frame of " + std::to_string(frameBytes_) + " bytes";
             return false;
         }
-        labels_.assign(std::size_t(fn_.labelCount) + 1, std::size_t(-1));
+        labels_.assign(std::size_t(fn_.labelCount) + 2, std::size_t(-1));
         emitPrologue(true);
         emitParameters();
         // The hot code first, then what the IR marked cold, so that the hot code stays together.
@@ -455,6 +455,8 @@ public:
             else if (cold)
                 emit(in);
         }
+        if (bailTail_)
+            emitBailTail(*bailTail_);
         const std::size_t coldWords = a_.here();
         emitCold();
         const std::size_t padWords = a_.here();
@@ -1505,6 +1507,16 @@ private:
 
     void emitCall(const IrCall& call)
     {
+        if (call.bailTail) {
+            // The registers are saved already; what differs from one bail to the next is which bail it is.
+            if (!bailTail_)
+                bailTail_ = &call;
+            moveImm(X1, reinterpret_cast<std::uint64_t>(call.readsPlaces));
+            a_.word(0x14000000u);
+            labelFixups_.push_back({a_.here() - 1, std::int32_t(fn_.labelCount) + 1});
+            skipReturn_ = true;
+            return;
+        }
         if (call.publishFrame && (call.kind == IrCallKind::Helper || call.kind == IrCallKind::Indirect))
             a_.strX(X29, kRt, std::uint32_t(config_.topFrame));
         if (call.cold)
@@ -1987,6 +1999,9 @@ private:
             }
             case IrOp::Call: emitCall(fn_.calls[std::size_t(in.imm)]); return;
             case IrOp::Ret:
+                // The return of a bail, which its shared tail makes.
+                if (std::exchange(skipReturn_, false))
+                    return;
                 if (in.b >= 0) {
                     std::vector<Move> results;
                     Move payload;
@@ -2042,6 +2057,26 @@ private:
         }
     }
 
+    /// Every bail of the method comes here with x1 saying which, its registers saved: the call that has the interpreter
+    /// finish the method, and the return of what it came to.
+    void emitBailTail(const IrCall& call)
+    {
+        labels_[std::size_t(fn_.labelCount) + 1] = a_.here();
+        a_.strX(X29, kRt, std::uint32_t(config_.topFrame));
+        a_.movReg(X0, kRt);
+        a_.addLarge(X2, Reg(31), areaBase_);
+        callAbsolute(call.helper);
+        if (call.site >= 0)
+            noteSite(call.site);
+        if (call.exit >= 0) {
+            a_.ldrW(X16, kRt, std::uint32_t(config_.nativeError));
+            branchToExit(a_.cbnzW(X16), call.exit);
+        }
+        emitEpilogue();
+    }
+
+    const IrCall* bailTail_ = nullptr;
+    bool skipReturn_ = false;
     bool saverWanted_ = false;
     const IrFunction& fn_;
     NativeConfig config_;
@@ -2100,6 +2135,7 @@ public:
     }
 
     const char* name() const noexcept override { return "arm64"; }
+    bool sharesBailTail() const noexcept override { return true; }
 
     bool hasJsToInt32() const noexcept override
     {

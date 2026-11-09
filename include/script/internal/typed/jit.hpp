@@ -207,6 +207,8 @@ public:
     /// False when this build has no generator for the host, or the host lacks
     /// something the generator needs.
     virtual bool available() const noexcept = 0;
+    /// Whether `IrCall::bailTail` is understood: bails then share their call and return.
+    virtual bool sharesBailTail() const noexcept { return false; }
     /// Whether the machine converts a double to an int32 the way JavaScript does in one instruction.
     virtual bool hasJsToInt32() const noexcept { return false; }
     /// Whether this method is within the subset the back end handles. A back

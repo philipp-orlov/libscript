@@ -1809,10 +1809,20 @@ private:
             put(e);
         for (const Entry& e : popped)
             put(e);
-        const std::int32_t saved = fn_.newVreg(false);
-        IrInst& addr = inst(IrOp::FrameAddr);
-        addr.d = saved;
-        addr.imm = 0;
+        // Not inlined, a bail is the same call and return as every other but for which bail it is, which a back end that
+        // can makes once for the method.
+        bool shared = !parent_ && inlineDone_ < 0 && rt_.jitBackend->sharesBailTail();
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("SCRIPT_JIT_NO_BAIL_TAIL"))
+            shared = false;
+#endif
+        std::int32_t saved = -1;
+        if (!shared) {
+            saved = fn_.newVreg(false);
+            IrInst& addr = inst(IrOp::FrameAddr);
+            addr.d = saved;
+            addr.imm = 0;
+        }
         const std::int32_t r = fn_.newVreg(false);
         const std::int32_t t = fn_.newVreg(false);
         IrExit exit;
@@ -1825,8 +1835,13 @@ private:
         IrCall call;
         call.kind = IrCallKind::Helper;
         call.helper = reinterpret_cast<void*>(&scriptDynBail);
-        call.args = {rtReg(), ptrReg(info), saved};
-        call.abiArgs = 3;
+        if (shared) {
+            call.abiArgs = 0;
+            call.bailTail = true;
+        } else {
+            call.args = {rtReg(), ptrReg(info), saved};
+            call.abiArgs = 3;
+        }
         call.readsPlaces = info;
         call.args.insert(call.args.end(), places.begin(), places.end());
         call.result = r;
@@ -6119,15 +6134,29 @@ private:
             mov(elem.r, bits);
             mov(elem.t, immReg(std::int64_t(Type::Double)));
             inst(IrOp::Br).imm = have;
-            inst(IrOp::Label).imm = hole;
-            mov(elem.r, immReg(0));
-            mov(elem.t, immReg(std::int64_t(Type::Undefined)));
-            inst(IrOp::Br).imm = have;
             inst(IrOp::Label).imm = values;
             const std::int32_t slot = plusReg(loadHeader(self.r, kElementsOffset), shiftLeft(index, 4));
             mov(elem.t, load(slot, 0, 1, false, kAliasValue));
             mov(elem.r, load(slot, kPayload, 8, false, kAliasValue));
+            // A hole is no element at all: the callback is not called for it, and `map` leaves one in its place.
+            const std::int32_t element = newLabel();
+            branchCmp(elem.t, IrCond::Ne, std::int64_t(Type::Undefined), element);
+            {
+                const std::int32_t marker = immReg(std::int64_t(kHolePayload));
+                IrInst& test = inst(IrOp::BrCmp);
+                test.a = elem.r;
+                test.b = marker;
+                test.cond = IrCond::Eq;
+                test.width = 64;
+                test.target = hole;
+            }
+            inst(IrOp::Label).imm = element;
             incRefOf(elem.r, elem.t, false);
+            inst(IrOp::Br).imm = have;
+            inst(IrOp::Label).imm = hole;
+            if (isMap)
+                coldCall(reinterpret_cast<void*>(&scriptDynArrayAppendHole), {rtReg(), out.r}, -1, -1, true, held);
+            inst(IrOp::Br).imm = next;
             inst(IrOp::Label).imm = have;
         }
         const std::int32_t asDouble = fn_.newVreg(true);

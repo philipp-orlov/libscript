@@ -150,7 +150,8 @@ struct StringCell : GCObject
         kInSource = 1,   ///< a name some compiled program spells out; there are only as many of those as the source has
         kRope = 2,       ///< two halves follow the cell, not yet joined
         kFlattened = 4,  ///< a rope whose characters are in a buffer of its own
-        kOutOfLine = kRope | kFlattened,  ///< the characters are not after the cell: what native code tests
+        kSlice = 8,      ///< part of another string, whose characters it points into and which it holds a count of
+        kOutOfLine = kRope | kFlattened | kSlice,  ///< the characters are not after the cell: what native code tests
     };
     bool interned = false;  ///< also present in the context's string table
     std::uint8_t bits = 0;  ///< `Bits`; one byte, so a string still fits the padding of its header
@@ -175,6 +176,14 @@ struct StringCell : GCObject
         halves()[0] = head;
         halves()[1] = tail;
     }
+    /// `count` characters of `whole`, a string that is not a slice, from `chars` within it.
+    StringCell(StringCell* whole, const Char* chars, std::uint32_t count) : bits(kSlice), length(count)
+    {
+        kind = CellKind::String;
+        detail::incRef(whole);
+        buffer() = const_cast<Char*>(chars);
+        halves()[1] = whole;
+    }
     ~StringCell() override;
 
     StringView text() const noexcept
@@ -191,7 +200,7 @@ struct StringCell : GCObject
     }
     std::size_t heapSize() const override
     {
-        if (bits & kRope)
+        if (bits & (kRope | kSlice))
             return cellBytes;
         if (bits & kFlattened)
             return cellBytes + length * sizeof(Char);
@@ -205,6 +214,8 @@ struct StringCell : GCObject
         return cellBytes > sizeof(*this) ? (cellBytes - sizeof(*this)) / sizeof(Char) : length;
     }
     Char* mutableChars() noexcept { return reinterpret_cast<Char*>(this + 1); }
+    /// The string a slice is part of; any other string is its own.
+    StringCell* whole() noexcept { return bits & kSlice ? halves()[1] : this; }
     static constexpr std::size_t kRopeBytes = 2 * sizeof(void*);
     bool inSource() const noexcept { return bits & kInSource; }
     void markInSource() noexcept { bits |= kInSource; }

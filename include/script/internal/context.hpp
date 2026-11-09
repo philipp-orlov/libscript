@@ -194,6 +194,8 @@ struct ContextImpl
     /// Strings up to this long are interned by `str`.
     static constexpr std::size_t kInternedLength = 32;
     static constexpr std::size_t kRopeLength = 64;
+    /// The shortest part of a string that `substring` shares instead of copying.
+    static constexpr std::size_t kSliceLength = 64;
     /// The interned cell for `text`. Its initial reference is the table's own,
     /// so a string nothing else names has a count of exactly one and
     /// `sweepStrings` can recognise it.
@@ -211,6 +213,8 @@ struct ContextImpl
     Value concat(StringView head, StringView tail);
     /// `head + tail`, as a rope when it is long enough to be worth not copying.
     Value concat(StringCell* head, StringCell* tail);
+    /// `count` characters of `s` from `start`, sharing its characters when that is worth it.
+    Value substring(StringCell* s, std::size_t start, std::size_t count);
     Box* newBox(Value v);
 
     // ---- shared vm state ----

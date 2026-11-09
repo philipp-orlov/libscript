@@ -108,10 +108,18 @@ StringCell::~StringCell()
         detail::decRef(halves()[0]);
         detail::decRef(halves()[1]);
     }
+    if (bits & kSlice)
+        detail::decRef(halves()[1]);
 }
 
 void StringCell::clearReferences()
 {
+    if (bits & kSlice) {
+        StringCell* of = halves()[1];
+        halves()[1] = nullptr;
+        detail::decRef(of);
+        return;
+    }
     if (!(bits & kRope))
         return;
     StringCell* head = halves()[0];
@@ -617,6 +625,21 @@ Value ContextImpl::str(StringView text)
     if (text.size() <= kInternedLength)
         return detail::Access::make(Type::String, intern(text));
     return detail::Access::adopt(Type::String, newString(text));
+}
+
+Value ContextImpl::substring(StringCell* s, std::size_t start, std::size_t count)
+{
+    const StringView text = s->text();
+    if (start == 0 && count == text.size()) {
+        detail::incRef(s);
+        return detail::Access::adopt(Type::String, s);
+    }
+    // Shared only when it is long and a good part of what it is cut from, so that a short piece never keeps a long
+    // string alive: what is cut off the front of a text being worked through, over and over.
+    if (count < kSliceLength || count * 4 < text.size())
+        return detail::Access::adopt(Type::String, newString(text.substr(start, count)));
+    return detail::Access::adopt(Type::String,
+                                 newCellSized<StringCell>(StringCell::kRopeBytes, s->whole(), text.data() + start, std::uint32_t(count)));
 }
 
 Value ContextImpl::concat(StringCell* head, StringCell* tail)

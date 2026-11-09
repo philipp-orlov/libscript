@@ -25,6 +25,13 @@ struct ThisText
     String owned;
     StringView view;
     explicit ThisText(CallInfo& ci);
+    /// `count` characters from `start`: part of the receiver's own string when it is one.
+    Value part(Runtime& rt, std::size_t start, std::size_t count) const
+    {
+        if (StringCell* cell = asString(keep))
+            return rt.ctx.substring(cell, start, count);
+        return rt.str(view.substr(start, count));
+    }
 };
 
 String thisString(CallInfo& ci)
@@ -321,7 +328,7 @@ void installString(Runtime& rt)
                                    : s.size();
         if (from >= to)
             return rt2.str("");
-        return rt2.str(s.substr(from, to - from));
+        return receiver.part(rt2, from, to - from);
     }, 2);
 
     rt.method(proto, "substring", [](CallInfo& ci) {
@@ -335,7 +342,7 @@ void installString(Runtime& rt)
                             : s.size();
         if (a > b)
             std::swap(a, b);
-        return rt2.str(s.substr(a, b - a));
+        return receiver.part(rt2, a, b - a);
     }, 2);
 
     rt.method(proto, "substr", [](CallInfo& ci) {
@@ -347,7 +354,7 @@ void installString(Runtime& rt)
             ci.arg(1).isUndefined() ? s.size() - from
                                     : std::size_t(std::max<std::int64_t>(
                                           0, toIntegerOrInfinity(toNumber(rt2, ci.arg(1)))));
-        return rt2.str(s.substr(from, count));
+        return receiver.part(rt2, from, std::min(count, s.size() - from));
     }, 2);
 
     const auto toUpper = [](CallInfo& ci) { return rtOf(ci).str(caseMapped(thisString(ci), true)); };

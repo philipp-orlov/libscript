@@ -1987,3 +1987,22 @@ TEST(theInterpreterRunsCallsInItsOwnLoop)
                  std::string("7,deep20,400,0,object,246,3,4,5,true,10,1,E3,true,7,2,1981284352"));
     }
 }
+
+TEST(aLongPieceOfAStringSharesItsCharacters)
+{
+    // Cutting the front off a long text over and over shares the characters that are left instead of copying them; a
+    // short piece is a string of its own, and a piece of a piece points into the first string.
+    const char* program =
+        "var src = ''; for (var i = 0; i < 20000; i++) src += 'token' + (i % 10) + ' ';"
+        "var n = 0, s = src; while (s.length) { var m = s.indexOf(' '); n += s.slice(0, m).length; s = s.slice(m + 1); }"
+        "var a = src.slice(100, 300), b = a.slice(10, 150), c = b.substring(5, 100) + '|' + src.substr(src.length - 70);"
+        "[n, s.length, a.length, b.length, c.length, c.slice(0, 20), c.charCodeAt(3), b === src.slice(110, 250),"
+        " JSON.stringify(c).length, src.slice(7).slice(7).slice(7).length, ({ [src.slice(1, 200)]: 1 })[src.substring(1, 200)]].join(',')";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("120000,0,200,140,166,en6 token7 token8 to,32,true,168,139979,1"));
+    }
+}

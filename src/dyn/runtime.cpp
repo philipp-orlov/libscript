@@ -368,6 +368,8 @@ void Runtime::releaseRoots() noexcept
                               &asyncGeneratorProto, &asyncGeneratorFunctionProto,
                               &iteratorProto, &arrayIteratorProto, &regExpProto, &regExpStringIteratorProto, &bigintProto})
         p->reset();
+    for (Ref<GCObject>& name : smallIndexNames)
+        name.reset();
     atom = Atoms{};
     sym = Symbols{};
     frames.clear();
@@ -439,6 +441,7 @@ Shape* Runtime::shapeAfter(Shape* from, GCObject* key, std::uint8_t attrs)
     next->count = from->count + 1;
     next->root = from->root;
     next->parent = from;
+    next->keyBits = from->keyBits | Shape::keyBit(key);
     next->root->expect = std::max(next->root->expect, next->count);
     from->addTransition(key, attrs, next);
     return next;

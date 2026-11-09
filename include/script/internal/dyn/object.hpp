@@ -273,9 +273,18 @@ struct Shape
     std::uint32_t births = 0;
     /// The shape this one adds a property to; null for a root.
     Shape* parent = nullptr;
+    /// A bit for each name along the chain, by hash: a name whose bit is clear is not here, which is the answer to most
+    /// questions asked on the way up a prototype chain, and needs no walk.
+    std::uint64_t keyBits = 0;
+    static std::uint64_t keyBit(const GCObject* k) noexcept
+    {
+        return std::uint64_t(1) << ((reinterpret_cast<std::uintptr_t>(k) >> 4) * 0x9E3779B97F4A7C15ull >> 58);
+    }
     /// Whether an object of this shape has `k`, following the chain back to the root.
     bool has(const GCObject* k) const noexcept
     {
+        if (!(keyBits & keyBit(k)))
+            return false;
         for (const Shape* s = this; s; s = s->parent) {
             if (s->key.get() == k)
                 return true;

@@ -200,6 +200,8 @@ struct ContextImpl
     /// so a string nothing else names has a count of exactly one and
     /// `sweepStrings` can recognise it.
     StringCell* intern(StringView text);
+    /// The interned string with `s`'s text: `s` itself when it is one, found with the hash `s` keeps.
+    StringCell* intern(StringCell* s);
     StringCell* intern(const char* asciiText) { return intern(ascii(asciiText)); }
     /// A fresh string cell that is not interned.
     StringCell* newString(StringView text);

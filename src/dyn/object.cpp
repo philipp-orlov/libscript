@@ -45,6 +45,8 @@ std::int32_t Shape::indexOf(const GCObject* k) const
     // through once, and a table for each of those would be a square of its size.
     constexpr std::uint32_t kWalkUpTo = 8;
     constexpr std::uint32_t kAskedBeforeTable = 4;
+    if (!(keyBits & keyBit(k)))
+        return -1;
     if (lookup_.empty()) {
         if (count <= kWalkUpTo || ++asked_ < kAskedBeforeTable) {
             std::int32_t at = std::int32_t(count);

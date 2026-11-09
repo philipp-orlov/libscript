@@ -437,8 +437,18 @@ Ref<GCObject> toPropertyKey(Runtime& rt, const Value& v)
 {
     if (v.isSymbol())
         return Ref<GCObject>(detail::Access::ptr(v));
-    if (v.isString() && asString(v)->interned)
-        return Ref<GCObject>(detail::Access::ptr(v));
+    if (v.isString())
+        return Ref<GCObject>(rt.ctx.intern(asString(v)));
+    // A small whole number, as an object's key: its name is worked out once.
+    if (v.isDouble()) {
+        const double d = detail::Access::r8(v);
+        if (d >= 0 && d < double(Runtime::kSmallIndexNames) && d == double(std::uint32_t(d)) && !(d == 0 && std::signbit(d))) {
+            Ref<GCObject>& name = rt.smallIndexNames[std::size_t(d)];
+            if (!name)
+                name.reset(rt.intern(toStringValue(rt, v)));
+            return name;
+        }
+    }
     return Ref<GCObject>(rt.intern(toStringValue(rt, v)));
 }
 

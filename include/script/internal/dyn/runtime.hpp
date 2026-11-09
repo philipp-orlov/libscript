@@ -314,6 +314,9 @@ struct Runtime : EngineRuntime
     std::uint64_t generatorNextEpoch = 0;
     /// One more than the `protoEpoch` at which Array.prototype and Object.prototype were last seen to hold no element.
     std::uint64_t noProtoElementsEpoch = 0;
+    /// The names of 0 up to `kSmallIndexNames`, made the first time each is a key.
+    static constexpr std::size_t kSmallIndexNames = 1024;
+    Ref<GCObject> smallIndexNames[kSmallIndexNames];
     std::uint32_t generatorNextIndex = 0;
     Shape* iterRootShape = nullptr;
     Shape* iterValueShape = nullptr;

@@ -620,6 +620,21 @@ StringCell* ContextImpl::intern(StringView text)
     return cell;
 }
 
+StringCell* ContextImpl::intern(StringCell* s)
+{
+    if (s->interned)
+        return s;
+    const StringView text = s->text();
+    const std::size_t hash = s->hash();
+    if (StringCell* existing = stringTable.find(text, hash))
+        return existing;
+    StringCell* cell = newString(text);
+    cell->hash_ = hash;
+    cell->interned = true;
+    stringTable.insert(cell);
+    return cell;
+}
+
 Value ContextImpl::str(StringView text)
 {
     if (text.size() <= kInternedLength)

@@ -2029,6 +2029,17 @@ TEST(theNameOfAFunctionExpressionIsReadOnly)
     }
 }
 
+TEST(htmlLikeCommentsAreComments)
+{
+    // Annex B.1.1: `<!--` comments to the end of the line anywhere; `-->` does so only at the start of a line, after
+    // space or comments, so `x --> 0` is still a decrement and a comparison.
+    CHECK_EQ(run("var z = 1 <!-- 5\n; z"), std::string("1"));
+    CHECK_EQ(run("-->first line\nvar a = 2;\n  --> after space\n/* a\n comment */ --> after a comment\na"), std::string("2"));
+    CHECK_EQ(run("var x = 3; var r = x --> 2; [r, x].join()"), std::string("true,2"));
+    CHECK_EQ(run("var y = 5; var t = y<!--y\n; t"), std::string("5"));
+    CHECK_EQ(run("var s = '<!-- not a comment'; var u = '-->'; s.length + u.length"), std::string("21"));
+}
+
 TEST(aGeneratorIsSteppedWithoutAResultObject)
 {
     // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the

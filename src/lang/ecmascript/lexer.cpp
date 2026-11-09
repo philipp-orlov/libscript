@@ -225,7 +225,11 @@ bool Lexer::skipSpace()
             ++pos_;
         } else if (c == ' ' || c == '\t' || c == '\f' || c == '\v') {
             ++pos_;
-        } else if (c == '/' && peek(1) == '/') {
+        } else if ((c == '/' && peek(1) == '/') ||
+                   // Annex B: `<!--` starts a line comment anywhere, `-->` only when nothing but space and comments
+                   // came before it on its line.
+                   (c == '<' && peek(1) == '!' && peek(2) == '-' && peek(3) == '-') ||
+                   (c == '-' && peek(1) == '-' && peek(2) == '>' && (sawNewline || pos_ == 0))) {
             // To the end of the line, whichever terminator ends it: LF, CR, U+2028 or U+2029.
             while (pos_ < src_.size() && src_[pos_] != '\n' && src_[pos_] != '\r' &&
                    !(src_[pos_] == '\xe2' && pos_ + 2 < src_.size() && src_[pos_ + 1] == '\x80' &&

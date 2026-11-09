@@ -1308,8 +1308,9 @@ bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunctio
 
 #if SCRIPT_ENABLE_JIT_THREAD
 /// IR instructions below which a compile is quick enough to wait for: the call that made the function hot gets its code.
-/// None is, since the interpreter runs well enough for the while a compile takes on the other thread.
-constexpr std::size_t kBackgroundIr = 0;
+/// Anything larger the interpreter runs well enough while the other thread compiles it; a small one is worth having at
+/// once (code-load tests lose a third with every compile sent away, babel a quarter with only those over 3000 sent).
+constexpr std::size_t kBackgroundIr = 300;
 
 bool backgroundWanted(const Runtime& rt, const typed::IrFunction& fn)
 {

@@ -642,9 +642,16 @@ Token Lexer::readIdentifier()
     Token t;
     t.line = line_;
     const std::size_t start = pos_;
-    while (pos_ < src_.size() && isIdPart(static_cast<unsigned char>(src_[pos_])))
+    bool ascii = true;
+    while (pos_ < src_.size() && isIdPart(static_cast<unsigned char>(src_[pos_]))) {
+        ascii = ascii && static_cast<unsigned char>(src_[pos_]) < 0x80;
         ++pos_;
-    t.text = fromUtf8(src_.substr(start, pos_ - start));
+    }
+    // Nearly every name is ASCII, each byte a character as it is.
+    if (ascii)
+        t.text.assign(src_.begin() + std::ptrdiff_t(start), src_.begin() + std::ptrdiff_t(pos_));
+    else
+        t.text = fromUtf8(src_.substr(start, pos_ - start));
     // `\u0061` and `\u{61}` are the letter they name, in any part of a name.
     bool escaped = false;
     while (peek() == '\\') {

@@ -369,6 +369,8 @@ inline constexpr std::uint32_t kNoSite = 0xFFFu;
 struct FunctionCode;
 /// A compile of one on another thread; see dyn/jit.hpp.
 struct JitJob;
+/// What compiling a function's body when it is first called needs; see dyn/compiler.hpp.
+struct LazyBody;
 
 /// One local, cell or stack entry of a bail: how to make the interpreter's value of it from what native code holds.
 struct DeoptValue
@@ -426,6 +428,7 @@ struct FunctionCode
     std::uint32_t srcStart = 0;
     std::uint32_t srcEnd = 0;
     int arity = 0;
+    int length = 0;  ///< what `length` says: the parameters before the first with a default, or the rest
     bool isArrow = false;
     bool hasRest = false;
     bool isClassConstructor = false;
@@ -525,6 +528,9 @@ struct FunctionCode
     std::vector<std::pair<std::uint32_t, std::uint32_t>> lines;
     /// Parameter slots that must be boxed on entry because a closure captures them.
     std::vector<std::uint32_t> boxedParams;
+    /// Set while the body is not compiled yet: of all the above, only the name, the arity, the kind, the text and the
+    /// upvalues are there before the first call.
+    std::shared_ptr<const LazyBody> lazy;
 
     std::uint32_t lineAt(std::uint32_t pc) const noexcept;
 };

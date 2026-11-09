@@ -1319,10 +1319,25 @@ namespace {
 
 Value execute(Runtime& rt, Frame& frame);
 
+/// The body of a function first called, compiled where every closure of it sees it. A mistake in it is a SyntaxError
+/// of this call.
+void compileLazyBody(Runtime& rt, const FunctionCode& code)
+{
+    try {
+        compileLazy(rt, const_cast<FunctionCode&>(code));
+    } catch (Exception&) {
+        throw;
+    } catch (const Error& e) {
+        throwError(rt, e.code() == ErrorCode::CompileError ? ErrorCode::SyntaxError : e.code(), e.what());
+    }
+}
+
 /// Push a frame, run it, pop it. `newTarget` is set for construction.
 Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue,
                      const std::vector<Value>& args, DynFunction* newTarget)
 {
+    if (fn->code->lazy)
+        compileLazyBody(rt, *fn->code);
     const FunctionCode& code = *fn->code;
 #if SCRIPT_ENABLE_DYN_JIT
     if (code.jitEntry)
@@ -1588,7 +1603,7 @@ Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode
     fn->fnKind = FnKind::Bytecode;
     fn->code = code;
     fn->name = code->wideName;
-    fn->arity = code->arity;
+    fn->arity = code->length;
     fn->isArrow = code->isArrow;
     fn->isClassConstructor = code->isClassConstructor;
     fn->isDerivedConstructor = code->isDerivedConstructor;
@@ -1598,7 +1613,7 @@ Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode
         fn->upvalues.emplace_back(boxes[i]);
     if (parent && code->isArrow)
         fn->homeObject = parent->homeObject;
-    fn->putOwn(rt.atom.length.get(), Value(double(code->arity)), PropConfigurable);
+    fn->putOwn(rt.atom.length.get(), Value(double(code->length)), PropConfigurable);
     fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
     if (!setUpCoroutineFunction(rt, fn, *code) && !code->isArrow && !code->isClassConstructor)
         fn->prototypePending = true;
@@ -1612,7 +1627,7 @@ Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, 
     fn->fnKind = FnKind::Bytecode;
     fn->code = code;
     fn->name = code->wideName;
-    fn->arity = code->arity;
+    fn->arity = code->length;
     fn->isArrow = code->isArrow;
     fn->isClassConstructor = code->isClassConstructor;
     fn->isDerivedConstructor = code->isDerivedConstructor;
@@ -1632,7 +1647,7 @@ Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, 
     if (parent && parent->fn && code->isArrow)
         fn->homeObject = parent->fn->homeObject;
 
-    fn->putOwn(rt.atom.length.get(), Value(double(code->arity)), PropConfigurable);
+    fn->putOwn(rt.atom.length.get(), Value(double(code->length)), PropConfigurable);
     fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
     if (!setUpCoroutineFunction(rt, fn, *code) && withPrototype && !code->isArrow && !code->isClassConstructor)
         fn->prototypePending = true;

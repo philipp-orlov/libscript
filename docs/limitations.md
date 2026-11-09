@@ -243,6 +243,15 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
 - **A function made inside a template literal's `${...}`** shows
   `{ [native code] }` to `Function.prototype.toString`; every other function
   shows its source text.
+- **A big program compiles a function when it is first called.** Past 64 KiB of
+  source, a plain function of 128 bytes or more (not an arrow, method or
+  anything in a class, and not next to a direct `eval`) is parsed again from its
+  text on its first call and compiled then: loading a library costs little more
+  than parsing it. A mistake that only compiling finds -- a name declared twice,
+  `break` outside a loop, strict-mode rules -- is then a `SyntaxError` of that
+  call rather than of loading the program, and a function never called never
+  reports it. Smaller programs are compiled whole, so every early error shows
+  before they run.
 - **A host wrapper has no own properties.** `shared.x = 1` on an object the
   host or C# handed over is a `TypeError` unless `x` is a bound field with a
   setter; wrappers made by a JavaScript `new` are ordinary objects.

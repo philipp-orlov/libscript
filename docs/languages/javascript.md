@@ -93,6 +93,11 @@ through `Symbol.iterator`, and any object that implements it participates.
   assigning to an undeclared name creates a global, and writes to non-writable
   properties are ignored rather than throwing.
 
+- **A big program's functions are compiled when first called.** Past 64 KiB
+  of source, a plain function's body waits for its first call, so a library
+  that is loaded but mostly unused costs about its parse. A compile-time
+  mistake in such a function shows as a `SyntaxError` of the call; see
+  [limitations](../limitations.md).
 - **Numbers from the host may carry any numeric tag.** `Value(42)` is an `Int`
   and `Value(u'A')` a `Char` when the host makes them; a JavaScript program
   sees both as numbers (`typeof` says `"number"`, `'A'` is `65`). Every number

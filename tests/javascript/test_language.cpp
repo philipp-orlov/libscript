@@ -1756,3 +1756,37 @@ TEST(nativeForOfClosesWhatItLeaves)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("6 9 6 2 1 boom c4,c5,c6,c7"));
     }
 }
+
+TEST(aBigProgramCompilesAFunctionWhenItIsFirstCalled)
+{
+    // Past 64 KiB of source a plain function is compiled on its first call, from its text, against what it captured
+    // when it was made: the answers are the ones compiling it at once would give.
+    std::string program = "/*" + std::string(70000, ' ') + "*/";
+    const std::string pad = "/*" + std::string(100, ' ') + "*/";
+    program +=
+        "let a = 1; const k = 5;"
+        "function outer(x) {"
+        "  let b = 2;                                                               "
+        "  function inner(y) { b += y; return a + b + x + k;" + pad + " }"
+        "  function fact(n) { return n <= 1 ? 1 : n * fact(n - 1);" + pad + " }"
+        "  var g = function* gen() { yield b; yield* [1, 2];" + pad + " };"
+        "  return [inner(3), inner(4), fact(5), [...g()].join(), arguments.length, inner.length, typeof fact];"
+        "}"
+        "function cycle() { var loop = function (n) { return n ? loop(n - 1) + 1 : 0;" + pad + " };"
+        "  return loop(3);" + pad + " }"
+        "function late() { return eventually + 1;" + pad + " }"
+        "function broken() { break;" + pad + " }"
+        "let eventually = 41;";
+    js::Context ctx;
+    ctx.eval(program.c_str(), "<test>");
+    CHECK_EQ(ctx.eval("outer(10, 20).join(' ')", "<test>").toString(), std::string("21 25 120 9,1,2 2 1 function"));
+    CHECK_EQ(ctx.eval("String(outer.length) + ' ' + outer.toString().slice(0, 16)", "<test>").toString(), std::string("1 function outer(x"));
+    for (int i = 0; i < 2000; ++i)
+        ctx.eval("cycle()", "<test>");
+    CHECK_EQ(ctx.eval("String(cycle())", "<test>").toString(), std::string("3"));
+    CHECK(ctx.stats().gcRuns == 0);
+    CHECK_EQ(ctx.eval("String(late())", "<test>").toString(), std::string("42"));
+    // What only compiling finds is a SyntaxError of the call, and of every call after.
+    CHECK_EQ(ctx.eval("var seen = []; for (var t = 0; t < 2; t++) { try { broken(); } catch (e) { seen.push(e.name); } } seen.join()", "<test>").toString(),
+             std::string("SyntaxError,SyntaxError"));
+}

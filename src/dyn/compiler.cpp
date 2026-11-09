@@ -12,8 +12,10 @@
 #include <list>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <map>
+#include <utility>
 #include <vector>
 
 #include "script/internal/dyn/bigint.hpp"
@@ -22,6 +24,7 @@
 #include "script/internal/dyn/runtime.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/object.hpp"
+#include "script/internal/dyn/parser.hpp"
 #include "script/internal/stack_guard.hpp"
 
 namespace script {
@@ -31,6 +34,11 @@ namespace dyn {
 namespace {
 
 constexpr std::uint32_t kNoSlot = FunctionCode::kNoSlot;
+/// A program this big leaves its plain functions to compile when first called: one that loads a library calls little
+/// of it. A smaller one is compiled whole, so that every mistake shows before it runs.
+constexpr std::size_t kLazyProgramBytes = std::size_t(64) << 10;
+/// A function this short costs less to compile now than to parse again later.
+constexpr std::uint32_t kLazyFunctionBytes = 128;
 
 struct Local
 {
@@ -653,6 +661,21 @@ public:
         return fs.code;
     }
 
+    /// The body of a function left to compile when first called. What it does not find among the upvalues it was
+    /// given when it was made, it does not find around it either: that is global.
+    std::shared_ptr<FunctionCode> lazyFunction(const Node& node, const LazyBody& lazy, const std::vector<UpvalDesc>& upvals)
+    {
+        FnState outer;
+        outer.code = std::make_shared<FunctionCode>();
+        fn_ = &outer;
+        const StrictScope inherited(*this, lazy.strict);
+        resumed_ = &lazy;
+        resumedUpvals_ = &upvals;
+        function(node, lazy.name);
+        fn_ = nullptr;
+        return outer.code->children.back();
+    }
+
     std::shared_ptr<FunctionCode> evalCode(const Node& node, const EvalScope& scope)
     {
         // The caller, as far as this code can tell: its cells as boxed locals, its upvalues as upvalues of its own.
@@ -1046,8 +1069,101 @@ private:
 
     // ---- functions ----
     /// Compile a FunctionExpr or ArrowExpr and leave the closure on the stack.
+    /// A function's `length`: its parameters up to the first with a default value, or the rest.
+    static int lengthOf(const Node& node) noexcept
+    {
+        int count = 0;
+        for (const NodePtr& p : node.list) {
+            if (p->kind == NK::AssignPattern || p->kind == NK::RestElement)
+                break;
+            ++count;
+        }
+        return count;
+    }
+
+    /// `(function () { ... })()`, and the same through `.call` or `.apply`: run as soon as it is made, so it is
+    /// compiled now, not parsed a second time a moment later.
+    void noteCalledAtOnce(const Node& call)
+    {
+        const Node* callee = call.a.get();
+        if (callee && callee->kind == NK::Member && !callee->computed &&
+            (callee->text == StringView(u"call") || callee->text == StringView(u"apply")))
+            callee = callee->a.get();
+        if (callee && callee->kind == NK::FunctionExpr)
+            calledAtOnce_.insert(callee);
+    }
+
+    /// Whether `node` is left to compile when it is first called: a plain function, in a big program, whose names
+    /// resolve the same then as now. Nothing in a class, which brings private names and `super`, and nothing next to
+    /// a direct `eval`.
+    bool leaveLazy(const Node& node)
+    {
+        return node.kind == NK::FunctionExpr && !node.isMethod && node.propKind != PropKind::Constructor && node.d &&
+               gAnalysis && fn_ && !fn_->boxAll && sloppyThis_ && sourceText_ && sourceText_->size() >= kLazyProgramBytes &&
+               node.srcEnd <= sourceText_->size() && node.srcEnd > node.srcStart && node.srcEnd >= node.srcStart + kLazyFunctionBytes &&
+               privateScopes_.empty() && !calledAtOnce_.count(&node) && !containsDirectEval(node);
+    }
+
+    /// The code of a function left to compile, with what makes a closure of it and what is asked of one before it is
+    /// called. It captures every variable around it that it names; the body may then use fewer.
+    void lazyStub(const Node& node, StringView name)
+    {
+        auto code = std::make_shared<FunctionCode>();
+        code->setName(toUtf8(name));
+        code->sourceName = sourceName_;
+        code->sourceText = sourceText_;
+        code->srcStart = node.srcStart;
+        code->srcEnd = node.srcEnd;
+        code->arity = int(node.list.size());
+        for (std::size_t i = 0; i < node.list.size(); ++i) {
+            if (node.list[i]->kind == NK::RestElement) {
+                code->arity = int(i);
+                break;
+            }
+        }
+        code->length = lengthOf(node);
+        code->isGenerator = node.isGenerator;
+        code->isAsync = node.isAsync;
+        code->sloppyThis = sloppyThis_ && strictDepth_ == 0 && !hasUseStrict(*node.d);
+        auto lazy = std::make_shared<LazyBody>();
+        lazy->name = String(name);
+        if (auto it = selfNames_.find(&node); it != selfNames_.end())
+            lazy->selfName = it->second;
+        lazy->line = node.line;
+        lazy->isDeclaration = !node.namedExpr && !node.text.empty();
+        lazy->strict = inStrictCode();
+        NameSet names;
+        collectNames(node, names, false);
+        for (StringView n : names) {
+            // The function's own variable it reads as the callee, and holds no cell of.
+            if (n == StringView(lazy->selfName))
+                continue;
+            if (const Local* local = findLocal(*fn_, n)) {
+                if (!local->boxed)
+                    continue;
+                code->upvals.push_back(UpvalDesc{true, local->slot});
+                lazy->upvalConst.push_back(local->isConst);
+            } else {
+                const int up = resolveUpval(*fn_, n);
+                if (up < 0)
+                    continue;
+                code->upvals.push_back(UpvalDesc{false, std::uint32_t(up)});
+                lazy->upvalConst.push_back(fn_->upvalConst[std::size_t(up)]);
+            }
+            lazy->upvalNames.emplace_back(n);
+        }
+        code->lazy = std::move(lazy);
+        fn_->code->children.push_back(std::move(code));
+        emitU(Op::Closure, std::uint32_t(fn_->code->children.size() - 1));
+    }
+
     void function(const Node& node, StringView name)
     {
+        const LazyBody* resumed = std::exchange(resumed_, nullptr);
+        if (!resumed && leaveLazy(node)) {
+            lazyStub(node, name);
+            return;
+        }
         FnState fs;
         fs.parent = fn_;
         fs.code = std::make_shared<FunctionCode>();
@@ -1064,6 +1180,7 @@ private:
         fs.code->isDerivedConstructor = node.isStatic;  // set by compileClass
         fs.isDerivedCtor = fs.code->isDerivedConstructor && fs.code->isClassConstructor;
         fs.code->arity = int(node.list.size());
+        fs.code->length = lengthOf(node);
         fs.code->isGenerator = node.isGenerator;
         fs.code->isAsync = node.isAsync;
         // A coroutine lives in a frame of its own, which is the interpreter's to resume.
@@ -1098,11 +1215,16 @@ private:
         collectCaptured(*node.d, fs.captured);
         for (const NodePtr& p : node.list)
             collectCaptured(*p, fs.captured);
-        fs.boxAll = containsDirectEval(*node.d);
-        for (const NodePtr& p : node.list)
-            fs.boxAll = fs.boxAll || containsDirectEval(*p);
+        // Asked of the function rather than its body, which the analysis has seen already from the function around.
+        fs.boxAll = containsDirectEval(node);
         if (auto it = selfNames_.find(&node); it != selfNames_.end())
             fs.selfName = it->second;
+        if (resumed) {
+            fs.upvalNames = resumed->upvalNames;
+            fs.upvalConst = resumed->upvalConst;
+            fs.code->upvals = *resumedUpvals_;
+            fs.selfName = resumed->selfName;
+        }
         // Which functions made here hold themselves through a variable of this one.
         if (!fs.boxAll && node.d) {
             SelfBound bound;
@@ -1115,7 +1237,7 @@ private:
                     continue;
                 if (bound.inLoop.count(name) && !onlyCalled(*node.d, name))
                     continue;
-                if (namedInNested(*site->d, name, false) || containsDirectEval(*site->d))
+                if (namedInNested(*site->d, name, false) || containsDirectEval(*site))
                     continue;
                 bool inParams = false;
                 for (const NodePtr& p : site->list) {
@@ -2077,6 +2199,7 @@ private:
                 return;
             case NK::Member:
             case NK::Call: {
+                noteCalledAtOnce(n);
                 if (!chainHasOptional(n)) {
                     std::vector<std::size_t> none;
                     chain(n, none);
@@ -3189,6 +3312,9 @@ private:
     std::shared_ptr<const std::string> sourceName_;
     std::shared_ptr<const std::string> sourceText_;
     Analysis analysis_;
+    std::unordered_set<const Node*> calledAtOnce_;
+    const LazyBody* resumed_ = nullptr;  ///< the next function compiled is this one, left to compile before
+    const std::vector<UpvalDesc>* resumedUpvals_ = nullptr;
     Analysis* outerAnalysis_ = nullptr;
     String classNameHint_;
     std::map<const Node*, String> selfNames_;
@@ -3207,6 +3333,18 @@ std::shared_ptr<FunctionCode> compileProgram(Runtime& rt, const Node& program,
     Compiler compiler(rt, sourceName, std::move(sourceText));
     compiler.setSloppyThis(sloppyThis);
     return compiler.program(program);
+}
+
+void compileLazy(Runtime& rt, FunctionCode& code)
+{
+    const std::shared_ptr<const LazyBody> lazy = code.lazy;
+    const std::string sourceName = code.sourceName ? *code.sourceName : std::string();
+    Parser parser(*code.sourceText, sourceName, /*typescript=*/false);
+    const NodePtr node = parser.parseFunctionAt(code.srcStart, lazy->line, lazy->isDeclaration);
+    Compiler compiler(rt, sourceName, code.sourceText);
+    compiler.setSloppyThis(true);
+    std::shared_ptr<FunctionCode> fresh = compiler.lazyFunction(*node, *lazy, code.upvals);
+    code = std::move(*fresh);
 }
 
 std::shared_ptr<FunctionCode> compileEval(Runtime& rt, const Node& program, const std::string& sourceName,

@@ -116,6 +116,14 @@ TEST(errorCauseComesFromTheOptionsArgument)
              std::string("c 2 m"));
 }
 
+TEST(dateParsingRefusesADayThatTheMonthLacks)
+{
+    CHECK_EQ(run("['2020-02-30', '2020-04-31', '2021-02-29', '2020-02-30T10:00:00Z', '2020/02/30', '02/30/2020',"
+                 " '2020-13-01', '2020-04-30', '2021-02-28', '1900-02-29', '2000-02-29', '2020-12-31']"
+                 ".map(s => String(new Date(s).getTime())).join(' ')"),
+             std::string("NaN NaN NaN NaN NaN NaN NaN 1588204800000 1614470400000 NaN 951782400000 1609372800000"));
+}
+
 TEST(jsonRoundTrips)
 {
     CHECK_EQ(run("JSON.stringify({ a: [1, 'two', null, true], b: { c: 3 } })"),

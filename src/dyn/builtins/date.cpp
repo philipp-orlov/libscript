@@ -60,6 +60,12 @@ double daysFromCivil(double year, double month, double dayOfMonth)
     return era * 146097 + doe - 719468;
 }
 
+/// The days in `month` (0-based) of `year`.
+double daysInMonth(double year, double month)
+{
+    return daysFromCivil(month >= 11 ? year + 1 : year, month >= 11 ? 0 : month + 1, 1) - daysFromCivil(year, month, 1);
+}
+
 struct Civil
 {
     double year, month, date;  // month 0-based, date 1-based
@@ -366,7 +372,7 @@ struct DateParser
         }
         if (!end())
             return kNaN;
-        if (dayOfMonth > daysFromCivil(year, month, 1) - daysFromCivil(year, month - 1, 1))
+        if (dayOfMonth > daysInMonth(year, month - 1))
             return kNaN;
         const double tv = makeDate(makeDay(year, month - 1, dayOfMonth), makeTime(hour, minute, second, ms));
         // A date alone is UTC; a date and a time with no zone are local.
@@ -520,7 +526,8 @@ struct DateParser
             hour += 12;
         if (am && hour == 12)
             hour = 0;
-        if (month < 0 || month > 11 || dayOfMonth < 1 || dayOfMonth > 31 || hour > 24 || minute > 59 || second > 59)
+        if (month < 0 || month > 11 || dayOfMonth < 1 || dayOfMonth > daysInMonth(year, month) || hour > 24 || minute > 59 ||
+            second > 59)
             return kNaN;
         const double tv = makeDate(makeDay(year, month, dayOfMonth), makeTime(hour, minute, second, ms));
         return timeClip(hasZone ? tv - offset : utcOf(tv));

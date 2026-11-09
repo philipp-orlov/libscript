@@ -1814,3 +1814,24 @@ TEST(classFieldsGoOnEveryShapeTheyMeet)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("13504500 3000 tag,n TypeError"));
     }
 }
+
+TEST(nativeCodeDoesBigIntArithmetic)
+{
+    // A function with bigint constants is compiled, and its operators go through the interpreter's own arithmetic; mixing
+    // a bigint with a number, or `>>>` on one, is still a TypeError.
+    const char* program =
+        "function f(n) { let a = 1n, b = 0n; for (let i = 0; i < n; i++) { const t = a; a = a + b; b = t; a = a * 3n - 2n;"
+        "  a = a % 1000000007n; b = -b; b = ~b; b++; } return [a, b, a === 1n, a < 5n, typeof a, 7n ** 3n, 100n >> 2n, 5n & 3n].join(); }"
+        "function g(x) { return x - 1; }"
+        "function h(x) { return x >>> 1n; }"
+        "let r, s = 0, e1 = '', e2 = ''; for (let k = 0; k < 300; k++) { r = f(50); s += g(k); }"
+        "try { g(10n); } catch (e) { e1 = e.name; } try { h(4n); } catch (e) { e2 = e.name; }"
+        "[r, s, e1, e2].join(' ')";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("392460006,800087529,false,false,bigint,343,25,1 44550 TypeError TypeError"));
+    }
+}

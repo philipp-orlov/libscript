@@ -216,6 +216,11 @@ NativePair scriptDynAdd(Runtime* rt, std::int64_t ta, std::uint64_t a, std::int6
     });
 }
 
+NativePair scriptDynArith(Runtime* rt, std::int64_t op, std::int64_t ta, std::uint64_t a, std::int64_t tb, std::uint64_t b) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(arithmeticOf(*rt, Op(op), valueOf(ta, a), valueOf(tb, b))); });
+}
+
 std::int32_t scriptDynCompare(Runtime* rt, std::int64_t op, std::int64_t ta, std::uint64_t a, std::int64_t tb,
                               std::uint64_t b) noexcept
 {

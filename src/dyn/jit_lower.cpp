@@ -1914,6 +1914,50 @@ private:
         }
     }
 
+    /// A numeric operator where a bigint is known to come, or has come before and bailed: all of it by `arithmeticOf`,
+    /// which does what the interpreter does. True when it was lowered so.
+    bool arithmeticByHelper(Op op)
+    {
+        bool unary = false;
+        switch (op) {
+            case Op::Neg:
+            case Op::BitNot:
+            case Op::Inc:
+            case Op::Dec:
+            case Op::ToNumber: unary = true; break;
+            case Op::Sub:
+            case Op::Mul:
+            case Op::Div:
+            case Op::Mod:
+            case Op::BitAnd:
+            case Op::BitOr:
+            case Op::BitXor:
+            case Op::Shl:
+            case Op::Shr:
+            case Op::UShr:
+            case Op::Pow: break;
+            default: return false;
+        }
+        const std::size_t n = unary ? 1 : 2;
+        if (stack_.size() < n)
+            return false;
+        bool big = std::find(code_.jitBailedAt.begin(), code_.jitBailedAt.end(), pc_) != code_.jitBailedAt.end();
+        for (std::size_t i = 0; i < n && !big; ++i)
+            big = (top(i).hasKnownTag || top(i).isConst) && top(i).known == Type::BigInt;
+        if (!big)
+            return false;
+        Entry b = unary ? constTagged(Type::Undefined) : pop();
+        Entry a = pop();
+        const std::int32_t r = fn_.newVreg(false);
+        const std::int32_t t = fn_.newVreg(false);
+        coldCall(reinterpret_cast<void*>(&scriptDynArith), {rtReg(), immReg(std::int64_t(op)), tagReg(a), payloadReg(a), tagReg(b), payloadReg(b)},
+                 r, t, true, {a, b});
+        release(b);
+        release(a);
+        push(taggedEntry(r, t, Own::Owned));
+        return true;
+    }
+
     /// Without that guess the conversions below make a number of whatever comes, and a bigint, or an object that may turn
     /// into one, is not a number: the interpreter takes those.
     void leaveOnBigInt(Op op)
@@ -2178,6 +2222,11 @@ private:
                 }
             }
             fallsIn = true;
+            if (arithmeticByHelper(op)) {
+                previousOp_ = op;
+                pc = next;
+                continue;
+            }
             if (betHere())
                 expectNumbers(op);
             else
@@ -2669,7 +2718,15 @@ private:
                     push(constDouble(detail::Access::r8(k)));
                 } else if (k.isString()) {
                     push(constTagged(Type::String, reinterpret_cast<std::uint64_t>(detail::Access::ptr(k))));
-                } else if (detail::Access::ptr(k) && k.type() >= Type::String && k.type() != Type::BigInt) {
+                } else if (k.type() == Type::BigInt) {
+                    // In registers, as a value read from somewhere: arithmetic takes a constant to be a number. The code's
+                    // constants keep it alive.
+                    Entry e = taggedEntry(ptrReg(detail::Access::ptr(k)), immReg(std::int64_t(Type::BigInt)), Own::Immortal);
+                    e.hasKnownTag = true;
+                    e.known = Type::BigInt;
+                    e.nonNull = true;
+                    push(e);
+                } else if (detail::Access::ptr(k) && k.type() >= Type::String) {
                     // Another cell the code's constants keep alive for as long as the code lives. Not a bigint: arithmetic
                     // here takes a constant to be a number.
                     push(constTagged(k.type(), reinterpret_cast<std::uint64_t>(detail::Access::ptr(k))));

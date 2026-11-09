@@ -213,6 +213,9 @@ void objectSpread(Runtime& rt, DynObject* target, const Value& src);
 DynArray* newArgumentsObject(Runtime& rt, const Value* args, std::size_t count);
 bool instanceOf(Runtime& rt, const Value& obj, const Value& ctor);
 Value add(Runtime& rt, const Value& a, const Value& b);
+/// One of the numeric operators, as the interpreter does it, for numbers and bigints alike: `Sub` to `Pow`, the bitwise
+/// ones and shifts, and the unary `Neg`, `BitNot`, `Inc`, `Dec` and `ToNumber`, which ignore `b`.
+Value arithmeticOf(Runtime& rt, Op op, const Value& a, const Value& b);
 /// `x + y` for a result that goes straight back where `x` came from, which with `x` holds `counts` counts: the string
 /// grows in place when nothing else can see it.
 Value appendForLocal(Runtime& rt, const Value& x, const Value& y, std::uint32_t counts);

@@ -196,6 +196,71 @@ Value toNumeric(Runtime& rt, const Value& v)
     return Value(toNumber(rt, primitive));
 }
 
+Value arithmeticOf(Runtime& rt, Op op, const Value& a, const Value& b)
+{
+    switch (op) {
+        case Op::Neg:
+        case Op::BitNot:
+        case Op::Inc:
+        case Op::Dec:
+        case Op::ToNumber: {
+            const Value x = toNumeric(rt, a);
+            if (x.isBigInt()) {
+                const BigIntCell* cell = bigint::cellOf(x);
+                switch (op) {
+                    case Op::Neg: return bigint::negate(rt, cell);
+                    case Op::BitNot: return bigint::bitNot(rt, cell);
+                    case Op::Inc: return bigint::increment(rt, cell, 1);
+                    case Op::Dec: return bigint::increment(rt, cell, -1);
+                    default: return x;
+                }
+            }
+            const double d = numberOf(x);
+            switch (op) {
+                case Op::Neg: return Value(-d);
+                case Op::BitNot: return Value(double(~toInt32(d)));
+                case Op::Inc: return Value(d + 1);
+                case Op::Dec: return Value(d - 1);
+                default: return Value(d);
+            }
+        }
+        default: break;
+    }
+    const Value x = toNumeric(rt, a);
+    const Value y = toNumeric(rt, b);
+    if (x.isBigInt() || y.isBigInt()) {
+        bigint::BinaryOp big = bigint::BinaryOp::Sub;
+        switch (op) {
+            case Op::Sub: big = bigint::BinaryOp::Sub; break;
+            case Op::Mul: big = bigint::BinaryOp::Mul; break;
+            case Op::Div: big = bigint::BinaryOp::Div; break;
+            case Op::Mod: big = bigint::BinaryOp::Mod; break;
+            case Op::Pow: big = bigint::BinaryOp::Pow; break;
+            case Op::BitAnd: big = bigint::BinaryOp::And; break;
+            case Op::BitOr: big = bigint::BinaryOp::Or; break;
+            case Op::BitXor: big = bigint::BinaryOp::Xor; break;
+            case Op::Shl: big = bigint::BinaryOp::Shl; break;
+            case Op::Shr: big = bigint::BinaryOp::Shr; break;
+            default: throwError(rt, ErrorCode::TypeError, "BigInts have no unsigned right shift");
+        }
+        return numericSlow(rt, big, x, y);
+    }
+    const double p = numberOf(x), q = numberOf(y);
+    switch (op) {
+        case Op::Sub: return Value(p - q);
+        case Op::Mul: return Value(p * q);
+        case Op::Div: return Value(p / q);
+        case Op::Mod: return Value(std::fmod(p, q));
+        case Op::Pow: return Value(numberPow(p, q));
+        case Op::BitAnd: return Value(double(toInt32(p) & toInt32(q)));
+        case Op::BitOr: return Value(double(toInt32(p) | toInt32(q)));
+        case Op::BitXor: return Value(double(toInt32(p) ^ toInt32(q)));
+        case Op::Shl: return Value(double(std::int32_t(toUint32(p) << (toUint32(q) & 31))));
+        case Op::Shr: return Value(double(toInt32(p) >> (toUint32(q) & 31)));
+        default: return Value(double(toUint32(p) >> (toUint32(q) & 31)));
+    }
+}
+
 bool toBoolean(const Value& v) noexcept
 {
     switch (v.type()) {

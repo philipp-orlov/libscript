@@ -635,8 +635,16 @@ void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v)
 
     if (key == rt.atom.prototype.get())
         ensurePrototype(rt, obj);
+    // An array's length and the elements it has are its own data properties, which nothing up the chain has a say in.
+    bool ownElement = false;
+    if (obj->cls == ObjClass::Array) {
+        std::uint32_t index = 0;
+        ownElement = key == rt.atom.length.get() ||
+                     (key->kind == CellKind::String && arrayIndexOf(static_cast<StringCell*>(key)->text(), index) &&
+                      index < static_cast<DynArray*>(obj)->size() && static_cast<DynArray*>(obj)->hasElement(index));
+    }
     // An accessor anywhere on the prototype chain wins over a plain own write.
-    for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
+    for (DynObject* cursor = ownElement ? nullptr : obj; cursor; cursor = cursor->proto.get()) {
         if (cursor->fnKindIsProxy()) {
             proxySet(rt, asProxy(cursor), key, v, base);
             return;

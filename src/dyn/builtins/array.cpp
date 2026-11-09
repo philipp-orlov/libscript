@@ -24,9 +24,7 @@ namespace {
 /// Element `i` of `a` as HasProperty and Get see it: its own, or for a hole, one up the prototype chain.
 bool presentElement(Runtime& rt, DynArray* a, std::size_t i, Value& out)
 {
-    if (i >= a->size())
-        return false;
-    if (a->hasElement(i)) {
+    if (i < a->size() && a->hasElement(i)) {
         out = a->at(i);
         return true;
     }
@@ -36,6 +34,32 @@ bool presentElement(Runtime& rt, DynArray* a, std::size_t i, Value& out)
         return false;
     out = getProperty(rt, self, key.get());
     return true;
+}
+
+/// Whether element `i` of `a` is `target` as === sees it: what is there compared in place, a hole looked up as
+/// HasProperty and Get would.
+bool strictElementIs(Runtime& rt, DynArray* a, std::size_t i, const Value& target)
+{
+    if (i >= a->size()) {
+        // Shortened while the search was set up: past its end is a hole too.
+        Value item;
+        return presentElement(rt, a, i, item) && strictEquals(item, target);
+    }
+    if (a->numbersOnly) {
+        std::uint64_t bits;
+        std::memcpy(&bits, a->numbers() + i, 8);
+        if (bits != kUndefinedElement)
+            return target.isNumber() && a->numbers()[i] == numberOf(target);
+    } else {
+        const Value& v = a->store[i];
+        if (!isHole(v)) {
+            if (v.type() == Type::Object || target.type() == Type::Object)
+                return v.type() == target.type() && detail::Access::ptr(v) == detail::Access::ptr(target);
+            return strictEquals(v, target);
+        }
+    }
+    Value item;
+    return presentElement(rt, a, i, item) && strictEquals(item, target);
 }
 
 DynArray* thisArray(CallInfo& ci)
@@ -533,22 +557,41 @@ void installArray(Runtime& rt)
     }, 0);
 
     arrayMethod("indexOf", false, [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
         const std::size_t n = a->size();
-        for (std::size_t i = 0; i < n; ++i) {
-            Value item;
-            if (presentElement(rtOf(ci), a, i, item) && strictEquals(item, ci.arg(0)))
+        if (n == 0)
+            return Value(-1.0);
+        std::size_t from = 0;
+        if (ci.size() > 1) {
+            const std::int64_t k = toIntegerOrInfinity(toNumber(rt2, ci.arg(1)));
+            if (k >= std::int64_t(n))
+                return Value(-1.0);
+            from = k >= 0 ? std::size_t(k) : std::size_t(std::max<std::int64_t>(std::int64_t(n) + k, 0));
+        }
+        const Value target = ci.arg(0);
+        for (std::size_t i = from; i < n; ++i) {
+            if (strictElementIs(rt2, a, i, target))
                 return Value(double(i));
         }
         return Value(-1.0);
     }, 1);
 
     arrayMethod("lastIndexOf", false, [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
-        for (std::size_t i = a->size(); i-- > 0;) {
-            Value item;
-            if (presentElement(rtOf(ci), a, i, item) && strictEquals(item, ci.arg(0)))
-                return Value(double(i));
+        const std::size_t n = a->size();
+        if (n == 0)
+            return Value(-1.0);
+        std::int64_t k = std::int64_t(n) - 1;
+        if (ci.size() > 1) {
+            const std::int64_t from = toIntegerOrInfinity(toNumber(rt2, ci.arg(1)));
+            k = from >= 0 ? std::min<std::int64_t>(from, std::int64_t(n) - 1) : std::int64_t(n) + from;
+        }
+        const Value target = ci.arg(0);
+        for (; k >= 0; --k) {
+            if (strictElementIs(rt2, a, std::size_t(k), target))
+                return Value(double(k));
         }
         return Value(-1.0);
     }, 1);

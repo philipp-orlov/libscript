@@ -4394,6 +4394,31 @@ Value execute(Runtime& rt, Frame& entry)
             LS_DISPATCH();
         }
 
+        // ------------------------------------------------------- iteration ---
+        L_IterNext: {
+            // iterator -> iterator value, or to the target when it is done.
+            LS_ROOM(1);
+            LS_SAVE();
+            Value item;
+            if (!iteratorStep(rt, top[-1], item)) {
+                ip = c + LS_OPERAND(1);
+                LS_DISPATCH();
+            }
+            new (top++) Value(std::move(item));
+            LS_NEXT(5);
+        }
+        L_Yield: {
+            // value -> sent: the coroutine's frame, always the one called from C++, is left until it is resumed.
+            if (frame != &entry || !frame->coroutine)
+                goto slow;
+            frame->coroutine->returnPc = LS_OPERAND(1);
+            ip += 5;
+            Value yielded = std::move(*--top);
+            LS_SAVE();
+            frame->left = Frame::Left::Yielded;
+            return yielded;
+        }
+
         // ------------------------------------------- pairs done in one go ---
         L_QGetLocal2:
             LS_ROOM(2);
@@ -4498,7 +4523,6 @@ Value execute(Runtime& rt, Frame& entry)
         L_ForInStart:
         L_ForInNext:
         L_IterStart:
-        L_IterNext:
         L_IterNextOpt:
         L_IterRest:
         L_IterClose:
@@ -4520,7 +4544,6 @@ Value execute(Runtime& rt, Frame& entry)
         L_CallStaticInit:
         L_SetHome:
         L_CoStart:
-        L_Yield:
         L_Await:
         L_DelegateStart:
         L_DelegateCall:

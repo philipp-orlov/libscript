@@ -3,9 +3,11 @@
 
 // Tokenizer.
 
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 
 #include "base/ascii.hpp"
@@ -148,18 +150,30 @@ const char* tokenName(Tok t) noexcept
 
 Tok keywordOf(StringView word) noexcept
 {
-    if (word.empty() || word.size() > 10)
+    // Every keyword is two to ten lower-case letters: most names are turned away by their first letter or length,
+    // and the rest are looked for among the few keywords of that length.
+    constexpr std::size_t kLongest = 10;
+    const std::size_t n = word.size();
+    if (n < 2 || n > kLongest)
         return Tok::Identifier;
-    std::string narrow;
-    narrow.reserve(word.size());
-    for (Char c : word) {
-        if (c > 0x7f)
+    char narrow[kLongest];
+    for (std::size_t i = 0; i < n; ++i) {
+        const Char c = word[i];
+        if (c < u'a' || c > u'z')
             return Tok::Identifier;
-        narrow.push_back(char(c));
+        narrow[i] = char(c);
     }
-    const auto& table = keywordTable();
-    auto it = table.find(narrow);
-    return it == table.end() ? Tok::Identifier : it->second;
+    static const auto byLength = [] {
+        std::array<std::vector<std::pair<std::string_view, Tok>>, kLongest + 1> buckets;
+        for (const auto& [text, tok] : keywordTable())
+            buckets[text.size()].emplace_back(text, tok);
+        return buckets;
+    }();
+    for (const auto& [text, tok] : byLength[n]) {
+        if (text[0] == narrow[0] && std::memcmp(text.data(), narrow, n) == 0)
+            return tok;
+    }
+    return Tok::Identifier;
 }
 
 Lexer::Lexer(std::string_view source, std::string name) : src_(source), name_(std::move(name)) {}

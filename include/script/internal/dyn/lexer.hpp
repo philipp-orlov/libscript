@@ -187,6 +187,13 @@ public:
     /// `slash` was the last token read: back up and read it again as a regular expression literal.
     Token rescanAsRegex(const Token& slash);
 
+    /// Go on reading at byte `pos`, which is on line `line`: where a function's text starts, to read it again.
+    void seek(std::size_t pos, std::uint32_t line) noexcept
+    {
+        pos_ = pos;
+        line_ = line;
+    }
+
     [[noreturn]] void fail(const std::string& message) const;
     [[noreturn]] static void fail(const std::string& sourceName, std::uint32_t line,
                                   const std::string& message);

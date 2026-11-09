@@ -349,11 +349,9 @@ bool Parser::startsDeclaration(Tok keyword) const
 String Parser::propertyName()
 {
     if (cur_.type == Tok::StringLit || cur_.type == Tok::Number || !cur_.text.empty()) {
-        String name = cur_.text;
-        if (cur_.type == Tok::Number)
-            name = numberToString(cur_.number);
-        else if (cur_.type == Tok::BigIntLit)
-            name = bigint::literalToDecimal(cur_.text);
+        String name = cur_.type == Tok::Number      ? numberToString(cur_.number)
+                      : cur_.type == Tok::BigIntLit ? bigint::literalToDecimal(cur_.text)
+                                                    : std::move(cur_.text);
         advance();
         return name;
     }
@@ -377,6 +375,14 @@ NodePtr Parser::parseProgram()
     while (!at(Tok::Eof))
         program->list.push_back(statement());
     return program;
+}
+
+NodePtr Parser::parseFunctionAt(std::uint32_t start, std::uint32_t line, bool isDeclaration)
+{
+    lexer_.seek(start, line);
+    prevEnd_ = start;
+    cur_ = lexer_.next(false);
+    return functionExpression(isDeclaration);
 }
 
 NodePtr Parser::statement()
@@ -439,7 +445,7 @@ NodePtr Parser::statement()
             advance();
             NodePtr n = makeNode(isBreak ? NK::BreakStmt : NK::ContinueStmt, line);
             if (identifierLike(cur_.type) && !cur_.newlineBefore) {
-                n->text = cur_.text;
+                n->text = std::move(cur_.text);
                 advance();
             }
             semicolon();
@@ -486,7 +492,7 @@ NodePtr Parser::statement()
         if (after.type == Tok::Colon) {
             checkReference();
             NodePtr n = makeNode(NK::Labeled, line);
-            n->text = cur_.text;
+            n->text = std::move(cur_.text);
             advance();
             advance();
             n->d = bodyStatement(true);
@@ -780,7 +786,7 @@ NodePtr Parser::typeAliasDeclaration()
 {
     NodePtr n = makeNode(NK::TypeAlias, cur_.line);
     advance();  // `type`
-    n->text = cur_.text;
+    n->text = std::move(cur_.text);
     advance();
     if (at(Tok::Lt))
         n->typeParams = typeParameterList();
@@ -794,7 +800,7 @@ NodePtr Parser::interfaceDeclaration()
 {
     NodePtr n = makeNode(NK::InterfaceDecl, cur_.line);
     advance();  // `interface`
-    n->text = cur_.text;
+    n->text = std::move(cur_.text);
     advance();
     if (at(Tok::Lt))
         n->typeParams = typeParameterList();
@@ -818,7 +824,7 @@ NodePtr Parser::enumDeclaration(bool isConst)
     expect(Tok::Enum, "'enum'");
     if (!identifierLike(cur_.type))
         fail("an enum declaration needs a name");
-    n->text = cur_.text;
+    n->text = std::move(cur_.text);
     advance();
     expect(Tok::LBrace, "'{'");
     while (!at(Tok::RBrace)) {
@@ -843,7 +849,7 @@ NodePtr Parser::namespaceDeclaration()
     outer->declared = ambient_;
     if (!identifierLike(cur_.type))
         fail("a namespace declaration needs a name");
-    outer->text = cur_.text;
+    outer->text = std::move(cur_.text);
     advance();
 
     // `namespace a.b {}` is shorthand for a namespace inside a namespace, and
@@ -891,7 +897,7 @@ NodePtr Parser::typeAnnotation()
         Lexer probe = lexer_;
         if (probe.next(false).type == Tok::Is) {
             NodePtr n = makeNode(NK::TypePredicate, cur_.line);
-            n->text = cur_.text;
+            n->text = std::move(cur_.text);
             advance();
             advance();
             n->type = typeExpr();
@@ -977,7 +983,7 @@ NodePtr Parser::primaryType()
             NodePtr n = makeNode(NK::TypeQuery, line);
             if (!identifierLike(cur_.type))
                 fail("expected a name after 'typeof'");
-            n->text = cur_.text;
+            n->text = std::move(cur_.text);
             advance();
             while (eat(Tok::Dot)) {
                 n->text += u'.';
@@ -1002,7 +1008,7 @@ NodePtr Parser::primaryType()
         case Tok::StringLit: {
             NodePtr n = makeNode(NK::LiteralType, line);
             n->op = Tok::StringLit;
-            n->text = cur_.text;
+            n->text = std::move(cur_.text);
             advance();
             return n;
         }
@@ -1056,7 +1062,7 @@ NodePtr Parser::primaryType()
         fail(std::string("expected a type but found ") + tokenName(cur_.type));
 
     NodePtr n = makeNode(NK::TypeRef, line);
-    n->text = cur_.text;
+    n->text = std::move(cur_.text);
     advance();
     while (at(Tok::Dot)) {
         advance();
@@ -1240,7 +1246,7 @@ std::vector<NodePtr> Parser::typeParameterList()
         NodePtr p = makeNode(NK::TypeParam, cur_.line);
         if (!identifierLike(cur_.type))
             fail("expected a type parameter name");
-        p->text = cur_.text;
+        p->text = std::move(cur_.text);
         advance();
         if (eat(Tok::Extends))
             p->a = typeExpr();
@@ -1315,7 +1321,7 @@ NodePtr Parser::bindingTarget()
     if (!identifierLike(cur_.type))
         fail(std::string("expected a binding name but found ") + tokenName(cur_.type));
     NodePtr n = makeNode(NK::Identifier, cur_.line);
-    n->text = cur_.text;
+    n->text = std::move(cur_.text);
     advance();
     return n;
 }
@@ -1520,7 +1526,7 @@ NodePtr Parser::assignment()
             params = parameterList();
         } else {
             NodePtr param = makeNode(NK::Identifier, cur_.line);
-            param->text = cur_.text;
+            param->text = std::move(cur_.text);
             advance();
             params.push_back(std::move(param));
         }
@@ -1978,7 +1984,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
     n->isAbstract = isAbstract;
     expect(Tok::Class, "'class'");
     if (identifierLike(cur_.type)) {
-        n->text = cur_.text;
+        n->text = std::move(cur_.text);
         advance();
     } else if (isDeclaration) {
         fail("a class declaration needs a name");
@@ -2314,7 +2320,7 @@ NodePtr Parser::primary()
         }
         case Tok::BigIntLit: {
             NodePtr n = makeNode(NK::BigIntLit, line);
-            n->text = cur_.text;
+            n->text = std::move(cur_.text);
             advance();
             return n;
         }
@@ -2392,7 +2398,7 @@ NodePtr Parser::primary()
     if (identifierLike(cur_.type)) {
         checkReference();
         NodePtr n = makeNode(NK::Identifier, line);
-        n->text = cur_.text;
+        n->text = std::move(cur_.text);
         advance();
         return n;
     }

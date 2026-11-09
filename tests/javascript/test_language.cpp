@@ -1790,3 +1790,27 @@ TEST(aBigProgramCompilesAFunctionWhenItIsFirstCalled)
     CHECK_EQ(ctx.eval("var seen = []; for (var t = 0; t < 2; t++) { try { broken(); } catch (e) { seen.push(e.name); } } seen.join()", "<test>").toString(),
              std::string("SyntaxError,SyntaxError"));
 }
+
+TEST(classFieldsGoOnEveryShapeTheyMeet)
+{
+    // A base class's fields go on objects of each class derived from it, so their sites see several shapes; `new` of a
+    // class with fields is made in place, its fields first. A class called without `new` still throws.
+    const char* program =
+        "class Vec { #x = 0; #y = 0; z = 1; constructor(x, y) { this.#x = x; this.#y = y; } get x() { return this.#x; }"
+        "  add(v) { return new Vec(this.#x + v.#x, this.#y + v.#y); } }"
+        "class Base { #pos = null; tag = 'b'; constructor(p) { this.#pos = p; } get pos() { return this.#pos; } }"
+        "class A extends Base { #r = 0; constructor(p, r) { super(p); this.#r = r; } get r() { return this.#r; } }"
+        "class B extends Base { n = null; constructor(p, n) { super(p); this.n = n; } }"
+        "function bare() { try { return Vec(1, 2); } catch (e) { return e.name; } }"
+        "let s = 0, v = new Vec(0, 0), last = '';"
+        "for (let i = 0; i < 3000; i++) { v = v.add(new Vec(1, 2)); const a = new A(v, i); const b = new B(a, i);"
+        "  s += a.r + b.pos.pos.x + b.n + v.z + (b.tag === 'b' ? 1 : 0); last = bare(); }"
+        "[s, v.x, Object.keys(new B(1, 2)).join(), last].join(' ')";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("13504500 3000 tag,n TypeError"));
+    }
+}

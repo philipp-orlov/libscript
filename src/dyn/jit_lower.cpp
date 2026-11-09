@@ -213,6 +213,7 @@ int operandsOf(Op op) noexcept
         case Op::IterCloseAt:
         case Op::NewPrivateName:
         case Op::DefPrivateAccessor:
+        case Op::DefPrivate:
         case Op::DefAccessorElem:
         case Op::CallSuperVia:
         case Op::Yield:
@@ -781,10 +782,12 @@ public:
     }
 
     /// Small enough, simple enough, and loop-free: what a call may do in place of calling.
-    static bool inlinable(const FunctionCode& c)
+    /// `asConstructor`: for `new`, where a class's own constructor qualifies too (not a derived one, which has no
+    /// object until `super()`).
+    static bool inlinable(const FunctionCode& c, bool asConstructor = false)
     {
         if (c.code.size() > 160 || !c.handlers.empty() || c.hasRest || c.argumentsSlot != FunctionCode::kNoSlot ||
-            c.isClassConstructor || c.isDerivedConstructor || c.numLocals > 8 || !c.boxedParams.empty())
+            (c.isClassConstructor && !asConstructor) || c.isDerivedConstructor || c.numLocals > 8 || !c.boxedParams.empty())
             return false;
         bool returns = false;
         for (std::uint32_t pc = 0; pc < c.code.size();) {
@@ -2898,13 +2901,27 @@ private:
                 Entry& object = stack_.back();
                 secureWeak();
                 object.fresh = nullptr;
+                // A field the interpreter has seen go on: the shape it went on, which lacks it, and the one adding this
+                // name leads to.
+                const PropertySite* site = op == Op::DefPrivate ? siteAt(operand() << kSiteShift) : nullptr;
+                if (site && site->addTo && object.rep == Rep::Tagged && !object.isConst) {
+                    const std::int32_t nameReg = payloadReg(name);
+                    defineKnown(object, site, nameReg, value, [&](std::int32_t vt, std::int32_t vr) {
+                        coldCall(reinterpret_cast<void*>(&scriptDynDefPrivate),
+                                 {rtReg(), payloadReg(object), nameReg, vt, vr, immReg(0), ptrReg(siteToTeach(operand() << kSiteShift))}, -1, -1,
+                                 true, {name, value});
+                    });
+                    release(name);
+                    return true;
+                }
                 const std::int32_t rt = rtReg();
                 const std::int32_t objectReg = payloadReg(object);
                 const std::int32_t nameReg = payloadReg(name);
                 const std::int32_t tag = tagReg(value);
                 const std::int32_t payload = payloadReg(value);
                 const std::int32_t method = immReg(op == Op::DefPrivateMethod ? 1 : 0);
-                coldCall(reinterpret_cast<void*>(&scriptDynDefPrivate), {rt, objectReg, nameReg, tag, payload, method}, -1, -1, true,
+                const std::int32_t teach = ptrReg(op == Op::DefPrivate ? siteToTeach(operand() << kSiteShift) : nullptr);
+                coldCall(reinterpret_cast<void*>(&scriptDynDefPrivate), {rt, objectReg, nameReg, tag, payload, method, teach}, -1, -1, true,
                          {name, value});
                 release(value);
                 release(name);
@@ -2913,7 +2930,7 @@ private:
             case Op::DefField: {
                 Entry value = pop();
                 Entry& object = stack_.back();
-                GCObject* key = code_.atoms[operand()].get();
+                GCObject* key = code_.atoms[operand() & kAtomMask].get();
                 secureWeak();
                 if (object.fresh && key != rt_.atom.protoName.get() && object.fresh->count < object.freshRoom &&
                     !object.fresh->has(key)) {
@@ -2934,11 +2951,21 @@ private:
                     }
                 }
                 object.fresh = nullptr;
+                // A field of `this` the interpreter has seen go on: the same shape before, the same one after.
+                const PropertySite* site = siteAt(operand());
+                if (site && site->addTo && object.rep == Rep::Tagged && !object.isConst) {
+                    defineKnown(object, site, -1, value, [&](std::int32_t vt, std::int32_t vr) {
+                        coldCall(reinterpret_cast<void*>(&scriptDynDefField),
+                                 {rtReg(), object.r, ptrReg(key), vt, vr, ptrReg(siteToTeach(operand()))}, -1, -1, true, {value});
+                    });
+                    return true;
+                }
                 const std::int32_t rt = rtReg();
                 const std::int32_t k = ptrReg(key);
                 const std::int32_t tag = tagReg(value);
                 const std::int32_t payload = payloadReg(value);
-                coldCall(reinterpret_cast<void*>(&scriptDynDefField), {rt, object.r, k, tag, payload}, -1, -1, true, {value});
+                const std::int32_t teach = ptrReg(siteToTeach(operand()));
+                coldCall(reinterpret_cast<void*>(&scriptDynDefField), {rt, object.r, k, tag, payload, teach}, -1, -1, true, {value});
                 release(value);
                 return true;
             }
@@ -3993,7 +4020,7 @@ private:
         if (target->cls != ObjClass::Function)
             return;
         const auto* fn = static_cast<const DynFunction*>(target);
-        if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isClassConstructor)
+        if (fn->fnKind != FnKind::Bytecode || !fn->code)
             return;
         const std::int32_t bail = newLabel();
         if (!e.hasKnownTag)
@@ -4131,6 +4158,15 @@ private:
         test.cond = IrCond::Ne;
         test.width = 64;
         test.target = slow;
+    }
+
+    /// The site of an operand for a helper to learn into, whatever it knows so far; null when there is none yet.
+    PropertySite* siteToTeach(std::uint32_t operand) const noexcept
+    {
+        const std::uint32_t index = operand >> kSiteShift;
+        if (index == kNoSite || index >= code_.sites.size())
+            return nullptr;
+        return &code_.sites[index];
     }
 
     const PropertySite* siteAt(std::uint32_t operand) const noexcept
@@ -4424,6 +4460,74 @@ private:
         push(result);
         release(base);
         return true;
+    }
+
+    /// A definition of a property `object` lacks, where the site has seen which shapes it goes on and which each leads
+    /// to: in place for those, and by `slowCall` for anything else, which teaches the site. A definition calls no
+    /// setter, so nothing on the prototype chain matters. `nameReg`, when not negative, is a private name the shape
+    /// reached must have added. Afterwards the object's shape is not known.
+    template <class SlowCall>
+    void defineKnown(const Entry& object, const PropertySite* site, std::int32_t nameReg, Entry& value, SlowCall slowCall)
+    {
+        makeOwned(value);
+        const std::int32_t vt = tagReg(value);
+        const std::int32_t vr = payloadReg(value);
+        const std::int32_t slow = newLabel();
+        const std::int32_t done = newLabel();
+        std::vector<std::pair<const Shape*, const Shape*>> known;
+        const auto want = [&](const Shape* from, const Shape* to) {
+            if (from && to && to->count <= DynObject::kIndexThreshold)
+                known.push_back({from, to});
+        };
+        want(site->shape, site->addTo);
+        for (std::uint8_t i = 0; i < site->moreCount; ++i)
+            want(site->moreShape[i], site->moreAddTo[i]);
+        const std::int32_t have = shapeOf(object, slow);
+        std::vector<std::int32_t> labels;
+        for (const auto& [from, to] : known) {
+            labels.push_back(newLabel());
+            // The operand first: making it adds an instruction, which may move the one being filled in.
+            const std::int32_t wantShape = ptrReg(from);
+            IrInst& test = inst(IrOp::BrCmp);
+            test.a = have;
+            test.b = wantShape;
+            test.cond = IrCond::Eq;
+            test.width = 64;
+            test.target = labels.back();
+        }
+        inst(IrOp::Br).imm = slow;
+        for (std::size_t i = 0; i < known.size(); ++i) {
+            inst(IrOp::Label).imm = labels[i];
+            if (nameReg >= 0) {
+                const std::int32_t wantKey = ptrReg(known[i].second->key.get());
+                IrInst& test = inst(IrOp::BrCmp);
+                test.a = nameReg;
+                test.b = wantKey;
+                test.cond = IrCond::Ne;
+                test.width = 64;
+                test.target = slow;
+            }
+            appendInPlace(object, known[i].second, vt, vr, slow);
+            inst(IrOp::Br).imm = done;
+        }
+        inst(IrOp::ColdBegin);
+        inst(IrOp::Label).imm = slow;
+        slowCall(vt, vr);
+        // The helper took its own count, so the one made above goes.
+        if (value.own == Own::Owned && !value.isConst && !(value.hasKnownTag && value.known < Type::String))
+            decRefOf(vr, value.hasKnownTag ? -1 : vt, false);
+        inst(IrOp::Br).imm = done;
+        inst(IrOp::ColdEnd);
+        inst(IrOp::Label).imm = done;
+        forgetShape(object.r);
+        for (std::size_t i = shapeFacts_.size(); i-- > 0;) {
+            for (const auto& [from, to] : known) {
+                if (i < shapeFacts_.size() && shapeFacts_[i].shape == from) {
+                    shapeFacts_[i] = shapeFacts_.back();
+                    shapeFacts_.pop_back();
+                }
+            }
+        }
     }
 
     /// A store that adds the property, in place while the table has room and no index: what `appendKnown` does. The
@@ -5364,7 +5468,8 @@ private:
         const std::int32_t fnTag = tagReg(callee);
         const std::int32_t fnPayload = payloadReg(callee);
         const std::int32_t count = immReg(std::int64_t(argc));
-        invoke(fnTag, fnPayload, selfTag, selfPayload, area, count, r, t, held, known);
+        // A class constructor, pinned for `new`, is no function to call: the long way says so.
+        invoke(fnTag, fnPayload, selfTag, selfPayload, area, count, r, t, held, known && !known->isClassConstructor ? known : nullptr);
         if (lazy) {
             release(made);
             args.back() = constTagged(Type::Undefined);
@@ -6662,7 +6767,11 @@ private:
         if (!callee.pinned || depth_ >= 2)
             return false;
         auto* fn = const_cast<DynFunction*>(static_cast<const DynFunction*>(callee.hint));
-        if (fn->isArrow || !fn->shape || fn->code->isDerivedConstructor || !inlinable(*fn->code))
+        if (fn->isArrow || !fn->shape || fn->code->isDerivedConstructor || fn->isDerivedConstructor || !inlinable(*fn->code, true))
+            return false;
+        // A class's fields go on first, by a function of their own: that too goes in place, or nothing does.
+        DynFunction* init = fn->fieldInit.get();
+        if (init && (init->fnKind != FnKind::Bytecode || !init->code || init->code->lazy || !inlinable(*init->code)))
             return false;
         std::uint32_t copies = 0;
         for (const Lowering* up = this; up; up = up->parent_) {
@@ -6685,6 +6794,17 @@ private:
         const std::int32_t done = newLabel();
         const std::int32_t finished = newLabel();
         guardShape(callee, fn->shape, slow);
+        if (init) {
+            // The fields are this function's: no other with the same shape and prototype will do.
+            const std::int32_t want = ptrReg(fn);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = callee.r;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = slow;
+            keepAlive(fn);
+        }
         const std::int32_t props = loadHeader(callee.r, kPropsOffset);
         const std::int32_t protoTag = load(props, at + kPropValueOffset, 1, false, kAliasValue);
         branchCmp(protoTag, IrCond::Ne, std::int64_t(Type::Object), slow);
@@ -6711,9 +6831,24 @@ private:
         std::vector<Entry> heldWithSelf = held;
         heldWithSelf.push_back(objectEntry(self));
         try {
+            if (init) {
+                const std::vector<std::uint8_t> noneInit(init->code->numLocals + 1, 1);
+                const std::int32_t fieldsDone = newLabel();
+                const std::int32_t ir = fn_.newVreg(false);
+                const std::int32_t it = fn_.newVreg(false);
+                Lowering fields(*this, *init->code, noneInit, heldWithSelf, siteHere);
+                fields.startShape_ = root;
+                fields.freshThis_ = true;
+                fields.freshRoom_ = room;
+                fields.runInline(ptrReg(init), objectEntry(self), {}, ir, it, fieldsDone);
+                inst(IrOp::Label).imm = fieldsDone;
+                forgetFacts();
+                release(taggedEntry(ir, it, Own::Owned));
+            }
             Lowering inner(*this, *fn->code, none, heldWithSelf, siteHere);
-            inner.startShape_ = root;
-            inner.freshThis_ = true;
+            // After the fields, the object's shape is whatever they made it.
+            inner.startShape_ = init ? nullptr : root;
+            inner.freshThis_ = !init;
             inner.freshRoom_ = room;
             inner.runInline(callee.r, objectEntry(self), args, r, t, finished);
         } catch (const Refuse&) {

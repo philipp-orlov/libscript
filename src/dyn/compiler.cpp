@@ -2316,7 +2316,7 @@ private:
                 case PropKind::Getter: emitU(Op::DefGetter, atomFor(p->text)); break;
                 case PropKind::Setter: emitU(Op::DefSetter, atomFor(p->text)); break;
                 case PropKind::Method: emitU(Op::DefMethod, atomFor(p->text)); break;
-                default: emitU(Op::DefField, atomFor(p->text)); break;
+                default: emitU(Op::DefField, siteOperand(p->text)); break;
             }
         }
     }
@@ -2860,14 +2860,15 @@ private:
         if (n.isPrivate) {
             loadVar(n.text);
             value(n.text);
-            emit(Op::DefPrivate);
+            std::uint32_t& count = fn_->code->siteCount;
+            emitU(Op::DefPrivate, count < kNoSite ? count++ : kNoSite);
         } else if (n.computed) {
             loadVar(n.a->text);
             value(ascii(""));
             emit(Op::DefElem);
         } else {
             value(n.text);
-            emitU(Op::DefField, atomFor(n.text));
+            emitU(Op::DefField, siteOperand(n.text));
         }
         emit(Op::Pop);
     }

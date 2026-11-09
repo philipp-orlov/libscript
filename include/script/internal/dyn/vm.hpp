@@ -187,6 +187,10 @@ inline void ensurePrototype(Runtime& rt, DynObject* o)
 Value getProperty(Runtime& rt, const Value& base, GCObject* key);
 Value getPropertyOfObject(Runtime& rt, DynObject* obj, GCObject* key, const Value& receiver);
 void setProperty(Runtime& rt, const Value& base, GCObject* key, const Value& v);
+/// A field or literal property defined, and a private field: in place where `site` has seen the object's shape, and
+/// teaching it otherwise. `site` may be null.
+void defineFieldAt(Runtime& rt, PropertySite* site, DynObject* obj, GCObject* key, Value v);
+void definePrivateAt(Runtime& rt, PropertySite* site, DynObject* obj, GCObject* key, Value v);
 bool hasProperty(Runtime& rt, const Value& base, GCObject* key);
 bool deleteProperty(Runtime& rt, const Value& base, GCObject* key);
 /// Own enumerable string keys, integer-like keys first, in insertion order.

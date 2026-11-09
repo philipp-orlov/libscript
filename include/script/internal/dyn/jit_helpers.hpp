@@ -89,7 +89,7 @@ GCObject* scriptDynNewThis(Runtime* rt, GCObject* fn) noexcept;
 GCObject* scriptDynNewArray(Runtime* rt, std::uint64_t reserve) noexcept;
 GCObject* scriptDynNewRegExp(Runtime* rt, GCObject* templateObject) noexcept;
 void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
-void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept;
+void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload, PropertySite* site) noexcept;
 NativePair scriptDynCatch(Runtime* rt) noexcept;
 void scriptDynIterCloseAt(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynIterCloseThrow(Runtime* rt, std::int64_t iterTag, std::uint64_t iter, std::int64_t thrownTag, std::uint64_t thrown) noexcept;
@@ -100,7 +100,8 @@ NativePair scriptDynCallSpread(Runtime* rt, std::int64_t calleeTag, std::uint64_
 NativePair scriptDynIterRest(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynArraySpread(Runtime* rt, GCObject* array, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynObjectSpread(Runtime* rt, GCObject* object, std::int64_t tag, std::uint64_t payload) noexcept;
-void scriptDynDefPrivate(Runtime* rt, GCObject* object, GCObject* name, std::int64_t tag, std::uint64_t payload, std::uint64_t method) noexcept;
+void scriptDynDefPrivate(Runtime* rt, GCObject* object, GCObject* name, std::int64_t tag, std::uint64_t payload, std::uint64_t method,
+                         PropertySite* site) noexcept;
 GCObject* scriptDynNewBox(Runtime* rt, std::int64_t tag, std::uint64_t payload) noexcept;
 void scriptDynStoreBox(GCObject* box, std::int64_t tag, std::uint64_t payload) noexcept;
 NativePair scriptDynClosure(Runtime* rt, const std::shared_ptr<FunctionCode>* code, DynFunction* parent,

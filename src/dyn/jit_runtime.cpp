@@ -529,10 +529,10 @@ void scriptDynArrayAppend(Runtime* rt, GCObject* array, std::int64_t tag, std::u
     });
 }
 
-void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept
+void scriptDynDefField(Runtime* rt, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload, PropertySite* site) noexcept
 {
     guarded(*rt, SCRIPT_HERE, [&]() -> int {
-        static_cast<DynObject*>(object)->putOwn(key, valueOf(tag, payload));
+        defineFieldAt(*rt, site, static_cast<DynObject*>(object), key, valueOf(tag, payload));
         return 0;
     });
 }
@@ -664,13 +664,18 @@ void scriptDynObjectSpread(Runtime* rt, GCObject* object, std::int64_t tag, std:
 }
 
 /// `#x = v` in a class body, or a private method: a member the object must not have yet.
-void scriptDynDefPrivate(Runtime* rt, GCObject* object, GCObject* name, std::int64_t tag, std::uint64_t payload, std::uint64_t method) noexcept
+void scriptDynDefPrivate(Runtime* rt, GCObject* object, GCObject* name, std::int64_t tag, std::uint64_t payload, std::uint64_t method,
+                         PropertySite* site) noexcept
 {
     guarded(*rt, SCRIPT_HERE, [&]() -> int {
         auto* o = static_cast<DynObject*>(object);
+        if (!method) {
+            definePrivateAt(*rt, site, o, name, valueOf(tag, payload));
+            return 0;
+        }
         if (o->findOwn(name))
             throwError(*rt, ErrorCode::TypeError, "this object has that private member already");
-        o->putOwn(name, valueOf(tag, payload), method ? std::uint8_t(0) : std::uint8_t(PropWritable));
+        o->putOwn(name, valueOf(tag, payload), std::uint8_t(0));
         return 0;
     });
 }

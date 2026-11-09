@@ -66,7 +66,7 @@ enum class Op : std::uint8_t
     GetElemDup,
     DeleteProp,  // atom
     DeleteElem,
-    DefField,   // atom  (obj value -> obj)
+    DefField,   // atom | site  (obj value -> obj)
     DefGetter,  // atom
     DefSetter,  // atom
     DefElem,    // (obj key value -> obj)
@@ -130,7 +130,7 @@ enum class Op : std::uint8_t
     // ---- classes ----
     NewPrivateName,      // atom: -> a private name, new each time the class is evaluated
     PrivateIn,           // object name -> boolean
-    DefPrivate,          // object name value -> object
+    DefPrivate,          // site: object name value -> object
     DefPrivateMethod,    // object name function -> object
     DefPrivateAccessor,  // setter?: object name function -> object
     DefAccessorElem,     // flags (1 setter, 2 not enumerable): object key function -> object
@@ -345,6 +345,14 @@ struct PropertySite
         moreIndex[moreCount] = at;
         moreAddTo[moreCount] = to;
         ++moreCount;
+    }
+    /// For a site that defines a property: the shape a definition on an object of shape `s` leads to, or null.
+    Shape* definesFrom(const Shape* s) const noexcept
+    {
+        if (s == shape)
+            return addTo;
+        const int i = moreFind(s);
+        return i >= 0 ? moreAddTo[i] : nullptr;
     }
     /// Learn one more shape, while there is room.
     void addShape(Shape* s, std::uint32_t at, DynObject* where = nullptr) noexcept

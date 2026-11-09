@@ -849,6 +849,59 @@ inline void setPropertySite(Runtime& rt, const FunctionCode& code, const Value& 
 
 }  // namespace
 
+/// A definition that went on the end of an object of shape `before`, leading to `after`: the first the site has seen, or
+/// one more while it has room. A base class's fields go on objects of each class derived from it.
+static void learnDefinition(Runtime& rt, PropertySite& site, Shape* before, std::uint32_t index, Shape* after)
+{
+    if (site.shape) {
+        if (site.addTo)
+            site.addStore(before, index, after);
+        return;
+    }
+    site.shape = before;
+    site.addTo = after;
+    site.index = index;
+    site.epoch = rt.ctx.protoEpoch;
+}
+
+void defineFieldAt(Runtime& rt, PropertySite* site, DynObject* obj, GCObject* key, Value v)
+{
+    Shape* const before = obj->shape;
+    if (site && before && site->addTo) {
+        if (Shape* to = site->definesFrom(before)) {
+            obj->appendKnown(std::move(v), to);
+            return;
+        }
+    }
+    const std::size_t count = obj->props.size();
+    const bool plain = before && key->kind == CellKind::String && key != rt.atom.protoName.get() && obj->cls == ObjClass::Plain;
+    obj->putOwn(key, std::move(v));
+    if (site && plain && obj->shape != before && obj->props.size() == count + 1 && obj->keyAt(count) == key &&
+        obj->attrsAt(count) == PropDefault)
+        learnDefinition(rt, *site, before, std::uint32_t(count), obj->shape);
+}
+
+void definePrivateAt(Runtime& rt, PropertySite* site, DynObject* obj, GCObject* key, Value v)
+{
+    Shape* const before = obj->shape;
+    // What the site saw: this shape, which lacks the name, and the one adding it leads to.
+    if (site && before && site->addTo) {
+        Shape* to = site->definesFrom(before);
+        if (to && to->key.get() == key) {
+            obj->appendKnown(std::move(v), to);
+            return;
+        }
+    }
+    if (obj->findOwn(key))
+        throwError(rt, ErrorCode::TypeError, "this object has that private member already");
+    const std::size_t count = obj->props.size();
+    obj->putOwn(key, std::move(v), std::uint8_t(PropWritable));
+    if (site && before && obj->cls == ObjClass::Plain && obj->shape != before && obj->props.size() == count + 1 &&
+        obj->keyAt(count) == key)
+        learnDefinition(rt, *site, before, std::uint32_t(count), obj->shape);
+}
+
+
 bool hasProperty(Runtime& rt, const Value& base, GCObject* key)
 {
     if (base.isString()) {
@@ -2424,7 +2477,14 @@ Value execute(Runtime& rt, Frame& frame)
                         break;
                     }
 
-                    case Op::DefField:
+                    case Op::DefField: {
+                        const std::uint32_t operand = operandAt(pc);
+                        pc += 4;
+                        Value v = pop();
+                        defineFieldAt(rt, siteOf(code, operand >> kSiteShift), asObject(sp.back()),
+                                      code.atoms[operand & kAtomMask].get(), std::move(v));
+                        break;
+                    }
                     case Op::DefMethod: {
                         GCObject* key = code.atoms[operandAt(pc)].get();
                         pc += 4;
@@ -2724,7 +2784,14 @@ Value execute(Runtime& rt, Frame& frame)
                         sp.emplace_back(o->findOwn(detail::Access::ptr(name)) != nullptr);
                         break;
                     }
-                    case Op::DefPrivate:
+                    case Op::DefPrivate: {
+                        PropertySite* site = siteOf(code, operandAt(pc));
+                        pc += 4;
+                        Value value = pop();
+                        const Value name = pop();
+                        definePrivateAt(rt, site, asObject(sp.back()), detail::Access::ptr(name), std::move(value));
+                        break;
+                    }
                     case Op::DefPrivateMethod: {
                         const Value value = pop();
                         const Value name = pop();

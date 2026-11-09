@@ -217,21 +217,31 @@ bool Lexer::skipSpace()
     bool sawNewline = false;
     for (;;) {
         const char c = peek();
-        if (c == '\n') {
-            ++line_;
+        if (c == '\n' || c == '\r') {
+            // A CR is a line terminator too, and CRLF is one.
+            if (c == '\n' || peek(1) != '\n')
+                ++line_;
             sawNewline = true;
             ++pos_;
-        } else if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') {
+        } else if (c == ' ' || c == '\t' || c == '\f' || c == '\v') {
             ++pos_;
         } else if (c == '/' && peek(1) == '/') {
-            while (pos_ < src_.size() && src_[pos_] != '\n')
+            // To the end of the line, whichever terminator ends it: LF, CR, U+2028 or U+2029.
+            while (pos_ < src_.size() && src_[pos_] != '\n' && src_[pos_] != '\r' &&
+                   !(src_[pos_] == '\xe2' && pos_ + 2 < src_.size() && src_[pos_ + 1] == '\x80' &&
+                     (src_[pos_ + 2] == '\xa8' || src_[pos_ + 2] == '\xa9')))
                 ++pos_;
         } else if (c == '/' && peek(1) == '*') {
             pos_ += 2;
             for (;;) {
                 if (pos_ >= src_.size())
                     fail("unterminated comment");
-                if (src_[pos_] == '\n') {
+                if (src_[pos_] == '\n' || src_[pos_] == '\r') {
+                    if (src_[pos_] == '\n' || peek(1) != '\n')
+                        ++line_;
+                    sawNewline = true;
+                } else if (src_[pos_] == '\xe2' && pos_ + 2 < src_.size() && src_[pos_ + 1] == '\x80' &&
+                           (src_[pos_ + 2] == '\xa8' || src_[pos_ + 2] == '\xa9')) {
                     ++line_;
                     sawNewline = true;
                 } else if (src_[pos_] == '*' && peek(1) == '/') {
@@ -290,6 +300,12 @@ void Lexer::readEscape(String& out)
             sawLegacyEscape_ = true;
             return;
         case '\n': ++line_; return;  // line continuation
+        case '\r':
+            // CR and CRLF end a line as LF does.
+            if (pos_ < src_.size() && src_[pos_] == '\n')
+                ++pos_;
+            ++line_;
+            return;
         case 'x': {
             if (!isHex(peek()) || !isHex(peek(1)))
                 fail("malformed \\x escape");
@@ -344,7 +360,7 @@ Token Lexer::readString(char quote)
             ++pos_;
             break;
         }
-        if (c == '\n')
+        if (c == '\n' || c == '\r')
             fail("unterminated string");
         if (c == '\\') {
             ++pos_;
@@ -357,7 +373,7 @@ Token Lexer::readString(char quote)
         }
         std::size_t start = pos_;
         while (pos_ < src_.size() && src_[pos_] != quote && src_[pos_] != '\\' &&
-               src_[pos_] != '\n')
+               src_[pos_] != '\n' && src_[pos_] != '\r')
             ++pos_;
         t.text += fromUtf8(src_.substr(start, pos_ - start));
     }

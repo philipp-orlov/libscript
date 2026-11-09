@@ -24,6 +24,8 @@ inline constexpr std::size_t kStackReserve = 96 * 1024;
 /// thread; zero means "not looked up yet", and `nativeStackFloorLookup` stores 1 for "cannot be determined".
 extern thread_local std::uintptr_t nativeStackFloorCache;
 std::uintptr_t nativeStackFloorLookup() noexcept;
+/// The highest address of this thread's stack, or 0 when it cannot be determined.
+std::uintptr_t nativeStackCeiling() noexcept;
 
 /// True when fewer than `reserve` bytes of the calling thread's stack remain. Always false where the stack's bounds
 /// are unknown, so such a platform keeps only the depth counters it already had.

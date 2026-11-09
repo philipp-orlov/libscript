@@ -135,7 +135,8 @@ extern "C" int scriptJitPoll(Runtime* rt) noexcept;
 /// writable while it is being added to and to read+execute afterwards, which
 /// is what hardened kernels (and Apple silicon's W^X) require; a context is
 /// single-threaded, so nothing is executing out of the block at that moment.
-/// A block is unmapped once the last method in it is released.
+/// Released code leaves a hole the next method of that size or smaller takes;
+/// a block is unmapped once the last method in it is released.
 class CodeCache
 {
 public:
@@ -157,12 +158,19 @@ public:
     std::size_t used() const noexcept { return used_; }
 
 private:
+    struct Hole
+    {
+        std::size_t offset;
+        std::size_t bytes;
+    };
     struct Block
     {
         void* base;
         std::size_t bytes;
         std::size_t filled;
         std::size_t live;
+        /// What released code left below `filled`, by offset, with no two touching: taken again before the tail is.
+        std::vector<Hole> holes;
     };
     Block* blockFor(void* address) noexcept;
 
@@ -223,6 +231,7 @@ public:
     /// The second half, on the thread that runs the code: into the cache with it. Null when the cache has no room.
     NativeCode* install(BuiltCode& built);
     const std::string& functionRefusal() const noexcept { return functionRefusal_; }
+    void noteRefusal(std::string why) { functionRefusal_ = std::move(why); }
     virtual void release(NativeCode* code) noexcept = 0;
     /// What `compile` refused the last method for, for the dump.
     virtual const std::string& lastRefusal() const noexcept

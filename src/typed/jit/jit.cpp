@@ -43,6 +43,23 @@ void* CodeCache::reserve(std::size_t bytes)
 
     // A small method is a few hundred bytes; a page each would waste most of
     // the cache, so blocks are filled before another is mapped.
+    // A hole that released code left, first: code that is recompiled again and again then reuses its own space.
+    for (Block& block : blocks_) {
+        for (std::size_t i = 0; i < block.holes.size(); ++i) {
+            Hole& hole = block.holes[i];
+            if (hole.bytes < aligned)
+                continue;
+            if (!sys::vmProtectWritable(block.base, block.bytes))
+                break;
+            void* slot = static_cast<std::uint8_t*>(block.base) + hole.offset;
+            hole.offset += aligned;
+            hole.bytes -= aligned;
+            if (hole.bytes == 0)
+                block.holes.erase(block.holes.begin() + std::ptrdiff_t(i));
+            block.live += aligned;
+            return slot;
+        }
+    }
     for (Block& block : blocks_) {
         if (block.bytes - block.filled < aligned)
             continue;
@@ -81,8 +98,34 @@ void CodeCache::release(void* block, std::size_t bytes) noexcept
         return;
     const std::size_t aligned = (bytes + 15u) & ~std::size_t(15u);
     owner->live -= owner->live < aligned ? owner->live : aligned;
-    if (owner->live != 0)
+    if (owner->live != 0) {
+        // A hole, joined to the ones either side; one that reaches the end of what is filled gives the tail back.
+        const std::size_t offset = std::size_t(static_cast<std::uint8_t*>(block) - static_cast<std::uint8_t*>(owner->base));
+        std::vector<Hole>& holes = owner->holes;
+        auto at = std::lower_bound(holes.begin(), holes.end(), offset,
+                                   [](const Hole& hole, std::size_t where) { return hole.offset < where; });
+        Hole joined{offset, aligned};
+        if (at != holes.end() && at->offset == offset + aligned) {
+            joined.bytes += at->bytes;
+            at = holes.erase(at);
+        }
+        if (at != holes.begin() && std::prev(at)->offset + std::prev(at)->bytes == offset) {
+            --at;
+            joined.offset = at->offset;
+            joined.bytes += at->bytes;
+            at = holes.erase(at);
+        }
+        if (joined.offset + joined.bytes == owner->filled) {
+            owner->filled = joined.offset;
+            return;
+        }
+        try {
+            holes.insert(at, joined);
+        } catch (...) {
+            // Lost until the block empties, as before there were holes.
+        }
         return;
+    }
 
     // The last method in the block is gone, so the mapping can go with it.
     const std::size_t index = std::size_t(owner - blocks_.data());

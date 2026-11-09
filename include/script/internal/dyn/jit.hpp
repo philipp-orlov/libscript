@@ -46,6 +46,9 @@ struct NativePair
 };
 
 /// Make `code` native if it can be. Remembers a refusal, so this is cheap to ask again.
+/// Stop entering a function's native code, which is freed once no frame is in it.
+void retireNative(Runtime& rt, const FunctionCode& code) noexcept;
+void sweepRetiredNative(Runtime& rt) noexcept;
 bool compileNative(Runtime& rt, const FunctionCode& code);
 /// Lower to IR. False, with `why` set, for a function native code does not handle.
 bool lowerFunction(Runtime& rt, const FunctionCode& code, typed::IrFunction& out, std::string* why);

@@ -1890,3 +1890,25 @@ TEST(aStringBuiltPieceByPieceIsJoinedOnce)
              "         o.out.slice(-11), c[79] + c[80]].join(' ');", "<test>");
     CHECK_EQ(ctx.eval("r", "<test>").toString(), std::string("408890 1705946264 1838404864 true 1 >29999</li> yx"));
 }
+
+TEST(nativeCodeNoFunctionEntersIsFreed)
+{
+    // Code a function stops entering, after a bail, goes back to the cache once no frame is in it: a small cache keeps
+    // taking new code for as long as old code is let go.
+    script::Context::Options options;
+    options.jit.mode = script::JitOptions::Mode::Eager;
+    options.jit.codeCacheLimit = 256u << 10;
+    options.runtimeCode = true;
+    js::Context ctx(options);
+    ctx.eval("var fs = [], total = 0;"
+             "for (var k = 0; k < 300; k++)"
+             "  fs.push(new Function('x', 'var s = 0; for (var i = 0; i < 40; i++) s += x * i + ' + k + '; return s;'));"
+             "for (var round = 0; round < 4; round++) for (var k = 0; k < fs.length; k++) {"
+             "  for (var j = 0; j < 30; j++) total += fs[k](j);"
+             "  var r = fs[k](round % 2 ? 'a' : {}); total += typeof r === 'string' ? r.length : 1; }", "<test>");
+    CHECK_EQ(ctx.eval("total", "<test>").toString(), std::string("622441200"));
+    // Each function is compiled twice: for numbers, and again once it is given something else. A cache that kept what it
+    // stopped entering fills at about 350; the stack is read conservatively, so a word left over in a frame can keep
+    // some code a while longer, and more of that in a sanitizer's larger frames.
+    CHECK(ctx.stats().methodsCompiled >= 390);
+}

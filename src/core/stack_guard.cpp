@@ -58,6 +58,31 @@ void throwTooDeep(const char* what)
     throw Error(ErrorCode::CompileError, std::string(what) + " is nested too deeply");
 }
 
+std::uintptr_t nativeStackCeiling() noexcept
+{
+    static thread_local std::uintptr_t ceiling = [] {
+#if defined(_WIN32)
+        ULONG_PTR low = 0, high = 0;
+        GetCurrentThreadStackLimits(&low, &high);
+        return std::uintptr_t(high);
+#elif defined(__APPLE__)
+        return reinterpret_cast<std::uintptr_t>(pthread_get_stackaddr_np(pthread_self()));
+#elif defined(__linux__) || defined(__unix__)
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) != 0)
+            return std::uintptr_t(0);
+        void* base = nullptr;
+        std::size_t size = 0;
+        const int rc = pthread_attr_getstack(&attr, &base, &size);
+        pthread_attr_destroy(&attr);
+        return rc == 0 && base ? reinterpret_cast<std::uintptr_t>(base) + size : std::uintptr_t(0);
+#else
+        return std::uintptr_t(0);
+#endif
+    }();
+    return ceiling;
+}
+
 std::uintptr_t nativeStackFloorLookup() noexcept
 {
     const std::uintptr_t floor = lookup();

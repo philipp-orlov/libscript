@@ -309,9 +309,7 @@ NativePair scriptDynResume(Runtime* rt, const FunctionCode* code, DynFunction* f
     }
 #endif
     if (!planned && ++outer->jitBails > kBailLimit && (outer->jitEntry || outer->jitCode)) {
-        outer->jitEntry = nullptr;
-        outer->jitCallEntry = nullptr;
-        outer->jitCode = nullptr;
+        retireNative(*rt, *outer);
         // It was hot a moment ago, and what it just learnt is no more use the longer it waits.
         outer->jitHotness = outer->jitThreshold(rt->ctx.options.jit.threshold) - std::min<std::uint32_t>(outer->jitThreshold(rt->ctx.options.jit.threshold), 16);
         outer->jitBails = 0;
@@ -471,9 +469,7 @@ NativePair scriptDynEntryMiss(Runtime* rt, const FunctionCode* code, DynFunction
         }
         // What the code assumed is known now to be wrong, and the next compile knows better. The profile only ever
         // grows, so this happens at most twice for each parameter.
-        code->jitEntry = nullptr;
-        code->jitCallEntry = nullptr;
-        code->jitCode = nullptr;
+        retireNative(*rt, *code);
         code->jitHotness = code->jitThreshold(rt->ctx.options.jit.threshold) - std::min<std::uint32_t>(code->jitThreshold(rt->ctx.options.jit.threshold), 16);
         ContextImpl::ArgBuffer buffer(rt->ctx);
         buffer.args.assign(args, args + argc);
@@ -1152,10 +1148,8 @@ int enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result
         return false;
     // Parameters or locals the code takes to be numbers that are not, which the interpreter can have made so after a bail:
     // this code is no good for the call, nor for the next. What it is compiled to next knows where the bail was.
-    const auto discard = [&code]() {
-        code.jitEntry = nullptr;
-        code.jitCallEntry = nullptr;
-        code.jitCode = nullptr;
+    const auto discard = [&rt, &code]() {
+        retireNative(rt, code);
         code.jitHotness = 0;
         return false;
     };
@@ -1355,10 +1349,88 @@ void JitWorker::run()
 }
 #endif
 
+void retireNative(Runtime& rt, const FunctionCode& code) noexcept
+{
+    code.jitEntry = nullptr;
+    code.jitCallEntry = nullptr;
+    if (typed::NativeCode* old = std::exchange(code.jitCode, nullptr)) {
+        try {
+            rt.jitRetired.push_back(old);
+            rt.jitRetiredBytes += old->codeBytes;
+        } catch (...) {
+            // Left to the end of the runtime, as all code used to be.
+        }
+    }
+}
+
+/// Free the retired code that no frame is in. A frame of native code is known by its return address, wherever on the
+/// stack it is saved, so the stack this thread has used is read word by word: a word that looks like an address in some
+/// retired code keeps that code. A number that happens to look like one only keeps code a while longer.
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((no_sanitize_address))
+#endif
+void sweepRetiredNative(Runtime& rt) noexcept
+{
+    if (rt.jitRetired.empty() || !rt.jitBackend)
+        return;
+    const std::uintptr_t ceiling = nativeStackCeiling();
+    if (!ceiling)
+        return;
+    std::vector<typed::NativeCode*>& retired = rt.jitRetired;
+    std::sort(retired.begin(), retired.end(), [](const typed::NativeCode* a, const typed::NativeCode* b) {
+        return a->codeStart < b->codeStart;
+    });
+    std::vector<bool> inUse(retired.size(), false);
+    volatile std::uintptr_t here = 0;
+    for (auto at = reinterpret_cast<std::uintptr_t>(&here) & ~std::uintptr_t(7); at + sizeof(void*) <= ceiling; at += sizeof(void*)) {
+        const std::uintptr_t word = *reinterpret_cast<const std::uintptr_t*>(at);
+        auto it = std::upper_bound(retired.begin(), retired.end(), word, [](std::uintptr_t w, const typed::NativeCode* code) {
+            return w < reinterpret_cast<std::uintptr_t>(code->codeStart);
+        });
+        if (it == retired.begin())
+            continue;
+        --it;
+        const auto start = reinterpret_cast<std::uintptr_t>((*it)->codeStart);
+        if (word < start + (*it)->codeBytes)
+            inUse[std::size_t(it - retired.begin())] = true;
+    }
+    std::vector<typed::NativeCode*> kept;
+    std::vector<typed::NativeCode*> freed;
+    for (std::size_t i = 0; i < retired.size(); ++i)
+        (inUse[i] ? kept : freed).push_back(retired[i]);
+    if (freed.empty())
+        return;
+    std::sort(freed.begin(), freed.end());
+    rt.jitCodes.erase(std::remove_if(rt.jitCodes.begin(), rt.jitCodes.end(),
+                                     [&freed](typed::NativeCode* code) { return std::binary_search(freed.begin(), freed.end(), code); }),
+                      rt.jitCodes.end());
+    rt.jitRetiredBytes = 0;
+    for (typed::NativeCode* code : kept)
+        rt.jitRetiredBytes += code->codeBytes;
+    for (typed::NativeCode* code : freed)
+        rt.jitBackend->release(code);
+    retired = std::move(kept);
+}
+
+/// Code put in the cache; when it is full, the retired code no frame is in makes room first.
+typed::NativeCode* installWithRoom(Runtime& rt, typed::BuiltCode& built)
+{
+    typed::NativeCode* compiled = rt.jitBackend->install(built);
+    if (!compiled && !rt.jitRetired.empty()) {
+        sweepRetiredNative(rt);
+        compiled = rt.jitBackend->install(built);
+    }
+    return compiled;
+}
+
 bool compileNative(Runtime& rt, const FunctionCode& code)
 {
     if (code.jitEntry || code.jitCode)
         return true;
+    // Recompiles leave code behind; what no frame is in goes back to the cache before it fills.
+    constexpr std::size_t kSweepBytes = std::size_t(1) << 20;
+    if (rt.jitRetiredBytes >= kSweepBytes)
+        sweepRetiredNative(rt);
 #if SCRIPT_ENABLE_JIT_THREAD
     if (code.jitJob) {
         if (!code.jitJob->done.load(std::memory_order_acquire))
@@ -1371,7 +1443,7 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
                 rt.ctx.write(fromUtf8("jit: the code generator refused " + code.name + ": " + job->built.refusal + "\n"), false);
             return false;
         }
-        return installNative(rt, code, job->fn, rt.jitBackend->install(job->built));
+        return installNative(rt, code, job->fn, installWithRoom(rt, job->built));
     }
 #endif
     if (code.jitRefused || !rt.jitBackend || !rt.jitBackend->available() ||
@@ -1423,7 +1495,14 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
         return false;
     }
 #endif
-    typed::NativeCode* compiled = rt.jitBackend->compileFunction(fn, config);
+    typed::NativeCode* compiled = nullptr;
+    {
+        typed::BuiltCode built;
+        if (rt.jitBackend->buildFunction(fn, config, built))
+            compiled = installWithRoom(rt, built);
+        else
+            rt.jitBackend->noteRefusal(std::move(built.refusal));
+    }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("SCRIPT_JIT_SIZES")) {
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };

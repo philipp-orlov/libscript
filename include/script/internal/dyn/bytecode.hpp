@@ -192,10 +192,21 @@ enum class Op : std::uint8_t
     ToPropertyKey,
     Void,
 
+    // ---- the interpreter's own: only in its copy of the code, where each stands for the instruction at its place and
+    // says what comes next. The instructions after it are still there, for a jump into the middle.
+    QCompareJump,    // Lt Le Gt Ge Eq Ne StrictEq StrictNe, then JumpIfFalse or JumpIfTrue
+    QGetLocal2,      // GetLocal, GetLocal
+    QGetLocalConst,  // GetLocal, PushConst
+    QSetLocalPop,    // Dup, SetLocal, Pop: an assignment as a statement
+    QGetLocalProp,   // GetLocal, GetProp
+    QThisProp,       // PushThis, GetProp
+
     OpCount,
 };
 
 const char* opName(Op op) noexcept;
+/// How many 32-bit operands follow an opcode.
+int operandsOf(Op op) noexcept;
 
 /// Where a closure finds a captured variable: either a boxed local of the
 /// enclosing frame, or one of the enclosing closure's own upvalues.
@@ -449,6 +460,9 @@ struct FunctionCode
 
     std::uint32_t numLocals = 0;
     std::uint32_t maxStack = 8;
+    /// What the interpreter runs: `code` with the first instruction of some pairs it does in one go replaced. Made the
+    /// first time the function is interpreted; nothing else reads it.
+    mutable std::vector<std::uint8_t> quick;
     /// Slot holding the `arguments` array, or `kNoSlot` when unused.
     std::uint32_t argumentsSlot = 0xffffffffu;
     bool argumentsBoxed = false;

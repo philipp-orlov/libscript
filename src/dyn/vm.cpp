@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -2065,10 +2067,91 @@ static void keyedLearn(const FunctionCode& code, std::uint32_t site, const Value
     code.elemKeyed[site] = {key, o->shape, std::uint32_t(index)};
 }
 
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+/// SCRIPT_OP_PAIRS: how often each instruction follows each other one, what is worth fusing, printed at exit.
+using OpPairTable = std::uint64_t[256][256];
+OpPairTable& opPairCounts()
+{
+    static OpPairTable table = {};
+    return table;
+}
+bool opPairs()
+{
+    static const bool on = [] {
+        if (!std::getenv("SCRIPT_OP_PAIRS"))
+            return false;
+        std::atexit([] {
+            struct Pair { std::uint64_t n; int a, b; };
+            std::vector<Pair> all;
+            std::uint64_t total = 0;
+            for (int a = 0; a < 256; ++a)
+                for (int b = 0; b < 256; ++b)
+                    if (opPairCounts()[a][b]) {
+                        all.push_back({opPairCounts()[a][b], a, b});
+                        total += opPairCounts()[a][b];
+                    }
+            std::sort(all.begin(), all.end(), [](const Pair& x, const Pair& y) { return x.n > y.n; });
+            for (std::size_t i = 0; i < all.size() && i < 40; ++i)
+                std::fprintf(stderr, "pair %5.2f%%  %s %s\n", 100.0 * double(all[i].n) / double(total), opName(Op(all[i].a)), opName(Op(all[i].b)));
+        });
+        return true;
+    }();
+    return on;
+}
+#endif
+
+/// The interpreter's copy of a function's code, with the pairs it does in one go marked.
+const std::uint8_t* quickened(const FunctionCode& code)
+{
+    if (code.quick.size() == code.code.size())
+        return code.quick.data();
+    const std::vector<std::uint8_t>& c = code.code;
+    code.quick = c;
+    for (std::size_t pc = 0; pc < c.size();) {
+        const Op op = Op(c[pc]);
+        const std::size_t next = pc + 1 + std::size_t(operandsOf(op)) * 4;
+        if (next >= c.size())
+            break;
+        const Op then = Op(c[next]);
+        switch (op) {
+            case Op::Lt:
+            case Op::Le:
+            case Op::Gt:
+            case Op::Ge:
+            case Op::Eq:
+            case Op::Ne:
+            case Op::StrictEq:
+            case Op::StrictNe:
+                if (then == Op::JumpIfFalse || then == Op::JumpIfTrue)
+                    code.quick[pc] = std::uint8_t(Op::QCompareJump);
+                break;
+            case Op::GetLocal:
+                if (then == Op::GetLocal)
+                    code.quick[pc] = std::uint8_t(Op::QGetLocal2);
+                else if (then == Op::PushConst)
+                    code.quick[pc] = std::uint8_t(Op::QGetLocalConst);
+                else if (then == Op::GetProp)
+                    code.quick[pc] = std::uint8_t(Op::QGetLocalProp);
+                break;
+            case Op::PushThis:
+                if (then == Op::GetProp)
+                    code.quick[pc] = std::uint8_t(Op::QThisProp);
+                break;
+            case Op::Dup:
+                if (then == Op::SetLocal && next + 5 < c.size() && Op(c[next + 5]) == Op::Pop)
+                    code.quick[pc] = std::uint8_t(Op::QSetLocalPop);
+                break;
+            default: break;
+        }
+        pc = next;
+    }
+    return code.quick.data();
+}
+
 Value execute(Runtime& rt, Frame& frame)
 {
     const FunctionCode& code = *frame.code;
-    const std::uint8_t* c = code.code.data();
+    const std::uint8_t* c = quickened(code);
     // Zero for a fresh call; part way through for one native code handed back.
     std::uint32_t pc = frame.pc;
     std::uint32_t ticks = 0;
@@ -2195,10 +2278,113 @@ Value execute(Runtime& rt, Frame& frame)
                     // reaches cell allocation, so budgets are checked here too.
                     rt.maybeCollect();
                 }
-                const Op op = Op(c[pc++]);
+                Op op = Op(c[pc++]);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+                if (opPairs()) {
+                    static std::uint8_t previous = 0;
+                    ++opPairCounts()[previous][std::uint8_t(op)];
+                    previous = std::uint8_t(op);
+                }
+#endif
+            redispatch:
                 switch (op) {
                     case Op::Nop:
                         break;
+                    // A pair in one go, for the common case; anything else is the first of them as it was.
+                    case Op::QGetLocal2:
+                        sp.push_back(frame.locals[operandAt(pc)]);
+                        sp.push_back(frame.locals[operandAt(pc + 5)]);
+                        pc += 9;
+                        break;
+                    case Op::QGetLocalConst:
+                        sp.push_back(frame.locals[operandAt(pc)]);
+                        sp.push_back(code.consts[operandAt(pc + 5)]);
+                        pc += 9;
+                        break;
+                    case Op::QSetLocalPop: {
+                        Value& slot = frame.locals[operandAt(pc + 1)];
+                        slot = std::move(sp.back());
+                        sp.pop_back();
+                        pc += 6;
+                        break;
+                    }
+                    case Op::QGetLocalProp:
+                        // The read as it is, with its own instruction's place for what it may throw.
+                        sp.push_back(frame.locals[operandAt(pc)]);
+                        pc += 5;
+                        frame.pc = pc - 1;
+                        op = Op::GetProp;
+                        goto redispatch;
+                    case Op::QThisProp:
+                        if (code.sloppyThis && frame.thisValue.isNullish())
+                            sp.push_back(detail::Access::make(Type::Object, rt.globalObject.get()));
+                        else
+                            sp.push_back(frame.thisValue);
+                        pc += 1;
+                        frame.pc = pc - 1;
+                        op = Op::GetProp;
+                        goto redispatch;
+                    case Op::QCompareJump: {
+                        const Op compare = Op(code.code[pc - 1]);
+                        const std::size_t n = sp.size();
+                        const Value& fa = sp[n - 2];
+                        const Value& fb = sp[n - 1];
+                        if (fa.type() != Type::Double || fb.type() != Type::Double) {
+                            // Strict equality has no side effects to order, whatever the operands.
+                            if (compare != Op::StrictEq && compare != Op::StrictNe) {
+                                op = compare;
+                                goto redispatch;
+                            }
+                            const bool same = strictEquals(fa, fb) == (compare == Op::StrictEq);
+                            sp.pop_back();
+                            sp.pop_back();
+                            const bool onTrue = Op(code.code[pc]) == Op::JumpIfTrue;
+                            const std::uint32_t target = operandAt(pc + 1);
+                            pc += 5;
+                            if (same != onTrue)
+                                break;
+                            if (target < pc) {
+                                Value result;
+                                if (const int entered = loopBack(target, pc, result)) {
+                                    if (entered == 1)
+                                        return result;
+                                    pc = frame.pc;
+                                    break;
+                                }
+                            }
+                            pc = target;
+                            break;
+                        }
+                        const double x = detail::Access::r8(fa), y = detail::Access::r8(fb);
+                        bool holds;
+                        switch (compare) {
+                            case Op::Lt: holds = x < y; break;
+                            case Op::Le: holds = x <= y; break;
+                            case Op::Gt: holds = x > y; break;
+                            case Op::Ge: holds = x >= y; break;
+                            case Op::Eq:
+                            case Op::StrictEq: holds = x == y; break;
+                            default: holds = x != y; break;
+                        }
+                        sp.pop_back();
+                        sp.pop_back();
+                        const bool onTrue = Op(code.code[pc]) == Op::JumpIfTrue;
+                        const std::uint32_t target = operandAt(pc + 1);
+                        pc += 5;
+                        if (holds != onTrue)
+                            break;
+                        if (target < pc) {
+                            Value result;
+                            if (const int entered = loopBack(target, pc, result)) {
+                                if (entered == 1)
+                                    return result;
+                                pc = frame.pc;
+                                break;
+                            }
+                        }
+                        pc = target;
+                        break;
+                    }
                     case Op::PushUndefined:
                         sp.push_back(Value::undefined());
                         break;
@@ -3249,12 +3435,13 @@ Value execute(Runtime& rt, Frame& frame)
                             sp.emplace_back(numberOf(a) + numberOf(b));
                             break;
                         }
+                        // Read from the code as compiled: the interpreter's copy has pairs marked.
                         // `s += x` into the local `s` came from: what is in the local is `a`, so it can grow in place.
                         if (a.isString() && !asString(a)->interned) {
                             std::uint32_t at = pc;
-                            if (at < code.code.size() && Op(c[at]) == Op::Dup)
+                            if (at < code.code.size() && Op(code.code[at]) == Op::Dup)
                                 ++at;
-                            if (at + 4 < code.code.size() && Op(c[at]) == Op::SetLocal) {
+                            if (at + 4 < code.code.size() && Op(code.code[at]) == Op::SetLocal) {
                                 const std::uint32_t slot = operandAt(at + 1);
                                 if (slot < frame.locals.size() && detail::Access::ptr(frame.locals[slot]) == detail::Access::ptr(a)) {
                                     sp.push_back(appendForLocal(rt, a, b, 2));
@@ -3262,7 +3449,7 @@ Value execute(Runtime& rt, Frame& frame)
                                 }
                             }
                             // The same for a variable a closure shares, in its cell.
-                            if (at + 4 < code.code.size() && Op(c[at]) == Op::SetCell) {
+                            if (at + 4 < code.code.size() && Op(code.code[at]) == Op::SetCell) {
                                 const std::uint32_t slot = operandAt(at + 1);
                                 if (slot < frame.cells.size() && frame.cells[slot] && detail::Access::ptr(frame.cells[slot]->value) == detail::Access::ptr(a)) {
                                     sp.push_back(appendForLocal(rt, a, b, 2));

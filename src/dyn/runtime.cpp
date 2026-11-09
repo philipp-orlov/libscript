@@ -20,6 +20,74 @@ namespace dyn {
 
 // ------------------------------------------------------------ bytecode ---
 
+/// How many 32-bit operands follow an opcode.
+int operandsOf(Op op) noexcept
+{
+    switch (op) {
+        case Op::DefGlobal: return 2;
+        case Op::PushConst:
+        case Op::PopN:
+        case Op::GetLocal:
+        case Op::SetLocal:
+        case Op::GetCell:
+        case Op::SetCell:
+        case Op::NewCell:
+        case Op::RenewCell:
+        case Op::GetUpval:
+        case Op::SetUpval:
+        case Op::GetGlobal:
+        case Op::SetGlobal:
+        case Op::TypeofGlobal:
+        case Op::DeleteGlobal:
+        case Op::ThrowConstAssign:
+        case Op::GetElem:
+        case Op::SetElem:
+        case Op::GetElemDup:
+        case Op::GetProp:
+        case Op::SetProp:
+        case Op::GetPropDup:
+        case Op::GetPropBound:
+        case Op::DeleteProp:
+        case Op::DefField:
+        case Op::DefGetter:
+        case Op::DefSetter:
+        case Op::DefMethod:
+        case Op::ClassSetup:
+        case Op::GetSuper:
+        case Op::SetSuper:
+        case Op::NewArray:
+        case Op::NewObject:
+        case Op::NewRegExp:
+        case Op::Closure:
+        case Op::Call:
+        case Op::New:
+        case Op::CallSuper:
+        case Op::Jump:
+        case Op::JumpIfFalse:
+        case Op::JumpIfTrue:
+        case Op::JumpIfFalseKeep:
+        case Op::JumpIfTrueKeep:
+        case Op::JumpIfNullishKeep:
+        case Op::JumpIfNotNullishKeep:
+        case Op::JumpSub:
+        case Op::ForInNext:
+        case Op::IterNext:
+        case Op::IterCloseAt:
+        case Op::NewPrivateName:
+        case Op::DefPrivateAccessor:
+        case Op::DefPrivate:
+        case Op::DefAccessorElem:
+        case Op::CallSuperVia:
+        case Op::Yield:
+        case Op::DelegateCall:
+        case Op::DelegateCheck:
+        case Op::DelegateDone:
+        case Op::AsyncIterCheck:
+        case Op::AsyncIterClose: return 1;
+        default: return 0;
+    }
+}
+
 const char* opName(Op op) noexcept
 {
     static const char* const names[] = {
@@ -42,7 +110,7 @@ const char* opName(Op op) noexcept
         "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Neg", "Pos", "BitAnd", "BitOr", "BitXor",
         "BitNot", "Shl", "Shr", "UShr", "Eq", "Ne", "StrictEq", "StrictNe", "Lt", "Le", "Gt",
         "Ge", "In", "InstanceOf", "Not", "TypeOf", "Inc", "Dec", "ToNumber", "ToString",
-        "ToObject", "ToPropertyKey", "Void",
+        "ToObject", "ToPropertyKey", "Void", "QCompareJump", "QGetLocal2", "QGetLocalConst", "QSetLocalPop", "QGetLocalProp", "QThisProp",
     };
     static_assert(sizeof(names) / sizeof(names[0]) == std::size_t(Op::OpCount),
                   "every opcode needs a name");

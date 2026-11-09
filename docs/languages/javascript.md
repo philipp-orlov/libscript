@@ -125,9 +125,11 @@ cells, where the compiled string finds them, and runs in the interpreter. A `var
 such a string declares inside a function stays in the string's own scope, as it would
 in strict code.
 
-Functions that use generators or async, and derived class constructors, run in
-the interpreter. A `for-of` runs in native code only over a plain array, whose
-iterator has nothing to close.
+A generator's or async function's loops run in native code, in the coroutine's
+own frame; each `yield` and `await` hands the frame back to the interpreter,
+which suspends it. A coroutine with a `finally`, and a derived class
+constructor, run in the interpreter. A `for-of` runs in native code only over a
+plain array, whose iterator has nothing to close.
 
 A regular expression runs in a matcher of its own, which backtracks on its own stack
 and interprets a small instruction set: it has no native code, and that is the widest

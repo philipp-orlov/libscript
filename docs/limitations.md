@@ -291,7 +291,7 @@ lists what is in; this is what is out, and where the object model shows.
 
 | Construct | Note |
 | --- | --- |
-| generators, `yield`, `async`/`await` | a suspension point, which the dynamic VM does not have (see JavaScript above); write an iterator class with `__iter__` |
+| generators, `yield`, `async`/`await` | the dynamic VM suspends JavaScript's coroutines, but the Python front end does not lower these to them yet; write an iterator class with `__iter__` |
 | `with` | there is nothing to manage: no files, no locks |
 | `import` of anything but `math`, `random`, `sys`, `time` | there is no module system and no file system; the host exposes what it wants through `hostClass` |
 | `**kwargs`, keyword-only parameters, `**` in calls | keyword arguments are matched by position at compile time, which a dictionary of them defeats |

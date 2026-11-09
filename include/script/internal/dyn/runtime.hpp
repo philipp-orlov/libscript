@@ -312,6 +312,8 @@ struct Runtime : EngineRuntime
     /// One more than the `protoEpoch` at which `next` was found at `generatorNextIndex` in the generators' prototype;
     /// zero for never.
     std::uint64_t generatorNextEpoch = 0;
+    /// One more than the `protoEpoch` at which Array.prototype and Object.prototype were last seen to hold no element.
+    std::uint64_t noProtoElementsEpoch = 0;
     std::uint32_t generatorNextIndex = 0;
     Shape* iterRootShape = nullptr;
     Shape* iterValueShape = nullptr;

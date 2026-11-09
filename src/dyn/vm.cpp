@@ -2297,8 +2297,35 @@ enum class Step : std::uint8_t
 
 /// One instruction, at `frame.pc`, with the frame's stack as it is: everything the interpreter does not do in its
 /// own loop, and what it does there when the quick way does not apply.
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+/// SCRIPT_SLOW_OPS: how often each instruction took the long way, printed at exit.
+std::uint64_t* slowOpCounts()
+{
+    static std::uint64_t* counts = [] () -> std::uint64_t* {
+        if (!std::getenv("SCRIPT_SLOW_OPS"))
+            return nullptr;
+        static std::uint64_t table[256] = {};
+        std::atexit([] {
+            std::vector<std::pair<std::uint64_t, int>> all;
+            for (int i = 0; i < 256; ++i)
+                if (table[i])
+                    all.push_back({table[i], i});
+            std::sort(all.rbegin(), all.rend());
+            for (std::size_t i = 0; i < all.size() && i < 30; ++i)
+                std::fprintf(stderr, "slow %12llu  %s\n", static_cast<unsigned long long>(all[i].first), opName(Op(all[i].second)));
+        });
+        return table;
+    }();
+    return counts;
+}
+#endif
+
 [[gnu::noinline]] Step slowStep(Runtime& rt, Frame& frame, Op op, Value& leaving)
 {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::uint64_t* counts = slowOpCounts())
+        ++counts[std::uint8_t(op)];
+#endif
     const FunctionCode& code = *frame.code;
     std::uint32_t pc = frame.pc + 1;
     ValueStack& sp = frame.stack;
@@ -3692,6 +3719,29 @@ inline void leaveInline(Runtime& rt, Frame*& frame) noexcept
     frame = rt.frames.back();
 }
 
+/// Whether nothing up an array's chain could take a write past its end: its prototype is Array.prototype, and that and
+/// Object.prototype have no element of their own. Worked out again only when some prototype has changed.
+inline bool protosHoldNoElements(Runtime& rt, DynArray* arr)
+{
+    DynObject* const arrayProto = rt.arrayProto.get();
+    if (arr->proto.get() != arrayProto || arrayProto->proto.get() != rt.objectProto.get())
+        return false;
+    if (rt.noProtoElementsEpoch == rt.ctx.protoEpoch + 1)
+        return true;
+    for (DynObject* proto : {arrayProto, rt.objectProto.get()}) {
+        if (proto->cls == ObjClass::Array && static_cast<DynArray*>(proto)->size())
+            return false;
+        for (std::size_t i = 0; i < proto->props.size(); ++i) {
+            GCObject* key = proto->keyAt(i);
+            std::uint32_t index = 0;
+            if (key && key->kind == CellKind::String && arrayIndexOf(static_cast<StringCell*>(key)->text(), index))
+                return false;
+        }
+    }
+    rt.noProtoElementsEpoch = rt.ctx.protoEpoch + 1;
+    return true;
+}
+
 /// The interpreter. The instructions it does often are each a few machine instructions here, with where it is in the
 /// code, the top of the stack and the locals kept in registers, and each going straight on to the next. The rest run in
 /// `slowStep`, with the frame's state written back for them first: what can throw, call out or look at the frame does
@@ -4091,10 +4141,25 @@ Value execute(Runtime& rt, Frame& entry)
             ip += 5;
             goto L_GetProp;
         L_GetProp: {
-            const Value* found = cachedRead(rt, *code, top[-1], LS_OPERAND(1));
-            if (!found)
+            const std::uint32_t operand = LS_OPERAND(1);
+            if (const Value* found = cachedRead(rt, *code, top[-1], operand)) {
+                copyInto(top[-1], *found);
+                LS_NEXT(5);
+            }
+            // `length` of an array or a string, which no table holds.
+            if (code->atoms[operand & kAtomMask].get() != rt.atom.length.get())
                 goto slow;
-            copyInto(top[-1], *found);
+            double length;
+            if (StringCell* str = asString(top[-1])) {
+                length = double(str->length);
+            } else {
+                DynObject* const obj = asObject(top[-1]);
+                if (!obj || obj->cls != ObjClass::Array)
+                    goto slow;
+                length = double(static_cast<DynArray*>(obj)->size());
+            }
+            top[-1].~Value();
+            new (&top[-1]) Value(length);
             LS_NEXT(5);
         }
         L_GetPropDup: {
@@ -4137,7 +4202,21 @@ Value execute(Runtime& rt, Frame& entry)
         L_GetElem: {
             const Value& key = top[-1];
             DynObject* obj = asObject(top[-2]);
-            if (key.type() != Type::Double || !obj || obj->cls != ObjClass::Array)
+            if (key.type() != Type::Double || !obj)
+                goto slow;
+            if (obj->cls == ObjClass::TypedArray) {
+                auto* const ta = static_cast<DynTypedArray*>(obj);
+                const double d = detail::Access::r8(key);
+                if (!(d >= 0 && d < double(ta->length)) || d != std::floor(d))
+                    goto slow;
+                ElemSite::noteTyped(code->elemSaw[LS_OPERAND(1)], int(ta->element));
+                LS_SAVE();
+                Value r = typedArrayGet(rt, ta, std::size_t(d));
+                --top;
+                moveInto(top[-1], r);
+                LS_NEXT(5);
+            }
+            if (obj->cls != ObjClass::Array)
                 goto slow;
             const double d = detail::Access::r8(key);
             if (!(d >= 0 && d < 4294967295.0))
@@ -4156,14 +4235,41 @@ Value execute(Runtime& rt, Frame& entry)
             // arr key value -> value
             const Value& key = top[-2];
             DynObject* obj = asObject(top[-3]);
-            if (key.type() != Type::Double || !obj || obj->cls != ObjClass::Array || obj->frozen || !obj->props.empty())
+            if (key.type() != Type::Double || !obj)
+                goto slow;
+            if (obj->cls == ObjClass::TypedArray) {
+                // A number into a typed array within its length; anything to convert takes the long way.
+                auto* const ta = static_cast<DynTypedArray*>(obj);
+                const double d = detail::Access::r8(key);
+                if (top[-1].type() != Type::Double || !(d >= 0 && d < double(ta->length)) || d != std::floor(d) ||
+                    ta->element == ElementKind::BigInt64 || ta->element == ElementKind::BigUint64)
+                    goto slow;
+                ElemSite::noteTyped(code->elemSaw[LS_OPERAND(1)], int(ta->element));
+                LS_SAVE();
+                typedArraySet(rt, ta, d, top[-1]);
+                moveInto(top[-3], top[-1]);
+                top -= 2;
+                LS_NEXT(5);
+            }
+            if (obj->cls != ObjClass::Array || obj->frozen || !obj->props.empty())
                 goto slow;
             const double d = detail::Access::r8(key);
             if (!(d >= 0 && d < 4294967295.0))
                 goto slow;
             const std::uint32_t i = std::uint32_t(d);
             auto* arr = static_cast<DynArray*>(obj);
-            if (double(i) != d || i >= arr->size() || !arr->hasElement(i))
+            if (double(i) != d)
+                goto slow;
+            if (i == arr->size() && obj->extensible && !obj->isProto && protosHoldNoElements(rt, arr)) {
+                // One past the end: the array grows by it.
+                code->elemSaw[LS_OPERAND(1)] |= ElemSite::of(arr);
+                LS_SAVE();
+                arr->append(top[-1]);
+                moveInto(top[-3], top[-1]);
+                top -= 2;
+                LS_NEXT(5);
+            }
+            if (i >= arr->size() || !arr->hasElement(i))
                 goto slow;
             code->elemSaw[LS_OPERAND(1)] |= ElemSite::of(arr);
             LS_SAVE();
@@ -4465,6 +4571,59 @@ Value execute(Runtime& rt, Frame& entry)
             return yielded;
         }
 
+        // ------------------------------------------------ objects and tests ---
+        L_NewObject: {
+            LS_ROOM(1);
+            LS_SAVE();
+            LS_PUSH(detail::Access::adopt(Type::Object, rt.newObjectSized(rt.objectProto.get(), LS_OPERAND(1))));
+            LS_NEXT(5);
+        }
+        L_DefField: {
+            // obj value -> obj, for a literal whose shape this site has seen grow by this name before.
+            const std::uint32_t operand = LS_OPERAND(1);
+            const std::uint32_t index = operand >> kSiteShift;
+            DynObject* const obj = asObject(top[-2]);
+            if (index == kNoSite || code->sites.empty() || !obj || !obj->shape)
+                goto slow;
+            const PropertySite& site = code->sites[index];
+            Shape* const to = site.addTo ? site.definesFrom(obj->shape) : nullptr;
+            if (!to)
+                goto slow;
+            LS_SAVE();
+            obj->appendKnown(std::move(top[-1]), to);
+            --top;
+            LS_NEXT(5);
+        }
+        L_Eq:
+        L_Ne: {
+            // The cases with nothing to convert: numbers, a test against null or undefined, the same kind of reference.
+            const Value& a = top[-2];
+            const Value& b = top[-1];
+            bool same;
+            if (a.type() == Type::Double && b.type() == Type::Double)
+                same = LS_A == LS_B;
+            else if (a.isNullish() || b.isNullish())
+                same = a.isNullish() && b.isNullish();
+            else if (a.type() == b.type() && (a.type() == Type::Object || a.type() == Type::String || a.type() == Type::Bool))
+                same = strictEquals(a, b);
+            else
+                goto slow;
+            (--top)->~Value();
+            top[-1].~Value();
+            new (&top[-1]) Value(same == (Op(*ip) == Op::Eq));
+            LS_NEXT(1);
+        }
+        L_TypeOf: {
+            LS_SAVE();
+            Value name = rt.typeOfValue(top[-1]);
+            moveInto(top[-1], name);
+            LS_NEXT(1);
+        }
+        L_Void:
+            top[-1].~Value();
+            new (&top[-1]) Value(Value::undefined());
+            LS_NEXT(1);
+
         // ------------------------------------------- pairs done in one go ---
         L_QGetLocal2:
             LS_ROOM(2);
@@ -4537,7 +4696,6 @@ Value execute(Runtime& rt, Frame& entry)
         L_GetElemDup:
         L_DeleteProp:
         L_DeleteElem:
-        L_DefField:
         L_DefGetter:
         L_DefSetter:
         L_DefElem:
@@ -4550,7 +4708,6 @@ Value execute(Runtime& rt, Frame& entry)
         L_SetSuper:
         L_SetSuperElem:
         L_GetSuperElem:
-        L_NewObject:
         L_NewArray:
         L_ArrayAppend:
         L_ArraySpread:
@@ -4602,15 +4759,11 @@ Value execute(Runtime& rt, Frame& entry)
         L_Pow:
         L_Pos:
         L_BitNot:
-        L_Eq:
-        L_Ne:
         L_In:
         L_InstanceOf:
-        L_TypeOf:
         L_ToString:
         L_ToObject:
         L_ToPropertyKey:
-        L_Void:
             goto slow;
         } catch (Exception& e) {
             // Whatever threw had the frame's state written back first. The frames this loop entered itself are left one

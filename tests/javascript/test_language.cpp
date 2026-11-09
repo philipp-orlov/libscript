@@ -1960,9 +1960,10 @@ TEST(anInlinedFunctionGivesItsCallerAnInt32)
 
 TEST(theInterpreterRunsCallsInItsOwnLoop)
 {
-    // A call from interpreted code to interpreted code is entered by the same loop: the function called may live only on
-    // the caller's stack, an exception goes back through the frames until one has a handler, deep recursion uses no
-    // native stack, and a loop counter in a local steps in place.
+    // A call from interpreted code to interpreted code is entered by the same loop, and so is `new` of a plain function:
+    // the function called may live only on the caller's stack, an exception goes back through the frames until one has
+    // a handler, deep recursion uses no native stack, a loop counter in a local steps in place, and a constructor that
+    // returns no object gives the one it made.
     const char* program =
         "function d(v) { return (() => v)(); }"
         "function thrower(n) { if (n === 0) throw new Error('deep'); return thrower(n - 1) + 1; }"
@@ -1970,12 +1971,19 @@ TEST(theInterpreterRunsCallsInItsOwnLoop)
         "function depth(n) { return n === 0 ? 0 : 1 + depth(n - 1); }"
         "function count(n) { var t = 0; for (var i = 0; i < n; i++) t++; for (var j = n; j > 0; j--) t--; return t; }"
         "function self() { return this === undefined ? 'u' : typeof this; }"
-        "[d(7), catcher(20), depth(400), count(50), self(), [1, 2, 3].map(x => d(x * 2)).join('')].join(',')";
+        "function A(x) { this.x = x; } function B(x) { this.x = x; return { y: x }; } function C(x) { this.x = x; return 5; }"
+        "function D() { this.t = new.target === D; } function E(n) { if (n > 2) throw new Error('E' + n); this.n = n; }"
+        "function F(n) { this.v = n ? new F(n - 1).v + 1 : 0; } A.prototype.get = function () { return this.x; };"
+        "function newE(n) { try { return new E(n).n; } catch (e) { return e.message; } }"
+        "[d(7), catcher(20), depth(400), count(50), self(), [1, 2, 3].map(x => d(x * 2)).join(''), new A(3).get(),"
+        " new B(4).y, new C(5).x, new D().t, new F(10).v, newE(1), newE(3), new E(1) instanceof E,"
+        " (2 ** 40 + 7) & 15, (2 ** 53 + 2) >> 0, -1e19 | 0].join(',')";
     for (bool off : {true, false}) {
         script::Context::Options options;
         if (off)
             options.jit.mode = script::JitOptions::Mode::Off;
         js::Context ctx(options);
-        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("7,deep20,400,0,object,246"));
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("7,deep20,400,0,object,246,3,4,5,true,10,1,E3,true,7,2,1981284352"));
     }
 }

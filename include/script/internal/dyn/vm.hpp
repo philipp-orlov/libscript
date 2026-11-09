@@ -203,6 +203,8 @@ struct Frame
     bool nativeRun = false;
     /// Entered by the interpreter's loop on a call from the frame below, which it goes back to on returning.
     bool inlineCall = false;
+    /// Entered so by `new`: a return of anything but an object gives `thisValue`.
+    bool constructing = false;
     /// The interpreter's back edges to go until it asks for native code, and the loop work done towards that.
     std::uint32_t backEdges = 0;
     std::uint64_t loopWork = 0;

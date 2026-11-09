@@ -73,6 +73,7 @@ void Frame::end() noexcept
     coroutine = nullptr;
     left = Left::Finished;
     inlineCall = false;
+    constructing = false;
 }
 
 // ------------------------------------------------------------- errors ---
@@ -375,6 +376,9 @@ std::int32_t toInt32(double d) noexcept
 {
     if (d >= -2147483648.0 && d <= 2147483647.0)
         return std::int32_t(d);
+    // Within 2^63 the whole part is exact as an int64, whose low 32 bits are the answer.
+    if (d > -9223372036854775808.0 && d < 9223372036854775808.0)
+        return std::int32_t(std::uint32_t(std::uint64_t(std::int64_t(d))));
     if (!std::isfinite(d) || d == 0)
         return 0;
     const double m = std::fmod(std::trunc(d), 4294967296.0);
@@ -4094,14 +4098,17 @@ Value execute(Runtime& rt, Frame& entry)
             leaving = Value::undefined();
             goto returnInline;
         returnInline:
-            // `leaving` goes back to the frame below, whose call entered this one in this loop.
+            // `leaving` goes back to the frame below, whose call entered this one in this loop. A constructor that
+            // returns no object gives the one it made.
+            if (frame->constructing && !leaving.isObject())
+                leaving = frame->thisValue;
             leaveInline(rt, frame);
             code = frame->code;
             c = quickened(*code);
             LS_LOAD();
             ip = c + frame->pc;
             // The call's function, `this` and arguments, given up only now, for the result.
-            for (std::uint32_t n = LS_OPERAND(1) + 2; n; --n)
+            for (std::uint32_t n = LS_OPERAND(1) + (Op(*ip) == Op::New ? 1 : 2); n; --n)
                 (--top)->~Value();
             new (top++) Value(std::move(leaving));
             LS_NEXT(5);
@@ -4292,6 +4299,55 @@ Value execute(Runtime& rt, Frame& entry)
             LS_DISPATCH();
         }
 
+        L_New: {
+            // ctor arg... -> object. A plain function of bytecode is entered as a call is, with a new object for `this`
+            // made the way native code makes it.
+            const std::uint32_t argc = LS_OPERAND(1);
+            Value* const args = top - argc;
+            DynObject* const callee = asObject(args[-1]);
+            if (!callee || callee->cls != ObjClass::Function)
+                goto slow;
+            auto* const fn = static_cast<DynFunction*>(callee);
+            if (fn->fnKind != FnKind::Bytecode || !fn->code || fn->isArrow || fn->prototypePending ||
+                fn->isDerivedConstructor || fn->fieldInit || fn->code->isMethod)
+                goto slow;
+            const Prop* const prototype = fn->findOwn(rt.atom.prototype.get());
+            if (!prototype || fn->accessorOf(*prototype))
+                goto slow;
+            const FunctionCode& target = *fn->code;
+            if (!inlineCallable(rt, target))
+                goto slow;
+            LS_SAVE();
+            DynObject* proto = asObject(prototype->value);
+            if (!proto)
+                proto = rt.objectProto.get();
+            Shape* const root = rt.rootShapeFor(proto);
+            Value self = detail::Access::adopt(Type::Object, rt.newObjectSized(proto, root ? std::min<std::uint32_t>(root->expect, 32) : 0));
+            if (++rt.interpTicks >= kInterruptInterval / 16) [[unlikely]] {
+                rt.interpTicks = 0;
+                if (rt.ctx.interruptAsked())
+                    throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
+            }
+            noteArguments(target, args, argc);
+            Frame& next = rt.acquireFrame(rt.frames.size());
+            next.begin(fn, &target, std::move(self), fn);
+            const std::size_t plain = std::min<std::size_t>(argc, target.numLocals);
+            for (std::size_t i = 0; i < plain; ++i)
+                moveInto(next.locals[i], args[i]);
+            frame->stack.setEnd(top);
+            next.inlineCall = true;
+            next.constructing = true;
+            rt.frames.push_back(&next);
+            ++rt.ctx.callDepth;
+            frame = &next;
+            code = &target;
+            c = quickened(target);
+            startLoops(rt, next);
+            LS_LOAD();
+            ip = c;
+            LS_DISPATCH();
+        }
+
         // ------------------------------------------- pairs done in one go ---
         L_QGetLocal2:
             LS_ROOM(2);
@@ -4386,7 +4442,6 @@ Value execute(Runtime& rt, Frame& entry)
         L_DirectEval:
         L_NewRegExp:
         L_CallSpread:
-        L_New:
         L_NewSpread:
         L_CallSuper:
         L_CallSuperSpread:

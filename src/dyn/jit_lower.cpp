@@ -69,6 +69,8 @@ constexpr std::int64_t kNumbersOnlyOffset = offsetof(DynObject, numbersOnly);
 constexpr std::int64_t kFnCodeOffset = offsetof(DynFunction, code);  // the first word of a shared_ptr is the pointer
 constexpr std::int64_t kFnUpvaluesOffset = offsetof(DynFunction, upvalues);
 constexpr std::int64_t kCallEntryOffset = offsetof(FunctionCode, jitCallEntry);
+/// Where `new` enters: a class constructor has this and not the call entry, since a call of one throws.
+constexpr std::int64_t kEntryOffset = offsetof(FunctionCode, jitEntry);
 constexpr std::int64_t kBoxValueOffset = offsetof(Box, value);
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
@@ -6859,7 +6861,7 @@ private:
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), slow);
         const std::int32_t codePtr = load(fnPayload, kFnCodeOffset, 8, false, kAliasHeader);
         branchCmp(codePtr, IrCond::Eq, 0, slow, 64);
-        const std::int32_t entry = load(codePtr, kCallEntryOffset, 8, false, kAliasHeader);
+        const std::int32_t entry = load(codePtr, kEntryOffset, 8, false, kAliasHeader);
         branchCmp(entry, IrCond::Eq, 0, slow, 64);
         const std::int32_t self = fn_.newVreg(false);
         if (!newOfKnownPrototype(callee, self, slow, held)) {

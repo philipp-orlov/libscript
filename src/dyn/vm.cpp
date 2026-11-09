@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <limits>
 
 #include "script/internal/dyn/vm.hpp"
@@ -1661,22 +1662,53 @@ static void runFieldInit(Runtime& rt, DynFunction* ctor, const Value& self)
 
 Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args, DynFunction* newTarget)
 {
+    return constructValue(rt, callee, args.data(), args.size(), newTarget, &args);
+}
+
+Value constructValue(Runtime& rt, const Value& callee, const Value* argv, std::size_t argc, DynFunction* newTarget,
+                     const std::vector<Value>* asVector)
+{
+    // The arguments as a vector only for what takes them so: a bound function, a proxy, a native constructor.
+    struct Args
+    {
+        ContextImpl& ctx;
+        const Value* p;
+        std::size_t n;
+        const std::vector<Value>* given;
+        std::optional<ContextImpl::ArgBuffer> made;
+        const Value* data() const noexcept { return p; }
+        std::size_t size() const noexcept { return n; }
+        const std::vector<Value>& vector()
+        {
+            if (given)
+                return *given;
+            made.emplace(ctx);
+            made->args.assign(p, p + n);
+            given = &made->args;
+            return made->args;
+        }
+    } args{rt.ctx, argv, argc, asVector, std::nullopt};
     DynFunction* fn = asFunction(callee);
     if (!fn || !isConstructor(rt, fn))
         throwError(rt, ErrorCode::TypeError, (fn && !fn->name.empty() ? toUtf8(fn->name) : std::string("value")) + " is not a constructor");
     if (!newTarget)
         newTarget = fn;
     if (fn->fnKind == FnKind::Bound)
-        return constructValue(rt, detail::Access::make(Type::Object, fn->boundTarget.get()), args,
+        return constructValue(rt, detail::Access::make(Type::Object, fn->boundTarget.get()), args.vector(),
                               newTarget == fn ? fn->boundTarget.get() : newTarget);
     if (fn->fnKind == FnKind::Proxy)
-        return proxyConstruct(rt, static_cast<DynProxy*>(fn), args, newTarget == fn ? nullptr : newTarget);
+        return proxyConstruct(rt, static_cast<DynProxy*>(fn), args.vector(), newTarget == fn ? nullptr : newTarget);
     // A derived class has no object until `super()` gives it one.
     if (fn->isDerivedConstructor)
-        return callInternal(rt, fn, Value::undefined(), args, true, newTarget);
+        return callInternal(rt, fn, Value::undefined(), args.vector(), true, newTarget);
 
-    const Value target = detail::Access::make(Type::Object, newTarget);
-    Value protoValue = getPropertyOfObject(rt, newTarget, rt.atom.prototype.get(), target);
+    // A function's own plain `prototype`, as it nearly always is, read where it is.
+    Value protoValue;
+    const Prop* ownProto = newTarget->prototypePending ? nullptr : newTarget->findOwn(rt.atom.prototype.get());
+    if (ownProto && !newTarget->accessorOf(*ownProto) && !newTarget->fnKindIsProxy())
+        protoValue = ownProto->value;
+    else
+        protoValue = getPropertyOfObject(rt, newTarget, rt.atom.prototype.get(), detail::Access::make(Type::Object, newTarget));
     DynObject* proto = asObject(protoValue);
     // A built-in whose new target has no usable prototype keeps the one it gives its own kind.
     const bool keepNativeProto = !proto;
@@ -1688,7 +1720,13 @@ Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>&
     const Value thisValue = detail::Access::adopt(Type::Object, self);
     runFieldInit(rt, fn, thisValue);
 
-    const Value result = callInternal(rt, fn, thisValue, args, true, newTarget);
+    Value result;
+    if (fn->fnKind == FnKind::Bytecode) {
+        DepthGuard guard(rt);
+        result = invokeBytecode(rt, fn, thisValue, const_cast<Value*>(args.data()), args.size(), newTarget, false);
+    } else {
+        result = callInternal(rt, fn, thisValue, args.vector(), true, newTarget);
+    }
     if (!result.isObject())
         return thisValue;
     // A built-in makes its own kind of object, which a class extending it inherits from the class.

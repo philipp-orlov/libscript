@@ -492,11 +492,7 @@ NativePair scriptDynCall(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std:
 
 NativePair scriptDynNew(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, const Value* args, std::uint64_t argc) noexcept
 {
-    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
-        ContextImpl::ArgBuffer buffer(rt->ctx);
-        buffer.args.assign(args, args + argc);
-        return take(constructValue(*rt, valueOf(fnTag, fn), buffer.args));
-    });
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(constructValue(*rt, valueOf(fnTag, fn), args, argc)); });
 }
 
 GCObject* scriptDynNewObject(Runtime* rt, std::uint64_t room) noexcept
@@ -512,8 +508,10 @@ GCObject* scriptDynNewOf(Runtime* rt, GCObject* proto, std::uint64_t room) noexc
 GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
 {
     auto* fn = static_cast<DynFunction*>(cell);
-    // A prototype still to make is made by the long way, which can allocate.
-    if (fn->fnKind != FnKind::Bytecode || fn->isArrow || fn->prototypePending)
+    // A prototype still to make is made by the long way, which can allocate; so is anything `new` refuses, and a derived
+    // class, which has no object until `super()`.
+    if (fn->fnKind != FnKind::Bytecode || fn->isArrow || fn->prototypePending || fn->isDerivedConstructor || !fn->code ||
+        fn->code->isGenerator || fn->code->isAsync || fn->code->isMethod)
         return nullptr;
     const Prop* prototype = fn->findOwn(rt->atom.prototype.get());
     if (!prototype || fn->accessorOf(*prototype))
@@ -523,7 +521,16 @@ GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
         proto = rt->objectProto.get();
     return guarded(*rt, SCRIPT_HERE, [&]() -> GCObject* {
         Shape* root = rt->rootShapeFor(proto);
-        return rt->newObjectSized(proto, root ? std::min<std::uint32_t>(root->expect, 32) : 0);
+        DynObject* made = rt->newObjectSized(proto, root ? std::min<std::uint32_t>(root->expect, 32) : 0);
+        // A class's fields go on before its constructor runs.
+        if (DynFunction* init = fn->fieldInit.get()) {
+            // Held by `self` while they do, so that one that throws lets it go.
+            const Value self = detail::Access::adopt(Type::Object, made);
+            ContextImpl::ArgBuffer none(rt->ctx);
+            callValue(*rt, detail::Access::make(Type::Object, init), self, none.args);
+            detail::incRef(made);
+        }
+        return made;
     });
 }
 

@@ -300,6 +300,9 @@ Value callValue(Runtime& rt, const Value& callee, const Value& thisValue,
 bool isConstructor(Runtime& rt, DynFunction* fn);
 /// `new callee(...args)`. `newTarget`, when given, is the function whose `prototype` the object inherits from.
 Value constructValue(Runtime& rt, const Value& callee, const std::vector<Value>& args, DynFunction* newTarget = nullptr);
+/// The same with the arguments where they are; `asVector`, when given, is them as a vector already.
+Value constructValue(Runtime& rt, const Value& callee, const Value* args, std::size_t argc, DynFunction* newTarget = nullptr,
+                     const std::vector<Value>* asVector = nullptr);
 
 /// One callee called many times from C++ -- a built-in's callback. Once the callee has native code, each call goes
 /// straight into it, with what a native run needs set up once for the whole loop rather than once a call.

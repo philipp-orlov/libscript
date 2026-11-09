@@ -2031,3 +2031,27 @@ TEST(aGeneratorIsSteppedWithoutAResultObject)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("a,0,1,r 1 fin 1 boom 0,10,20 0,1,2 | | 0,1 0 1 234"));
     }
 }
+
+TEST(nativeCodeConstructsAClassDirectly)
+{
+    // new of a class from native code makes the object, runs the field initializers and enters the constructor's native
+    // code; a derived class, a generator, a method and a call without new still take the long way, which refuses or
+    // throws as it should, and an initializer that throws lets the object go.
+    const char* program =
+        "var out = []; class V { #x; y = 2; constructor(x) { this.#x = x; } get x() { return this.#x; } }"
+        "class W extends V { z = 3; constructor(x) { super(x * 2); } }"
+        "class T { a = (() => { if (T.boom) throw new Error('init'); return 1; })(); } function* G() { yield 1; }"
+        "var s = 0; for (var i = 0; i < 3000; i++) { var v = new V(i); s += v.x + v.y; var w = new W(i); s += w.x + w.z; }"
+        "out.push(s); T.boom = false; for (var i = 0; i < 500; i++) new T();"
+        "T.boom = true; try { for (var i = 0; i < 500; i++) new T(); } catch (e) { out.push(e.message); }"
+        "try { for (var i = 0; i < 500; i++) new G(); } catch (e) { out.push(e.constructor.name); }"
+        "var m = { f() {} }; try { for (var i = 0; i < 500; i++) new m.f(); } catch (e) { out.push(e.constructor.name); }"
+        "try { for (var i = 0; i < 500; i++) V(1); } catch (e) { out.push(e.constructor.name); } out.join(' ')";
+    for (bool eager : {false, true}) {
+        script::Context::Options options;
+        if (eager)
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("13510500 init TypeError TypeError TypeError"));
+    }
+}

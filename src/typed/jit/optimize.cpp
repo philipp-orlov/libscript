@@ -1702,37 +1702,46 @@ public:
 
     void run()
     {
-        for (bool again = true; again;) {
-            again = false;
-            for (std::size_t i = 0; i + 1 < fn_.code.size(); ++i) {
-                if (fn_.code[i].op == IrOp::Label && !done_.count(fn_.code[i].imm) && rotate(i)) {
-                    again = true;
-                    break;
-                }
-            }
+        // Labels in order, each once: the code before one is never looked at again, so after a rotation, which moves
+        // the code after the loop's head, the walk goes on from there with where the branches are worked out afresh.
+        findBranches();
+        for (std::size_t i = 0; i + 1 < fn_.code.size(); ++i) {
+            if (fn_.code[i].op == IrOp::Label && !done_.count(fn_.code[i].imm) && rotate(i))
+                findBranches();
         }
     }
 
 private:
+    /// For each label, where the branches to it are, in order.
+    void findBranches()
+    {
+        branchesTo_.assign(std::size_t(fn_.labelCount), {});
+        for (std::size_t i = 0; i < fn_.code.size(); ++i) {
+            const IrInst& in = fn_.code[i];
+            if (in.op == IrOp::Br && in.imm >= 0 && in.imm < fn_.labelCount)
+                branchesTo_[std::size_t(in.imm)].push_back(std::uint32_t(i));
+            else if ((in.op == IrOp::BrCmp || in.op == IrOp::BrFCmp) && in.target >= 0 && in.target < fn_.labelCount)
+                branchesTo_[std::size_t(in.target)].push_back(std::uint32_t(i));
+        }
+    }
+
     bool rotate(std::size_t head)
     {
         const std::int64_t label = fn_.code[head].imm;
         done_.insert(label);
         const IrInst test = fn_.code[head + 1];
-        if (test.op != IrOp::BrCmp)
+        if (test.op != IrOp::BrCmp || label < 0 || label >= std::int64_t(branchesTo_.size()))
             return false;
         // The back branch: the last plain branch to this label, with the test's operands unchanged meaning at that point
         // because the test reads them afresh.
         std::size_t back = 0;
         std::uint32_t backs = 0;
-        for (std::size_t i = head + 2; i < fn_.code.size(); ++i) {
-            const IrInst& in = fn_.code[i];
-            if ((in.op == IrOp::Br && in.imm == label) ||
-                ((in.op == IrOp::BrCmp || in.op == IrOp::BrFCmp) && in.target == label)) {
-                ++backs;
-                if (in.op == IrOp::Br)
-                    back = i;
-            }
+        for (const std::uint32_t i : branchesTo_[std::size_t(label)]) {
+            if (i < head + 2)
+                continue;
+            ++backs;
+            if (fn_.code[i].op == IrOp::Br)
+                back = i;
         }
         if (backs != 1 || back == 0)
             return false;
@@ -1781,6 +1790,7 @@ private:
 
     IrFunction& fn_;
     std::set<std::int64_t> done_;
+    std::vector<std::vector<std::uint32_t>> branchesTo_;
 };
 
 }  // namespace

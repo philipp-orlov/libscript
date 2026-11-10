@@ -957,7 +957,7 @@ void Value::setPrototype(const Value& proto)
 {
 #if SCRIPT_ENGINE_DYNAMIC
     if (dyn::DynObject* obj = dyn::asObject(*this))
-        obj->proto.reset(dyn::asObject(proto));
+        obj->setProto(dyn::asObject(proto));
 #else
     (void)proto;
     noEngine("setPrototype");

@@ -156,6 +156,30 @@ TEST(scriptFunctionsAreCallableFromCpp)
     CHECK_EQ(object.invoke("add", {js::Value(5)}).toDouble(), 15.0);
 }
 
+TEST(aPrototypeSetFromCppIsSeenByWhatSitesLearned)
+{
+    // What a read site learned about where `x` is on the chain, and what native code compiled from it assumes, no longer
+    // holds once the prototype is changed from C++; nor does what it learned about a prototype that has since gained one.
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        ctx.eval("var p = {x: 1}, q = {x: 2}, o = Object.create(p);"
+                 "function read(o) { return o.x; } function readY(o) { return o.y; }"
+                 "var s = 0; for (var i = 0; i < 400; i++) { s += read(o); readY(o); }", "<test>");
+        js::Value o = ctx.global().get("o");
+        o.setPrototype(ctx.global().get("q"));
+        CHECK_EQ(ctx.eval("var t = 0; for (var i = 0; i < 400; i++) { t += read(o); readY(o); }"
+                          "q.y = 5; [s, t, read(o), readY(o)].join()", "<test>").toString(),
+                 std::string("400,800,2,5"));
+    }
+}
+
 TEST(objectsAreBuiltAndInspectedFromCpp)
 {
     js::Context ctx;

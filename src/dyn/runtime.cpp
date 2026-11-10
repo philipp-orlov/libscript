@@ -217,6 +217,12 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     atom.protoName.reset(intern("__proto__"));
     atom.arguments.reset(intern("arguments"));
     atom.toJSON.reset(intern("toJSON"));
+    {
+        auto* absent = newCell<DynObject>();
+        absent->putOwn(intern("absent"), Value::undefined(), PropDefault);
+        absent->pin();
+        absentHolder.reset(absent, true);
+    }
 
     auto wellKnown = [this](const char* description) {
         auto* s = newCell<SymbolCell>();
@@ -363,7 +369,7 @@ void Runtime::releaseRoots() noexcept
     arrayCtor.reset();
     functionCtor.reset();
     promiseCtor.reset();
-    for (Ref<DynObject>* p : {&globalObject, &objectProto, &functionProto, &arrayProto,
+    for (Ref<DynObject>* p : {&globalObject, &absentHolder, &objectProto, &functionProto, &arrayProto,
                               &stringProto, &numberProto, &booleanProto, &symbolProto,
                               &errorProto, &dateProto, &mapProto, &setProto, &weakMapProto, &weakSetProto, &argumentsProto, &promiseProto, &generatorProto, &generatorFunctionProto, &asyncFunctionProto, &asyncIteratorProto,
                               &asyncGeneratorProto, &asyncGeneratorFunctionProto,

@@ -2206,3 +2206,46 @@ TEST(nativeCodeConstructsAClassDirectly)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("13510500 init TypeError TypeError TypeError"));
     }
 }
+
+TEST(aPropertyAbsentFromTheWholeChainIsCachedAndForgottenWhenItAppears)
+{
+    // A read of a property no object on the chain has is learned by its site; whatever gives the receiver or anything
+    // on its chain the property, or changes the chain, is seen by the interpreter and by native code alike.
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "function ra(o) { return o.missing; } var a = {p: 1}; for (k = 0; k < 400; k++) ra(a); S(ra(a)); a.missing = 1; S(ra(a));"
+        "function rb(o) { return o.missing; } function P() {} var b = new P(); for (k = 0; k < 400; k++) rb(b);"
+        "Object.getPrototypeOf(b).missing = 2; S(rb(b));"
+        "function rc(o) { return o.missing; } var c = {q: 1}; for (k = 0; k < 400; k++) rc(c);"
+        "Object.prototype.missing = 3; S(rc(c)); delete Object.prototype.missing; S(rc(c));"
+        "function rd(o) { return o.missing; } var d = {r: 1}; for (k = 0; k < 400; k++) rd(d);"
+        "Object.setPrototypeOf(d, {missing: 4}); S(rd(d));"
+        "function re(o) { return o.missing; } var m2 = {}, m1 = Object.create(m2), e = Object.create(m1);"
+        "for (k = 0; k < 400; k++) re(e); Object.setPrototypeOf(m1, {missing: 5}); S(re(e));"
+        "function rf(o) { return o.missing; } var fp = {}, f = Object.create(fp); for (k = 0; k < 400; k++) rf(f);"
+        "Object.defineProperty(fp, 'missing', {get() { return 6; }, configurable: true}); S(rf(f));"
+        "function rg(o) { return o.missing; } var hits = 0, px = new Proxy({}, {get() { hits++; return undefined; }}),"
+        "  g = Object.create(px); for (k = 0; k < 400; k++) rg(g); S(rg(g)); S(hits);"
+        "function rl(o) { return o.length; } function r3(o) { return o['3']; } var arr = [0, 1, 2];"
+        "for (k = 0; k < 400; k++) { rl(arr); r3(arr); } S(rl(arr)); S(r3(arr)); arr.push(9); S(rl(arr)); S(r3(arr));"
+        "function ri(o) { return o.missing; } var five = [{missing: 'i1'}, {a: 1}, {b: 1}, {missing: 'i2', c: 1}, {d: 1}];"
+        "for (k = 0; k < 400; k++) ri(five[k % 5]); for (k = 0; k < 5; k++) S(ri(five[k]));"
+        "class A {} class B extends A {} class C extends B {} class D extends C { m() { return super.missing; } }"
+        "function rj(o) { return o.missing; } var j = new C(), dd = new D();"
+        "for (k = 0; k < 400; k++) { rj(j); dd.m(); } S(rj(j)); S(dd.m());"
+        "A.prototype.missing = 'j'; S(rj(j)); S(dd.m()); B.prototype.missing = 'js'; S(rj(j)); S(dd.m());"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("undefined 1 2 3 undefined 4 5 6 undefined 401 3 undefined 4 9 i1 undefined undefined i2 "
+                             "undefined undefined undefined j j js js"));
+    }
+}

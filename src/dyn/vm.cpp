@@ -4,6 +4,7 @@
 // Abstract operations, the call protocol and the dispatch loop.
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -747,6 +748,24 @@ inline PropertySite* siteOf(const FunctionCode& code, std::uint32_t site) noexce
     return &code.sites[site];
 }
 
+/// What a site that is about to be written over knew.
+inline void overwriteCensus(const PropertySite* site, const DynObject* obj) noexcept
+{
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (!site->shape)
+        SCRIPT_CENSUS(LearnFirst);
+    else if (site->shape == obj->shape || site->moreFind(obj->shape) >= 0)
+        SCRIPT_CENSUS(LearnStaleEpoch);
+    else if (site->moreCount == PropertySite::kMoreShapes)
+        SCRIPT_CENSUS(LearnResetFullSite);
+    else
+        SCRIPT_CENSUS(LearnReplace);
+#else
+    (void)site;
+    (void)obj;
+#endif
+}
+
 /// A read that missed: do it the long way and teach the site, when what it finds will stay where it is.
 Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, PropertySite* site)
 {
@@ -776,7 +795,8 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
     const bool answeredApart = key == rt.atom.length.get() || arrayIndexOf(static_cast<StringCell*>(key)->text(), index);
     // A typed array anywhere on the way answers for anything that reads as a number.
     double numeric = 0;
-    if (numericKey(key, numeric)) {
+    const bool numericName = numericKey(key, numeric);
+    if (numericName) {
         for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
             if (cursor->cls == ObjClass::TypedArray)
                 return getProperty(rt, base, key);
@@ -784,8 +804,13 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
     }
     if ((obj->cls == ObjClass::StringObject || obj->cls == ObjClass::Array) && answeredApart)
         return getProperty(rt, base, key);
+    // Whether every object on the chain answers this name by its own table and nothing else: a proxy's handler answers
+    // for it, and a host object may.
+    bool ordinaryChain = true;
     DynObject* cursor = obj;
     for (; cursor; cursor = cursor->proto.get()) {
+        if (cursor->fnKindIsProxy() || (cursor->rare && cursor->rare->nativeSlot))
+            ordinaryChain = false;
         if (cursor != obj && answeredApart && (cursor->cls == ObjClass::StringObject || cursor->cls == ObjClass::Array)) {
             SCRIPT_CENSUS(LearnPresentUnlearnable);
             break;
@@ -823,16 +848,7 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
                 return p->value;
             }
         }
-#if defined(SCRIPT_JIT_ENV_OVERRIDE)
-        if (!site->shape)
-            SCRIPT_CENSUS(LearnFirst);
-        else if (site->shape == obj->shape || site->moreFind(obj->shape) >= 0)
-            SCRIPT_CENSUS(LearnStaleEpoch);
-        else if (site->moreCount == PropertySite::kMoreShapes)
-            SCRIPT_CENSUS(LearnResetFullSite);
-        else
-            SCRIPT_CENSUS(LearnReplace);
-#endif
+        overwriteCensus(site, obj);
         site->shape = obj->shape;
         site->holder = cursor == obj ? nullptr : cursor;
         site->addTo = nullptr;
@@ -841,6 +857,33 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
         site->epoch = rt.ctx.protoEpoch;
         site->moreCount = 0;
         return p->value;
+    }
+    // On no object of the chain, which nothing but the tables could have answered: the site learns that as a property of
+    // `absentHolder`, kept while the receiver's shape and `protoEpoch` stay, since giving the receiver the property
+    // changes its shape and giving any prototype one moves the epoch. An array or a string object answers `length` and
+    // its indices, and a typed array numbers, apart from their tables; a pending `prototype` is made when asked for.
+    if (!cursor && ordinaryChain && !answeredApart && !numericName && key != rt.atom.prototype.get()) {
+        DynObject* const absent = rt.absentHolder.get();
+        assert(absent->props.size() == 1 && absent->props[0].value.isUndefined());
+        if (site->plainRead() && obj->shape != site->shape && site->moreFind(obj->shape) < 0 &&
+            site->moreCount < PropertySite::kMoreShapes) {
+            if (!site->anyHolder() || site->epoch == rt.ctx.protoEpoch) {
+                if (!site->anyHolder())
+                    site->epoch = rt.ctx.protoEpoch;
+                site->addShape(obj->shape, 0, absent);
+                SCRIPT_CENSUS(LearnAddShape);
+                return Value::undefined();
+            }
+        }
+        overwriteCensus(site, obj);
+        site->shape = obj->shape;
+        site->holder = absent;
+        site->addTo = nullptr;
+        site->getter = false;
+        site->index = 0;
+        site->epoch = rt.ctx.protoEpoch;
+        site->moreCount = 0;
+        return Value::undefined();
     }
     if (!cursor)
         SCRIPT_CENSUS(LearnAbsent);

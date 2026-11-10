@@ -135,6 +135,10 @@ struct Runtime : EngineRuntime
 
     // ---- intrinsics ----
     Ref<DynObject> globalObject;
+    /// What a read site learns for a property that no object on the receiver's chain has: a holder up the chain whose
+    /// one property is `undefined`, so every reader of a site answers it as it answers a property found on a prototype,
+    /// under the same checks. Never seen by a program and never changed.
+    Ref<DynObject> absentHolder;
     /// Changes whenever the global object's table moves, loses a property or changes one's attributes: while it stays,
     /// a global is where native code last saw it, and the same kind of property.
     std::size_t jsonSizeSeen = 0;

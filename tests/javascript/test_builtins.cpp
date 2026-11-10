@@ -100,6 +100,15 @@ TEST(numberFormattingRoundsTiesAwayFromZero)
              std::string("3e+0 1.3e+0 1e+1 0.00e+0 -1.23e+4"));
 }
 
+TEST(numberFormattingAnswersANumberThatIsNotFiniteBeforeLookingAtTheDigits)
+{
+    CHECK_EQ(run("[NaN.toExponential(1000), Infinity.toExponential(-1), (-Infinity).toPrecision(0), NaN.toPrecision(101)].join()"),
+             std::string("NaN,Infinity,-Infinity,NaN"));
+    CHECK_EQ(run("var r = []; for (var f of [() => (1).toExponential(101), () => (1).toExponential(-1), () => (1).toPrecision(0),"
+                 " () => (1).toPrecision(101), () => (1).toFixed(101)]) { try { f(); r.push('no'); } catch (e) { r.push(e.constructor.name); } } r.join()"),
+             std::string("RangeError,RangeError,RangeError,RangeError,RangeError"));
+}
+
 TEST(errorCauseComesFromTheOptionsArgument)
 {
     CHECK_EQ(run("const e = new TypeError('m', { cause: 1 });"

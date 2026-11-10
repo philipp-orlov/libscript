@@ -109,14 +109,20 @@ void installNumber(Runtime& rt)
         if (ci.arg(0).isUndefined())
             return rt2.str(numberToString(thisNumber(ci)));
         const int digits = int(toNumber(rt2, ci.arg(0)));
+        const double x = thisNumber(ci);
+        // A number that is not finite is answered before the digits are looked at.
+        if (!std::isfinite(x))
+            return rt2.str(numberToString(x));
         if (digits < 1 || digits > 100)
             ci.fail(ErrorCode::RangeError, "toPrecision digits must be between 1 and 100");
-        return rt2.str(numberToPrecision(thisNumber(ci), digits));
+        return rt2.str(numberToPrecision(x, digits));
     }, 1);
 
     rt.method(proto, "toExponential", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         const int digits = ci.arg(0).isUndefined() ? 6 : int(toNumber(rt2, ci.arg(0)));
+        if (!std::isfinite(thisNumber(ci)))
+            return rt2.str(numberToString(thisNumber(ci)));
         if (digits < 0 || digits > 100)
             ci.fail(ErrorCode::RangeError, "toExponential digits must be between 0 and 100");
         return rt2.str(numberToExponential(thisNumber(ci), digits));

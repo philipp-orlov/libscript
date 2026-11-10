@@ -3,11 +3,13 @@
 
 // What native code for the dynamic languages calls, and how it is entered.
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
 #include <unistd.h>
@@ -1285,7 +1287,15 @@ bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunctio
         info->spillOffset = (fn.frameAreaBytes + 7u) & ~7u;
     }
     code.jitCode = compiled;
-    rt.jitCodes.push_back(compiled);
+    // Kept in address order for describeNativeFrames; retiring code erases without disturbing it.
+    rt.jitCodes.insert(std::lower_bound(rt.jitCodes.begin(), rt.jitCodes.end(), compiled,
+                                        [](const typed::NativeCode* a, const typed::NativeCode* b) {
+                                            return std::less<const void*>()(a->codeStart, b->codeStart);
+                                        }),
+                       compiled);
+    assert(std::is_sorted(rt.jitCodes.begin(), rt.jitCodes.end(), [](const typed::NativeCode* a, const typed::NativeCode* b) {
+        return std::less<const void*>()(a->codeStart, b->codeStart);
+    }));
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     // For perf: the code's name, which a profile then shows in place of an address.
     if (std::getenv("SCRIPT_PERF_MAP")) {
@@ -1550,12 +1560,15 @@ std::string describeNativeFrames(const Runtime& rt, void* topFrame, const void* 
     std::string out;
     const auto find = [&rt](const void* pc) -> const typed::NativeCode* {
         const auto* at = static_cast<const std::uint8_t*>(pc);
-        for (const typed::NativeCode* code : rt.jitCodes) {
-            const auto* start = static_cast<const std::uint8_t*>(code->codeStart);
-            if (at >= start && at < start + code->codeBytes)
-                return code;
-        }
-        return nullptr;
+        // The last code that starts at or before the address, if the address is inside it.
+        auto next = std::upper_bound(rt.jitCodes.begin(), rt.jitCodes.end(), pc,
+                                     [](const void* address, const typed::NativeCode* code) {
+                                         return std::less<const void*>()(address, code->codeStart);
+                                     });
+        if (next == rt.jitCodes.begin())
+            return static_cast<const typed::NativeCode*>(nullptr);
+        const typed::NativeCode* code = *--next;
+        return at < static_cast<const std::uint8_t*>(code->codeStart) + code->codeBytes ? code : nullptr;
     };
     const auto describe = [&](const void* pc) -> bool {
         const typed::NativeCode* code = find(pc);

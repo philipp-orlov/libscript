@@ -2058,6 +2058,29 @@ TEST(aUnaryOperatorBeforeExponentiationIsASyntaxError)
     }
 }
 
+TEST(aStackCapturedFromCompiledCodeNamesTheFunctionsInOrder)
+{
+    // The frames of compiled code are found by address among all the compiled functions: a stack keeps at most 16
+    // frames, innermost first, so 12 functions and the one that makes the Error fit in it.
+    const char* program =
+        "var fns = [];"
+        "for (var n = 0; n < 12; n++) fns.push(new Function('next', 'return function f' + n + '(k) { return next(k); }'));"
+        "function leaf() { return new Error('x').stack; }"
+        "var chain = leaf;"
+        "for (var n = 0; n < 12; n++) chain = fns[n](chain);"
+        "var stack = ''; for (var i = 0; i < 60; i++) stack = chain(i);"
+        "var at = [stack.indexOf(' leaf ')]; for (var n = 0; n < 12; n++) at.push(stack.indexOf(' f' + n + ' '));"
+        "var ordered = at[0] >= 0; for (var n = 1; n < at.length; n++) if (at[n] <= at[n - 1]) ordered = false;"
+        "ordered";
+    for (auto mode : {script::JitOptions::Mode::Off, script::JitOptions::Mode::Eager}) {
+        script::Context::Options options;
+        options.jit.mode = mode;
+        options.runtimeCode = true;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("true"));
+    }
+}
+
 TEST(aGeneratorIsSteppedWithoutAResultObject)
 {
     // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the

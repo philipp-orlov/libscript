@@ -11,6 +11,7 @@
 #include "script/internal/typed/runtime.hpp"
 #endif
 #if SCRIPT_ENGINE_DYNAMIC
+#include "script/internal/dyn/census.hpp"
 #include "script/internal/dyn/runtime.hpp"
 #endif
 
@@ -331,8 +332,10 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
             // A plain object with nothing unusual about it: its values and its prototype are all it holds.
             auto* object = static_cast<dyn::DynObject*>(cell);
             // What sites and native code learned about where a property is may name this one: it no longer holds.
-            if (object->isProto)
+            if (object->isProto) {
+                SCRIPT_CENSUS(EpochProtoDied);
                 ++protoEpoch;
+            }
             if (object->rare || object->props.heapCapacity() != 0 ||
                 (object->cls != dyn::ObjClass::Plain && (object->cls != dyn::ObjClass::Array || !object->props.empty()))) {
                 cell->~GCObject();

@@ -10,6 +10,9 @@
 #include <cstring>
 #include <optional>
 #include <limits>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "script/internal/dyn/vm.hpp"
 #if SCRIPT_ENABLE_DYN_JIT
@@ -18,6 +21,7 @@
 #include "script/internal/dyn/jit_helpers.hpp"
 #include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/census.hpp"
 #include "script/internal/dyn/compiler.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/parser.hpp"
@@ -747,10 +751,21 @@ inline PropertySite* siteOf(const FunctionCode& code, std::uint32_t site) noexce
 Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, PropertySite* site)
 {
     DynObject* obj = asObject(base);
+    SCRIPT_CENSUS(LearnTotal);
     // A pending prototype is made before anything up the chain could answer in its place.
     if (key == rt.atom.prototype.get())
         ensurePrototype(rt, obj);
     if (!site || !obj || !obj->shape || key->kind != CellKind::String) {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (!site)
+            SCRIPT_CENSUS(LearnNoSite);
+        else if (!obj)
+            SCRIPT_CENSUS(LearnNotObject);
+        else if (!obj->shape)
+            SCRIPT_CENSUS(LearnNoShape);
+        else
+            SCRIPT_CENSUS(LearnKeyNotString);
+#endif
         if (site)
             ++site->misses;
         return getProperty(rt, base, key);
@@ -769,17 +784,22 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
     }
     if ((obj->cls == ObjClass::StringObject || obj->cls == ObjClass::Array) && answeredApart)
         return getProperty(rt, base, key);
-    for (DynObject* cursor = obj; cursor; cursor = cursor->proto.get()) {
-        if (cursor != obj && answeredApart && (cursor->cls == ObjClass::StringObject || cursor->cls == ObjClass::Array))
+    DynObject* cursor = obj;
+    for (; cursor; cursor = cursor->proto.get()) {
+        if (cursor != obj && answeredApart && (cursor->cls == ObjClass::StringObject || cursor->cls == ObjClass::Array)) {
+            SCRIPT_CENSUS(LearnPresentUnlearnable);
             break;
+        }
         const Prop* p = cursor->findOwn(key);
         if (!p)
             continue;
         const std::uint32_t at = std::uint32_t(p - cursor->props.data());
         if (cursor->accessorOf(*p)) {
             // A getter that is a function, called with the receiver each time; the property itself stays put.
-            if (!p->value.isObject() || cursor == obj)
+            if (!p->value.isObject() || cursor == obj) {
+                SCRIPT_CENSUS(LearnPresentUnlearnable);
                 break;
+            }
             site->shape = obj->shape;
             site->holder = cursor;
             site->addTo = nullptr;
@@ -799,9 +819,20 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
                 if (where && !site->anyHolder())
                     site->epoch = rt.ctx.protoEpoch;
                 site->addShape(obj->shape, at, where);
+                SCRIPT_CENSUS(LearnAddShape);
                 return p->value;
             }
         }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (!site->shape)
+            SCRIPT_CENSUS(LearnFirst);
+        else if (site->shape == obj->shape || site->moreFind(obj->shape) >= 0)
+            SCRIPT_CENSUS(LearnStaleEpoch);
+        else if (site->moreCount == PropertySite::kMoreShapes)
+            SCRIPT_CENSUS(LearnResetFullSite);
+        else
+            SCRIPT_CENSUS(LearnReplace);
+#endif
         site->shape = obj->shape;
         site->holder = cursor == obj ? nullptr : cursor;
         site->addTo = nullptr;
@@ -811,6 +842,8 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
         site->moreCount = 0;
         return p->value;
     }
+    if (!cursor)
+        SCRIPT_CENSUS(LearnAbsent);
     ++site->misses;
     return getProperty(rt, base, key);
 }
@@ -2029,16 +2062,19 @@ Vec<Value> iterableToVector(Runtime& rt, const Value& iterable)
 
 Value getPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand)
 {
+    SCRIPT_CENSUS(GetPropForNative);
     return getPropertySite(rt, code, base, code.atoms[operand & kAtomMask].get(), operand >> kSiteShift);
 }
 
 void setPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand, const Value& v)
 {
+    SCRIPT_CENSUS(SetPropForNative);
     setPropertySite(rt, code, base, code.atoms[operand & kAtomMask].get(), v, operand >> kSiteShift);
 }
 
 Value getGlobalForNative(Runtime& rt, GCObject* key)
 {
+    SCRIPT_CENSUS(GetGlobalForNative);
     const Prop* p = rt.globalObject->findOwn(key);
     if (p && !rt.globalObject->accessorOf(*p))
         return p->value;
@@ -2328,6 +2364,61 @@ std::uint64_t* slowOpCounts()
     }();
     return counts;
 }
+
+std::uint64_t censusTable[std::size_t(Census::Count)] = {};
+
+const char* const kCensusNames[] = {
+    "EpochSetProto", "EpochDropShape", "EpochAppendKnown", "EpochPutOwn", "EpochClearReferences", "EpochProtoDied",
+    "LearnTotal", "LearnNoSite", "LearnNoShape", "LearnKeyNotString", "LearnNotObject", "LearnStaleEpoch",
+    "LearnAddShape", "LearnResetFullSite", "LearnFirst", "LearnReplace", "LearnAbsent", "LearnPresentUnlearnable",
+    "GetPropForNative", "SetPropForNative", "GetGlobalForNative", "GetElemTotal", "GetElemByNumber",
+    "GetElemStringKey", "GetElemOtherKey", "DynCallTotal", "DynCallBuiltin", "DynCallBytecode", "DynCallBound",
+    "DynCallOther", "NewThisTotal", "NewThisRefused", "NewThisFieldInit", "Bail", "SweepCalls", "SweepFreedNothing",
+};
+static_assert(sizeof(kCensusNames) / sizeof(kCensusNames[0]) == std::size_t(Census::Count), "a name per counter");
+
+/// Never freed: the printer runs at exit, after static destructors may have run.
+std::unordered_map<std::string, std::uint64_t>& censusNameCounts()
+{
+    static auto* counts = new std::unordered_map<std::string, std::uint64_t>();
+    return *counts;
+}
+
+const bool censusEnabled = [] {
+    if (!std::getenv("SCRIPT_CENSUS"))
+        return false;
+    std::atexit([] {
+        for (std::size_t i = 0; i < std::size_t(Census::Count); ++i)
+            if (censusTable[i])
+                std::fprintf(stderr, "census %-24s %14llu\n", kCensusNames[i], static_cast<unsigned long long>(censusTable[i]));
+        std::vector<std::pair<std::uint64_t, std::string>> all;
+        for (const auto& kv : censusNameCounts())
+            all.push_back({kv.second, kv.first});
+        std::sort(all.rbegin(), all.rend());
+        for (std::size_t i = 0; i < all.size() && i < 40; ++i)
+            std::fprintf(stderr, "names %14llu  %s\n", static_cast<unsigned long long>(all[i].first), all[i].second.c_str());
+    });
+    return true;
+}();
+}  // namespace
+
+std::uint64_t* censusCounts() noexcept
+{
+    return censusTable;
+}
+
+bool censusOn() noexcept
+{
+    return censusEnabled;
+}
+
+void censusName(const std::string& text)
+{
+    if (censusEnabled)
+        ++censusNameCounts()[text];
+}
+
+namespace {
 #endif
 
 [[gnu::noinline]] Step slowStep(Runtime& rt, Frame& frame, Op op, Value& leaving)

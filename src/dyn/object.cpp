@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "script/internal/dyn/bytecode.hpp"
+#include "script/internal/dyn/census.hpp"
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/dyn/runtime.hpp"
 
@@ -152,8 +153,10 @@ void DynObject::setProto(DynObject* next)
 {
     if (next)
         next->isProto = true;
-    if (isProto && rt)
+    if (isProto && rt) {
+        SCRIPT_CENSUS(EpochSetProto);
         ++rt->protoEpoch;
+    }
     proto.reset(next);
     // With nothing in it yet, it can start from what that prototype's other children start from.
     Runtime* engine = rt ? rt->dynIfAny() : nullptr;
@@ -183,8 +186,10 @@ void DynObject::moveKeysHere() noexcept
 void DynObject::dropShape() noexcept
 {
     moveKeysHere();
-    if (isProto && rt)
+    if (isProto && rt) {
+        SCRIPT_CENSUS(EpochDropShape);
         ++rt->protoEpoch;
+    }
     tableChanged();
 }
 
@@ -203,8 +208,10 @@ void DynObject::appendKnown(Value value, Shape* next)
         tableChanged();
     chargeIfGrown(props, before);
     shape = next;
-    if (isProto)
+    if (isProto) {
+        SCRIPT_CENSUS(EpochAppendKnown);
         ++rt->protoEpoch;
+    }
 }
 
 Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
@@ -243,8 +250,10 @@ Prop& DynObject::putOwn(GCObject* key, Value value, std::uint8_t attrs)
         else if (!r.index.empty())
             indexInsert(std::uint32_t(props.size() - 1));
     }
-    if (isProto && rt)
+    if (isProto && rt) {
+        SCRIPT_CENSUS(EpochPutOwn);
         ++rt->protoEpoch;
+    }
     return p;
 }
 
@@ -352,8 +361,10 @@ void DynObject::setSetterOf(GCObject* key, Value fn)
 void DynObject::clearReferences()
 {
     // Emptied by the cycle collector, and gone soon after: nothing found here earlier is here now.
-    if (isProto && rt)
+    if (isProto && rt) {
+        SCRIPT_CENSUS(EpochClearReferences);
         ++rt->protoEpoch;
+    }
     shape = nullptr;
     proto.reset();
     props.clear();

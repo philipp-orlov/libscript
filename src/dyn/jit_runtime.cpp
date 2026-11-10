@@ -16,6 +16,7 @@
 #endif
 
 #include "script/internal/dyn/builtins.hpp"
+#include "script/internal/dyn/census.hpp"
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/jit.hpp"
 #include "script/internal/dyn/jit_helpers.hpp"
@@ -382,13 +383,69 @@ void scriptDynSetProp(Runtime* rt, const FunctionCode* code, std::int64_t tag, s
     });
 }
 
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+/// `getElem key=<type> base=<class>`, for the census of keyed reads that took the long way.
+static std::string elemCensusText(const Value& base, const Value& key)
+{
+    std::string text = std::string("getElem key=") + toString(key.type());
+    if (key.isDouble()) {
+        const double d = detail::Access::r8(key);
+        text += d == double(std::int64_t(d)) ? "(int)" : "(frac)";
+    } else if (key.isSymbol() && static_cast<SymbolCell*>(detail::Access::ptr(key))->isPrivate) {
+        text += "(private)";
+    }
+    text += " base=";
+    if (DynObject* o = asObject(base)) {
+        switch (o->cls) {
+            case ObjClass::Array: text += "Array"; break;
+            case ObjClass::TypedArray: text += "TypedArray"; break;
+            case ObjClass::Plain: text += o->shape ? "Plain" : "Plain(dictionary)"; break;
+            default: text += "otherObject"; break;
+        }
+    } else {
+        text += toString(base.type());
+    }
+    return text;
+}
+
+static void callCensus(const Value& callee)
+{
+    SCRIPT_CENSUS(DynCallTotal);
+    DynFunction* fn = asFunction(callee);
+    const char* what = "call other ";
+    if (!fn)
+        SCRIPT_CENSUS(DynCallOther);
+    else if (fn->fnKind == FnKind::Native)
+        SCRIPT_CENSUS(DynCallBuiltin), what = "call builtin ";
+    else if (fn->fnKind == FnKind::Bytecode)
+        SCRIPT_CENSUS(DynCallBytecode), what = "call bytecode ";
+    else if (fn->fnKind == FnKind::Bound)
+        SCRIPT_CENSUS(DynCallBound), what = "call bound ";
+    else
+        SCRIPT_CENSUS(DynCallOther);
+    if (censusOn())
+        censusName(what + (fn ? toUtf8(fn->name) : std::string(toString(callee.type()))));
+}
+#endif
+
 NativePair scriptDynGetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t keyTag,
                             std::uint64_t key) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
         Value element;
-        if (getElementByNumber(*rt, valueOf(tag, payload), valueOf(keyTag, key), element))
+        SCRIPT_CENSUS(GetElemTotal);
+        if (getElementByNumber(*rt, valueOf(tag, payload), valueOf(keyTag, key), element)) {
+            SCRIPT_CENSUS(GetElemByNumber);
             return keep(*rt, element);
+        }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (Type(keyTag) == Type::String)
+            SCRIPT_CENSUS(GetElemStringKey);
+        else
+            SCRIPT_CENSUS(GetElemOtherKey);
+        if (censusOn())
+            censusName(elemCensusText(valueOf(tag, payload), valueOf(keyTag, key)));
+#endif
         Ref<GCObject> k = toPropertyKey(*rt, valueOf(keyTag, key));
         return keep(*rt, getProperty(*rt, valueOf(tag, payload), k.get()));
     });
@@ -421,6 +478,7 @@ void scriptDynSetGlobal(Runtime* rt, GCObject* key, std::int64_t tag, std::uint6
 
 NativePair scriptDynBail(Runtime* rt, const DeoptInfo* info, const char* frame) noexcept
 {
+    SCRIPT_CENSUS(Bail);
     const std::uint64_t* saved = rt->bailRegs;
     const auto word = [&](std::int32_t at) -> std::uint64_t {
         const std::int32_t place = info->places[std::size_t(at)];
@@ -488,6 +546,9 @@ NativePair scriptDynCall(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std:
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
         ContextImpl::ArgBuffer buffer(rt->ctx);
         buffer.args.assign(args, args + argc);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        callCensus(valueOf(fnTag, fn));
+#endif
         return take(callValue(*rt, valueOf(fnTag, fn), valueOf(thisTag, self), buffer.args));
     });
 }
@@ -510,11 +571,14 @@ GCObject* scriptDynNewOf(Runtime* rt, GCObject* proto, std::uint64_t room) noexc
 GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
 {
     auto* fn = static_cast<DynFunction*>(cell);
+    SCRIPT_CENSUS(NewThisTotal);
     // A prototype still to make is made by the long way, which can allocate; so is anything `new` refuses, and a derived
     // class, which has no object until `super()`.
     if (fn->fnKind != FnKind::Bytecode || fn->isArrow || fn->prototypePending || fn->isDerivedConstructor || !fn->code ||
-        fn->code->isGenerator || fn->code->isAsync || fn->code->isMethod)
+        fn->code->isGenerator || fn->code->isAsync || fn->code->isMethod) {
+        SCRIPT_CENSUS(NewThisRefused);
         return nullptr;
+    }
     const Prop* prototype = fn->findOwn(rt->atom.prototype.get());
     if (!prototype || fn->accessorOf(*prototype))
         return nullptr;
@@ -526,6 +590,7 @@ GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
         DynObject* made = rt->newObjectSized(proto, root ? std::min<std::uint32_t>(root->expect, 32) : 0);
         // A class's fields go on before its constructor runs.
         if (DynFunction* init = fn->fieldInit.get()) {
+            SCRIPT_CENSUS(NewThisFieldInit);
             // Held by `self` while they do, so that one that throws lets it go.
             const Value self = detail::Access::adopt(Type::Object, made);
             ContextImpl::ArgBuffer none(rt->ctx);
@@ -1411,6 +1476,7 @@ void sweepRetiredNative(Runtime& rt) noexcept
 {
     if (rt.jitRetired.empty() || !rt.jitBackend)
         return;
+    SCRIPT_CENSUS(SweepCalls);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("SCRIPT_JIT_NO_SWEEP"))
         return;
@@ -1440,8 +1506,10 @@ void sweepRetiredNative(Runtime& rt) noexcept
     std::vector<typed::NativeCode*> freed;
     for (std::size_t i = 0; i < retired.size(); ++i)
         (inUse[i] ? kept : freed).push_back(retired[i]);
-    if (freed.empty())
+    if (freed.empty()) {
+        SCRIPT_CENSUS(SweepFreedNothing);
         return;
+    }
     std::sort(freed.begin(), freed.end());
     rt.jitCodes.erase(std::remove_if(rt.jitCodes.begin(), rt.jitCodes.end(),
                                      [&freed](typed::NativeCode* code) { return std::binary_search(freed.begin(), freed.end(), code); }),

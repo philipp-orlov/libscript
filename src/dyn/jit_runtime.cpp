@@ -1498,9 +1498,16 @@ void sweepRetiredNative(Runtime& rt) noexcept
         return a->codeStart < b->codeStart;
     });
     std::vector<bool> inUse(retired.size(), false);
+    // Most words on a stack are nowhere near code: those are passed over without a search.
+    const auto lowest = reinterpret_cast<std::uintptr_t>(retired.front()->codeStart);
+    std::uintptr_t highest = 0;
+    for (const typed::NativeCode* code : retired)
+        highest = std::max(highest, reinterpret_cast<std::uintptr_t>(code->codeStart) + code->codeBytes);
     volatile std::uintptr_t here = 0;
     for (auto at = reinterpret_cast<std::uintptr_t>(&here) & ~std::uintptr_t(7); at + sizeof(void*) <= ceiling; at += sizeof(void*)) {
         const std::uintptr_t word = *reinterpret_cast<const std::uintptr_t*>(at);
+        if (word < lowest || word >= highest)
+            continue;
         auto it = std::upper_bound(retired.begin(), retired.end(), word, [](std::uintptr_t w, const typed::NativeCode* code) {
             return w < reinterpret_cast<std::uintptr_t>(code->codeStart);
         });
@@ -1515,8 +1522,10 @@ void sweepRetiredNative(Runtime& rt) noexcept
     std::vector<typed::NativeCode*> freed;
     for (std::size_t i = 0; i < retired.size(); ++i)
         (inUse[i] ? kept : freed).push_back(retired[i]);
+    constexpr std::size_t kSweepEvery = std::size_t(1) << 20;
     if (freed.empty()) {
         SCRIPT_CENSUS(SweepFreedNothing);
+        rt.jitSweepAt = rt.jitRetiredBytes + kSweepEvery;
         return;
     }
     std::sort(freed.begin(), freed.end());
@@ -1526,6 +1535,7 @@ void sweepRetiredNative(Runtime& rt) noexcept
     rt.jitRetiredBytes = 0;
     for (typed::NativeCode* code : kept)
         rt.jitRetiredBytes += code->codeBytes;
+    rt.jitSweepAt = rt.jitRetiredBytes + kSweepEvery;
     for (typed::NativeCode* code : freed)
         rt.jitBackend->release(code);
     retired = std::move(kept);
@@ -1547,8 +1557,7 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
     if (code.jitEntry || code.jitCode)
         return true;
     // Recompiles leave code behind; what no frame is in goes back to the cache before it fills.
-    constexpr std::size_t kSweepBytes = std::size_t(1) << 20;
-    if (rt.jitRetiredBytes >= kSweepBytes)
+    if (rt.jitRetiredBytes >= rt.jitSweepAt)
         sweepRetiredNative(rt);
 #if SCRIPT_ENABLE_JIT_THREAD
     if (code.jitJob) {

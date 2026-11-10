@@ -2363,3 +2363,25 @@ TEST(nativeCodeCallsTheGetterItsSiteKnowsNow)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("400 400 new new data data undefined undefined boom"));
     }
 }
+
+TEST(retiredCodeIsSweptWithoutReadingTheStackAtEveryCompile)
+{
+    // Two hundred functions compiled for numbers and again for strings, all of it under a recursion 2,000 frames deep:
+    // the answers are right and the retired code that no frame is in still goes back, with the stack read only every
+    // megabyte of retired code.
+    script::Context::Options options;
+    options.jit.mode = script::JitOptions::Mode::Eager;
+    options.runtimeCode = true;
+    options.stackLimit = 4000;
+    js::Context ctx(options);
+    ctx.eval("var fs = [];"
+             "for (var k = 0; k < 200; k++)"
+             "  fs.push(new Function('x', 'var s = 0; for (var i = 0; i < 40; i++) s = s + x + (i + ' + k + '); return s;'));"
+             "function work() { var total = 0;"
+             "  for (var k = 0; k < fs.length; k++) { for (var j = 0; j < 30; j++) total += fs[k](j);"
+             "    var r = fs[k]('a'); total += r.length; } return total; }"
+             "function deep(n) { return n > 0 ? deep(n - 1) : work(); }", "<test>");
+    CHECK_EQ(ctx.eval("deep(2000)", "<test>").toString(), std::string("32068925"));
+    CHECK_EQ(ctx.eval("work()", "<test>").toString(), std::string("32068925"));
+    CHECK(ctx.stats().nativeCodeBytes < (std::uint64_t(4) << 20));
+}

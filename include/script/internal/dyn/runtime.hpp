@@ -286,6 +286,9 @@ struct Runtime : EngineRuntime
     /// Code no function enters any more, freed by `sweepRetiredNative` once nothing on the stack is in it.
     std::vector<typed::NativeCode*> jitRetired;
     std::size_t jitRetiredBytes = 0;
+    /// What `jitRetiredBytes` has to reach before a compile sweeps: a sweep that keeps what it finds in use waits for
+    /// another megabyte of retired code before the next, rather than read the whole stack again at every compile.
+    std::size_t jitSweepAt = std::size_t(1) << 20;
     /// The code of functions native code has a copy of, known by their code alone: kept while the runtime lives, since
     /// that copy's bails name it. Held here rather than by the code that has the copy, where two functions copied into
     /// each other would keep each other.

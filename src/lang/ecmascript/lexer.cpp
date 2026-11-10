@@ -350,9 +350,8 @@ void Lexer::readEscape(String& out)
     }
 }
 
-Token Lexer::readString(char quote)
+void Lexer::readString(Token& t, char quote)
 {
-    Token t;
     t.type = Tok::StringLit;
     t.line = line_;
     ++pos_;
@@ -381,12 +380,10 @@ Token Lexer::readString(char quote)
             ++pos_;
         t.text += fromUtf8(src_.substr(start, pos_ - start));
     }
-    return t;
 }
 
-Token Lexer::readTemplate()
+void Lexer::readTemplate(Token& t)
 {
-    Token t;
     t.type = Tok::Template;
     t.line = line_;
     ++pos_;  // opening backtick
@@ -533,12 +530,10 @@ Token Lexer::readTemplate()
             chunk += fromUtf8(plain);
         }
     }
-    return t;
 }
 
-Token Lexer::readNumber()
+void Lexer::readNumber(Token& t)
 {
-    Token t;
     t.type = Tok::Number;
     t.line = line_;
     const std::size_t start = pos_;
@@ -638,12 +633,10 @@ Token Lexer::readNumber()
     }
     if (isIdStart(static_cast<unsigned char>(peek())))
         fail("identifier immediately after a number");
-    return t;
 }
 
-Token Lexer::readIdentifier()
+void Lexer::readIdentifier(Token& t)
 {
-    Token t;
     t.line = line_;
     const std::size_t start = pos_;
     bool ascii = true;
@@ -706,49 +699,61 @@ Token Lexer::readIdentifier()
         t.escapedKeyword = true;
         t.type = Tok::Identifier;
     }
-    return t;
 }
 
 Token Lexer::rescanAsRegex(const Token& slash)
 {
-    pos_ -= slash.type == Tok::SlashAssign ? 2 : 1;
-    Token t = next(true);
-    t.newlineBefore = slash.newlineBefore;
+    Token t = slash;
+    rescanAsRegex(t);
     return t;
+}
+
+void Lexer::rescanAsRegex(Token& slash)
+{
+    pos_ -= slash.type == Tok::SlashAssign ? 2 : 1;
+    const bool newlineBefore = slash.newlineBefore;
+    next(slash, true);
+    slash.newlineBefore = newlineBefore;
 }
 
 Token Lexer::next(bool regexAllowed)
 {
-    const bool newlineBefore = skipSpace();
-    const auto start = std::uint32_t(pos_);
-    Token t = readToken(regexAllowed);
-    t.newlineBefore = newlineBefore;
-    t.start = start;
-    t.end = std::uint32_t(pos_);
+    Token t;
+    next(t, regexAllowed);
     return t;
 }
 
-Token Lexer::readToken(bool regexAllowed)
+void Lexer::next(Token& out, bool regexAllowed)
 {
-    Token t;
+    const bool newlineBefore = skipSpace();
+    out.reset();
+    const auto start = std::uint32_t(pos_);
+    readToken(out, regexAllowed);
+    out.newlineBefore = newlineBefore;
+    out.start = start;
+    out.end = std::uint32_t(pos_);
+}
+
+void Lexer::readToken(Token& t, bool regexAllowed)
+{
     t.line = line_;
     if (pos_ >= src_.size())
-        return t;
+        return;
 
     const char c = src_[pos_];
     if (isIdStart(static_cast<unsigned char>(c)) || c == '\\')
-        return readIdentifier();
+        return readIdentifier(t);
     if (isDigit(c) || (c == '.' && isDigit(peek(1))))
-        return readNumber();
+        return readNumber(t);
     if (c == '"' || c == '\'')
-        return readString(c);
+        return readString(t, c);
     if (c == '`')
-        return readTemplate();
+        return readTemplate(t);
     if (c == '#') {
         ++pos_;
-        Token id = readIdentifier();
-        id.type = Tok::PrivateName;
-        return id;
+        readIdentifier(t);
+        t.type = Tok::PrivateName;
+        return;
     }
     if (c == '/' && regexAllowed) {
         const std::size_t save = pos_;
@@ -785,7 +790,7 @@ Token Lexer::readToken(bool regexAllowed)
         if (ok) {
             t.type = Tok::Regex;
             t.text = fromUtf8(src_.substr(save, pos_ - save));
-            return t;
+            return;
         }
         pos_ = save;
     }
@@ -793,7 +798,6 @@ Token Lexer::readToken(bool regexAllowed)
     auto take = [&](std::size_t n, Tok type) {
         pos_ += n;
         t.type = type;
-        return t;
     };
 
     switch (c) {

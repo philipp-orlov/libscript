@@ -2081,6 +2081,24 @@ TEST(aStackCapturedFromCompiledCodeNamesTheFunctionsInOrder)
     }
 }
 
+TEST(tokensReadOneAfterAnotherKeepNothingOfTheLastOne)
+{
+    // The parser reads every token into the one it has: a template's chunks, a string's value, a number's value and a
+    // regular expression's text must not show in the token after, and a slash after `)` or `}` is a division or a
+    // regular expression by what the parser wants.
+    const char* program =
+        "var a = 8, b = 2, g = 2, out = [];"
+        "out.push(`x${a}y${`in${b}ner`}z`, 'str' + 1, 0x10 + 1.5e1, 017 + 1);"
+        "out.push((a) / b / g, (a)\n/ 2 /g);"
+        "if (true) { out.push(1) }\n/b/g.test('b') && out.push('re-after-brace');"
+        "var r = /[/]=/.test('/=') + '|' + 'a=b'.replace(/=/, '-') + '|' + (a /= 2) + '|' + a;"
+        "out.push(r, `${'a'}${'b'}`.length, `line\nbreak`.length, String.raw`\\n${1}`);"
+        "var tag = (s, ...v) => s.raw.join('|') + v.join(',');"
+        "out.push(tag`a${1}b${2}c`, tag`x`, tag`${a}`);"
+        "out.join(' ')";
+    CHECK_EQ(run(program), std::string("x8yin2nerz str1 31 16 2 2 1 re-after-brace true|a-b|4|4 2 10 \\n1 a|b|c1,2 x |4"));
+}
+
 TEST(aGeneratorIsSteppedWithoutAResultObject)
 {
     // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the

@@ -242,13 +242,13 @@ Parser::Parser(std::string_view source, std::string sourceName, bool typescript)
       typescript_(typescript)
 {
     lookaheadLimit_ = 32 * source.size() + 100000;
-    cur_ = lexer_.next(false);
+    lexer_.next(cur_, false);
 }
 
 void Parser::advance()
 {
     prevEnd_ = cur_.end;
-    cur_ = lexer_.next(false);
+    lexer_.next(cur_, false);
 }
 
 bool Parser::eat(Tok t)
@@ -381,7 +381,7 @@ NodePtr Parser::parseFunctionAt(std::uint32_t start, std::uint32_t line, bool is
 {
     lexer_.seek(start, line);
     prevEnd_ = start;
-    cur_ = lexer_.next(false);
+    lexer_.next(cur_, false);
     return functionExpression(isDeclaration);
 }
 
@@ -2359,7 +2359,7 @@ NodePtr Parser::primary()
         case Tok::Slash:
         case Tok::SlashAssign:
             // Only a parser knows an operand is wanted here: what was read as a division is the start of a literal.
-            cur_ = lexer_.rescanAsRegex(cur_);
+            lexer_.rescanAsRegex(cur_);
             if (!at(Tok::Regex))
                 fail("unterminated regular expression literal");
             [[fallthrough]];

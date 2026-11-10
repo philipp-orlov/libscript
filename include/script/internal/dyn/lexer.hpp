@@ -172,6 +172,23 @@ struct Token
     /// Where it is in the source, in bytes: from its first character to just past its last.
     std::uint32_t start = 0;
     std::uint32_t end = 0;
+
+    /// Back to a fresh token, keeping the buffers of `text`, `parts`, `exprs` and `raws` for the next one.
+    void reset() noexcept
+    {
+        type = Tok::Eof;
+        line = 1;
+        newlineBefore = false;
+        text.clear();
+        number = 0;
+        parts.clear();
+        exprs.clear();
+        raws.clear();
+        escapedKeyword = false;
+        legacyOctal = false;
+        start = 0;
+        end = 0;
+    }
 };
 
 /// A single-pass tokenizer. Division and regular-expression literals are told
@@ -184,8 +201,12 @@ public:
 
     /// Read the next token. `regexAllowed` selects the `/` interpretation.
     Token next(bool regexAllowed = true);
+    /// The same, into `out`, which keeps what buffers it has: the parser reads every token this way.
+    void next(Token& out, bool regexAllowed = true);
     /// `slash` was the last token read: back up and read it again as a regular expression literal.
     Token rescanAsRegex(const Token& slash);
+    /// The same, with `slash` turned into the literal.
+    void rescanAsRegex(Token& slash);
 
     /// Go on reading at byte `pos`, which is on line `line`: where a function's text starts, to read it again.
     void seek(std::size_t pos, std::uint32_t line) noexcept
@@ -204,11 +225,11 @@ private:
         return pos_ + ahead < src_.size() ? src_[pos_ + ahead] : '\0';
     }
     bool skipSpace();  ///< returns true when a line terminator was crossed
-    Token readToken(bool regexAllowed);
-    Token readNumber();
-    Token readString(char quote);
-    Token readTemplate();
-    Token readIdentifier();
+    void readToken(Token& t, bool regexAllowed);
+    void readNumber(Token& t);
+    void readString(Token& t, char quote);
+    void readTemplate(Token& t);
+    void readIdentifier(Token& t);
     void readEscape(String& out);
     /// The last escape was a legacy octal one, or `\8` or `\9`: fine in sloppy code, an error in strict code or a template.
     bool sawLegacyEscape_ = false;

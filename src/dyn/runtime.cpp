@@ -610,6 +610,22 @@ void Runtime::method(DynObject* target, const char* name, NativeFunction fn, int
                    PropWritable | PropConfigurable);
 }
 
+void Runtime::methodFast(DynObject* target, const char* name, DynFunction::FastNative fn, int arity)
+{
+    Value f = makeFunction(ascii(name), [this, fn](CallInfo& ci) { return fn(*this, ci.thisValue(), ci.args().data(), ci.size()); },
+                           arity);
+    asFunction(f)->fast = fn;
+    target->putOwn(intern(name), std::move(f), PropWritable | PropConfigurable);
+}
+
+void Runtime::getterFast(DynObject* target, const char* name, DynFunction::FastNative fn)
+{
+    Value f = makeFunction(ascii("get ") + ascii(name),
+                           [this, fn](CallInfo& ci) { return fn(*this, ci.thisValue(), ci.args().data(), ci.size()); }, 0);
+    asFunction(f)->fast = fn;
+    target->putOwn(intern(name), std::move(f), PropConfigurable | PropAccessor);
+}
+
 void Runtime::getter(DynObject* target, const char* name, NativeFunction fn)
 {
     target->putOwn(intern(name), makeFunction(ascii("get ") + ascii(name), std::move(fn), 0),

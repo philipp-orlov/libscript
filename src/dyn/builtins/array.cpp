@@ -262,7 +262,9 @@ void installArray(Runtime& rt)
     }, 1, proto);
     rt.arrayCtor.reset(ctor);
 
-    rt.method(ctor, "isArray", [](CallInfo& ci) { return Value(isArray(rtOf(ci), ci.arg(0))); }, 1);
+    rt.methodFast(ctor, "isArray", [](Runtime& rt2, const Value&, const Value* args, std::size_t argc) {
+        return Value(isArray(rt2, argc ? args[0] : Value::undefined()));
+    }, 1);
 
     rt.method(ctor, "of", [](CallInfo& ci) { return rtOf(ci).makeArray(ci.args()); }, 0);
 
@@ -353,6 +355,21 @@ void installArray(Runtime& rt)
     }, 0);
     keepIntrinsic(Runtime::ArrayPush, "push");
     keepIntrinsic(Runtime::ArrayPop, "pop");
+    // Native code's direct entry: onto an array that can grow, in place; anything else the way above, which `native` still
+    // is, since this entry is set beside it rather than in its place.
+    static_cast<DynFunction*>(rt.intrinsics[Runtime::ArrayPush].get())->fast =
+        [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) -> Value {
+        DynArray* a = asArray(self);
+        if (a && !a->frozen) {
+            a->appendAll(args, argc);
+            return Value(double(a->size()));
+        }
+        auto* push = static_cast<DynFunction*>(rt2.intrinsics[Runtime::ArrayPush].get());
+        ContextImpl::ArgBuffer buffer(rt2.ctx);
+        buffer.args.assign(args, args + argc);
+        CallInfo info = detail::Access::makeCallInfo(rt2.ctx.owner, &self, &buffer.args, false);
+        return push->native(info);
+    };
 
     arrayMethod("shift", true, [](CallInfo& ci) {
         DynArray* a = thisMutableArray(ci);

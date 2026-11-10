@@ -251,3 +251,54 @@ TEST(consoleGoesThroughThePrintHandler)
     ctx.eval("console.log('n =', 42, [1, 2], { a: 1 })");
     CHECK_EQ(captured, std::string("n = 42 [ 1, 2 ] { a: 1 }\n"));
 }
+
+TEST(arrayIsArrayFromNativeCodeAndElsewhere)
+{
+    // Array.isArray, the first built-in with a direct entry for native code: in a hot loop over arrays, objects, a proxy of
+    // an array, a typed array; with no argument, through call and apply and a proxy; and new on it, which throws.
+    const char* program =
+        "var out = []; function S(v) { out.push(String(v)); }"
+        "function f(x) { return Array.isArray(x); } var n = 0, xs = [[], {}, 'a', new Proxy([], {}), null, undefined, new Uint8Array(2)];"
+        "for (var k = 0; k < 7000; k++) if (f(xs[k % 7])) n++; S(n); S(Array.isArray()); S(Array.isArray.call(null, [])); S(Array.isArray.apply(null, [{}]));"
+        "S(Array.isArray.length); S(Array.isArray.name); S(new Proxy(Array.isArray, {})([1]));"
+        "try { new Array.isArray([]); } catch (e) { S(e.constructor.name); }"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2000 false true false 1 isArray true TypeError"));
+    }
+}
+
+TEST(arrayPushFromNativeCodeAndOnArrayLikes)
+{
+    // Array.prototype.push from native code onto an array, and on an array-like, a frozen array and null, where its direct
+    // entry hands over to the generic one.
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "function f(a, i) { return a.push(i, i + 1); } var arr = [], n = 0;"
+        "for (k = 0; k < 3000; k++) n += f(arr, k); S(n); S(arr.length); S(arr[5999]);"
+        "var like = {length: 2, 0: 'a', 1: 'b'}; S(Array.prototype.push.call(like, 'c')); S(like[2] + like.length);"
+        "var fr = Object.freeze([1]); try { fr.push(2); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { Array.prototype.push.call(null, 1); } catch (e) { S(e.constructor.name); }"
+        "S([].push()); var b = [1]; b.push(); S(b.length); S(Array.prototype.push.length);"
+        "var g = [], P = Array.prototype.push; function h(o, i) { return P.call(o, i); } for (k = 0; k < 3000; k++) h(k % 2 ? g : like, k); S(g.length); S(like.length);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9003000 6000 3000 3 c3 TypeError:the array is frozen TypeError 0 1 1 1500 1503"));
+    }
+}

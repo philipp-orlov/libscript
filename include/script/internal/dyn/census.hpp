@@ -60,6 +60,7 @@ enum class Census : std::uint8_t
     SweepFreedNothing,
     GetElemKeyedHit,
     NewThisFieldInitGeneric,
+    DynCallBuiltinFast,
     Count,
 };
 

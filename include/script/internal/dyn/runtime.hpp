@@ -337,6 +337,9 @@ struct Runtime : EngineRuntime
     /// Install `name` on `target` as a non-enumerable native method.
     void method(DynObject* target, const char* name, NativeFunction fn, int arity = 0);
     void getter(DynObject* target, const char* name, NativeFunction fn);
+    /// The same with a built-in native code calls without the generic call's machinery: see `DynFunction::fast`.
+    void methodFast(DynObject* target, const char* name, DynFunction::FastNative fn, int arity = 0);
+    void getterFast(DynObject* target, const char* name, DynFunction::FastNative fn);
     void constant(DynObject* target, const char* name, Value v);
     /// Create a constructor with a fresh prototype wired to it.
     DynFunction* makeConstructor(const char* name, NativeFunction fn, int arity, DynObject* proto);

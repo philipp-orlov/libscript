@@ -570,11 +570,21 @@ NativePair scriptDynCall(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std:
                          const Value* args, std::uint64_t argc) noexcept
 {
     return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
-        ContextImpl::ArgBuffer buffer(rt->ctx);
-        buffer.args.assign(args, args + argc);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         callCensus(valueOf(fnTag, fn));
 #endif
+        // A built-in with a direct entry takes the arguments where they are.
+        if (DynFunction* callee = asFunction(valueOf(fnTag, fn)); callee && callee->fnKind == FnKind::Native && callee->fast) {
+            SCRIPT_CENSUS(DynCallBuiltinFast);
+            ContextImpl::ActiveEngine active(rt->ctx, EngineKind::Dynamic);
+            try {
+                return take(callee->fast(*rt, valueOf(thisTag, self), args, std::size_t(argc)));
+            } catch (...) {
+                rethrowAsScript(*rt);
+            }
+        }
+        ContextImpl::ArgBuffer buffer(rt->ctx);
+        buffer.args.assign(args, args + argc);
         return take(callValue(*rt, valueOf(fnTag, fn), valueOf(thisTag, self), buffer.args));
     });
 }

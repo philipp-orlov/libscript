@@ -689,6 +689,10 @@ struct DynFunction : DynObject
     Ref<DynFunction> fieldInit;                 ///< a class: what makes the fields of a new instance
 
     NativeFunction native;  ///< Native
+    /// A built-in that needs no `CallInfo`: the arguments as they are, a missing one read as `undefined`. It throws as
+    /// `native` would; `native` forwards to it, so every caller works without knowing.
+    using FastNative = Value (*)(Runtime& rt, const Value& self, const Value* args, std::size_t argc);
+    FastNative fast = nullptr;
 
     Ref<DynFunction> boundTarget;  ///< Bound
     Value boundThis = Value::undefined();

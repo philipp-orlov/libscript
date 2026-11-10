@@ -2279,3 +2279,32 @@ TEST(aReadSiteThatMeetsTooManyShapesKeepsWhatItKnows)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("8400 7 8 13600 4500 10"));
     }
 }
+
+TEST(nativeCodeReadsWhatASiteLearnedAfterItWasCompiled)
+{
+    // Code compiled before its read site had learned anything reads what the site learns later, a first shape, a second
+    // one, a shape changed by a delete and an add; anything else, up the chain, a getter, a string, still reads right.
+    const char* program =
+        "var out = [], k, s = 0, t = 0; function S(v) { out.push(String(v)); }"
+        "function f(o) { return o === null ? -1 : o.x; }"
+        "for (k = 0; k < 400; k++) s += f(null);"
+        "var a = {x: 2}; for (k = 0; k < 400; k++) s += f(a);"
+        "var b = {y: 0, x: 3}; for (k = 0; k < 400; k++) s += f(b);"
+        "S(s); S(f({x: 'str'})); S(f(Object.create({x: 'up'}))); S(f({get x() { return 'got'; }})); S(f('abc'));"
+        "function g(o) { return o === null ? 0 : o.x; }"
+        "for (k = 0; k < 400; k++) g(null);"
+        "var c = {x: 1, z: 2};"
+        "for (k = 0; k < 400; k++) { t += g(c); if (k % 50 === 49) { delete c.x; t += g(c) === undefined ? 100 : 0; c.x = k; } }"
+        "S(t); out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1600 str up got undefined 70500"));
+    }
+}

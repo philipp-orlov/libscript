@@ -72,6 +72,13 @@ constexpr std::int64_t kCallEntryOffset = offsetof(FunctionCode, jitCallEntry);
 /// Where `new` enters: a class constructor has this and not the call entry, since a call of one throws.
 constexpr std::int64_t kEntryOffset = offsetof(FunctionCode, jitEntry);
 constexpr std::int64_t kBoxValueOffset = offsetof(Box, value);
+/// What native code reads of a property site at run time.
+constexpr std::int64_t kSiteShapeOffset = offsetof(PropertySite, shape);
+constexpr std::int64_t kSiteHolderOffset = offsetof(PropertySite, holder);
+constexpr std::int64_t kSiteIndexOffset = offsetof(PropertySite, index);
+static_assert(sizeof(PropertySite::shape) == 8 && sizeof(PropertySite::holder) == 8, "read as words");
+static_assert(sizeof(PropertySite::index) == 4, "read as 32 bits");
+static_assert(sizeof(Prop) == 16, "an index into a property table is scaled by a shift of 4");
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
@@ -4252,6 +4259,19 @@ private:
         return &code_.sites[index];
     }
 
+    /// The site of an operand as memory native code may read while it runs, whatever it knows now. The table is made here
+    /// if no access has made it yet; it is never made again or resized, so the site stays where it is for the life of
+    /// the code. Null for an operand with no site.
+    const PropertySite* liveSite(std::uint32_t operand) const
+    {
+        const std::uint32_t index = operand >> kSiteShift;
+        if (index == kNoSite || index >= code_.siteCount)
+            return nullptr;
+        if (code_.sites.empty())
+            code_.sites.assign(code_.siteCount, PropertySite());
+        return &code_.sites[index];
+    }
+
     const PropertySite* siteAt(std::uint32_t operand) const noexcept
     {
         const std::uint32_t index = operand >> kSiteShift;
@@ -4400,6 +4420,36 @@ private:
             IrInst& mr = inst(IrOp::Mov);
             mr.d = r;
             mr.a = lr;
+        } else if (const PropertySite* live = liveSite(operand)) {
+            // Nothing to count on when this was compiled: what the site has learned since, of a property on the receiver
+            // itself, is read from the site each time. Nothing is patched; the helper and the interpreter teach it.
+            const std::int32_t have = shapeOf(base, slow);
+            branchCmp(have, IrCond::Eq, 0, slow, 64);
+            const std::int32_t where = ptrReg(live);
+            const std::int32_t want = load(where, kSiteShapeOffset, 8);
+            IrInst& same = inst(IrOp::BrCmp);
+            same.a = have;
+            same.b = want;
+            same.cond = IrCond::Ne;
+            same.width = 64;
+            same.target = slow;
+            branchCmp(load(where, kSiteHolderOffset, 8), IrCond::Ne, 0, slow, 64);
+            const std::int32_t scaled = shiftLeft(load(where, kSiteIndexOffset, 4), 4);
+            const std::int32_t props = loadHeader(base.r, kPropsOffset);
+            IrInst& lt = inst(IrOp::LoadIdx);
+            lt.d = t;
+            lt.a = props;
+            lt.b = scaled;
+            lt.imm = kPropValueOffset;
+            lt.width = 1;
+            lt.alias = kAliasValue;
+            IrInst& lr = inst(IrOp::LoadIdx);
+            lr.d = r;
+            lr.a = props;
+            lr.b = scaled;
+            lr.imm = kPropValueOffset + kPayload;
+            lr.width = 8;
+            lr.alias = kAliasValue;
         } else {
             inst(IrOp::Br).imm = slow;
         }

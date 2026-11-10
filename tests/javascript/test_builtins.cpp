@@ -302,3 +302,35 @@ TEST(arrayPushFromNativeCodeAndOnArrayLikes)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9003000 6000 3000 3 c3 TypeError:the array is frozen TypeError 0 1 1 1500 1503"));
     }
 }
+
+TEST(dataViewAndBufferGettersFromNativeCode)
+{
+    // DataView reads and writes and the byteLength, byteOffset and length getters of views, typed arrays and buffers, from
+    // native code in a hot loop, with missing arguments, out of range, on the wrong receiver, through call and apply.
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "var buf = new ArrayBuffer(64), dv = new DataView(buf, 8), ta = new Float64Array(buf, 16, 4);"
+        "function rw(i) { dv.setFloat64(i * 8, i + 0.5, true); dv.setInt16(40, -i, false); return dv.getFloat64(i * 8, true) + dv.getInt16(40) + dv.byteLength + ta.length + ta.byteLength + ta.byteOffset + buf.byteLength; }"
+        "var s = 0; for (k = 0; k < 3000; k++) s += rw(k % 5); S(s);"
+        "S(dv.getFloat64(8)); S(dv.getUint8(0)); S(dv.getFloat64()); dv.setUint32(0); S(dv.getUint32(0));"
+        "dv.setBigInt64(16, -5n, true); S(dv.getBigInt64(16, true)); S(dv.getBigUint64(16, true));"
+        "try { dv.getFloat64(100); } catch (e) { S(e.constructor.name); }"
+        "try { DataView.prototype.getInt8.call({}, 0); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get.call([]); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get.call(new SharedArrayBuffer(2)); } catch (e) { S(e.constructor.name); }"
+        "try { Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array.prototype), 'length').get.call(dv); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "S(DataView.prototype.setFloat64.length); S(DataView.prototype.getFloat64.name); S(Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get.name);"
+        "S(dv.getFloat32.call(dv, 0, true)); S(Reflect.apply(dv.getInt8, dv, [3]));"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("517500 3.13984e-319 0 2.8363e-319 0 -5 18446744073709551611 RangeError TypeError:not a DataView TypeError:not a DataView TypeError TypeError:not a typed array 2 getFloat64 get byteLength 0 0"));
+    }
+}

@@ -190,12 +190,23 @@ DynArrayBuffer* newBuffer(Runtime& rt, double bytes, DynObject* proto, bool shar
     return buffer;
 }
 
+DynArrayBuffer* thisBuffer(Runtime& rt, const Value& self, bool shared, const char* what)
+{
+    DynObject* o = asObject(self);
+    if (!o || o->cls != (shared ? ObjClass::SharedArrayBuffer : ObjClass::ArrayBuffer))
+        throwError(rt, ErrorCode::TypeError, std::string(what) + " called on something of another kind");
+    return static_cast<DynArrayBuffer*>(o);
+}
+
 DynArrayBuffer* thisBuffer(CallInfo& ci, bool shared, const char* what)
 {
-    DynObject* o = asObject(ci.thisValue());
-    if (!o || o->cls != (shared ? ObjClass::SharedArrayBuffer : ObjClass::ArrayBuffer))
-        ci.fail(ErrorCode::TypeError, std::string(what) + " called on something of another kind");
-    return static_cast<DynArrayBuffer*>(o);
+    return thisBuffer(rtOf(ci), ci.thisValue(), shared, what);
+}
+
+template <bool shared>
+Value bufferByteLength(Runtime& rt, const Value& self, const Value*, std::size_t)
+{
+    return Value(double(thisBuffer(rt, self, shared, "byteLength")->byteLength));
 }
 
 DynTypedArray* asTypedArray(const Value& v) noexcept
@@ -429,22 +440,22 @@ void installTypedArrayPrototype(Runtime& rt, DynObject* proto)
             ci.fail(ErrorCode::TypeError, "not a typed array");
         return objectValue(ta->buffer.get());
     });
-    rt.getter(proto, "byteLength", [](CallInfo& ci) -> Value {
-        DynTypedArray* ta = asTypedArray(ci.thisValue());
+    rt.getterFast(proto, "byteLength", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
+        DynTypedArray* ta = asTypedArray(self);
         if (!ta)
-            ci.fail(ErrorCode::TypeError, "not a typed array");
+            throwError(rt2, ErrorCode::TypeError, "not a typed array");
         return Value(double(ta->length * sizeOf(ta->element)));
     });
-    rt.getter(proto, "byteOffset", [](CallInfo& ci) -> Value {
-        DynTypedArray* ta = asTypedArray(ci.thisValue());
+    rt.getterFast(proto, "byteOffset", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
+        DynTypedArray* ta = asTypedArray(self);
         if (!ta)
-            ci.fail(ErrorCode::TypeError, "not a typed array");
+            throwError(rt2, ErrorCode::TypeError, "not a typed array");
         return Value(ta->outOfBounds || ta->buffer->detached ? 0.0 : double(ta->byteOffset));
     });
-    rt.getter(proto, "length", [](CallInfo& ci) -> Value {
-        DynTypedArray* ta = asTypedArray(ci.thisValue());
+    rt.getterFast(proto, "length", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
+        DynTypedArray* ta = asTypedArray(self);
         if (!ta)
-            ci.fail(ErrorCode::TypeError, "not a typed array");
+            throwError(rt2, ErrorCode::TypeError, "not a typed array");
         return Value(double(ta->length));
     });
     proto->putOwn(rt.sym.toStringTag.get(), rt.makeFunction(ascii("get [Symbol.toStringTag]"), [](CallInfo& ci) -> Value {
@@ -969,10 +980,7 @@ void installBuffers(Runtime& rt)
         ctor->putOwn(rt.sym.species.get(), rt.makeFunction(ascii("get [Symbol.species]"), [](CallInfo& ci) { return ci.thisValue(); }, 0), PropConfigurable | PropAccessor);
         proto->putOwn(rt.sym.toStringTag.get(), rt.str(name), PropConfigurable);
 
-        rt.getter(proto, "byteLength", [shared](CallInfo& ci) -> Value {
-            DynArrayBuffer* b = thisBuffer(ci, shared, "byteLength");
-            return Value(double(b->byteLength));
-        });
+        rt.getterFast(proto, "byteLength", shared ? bufferByteLength<true> : bufferByteLength<false>);
         rt.getter(proto, "maxByteLength", [shared](CallInfo& ci) -> Value {
             DynArrayBuffer* b = thisBuffer(ci, shared, "maxByteLength");
             return Value(double(b->detached ? 0 : b->resizable ? b->maxByteLength : b->byteLength));
@@ -1092,12 +1100,61 @@ std::size_t viewLength(const DynDataView* v) noexcept
     return v->tracksLength ? v->buffer->byteLength - v->byteOffset : v->fixedLength;
 }
 
+DynDataView* thisDataView(Runtime& rt, const Value& self)
+{
+    DynObject* o = asObject(self);
+    if (!o || o->cls != ObjClass::DataView)
+        throwError(rt, ErrorCode::TypeError, "not a DataView");
+    return static_cast<DynDataView*>(o);
+}
+
 DynDataView* thisDataView(CallInfo& ci)
 {
-    DynObject* o = asObject(ci.thisValue());
-    if (!o || o->cls != ObjClass::DataView)
-        ci.fail(ErrorCode::TypeError, "not a DataView");
-    return static_cast<DynDataView*>(o);
+    return thisDataView(rtOf(ci), ci.thisValue());
+}
+
+inline const Value& argAt(const Value* args, std::size_t argc, std::size_t i) noexcept
+{
+    static const Value undefined = Value::undefined();
+    return i < argc ? args[i] : undefined;
+}
+
+template <ElementKind kind>
+Value dataViewGet(Runtime& rt, const Value& self, const Value* args, std::size_t argc)
+{
+    DynDataView* v = thisDataView(rt, self);
+    const double index = toIndex(rt, argAt(args, argc, 0));
+    const bool little = toBoolean(argAt(args, argc, 1));
+    if (viewOutOfBounds(v))
+        throwError(rt, ErrorCode::TypeError, "the view's buffer is detached or too short for it");
+    const std::size_t size = sizeOf(kind);
+    if (index + double(size) > double(viewLength(v)))
+        throwError(rt, ErrorCode::RangeError, "past the end of the view");
+    std::uint8_t bytes[8];
+    std::memcpy(bytes, v->buffer->data + v->byteOffset + std::size_t(index), size);
+    if (!little)
+        std::reverse(bytes, bytes + size);
+    return readElement(rt, kind, bytes);
+}
+
+template <ElementKind kind>
+Value dataViewSet(Runtime& rt, const Value& self, const Value* args, std::size_t argc)
+{
+    DynDataView* v = thisDataView(rt, self);
+    const double index = toIndex(rt, argAt(args, argc, 0));
+    const Value value = convertFor(rt, kind, argAt(args, argc, 1));
+    const bool little = toBoolean(argAt(args, argc, 2));
+    if (viewOutOfBounds(v))
+        throwError(rt, ErrorCode::TypeError, "the view's buffer is detached or too short for it");
+    const std::size_t size = sizeOf(kind);
+    if (index + double(size) > double(viewLength(v)))
+        throwError(rt, ErrorCode::RangeError, "past the end of the view");
+    std::uint8_t bytes[8];
+    writeElement(kind, bytes, value);
+    if (!little)
+        std::reverse(bytes, bytes + size);
+    std::memcpy(v->buffer->data + v->byteOffset + std::size_t(index), bytes, size);
+    return Value::undefined();
 }
 
 void installDataView(Runtime& rt)
@@ -1138,63 +1195,41 @@ void installDataView(Runtime& rt)
     }, 1, proto);
     proto->putOwn(rt.sym.toStringTag.get(), rt.str("DataView"), PropConfigurable);
     rt.getter(proto, "buffer", [](CallInfo& ci) -> Value { return objectValue(thisDataView(ci)->buffer.get()); });
-    rt.getter(proto, "byteLength", [](CallInfo& ci) -> Value {
-        DynDataView* v = thisDataView(ci);
+    rt.getterFast(proto, "byteLength", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
+        DynDataView* v = thisDataView(rt2, self);
         if (viewOutOfBounds(v))
-            ci.fail(ErrorCode::TypeError, "the view's buffer is detached or too short for it");
+            throwError(rt2, ErrorCode::TypeError, "the view's buffer is detached or too short for it");
         return Value(double(viewLength(v)));
     });
-    rt.getter(proto, "byteOffset", [](CallInfo& ci) -> Value {
-        DynDataView* v = thisDataView(ci);
+    rt.getterFast(proto, "byteOffset", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
+        DynDataView* v = thisDataView(rt2, self);
         if (viewOutOfBounds(v))
-            ci.fail(ErrorCode::TypeError, "the view's buffer is detached or too short for it");
+            throwError(rt2, ErrorCode::TypeError, "the view's buffer is detached or too short for it");
         return Value(double(v->byteOffset));
     });
 
-    static const struct { const char* get; const char* set; ElementKind kind; } kAccessors[] = {
-        {"getInt8", "setInt8", ElementKind::Int8},          {"getUint8", "setUint8", ElementKind::Uint8},
-        {"getInt16", "setInt16", ElementKind::Int16},       {"getUint16", "setUint16", ElementKind::Uint16},
-        {"getInt32", "setInt32", ElementKind::Int32},       {"getUint32", "setUint32", ElementKind::Uint32},
-        {"getFloat16", "setFloat16", ElementKind::Float16}, {"getFloat32", "setFloat32", ElementKind::Float32},
-        {"getFloat64", "setFloat64", ElementKind::Float64}, {"getBigInt64", "setBigInt64", ElementKind::BigInt64},
-        {"getBigUint64", "setBigUint64", ElementKind::BigUint64},
+    static const struct
+    {
+        const char* get;
+        const char* set;
+        DynFunction::FastNative read;
+        DynFunction::FastNative write;
+    } kAccessors[] = {
+        {"getInt8", "setInt8", dataViewGet<ElementKind::Int8>, dataViewSet<ElementKind::Int8>},
+        {"getUint8", "setUint8", dataViewGet<ElementKind::Uint8>, dataViewSet<ElementKind::Uint8>},
+        {"getInt16", "setInt16", dataViewGet<ElementKind::Int16>, dataViewSet<ElementKind::Int16>},
+        {"getUint16", "setUint16", dataViewGet<ElementKind::Uint16>, dataViewSet<ElementKind::Uint16>},
+        {"getInt32", "setInt32", dataViewGet<ElementKind::Int32>, dataViewSet<ElementKind::Int32>},
+        {"getUint32", "setUint32", dataViewGet<ElementKind::Uint32>, dataViewSet<ElementKind::Uint32>},
+        {"getFloat16", "setFloat16", dataViewGet<ElementKind::Float16>, dataViewSet<ElementKind::Float16>},
+        {"getFloat32", "setFloat32", dataViewGet<ElementKind::Float32>, dataViewSet<ElementKind::Float32>},
+        {"getFloat64", "setFloat64", dataViewGet<ElementKind::Float64>, dataViewSet<ElementKind::Float64>},
+        {"getBigInt64", "setBigInt64", dataViewGet<ElementKind::BigInt64>, dataViewSet<ElementKind::BigInt64>},
+        {"getBigUint64", "setBigUint64", dataViewGet<ElementKind::BigUint64>, dataViewSet<ElementKind::BigUint64>},
     };
     for (const auto& accessor : kAccessors) {
-        const ElementKind kind = accessor.kind;
-        rt.method(proto, accessor.get, [kind](CallInfo& ci) -> Value {
-            Runtime& rt2 = rtOf(ci);
-            DynDataView* v = thisDataView(ci);
-            const double index = toIndex(rt2, ci.arg(0));
-            const bool little = toBoolean(ci.arg(1));
-            if (viewOutOfBounds(v))
-                ci.fail(ErrorCode::TypeError, "the view's buffer is detached or too short for it");
-            const std::size_t size = sizeOf(kind);
-            if (index + double(size) > double(viewLength(v)))
-                ci.fail(ErrorCode::RangeError, "past the end of the view");
-            std::uint8_t bytes[8];
-            std::memcpy(bytes, v->buffer->data + v->byteOffset + std::size_t(index), size);
-            if (!little)
-                std::reverse(bytes, bytes + size);
-            return readElement(rt2, kind, bytes);
-        }, 1);
-        rt.method(proto, accessor.set, [kind](CallInfo& ci) -> Value {
-            Runtime& rt2 = rtOf(ci);
-            DynDataView* v = thisDataView(ci);
-            const double index = toIndex(rt2, ci.arg(0));
-            const Value value = convertFor(rt2, kind, ci.arg(1));
-            const bool little = toBoolean(ci.arg(2));
-            if (viewOutOfBounds(v))
-                ci.fail(ErrorCode::TypeError, "the view's buffer is detached or too short for it");
-            const std::size_t size = sizeOf(kind);
-            if (index + double(size) > double(viewLength(v)))
-                ci.fail(ErrorCode::RangeError, "past the end of the view");
-            std::uint8_t bytes[8];
-            writeElement(kind, bytes, value);
-            if (!little)
-                std::reverse(bytes, bytes + size);
-            std::memcpy(v->buffer->data + v->byteOffset + std::size_t(index), bytes, size);
-            return Value::undefined();
-        }, 2);
+        rt.methodFast(proto, accessor.get, accessor.read, 1);
+        rt.methodFast(proto, accessor.set, accessor.write, 2);
     }
 }
 

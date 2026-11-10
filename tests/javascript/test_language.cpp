@@ -2484,3 +2484,26 @@ TEST(fieldInitializersRunAsNativeCodeWhenNewIsDoneByTheHelper)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("31540500 6000 126000 init 6004 1"));
     }
 }
+
+TEST(aBuiltInCalledThroughCallTakesAnyReceiver)
+{
+    // f.call(x, a) with f a built-in done in place, Array.prototype.push here: x is the receiver, whatever native code
+    // holds it as, a number in a register included, and the code done in place reads its tag.
+    const char* program =
+        "var P = Array.prototype.push; function h(o, i) { return P.call(o, i); }"
+        "var g = [], like = {length: 2}, r = [], k;"
+        "for (k = 0; k < 3000; k++) h(k % 2 ? g : like, k);"
+        "for (k = 0; k < 300; k++) { try { r.push(h(k % 3 ? 5 : [], k)); } catch (e) { r.push(e.constructor.name); } }"
+        "[g.length, like.length, r.slice(0, 6).join()].join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1500 1502 1,1,1,1,1,1"));
+    }
+}

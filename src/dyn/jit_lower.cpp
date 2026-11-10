@@ -5573,6 +5573,12 @@ private:
             self = args[0];
             args.erase(args.begin());
             --argc;
+            // What is done in place with a receiver reads its tag and payload: an argument may be a number in a register.
+            if (self.rep != Rep::Tagged || self.isConst) {
+                const std::int32_t tag = tagReg(self);
+                const std::int32_t payload = payloadReg(self);
+                self = taggedEntry(payload, tag, self.own);
+            }
         }
         const DynFunction* known = expectCallee(callee);
         // A small function that goes in place of the call and only reads can release nothing, so nothing here needs a

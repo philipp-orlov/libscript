@@ -2309,6 +2309,25 @@ static void keyedLearn(const FunctionCode& code, std::uint32_t site, const Value
     code.elemKeyed[site] = {key, o->shape, std::uint32_t(index)};
 }
 
+}  // namespace
+
+Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& base, const Value& key, std::uint32_t site,
+                          bool& hit)
+{
+    hit = false;
+    if (const Prop* p = keyedHit(code, site, base, key)) {
+        SCRIPT_CENSUS(GetElemKeyedHit);
+        hit = true;
+        return p->value;
+    }
+    Ref<GCObject> name = toPropertyKey(rt, key);
+    Value v = getProperty(rt, base, name.get());
+    keyedLearn(code, site, base, name.get(), false);
+    return v;
+}
+
+namespace {
+
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
 /// SCRIPT_OP_PAIRS: how often each instruction follows each other one, what is worth fusing, printed at exit.
 using OpPairTable = std::uint64_t[256][256];
@@ -2439,6 +2458,7 @@ const char* const kCensusNames[] = {
     "GetPropForNative", "SetPropForNative", "GetGlobalForNative", "GetElemTotal", "GetElemByNumber",
     "GetElemStringKey", "GetElemOtherKey", "DynCallTotal", "DynCallBuiltin", "DynCallBytecode", "DynCallBound",
     "DynCallOther", "NewThisTotal", "NewThisRefused", "NewThisFieldInit", "Bail", "SweepCalls", "SweepFreedNothing",
+    "GetElemKeyedHit",
 };
 static_assert(sizeof(kCensusNames) / sizeof(kCensusNames[0]) == std::size_t(Census::Count), "a name per counter");
 
@@ -2912,9 +2932,18 @@ namespace {
                     }
                 }
                 note(ElemSite::kOther);
+                const std::uint32_t site = operandAt(pc - 4);
+                if (Prop* p = keyedHit(code, site, sp[sp.size() - 2], sp.back())) {
+                    Value r = p->value;
+                    Value base = sp[sp.size() - 2];
+                    sp[sp.size() - 2] = std::move(r);
+                    sp.back() = std::move(base);
+                    break;
+                }
                 Ref<GCObject> key = toPropertyKey(rt, pop());
                 Value base = sp.back();
                 sp.back() = getProperty(rt, base, key.get());
+                keyedLearn(code, site, base, key.get(), false);
                 sp.push_back(std::move(base));
                 break;
             }

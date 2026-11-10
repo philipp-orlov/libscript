@@ -451,6 +451,32 @@ NativePair scriptDynGetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload
     });
 }
 
+NativePair scriptDynGetElemAt(Runtime* rt, const FunctionCode* code, std::int64_t tag, std::uint64_t payload,
+                              std::int64_t keyTag, std::uint64_t key, std::uint32_t site) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        Value element;
+        SCRIPT_CENSUS(GetElemTotal);
+        if (getElementByNumber(*rt, valueOf(tag, payload), valueOf(keyTag, key), element)) {
+            SCRIPT_CENSUS(GetElemByNumber);
+            return keep(*rt, element);
+        }
+        bool hit = false;
+        Value v = getElementForNative(*rt, *code, valueOf(tag, payload), valueOf(keyTag, key), site, hit);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (!hit) {
+            if (Type(keyTag) == Type::String)
+                SCRIPT_CENSUS(GetElemStringKey);
+            else
+                SCRIPT_CENSUS(GetElemOtherKey);
+            if (censusOn())
+                censusName(elemCensusText(valueOf(tag, payload), valueOf(keyTag, key)));
+        }
+#endif
+        return keep(*rt, v);
+    });
+}
+
 void scriptDynSetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t keyTag, std::uint64_t key,
                       std::int64_t valueTag, std::uint64_t value) noexcept
 {

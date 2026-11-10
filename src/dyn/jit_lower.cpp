@@ -3096,16 +3096,19 @@ private:
             }
             case Op::GetElemDup: {
                 // base key -> value base
-                (void)operand();
+                const std::uint32_t elemOperand = operand();
                 Entry key = pop();
                 Entry base = pop();
                 secureWeak();
                 makeOwned(base);
+                if (getKeyed(base, key, elemOperand, true))
+                    return true;
                 const std::int32_t rt = rtReg();
                 const std::int32_t r = fn_.newVreg(false);
                 const std::int32_t t = fn_.newVreg(false);
-                coldCall(reinterpret_cast<void*>(&scriptDynGetElem), {rt, tagReg(base), payloadReg(base), tagReg(key), payloadReg(key)}, r,
-                         t, true, {base, key});
+                coldCall(reinterpret_cast<void*>(&scriptDynGetElemAt),
+                         {rt, ptrReg(&code_), tagReg(base), payloadReg(base), tagReg(key), payloadReg(key), immReg(std::int64_t(elemOperand))},
+                         r, t, true, {base, key});
                 release(key);
                 push(taggedEntry(r, t, Own::Weak));
                 push(base);
@@ -5055,7 +5058,9 @@ private:
 
     /// `o[k]` where the site has only met keys that are no index, and has learned one key and shape (`KeyedSite`): that
     /// key on an object of that shape is a load from the slot; anything else, the generic helper.
-    bool getKeyed(Entry& base, Entry& key, std::uint32_t elemOperand)
+    /// `base[key]` for the key and shape the site's keyed cache knows. With `dup`, for a call: the receiver, which has to
+    /// be owned, stays on the stack over the result.
+    bool getKeyed(Entry& base, Entry& key, std::uint32_t elemOperand, bool dup = false)
     {
         if (code_.elemSaw[elemOperand] != ElemSite::kOther || elemOperand >= code_.elemKeyed.size())
             return false;
@@ -5103,12 +5108,20 @@ private:
         mr.a = loaded;
         inst(IrOp::ColdBegin);
         inst(IrOp::Label).imm = slow;
-        coldCall(reinterpret_cast<void*>(&scriptDynGetElem), {rtReg(), tagReg(base), base.r, tagReg(key), payloadReg(key)}, r, t, true,
-                 {base, key});
+        coldCall(reinterpret_cast<void*>(&scriptDynGetElemAt),
+                 {rtReg(), ptrReg(&code_), tagReg(base), base.r, tagReg(key), payloadReg(key), immReg(std::int64_t(elemOperand))}, r, t,
+                 true, {base, key});
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;
         Entry result = taggedEntry(r, t, Own::Weak);
+        if (dup) {
+            // Borrowed from the receiver, which stays: whatever could let it go owns the result first.
+            push(result);
+            release(key);
+            push(base);
+            return true;
+        }
         // Borrowed from the object, which may go when `base` or `key` is let go: a count of its own then.
         if (base.own == Own::Owned || key.own == Own::Owned) {
             makeOwned(result);
@@ -5202,7 +5215,8 @@ private:
             inst(IrOp::ColdBegin);
             inst(IrOp::Label).imm = slow;
             const std::int32_t rt = rtReg();
-            coldCall(reinterpret_cast<void*>(&scriptDynGetElem), {rt, tagReg(base), base.r, tagReg(key), payloadReg(key)}, r,
+            coldCall(reinterpret_cast<void*>(&scriptDynGetElemAt),
+                     {rt, ptrReg(&code_), tagReg(base), base.r, tagReg(key), payloadReg(key), immReg(std::int64_t(elemOperand))}, r,
                      t, true, {base, key});
             inst(IrOp::Br).imm = done;
             inst(IrOp::ColdEnd);

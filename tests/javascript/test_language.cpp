@@ -2385,3 +2385,70 @@ TEST(retiredCodeIsSweptWithoutReadingTheStackAtEveryCompile)
     CHECK_EQ(ctx.eval("work()", "<test>").toString(), std::string("32068925"));
     CHECK(ctx.stats().nativeCodeBytes < (std::uint64_t(4) << 20));
 }
+
+TEST(privateMethodsAreCalledThroughWhatTheirSiteKnows)
+{
+    // Private fields read and written and private methods called in hot loops, from a class made twice so that two private
+    // names of the same spelling exist, #x in o, and a private method called on an object of the other class, which has
+    // to throw a TypeError from native code as from the interpreter.
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "function make(tag) {"
+        "  return class P {"
+        "    #a = 1; #b = 2; #c = tag;"
+        "    #sum() { return this.#a + this.#b; }"
+        "    #scale(f) { this.#a *= f; return this; }"
+        "    step() { this.#b += 1; return this.#sum(); }"
+        "    grow(f) { return this.#scale(f).#sum(); }"
+        "    static has(o) { return #a in o; }"
+        "    static peek(o) { return o.#c; }"
+        "    static callSum(o) { return o.#sum(); }"
+        "  };"
+        "}"
+        "var A = make('A'), B = make('B'), a = new A(), b = new B(), t = 0;"
+        "for (k = 0; k < 3000; k++) { t += a.step(); t += b.step(); if (k % 1000 === 999) t += a.grow(2); }"
+        "S(t); S(A.has(a)); S(A.has(b)); S(A.peek(a)); S(B.peek(b));"
+        "var errs = 0; for (k = 0; k < 600; k++) { try { A.callSum(k < 590 ? a : b); } catch (e) { if (e instanceof TypeError) errs++; } }"
+        "S(errs); try { A.peek({}); } catch (e) { S(e.constructor.name); }"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9031020 true false A B 10 TypeError"));
+    }
+}
+
+TEST(keyedReadsWithNamesNumbersAndOddKeys)
+{
+    // o[k] with k undefined, null, a boolean or the same words as strings, a symbol, names made at run time on an object
+    // used as a dictionary, an index into an array, a typed array and a string, numbers as keys, -0, and a proxy.
+    const char* program =
+        "var out = []; function S(v) { out.push(String(v)); }"
+        "var o = {}; o[undefined] = 'u'; o[null] = 'n'; o[true] = 't'; o[false] = 'f';"
+        "var keys = [undefined, null, true, false, 'undefined', 'null', 'true', 'false'];"
+        "function g(o, k) { return o[k]; } var s = '';"
+        "for (var i = 0; i < 4000; i++) s = g(o, keys[i % 8]) + s.slice(0, 15); S(s);"
+        "S(Object.keys(o).join()); var sym = Symbol('s'); o[sym] = 'sym'; S(g(o, sym));"
+        "var d = {}; for (i = 0; i < 40; i++) d['k' + i] = i; var t = 0; for (i = 0; i < 4000; i++) t += g(d, 'k' + (i % 40)); S(t);"
+        "S(g([1, 2, 3], 1)); S(g(new Uint8Array([4, 5]), 1)); S(g('str', 2)); S(g({7: 'seven'}, 7)); S(g({'7': 'x'}, '7')); S(g({7.5: 'f'}, 7.5)); S(g({0: 'z'}, -0));"
+        "S(g(new Proxy({}, {get(t, k) { return typeof k + ':' + String(k); }}), undefined));"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("ftnuftnuftnuftnu undefined,null,true,false sym 78000 2 5 r seven x f z string:undefined"));
+    }
+}

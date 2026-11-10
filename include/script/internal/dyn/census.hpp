@@ -58,6 +58,7 @@ enum class Census : std::uint8_t
     Bail,
     SweepCalls,
     SweepFreedNothing,
+    GetElemKeyedHit,
     Count,
 };
 

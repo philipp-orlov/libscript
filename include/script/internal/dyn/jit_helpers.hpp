@@ -66,6 +66,9 @@ NativePair scriptDynGetProp(Runtime* rt, const FunctionCode* code, std::int64_t 
                             std::uint32_t operand) noexcept;
 NativePair scriptDynGetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t keyTag,
                             std::uint64_t key) noexcept;
+/// `o[k]` at an element site of `code`: what the site's keyed cache knows first, then the long way, which teaches it.
+NativePair scriptDynGetElemAt(Runtime* rt, const FunctionCode* code, std::int64_t tag, std::uint64_t payload,
+                              std::int64_t keyTag, std::uint64_t key, std::uint32_t site) noexcept;
 NativePair scriptDynGetGlobal(Runtime* rt, GCObject* key) noexcept;
 
 void scriptDynSetProp(Runtime* rt, const FunctionCode* code, std::int64_t tag, std::uint64_t payload, std::uint32_t operand,
@@ -148,6 +151,9 @@ NativePair scriptDynToObject(Runtime* rt, std::int64_t tag, std::uint64_t payloa
 Value getPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand);
 void setPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand, const Value& v);
 Value getGlobalForNative(Runtime& rt, GCObject* key);
+/// `base[key]` for a key that is no element: `hit` says whether the site's keyed cache answered.
+Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& base, const Value& key, std::uint32_t site,
+                          bool& hit);
 void setGlobalForNative(Runtime& rt, GCObject* key, const Value& v);
 Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, DynFunction* parent,
                            Box* const* boxes);

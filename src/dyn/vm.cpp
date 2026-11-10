@@ -1563,6 +1563,9 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue, Value
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
 #endif
     noteArguments(code, args.data(), args.size());
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    censusInterpretedCall(code);
+#endif
     Frame& frame = rt.acquireFrame(rt.frames.size());
     frame.begin(fn, &code, thisValue, newTarget);
     rt.frames.push_back(&frame);
@@ -2384,6 +2387,71 @@ std::unordered_map<std::string, std::uint64_t>& censusNameCounts()
     return *counts;
 }
 
+/// What the interpreter ran of one function, and what became of compiling it. Keyed by address: a function freed and
+/// another made in its place share a line, which a census can live with.
+struct CensusCode
+{
+    std::uint64_t calls = 0;
+    std::uint64_t work = 0;
+    bool compiled = false;
+    std::string refusal;
+};
+std::unordered_map<const FunctionCode*, CensusCode>& censusCodes()
+{
+    static auto* codes = new std::unordered_map<const FunctionCode*, CensusCode>();
+    return *codes;
+}
+
+/// Refused for a reason the compile to bytecode or the tiering policy gave, not the code generator.
+const char* refusedBefore(const FunctionCode& code)
+{
+    if (code.isGenerator || code.isAsync)
+        return "a generator or async function: native code only for its loops";
+    if (!code.jitRefused)
+        return nullptr;
+    if (code.isDerivedConstructor && code.isClassConstructor)
+        return "a derived class constructor";
+    return "refused by the bytecode compiler: direct eval, or eval code";
+}
+
+CensusCode& censusCode(const FunctionCode& code)
+{
+    CensusCode& c = censusCodes()[&code];
+    if (c.refusal.empty() && !c.compiled)
+        if (const char* why = refusedBefore(code))
+            c.refusal = why;
+    return c;
+}
+
+void printCodeCensus()
+{
+    struct Group
+    {
+        std::uint64_t calls = 0, functions = 0, work = 0;
+    };
+    std::unordered_map<std::string, Group> groups;
+    for (const auto& kv : censusCodes()) {
+        const CensusCode& c = kv.second;
+        const std::string key = c.compiled ? "compiled" : !c.refusal.empty() ? "refused " + c.refusal : "notyet";
+        Group& g = groups[key];
+        g.calls += c.calls;
+        g.work += c.work;
+        ++g.functions;
+    }
+    std::vector<std::pair<std::uint64_t, std::string>> order;
+    for (const auto& kv : groups)
+        order.push_back({kv.second.calls + kv.second.work, kv.first});
+    std::sort(order.rbegin(), order.rend());
+    for (const auto& [weight, key] : order) {
+        const Group& g = groups[key];
+        const std::size_t space = key.find(' ');
+        const std::string kind = key.substr(0, space);
+        const std::string text = space == std::string::npos ? std::string() : key.substr(space + 1);
+        std::fprintf(stderr, "%s %14llu %8llu %12llu %s\n", kind.c_str(), static_cast<unsigned long long>(g.calls),
+                     static_cast<unsigned long long>(g.functions), static_cast<unsigned long long>(g.work), text.c_str());
+    }
+}
+
 const bool censusEnabled = [] {
     if (!std::getenv("SCRIPT_CENSUS"))
         return false;
@@ -2397,6 +2465,7 @@ const bool censusEnabled = [] {
         std::sort(all.rbegin(), all.rend());
         for (std::size_t i = 0; i < all.size() && i < 40; ++i)
             std::fprintf(stderr, "names %14llu  %s\n", static_cast<unsigned long long>(all[i].first), all[i].second.c_str());
+        printCodeCensus();
     });
     return true;
 }();
@@ -2416,6 +2485,27 @@ void censusName(const std::string& text)
 {
     if (censusEnabled)
         ++censusNameCounts()[text];
+}
+
+void censusInterpretedCall(const FunctionCode& code)
+{
+    if (censusEnabled)
+        ++censusCode(code).calls;
+}
+
+void censusInterpretedWork(const FunctionCode& code)
+{
+    if (censusEnabled)
+        ++censusCode(code).work;
+}
+
+void censusCompileOutcome(const FunctionCode& code, const std::string* refusal)
+{
+    if (!censusEnabled)
+        return;
+    CensusCode& c = censusCodes()[&code];
+    c.compiled = !refusal;
+    c.refusal = refusal ? *refusal : std::string();
 }
 
 namespace {
@@ -4102,6 +4192,7 @@ Value execute(Runtime& rt, Frame& entry)
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
                 if (!code->interpreted++ && std::getenv("SCRIPT_INTERP_PROFILE"))
                     rt.interpretedCodes.push_back(code);
+                censusInterpretedWork(*code);
 #endif
                 if (rt.ctx.interruptAsked())
                     throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
@@ -4583,6 +4674,9 @@ Value execute(Runtime& rt, Frame& entry)
             }
             // Into the callee's frame, run by this same loop, which goes back to this one when it returns.
             noteArguments(target, args, argc);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            censusInterpretedCall(target);
+#endif
             Frame& next = rt.acquireFrame(rt.frames.size());
             next.begin(fn, &target, args[-1], nullptr);
             const std::size_t plain = std::min<std::size_t>(argc, target.numLocals);
@@ -4633,6 +4727,9 @@ Value execute(Runtime& rt, Frame& entry)
                     throwError(rt, ErrorCode::Interrupted, "execution was interrupted");
             }
             noteArguments(target, args, argc);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            censusInterpretedCall(target);
+#endif
             Frame& next = rt.acquireFrame(rt.frames.size());
             next.begin(fn, &target, std::move(self), fn);
             const std::size_t plain = std::min<std::size_t>(argc, target.numLocals);
@@ -5177,6 +5274,9 @@ Value runCoroutine(Runtime& rt, DynCoroutine* co, DynCoroutine::Resume mode, con
         Runtime& rt;
         ~Pop() { rt.frames.pop_back(); }
     } pop{rt};
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    censusInterpretedCall(*frame.code);
+#endif
     return execute(rt, frame);
 }
 

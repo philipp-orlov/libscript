@@ -1333,10 +1333,19 @@ bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunctio
 {
     if (!compiled) {
         code.jitRefused = true;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (censusOn()) {
+            const std::string why = "the code generator: " + rt.jitBackend->functionRefusal();
+            censusCompileOutcome(code, &why);
+        }
+#endif
         if (rt.ctx.options.jit.dumpCode)
             rt.ctx.write(fromUtf8("jit: the code generator refused " + code.name + ": " + rt.jitBackend->functionRefusal() + "\n"), false);
         return false;
     }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    censusCompileOutcome(code, nullptr);
+#endif
     // Where each bail's values ended up, now that that is decided.
     for (const typed::IrCall& call : fn.calls) {
         if (!call.readsPlaces)
@@ -1549,6 +1558,12 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
         code.jitJob = nullptr;
         if (!job->ok) {
             code.jitRefused = true;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (censusOn()) {
+                const std::string why = "the code generator: " + job->built.refusal;
+                censusCompileOutcome(code, &why);
+            }
+#endif
             if (rt.ctx.options.jit.dumpCode)
                 rt.ctx.write(fromUtf8("jit: the code generator refused " + code.name + ": " + job->built.refusal + "\n"), false);
             return false;
@@ -1569,12 +1584,17 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* skip = std::getenv("SCRIPT_JIT_SKIP"); skip && (std::string(",") + skip + ",").find("," + code.name + ",") != std::string::npos) {
         code.jitRefused = true;
+        const std::string why = "SCRIPT_JIT_SKIP";
+        censusCompileOutcome(code, &why);
         return false;
     }
     const auto started = std::chrono::steady_clock::now();
 #endif
     if (!lowerFunction(rt, code, fn, &why)) {
         code.jitRefused = true;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        censusCompileOutcome(code, &why);
+#endif
         if (rt.ctx.options.jit.dumpCode)
             rt.ctx.write(fromUtf8("jit: skipping " + code.name + ": " + why + "\n"), false);
         return false;

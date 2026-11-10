@@ -15,6 +15,8 @@ namespace dyn {
 
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
 
+struct FunctionCode;
+
 enum class Census : std::uint8_t
 {
     // Where `protoEpoch` moves.
@@ -65,6 +67,13 @@ std::uint64_t* censusCounts() noexcept;
 bool censusOn() noexcept;
 /// One more of `text` in the histogram printed as `names <count> <text>`, the 40 largest.
 void censusName(const std::string& text);
+/// Why code stays in the interpreter, printed at exit as `refused <calls> <functions> <work> <text>`, `notyet ...` and
+/// `compiled ...`: calls are the interpreter's entries into a function, work its blocks of loop iterations
+/// (`FunctionCode::interpreted`). Only when SCRIPT_CENSUS is set.
+void censusInterpretedCall(const FunctionCode& code);
+void censusInterpretedWork(const FunctionCode& code);
+/// What became of a compile: `refusal` null for code installed.
+void censusCompileOutcome(const FunctionCode& code, const std::string* refusal);
 
 #define SCRIPT_CENSUS(id) \
     (void)(++script::internal::dyn::censusCounts()[std::size_t(script::internal::dyn::Census::id)])

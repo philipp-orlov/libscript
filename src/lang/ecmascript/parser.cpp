@@ -1492,6 +1492,7 @@ NodePtr Parser::assignment()
     if (nest.tooDeep())
         fail("expression is nested too deeply");
     const std::uint32_t exprStart = cur_.start;
+    const std::uint32_t evalBefore = evalCalls_;
     if (at(Tok::Yield) && inGenerator_) {
         if (inParameters_)
             fail("'yield' cannot be used in a generator's parameters");
@@ -1533,7 +1534,7 @@ NodePtr Parser::assignment()
         NodePtr returnType = at(Tok::Colon) ? typeAnnotation() : nullptr;
         expect(Tok::Arrow, "'=>'");
         arrowIsAsync_ = true;
-        return withSource(arrowFromParams(std::move(params), std::move(returnType), line), exprStart);
+        return withSource(arrowFromParams(std::move(params), std::move(returnType), line, evalBefore), exprStart);
     }
 
     // `x => ...` and `(a, b) => ...`
@@ -1547,7 +1548,7 @@ NodePtr Parser::assignment()
             advance();
             std::vector<NodePtr> params;
             params.push_back(std::move(param));
-            return withSource(arrowFromParams(std::move(params), nullptr, line), exprStart);
+            return withSource(arrowFromParams(std::move(params), nullptr, line, evalBefore), exprStart);
         }
     }
     if ((at(Tok::LParen) && looksLikeArrow()) || (at(Tok::Lt) && looksLikeGenericArrow())) {
@@ -1558,7 +1559,7 @@ NodePtr Parser::assignment()
         std::vector<NodePtr> params = parameterList();
         NodePtr returnType = typeAnnotation();
         expect(Tok::Arrow, "'=>'");
-        NodePtr arrow = withSource(arrowFromParams(std::move(params), std::move(returnType), line), exprStart);
+        NodePtr arrow = withSource(arrowFromParams(std::move(params), std::move(returnType), line, evalBefore), exprStart);
         arrow->typeParams = std::move(generics);
         return arrow;
     }
@@ -1730,6 +1731,7 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
             if (at(Tok::LParen) && allowCall) {
                 NodePtr n = makeNode(NK::Call, base->line);
                 n->optional = true;
+                noteCallee(*base);
                 n->a = std::move(base);
                 n->list = argumentList();
                 base = std::move(n);
@@ -1765,6 +1767,7 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
             base = std::move(n);
         } else if (at(Tok::LParen) && allowCall) {
             NodePtr n = makeNode(NK::Call, base->line);
+            noteCallee(*base);
             n->a = std::move(base);
             n->list = argumentList();
             base = std::move(n);
@@ -1780,12 +1783,14 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
             if (!at(Tok::LParen))
                 fail("expected an argument list after type arguments");
             NodePtr n = makeNode(NK::Call, base->line);
+            noteCallee(*base);
             n->a = std::move(base);
             n->typeParams = std::move(args);
             n->list = argumentList();
             base = std::move(n);
         } else if (at(Tok::Template)) {
             NodePtr n = makeNode(NK::Call, base->line);
+            noteCallee(*base);
             n->a = std::move(base);
             NodePtr strings = makeNode(NK::TemplateObject, cur_.line);
             strings->strs = cur_.parts;
@@ -1878,7 +1883,7 @@ bool Parser::looksLikeTypeArguments()
     return after == Tok::LParen || after == Tok::Template;
 }
 
-NodePtr Parser::arrowFromParams(std::vector<NodePtr> params, NodePtr returnType, std::uint32_t line)
+NodePtr Parser::arrowFromParams(std::vector<NodePtr> params, NodePtr returnType, std::uint32_t line, std::uint32_t evalBefore)
 {
     NodePtr n = makeNode(NK::ArrowExpr, line);
     n->list = std::move(params);
@@ -1895,6 +1900,7 @@ NodePtr Parser::arrowFromParams(std::vector<NodePtr> params, NodePtr returnType,
         body->list.push_back(std::move(ret));
         n->d = std::move(body);
     }
+    n->evalInside = evalCalls_ != evalBefore;
     return n;
 }
 
@@ -1969,6 +1975,7 @@ std::vector<NodePtr> Parser::parameterList(bool allowModifiers)
 NodePtr Parser::functionExpression(bool isDeclaration)
 {
     const std::uint32_t start = cur_.start;
+    const std::uint32_t evalBefore = evalCalls_;
     NodePtr n = makeNode(NK::FunctionExpr, cur_.line);
     n->isAsync = eat(Tok::Async);
     expect(Tok::Function, "'function'");
@@ -1988,15 +1995,18 @@ NodePtr Parser::functionExpression(bool isDeclaration)
     if (ambient_) {
         n->declared = true;
         semicolon();
+        n->evalInside = evalCalls_ != evalBefore;
         return n;
     }
     n->d = block();
+    n->evalInside = evalCalls_ != evalBefore;
     return withSource(std::move(n), start);
 }
 
 NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
 {
     const std::uint32_t start = cur_.start;
+    const std::uint32_t evalBefore = evalCalls_;
     NodePtr n = makeNode(NK::ClassExpr, cur_.line);
     n->isAbstract = isAbstract;
     expect(Tok::Class, "'class'");
@@ -2124,6 +2134,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
         if (at(Tok::LParen) || (typescript_ && at(Tok::Lt))) {
             const bool isConstructor = kind == PropKind::Method && !computed && !isStatic &&
                                        key->text == ascii("constructor");
+            const std::uint32_t evalBefore = evalCalls_;
             NodePtr fn = makeNode(NK::FunctionExpr, line);
             if (!computed)
                 fn->text = key->text;
@@ -2140,8 +2151,10 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             if (memberAbstract || ambientMember || (typescript_ && !at(Tok::LBrace))) {
                 fn->declared = true;
                 semicolon();
+                fn->evalInside = evalCalls_ != evalBefore;
             } else {
                 fn->d = block();
+                fn->evalInside = evalCalls_ != evalBefore;
                 fn = withSource(std::move(fn), memberStart);
             }
 
@@ -2179,6 +2192,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
         n->list.push_back(std::move(f));
     }
     advance();
+    n->evalInside = evalCalls_ != evalBefore;
     return withSource(std::move(n), start);
 }
 
@@ -2252,6 +2266,7 @@ NodePtr Parser::objectLiteral()
         }
 
         if (at(Tok::LParen) || (typescript_ && at(Tok::Lt))) {
+            const std::uint32_t evalBefore = evalCalls_;
             NodePtr fn = makeNode(NK::FunctionExpr, line);
             fn->text = p->text;
             fn->isAsync = memberAsync;
@@ -2263,6 +2278,7 @@ NodePtr Parser::objectLiteral()
             fn->list = parameterList();
             fn->type = typeAnnotation();
             fn->d = block();
+            fn->evalInside = evalCalls_ != evalBefore;
             p->b = withSource(std::move(fn), propStart);
             if (kind == PropKind::Init)
                 p->propKind = PropKind::Method;

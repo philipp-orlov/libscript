@@ -2099,6 +2099,31 @@ TEST(tokensReadOneAfterAnotherKeepNothingOfTheLastOne)
     CHECK_EQ(run(program), std::string("x8yin2nerz str1 31 16 2 2 1 re-after-brace true|a-b|4|4 2 10 \\n1 a|b|c1,2 x |4"));
 }
 
+TEST(aCallOfEvalAnywhereInAFunctionMakesItsVariablesVisibleToEval)
+{
+    // The parser tells the compiler which functions hold an `eval` call, in a parameter default, an arrow's body, a
+    // method, a field initializer or a class heritage as much as in a statement; one that has none is not slowed.
+    const char* program =
+        "var out = [];"
+        "function inArrow() { var x = 1; var g = () => eval('x + 1'); return g(); } out.push(inArrow());"
+        "function inDefault() { var y = 2; function h(a = eval('y * 3')) { return a; } return h(); } out.push(inDefault());"
+        "function inArrowDefault() { var z = 4; var g = (a = eval('z + 1')) => a; return g(); } out.push(inArrowDefault());"
+        "function inMethod() { var m = 5; var o = { f() { return eval('m'); } }; return o.f(); } out.push(inMethod());"
+        "function inClass() { var c = 6; class K { static v = eval('c * 2'); get g() { return eval('c'); } } return K.v + ':' + new K().g; } out.push(inClass());"
+        "function inHeritage() { var b = 7; class B { constructor() { this.q = 1; } } class D extends (eval('b'), B) {} return new D().q; } out.push(inHeritage());"
+        "function nested() { var n = 8; return (() => () => eval('n'))()(); } out.push(nested());"
+        "function noEval() { var w = 9; var g = () => w; return g() + (function () { return 1; })(); } out.push(noEval());"
+        "function shadowed() { var e = 1; { var eval2 = 2; } return [1, 2].map(i => i + e).join(''); } out.push(shadowed());"
+        "out.join(' ')";
+    for (auto mode : {script::JitOptions::Mode::Off, script::JitOptions::Mode::Eager}) {
+        script::Context::Options options;
+        options.jit.mode = mode;
+        options.runtimeCode = true;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2 6 5 5 12:6 1 8 10 23"));
+    }
+}
+
 TEST(aGeneratorIsSteppedWithoutAResultObject)
 {
     // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the

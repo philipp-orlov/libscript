@@ -110,7 +110,8 @@ private:
     NodePtr templateLiteral();
     NodePtr functionExpression(bool isDeclaration);
     NodePtr classExpression(bool isDeclaration, bool isAbstract);
-    NodePtr arrowFromParams(std::vector<NodePtr> params, NodePtr returnType, std::uint32_t line);
+    /// `evalBefore` is the count of `eval` calls when the arrow's text began, its parameters included.
+    NodePtr arrowFromParams(std::vector<NodePtr> params, NodePtr returnType, std::uint32_t line, std::uint32_t evalBefore);
     std::vector<NodePtr> argumentList();
     /// `allowModifiers` admits `private x: T` constructor parameter properties.
     std::vector<NodePtr> parameterList(bool allowModifiers = false);
@@ -153,6 +154,13 @@ private:
     std::size_t lookaheadLimit_ = 0;
     bool ambient_ = false;   ///< inside `declare`: bodies are not required
     bool noIn_ = false;      ///< parsing a for-in head: `in` ends the expression
+    /// How many calls of a name `eval` have been parsed: a function holds one if the count moved while it was parsed.
+    std::uint32_t evalCalls_ = 0;
+    void noteCallee(const Node& callee)
+    {
+        if (callee.kind == NK::Identifier && callee.text == u"eval")
+            ++evalCalls_;
+    }
     bool arrowIsAsync_ = false;  ///< the arrow function about to be parsed was written `async`
     bool inParameters_ = false;
     bool inStaticBlock_ = false;

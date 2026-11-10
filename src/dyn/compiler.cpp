@@ -504,6 +504,8 @@ bool containsDirectEval(const Node& n)
     checkNativeStack();
     if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval")
         return true;
+    if (n.evalInside >= 0)
+        return n.evalInside == 1;
     const bool cacheHere = gAnalysis && isFunctionNode(n);
     if (cacheHere) {
         if (auto it = gAnalysis->eval.find(&n); it != gAnalysis->eval.end())
@@ -3303,6 +3305,7 @@ private:
         copy->prefix = n.prefix;
         copy->optional = n.optional;
         copy->namedExpr = n.namedExpr;
+        copy->evalInside = n.evalInside;
         copy->isGenerator = n.isGenerator;
         copy->isAsync = n.isAsync;
         copy->isPrivate = n.isPrivate;

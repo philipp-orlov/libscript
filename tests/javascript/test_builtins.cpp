@@ -142,6 +142,28 @@ TEST(objectAssignCopiesTheIndicesOfAString)
              std::string("0,1,2 3"));
 }
 
+TEST(applyInCodeCompiledBeforeItsParametersWereSeen)
+{
+    // The array of `f.apply(x, list)` may be a parameter that code compiled before any call types as a number, or a
+    // constant: neither has a tag or a cell to guard, so the call is made the long way.
+    const char* program =
+        "function viaParam(f, list) { return f.apply(null, list); }"
+        "function viaConst(f) { return f.apply(null, null); }"
+        "function viaLiteral(f) { return f.apply(null, [4, 5]); }"
+        "function sum() { var s = 0; for (var i = 0; i < arguments.length; i++) s += arguments[i]; return s; }"
+        "var out = [viaParam(sum, [1, 2, 3]), viaConst(sum), viaLiteral(sum)];"
+        "try { viaParam(sum, 7); out.push('no'); } catch (e) { out.push(e.constructor.name); }"
+        "for (var i = 0; i < 200; i++) viaParam(sum, [i, i]);"
+        "out.push(viaParam(sum, [10, 20]));"
+        "out.join(',')";
+    for (auto mode : {script::JitOptions::Mode::Off, script::JitOptions::Mode::Eager}) {
+        script::Context::Options options;
+        options.jit.mode = mode;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("6,0,9,TypeError,30"));
+    }
+}
+
 TEST(jsonRoundTrips)
 {
     CHECK_EQ(run("JSON.stringify({ a: [1, 'two', null, true], b: { c: 3 } })"),

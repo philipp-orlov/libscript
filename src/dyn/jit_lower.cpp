@@ -6372,6 +6372,9 @@ private:
                            (which == Runtime::ArrayReduce && argc == 2);
         if (!fits && !loops)
             return false;
+        // `f.apply(x, list)` reads the list's tag and cell: a number a parameter is typed as, or a constant, has neither.
+        if (which == Runtime::FunctionApply && (args[1].rep != Rep::Tagged || args[1].isConst || (args[1].hasKnownTag && args[1].known != Type::Object)))
+            return false;
         const auto anObject = [](const Entry& e) {
             return e.rep == Rep::Tagged && !e.isConst && (!e.hasKnownTag || e.known == Type::Object);
         };

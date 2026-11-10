@@ -2308,3 +2308,31 @@ TEST(nativeCodeReadsWhatASiteLearnedAfterItWasCompiled)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1600 str up got undefined 70500"));
     }
 }
+
+TEST(nativeCodeReadsAPrototypesPropertyASiteLearnedAfterItWasCompiled)
+{
+    // The same for a property up the chain: read while the prototypes stay as they were when the site learned it, and
+    // whatever changes them, a new value, a getter, a delete, a property higher up, a new prototype, is seen.
+    const char* program =
+        "var out = [], k, s = 0; function S(v) { out.push(String(v)); }"
+        "function f(o) { return o === null ? 0 : o.v; }"
+        "for (k = 0; k < 400; k++) f(null);"
+        "function P() {} P.prototype.v = 2; var p = new P();"
+        "for (k = 0; k < 400; k++) s += f(p); S(s);"
+        "P.prototype.v = 3; S(f(p)); Object.defineProperty(P.prototype, 'v', {get() { return 'g'; }, configurable: true}); S(f(p));"
+        "delete P.prototype.v; S(f(p)); for (k = 0; k < 400; k++) f(p); S(f(p));"
+        "Object.prototype.v = 'top'; S(f(p)); delete Object.prototype.v; S(f(p));"
+        "p.v = 'own'; S(f(p)); Object.setPrototypeOf(p, {v: 'other'}); delete p.v; S(f(p));"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("800 3 g undefined undefined top undefined own other"));
+    }
+}

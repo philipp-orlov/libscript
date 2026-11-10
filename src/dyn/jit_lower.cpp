@@ -76,7 +76,10 @@ constexpr std::int64_t kBoxValueOffset = offsetof(Box, value);
 constexpr std::int64_t kSiteShapeOffset = offsetof(PropertySite, shape);
 constexpr std::int64_t kSiteHolderOffset = offsetof(PropertySite, holder);
 constexpr std::int64_t kSiteIndexOffset = offsetof(PropertySite, index);
+constexpr std::int64_t kSiteEpochOffset = offsetof(PropertySite, epoch);
+constexpr std::int64_t kSiteGetterOffset = offsetof(PropertySite, getter);
 static_assert(sizeof(PropertySite::shape) == 8 && sizeof(PropertySite::holder) == 8, "read as words");
+static_assert(sizeof(PropertySite::epoch) == 8 && sizeof(PropertySite::getter) == 1, "read as a word and a byte");
 static_assert(sizeof(PropertySite::index) == 4, "read as 32 bits");
 static_assert(sizeof(Prop) == 16, "an index into a property table is scaled by a shift of 4");
 #if defined(__GNUC__)
@@ -4281,6 +4284,60 @@ private:
         return site.shape ? &site : nullptr;
     }
 
+    /// What a read site has learned by now, read from the site as the code runs, into `t` and `r`; anything it does not
+    /// answer goes to `miss`. The code is compiled against what the site knew then: since, it may have learned a first
+    /// shape, or the prototypes may have changed and it may have learned again. A property on the receiver, or one up its
+    /// chain while `protoEpoch` is what it was learned at; a getter is left to `miss`. Nothing is patched; the helper and
+    /// the interpreter teach the site.
+    void readLiveSite(const Entry& base, const PropertySite* live, std::int32_t t, std::int32_t r, std::int32_t miss)
+    {
+        const std::int32_t have = shapeOf(base, miss);
+        branchCmp(have, IrCond::Eq, 0, miss, 64);
+        const std::int32_t where = ptrReg(live);
+        const std::int32_t want = load(where, kSiteShapeOffset, 8);
+        IrInst& same = inst(IrOp::BrCmp);
+        same.a = have;
+        same.b = want;
+        same.cond = IrCond::Ne;
+        same.width = 64;
+        same.target = miss;
+        const std::int32_t own = newLabel();
+        const std::int32_t found = newLabel();
+        const std::int32_t from = fn_.newVreg(false);
+        const std::int32_t holder = load(where, kSiteHolderOffset, 8);
+        branchCmp(holder, IrCond::Eq, 0, own, 64);
+        branchCmp(load(where, kSiteGetterOffset, 1), IrCond::Ne, 0, miss);
+        const std::int32_t learnedAt = load(where, kSiteEpochOffset, 8);
+        const std::int32_t now = load(ptrReg(&rt_.ctx.protoEpoch), 0, 8);
+        IrInst& current = inst(IrOp::BrCmp);
+        current.a = now;
+        current.b = learnedAt;
+        current.cond = IrCond::Ne;
+        current.width = 64;
+        current.target = miss;
+        mov(from, holder);
+        inst(IrOp::Br).imm = found;
+        inst(IrOp::Label).imm = own;
+        mov(from, base.r);
+        inst(IrOp::Label).imm = found;
+        const std::int32_t scaled = shiftLeft(load(where, kSiteIndexOffset, 4), 4);
+        const std::int32_t props = loadHeader(from, kPropsOffset);
+        IrInst& lt = inst(IrOp::LoadIdx);
+        lt.d = t;
+        lt.a = props;
+        lt.b = scaled;
+        lt.imm = kPropValueOffset;
+        lt.width = 1;
+        lt.alias = kAliasValue;
+        IrInst& lr = inst(IrOp::LoadIdx);
+        lr.d = r;
+        lr.a = props;
+        lr.b = scaled;
+        lr.imm = kPropValueOffset + kPayload;
+        lr.width = 8;
+        lr.alias = kAliasValue;
+    }
+
     void getProp(std::uint32_t operand, bool keepBase)
     {
         Entry base = pop();
@@ -4420,42 +4477,18 @@ private:
             IrInst& mr = inst(IrOp::Mov);
             mr.d = r;
             mr.a = lr;
-        } else if (const PropertySite* live = liveSite(operand)) {
-            // Nothing to count on when this was compiled: what the site has learned since, of a property on the receiver
-            // itself, is read from the site each time. Nothing is patched; the helper and the interpreter teach it.
-            const std::int32_t have = shapeOf(base, slow);
-            branchCmp(have, IrCond::Eq, 0, slow, 64);
-            const std::int32_t where = ptrReg(live);
-            const std::int32_t want = load(where, kSiteShapeOffset, 8);
-            IrInst& same = inst(IrOp::BrCmp);
-            same.a = have;
-            same.b = want;
-            same.cond = IrCond::Ne;
-            same.width = 64;
-            same.target = slow;
-            branchCmp(load(where, kSiteHolderOffset, 8), IrCond::Ne, 0, slow, 64);
-            const std::int32_t scaled = shiftLeft(load(where, kSiteIndexOffset, 4), 4);
-            const std::int32_t props = loadHeader(base.r, kPropsOffset);
-            IrInst& lt = inst(IrOp::LoadIdx);
-            lt.d = t;
-            lt.a = props;
-            lt.b = scaled;
-            lt.imm = kPropValueOffset;
-            lt.width = 1;
-            lt.alias = kAliasValue;
-            IrInst& lr = inst(IrOp::LoadIdx);
-            lr.d = r;
-            lr.a = props;
-            lr.b = scaled;
-            lr.imm = kPropValueOffset + kPayload;
-            lr.width = 8;
-            lr.alias = kAliasValue;
         } else {
             inst(IrOp::Br).imm = slow;
         }
         if (!bet && !polyBet) {
             inst(IrOp::ColdBegin);
             inst(IrOp::Label).imm = slow;
+            if (const PropertySite* live = liveSite(operand)) {
+                const std::int32_t helper = newLabel();
+                readLiveSite(base, live, t, r, helper);
+                inst(IrOp::Br).imm = done;
+                inst(IrOp::Label).imm = helper;
+            }
             const std::int32_t rt = rtReg();
             const std::int32_t self = ptrReg(&code_);
             const std::int32_t op = immReg(std::int64_t(operand));

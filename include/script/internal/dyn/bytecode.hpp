@@ -526,16 +526,28 @@ struct FunctionCode
         std::weak_ptr<const FunctionCode> code;
     };
     mutable std::vector<CallTarget> jitCallTargets;
+    /// Where the last call was found: the next one is mostly the next site along, or the same one again in a loop.
+    mutable std::uint32_t jitCallTargetHint = 0;
     void noteCall(std::uint32_t pc, const std::shared_ptr<const FunctionCode>& target) const
     {
-        for (CallTarget& known : jitCallTargets) {
-            if (known.pc == pc) {
-                if (known.seen != target.get())
-                    known.seen = nullptr;
-                return;
+        const std::size_t count = jitCallTargets.size();
+        std::size_t at = jitCallTargetHint;
+        if (at >= count || jitCallTargets[at].pc != pc) {
+            // The sites are in the order they first ran, which a loop repeats: try the one after the last.
+            at = at + 1 < count && jitCallTargets[at + 1].pc == pc ? at + 1 : count;
+            for (std::size_t i = 0; at == count && i < count; ++i) {
+                if (jitCallTargets[i].pc == pc)
+                    at = i;
             }
         }
-        if (jitCallTargets.size() < 64)
+        if (at < count) {
+            CallTarget& known = jitCallTargets[at];
+            jitCallTargetHint = std::uint32_t(at);
+            if (known.seen != target.get())
+                known.seen = nullptr;
+            return;
+        }
+        if (count < 64)
             jitCallTargets.push_back({pc, target.get(), target});
     }
     /// What native code compiled from this has to bail with.

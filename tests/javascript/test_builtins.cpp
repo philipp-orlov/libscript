@@ -334,3 +334,38 @@ TEST(dataViewAndBufferGettersFromNativeCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("517500 3.13984e-319 0 2.8363e-319 0 -5 18446744073709551611 RangeError TypeError:not a DataView TypeError:not a DataView TypeError TypeError:not a typed array 2 getFloat64 get byteLength 0 0"));
     }
 }
+
+TEST(collectionsFromNativeCode)
+{
+    // Map get, set and has, Set add and has, WeakMap get, set and has, WeakSet add and has from native code, with missing
+    // arguments, keys that are no objects, NaN and -0, and each on the wrong kind of receiver.
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "var m = new Map(), st = new Set(), wm = new WeakMap(), ws = new WeakSet(), keys = [];"
+        "for (k = 0; k < 20; k++) keys.push({k: k});"
+        "function work(i) { var o = keys[i % 20]; m.set(i % 7, i); st.add(i % 5); wm.set(o, i); ws.add(o);"
+        "  return (m.get(i % 7) | 0) + (m.has(i % 9) ? 1 : 0) + (st.has(i % 6) ? 2 : 0) + (wm.get(o) | 0) + (wm.has(o) ? 4 : 0) + (ws.has(o) ? 8 : 0); }"
+        "var s = 0; for (k = 0; k < 4000; k++) s += work(k); S(s); S(m.size); S(st.size);"
+        "S(m.get()); S(m.has()); m.set(); S(m.has(undefined)); S(st.add() === st); S(m.set(NaN, 1).get(NaN)); S(m.get(-0) === m.get(0));"
+        "S(wm.get(1)); S(wm.has('x')); S(ws.has(null));"
+        "try { wm.set(1, 2); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { ws.add(3); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { Map.prototype.get.call(st, 1); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { Set.prototype.has.call(m, 1); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { WeakMap.prototype.get.call(ws, {}); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { WeakSet.prototype.has.call({}, {}); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "S(Map.prototype.set.length); S(Set.prototype.has.name); S(WeakMap.prototype.set.call(wm, keys[0], 'v') === wm); S(wm.get(keys[0]));"
+        "var sym = Symbol('s'); wm.set(sym, 'sym'); S(wm.get(sym));"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("16053780 7 5 undefined false true true 1 true undefined false false TypeError:invalid value used as a WeakMap key TypeError:invalid value used in a WeakSet TypeError:not a Map TypeError:not a Set TypeError:not a WeakMap TypeError:not a WeakSet 2 has true v sym"));
+    }
+}

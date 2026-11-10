@@ -174,13 +174,48 @@ Value combinator(CallInfo& ci, Combine kind)
     }
 }
 
+DynMap* thisCollection(Runtime& rt, const Value& self, ObjClass expected)
+{
+    DynObject* o = asObject(self);
+    if (!o || o->cls != expected)
+        throwError(rt, ErrorCode::TypeError, expected == ObjClass::Map ? "not a Map" : "not a Set");
+    return static_cast<DynMap*>(o);
+}
+
 DynMap* thisCollection(CallInfo& ci, ObjClass expected)
 {
-    DynObject* o = asObject(ci.thisValue());
-    if (!o || o->cls != expected)
-        ci.fail(ErrorCode::TypeError,
-                expected == ObjClass::Map ? "not a Map" : "not a Set");
-    return static_cast<DynMap*>(o);
+    return thisCollection(rtOf(ci), ci.thisValue(), expected);
+}
+
+inline const Value& argAt(const Value* args, std::size_t argc, std::size_t i) noexcept
+{
+    static const Value undefined = Value::undefined();
+    return i < argc ? args[i] : undefined;
+}
+
+template <ObjClass cls>
+Value collectionHas(Runtime& rt, const Value& self, const Value* args, std::size_t argc)
+{
+    return Value(thisCollection(rt, self, cls)->find(argAt(args, argc, 0)) >= 0);
+}
+
+Value mapGet(Runtime& rt, const Value& self, const Value* args, std::size_t argc)
+{
+    DynMap* m = thisCollection(rt, self, ObjClass::Map);
+    const std::int64_t at = m->find(argAt(args, argc, 0));
+    return at < 0 ? Value::undefined() : m->entries[std::size_t(at)].value;
+}
+
+Value mapSet(Runtime& rt, const Value& self, const Value* args, std::size_t argc)
+{
+    thisCollection(rt, self, ObjClass::Map)->insert(argAt(args, argc, 0), argAt(args, argc, 1));
+    return self;
+}
+
+Value setAdd(Runtime& rt, const Value& self, const Value* args, std::size_t argc)
+{
+    thisCollection(rt, self, ObjClass::Set)->insert(argAt(args, argc, 0), argAt(args, argc, 0));
+    return self;
 }
 
 DynMap* newCollection(Runtime& rt, ObjClass cls, DynObject* proto)
@@ -213,9 +248,7 @@ void installCollectionCommon(Runtime& rt, DynObject* proto, ObjClass cls)
     rt.getter(proto, "size", [cls](CallInfo& ci) {
         return Value(double(thisCollection(ci, cls)->liveCount));
     });
-    rt.method(proto, "has", [cls](CallInfo& ci) {
-        return Value(thisCollection(ci, cls)->find(ci.arg(0)) >= 0);
-    }, 1);
+    rt.methodFast(proto, "has", cls == ObjClass::Map ? collectionHas<ObjClass::Map> : collectionHas<ObjClass::Set>, 1);
     rt.method(proto, "delete", [cls](CallInfo& ci) {
         return Value(thisCollection(ci, cls)->erase(ci.arg(0)));
     }, 1);
@@ -245,15 +278,8 @@ void installMap(Runtime& rt)
         return result;
     }, 0, proto);
 
-    rt.method(proto, "get", [](CallInfo& ci) {
-        DynMap* m = thisCollection(ci, ObjClass::Map);
-        const std::int64_t at = m->find(ci.arg(0));
-        return at < 0 ? Value::undefined() : m->entries[std::size_t(at)].value;
-    }, 1);
-    rt.method(proto, "set", [](CallInfo& ci) {
-        thisCollection(ci, ObjClass::Map)->insert(ci.arg(0), ci.arg(1));
-        return ci.thisValue();
-    }, 2);
+    rt.methodFast(proto, "get", mapGet, 1);
+    rt.methodFast(proto, "set", mapSet, 2);
     rt.intrinsics[Runtime::MapGet].reset(detail::Access::ptr(proto->findOwn(rt.intern("get"))->value));
     rt.intrinsics[Runtime::MapSet].reset(detail::Access::ptr(proto->findOwn(rt.intern("set"))->value));
     rt.intrinsics[Runtime::MapHas].reset(detail::Access::ptr(proto->findOwn(rt.intern("has"))->value));
@@ -302,10 +328,7 @@ void installSet(Runtime& rt)
         return result;
     }, 0, proto);
 
-    rt.method(proto, "add", [](CallInfo& ci) {
-        thisCollection(ci, ObjClass::Set)->insert(ci.arg(0), ci.arg(0));
-        return ci.thisValue();
-    }, 1);
+    rt.methodFast(proto, "add", setAdd, 1);
     rt.intrinsics[Runtime::SetAdd].reset(detail::Access::ptr(proto->findOwn(rt.intern("add"))->value));
     rt.intrinsics[Runtime::SetHas].reset(detail::Access::ptr(proto->findOwn(rt.intern("has"))->value));
     rt.method(proto, "forEach", [](CallInfo& ci) {
@@ -619,12 +642,17 @@ bool canBeHeldWeakly(Runtime& rt, const Value& v)
     return true;
 }
 
+DynWeakCollection* thisWeak(Runtime& rt, const Value& self, ObjClass expected)
+{
+    DynObject* o = asObject(self);
+    if (!o || o->cls != expected)
+        throwError(rt, ErrorCode::TypeError, expected == ObjClass::WeakMap ? "not a WeakMap" : "not a WeakSet");
+    return static_cast<DynWeakCollection*>(o);
+}
+
 DynWeakCollection* thisWeak(CallInfo& ci, ObjClass expected)
 {
-    DynObject* o = asObject(ci.thisValue());
-    if (!o || o->cls != expected)
-        ci.fail(ErrorCode::TypeError, expected == ObjClass::WeakMap ? "not a WeakMap" : "not a WeakSet");
-    return static_cast<DynWeakCollection*>(o);
+    return thisWeak(rtOf(ci), ci.thisValue(), expected);
 }
 
 const Value* weakFind(DynWeakCollection* c, const Value& key)
@@ -694,6 +722,12 @@ bool weakErase(DynWeakCollection* c, const Value& key)
     return false;
 }
 
+template <ObjClass cls>
+Value weakHas(Runtime& rt, const Value& self, const Value* args, std::size_t argc)
+{
+    return Value(weakFind(thisWeak(rt, self, cls), argAt(args, argc, 0)) != nullptr);
+}
+
 void installWeakCollection(Runtime& rt, ObjClass cls)
 {
     const bool isMap = cls == ObjClass::WeakMap;
@@ -742,17 +776,16 @@ void installWeakCollection(Runtime& rt, ObjClass cls)
         return result;
     }, 0, proto);
     if (isMap) {
-        rt.method(proto, "get", [](CallInfo& ci) {
-            const Value* v = weakFind(thisWeak(ci, ObjClass::WeakMap), ci.arg(0));
+        rt.methodFast(proto, "get", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+            const Value* v = weakFind(thisWeak(rt2, self, ObjClass::WeakMap), argAt(args, argc, 0));
             return v ? *v : Value::undefined();
         }, 1);
-        rt.method(proto, "set", [](CallInfo& ci) {
-            Runtime& rt2 = rtOf(ci);
-            DynWeakCollection* c = thisWeak(ci, ObjClass::WeakMap);
-            if (!canBeHeldWeakly(rt2, ci.arg(0)))
-                ci.fail(ErrorCode::TypeError, "invalid value used as a WeakMap key");
-            weakPut(rt2, c, ci.arg(0), ci.arg(1));
-            return ci.thisValue();
+        rt.methodFast(proto, "set", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+            DynWeakCollection* c = thisWeak(rt2, self, ObjClass::WeakMap);
+            if (!canBeHeldWeakly(rt2, argAt(args, argc, 0)))
+                throwError(rt2, ErrorCode::TypeError, "invalid value used as a WeakMap key");
+            weakPut(rt2, c, argAt(args, argc, 0), argAt(args, argc, 1));
+            return self;
         }, 2);
         rt.method(proto, "getOrInsert", [](CallInfo& ci) {
             Runtime& rt2 = rtOf(ci);
@@ -779,16 +812,15 @@ void installWeakCollection(Runtime& rt, ObjClass cls)
             return value;
         }, 2);
     } else {
-        rt.method(proto, "add", [](CallInfo& ci) {
-            Runtime& rt2 = rtOf(ci);
-            DynWeakCollection* c = thisWeak(ci, ObjClass::WeakSet);
-            if (!canBeHeldWeakly(rt2, ci.arg(0)))
-                ci.fail(ErrorCode::TypeError, "invalid value used in a WeakSet");
-            weakPut(rt2, c, ci.arg(0), Value(true));
-            return ci.thisValue();
+        rt.methodFast(proto, "add", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+            DynWeakCollection* c = thisWeak(rt2, self, ObjClass::WeakSet);
+            if (!canBeHeldWeakly(rt2, argAt(args, argc, 0)))
+                throwError(rt2, ErrorCode::TypeError, "invalid value used in a WeakSet");
+            weakPut(rt2, c, argAt(args, argc, 0), Value(true));
+            return self;
         }, 1);
     }
-    rt.method(proto, "has", [cls](CallInfo& ci) { return Value(weakFind(thisWeak(ci, cls), ci.arg(0)) != nullptr); }, 1);
+    rt.methodFast(proto, "has", isMap ? weakHas<ObjClass::WeakMap> : weakHas<ObjClass::WeakSet>, 1);
     rt.method(proto, "delete", [cls](CallInfo& ci) { return Value(weakErase(thisWeak(ci, cls), ci.arg(0))); }, 1);
 }
 

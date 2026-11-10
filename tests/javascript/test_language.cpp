@@ -2452,3 +2452,35 @@ TEST(keyedReadsWithNamesNumbersAndOddKeys)
                  std::string("ftnuftnuftnuftnu undefined,null,true,false sym 78000 2 5 r seven x f z string:undefined"));
     }
 }
+
+TEST(fieldInitializersRunAsNativeCodeWhenNewIsDoneByTheHelper)
+{
+    // Objects made by new on a class known only at run time: six fields, two calling a function, one reading this, one
+    // that throws on a late construction; a derived class whose base has fields, a private one among them.
+    const char* program =
+        "var out = [], k, calls = 0; function S(v) { out.push(String(v)); }"
+        "function next() { return ++calls; } function build(C, x) { return new C(x); }"
+        "class F {"
+        "  a = 1; b = next(); c = 'c'; d = this.a + 10; e = next() * 2;"
+        "  f = (() => { if (F.boom && calls > F.boom) throw new Error('init ' + calls); return 0; })();"
+        "  constructor(x) { this.x = x; }"
+        "}"
+        "var s = 0; for (k = 0; k < 3000; k++) { var o = build(F, k); s += o.a + o.b + o.d + o.e + o.x + o.f; } S(s); S(calls);"
+        "class Base { #p = 5; q = this.#p * 2; get p() { return this.#p; } }"
+        "class Derived extends Base { r = this.q + 1; constructor() { super(); this.t = this.r + this.p; } }"
+        "var u = 0; for (k = 0; k < 3000; k++) { var d = build(Derived); u += d.q + d.r + d.t + d.p; } S(u);"
+        "F.boom = calls + 2; var made = 0;"
+        "try { for (k = 0; k < 10; k++) { build(F, k); made++; } } catch (e) { S(e.message); } S(made);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("31540500 6000 126000 init 6004 1"));
+    }
+}

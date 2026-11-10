@@ -619,8 +619,27 @@ GCObject* scriptDynNewThis(Runtime* rt, GCObject* cell) noexcept
             SCRIPT_CENSUS(NewThisFieldInit);
             // Held by `self` while they do, so that one that throws lets it go.
             const Value self = detail::Access::adopt(Type::Object, made);
-            ContextImpl::ArgBuffer none(rt->ctx);
-            callValue(*rt, detail::Access::make(Type::Object, init), self, none.args);
+            if (init->fnKind == FnKind::Bytecode && init->code && init->code->jitEntry) {
+                // Compiled: entered as a call from the interpreter would enter it, without the generic call's arguments.
+                struct Depth
+                {
+                    ContextImpl& ctx;
+                    explicit Depth(Runtime& r) : ctx(r.ctx)
+                    {
+                        if (++ctx.callDepth > ctx.options.stackLimit || nativeStackLow()) {
+                            --ctx.callDepth;
+                            throwError(r, ErrorCode::StackOverflow, "maximum call depth exceeded");
+                        }
+                    }
+                    ~Depth() { --ctx.callDepth; }
+                } depth(*rt);
+                enterNative(*rt, init, *init->code, self, nullptr, 0);
+            } else {
+                // Until it is compiled, the generic call counts it towards that.
+                SCRIPT_CENSUS(NewThisFieldInitGeneric);
+                ContextImpl::ArgBuffer none(rt->ctx);
+                callValue(*rt, detail::Access::make(Type::Object, init), self, none.args);
+            }
             detail::incRef(made);
         }
         return made;

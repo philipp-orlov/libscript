@@ -2458,7 +2458,7 @@ const char* const kCensusNames[] = {
     "GetPropForNative", "SetPropForNative", "GetGlobalForNative", "GetElemTotal", "GetElemByNumber",
     "GetElemStringKey", "GetElemOtherKey", "DynCallTotal", "DynCallBuiltin", "DynCallBytecode", "DynCallBound",
     "DynCallOther", "NewThisTotal", "NewThisRefused", "NewThisFieldInit", "Bail", "SweepCalls", "SweepFreedNothing",
-    "GetElemKeyedHit",
+    "GetElemKeyedHit", "NewThisFieldInitGeneric",
 };
 static_assert(sizeof(kCensusNames) / sizeof(kCensusNames[0]) == std::size_t(Census::Count), "a name per counter");
 

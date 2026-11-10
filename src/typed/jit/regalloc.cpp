@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <functional>
 #include <queue>
-#include <set>
 #include <cstdio>
 #include <string>
 
@@ -486,7 +485,9 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     for (Interval& iv : intervals) {
         if (iv.ranges.empty())
             continue;
-        std::sort(iv.ranges.begin(), iv.ranges.end());
+        // They are made in program order, so mostly in order already.
+        if (!std::is_sorted(iv.ranges.begin(), iv.ranges.end()))
+            std::sort(iv.ranges.begin(), iv.ranges.end());
         std::vector<Range> merged;
         for (const Range& r : iv.ranges) {
             if (!merged.empty() && r.from <= merged.back().to + 1)
@@ -588,29 +589,54 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     std::stable_sort(order.begin(), order.end(), [](const Interval* a, const Interval* b) { return a->weight > b->weight; });
 
     fn.location.assign(vregs, IrFunction::kUnused);
-    // What each machine register holds, as disjoint ranges in order: a tree, since a long function puts tens of
-    // thousands in each, in no particular order.
-    std::vector<std::set<Range>> busyInt(64), busyFp(64);
-    const auto fits = [](const std::set<Range>& busy, const Interval& iv) {
+    // What each machine register holds, a bit for each position: a long function puts tens of thousands of ranges in one,
+    // which a tree of ranges tests and grows one at a time. A register's bits are made when it is first used.
+    std::size_t lastPosition = 0;
+    for (const Interval* iv : order)
+        lastPosition = std::max(lastPosition, std::size_t(iv->ranges.back().to) + 1);
+    const std::size_t bitWords = (lastPosition + 64) / 64;
+    std::vector<std::vector<std::uint64_t>> busyInt(64), busyFp(64);
+    const auto fits = [](const std::vector<std::uint64_t>& busy, const Interval& iv) {
+        if (busy.empty())
+            return true;
         for (const Range& r : iv.ranges) {
-            // The ranges either side of where r.from would go: the one after must start beyond r.to, the one before end
-            // short of r.from.
-            auto it = busy.upper_bound(Range{r.from, 0x7fffffff});
-            if (it != busy.end() && it->from <= r.to)
+            // Positions start at -1, so a position's bit is at its value plus one.
+            const std::size_t lo = std::size_t(r.from + 1), hi = std::size_t(r.to + 1);
+            const std::uint64_t first = ~std::uint64_t(0) << (lo & 63), last = ~std::uint64_t(0) >> (63 - (hi & 63));
+            if ((lo >> 6) == (hi >> 6)) {
+                if (busy[lo >> 6] & first & last)
+                    return false;
+                continue;
+            }
+            if ((busy[lo >> 6] & first) || (busy[hi >> 6] & last))
                 return false;
-            if (it != busy.begin() && std::prev(it)->to >= r.from)
-                return false;
+            for (std::size_t w = (lo >> 6) + 1; w < (hi >> 6); ++w) {
+                if (busy[w])
+                    return false;
+            }
         }
         return true;
     };
-    const auto occupy = [](std::set<Range>& busy, const Interval& iv) {
-        for (const Range& r : iv.ranges)
-            busy.insert(r);
+    const auto occupy = [bitWords](std::vector<std::uint64_t>& busy, const Interval& iv) {
+        if (busy.empty())
+            busy.assign(bitWords, 0);
+        for (const Range& r : iv.ranges) {
+            const std::size_t lo = std::size_t(r.from + 1), hi = std::size_t(r.to + 1);
+            const std::uint64_t first = ~std::uint64_t(0) << (lo & 63), last = ~std::uint64_t(0) >> (63 - (hi & 63));
+            if ((lo >> 6) == (hi >> 6)) {
+                busy[lo >> 6] |= first & last;
+                continue;
+            }
+            busy[lo >> 6] |= first;
+            for (std::size_t w = (lo >> 6) + 1; w < (hi >> 6); ++w)
+                busy[w] = ~std::uint64_t(0);
+            busy[hi >> 6] |= last;
+        }
     };
     std::vector<Interval*> spilled;
     for (Interval* iv : order) {
         const bool fp = fn.vregIsFp[std::size_t(iv->vreg)] != 0;
-        std::vector<std::set<Range>>& busy = fp ? busyFp : busyInt;
+        std::vector<std::vector<std::uint64_t>>& busy = fp ? busyFp : busyInt;
         const std::vector<std::int32_t>& callerOrder = fp ? regs.fpCallerSaved : regs.intCallerSaved;
         const std::vector<std::int32_t>& calleeOrder = fp ? regs.fpCalleeSaved : regs.intCalleeSaved;
         std::int32_t chosen = -1;

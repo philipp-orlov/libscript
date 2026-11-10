@@ -114,6 +114,7 @@ enum class Op : std::uint8_t
     EndFinally,
     Throw,
     ThrowConstAssign,  // atom: value -> : a TypeError, for an assignment to a `const` that runs
+    ThrowTdz,          // atom: a ReferenceError, for a `let`, `const` or `class` used before its declaration has run
 
     // ---- iteration ----
     ForInStart,  // obj -> keysArray index

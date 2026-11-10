@@ -2124,6 +2124,40 @@ TEST(aCallOfEvalAnywhereInAFunctionMakesItsVariablesVisibleToEval)
     }
 }
 
+TEST(aBindingUsedAboveItsDeclarationInTheSameFunctionIsAReferenceError)
+{
+    // The dead zone of `let`, `const` and `class`, for what the compiler can see: a use above the declaration in one
+    // function, in a read, a write, a typeof, an initializer or a default of the same pattern. A closure's use is a
+    // different function's, and a later use is no use in the zone.
+    const char* program =
+        "var out = [];"
+        "function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }"
+        "t(function () { x; let x = 1; });"
+        "t(function () { let q = q + 1; });"
+        "t(function () { const k = k; });"
+        "t(function () { typeof z; let z; });"
+        "t(function () { w = 1; let w; });"
+        "t(function () { w2++; let w2 = 0; });"
+        "t(function () { return new C(); class C {} });"
+        "t(function () { let { m = n, n } = {}; return m; });"
+        "t(function () { { let a = 1; a += 1; return a; } });"
+        "t(function () { let { m, n = m } = { m: 3 }; return n; });"
+        "t(function () { for (var i = 0; i < 2; i++) { let y = i; if (i) return y; } });"
+        "t(function () { function f() { return v; } let v = 2; return f(); });"
+        "t(function () { let c = 1; { let c2 = c; return c2; } });"
+        "t(function () { { let b = 1; } return typeof b; });"
+        "t(function () { const o = 1; try { o = 2; } catch (e) { return e.constructor.name; } });"
+        "out.join(' ')";
+    for (auto mode : {script::JitOptions::Mode::Off, script::JitOptions::Mode::Eager}) {
+        script::Context::Options options;
+        options.jit.mode = mode;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("ReferenceError ReferenceError ReferenceError ReferenceError ReferenceError ReferenceError "
+                             "ReferenceError ReferenceError 2 3 1 2 1 undefined TypeError"));
+    }
+}
+
 TEST(aGeneratorIsSteppedWithoutAResultObject)
 {
     // for-of over a generator whose next is the one generators start with resumes it directly; a next replaced on the

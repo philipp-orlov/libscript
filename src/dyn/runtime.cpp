@@ -40,6 +40,7 @@ int operandsOf(Op op) noexcept
         case Op::TypeofGlobal:
         case Op::DeleteGlobal:
         case Op::ThrowConstAssign:
+        case Op::ThrowTdz:
         case Op::GetElem:
         case Op::SetElem:
         case Op::GetElemDup:
@@ -104,7 +105,7 @@ const char* opName(Op op) noexcept
         "Call", "CallSpread", "New", "NewSpread", "CallSuper", "CallSuperSpread", "Return",
         "ReturnUndefined",
         "Jump", "JumpIfFalse", "JumpIfTrue", "JumpIfFalseKeep", "JumpIfTrueKeep",
-        "JumpIfNullishKeep", "JumpIfNotNullishKeep", "JumpSub", "EndFinally", "Throw", "ThrowConstAssign",
+        "JumpIfNullishKeep", "JumpIfNotNullishKeep", "JumpSub", "EndFinally", "Throw", "ThrowConstAssign", "ThrowTdz",
         "ForInStart", "ForInNext", "IterStart", "IterNext", "IterNextOpt", "IterRest",
         "IterClose", "IterStartLoop", "IterCloseAt", "IterCloseThrow", "NewPrivateName", "PrivateIn", "DefPrivate", "DefPrivateMethod", "DefPrivateAccessor", "DefAccessorElem", "CheckThis", "DerivedReturn", "PushNewTarget", "CallSuperVia", "CallSuperViaSpread", "SetFieldInit", "CallStaticInit", "SetHome", "CoStart", "Yield", "Await", "DelegateStart", "DelegateCall", "DelegateCheck", "DelegateDone", "AsyncIterStart", "AsyncIterCall", "AsyncIterCheck", "AsyncIterClose",
         "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Neg", "Pos", "BitAnd", "BitOr", "BitXor",

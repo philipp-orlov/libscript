@@ -3185,6 +3185,10 @@ std::uint64_t* slowOpCounts()
                 const auto* name = static_cast<const StringCell*>(code.atoms[operandAt(pc)].get());
                 throwError(rt, ErrorCode::TypeError, "assignment to a constant: " + toUtf8(name->text()));
             }
+            case Op::ThrowTdz: {
+                const auto* name = static_cast<const StringCell*>(code.atoms[operandAt(pc)].get());
+                throwError(rt, ErrorCode::ReferenceError, "cannot access '" + toUtf8(name->text()) + "' before initialization");
+            }
 
             case Op::ForInStart: {
                 Value src = pop();
@@ -3845,6 +3849,7 @@ Value execute(Runtime& rt, Frame& entry)
         &&L_EndFinally,
         &&L_Throw,
         &&L_ThrowConstAssign,
+        &&L_ThrowTdz,
         &&L_ForInStart,
         &&L_ForInNext,
         &&L_IterStart,
@@ -4733,6 +4738,7 @@ Value execute(Runtime& rt, Frame& entry)
         L_EndFinally:
         L_Throw:
         L_ThrowConstAssign:
+        L_ThrowTdz:
         L_ForInStart:
         L_ForInNext:
         L_IterStart:

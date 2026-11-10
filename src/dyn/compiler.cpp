@@ -48,6 +48,7 @@ struct Local
     bool boxed = false;
     bool isConst = false;
     bool silentConst = false;  ///< a function expression's own name: a write is ignored unless the code is strict
+    bool inTdz = false;        ///< a `let`, `const` or `class` whose declaration has not been compiled yet: its dead zone
 };
 
 struct LoopCtx
@@ -953,6 +954,11 @@ private:
             emit(Op::PushCallee);
             return;
         }
+        if (inDeadZone(name)) {
+            emitU(Op::ThrowTdz, atomFor(name));
+            emit(Op::PushUndefined);
+            return;
+        }
         const VarRef ref = resolve(name);
         switch (ref.kind) {
             case RefKind::Local: emitU(Op::GetLocal, ref.index); break;
@@ -977,6 +983,10 @@ private:
         // A private name on its own is no variable: `#x = 1` and `for (#x in o)` are early errors.
         if (!name.empty() && name[0] == u'#')
             fail(line, "a private name is not something to assign to");
+        if (inDeadZone(name)) {
+            emitU(Op::ThrowTdz, atomFor(name));
+            return;
+        }
         const VarRef ref = resolve(name);
         // An error when it runs, not when it compiles: the assignment may never run.
         if (ref.isConst) {
@@ -1055,8 +1065,28 @@ private:
     void predeclareName(const String& name, bool isConst)
     {
         const Local* existing = findLocal(*fn_, name);
-        if (!existing || existing->depth != fn_->depth)
+        if (!existing || existing->depth != fn_->depth) {
             declareLocal(name, isConst);
+            fn_->locals.back().inTdz = true;
+        }
+    }
+
+    /// The declaration of `name` has been compiled: what follows it, in this function, may use it.
+    void leaveDeadZone(StringView name)
+    {
+        for (std::size_t i = fn_->locals.size(); i-- > 0;) {
+            if (fn_->locals[i].name == name) {
+                fn_->locals[i].inTdz = false;
+                return;
+            }
+        }
+    }
+
+    /// A use of a binding of this function that is still in its dead zone: a ReferenceError when it runs.
+    bool inDeadZone(StringView name) const
+    {
+        const Local* local = findLocal(*fn_, name);
+        return local && local->inTdz;
     }
 
     void predeclareTarget(const Node& target, bool isConst)
@@ -1541,6 +1571,7 @@ private:
                 else if (!findLocal(*fn_, n.text))
                     declareLocal(n.text, false);
                 classExpr(*n.a);
+                leaveDeadZone(n.text);
                 storeVar(n.text, n.line);
                 return;
             default:
@@ -1589,6 +1620,7 @@ private:
             const Local* existing = findLocal(*fn_, target.text);
             if (existing && existing->depth == fn_->depth) {
                 emitU(existing->boxed ? Op::SetCell : Op::SetLocal, existing->slot);
+                leaveDeadZone(target.text);
                 return;
             }
             const std::uint32_t slot = declareLocal(target.text, isConst);

@@ -212,9 +212,11 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
 - **One execution mode.** There is no sloppy/strict split. Assigning to an
   undeclared name creates a global, writes to non-writable properties are
   ignored instead of throwing, and duplicate parameter names are accepted.
-- **No temporal dead zone.** `let` and `const` are not observably uninitialised
-  before their declaration; reading one early yields `undefined` rather than
-  throwing a `ReferenceError`.
+- **A temporal dead zone for code in the same function only.** Reading or writing a
+  `let`, `const` or `class` binding above its declaration in the same function (`x; let x`,
+  `let x = x + 1`, `typeof x; let x`) is a `ReferenceError`. A closure that runs before the
+  declaration has, a `let` or `const` at the top level of a script, the head of a `for-in`
+  or `for-of`, and a `switch` case whose declaration did not run still read `undefined`.
 - **`const` at the top level is not enforced.** Top-level declarations become
   global object properties, and the write barrier lives on the binding, not the
   property. `const` inside a function is enforced: assigning to it is a

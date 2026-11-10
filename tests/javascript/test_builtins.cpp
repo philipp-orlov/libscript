@@ -369,3 +369,33 @@ TEST(collectionsFromNativeCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("16053780 7 5 undefined false true true 1 true undefined false false TypeError:invalid value used as a WeakMap key TypeError:invalid value used in a WeakSet TypeError:not a Map TypeError:not a Set TypeError:not a WeakMap TypeError:not a WeakSet 2 has true v sym"));
     }
 }
+
+TEST(stringAndMathMethodsFromNativeCode)
+{
+    // toLowerCase, toUpperCase, charAt, charCodeAt, startsWith, includes, substring, Math.sign, max and min from native code,
+    // with missing arguments, objects converted by valueOf, a String object, and null as the receiver.
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "var words = ['Hello', 'WORLD', 'MiXeD', 'ÀÉÎ', ''];"
+        "function w(i) { var x = words[i % 5]; return x.toLowerCase() + x.toUpperCase().charAt(1) + x.charCodeAt(0) + (x.startsWith('M') ? 1 : 0) + (x.includes('l') ? 2 : 0) + x.substring(1, 3) + Math.sign(i - 2000) + Math.max(i, 7, -1) + Math.min(i, 3); }"
+        "var s = ''; for (k = 0; k < 3000; k++) s = w(k).slice(0, 30); S(s);"
+        "S('abc'.charAt()); S('abc'.charCodeAt(9)); S('abc'.startsWith('b', 1)); S('abc'.substring(2, 0)); S('abc'.substring()); S('abc'.includes());"
+        "S(Math.max()); S(Math.min()); S(Math.sign()); S(Math.max(1, NaN)); S(Math.min(-0, 0)); S(1 / Math.min(0, -0)); S(Math.sign(-0));"
+        "S(Math.max({valueOf() { return 9; }}, 2)); S(String.prototype.toLowerCase.call(42)); S(new String('XY').toLowerCase());"
+        "try { String.prototype.charAt.call(null); } catch (e) { S(e.constructor.name + ':' + e.message); }"
+        "try { ''.includes.call(undefined); } catch (e) { S(e.constructor.name); }"
+        "try { 'a'.startsWith(Symbol()); } catch (e) { S(e.constructor.name); }"
+        "S(''.toLocaleLowerCase.name); S(''.charCodeAt.length); S(Math.max.length);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("NaN00129993 a NaN true ab abc false -Infinity Infinity NaN NaN 0 -Infinity 0 9 42 xy TypeError:String.prototype method called on null or undefined TypeError TypeError toLocaleLowerCase 1 2"));
+    }
+}

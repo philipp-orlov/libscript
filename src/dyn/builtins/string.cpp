@@ -25,6 +25,7 @@ struct ThisText
     String owned;
     StringView view;
     explicit ThisText(CallInfo& ci);
+    ThisText(Runtime& rt, const Value& self);
     /// `count` characters from `start`: part of the receiver's own string when it is one.
     Value part(Runtime& rt, std::size_t start, std::size_t count) const
     {
@@ -34,10 +35,8 @@ struct ThisText
     }
 };
 
-String thisString(CallInfo& ci)
+String thisString(Runtime& rt, const Value& self)
 {
-    Runtime& rt = rtOf(ci);
-    const Value self = ci.thisValue();
     if (StringCell* s = asString(self))
         return String(s->text());
     if (DynObject* o = asObject(self); o && o->cls == ObjClass::StringObject) {
@@ -45,20 +44,32 @@ String thisString(CallInfo& ci)
             return String(s->text());
     }
     if (self.isNullish())
-        ci.fail(ErrorCode::TypeError, "String.prototype method called on null or undefined");
+        throwError(rt, ErrorCode::TypeError, "String.prototype method called on null or undefined");
     return toStringValue(rt, self);
 }
 
-ThisText::ThisText(CallInfo& ci)
+String thisString(CallInfo& ci)
 {
-    const Value self = ci.thisValue();
+    return thisString(rtOf(ci), ci.thisValue());
+}
+
+ThisText::ThisText(Runtime& rt, const Value& self)
+{
     if (StringCell* cell = asString(self)) {
         keep = self;
         view = cell->text();
         return;
     }
-    owned = thisString(ci);
+    owned = thisString(rt, self);
     view = owned;
+}
+
+ThisText::ThisText(CallInfo& ci) : ThisText(rtOf(ci), ci.thisValue()) {}
+
+inline const Value& argAt(const Value* args, std::size_t argc, std::size_t i) noexcept
+{
+    static const Value undefined = Value::undefined();
+    return i < argc ? args[i] : undefined;
 }
 
 std::size_t clampTo(double raw, std::size_t length)
@@ -218,21 +229,19 @@ void installString(Runtime& rt)
     rt.method(proto, "toString", [](CallInfo& ci) { return rtOf(ci).str(thisString(ci)); }, 0);
     rt.method(proto, "valueOf", [](CallInfo& ci) { return rtOf(ci).str(thisString(ci)); }, 0);
 
-    rt.method(proto, "charAt", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        const ThisText receiver(ci);
+    rt.methodFast(proto, "charAt", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+        const ThisText receiver(rt2, self);
         const StringView s = receiver.view;
-        const std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
+        const std::int64_t i = toIntegerOrInfinity(toNumber(rt2, argAt(args, argc, 0)));
         if (i < 0 || i >= std::int64_t(s.size()))
             return rt2.str("");
         return rt2.str(s.substr(std::size_t(i), 1));
     }, 1);
 
-    rt.method(proto, "charCodeAt", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        const ThisText receiver(ci);
+    rt.methodFast(proto, "charCodeAt", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+        const ThisText receiver(rt2, self);
         const StringView s = receiver.view;
-        const std::int64_t i = toIntegerOrInfinity(toNumber(rt2, ci.arg(0)));
+        const std::int64_t i = toIntegerOrInfinity(toNumber(rt2, argAt(args, argc, 0)));
         if (i < 0 || i >= std::int64_t(s.size()))
             return Value(std::nan(""));
         return Value(double(s[std::size_t(i)]));
@@ -291,17 +300,15 @@ void installString(Runtime& rt)
         return Value(at == String::npos ? -1.0 : double(at));
     }, 1);
 
-    rt.method(proto, "includes", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        return Value(thisString(ci).find(toStringValue(rt2, ci.arg(0))) != String::npos);
+    rt.methodFast(proto, "includes", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+        return Value(thisString(rt2, self).find(toStringValue(rt2, argAt(args, argc, 0))) != String::npos);
     }, 1);
 
-    rt.method(proto, "startsWith", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        const ThisText receiver(ci);
+    rt.methodFast(proto, "startsWith", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+        const ThisText receiver(rt2, self);
         const StringView s = receiver.view;
-        const String needle = toStringValue(rt2, ci.arg(0));
-        const std::size_t from = ci.size() > 1 ? clampTo(toNumber(rt2, ci.arg(1)), s.size()) : 0;
+        const String needle = toStringValue(rt2, argAt(args, argc, 0));
+        const std::size_t from = argc > 1 ? clampTo(toNumber(rt2, args[1]), s.size()) : 0;
         return Value(s.compare(from, needle.size(), needle) == 0);
     }, 1);
 
@@ -331,15 +338,12 @@ void installString(Runtime& rt)
         return receiver.part(rt2, from, to - from);
     }, 2);
 
-    rt.method(proto, "substring", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
-        const ThisText receiver(ci);
+    rt.methodFast(proto, "substring", [](Runtime& rt2, const Value& self, const Value* args, std::size_t argc) {
+        const ThisText receiver(rt2, self);
         const StringView s = receiver.view;
-        std::size_t a = ci.size() > 0 ? clampTo(std::max(0.0, toNumber(rt2, ci.arg(0))), s.size())
-                                      : 0;
-        std::size_t b = ci.size() > 1 && !ci.arg(1).isUndefined()
-                            ? clampTo(std::max(0.0, toNumber(rt2, ci.arg(1))), s.size())
-                            : s.size();
+        std::size_t a = argc > 0 ? clampTo(std::max(0.0, toNumber(rt2, args[0])), s.size()) : 0;
+        std::size_t b = argc > 1 && !args[1].isUndefined() ? clampTo(std::max(0.0, toNumber(rt2, args[1])), s.size())
+                                                           : s.size();
         if (a > b)
             std::swap(a, b);
         return receiver.part(rt2, a, b - a);
@@ -357,12 +361,16 @@ void installString(Runtime& rt)
         return receiver.part(rt2, from, std::min(count, s.size() - from));
     }, 2);
 
-    const auto toUpper = [](CallInfo& ci) { return rtOf(ci).str(caseMapped(thisString(ci), true)); };
-    const auto toLower = [](CallInfo& ci) { return rtOf(ci).str(caseMapped(thisString(ci), false)); };
-    rt.method(proto, "toUpperCase", toUpper, 0);
-    rt.method(proto, "toLowerCase", toLower, 0);
-    rt.method(proto, "toLocaleUpperCase", toUpper, 0);
-    rt.method(proto, "toLocaleLowerCase", toLower, 0);
+    const DynFunction::FastNative toUpper = [](Runtime& rt2, const Value& self, const Value*, std::size_t) {
+        return rt2.str(caseMapped(thisString(rt2, self), true));
+    };
+    const DynFunction::FastNative toLower = [](Runtime& rt2, const Value& self, const Value*, std::size_t) {
+        return rt2.str(caseMapped(thisString(rt2, self), false));
+    };
+    rt.methodFast(proto, "toUpperCase", toUpper, 0);
+    rt.methodFast(proto, "toLowerCase", toLower, 0);
+    rt.methodFast(proto, "toLocaleUpperCase", toUpper, 0);
+    rt.methodFast(proto, "toLocaleLowerCase", toLower, 0);
 
     rt.method(proto, "isWellFormed", [](CallInfo& ci) {
         const String s = thisString(ci);

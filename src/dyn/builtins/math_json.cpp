@@ -206,11 +206,12 @@ void installMath(Runtime& rt)
     unary("sinh", [](double d) { return std::sinh(d); });
     unary("cosh", [](double d) { return std::cosh(d); });
     unary("tanh", [](double d) { return std::tanh(d); });
-    unary("sign", [](double d) {
+    rt.methodFast(math, "sign", [](Runtime& rt2, const Value&, const Value* args, std::size_t argc) {
+        const double d = toNumber(rt2, argc ? args[0] : Value::undefined());
         if (std::isnan(d) || d == 0)
-            return d;
-        return d < 0 ? -1.0 : 1.0;
-    });
+            return Value(d);
+        return Value(d < 0 ? -1.0 : 1.0);
+    }, 1);
     unary("asinh", [](double d) { return std::asinh(d); });
     unary("acosh", [](double d) { return std::acosh(d); });
     unary("atanh", [](double d) { return std::atanh(d); });
@@ -244,20 +245,16 @@ void installMath(Runtime& rt)
         }
         return Value(std::sqrt(sum));
     }, 2);
-    rt.method(math, "max", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
+    rt.methodFast(math, "max", [](Runtime& rt2, const Value&, const Value* args, std::size_t argc) {
         double best = -std::numeric_limits<double>::infinity();
-        for (const Value& v : ci.args()) {
-            best = numberMax(best, toNumber(rt2, v));
-        }
+        for (std::size_t i = 0; i < argc; ++i)
+            best = numberMax(best, toNumber(rt2, args[i]));
         return Value(best);
     }, 2);
-    rt.method(math, "min", [](CallInfo& ci) {
-        Runtime& rt2 = rtOf(ci);
+    rt.methodFast(math, "min", [](Runtime& rt2, const Value&, const Value* args, std::size_t argc) {
         double best = std::numeric_limits<double>::infinity();
-        for (const Value& v : ci.args()) {
-            best = numberMin(best, toNumber(rt2, v));
-        }
+        for (std::size_t i = 0; i < argc; ++i)
+            best = numberMin(best, toNumber(rt2, args[i]));
         return Value(best);
     }, 2);
     const std::pair<Runtime::Intrinsic, const char*> direct[] = {

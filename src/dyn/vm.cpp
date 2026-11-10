@@ -2322,7 +2322,10 @@ Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& ba
     }
     Ref<GCObject> name = toPropertyKey(rt, key);
     Value v = getProperty(rt, base, name.get());
-    keyedLearn(code, site, base, name.get(), false);
+    // A symbol, a private name above all, is where the cache pays; a string key at such a site is most often a property
+    // up the chain or none, which the cache does not hold, and trying would cost every miss a search.
+    if (key.isSymbol())
+        keyedLearn(code, site, base, name.get(), false);
     return v;
 }
 

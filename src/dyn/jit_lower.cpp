@@ -4383,9 +4383,10 @@ private:
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
         const bool usable = site && (!site->holder || site->epoch == rt_.ctx.protoEpoch);
-        if (usable && site->getter) {
+        // A getter is called where the site says it is when the code runs, so one learned at an epoch gone by is as good.
+        if (site && site->getter) {
             secure();
-            getterProp(base, site, operand, keepBase);
+            getterProp(base, operand, keepBase);
             return;
         }
         // At a megamorphic site a shape it does not know is ordinary: that goes to the helper, not back to the interpreter.
@@ -6877,7 +6878,7 @@ private:
     }
 
     /// A read the site says goes to a getter on the prototype chain: called with the receiver, the result owned.
-    void getterProp(Entry base, const PropertySite* site, std::uint32_t operand, bool keepBase)
+    void getterProp(Entry base, std::uint32_t operand, bool keepBase)
     {
         if (base.own == Own::Weak)
             makeOwned(base);
@@ -6885,12 +6886,45 @@ private:
         const std::int32_t t = fn_.newVreg(false);
         const std::int32_t slow = newLabel();
         const std::int32_t done = newLabel();
-        guardShape(base, site->shape, slow);
-        guardEpoch(site->epoch, slow);
-        const std::int64_t at = std::int64_t(site->index) * std::int64_t(sizeof(Prop));
-        const std::int32_t props = loadHeader(ptrReg(site->holder), kPropsOffset);
-        const std::int32_t ft = load(props, at + kPropValueOffset, 1, false, kAliasValue);
-        const std::int32_t fr = load(props, at + kPropValueOffset + kPayload, 8, false, kAliasValue);
+        // Where the getter is, read from the site as the code runs, so a prototype changed or gone since this was
+        // compiled, after which the site learned the getter again, does not send every call to the helper.
+        const PropertySite* live = liveSite(operand);
+        const std::int32_t where = ptrReg(live);
+        const std::int32_t have = shapeOf(base, slow);
+        const std::int32_t want = load(where, kSiteShapeOffset, 8);
+        IrInst& same = inst(IrOp::BrCmp);
+        same.a = have;
+        same.b = want;
+        same.cond = IrCond::Ne;
+        same.width = 64;
+        same.target = slow;
+        branchCmp(load(where, kSiteGetterOffset, 1), IrCond::Eq, 0, slow);
+        const std::int32_t now = load(ptrReg(&rt_.ctx.protoEpoch), 0, 8);
+        const std::int32_t learnedAt = load(where, kSiteEpochOffset, 8);
+        IrInst& current = inst(IrOp::BrCmp);
+        current.a = now;
+        current.b = learnedAt;
+        current.cond = IrCond::Ne;
+        current.width = 64;
+        current.target = slow;
+        const std::int32_t scaled = shiftLeft(load(where, kSiteIndexOffset, 4), 4);
+        const std::int32_t props = loadHeader(load(where, kSiteHolderOffset, 8), kPropsOffset);
+        const std::int32_t ft = fn_.newVreg(false);
+        const std::int32_t fr = fn_.newVreg(false);
+        IrInst& lt = inst(IrOp::LoadIdx);
+        lt.d = ft;
+        lt.a = props;
+        lt.b = scaled;
+        lt.imm = kPropValueOffset;
+        lt.width = 1;
+        lt.alias = kAliasValue;
+        IrInst& lr = inst(IrOp::LoadIdx);
+        lr.d = fr;
+        lr.a = props;
+        lr.b = scaled;
+        lr.imm = kPropValueOffset + kPayload;
+        lr.width = 8;
+        lr.alias = kAliasValue;
         // The getter keeps a count of its own while it runs: it could take itself off the prototype.
         incRefOf(fr, ft, false);
         Entry getter = taggedEntry(fr, ft, Own::Owned);
@@ -6901,9 +6935,15 @@ private:
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdBegin);
         inst(IrOp::Label).imm = slow;
+        const std::int32_t helper = newLabel();
+        const std::int32_t read = newLabel();
+        readLiveSite(base, live, t, r, helper);
+        inst(IrOp::Br).imm = read;
+        inst(IrOp::Label).imm = helper;
         const std::int32_t rt = rtReg();
         coldCall(reinterpret_cast<void*>(&scriptDynGetProp), {rt, ptrReg(&code_), tagReg(base), base.r, immReg(std::int64_t(operand))},
                  r, t, true, {base});
+        inst(IrOp::Label).imm = read;
         incRefOf(r, t, false);
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);

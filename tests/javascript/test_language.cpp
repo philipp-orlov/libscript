@@ -2336,3 +2336,30 @@ TEST(nativeCodeReadsAPrototypesPropertyASiteLearnedAfterItWasCompiled)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("800 3 g undefined undefined top undefined own other"));
     }
 }
+
+TEST(nativeCodeCallsTheGetterItsSiteKnowsNow)
+{
+    // A getter on a prototype, read from native code after the prototypes changed and the site learned it again, a getter
+    // replaced, turned into a value, deleted, and one that throws.
+    const char* program =
+        "var out = [], k, s = 0; function S(v) { out.push(String(v)); }"
+        "class A { get v() { return this.k; } } function f(o) { return o.v; }"
+        "var a = new A(); a.k = 1; for (k = 0; k < 400; k++) s += f(a); S(s);"
+        "A.prototype.other = 1; s = 0; for (k = 0; k < 400; k++) s += f(a); S(s);"
+        "Object.defineProperty(A.prototype, 'v', {get() { return 'new'; }, configurable: true}); S(f(a)); S(f(a));"
+        "Object.defineProperty(A.prototype, 'v', {value: 'data', configurable: true}); S(f(a)); S(f(a));"
+        "delete A.prototype.v; S(f(a)); S(f(a));"
+        "Object.defineProperty(A.prototype, 'v', {get() { throw new Error('boom'); }, configurable: true});"
+        "try { f(a); } catch (e) { S(e.message); } out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("400 400 new new data data undefined undefined boom"));
+    }
+}

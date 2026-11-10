@@ -4311,10 +4311,11 @@ private:
             getterProp(base, site, operand, keepBase);
             return;
         }
-        const bool bet = betHere() && usable && !site->getter && !site->addTo && !site->moreCount &&
+        // At a megamorphic site a shape it does not know is ordinary: that goes to the helper, not back to the interpreter.
+        const bool bet = betHere() && usable && !site->getter && !site->addTo && !site->moreCount && !site->megamorphic &&
                          base.rep == Rep::Tagged && !base.isConst;
         const bool polyBet = !bet && betHere() && site && !site->getter && !site->addTo && site->moreCount &&
-                             base.rep == Rep::Tagged && !base.isConst;
+                             !site->megamorphic && base.rep == Rep::Tagged && !base.isConst;
         if (!bet && !polyBet)
             secure();
         Entry result;

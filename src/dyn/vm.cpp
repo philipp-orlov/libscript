@@ -766,6 +766,18 @@ inline void overwriteCensus(const PropertySite* site, const DynObject* obj) noex
 #endif
 }
 
+/// A plain read site with no room for one more receiver shape, whose entries all still hold: it becomes megamorphic and
+/// stays as it is, rather than forget what it knows for a shape that is one of many.
+inline bool fullAndCurrent(Runtime& rt, PropertySite* site, const DynObject* obj) noexcept
+{
+    if (!site->plainRead() || site->moreCount != PropertySite::kMoreShapes || obj->shape == site->shape ||
+        site->moreFind(obj->shape) >= 0 || (site->anyHolder() && site->epoch != rt.ctx.protoEpoch))
+        return false;
+    site->megamorphic = true;
+    SCRIPT_CENSUS(LearnResetFullSite);
+    return true;
+}
+
 /// A read that missed: do it the long way and teach the site, when what it finds will stay where it is.
 Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, PropertySite* site)
 {
@@ -848,6 +860,8 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
                 return p->value;
             }
         }
+        if (fullAndCurrent(rt, site, obj))
+            return p->value;
         overwriteCensus(site, obj);
         site->shape = obj->shape;
         site->holder = cursor == obj ? nullptr : cursor;
@@ -874,6 +888,11 @@ Value getPropertyLearning(Runtime& rt, const Value& base, GCObject* key, Propert
                 SCRIPT_CENSUS(LearnAddShape);
                 return Value::undefined();
             }
+        }
+        // The walk has shown it is nowhere: a full site keeps what it knows, and the answer needs no second walk.
+        if (fullAndCurrent(rt, site, obj)) {
+            SCRIPT_CENSUS(LearnAbsent);
+            return Value::undefined();
         }
         overwriteCensus(site, obj);
         site->shape = obj->shape;

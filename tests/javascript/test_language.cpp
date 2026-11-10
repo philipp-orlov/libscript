@@ -2249,3 +2249,33 @@ TEST(aPropertyAbsentFromTheWholeChainIsCachedAndForgottenWhenItAppears)
                              "undefined undefined undefined j j js js"));
     }
 }
+
+TEST(aReadSiteThatMeetsTooManyShapesKeepsWhatItKnows)
+{
+    // Six shapes in turn at one read, then one with the property up the chain, one with a getter there, and one without
+    // it, all in turn: a site past its room stops starting again, and every answer is still right, before and after
+    // a prototype gains the property.
+    const char* program =
+        "var out = [], k, s = 0; function S(v) { out.push(String(v)); }"
+        "function rx(o) { return o.x; }"
+        "var objs = [{x: 1}, {x: 2, a: 0}, {x: 3, b: 0}, {x: 4, c: 0}, {x: 5, d: 0}, {x: 6, e: 0}];"
+        "for (k = 0; k < 2400; k++) s += rx(objs[k % 6]); S(s);"
+        "var o7 = Object.create({x: 7}); S(rx(o7)); objs.push(o7);"
+        "var o8 = Object.create({get x() { return 8; }}); S(rx(o8)); objs.push(o8);"
+        "var o9 = Object.create({y: 1}); objs.push(o9);"
+        "s = 0; for (k = 0; k < 900; k++) { var v = rx(objs[k % 9]); s += v === undefined ? 100 : v; } S(s);"
+        "Object.getPrototypeOf(o9).x = 9; s = 0; for (k = 0; k < 900; k++) s += rx(objs[k % 9]); S(s);"
+        "objs[0].x = 10; S(rx(objs[0]));"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("8400 7 8 13600 4500 10"));
+    }
+}

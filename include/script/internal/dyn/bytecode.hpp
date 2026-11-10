@@ -305,6 +305,9 @@ struct PropertySite
     void see(const Value& v) noexcept { saw |= v.type() == Type::Double ? kSawNumber : kSawOther; }
     /// The property is a getter, to call with the receiver; `holder` and `index` say where it is.
     bool getter = false;
+    /// A plain read that met more shapes than it has room for: it keeps those it knows rather than start again, and a
+    /// miss here is ordinary, for native code to leave to the helper.
+    bool megamorphic = false;
     /// Further receiver shapes a plain read or write has met, each with where the property is in that one: on the
     /// receiver, or for a read, on `moreHolder` up its prototype chain (valid while `epoch` is current). For a write, a
     /// shape that lacks the property has `moreAddTo`, the shape adding it leads to, valid likewise. A site does only the

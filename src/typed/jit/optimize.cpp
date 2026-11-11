@@ -1235,17 +1235,57 @@ private:
         }
         std::vector<IrInst> moved;
         std::vector<std::uint8_t> gone(std::size_t(last - head) + 1, 0);
-        int nest = 0;
-        for (std::int32_t i = head; i <= last; ++i) {
+        // What can move, and how often the loop's hot code uses each: only the most used few move, a few of each kind of
+        // register, since each one moved holds a register all through the loop, and one the allocator has to put on the
+        // stack is reloaded at every use, which is worse than making it there.
+        std::vector<std::int32_t> candidates;
+        {
+            int nest = 0;
+            for (std::int32_t i = head; i <= last; ++i) {
+                const IrInst& in = fn_.code[std::size_t(i)];
+                if (in.op == IrOp::ColdBegin)
+                    ++nest;
+                else if (in.op == IrOp::ColdEnd)
+                    --nest;
+                if (nest > 0 || !movable(in) || defCount[std::size_t(in.d)] != 1)
+                    continue;
+                if ((in.a >= 0 && definedInside[std::size_t(in.a)]) || (in.b >= 0 && definedInside[std::size_t(in.b)]))
+                    continue;
+                candidates.push_back(i);
+            }
+        }
+        std::map<std::int32_t, std::uint32_t> uses;
+        {
+            int nest = 0;
+            for (std::int32_t i = head; i <= last; ++i) {
+                const IrInst& in = fn_.code[std::size_t(i)];
+                if (in.op == IrOp::ColdBegin)
+                    ++nest;
+                else if (in.op == IrOp::ColdEnd)
+                    --nest;
+                if (nest > 0)
+                    continue;
+                for (std::int32_t v : {in.a, in.b, in.c})
+                    if (v >= 0)
+                        ++uses[v];
+            }
+        }
+        std::vector<std::int32_t> chosen;
+        for (const bool fp : {false, true}) {
+            std::vector<std::int32_t> kind;
+            for (std::int32_t i : candidates)
+                if (bool(fn_.vregIsFp[std::size_t(fn_.code[std::size_t(i)].d)]) == fp)
+                    kind.push_back(i);
+            std::stable_sort(kind.begin(), kind.end(), [&](std::int32_t x, std::int32_t y) {
+                return uses[fn_.code[std::size_t(x)].d] > uses[fn_.code[std::size_t(y)].d];
+            });
+            constexpr std::size_t kMovedPerKind = 4;
+            for (std::size_t k = 0; k < kind.size() && k < kMovedPerKind; ++k)
+                chosen.push_back(kind[k]);
+        }
+        std::sort(chosen.begin(), chosen.end());
+        for (std::int32_t i : chosen) {
             const IrInst& in = fn_.code[std::size_t(i)];
-            if (in.op == IrOp::ColdBegin)
-                ++nest;
-            else if (in.op == IrOp::ColdEnd)
-                --nest;
-            if (nest > 0 || !movable(in) || defCount[std::size_t(in.d)] != 1)
-                continue;
-            if ((in.a >= 0 && definedInside[std::size_t(in.a)]) || (in.b >= 0 && definedInside[std::size_t(in.b)]))
-                continue;
             moved.push_back(in);
             definedInside[std::size_t(in.d)] = 0;
             gone[std::size_t(i - head)] = 1;

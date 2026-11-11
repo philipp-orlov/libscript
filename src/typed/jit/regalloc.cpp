@@ -406,6 +406,17 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     std::vector<Interval> intervals(vregs);
     for (std::size_t v = 0; v < vregs; ++v)
         intervals[v].vreg = std::int32_t(v);
+    // Blocks are walked from the last, so a value's ranges come in falling order: one that reaches the one before it
+    // (a value live through a run of blocks) grows that one rather than adding another.
+    const auto addRange = [&](std::int32_t v, Range r) {
+        std::vector<Range>& ranges = intervals[std::size_t(v)].ranges;
+        if (!ranges.empty() && r.to + 1 >= ranges.back().from && r.from <= ranges.back().to + 1) {
+            ranges.back().from = std::min(ranges.back().from, r.from);
+            ranges.back().to = std::max(ranges.back().to, r.to);
+            return;
+        }
+        ranges.push_back(r);
+    };
     std::vector<std::int32_t> callPositions;
     // Where the range being built for each value ends, walking a block backwards; -1 when it is not live there.
     std::vector<std::int32_t> endOf(vregs, -1);
@@ -420,7 +431,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         };
         const auto def = [&](std::int32_t v, std::int32_t pos) {
             const std::int32_t end = endOf[std::size_t(v)];
-            intervals[std::size_t(v)].ranges.push_back({pos, end < pos ? pos : end});
+            addRange(v, {pos, end < pos ? pos : end});
             endOf[std::size_t(v)] = -1;
         };
         for (std::int32_t i = block.last; i >= block.first; --i) {
@@ -463,7 +474,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
         block.liveIn.forEach([&](std::size_t g) {
             const std::size_t v = std::size_t(globalVreg[g]);
             if (endOf[v] >= 0)
-                intervals[v].ranges.push_back({from, endOf[v]});
+                addRange(std::int32_t(v), {from, endOf[v]});
             endOf[v] = -1;
         });
     }
@@ -472,7 +483,7 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     for (const IrInst& in : fn.code)
         fn.makesCalls = fn.makesCalls || in.op == IrOp::Call;
     // What arrives at entry is live from before the first instruction.
-    const auto fromEntry = [&](std::int32_t v) { intervals[std::size_t(v)].ranges.push_back({-1, 0}); };
+    const auto fromEntry = [&](std::int32_t v) { addRange(v, {-1, 0}); };
     for (std::int32_t p : fn.params)
         fromEntry(p);
     for (std::int32_t c : fn.captures)
@@ -485,17 +496,19 @@ void allocateRegisters(IrFunction& fn, const RegisterSet& regs)
     for (Interval& iv : intervals) {
         if (iv.ranges.empty())
             continue;
-        // They are made in program order, so mostly in order already.
+        // They are made in falling order (see `addRange`): turned round, they are in order, or nearly.
+        std::reverse(iv.ranges.begin(), iv.ranges.end());
         if (!std::is_sorted(iv.ranges.begin(), iv.ranges.end()))
             std::sort(iv.ranges.begin(), iv.ranges.end());
-        std::vector<Range> merged;
-        for (const Range& r : iv.ranges) {
-            if (!merged.empty() && r.from <= merged.back().to + 1)
-                merged.back().to = std::max(merged.back().to, r.to);
+        std::size_t kept = 0;
+        for (std::size_t k = 0; k < iv.ranges.size(); ++k) {
+            const Range r = iv.ranges[k];
+            if (kept && r.from <= iv.ranges[kept - 1].to + 1)
+                iv.ranges[kept - 1].to = std::max(iv.ranges[kept - 1].to, r.to);
             else
-                merged.push_back(r);
+                iv.ranges[kept++] = r;
         }
-        iv.ranges.swap(merged);
+        iv.ranges.resize(kept);
         iv.start = iv.ranges.front().from;
         iv.end = iv.ranges.back().to;
     }

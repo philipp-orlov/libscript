@@ -1435,6 +1435,7 @@ private:
         inst(IrOp::ColdBegin);
         inst(IrOp::Label).imm = slow;
         coldCall(reinterpret_cast<void*>(&scriptDynToInt32), {fp}, raw, -1, false);
+        fn_.calls.back().pure = true;
         inst(IrOp::Br).imm = done;
         inst(IrOp::ColdEnd);
         inst(IrOp::Label).imm = done;

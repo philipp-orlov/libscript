@@ -579,7 +579,8 @@ public:
                     break;
                 case IrOp::Call:
                     // A call may have written anything, so no load survives; a constant or a sum does.
-                    dropMemory();
+                    if (!fn_.calls[std::size_t(in.imm)].pure)
+                        dropMemory();
                     killDefs(in);
                     break;
                 case IrOp::Store:
@@ -815,7 +816,8 @@ private:
                 const IrCall& call = fn_.calls[std::size_t(in.imm)];
                 if (!cold || !call.cold)
                     return false;
-                callInCold.back() = 1;
+                if (!call.pure)
+                    callInCold.back() = 1;
                 define(call.result);
                 define(call.resultTag);
                 continue;
@@ -825,8 +827,9 @@ private:
                 // A cold block that carries on in the hot path, having called something, may have changed anything, unless
                 // the place it comes back to says otherwise.
                 const std::int32_t at = labelAt[std::size_t(to)];
-                if (callInCold.back() && at >= 0 && fn_.code[std::size_t(at)].alias == 0)
+                if (callInCold.back() && at >= 0 && fn_.code[std::size_t(at)].alias == 0) {
                     return false;
+                }
             }
             // A cold block's stores too: one that carries on in the hot path has done them by then.
             if (in.op == IrOp::Store || in.op == IrOp::StoreTag || in.op == IrOp::StoreIdx) {
@@ -842,7 +845,9 @@ private:
                         if (!added && at->second != constant->second)
                             writes.variedBytes.insert(in.imm);
                     }
-                } else {
+                } else if (in.op != IrOp::StoreIdx) {
+                    // An element store writes only element storage, which no load the loop keeps reads: `keepThrough`
+                    // forgets every indexed load at the head, as the pass forgets them at such a store.
                     writes.memory = true;
                 }
             }

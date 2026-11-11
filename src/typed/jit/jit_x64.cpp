@@ -2169,8 +2169,23 @@ public:
 
     bool buildFunction(IrFunction& fn, const NativeConfig& config, BuiltCode& out) const override
     {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        const auto dump = [&fn](const char* variable) {
+            if (const char* path = std::getenv(variable)) {
+                if (std::FILE* file = std::fopen(path, "a")) {
+                    const std::string text = dumpIr(fn);
+                    std::fwrite(text.data(), 1, text.size(), file);
+                    std::fclose(file);
+                }
+            }
+        };
+        dump("SCRIPT_JIT_IR_BEFORE");
+#endif
         optimizeLoops(fn);
         allocateRegisters(fn, regs_);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        dump("SCRIPT_JIT_IR");
+#endif
         static const std::unordered_map<const MethodInfo*, std::size_t> kNoSession;
         Emitter emitter(fn, config, kNoSession);
         if (!emitter.run()) {

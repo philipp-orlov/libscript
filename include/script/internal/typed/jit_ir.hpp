@@ -163,6 +163,9 @@ struct IrCall
     std::int32_t exit = -1;   ///< where to go when the call raised; -1 when it cannot raise
     std::int32_t site = -1;   ///< index in `sites`
     bool publishFrame = false;  ///< a helper that may raise wants the frame pointer recorded first
+    /// Writes no memory the method can see and runs none of the program's code: a conversion, say. What was known before
+    /// it is known after.
+    bool pure = false;
     /// In a cold region: registers live across it are kept by the call itself, not by the allocator's choices.
     bool cold = false;
     std::int32_t liveIndex = -1;  ///< with `cold`, into `liveAtRelease`

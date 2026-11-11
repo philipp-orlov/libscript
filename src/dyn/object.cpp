@@ -879,9 +879,14 @@ std::size_t hashValue(const Value& v) noexcept
                 return 0x7ff80000;
             std::uint64_t bits = 0;
             std::memcpy(&bits, &d, sizeof bits);
-            // Whole numbers differ in the top of the mantissa only, and the table goes by the low bits.
-            bits *= 0x9E3779B97F4A7C15ull;
-            return std::size_t(bits ^ (bits >> 32));
+            // Whole numbers differ in the top of the mantissa only, and the table goes by the low bits: those have to
+            // come from all of them. A multiply alone carries bits up, never down, and left a small integer's low bits 0.
+            bits ^= bits >> 33;
+            bits *= 0xff51afd7ed558ccdull;
+            bits ^= bits >> 33;
+            bits *= 0xc4ceb9fe1a85ec53ull;
+            bits ^= bits >> 33;
+            return std::size_t(bits);
         }
         case Type::String:
             return asString(v)->hash();

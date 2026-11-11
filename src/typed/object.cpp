@@ -26,7 +26,13 @@ std::size_t hashValue(const Value& v) noexcept
             const double d = detail::Access::r8(v);
             std::uint64_t bits = 0;
             std::memcpy(&bits, &d, sizeof bits);
-            return std::size_t(bits ^ (bits >> 32));
+            // A whole number's low 32 bits are 0, and the table goes by the low bits: mix all of them down.
+            bits ^= bits >> 33;
+            bits *= 0xff51afd7ed558ccdull;
+            bits ^= bits >> 33;
+            bits *= 0xc4ceb9fe1a85ec53ull;
+            bits ^= bits >> 33;
+            return std::size_t(bits);
         }
         case Type::String: {
             auto* s = static_cast<StringCell*>(detail::Access::ptr(v));

@@ -71,6 +71,11 @@ struct NativeCode
     /// Which back end produced this, for `Stats` and for the dump.
     const char* backend = "";
 
+    /// What made this, for the engine that did: its own code, while that lives (dyn: the `FunctionCode`).
+    void* owner = nullptr;
+    /// What this has copies of and so keeps for as long as it is there (dyn: the code of the functions inlined).
+    std::vector<std::shared_ptr<const void>> held;
+
     // ---- the optimizing tier; `entry` stays null and these say how to get in ----
     void* fastEntry = nullptr;
     /// A loop head in the interpreter's frame, and the code that picks up from there.

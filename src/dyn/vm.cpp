@@ -2355,6 +2355,14 @@ Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& ba
     return v;
 }
 
+FunctionCode::~FunctionCode()
+{
+#if SCRIPT_ENABLE_DYN_JIT
+    if (jitCode && jitRuntime)
+        retireNative(*jitRuntime, *this);
+#endif
+}
+
 namespace {
 
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)

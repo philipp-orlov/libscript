@@ -393,6 +393,7 @@ inline constexpr std::uint32_t kNoSite = 0xFFFu;
 /// One compiled function. Immutable once the compiler is done, shared by every
 /// closure made from it.
 struct FunctionCode;
+struct Runtime;
 /// A compile of one on another thread; see dyn/jit.hpp.
 struct JitJob;
 /// What compiling a function's body when it is first called needs; see dyn/compiler.hpp.
@@ -438,6 +439,14 @@ struct DeoptInfo
 
 struct FunctionCode
 {
+    FunctionCode() = default;
+    FunctionCode(const FunctionCode&) = delete;
+    FunctionCode& operator=(const FunctionCode&) = delete;
+    /// For a lazily compiled function's stub taking its compiled body; neither has native code then.
+    FunctionCode& operator=(FunctionCode&&) = default;
+    /// Gives its native code back to its runtime, to be freed once no frame is in it.
+    ~FunctionCode();
+
     /// One for each `GetElem`, `GetElemDup` and `SetElem`, whose operand says which.
     mutable Vec<std::uint8_t> elemSaw;
     /// Parallel to `elemSaw` once an access with a key that is no index has been made through any of them.
@@ -490,6 +499,10 @@ struct FunctionCode
     /// The same for a plain call, which is not how a class constructor is ever entered.
     mutable void* jitCallEntry = nullptr;
     mutable typed::NativeCode* jitCode = nullptr;
+    /// The runtime `jitCode` was made in, which takes it back when this code goes.
+    mutable Runtime* jitRuntime = nullptr;
+    /// The code of the functions a compile under way has copied in, for the native code it makes to keep.
+    mutable std::vector<std::shared_ptr<const FunctionCode>> jitHeldPending;
     mutable bool jitRefused = false;
     mutable std::uint32_t jitHotness = 0;
     /// Times native code has handed a call back to the interpreter part way through, since it was last compiled.

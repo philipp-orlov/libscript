@@ -1913,6 +1913,26 @@ TEST(nativeCodeNoFunctionEntersIsFreed)
     CHECK(ctx.stats().methodsCompiled >= 390);
 }
 
+TEST(nativeCodeOfAFunctionThatIsGoneIsFreed)
+{
+    // A function no one can call any more gives its code back: a small cache keeps taking new code for as long as the
+    // functions made before are dropped, here 400 of them in a cache that holds about 120.
+    script::Context::Options options;
+    options.jit.mode = script::JitOptions::Mode::Eager;
+    options.jit.codeCacheLimit = 256u << 10;
+    options.runtimeCode = true;
+    js::Context ctx(options);
+    ctx.eval("var total = 0;"
+             "for (var k = 0; k < 400; k++) {"
+             "  var f = new Function('x', 'var s = 0; for (var i = 0; i < 40; i++) s += x * i + ' + k + '; return s;');"
+             "  for (var j = 0; j < 3; j++) total += f(j); }", "<test>");
+    CHECK_EQ(ctx.eval("total", "<test>").toString(), std::string("10512000"));
+    // The stack is read conservatively, so a word left over in a frame can keep some code a while longer. Nothing
+    // compiled at all is a build or a run with no native code.
+    if (ctx.stats().methodsCompiled > 0)
+        CHECK(ctx.stats().methodsCompiled >= 380);
+}
+
 TEST(nativeHigherOrderLoopsSkipHoles)
 {
     // `map`, `forEach`, `filter` and `reduce` in native code do not call the callback for a hole, in an array of numbers

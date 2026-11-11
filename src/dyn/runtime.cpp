@@ -188,6 +188,11 @@ Runtime::Runtime(ContextImpl& context) : ctx(context)
     jitBackend = typed::createHostBackend();
     if (jitBackend)
         jitBackend->cache().setLimit(ctx.options.jit.codeCacheLimit);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    // SCRIPT_CODE_CACHE_MB: another size for the code cache, to see what a test loses to a full one.
+    if (const char* mb = std::getenv("SCRIPT_CODE_CACHE_MB"); jitBackend && mb)
+        jitBackend->cache().setLimit(std::size_t(std::strtoull(mb, nullptr, 10)) << 20);
+#endif
 #endif
     objectProto.reset(newCell<DynObject>(), true);
 
@@ -353,11 +358,25 @@ void Runtime::releaseRoots() noexcept
     jitWorker.reset();
 #endif
     if (jitBackend) {
-        for (typed::NativeCode* code : jitCodes)
+        // Code that outlives the runtime keeps nothing of it, and what the native code keeps goes after the code.
+        std::vector<std::shared_ptr<const void>> held;
+        for (typed::NativeCode* code : jitCodes) {
+            if (auto* owner = static_cast<const FunctionCode*>(code->owner)) {
+                owner->jitCode = nullptr;
+                owner->jitEntry = nullptr;
+                owner->jitCallEntry = nullptr;
+                owner->jitRuntime = nullptr;
+            }
+            for (auto& h : code->held)
+                held.push_back(std::move(h));
+            code->held.clear();
             jitBackend->release(code);
+        }
+        jitCodes.clear();
+        jitRetired.clear();
+        held.clear();
     }
     jitCodes.clear();
-    jitHeldCodes.clear();
     jitBackend.reset();
     shapes.clear();
     nullProtoRoot = nullptr;

@@ -1430,6 +1430,7 @@ bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunctio
 {
     if (!compiled) {
         code.jitRefused = true;
+        code.jitHeldPending.clear();
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (censusOn()) {
             const std::string why = "the code generator: " + rt.jitBackend->functionRefusal();
@@ -1458,6 +1459,11 @@ bool installNative(Runtime& rt, const FunctionCode& code, const typed::IrFunctio
         info->spillOffset = (fn.frameAreaBytes + 7u) & ~7u;
     }
     code.jitCode = compiled;
+    code.jitRuntime = &rt;
+    compiled->owner = const_cast<FunctionCode*>(&code);
+    for (auto& held : code.jitHeldPending)
+        compiled->held.push_back(std::move(held));
+    code.jitHeldPending.clear();
     // Kept in address order for describeNativeFrames; retiring code erases without disturbing it.
     rt.jitCodes.insert(std::lower_bound(rt.jitCodes.begin(), rt.jitCodes.end(), compiled,
                                         [](const typed::NativeCode* a, const typed::NativeCode* b) {
@@ -1563,6 +1569,7 @@ void retireNative(Runtime& rt, const FunctionCode& code) noexcept
     code.jitEntry = nullptr;
     code.jitCallEntry = nullptr;
     if (typed::NativeCode* old = std::exchange(code.jitCode, nullptr)) {
+        old->owner = nullptr;
         try {
             rt.jitRetired.push_back(old);
             rt.jitRetiredBytes += old->codeBytes;
@@ -1570,6 +1577,65 @@ void retireNative(Runtime& rt, const FunctionCode& code) noexcept
             // Left to the end of the runtime, as all code used to be.
         }
     }
+}
+
+/// The holds of native code no function the program can still reach is behind: two functions inlined into each other
+/// keep each other's code by their holds alone, and nothing else would let either go. A function's code is reached
+/// when something besides holds keeps it (a closure, the code around it, a compile under way), or when reached code
+/// holds it; retired code still waiting for its frames to end holds what it has, too. The holds of the rest are handed
+/// back, to be let go once the sweep is done with its lists.
+std::vector<std::shared_ptr<const void>> unreachableHolds(Runtime& rt)
+{
+    std::unordered_map<const FunctionCode*, long> holds;
+    for (const typed::NativeCode* native : rt.jitCodes) {
+        for (const auto& h : native->held)
+            ++holds[static_cast<const FunctionCode*>(h.get())];
+    }
+    if (holds.empty())
+        return {};
+    std::unordered_map<const FunctionCode*, bool> reached;
+    std::vector<const typed::NativeCode*> work;
+    for (const typed::NativeCode* native : rt.jitCodes) {
+        const auto* owner = static_cast<const FunctionCode*>(native->owner);
+        if (!owner)
+            work.push_back(native);
+        for (const auto& h : native->held) {
+            const auto* code = static_cast<const FunctionCode*>(h.get());
+            if (h.use_count() > holds[code] && !reached[code]) {
+                reached[code] = true;
+                if (code->jitCode)
+                    work.push_back(code->jitCode);
+            }
+        }
+    }
+    // A function's code nothing holds is reached by its own references, which holds do not count: its code holds.
+    for (const typed::NativeCode* native : rt.jitCodes) {
+        const auto* owner = static_cast<const FunctionCode*>(native->owner);
+        if (owner && !holds.count(owner))
+            work.push_back(native);
+    }
+    while (!work.empty()) {
+        const typed::NativeCode* native = work.back();
+        work.pop_back();
+        for (const auto& h : native->held) {
+            const auto* code = static_cast<const FunctionCode*>(h.get());
+            if (!reached[code]) {
+                reached[code] = true;
+                if (code->jitCode)
+                    work.push_back(code->jitCode);
+            }
+        }
+    }
+    std::vector<std::shared_ptr<const void>> dropped;
+    for (typed::NativeCode* native : rt.jitCodes) {
+        const auto* owner = static_cast<const FunctionCode*>(native->owner);
+        if (!owner || !holds.count(owner) || reached[owner])
+            continue;
+        for (auto& h : native->held)
+            dropped.push_back(std::move(h));
+        native->held.clear();
+    }
+    return dropped;
 }
 
 /// Free the retired code that no frame is in. A frame of native code is known by its return address, wherever on the
@@ -1619,10 +1685,13 @@ void sweepRetiredNative(Runtime& rt) noexcept
     std::vector<typed::NativeCode*> freed;
     for (std::size_t i = 0; i < retired.size(); ++i)
         (inUse[i] ? kept : freed).push_back(retired[i]);
+    std::vector<std::shared_ptr<const void>> dropped = unreachableHolds(rt);
     constexpr std::size_t kSweepEvery = std::size_t(1) << 20;
     if (freed.empty()) {
         SCRIPT_CENSUS(SweepFreedNothing);
         rt.jitSweepAt = rt.jitRetiredBytes + kSweepEvery;
+        // What goes with the holds is retired as it goes, for the next sweep.
+        dropped.clear();
         return;
     }
     std::sort(freed.begin(), freed.end());
@@ -1633,9 +1702,14 @@ void sweepRetiredNative(Runtime& rt) noexcept
     for (typed::NativeCode* code : kept)
         rt.jitRetiredBytes += code->codeBytes;
     rt.jitSweepAt = rt.jitRetiredBytes + kSweepEvery;
-    for (typed::NativeCode* code : freed)
-        rt.jitBackend->release(code);
     retired = std::move(kept);
+    // Freeing code lets go of what it kept, whose own code is then retired: onto the list as it now is.
+    for (typed::NativeCode* code : freed) {
+        std::vector<std::shared_ptr<const void>> held = std::move(code->held);
+        rt.jitBackend->release(code);
+        held.clear();
+    }
+    dropped.clear();
 }
 
 /// Code put in the cache; when it is full, the retired code no frame is in makes room first.

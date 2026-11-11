@@ -945,8 +945,11 @@ public:
         const std::int32_t cls = load(callee.r, kClsOffset, 1, false, kAliasHeader);
         branchCmp(cls, IrCond::Ne, std::int64_t(ObjClass::Function), generic);
         const std::int32_t have = load(callee.r, kFnCodeOffset, 8, false, kAliasHeader);
-        // The same for the code, which the bails in its copy also name.
-        rt_.jitHeldCodes.emplace(code.get(), code);
+        // The same for the code, which the bails in its copy also name: kept by the native code made from this.
+        const Lowering* top = this;
+        while (top->parent_)
+            top = top->parent_;
+        top->code_.jitHeldPending.push_back(code);
         const std::int32_t want = ptrReg(code.get());
         IrInst& same = inst(IrOp::BrCmp);
         same.a = have;

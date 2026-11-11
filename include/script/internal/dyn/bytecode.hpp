@@ -578,6 +578,8 @@ struct FunctionCode
     /// The compile going on on another thread, whose code is not in place yet.
     mutable std::shared_ptr<JitJob> jitJob;
     std::vector<Value> consts;         ///< PushConst operands
+    /// `wideName` as a string, made by the first closure, for every closure's `name`.
+    mutable Value nameValue = Value::undefined();
     std::vector<Ref<GCObject>> atoms;  ///< interned property names and symbols
     std::vector<std::shared_ptr<FunctionCode>> children;
     std::vector<EvalScope> evalScopes;  ///< DirectEval operands

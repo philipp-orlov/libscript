@@ -1913,7 +1913,18 @@ static bool setUpCoroutineFunction(Runtime& rt, DynFunction* fn, const FunctionC
     return true;
 }
 
-Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, DynFunction* parent,
+namespace {
+/// The string every closure of `code` is named by, made once.
+const Value& nameValueOf(Runtime& rt, const FunctionCode& code)
+{
+    if (!code.nameValue.isString())
+        code.nameValue = rt.str(code.wideName);
+    return code.nameValue;
+}
+}  // namespace
+
+// Takes the code as the closure instruction holds it: one of another constness would be a copy made and dropped.
+Value makeClosureForNative(Runtime& rt, const std::shared_ptr<FunctionCode>& code, DynFunction* parent,
                            Box* const* boxes)
 {
     DynFunction* fn = rt.newFunction();
@@ -1932,7 +1943,7 @@ Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode
     if (parent && code->isArrow)
         fn->homeObject = parent->homeObject;
     fn->putOwn(rt.atom.length.get(), Value(double(code->length)), PropConfigurable);
-    fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
+    fn->putOwn(rt.atom.name.get(), nameValueOf(rt, *code), PropConfigurable);
     if (!setUpCoroutineFunction(rt, fn, *code) && !code->isArrow && !code->isClassConstructor)
         fn->prototypePending = true;
     return handle;
@@ -1966,7 +1977,7 @@ Value makeClosure(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, 
         fn->homeObject = parent->fn->homeObject;
 
     fn->putOwn(rt.atom.length.get(), Value(double(code->length)), PropConfigurable);
-    fn->putOwn(rt.atom.name.get(), rt.str(fn->name), PropConfigurable);
+    fn->putOwn(rt.atom.name.get(), nameValueOf(rt, *code), PropConfigurable);
     if (!setUpCoroutineFunction(rt, fn, *code) && withPrototype && !code->isArrow && !code->isClassConstructor)
         fn->prototypePending = true;
     return detail::Access::adopt(Type::Object, fn);

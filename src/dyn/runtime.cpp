@@ -297,6 +297,7 @@ void releaseCode(const FunctionCode& code) noexcept
     mutableCode.consts.clear();
     mutableCode.atoms.clear();
     mutableCode.jitKeep.clear();
+    mutableCode.nameValue = Value::undefined();
     for (const auto& child : mutableCode.children)
         releaseCode(*child);
 }

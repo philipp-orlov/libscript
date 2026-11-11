@@ -170,7 +170,7 @@ void bindThis(Runtime& rt, const Value& ctor, const Value& made, const Value& bo
 Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& base, const Value& key, std::uint32_t site,
                           bool& hit);
 void setGlobalForNative(Runtime& rt, GCObject* key, const Value& v);
-Value makeClosureForNative(Runtime& rt, const std::shared_ptr<const FunctionCode>& code, DynFunction* parent,
+Value makeClosureForNative(Runtime& rt, const std::shared_ptr<FunctionCode>& code, DynFunction* parent,
                            Box* const* boxes);
 [[noreturn]] void throwValueForNative(Runtime& rt, const Value& v);
 void classSetupForNative(Runtime& rt, bool hasSuper, const Value& superValue, const Value& ctorValue);

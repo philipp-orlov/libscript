@@ -2674,3 +2674,30 @@ TEST(whatNestedFunctionsMentionIsKeptInCellsByEveryRule)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2 at 6 Bm! true 2st 9 innerouter 2,3 012 t2 object 2 {\"7\":\"c\",\"q\":7,\"r\":7} mkundefined ar"));
     }
 }
+
+TEST(closuresOfOneFunctionShareTheirNameButEachKeepsItsOwnProperty)
+{
+    // Every closure of a function is named by the same string, made once; its name property is still its own to change.
+    const char* program =
+        "var out = [];"
+        "function mk(i) { return function inner() { return i; }; }"
+        "var fs = []; for (var k = 0; k < 5000; k++) fs.push(mk(k));"
+        "out.push(fs[3].name, fs[4999].name, fs[10](), (() => 1).name, (function () {}).name);"
+        "class K { static name2() {} } out.push(K.name, K.name2.name);"
+        "var anon = function () {}; out.push(anon.name); var f2 = function named() {}; out.push(f2.name);"
+        "fs[0].name = 'x'; out.push(fs[0].name, fs[1].name, Object.getOwnPropertyDescriptor(fs[1], 'name').configurable);"
+        "Object.defineProperty(fs[2], 'name', {value: 'changed'}); out.push(fs[2].name, fs[5].name);"
+        "async function af() {} function* gf() {} out.push(af.name, gf.name);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("inner inner 10   K name2 anon named inner inner true changed inner af gf"));
+    }
+}

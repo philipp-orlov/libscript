@@ -140,6 +140,8 @@ std::int32_t scriptDynDeleteElem(Runtime* rt, std::int64_t tag, std::uint64_t pa
 void scriptDynDefGlobal(Runtime* rt, GCObject* key, std::uint64_t attrs) noexcept;
 NativePair scriptDynTypeofGlobal(Runtime* rt, GCObject* key) noexcept;
 void scriptDynDefMember(Runtime* rt, std::int64_t mode, GCObject* object, GCObject* key, std::int64_t tag, std::uint64_t payload) noexcept;
+void scriptDynNameFunctionElem(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std::int64_t keyTag, std::uint64_t key,
+                               std::int64_t prefix) noexcept;
 void scriptDynDefElem(Runtime* rt, std::int64_t mode, GCObject* object, std::int64_t keyTag, std::uint64_t key, std::int64_t tag,
                       std::uint64_t payload) noexcept;
 void scriptDynClassSetup(Runtime* rt, std::int64_t hasSuper, std::int64_t superTag, std::uint64_t super, std::int64_t ctorTag,

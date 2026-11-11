@@ -144,6 +144,7 @@ enum class Op : std::uint8_t
     SetFieldInit,        // constructor function -> constructor
     CallStaticInit,      // constructor function -> constructor
     SetHome,             // home function -> function
+    NameFunctionElem,    // prefix (0 none, 1 get, 2 set): key function -> key function, the function named by the key
 
     // ---- generators and async functions ----
     CoStart,          // what has run so far was the call: the rest runs as a coroutine, resumed from here

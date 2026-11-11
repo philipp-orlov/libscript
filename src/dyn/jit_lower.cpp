@@ -3193,6 +3193,15 @@ private:
                 release(value);
                 return true;
             }
+            case Op::NameFunctionElem: {
+                const Entry& fn = stack_[stack_.size() - 1];
+                const Entry& key = stack_[stack_.size() - 2];
+                secureWeak();
+                coldCall(reinterpret_cast<void*>(&scriptDynNameFunctionElem),
+                         {rtReg(), tagReg(fn), payloadReg(fn), tagReg(key), payloadReg(key), immReg(std::int64_t(operand()))}, -1, -1,
+                         true, {});
+                return true;
+            }
             case Op::DefElem:
             case Op::DefMethodElem: {
                 Entry value = pop();

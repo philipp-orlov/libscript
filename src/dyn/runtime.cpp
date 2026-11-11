@@ -78,6 +78,7 @@ int operandsOf(Op op) noexcept
         case Op::DefPrivateAccessor:
         case Op::DefPrivate:
         case Op::DefAccessorElem:
+        case Op::NameFunctionElem:
         case Op::CallSuperVia:
         case Op::Yield:
         case Op::DelegateCall:
@@ -107,7 +108,7 @@ const char* opName(Op op) noexcept
         "Jump", "JumpIfFalse", "JumpIfTrue", "JumpIfFalseKeep", "JumpIfTrueKeep",
         "JumpIfNullishKeep", "JumpIfNotNullishKeep", "JumpSub", "EndFinally", "Throw", "ThrowConstAssign", "ThrowTdz",
         "ForInStart", "ForInNext", "IterStart", "IterNext", "IterNextOpt", "IterRest",
-        "IterClose", "IterStartLoop", "IterCloseAt", "IterCloseThrow", "NewPrivateName", "PrivateIn", "DefPrivate", "DefPrivateMethod", "DefPrivateAccessor", "DefAccessorElem", "CheckThis", "DerivedReturn", "PushNewTarget", "CallSuperVia", "CallSuperViaSpread", "BindThis", "SetFieldInit", "CallStaticInit", "SetHome", "CoStart", "Yield", "Await", "DelegateStart", "DelegateCall", "DelegateCheck", "DelegateDone", "AsyncIterStart", "AsyncIterCall", "AsyncIterCheck", "AsyncIterClose",
+        "IterClose", "IterStartLoop", "IterCloseAt", "IterCloseThrow", "NewPrivateName", "PrivateIn", "DefPrivate", "DefPrivateMethod", "DefPrivateAccessor", "DefAccessorElem", "CheckThis", "DerivedReturn", "PushNewTarget", "CallSuperVia", "CallSuperViaSpread", "BindThis", "SetFieldInit", "CallStaticInit", "SetHome", "NameFunctionElem", "CoStart", "Yield", "Await", "DelegateStart", "DelegateCall", "DelegateCheck", "DelegateDone", "AsyncIterStart", "AsyncIterCall", "AsyncIterCheck", "AsyncIterClose",
         "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Neg", "Pos", "BitAnd", "BitOr", "BitXor",
         "BitNot", "Shl", "Shr", "UShr", "Eq", "Ne", "StrictEq", "StrictNe", "Lt", "Le", "Gt",
         "Ge", "In", "InstanceOf", "Not", "TypeOf", "Inc", "Dec", "ToNumber", "ToString",

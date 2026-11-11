@@ -995,6 +995,15 @@ void scriptDynDefMember(Runtime* rt, std::int64_t mode, GCObject* object, GCObje
     });
 }
 
+void scriptDynNameFunctionElem(Runtime* rt, std::int64_t fnTag, std::uint64_t fn, std::int64_t keyTag, std::uint64_t key,
+                               std::int64_t prefix) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        nameFunctionByKey(*rt, valueOf(fnTag, fn), valueOf(keyTag, key), std::uint32_t(prefix));
+        return 0;
+    });
+}
+
 void scriptDynDefElem(Runtime* rt, std::int64_t mode, GCObject* object, std::int64_t keyTag, std::uint64_t key, std::int64_t tag,
                       std::uint64_t payload) noexcept
 {

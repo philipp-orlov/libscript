@@ -362,6 +362,8 @@ Vec<Value> iterableToVector(Runtime& rt, const Value& iterable);
 Value makePromise(Runtime& rt);
 void resolvePromise(Runtime& rt, DynPromise* p, const Value& value);
 void rejectPromise(Runtime& rt, DynPromise* p, const Value& reason);
+/// SetFunctionName from a key known at run time; see vm.cpp.
+void nameFunctionByKey(Runtime& rt, const Value& fn, const Value& key, std::uint32_t prefix);
 /// A one-argument native function that settles `promise` when called -- the
 /// `resolve`/`reject` pair handed to executors and `then` callbacks.
 Value makeSettler(Runtime& rt, const Value& promise, bool reject);

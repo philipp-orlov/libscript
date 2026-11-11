@@ -2366,6 +2366,35 @@ Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& ba
     return v;
 }
 
+/// SetFunctionName for a key worked out at run time: a function made without a name of its own takes the key's, a
+/// symbol's as `[description]`, after `get ` or `set ` for an accessor. One that has a `name` of its own already (a class
+/// with a static `name`) keeps it.
+void nameFunctionByKey(Runtime& rt, const Value& fnValue, const Value& key, std::uint32_t prefix)
+{
+    DynFunction* fn = asFunction(fnValue);
+    if (!fn)
+        return;
+    Prop* own = fn->findOwn(rt.atom.name.get());
+    if (own && (fn->accessorOf(*own) || !own->value.isString() || asString(own->value)->length != 0))
+        return;
+    String name;
+    if (key.isSymbol()) {
+        const String& description = static_cast<SymbolCell*>(detail::Access::ptr(key))->description;
+        if (!description.empty())
+            name = u"[" + description + u"]";
+    } else {
+        name = toStringValue(rt, key);
+    }
+    if (prefix)
+        name = (prefix == 1 ? u"get " : u"set ") + name;
+    fn->name = name;
+    const Value text = rt.str(name);
+    if (own)
+        own->value = text;
+    else
+        fn->putOwn(rt.atom.name.get(), text, PropConfigurable);
+}
+
 FunctionCode::~FunctionCode()
 {
 #if SCRIPT_ENABLE_DYN_JIT
@@ -3451,6 +3480,12 @@ namespace {
                 sp.back() = fn;
                 break;
             }
+            case Op::NameFunctionElem: {
+                const std::uint32_t prefix = operandAt(pc);
+                pc += 4;
+                nameFunctionByKey(rt, sp[sp.size() - 1], sp[sp.size() - 2], prefix);
+                break;
+            }
             case Op::Return:
                 leaving = pop();
                 return Step::Leave;
@@ -4202,6 +4237,7 @@ Value execute(Runtime& rt, Frame& entry)
         &&L_SetFieldInit,
         &&L_CallStaticInit,
         &&L_SetHome,
+        &&L_NameFunctionElem,
         &&L_CoStart,
         &&L_Yield,
         &&L_Await,
@@ -5098,6 +5134,7 @@ Value execute(Runtime& rt, Frame& entry)
         L_SetFieldInit:
         L_CallStaticInit:
         L_SetHome:
+        L_NameFunctionElem:
         L_CoStart:
         L_Await:
         L_DelegateStart:

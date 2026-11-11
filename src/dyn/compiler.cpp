@@ -586,6 +586,13 @@ bool isTypeofAnswer(StringView text) noexcept
     return false;
 }
 
+/// IsAnonymousFunctionDefinition: what takes the name of the key or the variable it is stored under.
+bool isAnonymousFunction(const Node& n) noexcept
+{
+    return ((n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr) && n.text.empty() && !n.isMethod) ||
+           (n.kind == NK::ClassExpr && n.text.empty());
+}
+
 bool isFunctionNode(const Node& n) noexcept
 {
     return n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr;
@@ -2759,6 +2766,11 @@ private:
                 expr(*p->a);
                 emit(Op::ToPropertyKey);
                 expr(*p->b);
+                // The function takes its name from the key, which is known only now.
+                if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter)
+                    emitU(Op::NameFunctionElem, p->propKind == PropKind::Setter ? 2u : 1u);
+                else if (p->propKind == PropKind::Method || isAnonymousFunction(*p->b))
+                    emitU(Op::NameFunctionElem, 0u);
                 if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter)
                     emitU(Op::DefAccessorElem, p->propKind == PropKind::Setter ? 1u : 0u);
                 else if (p->propKind == PropKind::Method)
@@ -2774,6 +2786,8 @@ private:
             }
             if (p->propKind == PropKind::Init && p->text != u"__proto__")
                 exprNamed(*p->b, p->text);
+            else if ((p->propKind == PropKind::Getter || p->propKind == PropKind::Setter) && p->b->kind == NK::FunctionExpr)
+                function(*p->b, (p->propKind == PropKind::Getter ? u"get " : u"set ") + p->text);
             else
                 expr(*p->b);
             switch (p->propKind) {
@@ -3341,6 +3355,8 @@ private:
         } else if (n.computed) {
             loadVar(n.a->text);
             value(ascii(""));
+            if (n.b && isAnonymousFunction(*n.b))
+                emitU(Op::NameFunctionElem, 0u);
             emit(Op::DefElem);
         } else {
             value(n.text);
@@ -3723,6 +3739,7 @@ private:
                 expr(*m->a);
                 emit(Op::ToPropertyKey);
                 function(*m->b, ascii(""));
+                emitU(Op::NameFunctionElem, getter ? 1u : setter ? 2u : 0u);
                 if (getter || setter)
                     emitU(Op::DefAccessorElem, (setter ? 1u : 0u) | 2u);
                 else

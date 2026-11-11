@@ -2701,3 +2701,28 @@ TEST(closuresOfOneFunctionShareTheirNameButEachKeepsItsOwnProperty)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("inner inner 10   K name2 anon named inner inner true changed inner af gf"));
     }
 }
+
+TEST(functionsTakeTheNameOfAComputedKeyOrAnAccessor)
+{
+    // SetFunctionName: a method, accessor or anonymous function under a computed key is named by the key (a symbol's in
+    // brackets, an accessor's after get or set); a class with a static name method keeps that.
+    const char* program =
+        "var s = Symbol('q'), e = Symbol(), out = [];"
+        "var o = {['a' + 1]() {}, [s]() {}, [e]() {}, ['f']: function () {}, ['ar']: () => 1, ['n']: function named() {}, get ['g' + 1]() {}, set ['g' + 1](v) {}, [2]: class {}, ['k']: class { static name() {} }};"
+        "var d = Object.getOwnPropertyDescriptor(o, 'g1');"
+        "out.push(o.a1.name, o[s].name, o[e].name, o.f.name, o.ar.name, o.n.name, d.get.name, d.set.name, o[2].name, typeof o.k.name);"
+        "class C { ['m' + 2]() {} static get ['s' + 3]() {} ['x'] = function () {}; static ['y'] = () => 0; }"
+        "out.push(C.prototype.m2.name, Object.getOwnPropertyDescriptor(C, 's3').get.name, new C().x.name, C.y.name);"
+        "out.join(\",\")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("a1,[q],,f,ar,named,get g1,set g1,2,function,m2,get s3,x,y"));
+    }
+}

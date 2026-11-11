@@ -2234,6 +2234,8 @@ private:
             fallsIn = true;
             if (arithmeticByHelper(op)) {
                 previousOp_ = op;
+            previousPc_ = pc;
+                previousPc_ = pc;
                 pc = next;
                 continue;
             }
@@ -4013,6 +4015,74 @@ private:
         }
     }
 
+    /// Whether a store of a value of no known kind may bet it is a number: not in a function where such a bet has been
+    /// lost, at any of its stores (one round of bails a function, not one a store).
+    bool storesBetOn() const
+    {
+        for (std::uint32_t pc : code_.jitBailedAt) {
+            if (pc < code_.code.size() && Op(code_.code[pc]) == Op::SetLocal)
+                return false;
+        }
+        return true;
+    }
+
+    /// A number local takes `value`, which has to be a double, and for an int32 local a whole one in range that is not -0:
+    /// anything else bails with the value back on the stack, before the store.
+    void storeNumberGuessed(std::uint32_t slot, const Entry& value)
+    {
+        const std::int32_t bail = newLabel();
+        branchCmp(tagReg(value), IrCond::Ne, std::int64_t(Type::Double), bail);
+        const std::int32_t payload = payloadReg(value);
+        const std::int32_t fp = fn_.newVreg(true);
+        IrInst& bits = inst(IrOp::BitsToFp);
+        bits.d = fp;
+        bits.a = payload;
+        bits.width = 64;
+        if (!isIntLocal(slot)) {
+            IrInst& mov = inst(IrOp::Mov);
+            mov.d = localReg_[slot];
+            mov.a = fp;
+            emitBail(bail, {value});
+            return;
+        }
+        const std::int32_t i = fn_.newVreg(false);
+        IrInst& conv = inst(IrOp::FpToIntRaw);
+        conv.d = i;
+        conv.a = fp;
+        const std::int32_t back = fn_.newVreg(true);
+        IrInst& to = inst(IrOp::IntToFp);
+        to.d = back;
+        to.a = i;
+        to.srcWidth = 64;
+        to.width = 64;
+        IrInst& eq = inst(IrOp::BrFCmp);
+        eq.a = fp;
+        eq.b = back;
+        eq.cond = IrCond::FNe;
+        eq.width = 64;
+        eq.target = bail;
+        // In range of an int32: the value sign-extended from its low half is the value.
+        const std::int32_t narrow = fn_.newVreg(false);
+        IrInst& ext = inst(IrOp::Sext32);
+        ext.d = narrow;
+        ext.a = i;
+        IrInst& fits = inst(IrOp::BrCmp);
+        fits.a = narrow;
+        fits.b = i;
+        fits.cond = IrCond::Ne;
+        fits.width = 64;
+        fits.target = bail;
+        // A zero whose bits are not all zero is -0, which an int32 cannot hold.
+        const std::int32_t nonzero = newLabel();
+        branchCmp(i, IrCond::Ne, 0, nonzero, 64);
+        branchCmp(payload, IrCond::Ne, 0, bail, 64);
+        inst(IrOp::Label).imm = nonzero;
+        IrInst& mov = inst(IrOp::Mov);
+        mov.d = localReg_[slot];
+        mov.a = narrow;
+        emitBail(bail, {value});
+    }
+
     void storeLocal(std::uint32_t slot)
     {
         Entry value = pop();
@@ -4025,6 +4095,13 @@ private:
                 return;
             // A guess about the slot was wrong. The outermost function notes it and carries on, so one more lowering puts
             // right every slot this one finds; the code made meanwhile is thrown away.
+            // A value of a kind not known here: bet it is a number, as the slot has always held, and bail if not. A bet
+            // lost here is remembered, and the next lowering makes the slot hold anything.
+            if (!isKnownNumber(value) && betHere() && value.rep == Rep::Tagged && !value.isConst &&
+                !(value.hasKnownTag && value.known != Type::Double) && code_.localOnlyNumbers(slot) && storesBetOn()) {
+                storeNumberGuessed(slot, value);
+                return;
+            }
             if (!isKnownNumber(value)) {
                 if (parent_)
                     throw LowerAgain{slot};
@@ -8327,6 +8404,7 @@ private:
     std::int32_t fnReg_ = -1, thisTag_ = -1, thisReg_ = -1;
     /// The instruction lowered just before this one, in straight-line order; `Nop` after a label.
     Op previousOp_ = Op::Nop;
+    std::uint32_t previousPc_ = 0;
     std::vector<std::int32_t> localReg_, localTag_, cellReg_;
     std::vector<std::uint8_t> localOwned_, cellOwned_, assigned_, reachable_;
     std::vector<std::int32_t> labels_;
@@ -8510,6 +8588,10 @@ bool lowerFunction(Runtime& rt, const FunctionCode& code, IrFunction& out, std::
     if (code.derivedThisSlot < code.numLocals)
         notNumber[code.derivedThisSlot] = 1;
     std::vector<std::uint8_t> notInt(code.numLocals, 0);
+    // A slot the interpreter has given a number that is no int32 holds doubles from the start.
+    for (std::uint32_t slot = 0; slot < code.numLocals && slot < 64; ++slot)
+        if ((code.localsGotFraction >> slot) & 1)
+            notInt[slot] = 1;
     for (;;) {
         IrFunction fn;
         try {

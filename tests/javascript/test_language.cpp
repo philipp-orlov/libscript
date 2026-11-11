@@ -2813,3 +2813,28 @@ TEST(aLoopChecksItsTypedArraysOnceAndStillSeesThemReplaced)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("299872800 0 100 124750 0 0 427238000 1100"));
     }
 }
+
+TEST(aLocalGivenOnlyNumbersStaysANumberAndFindsOutOtherwise)
+{
+    // A local the interpreter has only ever given numbers is a number in native code even where what is stored has no
+    // known kind: a string, an object, -0, a fraction or one too large for an int32 later bails, and is right.
+    const char* program =
+        "var out = [], arr = [1, 2, 3, {}, 'x', 2.5, -0, 1e10, NaN];"
+        "function f(a, n) { var r, s = 0, z; for (var i = 0; i < n; i++) { r = a[i % 3]; s = (s + r) | 0; } z = a[(n % 9)]; r = z; return [s, typeof r, 1 / r]; }"
+        "for (var k = 0; k < 3000; k++) out[0] = f(arr, 50).join();"
+        "for (var k = 4; k < 9; k++) out.push(f(arr, k + 9 * 3).join());"
+        "var t = 0; function g(o) { var x, y = 0; for (var i = 0; i < 100; i++) { x = o.v; y = (y + x) | 0; } return y + '/' + x; }"
+        "for (var k = 0; k < 2000; k++) t = g({v: k & 7}); out.push(t, g({v: 'q'}), g({v: 1.5}), g({v: -0}), g({}));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("99,number,0.4 61,string,NaN 63,number,0.4 66,number,-Infinity 67,number,1e-10 69,number,NaN 700/7 0/q 100/1.5 0/0 0/undefined"));
+    }
+}

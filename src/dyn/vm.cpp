@@ -2820,6 +2820,7 @@ namespace {
                 pc += 4;
                 break;
             case Op::SetLocal:
+                code.noteLocalStore(operandAt(pc), sp.back());
                 frame.locals[operandAt(pc)] = pop();
                 pc += 4;
                 break;
@@ -4475,6 +4476,7 @@ Value execute(Runtime& rt, Frame& entry)
             LS_NEXT(5);
         L_SetLocal:
             --top;
+            code->noteLocalStore(LS_OPERAND(1), *top);
             moveInto(locals[LS_OPERAND(1)], *top);
             LS_NEXT(5);
         L_GetCell: {
@@ -5036,6 +5038,7 @@ Value execute(Runtime& rt, Frame& entry)
         L_QSetLocalPop:
             // Dup, SetLocal, Pop
             --top;
+            code->noteLocalStore(LS_OPERAND(2), *top);
             moveInto(locals[LS_OPERAND(2)], *top);
             LS_NEXT(7);
         L_QIncLocal:

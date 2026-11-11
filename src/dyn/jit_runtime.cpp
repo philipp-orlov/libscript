@@ -1356,6 +1356,9 @@ int enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result
         if (type != Type::Double && (type != Type::Undefined || slot < params)) {
             if (slot < params && slot < 32)
                 code.argsNotNumber |= 1u << slot;
+            // Something the interpreter never stored there (code made before put it): no bet on the slot next time.
+            if (slot < 64)
+                code.localsGotOther |= std::uint64_t(1) << slot;
             return discard();
         }
     }
@@ -1366,6 +1369,8 @@ int enterNativeAtLoop(Runtime& rt, Frame& frame, std::uint32_t pc, Value& result
         if (!(d >= -2147483648.0 && d <= 2147483647.0) || double(std::int32_t(d)) != d || (d == 0 && std::signbit(d))) {
             if (slot < params && slot < 32)
                 code.argsNotInt |= 1u << slot;
+            if (slot < 64)
+                code.localsGotFraction |= std::uint64_t(1) << slot;
             return discard();
         }
     }

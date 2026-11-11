@@ -476,6 +476,26 @@ struct FunctionCode
     bool isMethod = false;  ///< written as a method or accessor: `new` means nothing for it
 
     std::uint32_t numLocals = 0;
+    /// What the interpreter has stored in each of the first 64 locals: a number, and something else (`undefined` aside,
+    /// which only hoisting stores). Native code bets a slot holds numbers where it has only ever been given numbers.
+    mutable std::uint64_t localsGotNumber = 0;
+    mutable std::uint64_t localsGotOther = 0;
+    /// A number that is no int32 found where native code was to start with an int32 there.
+    mutable std::uint64_t localsGotFraction = 0;
+    void noteLocalStore(std::uint32_t slot, const Value& v) const noexcept
+    {
+        if (slot >= 64)
+            return;
+        if (v.isDouble())
+            localsGotNumber |= std::uint64_t(1) << slot;
+        else if (!v.isUndefined())
+            localsGotOther |= std::uint64_t(1) << slot;
+    }
+    /// Whether every store the interpreter made to `slot` was a number, and there was one.
+    bool localOnlyNumbers(std::uint32_t slot) const noexcept
+    {
+        return slot < 64 && ((localsGotNumber >> slot) & 1) && !((localsGotOther >> slot) & 1);
+    }
     std::uint32_t maxStack = 8;
     /// What the interpreter runs: `code` with the first instruction of some pairs it does in one go replaced. Made the
     /// first time the function is interpreted; nothing else reads it.

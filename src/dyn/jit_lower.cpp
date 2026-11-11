@@ -2394,7 +2394,9 @@ private:
             const std::int32_t slot = globalSlot(found, bail);
             const Entry value = taggedEntry(load(slot, kPropValueOffset + kPayload, 8, false, kAliasValue),
                                             load(slot, kPropValueOffset, 1, false, kAliasValue), Own::Weak);
-            if (g.w.elements && !g.w.shape && found->value.isObject()) {
+            if (const int kind = ElemSite::typedOnly(g.w.elements); kind >= 0 && !g.w.shape && found->value.isObject()) {
+                typedBeforeLoop(value, kind, bail);
+            } else if (g.w.elements && !g.w.shape && asArray(found->value)) {
                 guardArray(value, bail);
                 loadHeader(value.r, kElementsOffset);
                 load(value.r, kElementCountOffset, 4, false, kAliasHeader);
@@ -2411,6 +2413,12 @@ private:
             if (w.elements) {
                 if (w.shape)
                     continue;  // an array that has been read like an object as well: not one thing to know about
+                if (const int kind = ElemSite::typedOnly(w.elements); kind >= 0) {
+                    typedBeforeLoop(local, kind, bail);
+                    continue;
+                }
+                if (w.elements & ElemSite::kTyped)
+                    continue;  // typed arrays of more than one kind: each access checks for itself
                 guardArray(local, bail);
                 loadHeader(local.r, kElementsOffset);
                 load(local.r, kElementCountOffset, 4, false, kAliasHeader);
@@ -2428,6 +2436,26 @@ private:
         }
         emitBail(bail, {});
         forgetFacts();
+    }
+
+    /// Ahead of a loop, what an element access in it checks of a typed array and reads from it, as `typedElements` does
+    /// but for the index: a loop that does not call finds them all known.
+    void typedBeforeLoop(const Entry& base, int kind, std::int32_t bail)
+    {
+        std::uint8_t bytes, scale;
+        bool isSigned, isFloat;
+        if (!typedAccess(kind, bytes, scale, isSigned, isFloat))
+            return;
+        if (!base.hasKnownTag)
+            branchCmp(base.t, IrCond::Ne, std::int64_t(Type::Object), bail);
+        else if (base.known != Type::Object)
+            return;
+        const std::int32_t both = load(base.r, kCellKindOffset, 2, false, kAliasHeader);
+        branchCmp(both, IrCond::Ne, kKindAndClassOfTypedArray, bail);
+        const std::int32_t kindHere = load(base.r, kTypedKindOffset, 1, false, kAliasHeader);
+        branchCmp(kindHere, IrCond::Ne, std::int64_t(kind), bail);
+        load(base.r, kTypedLengthOffset, 8, false, kAliasHeader);
+        load(base.r, kTypedElementsOffset, 8, false, kAliasHeader);
     }
 
     /// Ahead of a loop, the reads it makes of properties of what it does not assign, as it makes them: where the loop does

@@ -2780,3 +2780,36 @@ TEST(aForOfWithReturnAndContinueKeepsItsIteratorInNativeCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("{\"result\":true,\"c\":2}"));
     }
 }
+
+TEST(aLoopChecksItsTypedArraysOnceAndStillSeesThemReplaced)
+{
+    // A loop over global typed arrays checks each once ahead of it; replaced by another kind, a plain array or from a
+    // call inside the loop, the access finds out.
+    const char* program =
+        "var out = [];"
+        "var buf = new ArrayBuffer(4096), heapU16 = new Uint16Array(buf), heap16 = new Int16Array(buf);"
+        "for (var i = 0; i < 2048; i++) heapU16[i] = i;"
+        "function sum(n) { var s = 0; for (var k = 0; k < n; k++) { s = (s + heapU16[k & 1023]) | 0; heap16[(k & 511) + 1024] = k; } return s; }"
+        "function swap() { heapU16 = new Uint8Array(4096); }"
+        "function mixed(n) { var s = 0; for (var k = 0; k < n; k++) { if (k == 500) swap(); s = (s + heapU16[k & 1023]) | 0; } return s; }"
+        "var t = 0; for (var r = 0; r < 300; r++) t = (t + sum(2000)) | 0; out.push(t);"
+        "var saved = heapU16; heapU16 = new Float64Array(2048); heapU16[3] = 0.5; out.push(sum(4));"
+        "heapU16 = [10, 20, 30, 40]; out.push(sum(4)); heapU16 = saved;"
+        "out.push(mixed(1000)); heapU16 = saved;"
+        "var det = new ArrayBuffer(64), view = new Uint16Array(det); heapU16 = view; out.push(sum(8));"
+        "if (typeof structuredClone === 'function') { try { structuredClone(det, { transfer: [det] }); } catch (e) {} }"
+        "out.push(sum(3)); heapU16 = saved;"
+        "for (var r = 0; r < 200; r++) t = (t + sum(1500)) | 0; out.push(t, heap16[1100]);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("299872800 0 100 124750 0 0 427238000 1100"));
+    }
+}

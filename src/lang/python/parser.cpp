@@ -1799,15 +1799,15 @@ Parser::NodePtr Parser::stringAtom()
         // Merge into one template.
         if (result->kind == NK::StringLit) {
             NodePtr tpl = make(NK::TemplateLit, at);
-            tpl->strs.push_back(result->text);
+            tpl->writeExtra().strs.push_back(result->text);
             result = std::move(tpl);
         }
         if (piece->kind == NK::StringLit) {
-            result->strs.back() += piece->text;
+            result->writeExtra().strs.back() += piece->text;
         } else {
-            result->strs.back() += piece->strs.front();
-            for (std::size_t i = 1; i < piece->strs.size(); ++i)
-                result->strs.push_back(piece->strs[i]);
+            result->writeExtra().strs.back() += piece->extra().strs.front();
+            for (std::size_t i = 1; i < piece->extra().strs.size(); ++i)
+                result->writeExtra().strs.push_back(piece->extra().strs[i]);
             for (NodePtr& e : piece->list)
                 result->list.push_back(std::move(e));
         }
@@ -1818,7 +1818,7 @@ Parser::NodePtr Parser::stringAtom()
 Parser::NodePtr Parser::fstring(const Token& token)
 {
     NodePtr tpl = make(NK::TemplateLit, token.line);
-    tpl->strs = token.parts;
+    tpl->writeExtra().strs = token.parts;
     for (std::size_t i = 0; i < token.exprs.size(); ++i) {
         Parser sub(token.exprs[i], name_);
         for (Token& t : sub.toks_)
@@ -2245,7 +2245,7 @@ Parser::NodePtr Parser::clone(const Node& n)
     c->namedExpr = n.namedExpr;
     c->text = n.text;
     c->number = n.number;
-    c->strs = n.strs;
+    c->writeExtra().strs = n.extra().strs;
     if (n.a)
         c->a = clone(*n.a);
     if (n.b)

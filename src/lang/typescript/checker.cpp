@@ -366,7 +366,7 @@ const Ty* Checker::resolveType(const Node* n)
         case NK::ConstructorType: {
             TySignature sig;
             push();
-            for (const NodePtr& param : n->typeParams) {
+            for (const NodePtr& param : n->extra().typeParams) {
                 const Ty* constraint = resolveType(param->a.get());
                 const Ty* placeholder = arena_.paramOf(param->text, constraint);
                 scope().types[param->text] = TypeBinding{placeholder, {}, {}, nullptr, false};
@@ -849,7 +849,7 @@ void Checker::collect(const std::vector<NodePtr>& statements, bool ambient)
                 TypeBinding binding;
                 Ty* open = arena_.openObject(decl.text);
                 binding.type = open;
-                for (const NodePtr& p : generic.typeParams) {
+                for (const NodePtr& p : generic.extra().typeParams) {
                     binding.params.push_back(p->text);
                     binding.defaults.push_back(nullptr);
                 }
@@ -860,7 +860,7 @@ void Checker::collect(const std::vector<NodePtr>& statements, bool ambient)
             case NK::TypeAlias: {
                 TypeBinding binding;
                 binding.pending = s->type.get();
-                for (const NodePtr& p : s->typeParams) {
+                for (const NodePtr& p : s->extra().typeParams) {
                     binding.params.push_back(p->text);
                     binding.defaults.push_back(nullptr);
                 }
@@ -890,8 +890,8 @@ void Checker::collect(const std::vector<NodePtr>& statements, bool ambient)
         TypeBinding* binding = findType(s->text);
         if (!binding)
             continue;
-        for (std::size_t i = 0; i < s->typeParams.size() && i < binding->defaults.size(); ++i)
-            binding->defaults[i] = resolveType(s->typeParams[i]->b.get());
+        for (std::size_t i = 0; i < s->extra().typeParams.size() && i < binding->defaults.size(); ++i)
+            binding->defaults[i] = resolveType(s->extra().typeParams[i]->b.get());
     }
 
     for (const auto& entry : openTypes) {
@@ -899,7 +899,7 @@ void Checker::collect(const std::vector<NodePtr>& statements, bool ambient)
         Ty* open = entry.second;
         const Node& generic = decl.kind == NK::ClassDecl ? *decl.a : decl;
         push();
-        for (const NodePtr& p : generic.typeParams) {
+        for (const NodePtr& p : generic.extra().typeParams) {
             const Ty* constraint = resolveType(p->a.get());
             scope().types[p->text] =
                 TypeBinding{arena_.paramOf(p->text, constraint), {}, {}, nullptr, false};
@@ -1014,7 +1014,7 @@ const Ty* Checker::typeOfFunction(const Node& fn, const Ty* thisType, const TySi
 {
     TySignature sig;
     push();
-    for (const NodePtr& p : fn.typeParams) {
+    for (const NodePtr& p : fn.extra().typeParams) {
         const Ty* constraint = resolveType(p->a.get());
         scope().types[p->text] =
             TypeBinding{arena_.paramOf(p->text, constraint), {}, {}, nullptr, false};
@@ -1178,7 +1178,7 @@ const Ty* Checker::typeOfClass(const Node& cls)
     Ty statics;
 
     push();
-    for (const NodePtr& p : cls.typeParams) {
+    for (const NodePtr& p : cls.extra().typeParams) {
         const Ty* constraint = resolveType(p->a.get());
         scope().types[p->text] =
             TypeBinding{arena_.paramOf(p->text, constraint), {}, {}, nullptr, false};
@@ -1288,7 +1288,7 @@ const Ty* Checker::typeOfClass(const Node& cls)
 void Checker::checkClassBody(const Node& cls, const Ty* instance, const Ty* statics)
 {
     push();
-    for (const NodePtr& p : cls.typeParams) {
+    for (const NodePtr& p : cls.extra().typeParams) {
         const Ty* constraint = resolveType(p->a.get());
         scope().types[p->text] =
             TypeBinding{arena_.paramOf(p->text, constraint), {}, {}, nullptr, false};
@@ -2018,10 +2018,10 @@ const Ty* Checker::callSignature(const Node& n, const Ty* callee, const TySignat
     // the parameter types to work the type variables out.
     Substitution map;
     if (!sig.typeParams.empty()) {
-        if (!n.typeParams.empty()) {
+        if (!n.extra().typeParams.empty()) {
             for (std::size_t i = 0; i < sig.typeParams.size(); ++i) {
                 map[sig.typeParams[i]] =
-                    i < n.typeParams.size() ? resolveType(n.typeParams[i].get()) : arena_.anyType();
+                    i < n.extra().typeParams.size() ? resolveType(n.extra().typeParams[i].get()) : arena_.anyType();
             }
         } else {
             std::vector<const Ty*> argTypes;

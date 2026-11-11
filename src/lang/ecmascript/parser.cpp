@@ -789,7 +789,7 @@ NodePtr Parser::typeAliasDeclaration()
     n->text = std::move(cur_.text);
     advance();
     if (at(Tok::Lt))
-        n->typeParams = typeParameterList();
+        n->setTypeParams(typeParameterList());
     expect(Tok::Assign, "'='");
     n->type = typeExpr();
     semicolon();
@@ -803,7 +803,7 @@ NodePtr Parser::interfaceDeclaration()
     n->text = std::move(cur_.text);
     advance();
     if (at(Tok::Lt))
-        n->typeParams = typeParameterList();
+        n->setTypeParams(typeParameterList());
     if (at(Tok::Extends)) {
         advance();
         NodePtr heritage = makeNode(NK::HeritageClause, cur_.line);
@@ -995,7 +995,7 @@ NodePtr Parser::primaryType()
             advance();
             NodePtr n = makeNode(NK::ConstructorType, line);
             if (at(Tok::Lt))
-                n->typeParams = typeParameterList();
+                n->setTypeParams(typeParameterList());
             n->list = parameterList();
             expect(Tok::Arrow, "'=>'");
             n->type = typeExpr();
@@ -1081,7 +1081,7 @@ NodePtr Parser::parenOrFunctionType()
     if (at(Tok::Lt) || looksLikeArrow()) {
         NodePtr n = makeNode(NK::FunctionType, cur_.line);
         if (at(Tok::Lt))
-            n->typeParams = typeParameterList();
+            n->setTypeParams(typeParameterList());
         n->list = parameterList();
         expect(Tok::Arrow, "'=>'");
         n->type = typeExpr();
@@ -1168,7 +1168,7 @@ NodePtr Parser::typeMember()
         m->propKind = isNew ? PropKind::Constructor : PropKind::Method;
         NodePtr fn = makeNode(isNew ? NK::ConstructorType : NK::FunctionType, m->line);
         if (at(Tok::Lt))
-            fn->typeParams = typeParameterList();
+            fn->setTypeParams(typeParameterList());
         fn->list = parameterList();
         fn->type = typeAnnotation();
         m->type = std::move(fn);
@@ -1204,7 +1204,7 @@ NodePtr Parser::typeMember()
                 m->propKind = PropKind::Method;
                 NodePtr fn = makeNode(NK::FunctionType, m->line);
                 if (at(Tok::Lt))
-                    fn->typeParams = typeParameterList();
+                    fn->setTypeParams(typeParameterList());
                 fn->list = parameterList();
                 fn->type = typeAnnotation();
                 m->type = std::move(fn);
@@ -1224,7 +1224,7 @@ NodePtr Parser::typeMember()
         m->propKind = PropKind::Method;
         NodePtr fn = makeNode(NK::FunctionType, m->line);
         if (at(Tok::Lt))
-            fn->typeParams = typeParameterList();
+            fn->setTypeParams(typeParameterList());
         fn->list = parameterList();
         fn->type = typeAnnotation();
         m->type = std::move(fn);
@@ -1560,7 +1560,7 @@ NodePtr Parser::assignment()
         NodePtr returnType = typeAnnotation();
         expect(Tok::Arrow, "'=>'");
         NodePtr arrow = withSource(arrowFromParams(std::move(params), std::move(returnType), line, evalBefore), exprStart);
-        arrow->typeParams = std::move(generics);
+        arrow->setTypeParams(std::move(generics));
         return arrow;
     }
 
@@ -1785,7 +1785,7 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
             NodePtr n = makeNode(NK::Call, base->line);
             noteCallee(*base);
             n->a = std::move(base);
-            n->typeParams = std::move(args);
+            n->setTypeParams(std::move(args));
             n->list = argumentList();
             base = std::move(n);
         } else if (at(Tok::Template)) {
@@ -1793,8 +1793,8 @@ NodePtr Parser::callOrMember(NodePtr base, bool allowCall)
             noteCallee(*base);
             n->a = std::move(base);
             NodePtr strings = makeNode(NK::TemplateObject, cur_.line);
-            strings->strs = cur_.parts;
-            strings->raws = cur_.raws;
+            strings->writeExtra().strs = cur_.parts;
+            strings->writeExtra().raws = cur_.raws;
             NodePtr literal = templateLiteral();
             n->list.push_back(std::move(strings));
             for (NodePtr& e : literal->list)
@@ -1989,7 +1989,7 @@ NodePtr Parser::functionExpression(bool isDeclaration)
     }
     const FunctionKind kind(*this, n->isGenerator, n->isAsync);
     if (typescript_ && at(Tok::Lt))
-        n->typeParams = typeParameterList();
+        n->setTypeParams(typeParameterList());
     n->list = parameterList();
     n->type = typeAnnotation();
     if (ambient_) {
@@ -2017,11 +2017,11 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
         fail("a class declaration needs a name");
     }
     if (typescript_ && at(Tok::Lt))
-        n->typeParams = typeParameterList();
+        n->setTypeParams(typeParameterList());
     if (eat(Tok::Extends)) {
         n->a = callOrMember(primary(), true);
         if (typescript_ && at(Tok::Lt))
-            n->a->typeParams = typeArguments();
+            n->a->setTypeParams(typeArguments());
     }
     if (typescript_ && eat(Tok::Implements)) {
         NodePtr heritage = makeNode(NK::HeritageClause, cur_.line);
@@ -2143,7 +2143,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             fn->isMethod = true;
             const FunctionKind functionKind(*this, memberGenerator, memberAsync);
             if (at(Tok::Lt))
-                fn->typeParams = typeParameterList();
+                fn->setTypeParams(typeParameterList());
             fn->list = parameterList(isConstructor);
             fn->type = typeAnnotation();
             // An abstract or ambient method, and a bare overload signature,
@@ -2274,7 +2274,7 @@ NodePtr Parser::objectLiteral()
             fn->isMethod = true;
             const FunctionKind functionKind(*this, memberGenerator, memberAsync);
             if (at(Tok::Lt))
-                fn->typeParams = typeParameterList();
+                fn->setTypeParams(typeParameterList());
             fn->list = parameterList();
             fn->type = typeAnnotation();
             fn->d = block();
@@ -2319,7 +2319,7 @@ NodePtr Parser::objectLiteral()
 NodePtr Parser::templateLiteral()
 {
     NodePtr n = makeNode(NK::TemplateLit, cur_.line);
-    n->strs = cur_.parts;
+    n->writeExtra().strs = cur_.parts;
     for (const std::string& raw : cur_.exprs) {
         Parser sub(raw, name_);
         sub.noSourceRanges_ = true;
@@ -2383,9 +2383,9 @@ NodePtr Parser::primary()
             const std::size_t close = cur_.text.rfind(u'/');
             NodePtr n = makeNode(NK::RegExpLit, line);
             n->text = cur_.text.substr(1, close - 1);
-            n->strs.push_back(cur_.text.substr(close + 1));
+            n->writeExtra().strs.push_back(cur_.text.substr(close + 1));
             std::string error;
-            if (regex::literalError(n->text, n->strs[0], error))
+            if (regex::literalError(n->text, n->extra().strs[0], error))
                 fail("invalid regular expression: " + error);
             advance();
             return n;
@@ -2415,7 +2415,7 @@ NodePtr Parser::primary()
             NodePtr n = makeNode(NK::NewExpr, line);
             n->a = callOrMember(primary(), false);
             if (at(Tok::Lt) && looksLikeTypeArguments())
-                n->typeParams = typeArguments();
+                n->setTypeParams(typeArguments());
             if (at(Tok::LParen))
                 n->list = argumentList();
             return n;

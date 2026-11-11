@@ -151,6 +151,15 @@ enum class Visibility : std::uint8_t
 struct Node;
 using NodePtr = std::unique_ptr<Node>;
 
+/// What few nodes have: the chunks of a template literal, and TypeScript's type parameters. Kept apart so that the many
+/// nodes without them do not carry three empty vectors each.
+struct NodeExtra
+{
+    std::vector<String> strs;  ///< cooked chunks of a template literal
+    std::vector<String> raws;  ///< the same as written, for a tag
+    std::vector<NodePtr> typeParams;
+};
+
 struct Node final
 {
     NK kind = NK::Empty;
@@ -187,8 +196,6 @@ struct Node final
 
     String text;
     double number = 0;
-    std::vector<String> strs;  ///< cooked chunks of a template literal
-    std::vector<String> raws;  ///< the same as written, for a tag
 
     NodePtr a, b, c, d;
     std::vector<NodePtr> list;
@@ -196,9 +203,30 @@ struct Node final
     /// The type annotation written on this node, if any: the declared type of a
     /// binding, the return type of a function, the operand of a type operator.
     NodePtr type;
-    std::vector<NodePtr> typeParams;
+
+    /// The node's extra parts: read from a node without them, empty; written, made then.
+    const NodeExtra& extra() const { return extra_ ? *extra_ : noExtra(); }
+    NodeExtra& writeExtra()
+    {
+        if (!extra_)
+            extra_ = std::make_unique<NodeExtra>();
+        return *extra_;
+    }
+    bool hasExtra() const noexcept { return extra_ != nullptr; }
+    /// Type parameters or arguments, when there are some.
+    void setTypeParams(std::vector<NodePtr> params)
+    {
+        if (!params.empty())
+            writeExtra().typeParams = std::move(params);
+    }
 
     explicit Node(NK k, std::uint32_t ln = 0) : kind(k), line(ln) {}
+
+private:
+    std::unique_ptr<NodeExtra> extra_;
+    static const NodeExtra& noExtra() noexcept;
+
+public:
 
     /// Nodes come by the hundred thousand and go together, so they are carved from blocks of their own instead of each
     /// being a `malloc`; a block goes back when the last node in it does.

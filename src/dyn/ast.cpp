@@ -57,6 +57,12 @@ thread_local Carver carver;
 
 }  // namespace
 
+const NodeExtra& Node::noExtra() noexcept
+{
+    static const NodeExtra none;
+    return none;
+}
+
 void* Node::operator new(std::size_t size)
 {
 #if defined(__SANITIZE_ADDRESS__)

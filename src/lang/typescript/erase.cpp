@@ -97,7 +97,8 @@ private:
 void Eraser::stripTypes(Node& n)
 {
     n.type.reset();
-    n.typeParams.clear();
+    if (n.hasExtra())
+        n.writeExtra().typeParams.clear();
 }
 
 void Eraser::statements(std::vector<NodePtr>& list)

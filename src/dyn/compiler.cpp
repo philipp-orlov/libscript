@@ -2323,7 +2323,7 @@ private:
                 return;
             }
             case NK::RegExpLit:
-                fn_->code->consts.push_back(makeRegExpTemplate(rt_, n.text, n.strs[0]));
+                fn_->code->consts.push_back(makeRegExpTemplate(rt_, n.text, n.extra().strs[0]));
                 emitU(Op::NewRegExp, std::uint32_t(fn_->code->consts.size() - 1));
                 return;
             case NK::NewTarget:
@@ -2346,15 +2346,15 @@ private:
 
     void templateLit(const Node& n)
     {
-        emitU(Op::PushConst, constIndex(rt_.str(n.strs.empty() ? String() : n.strs[0])));
+        emitU(Op::PushConst, constIndex(rt_.str(n.extra().strs.empty() ? String() : n.extra().strs[0])));
         for (std::size_t i = 0; i < n.list.size(); ++i) {
             expr(*n.list[i]);
             // A substitution is converted with ToString, so an object's
             // `toString` wins over its `valueOf`, unlike `'' + value`.
             emit(Op::ToString);
             emit(Op::Add);
-            if (i + 1 < n.strs.size() && !n.strs[i + 1].empty()) {
-                emitU(Op::PushConst, constIndex(rt_.str(n.strs[i + 1])));
+            if (i + 1 < n.extra().strs.size() && !n.extra().strs[i + 1].empty()) {
+                emitU(Op::PushConst, constIndex(rt_.str(n.extra().strs[i + 1])));
                 emit(Op::Add);
             }
         }
@@ -2992,8 +2992,8 @@ private:
                 array->append(rt_.str(item));
             return handle;
         };
-        Value cooked = frozen(n.strs);
-        Value raw = frozen(n.raws);
+        Value cooked = frozen(n.extra().strs);
+        Value raw = frozen(n.extra().raws);
         asObject(raw)->frozen = true;
         asObject(raw)->extensible = false;
         asObject(cooked)->putOwn(rt_.intern("raw"), raw, 0);
@@ -3408,11 +3408,11 @@ private:
         copy->isAsync = n.isAsync;
         copy->isPrivate = n.isPrivate;
         copy->isMethod = n.isMethod;
-        copy->raws = n.raws;
+        copy->writeExtra().raws = n.extra().raws;
         copy->declared = n.declared;
         copy->text = n.text;
         copy->number = n.number;
-        copy->strs = n.strs;
+        copy->writeExtra().strs = n.extra().strs;
         if (n.a)
             copy->a = cloneExpression(*n.a);
         if (n.b)

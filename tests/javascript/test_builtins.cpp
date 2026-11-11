@@ -478,3 +478,25 @@ TEST(includesStartsFromItsSecondArgument)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("true true true true false true false false false false true true"));
     }
 }
+
+TEST(aPatternStartingWithOneUnitIsSearchedForIt)
+{
+    // A pattern whose every match starts with one code unit scans for that unit, eight at a time past the first few;
+    // a surrogate half of a pair under u is left to the general scan.
+    const char* program =
+        "var s = 'abc'.repeat(1000) + 'xyz' + 'q'.repeat(7) + 'x', out = [];"
+        "out.push(/xyz/.exec(s).index, /x/.test('abc'), /x/g.exec('aaaaaaaaaaaaaaaaaaaaxbx').index, 'aaxaaaaaaaaaaaxaaa'.replace(/x/g, '-'), /é/.exec('aaaaaaaaaaaaaaaaé').index, /\\ud83d/.exec('aaaaaaaaaaaa😀').index, /😀/u.exec('aaaaaaaaaaaa😀b').index, /x$/.exec(s).index, /(?:x)y/.exec(s).index, 'x'.match(/x/).index, ''.search(/x/), 'ab'.repeat(9).search(/b/));"
+        "var re = /q+x/g; re.lastIndex = 2990; out.push(re.exec(s).index);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3000 false 20 aa-aaaaaaaaaaa-aaa 16 12 12 3010 3000 0 -1 1 3003"));
+    }
+}

@@ -4,6 +4,11 @@
 #include "script/internal/dyn/regexp.hpp"
 
 #include <algorithm>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <cstring>
 #include <deque>
 
@@ -260,6 +265,7 @@ struct Program
     unsigned flags = 0;
     bool anchored = false;       ///< only the start of the input can begin a match
     std::int32_t firstSet = -1;  ///< every match begins with one of these units
+    std::int32_t firstUnit = -1; ///< when that is one unit, the unit
 };
 
 std::uint32_t groupCount(const Program& program) { return program.groups; }
@@ -1724,6 +1730,8 @@ private:
         }
         normalize(units);
         p_.firstSet = std::int32_t(setIndex(units));
+        if (units.size() == 1 && units[0].first == units[0].second)
+            p_.firstUnit = std::int32_t(units[0].first);
     }
 
     Program& p_;
@@ -1736,6 +1744,37 @@ constexpr std::uint32_t kUndoTag = 0x80000000u;    // [old value, register | tag
 constexpr std::uint32_t kGreedyTag = 0x40000000u;  // [lowest, position, pc | tag]: can give back one unit
 constexpr std::uint32_t kGreedyUTag = 0x20000000u; // the same, a code point at a time
 constexpr std::uint32_t kPcMask = 0x1fffffffu;
+
+/// Where `unit` is first found in [at, length), or `length`: eight units at a time where the machine can.
+std::int32_t findUnit(const char16_t* s, std::int32_t at, std::int32_t length, char16_t unit) noexcept
+{
+    // Most searches end within a few units: those, one at a time.
+    for (const std::int32_t near = std::min(length, at + 8); at < near; ++at) {
+        if (s[at] == unit)
+            return at;
+    }
+#if defined(__SSE2__)
+    const __m128i want = _mm_set1_epi16(static_cast<short>(unit));
+    for (; at + 8 <= length; at += 8) {
+        const __m128i here = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + at));
+        if (const int mask = _mm_movemask_epi8(_mm_cmpeq_epi16(here, want)))
+            return at + (__builtin_ctz(unsigned(mask)) >> 1);
+    }
+#elif defined(__ARM_NEON)
+    const uint16x8_t want = vdupq_n_u16(unit);
+    for (; at + 8 <= length; at += 8) {
+        const uint16x8_t same = vceqq_u16(vld1q_u16(reinterpret_cast<const std::uint16_t*>(s + at)), want);
+        if (vmaxvq_u16(same)) {
+            while (s[at] != unit)
+                ++at;
+            return at;
+        }
+    }
+#endif
+    while (at < length && s[at] != unit)
+        ++at;
+    return at;
+}
 
 bool wordAt(const char16_t* s, std::int32_t i, std::int32_t length, bool folds) noexcept
 {
@@ -2211,7 +2250,9 @@ bool exec(const Program& program, std::u16string_view input, std::size_t start, 
     const CodeSet* first = !once && program.firstSet >= 0 ? &program.sets[std::size_t(program.firstSet)] : nullptr;
     for (;;) {
         if (first) {
-            if (!pairs) {
+            if (program.firstUnit >= 0 && (!pairs || !(program.firstUnit >= 0xd800 && program.firstUnit <= 0xdfff))) {
+                at = findUnit(s, at, length, char16_t(program.firstUnit));
+            } else if (!pairs) {
                 while (at < length && !first->has(s[at]))
                     ++at;
             } else {

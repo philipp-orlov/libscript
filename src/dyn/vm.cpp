@@ -2554,6 +2554,7 @@ struct CensusCode
     std::uint64_t work = 0;
     bool compiled = false;
     std::string refusal;
+    std::string where;  ///< name and line, kept here: the code may be gone by the time this is printed
 };
 std::unordered_map<const FunctionCode*, CensusCode>& censusCodes()
 {
@@ -2576,6 +2577,8 @@ const char* refusedBefore(const FunctionCode& code)
 CensusCode& censusCode(const FunctionCode& code)
 {
     CensusCode& c = censusCodes()[&code];
+    if (c.where.empty())
+        c.where = (code.name.empty() ? std::string("<anon>") : code.name) + ":" + std::to_string(code.lineAt(0));
     if (c.refusal.empty() && !c.compiled)
         if (const char* why = refusedBefore(code))
             c.refusal = why;
@@ -2597,6 +2600,15 @@ void printCodeCensus()
         g.work += c.work;
         ++g.functions;
     }
+    // The functions behind the refusals, the most called first: `refusedfn <calls> <name:line> <why>`.
+    std::vector<const CensusCode*> refused;
+    for (const auto& kv : censusCodes())
+        if (!kv.second.compiled && !kv.second.refusal.empty())
+            refused.push_back(&kv.second);
+    std::sort(refused.begin(), refused.end(), [](const CensusCode* a, const CensusCode* b) { return a->calls + a->work > b->calls + b->work; });
+    for (std::size_t i = 0; i < refused.size() && i < 12; ++i)
+        std::fprintf(stderr, "refusedfn %12llu %s %s\n", static_cast<unsigned long long>(refused[i]->calls + refused[i]->work),
+                     refused[i]->where.c_str(), refused[i]->refusal.c_str());
     std::vector<std::pair<std::uint64_t, std::string>> order;
     for (const auto& kv : groups)
         order.push_back({kv.second.calls + kv.second.work, kv.first});

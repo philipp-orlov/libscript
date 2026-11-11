@@ -140,6 +140,7 @@ enum class Op : std::uint8_t
     PushNewTarget,
     CallSuperVia,        // argc: constructor newTarget this arg... -> result, from an arrow function
     CallSuperViaSpread,  // constructor newTarget this array -> result
+    BindThis,            // made constructor this -> made: a ReferenceError when `this` was bound already, else the fields
     SetFieldInit,        // constructor function -> constructor
     CallStaticInit,      // constructor function -> constructor
     SetHome,             // home function -> function
@@ -519,6 +520,9 @@ struct FunctionCode
     mutable std::vector<std::uint32_t> jitIntLocals;
     /// The current native code takes `this` to be an object, which entering it part way through has to check.
     mutable bool jitThisIsObject = false;
+    /// A derived class constructor keeps `this` in this local (a box when something captures it), since it changes at
+    /// `super()`: an interpreter frame taking over from native code reads it back from there.
+    std::uint32_t derivedThisSlot = kNoSlot;
     /// Where native code has bailed: what it is compiled to next assumes nothing there.
     mutable std::vector<std::uint32_t> jitBailedAt;
     /// What each call site has called while interpreted, for native code to put in its place: by the instruction's pc,

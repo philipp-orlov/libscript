@@ -70,6 +70,19 @@ NativePair scriptDynGetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload
 NativePair scriptDynGetElemAt(Runtime* rt, const FunctionCode* code, std::int64_t tag, std::uint64_t payload,
                               std::int64_t keyTag, std::uint64_t key, std::uint32_t site) noexcept;
 NativePair scriptDynGetGlobal(Runtime* rt, GCObject* key) noexcept;
+/// `super(...)` in a derived constructor: `given` is the constructor, new.target, `this` so far, then the arguments.
+NativePair scriptDynSuperCall(Runtime* rt, const Value* given, std::uint64_t count) noexcept;
+/// The same with the arguments spread: `given` is the constructor, new.target, `this` so far and the array of them.
+NativePair scriptDynSuperCallSpread(Runtime* rt, const Value* given) noexcept;
+/// `this` read in a derived constructor ahead of `super()`: a ReferenceError.
+void scriptDynNoThis(Runtime* rt) noexcept;
+/// What `super()` does once the super constructor has run: a ReferenceError when `this` is bound already, else the
+/// constructor's fields onto the object made.
+void scriptDynBindThis(Runtime* rt, std::int64_t ctorTag, std::uint64_t ctor, std::int64_t madeTag, std::uint64_t made,
+                       std::int64_t boundTag, std::uint64_t bound) noexcept;
+/// What a derived constructor returns: the value when it is an object, else `this`, which `super()` must have made.
+NativePair scriptDynDerivedReturn(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t thisTag,
+                                  std::uint64_t thisPayload) noexcept;
 
 void scriptDynSetProp(Runtime* rt, const FunctionCode* code, std::int64_t tag, std::uint64_t payload, std::uint32_t operand,
                       std::int64_t valueTag, std::uint64_t value) noexcept;
@@ -151,6 +164,8 @@ NativePair scriptDynToObject(Runtime* rt, std::int64_t tag, std::uint64_t payloa
 Value getPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand);
 void setPropertyForNative(Runtime& rt, const FunctionCode& code, const Value& base, std::uint32_t operand, const Value& v);
 Value getGlobalForNative(Runtime& rt, GCObject* key);
+Value superCallForNative(Runtime& rt, const Value* given, std::size_t count, bool spread);
+void bindThis(Runtime& rt, const Value& ctor, const Value& made, const Value& bound);
 /// `base[key]` for a key that is no element: `hit` says whether the site's keyed cache answered.
 Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& base, const Value& key, std::uint32_t site,
                           bool& hit);

@@ -575,7 +575,8 @@ public:
 
         // `this` is an object in any function that reads it, as a rule, and it does not change: asked once, here.
         code_.jitThisIsObject = false;
-        if (betHere() && readsThis()) {
+        // A derived constructor has none until `super()`, and keeps the one it gets in a local.
+        if (betHere() && readsThis() && !code_.isDerivedConstructor) {
             const std::int32_t bail = newLabel();
             branchCmp(thisTag_, IrCond::Ne, std::int64_t(Type::Object), bail);
             const std::int32_t kind = load(thisReg_, kCellKindOffset, 1, false, kAliasHeader);
@@ -771,6 +772,12 @@ public:
                 case Op::GetSuper:
                 case Op::SetSuper:
                 case Op::CallSuper:
+                case Op::CallSuperVia:
+                case Op::CallSuperViaSpread:
+                case Op::PushNewTarget:
+                case Op::CheckThis:
+                case Op::BindThis:
+                case Op::DerivedReturn:
                 case Op::New:
                 case Op::JumpSub:
                 case Op::ForInStart:
@@ -3261,6 +3268,9 @@ private:
                 return true;
             }
             case Op::GetSuper: {
+                // The receiver is the `this` the function was entered with, which in a derived constructor is not the one.
+                if (code_.isDerivedConstructor)
+                    refuse("a super property in a derived constructor");
                 secureWeak();
                 const std::int32_t rt = rtReg();
                 const std::int32_t k = ptrReg(code_.atoms[operand()].get());
@@ -3739,6 +3749,106 @@ private:
                 const std::int32_t t = fn_.newVreg(false);
                 coldCall(helper, {rt, tag, payload}, r, t, true, {a});
                 release(a);
+                push(taggedEntry(r, t, Own::Owned));
+                return true;
+            }
+            case Op::PushNewTarget: {
+                // Taken where the call left it, at the start of a derived constructor, before anything can call anything.
+                if (!code_.isDerivedConstructor || parent_)
+                    refuse("new.target outside the start of a derived constructor");
+                Entry e;
+                e.r = load(ptrReg(&rt_.jitNewTarget), 0, 8);
+                e.hasKnownTag = true;
+                e.known = Type::Object;
+                e.own = Own::Immortal;
+                e.nonNull = true;
+                push(e);
+                return true;
+            }
+            case Op::BindThis: {
+                Entry bound = pop();
+                Entry ctor = pop();
+                const Entry& made = stack_.back();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t ct = tagReg(ctor);
+                const std::int32_t cr = payloadReg(ctor);
+                const std::int32_t mt = tagReg(made);
+                const std::int32_t mr = payloadReg(made);
+                const std::int32_t bt = tagReg(bound);
+                const std::int32_t br = payloadReg(bound);
+                coldCall(reinterpret_cast<void*>(&scriptDynBindThis), {rt, ct, cr, mt, mr, bt, br}, -1, -1, true, {ctor, bound});
+                release(bound);
+                release(ctor);
+                return true;
+            }
+            case Op::CheckThis: {
+                const Entry& top = stack_.back();
+                if (top.hasKnownTag && top.known != Type::Undefined)
+                    return true;
+                if (top.hasKnownTag || top.rep != Rep::Tagged || top.isConst)
+                    refuse("a this known to be missing");
+                const std::int32_t missing = newLabel();
+                const std::int32_t there = newLabel();
+                branchCmp(top.t, IrCond::Eq, std::int64_t(Type::Undefined), missing);
+                inst(IrOp::ColdBegin);
+                inst(IrOp::Label).imm = missing;
+                coldCall(reinterpret_cast<void*>(&scriptDynNoThis), {rtReg()}, -1, -1, true);
+                inst(IrOp::Br).imm = there;
+                inst(IrOp::ColdEnd);
+                inst(IrOp::Label).imm = there;
+                return true;
+            }
+            case Op::DerivedReturn: {
+                Entry self = pop();
+                Entry value = pop();
+                secureWeak();
+                const std::int32_t rt = rtReg();
+                const std::int32_t vt = tagReg(value);
+                const std::int32_t vr = payloadReg(value);
+                const std::int32_t st = tagReg(self);
+                const std::int32_t sr = payloadReg(self);
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynDerivedReturn), {rt, vt, vr, st, sr}, r, t, true, {value, self});
+                // Kept by the runtime only until the next helper: a count of its own before either goes.
+                Entry result = taggedEntry(r, t, Own::Weak);
+                makeOwned(result);
+                release(value);
+                release(self);
+                push(result);
+                return true;
+            }
+            case Op::CallSuperVia:
+            case Op::CallSuperViaSpread: {
+                const bool spread = op == Op::CallSuperViaSpread;
+                const std::uint32_t argc = spread ? 1 : operand();
+                std::vector<Entry> given(argc + 3);
+                for (std::uint32_t i = argc + 3; i-- > 0;)
+                    given[i] = pop();
+                if (given.back().lazyArgs)
+                    refuse("super(...arguments) with arguments not made");
+                secureWeak();
+                securePopped(given);
+                const std::int32_t area = layOutArgs(given);
+                const std::int32_t rt = rtReg();
+                const std::int32_t count = immReg(std::int64_t(argc + 3));
+                const std::int32_t r = fn_.newVreg(false);
+                const std::int32_t t = fn_.newVreg(false);
+                IrCall viaHelper;
+                viaHelper.kind = IrCallKind::Helper;
+                viaHelper.helper = spread ? reinterpret_cast<void*>(&scriptDynSuperCallSpread) : reinterpret_cast<void*>(&scriptDynSuperCall);
+                viaHelper.args = spread ? std::vector<std::int32_t>{rt, area} : std::vector<std::int32_t>{rt, area, count};
+                viaHelper.result = r;
+                viaHelper.resultTag = t;
+                viaHelper.site = site();
+                viaHelper.publishFrame = true;
+                viaHelper.exit = makeExit(0, given);
+                forgetFacts();
+                fn_.calls.push_back(std::move(viaHelper));
+                inst(IrOp::Call).imm = std::int64_t(fn_.calls.size()) - 1;
+                for (const Entry& e : given)
+                    release(e);
                 push(taggedEntry(r, t, Own::Owned));
                 return true;
             }
@@ -8347,6 +8457,9 @@ bool lowerFunction(Runtime& rt, const FunctionCode& code, IrFunction& out, std::
 {
     std::vector<std::uint8_t> notNumber = readsBeforeWrite(code);
     notNumber.resize(code.numLocals, 0);
+    // A derived constructor's `this`: undefined, then an object.
+    if (code.derivedThisSlot < code.numLocals)
+        notNumber[code.derivedThisSlot] = 1;
     std::vector<std::uint8_t> notInt(code.numLocals, 0);
     for (;;) {
         IrFunction fn;

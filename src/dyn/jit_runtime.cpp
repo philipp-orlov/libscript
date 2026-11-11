@@ -477,6 +477,48 @@ NativePair scriptDynGetElemAt(Runtime* rt, const FunctionCode* code, std::int64_
     });
 }
 
+NativePair scriptDynSuperCall(Runtime* rt, const Value* given, std::uint64_t count) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(superCallForNative(*rt, given, std::size_t(count), false)); });
+}
+
+NativePair scriptDynSuperCallSpread(Runtime* rt, const Value* given) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair { return take(superCallForNative(*rt, given, 4, true)); });
+}
+
+void scriptDynNoThis(Runtime* rt) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        throwError(*rt, ErrorCode::ReferenceError, "'this' is not there until super() has been called");
+    });
+}
+
+void scriptDynBindThis(Runtime* rt, std::int64_t ctorTag, std::uint64_t ctor, std::int64_t madeTag, std::uint64_t made,
+                       std::int64_t boundTag, std::uint64_t bound) noexcept
+{
+    guarded(*rt, SCRIPT_HERE, [&]() -> int {
+        bindThis(*rt, valueOf(ctorTag, ctor), valueOf(madeTag, made), valueOf(boundTag, bound));
+        return 0;
+    });
+}
+
+NativePair scriptDynDerivedReturn(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t thisTag,
+                                  std::uint64_t thisPayload) noexcept
+{
+    return guarded(*rt, SCRIPT_HERE, [&]() -> NativePair {
+        const Value value = valueOf(tag, payload);
+        if (value.isObject())
+            return keep(*rt, value);
+        if (!value.isUndefined())
+            throwError(*rt, ErrorCode::TypeError, "a derived constructor can only return an object or undefined");
+        const Value self = valueOf(thisTag, thisPayload);
+        if (self.isUndefined())
+            throwError(*rt, ErrorCode::ReferenceError, "a derived constructor did not call super()");
+        return keep(*rt, self);
+    });
+}
+
 void scriptDynSetElem(Runtime* rt, std::int64_t tag, std::uint64_t payload, std::int64_t keyTag, std::uint64_t key,
                       std::int64_t valueTag, std::uint64_t value) noexcept
 {

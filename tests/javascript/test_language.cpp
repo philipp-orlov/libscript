@@ -2507,3 +2507,94 @@ TEST(aBuiltInCalledThroughCallTakesAnyReceiver)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1500 1502 1,1,1,1,1,1"));
     }
 }
+
+TEST(derivedClassConstructorsRunAsNativeCode)
+{
+    // Derived class constructors in native code: fields, super calls up two levels, new.target, returning an object, a
+    // number or nothing before super(), this read before super(), super() twice, from an arrow function, a loop after it,
+    // Reflect.construct with another new.target, extending Array, and an exception in the arguments of super().
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "class A { constructor(x) { this.x = x; } sum() { return this.x; } }"
+        "class B extends A { y = 2; constructor(x) { super(x + 1); this.z = this.x * 10; } sum() { return super.sum() + this.y + this.z; } }"
+        "class C extends B { constructor() { const before = new.target === C; super(3); this.w = before ? 1 : 0; } }"
+        "var s = 0; for (k = 0; k < 3000; k++) { var b = new B(k % 7), c = new C(); s += b.sum() + c.sum() + c.w; } S(s);"
+        "class D extends A { constructor(v) { if (v === 1) return {plain: true}; if (v === 2) return 5; if (v === 3) return; super(v); } }"
+        "for (k = 0; k < 600; k++) new D(10); S(JSON.stringify(new D(1)));"
+        "try { new D(2); } catch (e) { S(e.constructor.name); }"
+        "try { new D(3); } catch (e) { S(e.constructor.name); }"
+        "class E extends A { constructor(early) { if (early) this.q = 1; super(7); } }"
+        "for (k = 0; k < 600; k++) new E(false);"
+        "try { new E(true); } catch (e) { S(e.constructor.name); }"
+        "class F extends A { constructor() { super(1); super(2); } }"
+        "try { for (k = 0; k < 600; k++) new F(); } catch (e) { S(e.constructor.name); }"
+        "class G extends A { constructor(...xs) { const f = () => super(xs.length); f(); this.t = new.target.name; } }"
+        "var g; for (k = 0; k < 600; k++) g = new G(1, 2, 3); S(g.x + g.t);"
+        "class H extends A { constructor() { super(5); for (let i = 0; i < 50; i++) this.x += i; } }"
+        "var h; for (k = 0; k < 300; k++) h = new H(); S(h.x);"
+        "class I extends C {} var i1 = Reflect.construct(B, [4], C); S(Object.getPrototypeOf(i1) === C.prototype); S(new I().w);"
+        "class J extends Array { constructor(n) { super(n); this.tag = 'j'; } } var j; for (k = 0; k < 600; k++) j = new J(3); S(j.length + j.tag + Array.isArray(j));"
+        "class K extends A { constructor(o) { super(o.v); } } var bad = 0; for (k = 0; k < 600; k++) { try { new K(k === 500 ? null : {v: k}); } catch (e) { bad++; } } S(bad);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("278934 {\"plain\":true} TypeError ReferenceError ReferenceError ReferenceError 3G 1230 true 0 3jtrue 1"));
+    }
+}
+
+TEST(superWithSpreadArgumentsInNativeCode)
+{
+    // super(...xs), super(...arguments) and two spreads in a derived constructor that runs as native code.
+    const char* program =
+        "var out = [], k; function S(v) { out.push(String(v)); }"
+        "class A { constructor(...xs) { this.n = xs.length; this.s = xs.reduce((a, b) => a + b, 0); } }"
+        "class B extends A { constructor(...xs) { super(...xs, 1); } }"
+        "class C extends A { constructor() { super(...arguments); } }"
+        "class D extends B { constructor(a, b) { super(...[a, b], ...'xy'); } }"
+        "var t = 0; for (k = 0; k < 3000; k++) { var b = new B(k, 2), c = new C(1, 2, 3), d = new D(1, 2); t += b.n + b.s + c.n + c.s + d.n; }"
+        "S(t); S(new D(5, 6).s); out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("4558500 11xy1"));
+    }
+}
+
+TEST(superCalledTwiceIsAReferenceErrorOnceTheSuperConstructorReturns)
+{
+    // super(super()) and a second super() caught in the constructor: the binding of this is checked after the super
+    // constructor has run, and the first object stays this.
+    const char* program =
+        "class Base {}"
+        "var r = [];"
+        "for (var k = 0; k < 600; k++) {"
+        "  try { new (class C extends Base { constructor() { super(super()); } })(); r.push('none'); } catch (e) { r.push(e.constructor.name); }"
+        "}"
+        "class T extends Base { constructor() { super(); try { super(); } catch (e) { this.caught = e.constructor.name; } } }"
+        "var t; for (k = 0; k < 600; k++) t = new T();"
+        "[r[0], r[599], t.caught, t instanceof T].join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("ReferenceError ReferenceError ReferenceError true"));
+    }
+}

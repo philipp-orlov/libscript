@@ -286,6 +286,8 @@ struct Runtime : EngineRuntime
     /// Code no function enters any more, freed by `sweepRetiredNative` once nothing on the stack is in it.
     std::vector<typed::NativeCode*> jitRetired;
     std::size_t jitRetiredBytes = 0;
+    /// `new.target` of the bytecode function being entered, for a derived constructor's native code to take at its start.
+    DynFunction* jitNewTarget = nullptr;
     /// What `jitRetiredBytes` has to reach before a compile sweeps: a sweep that keeps what it finds in use waits for
     /// another megabyte of retired code before the next, rather than read the whole stack again at every compile.
     std::size_t jitSweepAt = std::size_t(1) << 20;

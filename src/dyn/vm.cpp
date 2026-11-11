@@ -1617,12 +1617,16 @@ Value invokeBytecode(Runtime& rt, DynFunction* fn, const Value& thisValue, Value
     // What a rest parameter or `arguments` is made of is read after the parameters are set.
     take = take && !code.hasRest && code.argumentsSlot == FunctionCode::kNoSlot;
 #if SCRIPT_ENABLE_DYN_JIT
+    // What a derived constructor's native code reads first thing, before anything it calls could change it.
+    rt.jitNewTarget = newTarget;
     if (code.jitEntry)
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
     if (!code.jitRefused && !code.isGenerator && !code.isAsync && rt.ctx.options.jit.mode != JitOptions::Mode::Off &&
         (rt.ctx.options.jit.mode == JitOptions::Mode::Eager || ++code.jitHotness >= code.jitThreshold(rt.ctx.options.jit.threshold)) &&
-        compileNative(rt, code))
+        compileNative(rt, code)) {
+        rt.jitNewTarget = newTarget;
         return enterNative(rt, fn, code, thisValue, args.data(), args.size());
+    }
 #endif
     noteArguments(code, args.data(), args.size());
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -2310,6 +2314,28 @@ static void keyedLearn(const FunctionCode& code, std::uint32_t site, const Value
 }
 
 }  // namespace
+
+Value superCallForNative(Runtime& rt, const Value* given, std::size_t count, bool spread)
+{
+    DynFunction* ctor = asFunction(given[0]);
+    ContextImpl::ArgBuffer buffer(rt.ctx);
+    if (spread) {
+        // The arguments as one array, made by the spread.
+        DynArray* items = asArray(given[3]);
+        for (std::size_t i = 0; items && i < items->size(); ++i)
+            buffer.args.push_back(items->at(i));
+    } else {
+        buffer.args.assign(given + 3, given + count);
+    }
+    return superCall(rt, ctor, asFunction(given[1]), buffer.args, given[2]);
+}
+
+void bindThis(Runtime& rt, const Value& ctor, const Value& made, const Value& bound)
+{
+    if (!bound.isUndefined())
+        throwError(rt, ErrorCode::ReferenceError, "super() has already been called");
+    runFieldInit(rt, asFunction(ctor), made);
+}
 
 Value getElementForNative(Runtime& rt, const FunctionCode& code, const Value& base, const Value& key, std::uint32_t site,
                           bool& hit)
@@ -3286,9 +3312,16 @@ namespace {
                 const Value target = pop();
                 const Value ctorValue = pop();
                 DynFunction* ctor = asFunction(ctorValue);
-                Value made = superCall(rt, ctor, asFunction(target), buffer.args, thisNow);
-                runFieldInit(rt, ctor, made);
-                sp.push_back(std::move(made));
+                sp.push_back(superCall(rt, ctor, asFunction(target), buffer.args, thisNow));
+                break;
+            }
+            case Op::BindThis: {
+                const Value bound = pop();
+                const Value ctor = pop();
+                bindThis(rt, ctor, sp.back(), bound);
+                // In the constructor itself, rather than an arrow function in it, the frame's `this` is this from now on.
+                if (!code.isArrow)
+                    frame.thisValue = sp.back();
                 break;
             }
             case Op::CheckThis:
@@ -4146,6 +4179,7 @@ Value execute(Runtime& rt, Frame& entry)
         &&L_PushNewTarget,
         &&L_CallSuperVia,
         &&L_CallSuperViaSpread,
+        &&L_BindThis,
         &&L_SetFieldInit,
         &&L_CallStaticInit,
         &&L_SetHome,
@@ -5041,6 +5075,7 @@ Value execute(Runtime& rt, Frame& entry)
         L_PushNewTarget:
         L_CallSuperVia:
         L_CallSuperViaSpread:
+        L_BindThis:
         L_SetFieldInit:
         L_CallStaticInit:
         L_SetHome:
@@ -5114,6 +5149,11 @@ Value resumeInterpreter(Runtime& rt, DynFunction* fn, const FunctionCode& code, 
     } popper{&rt, &frame};
     fill(frame, state);
     frame.pc = pc;
+    // A derived constructor's `this` is what its local says, `super()` having been called or not.
+    if (code.derivedThisSlot != FunctionCode::kNoSlot) {
+        const std::uint32_t slot = code.derivedThisSlot;
+        frame.thisValue = frame.cells[slot] ? frame.cells[slot]->value : frame.locals[slot];
+    }
     return execute(rt, frame);
 }
 

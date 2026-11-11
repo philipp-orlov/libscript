@@ -1230,10 +1230,6 @@ private:
         fs.code->length = lengthOf(node);
         fs.code->isGenerator = node.isGenerator;
         fs.code->isAsync = node.isAsync;
-        // What `super()` binds `this` to is known only in the frame. A coroutine is compiled for its loops only, which
-        // native code runs in the coroutine's own frame.
-        if (fs.isDerivedCtor)
-            fs.code->jitRefused = true;
         const StrictScope strictBody(*this, node.d && hasUseStrict(*node.d));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
         fs.isMethod = node.isMethod || fs.code->isClassConstructor;
@@ -1322,20 +1318,24 @@ private:
 
         // Arrow functions inside this one read `this` from a box. It is made
         // before the parameters are bound so a default value can use it.
-        if (!fs.isArrow && (fs.boxAll || fs.captured.count(u"this"))) {
+        // A derived constructor's `this` changes at `super()`, and that and `new.target` are kept in locals from the start,
+        // where native code keeps them as it keeps any other.
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(u"this") || fs.isDerivedCtor)) {
             const std::uint32_t slot = declareLocal(ascii("this"), false);
             emit(Op::PushThis);
-            emitU(Op::SetCell, slot);
+            storeLocalNamed(ascii("this"), slot);
+            if (fs.isDerivedCtor)
+                fs.code->derivedThisSlot = slot;
         }
         if (!fs.isArrow && (fs.boxAll || fs.captured.count(u" ctor"))) {
             const std::uint32_t slot = declareLocal(ascii(" ctor"), false);
             emit(Op::PushCallee);
             emitU(Op::SetCell, slot);
         }
-        if (!fs.isArrow && (fs.boxAll || fs.captured.count(u" nt"))) {
+        if (!fs.isArrow && (fs.boxAll || fs.captured.count(u" nt") || fs.isDerivedCtor)) {
             const std::uint32_t slot = declareLocal(ascii(" nt"), false);
             emit(Op::PushNewTarget);
-            emitU(Op::SetCell, slot);
+            storeLocalNamed(ascii(" nt"), slot);
         }
 
         for (std::size_t i = 0; i < node.list.size(); ++i)
@@ -2280,7 +2280,7 @@ private:
                 emitU(Op::NewRegExp, std::uint32_t(fn_->code->consts.size() - 1));
                 return;
             case NK::NewTarget:
-                if (fn_->isArrow)
+                if (fn_->isArrow || findLocal(*fn_, ascii(" nt")))
                     loadVar(ascii(" nt"));
                 else
                     emit(Op::PushNewTarget);
@@ -2771,15 +2771,27 @@ private:
             }
             // `this` from here on is what the super constructor made. An arrow function has neither the constructor nor
             // `this` in its own frame.
-            if (fn_->isArrow) {
-                loadVar(ascii(" ctor"));
+            // A derived constructor passes its own, as an arrow function in one does: native code has them in hand there.
+            if (fn_->isArrow || fn_->isDerivedCtor) {
+                if (fn_->isArrow)
+                    loadVar(ascii(" ctor"));
+                else
+                    emit(Op::PushCallee);
                 loadVar(ascii(" nt"));
-                loadThisUnchecked();
+                // Whether `this` is bound already is asked once the super constructor has returned, as the arguments may
+                // have called `super()` themselves.
+                emit(Op::PushUndefined);
                 pushArgs(n.list, spread);
                 if (spread)
                     emit(Op::CallSuperViaSpread);
                 else
                     emitU(Op::CallSuperVia, std::uint32_t(n.list.size()));
+                if (fn_->isArrow)
+                    loadVar(ascii(" ctor"));
+                else
+                    emit(Op::PushCallee);
+                loadThisUnchecked();
+                emit(Op::BindThis);
             } else {
                 pushArgs(n.list, spread);
                 if (spread)
@@ -2942,6 +2954,13 @@ private:
         asObject(cooked)->extensible = false;
         fn_->code->consts.push_back(cooked);
         emitU(Op::PushConst, std::uint32_t(fn_->code->consts.size() - 1));
+    }
+
+    /// Into a local just declared, boxed or not.
+    void storeLocalNamed(const String& name, std::uint32_t slot)
+    {
+        const Local* local = findLocal(*fn_, name);
+        emitU(local && local->boxed ? Op::SetCell : Op::SetLocal, slot);
     }
 
     void storeThisBox()

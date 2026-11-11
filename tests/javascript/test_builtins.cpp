@@ -428,3 +428,53 @@ TEST(stringAndMathMethodsFromNativeCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("NaN00129993 a NaN true ab abc false -Infinity Infinity NaN NaN 0 -Infinity 0 9 42 xy TypeError:String.prototype method called on null or undefined TypeError TypeError toLocaleLowerCase 1 2"));
     }
 }
+
+TEST(indexOfScansTheStorageAndReadsAHoleFromThePrototype)
+{
+    // indexOf and includes scan the elements as stored, by the target's kind; a hole is read the long way, from the
+    // prototype, through a getter that may change the array.
+    const char* program =
+        "var o = {}, p = {}, s = Symbol(), out = [];"
+        "var a = [1, o, 'x', p, NaN, -0, s, null, undefined];"
+        "out.push(a.indexOf(o), a.indexOf(p), a.indexOf('x'), a.indexOf(NaN), a.indexOf(0), a.indexOf(s), a.indexOf(null), a.indexOf(undefined), a.indexOf({}), a.indexOf(p, 4), a.indexOf(o, -9), a.indexOf(1, -1));"
+        "var n = [1.5, 2, 3, 0]; out.push(n.indexOf(3), n.indexOf(-0), n.indexOf('3'), n.indexOf(o));"
+        "var h = [1, , 3]; out.push(h.indexOf(undefined)); Array.prototype[1] = o; out.push(h.indexOf(o)); delete Array.prototype[1];"
+        "var hn = [1.5, , 2.5]; Array.prototype[1] = 7; out.push(hn.indexOf(7)); delete Array.prototype[1];"
+        "var g = [0, , 2, 3]; Object.defineProperty(Array.prototype, 1, { get() { g.length = 1; return 'no'; }, configurable: true });"
+        "out.push(g.indexOf(3)); delete Array.prototype[1];"
+        "var big = []; for (var i = 0; i < 1000; i++) big.push({i}); var t = big[700], c = 0;"
+        "for (var k = 0; k < 2000; k++) c += big.indexOf(t); out.push(c);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1 3 2 -1 5 6 7 8 -1 -1 1 -1 2 3 -1 -1 -1 1 1 -1 1400000"));
+    }
+}
+
+TEST(includesStartsFromItsSecondArgument)
+{
+    // includes takes a start, negative from the end, and finds NaN, holes as undefined and elements of the prototype.
+    const char* program =
+        "var o={}, out=[]; var a=[1,o,NaN,,'s'];"
+        "out.push(a.includes(o), a.includes(NaN), a.includes(undefined), a.includes('s'), a.includes(1,1), a.includes(o,-4), a.includes(o,-3), a.includes(2), [].includes(undefined), [1,2].includes(2, 5), [,].includes(undefined));"
+        "Array.prototype[3]=9; out.push(a.includes(9)); delete Array.prototype[3];"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("true true true true false true false false false false true true"));
+    }
+}

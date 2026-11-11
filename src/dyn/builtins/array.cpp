@@ -62,6 +62,63 @@ bool strictElementIs(Runtime& rt, DynArray* a, std::size_t i, const Value& targe
     return presentElement(rt, a, i, item) && strictEquals(item, target);
 }
 
+/// The first `i` in [from, end) where the element is strictly `target`, or -1: a plain scan over the storage, comparing
+/// the way the target's kind needs, and the general rule only at a hole, which may be read from the prototype (and so run
+/// a getter that changes the array: then the scan goes on from where it was, over the array as it now is).
+std::int64_t findStrict(Runtime& rt, DynArray* a, std::size_t from, std::size_t end, const Value& target)
+{
+    for (std::size_t i = from; i < end;) {
+        const std::size_t n = std::min(end, a->size());
+        if (i >= n) {
+            if (strictElementIs(rt, a, i, target))
+                return std::int64_t(i);
+            ++i;
+            continue;
+        }
+        if (a->numbersOnly) {
+            const double* nums = a->numbers();
+            const bool num = target.isNumber();
+            const double want = num ? numberOf(target) : 0;
+            for (; i < n; ++i) {
+                std::uint64_t bits;
+                std::memcpy(&bits, nums + i, 8);
+                if (bits == kUndefinedElement)
+                    break;
+                if (num && nums[i] == want)
+                    return std::int64_t(i);
+            }
+        } else {
+            const Value* items = &a->store[0];
+            const Type t = target.type();
+            if (t == Type::Object || t == Type::Symbol) {
+                GCObject* const want = detail::Access::ptr(target);
+                for (; i < n; ++i) {
+                    const Value& v = items[i];
+                    if (v.type() == t && detail::Access::ptr(v) == want)
+                        return std::int64_t(i);
+                    if (isHole(v))
+                        break;
+                }
+            } else {
+                for (; i < n; ++i) {
+                    const Value& v = items[i];
+                    if (isHole(v))
+                        break;
+                    if (strictEquals(v, target))
+                        return std::int64_t(i);
+                }
+            }
+        }
+        if (i < n) {
+            // A hole: the long way, for this one.
+            if (strictElementIs(rt, a, i, target))
+                return std::int64_t(i);
+            ++i;
+        }
+    }
+    return -1;
+}
+
 DynArray* thisArray(CallInfo& ci)
 {
     DynArray* arr = asArray(ci.thisValue());
@@ -586,12 +643,7 @@ void installArray(Runtime& rt)
                 return Value(-1.0);
             from = k >= 0 ? std::size_t(k) : std::size_t(std::max<std::int64_t>(std::int64_t(n) + k, 0));
         }
-        const Value target = ci.arg(0);
-        for (std::size_t i = from; i < n; ++i) {
-            if (strictElementIs(rt2, a, i, target))
-                return Value(double(i));
-        }
-        return Value(-1.0);
+        return Value(double(findStrict(rt2, a, from, n, ci.arg(0))));
     }, 1);
 
     arrayMethod("lastIndexOf", false, [](CallInfo& ci) {
@@ -614,9 +666,27 @@ void installArray(Runtime& rt)
     }, 1);
 
     arrayMethod("includes", false, [](CallInfo& ci) {
+        Runtime& rt2 = rtOf(ci);
         DynArray* a = thisArray(ci);
-        for (std::size_t i = 0; i < a->size(); ++i) {
-            if (sameValueZero(a->at(i), ci.arg(0)))
+        const std::size_t n = a->size();
+        if (n == 0)
+            return Value(false);
+        std::size_t from = 0;
+        if (ci.size() > 1) {
+            const std::int64_t k = toIntegerOrInfinity(toNumber(rt2, ci.arg(1)));
+            if (k >= std::int64_t(n))
+                return Value(false);
+            from = k >= 0 ? std::size_t(k) : std::size_t(std::max<std::int64_t>(std::int64_t(n) + k, 0));
+        }
+        // SameValueZero is strict equality but for NaN, and a hole reads as undefined: those two the long way.
+        const Value target = ci.arg(0);
+        if (!target.isUndefined() && !(target.isNumber() && std::isnan(numberOf(target))))
+            return Value(findStrict(rt2, a, from, n, target) >= 0);
+        for (std::size_t i = from; i < n; ++i) {
+            Value item;
+            if (!presentElement(rt2, a, i, item))
+                item = Value::undefined();
+            if (sameValueZero(item, target))
                 return Value(true);
         }
         return Value(false);

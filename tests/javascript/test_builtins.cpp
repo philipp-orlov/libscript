@@ -242,6 +242,35 @@ TEST(promisesResolveThroughTheJobQueue)
     CHECK_EQ(ctx.eval("log").toString(), std::string("1,2"));
 }
 
+TEST(promisesMadeForPromiseItselfSettleAsTheirFunctionsWould)
+{
+    // Promise.resolve, reject, all, allSettled, any, race, try and withResolvers settle a promise of Promise's own in
+    // place, and make its resolve and reject only where something is handed them: what each does is the same.
+    js::Context ctx;
+    ctx.eval(
+             "var log = [];"
+             "Promise.resolve(1).then(v => log.push('r' + v));"
+             "Promise.reject(2).catch(v => log.push('j' + v));"
+             "Promise.resolve({ then(f) { f(3); } }).then(v => log.push('t' + v));"
+             "Promise.all([1, Promise.resolve(2), { then(f) { f(3); } }]).then(v => log.push('all' + v));"
+             "Promise.all([1, Promise.reject(9)]).catch(v => log.push('allrej' + v));"
+             "Promise.race([new Promise(r => r(5)), 6]).then(v => log.push('race' + v));"
+             "Promise.any([Promise.reject(1), Promise.resolve(7)]).then(v => log.push('any' + v));"
+             "Promise.any([Promise.reject(1)]).catch(e => log.push('anyerr' + e.constructor.name + e.errors));"
+             "Promise.allSettled([1, Promise.reject(2)]).then(v => log.push('settled' + JSON.stringify(v)));"
+             "var w = Promise.withResolvers(); w.promise.then(v => log.push('wr' + v)); w.resolve(8); w.resolve(9);"
+             "Promise.try(() => 10).then(v => log.push('try' + v)); Promise.try(() => { throw 11; }).catch(v => log.push('tryerr' + v));"
+             "class MyP extends Promise {} MyP.resolve(12).then(v => log.push('sub' + v + (MyP.resolve(1) instanceof MyP)));"
+             "var p = Promise.resolve(13); log.push(Promise.resolve(p) === p);"
+             "Promise.resolve(14).finally(() => log.push('fin')).then(v => log.push('afterfin' + v));"
+             "var selfp = Promise.resolve().then(() => selfp); selfp.catch(e => log.push('self' + e.constructor.name));");
+    ctx.runJobs();
+    CHECK_EQ(ctx.eval("log.join(' ')").toString(),
+             std::string("true r1 j2 wr8 try10 tryerr11 sub12true fin t3 allrej9 race5 any7 anyerrAggregateError1 "
+                         "settled[{\"status\":\"fulfilled\",\"value\":1},{\"status\":\"rejected\",\"reason\":2}] selfTypeError "
+                         "all1,2,3 afterfin14"));
+}
+
 TEST(consoleGoesThroughThePrintHandler)
 {
     js::Context ctx;

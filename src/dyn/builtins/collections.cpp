@@ -27,6 +27,32 @@ struct Capability
     Value promise;
     Value resolve;
     Value reject;
+    /// Made for Promise itself: settled in place, and its two functions made only when something is handed them, which
+    /// would do no more than that.
+    bool direct = false;
+
+    void settle(Runtime& rt, const Value& value, bool rejected) const
+    {
+        if (direct) {
+            auto* target = static_cast<DynPromise*>(asObject(promise));
+            if (rejected)
+                rejectPromise(rt, target, value);
+            else
+                resolvePromise(rt, target, value);
+            return;
+        }
+        callValue(rt, rejected ? reject : resolve, Value::undefined(), {value});
+    }
+    /// With `resolve` and `reject` to hand out.
+    Capability& withFunctions(Runtime& rt)
+    {
+        if (direct) {
+            resolve = makeSettler(rt, promise, false);
+            reject = makeSettler(rt, promise, true);
+            direct = false;
+        }
+        return *this;
+    }
 };
 
 /// NewPromiseCapability: for Promise itself, a promise made directly; for anything else, what its constructor makes.
@@ -35,8 +61,7 @@ Capability newCapability(Runtime& rt, const Value& ctor)
     Capability cap;
     if (asObject(ctor) == rt.promiseCtor.get()) {
         cap.promise = makePromise(rt);
-        cap.resolve = makeSettler(rt, cap.promise, false);
-        cap.reject = makeSettler(rt, cap.promise, true);
+        cap.direct = true;
         return cap;
     }
     DynFunction* fn = asFunction(ctor);
@@ -67,7 +92,7 @@ Value promiseResolve(Runtime& rt, const Value& ctor, const Value& x)
             return x;
     }
     const Capability cap = newCapability(rt, ctor);
-    callValue(rt, cap.resolve, Value::undefined(), {x});
+    cap.settle(rt, x, false);
     return cap.promise;
 }
 
@@ -84,9 +109,9 @@ Value combinator(CallInfo& ci, Combine kind)
 {
     Runtime& rt = rtOf(ci);
     const Value ctor = ci.thisValue();
-    const Capability cap = newCapability(rt, ctor);
+    Capability cap = newCapability(rt, ctor);
     const auto rejectWith = [&](const Value& reason) {
-        callValue(rt, cap.reject, Value::undefined(), {reason});
+        cap.settle(rt, reason, true);
         return cap.promise;
     };
     Value resolveFn;
@@ -105,10 +130,10 @@ Value combinator(CallInfo& ci, Combine kind)
         if (kind == Combine::Any) {
             const Value error = constructValue(rtc, getProperty(rtc, objectValue(rtc.globalObject.get()), rtc.intern("AggregateError")),
                                                {rtc.makeArray(*values), rtc.str("all promises were rejected")});
-            callValue(rtc, cap.reject, Value::undefined(), {error});
+            cap.settle(rtc, error, true);
             return;
         }
-        callValue(rtc, cap.resolve, Value::undefined(), {rtc.makeArray(*values)});
+        cap.settle(rtc, rtc.makeArray(*values), false);
     };
     for (std::size_t index = 0;; ++index) {
         Value next;
@@ -124,6 +149,7 @@ Value combinator(CallInfo& ci, Combine kind)
         try {
             const Value nextPromise = callValue(rt, resolveFn, ctor, {next});
             if (kind == Combine::Race) {
+                cap.withFunctions(rt);
                 invokeMethod(rt, nextPromise, rt.atom.then.get(), {cap.resolve, cap.reject});
                 continue;
             }
@@ -155,14 +181,14 @@ Value combinator(CallInfo& ci, Combine kind)
             switch (kind) {
                 case Combine::All:
                     onFulfilled = rt.makeFunction(String(), element(0), 1);
-                    onRejected = cap.reject;
+                    onRejected = cap.withFunctions(rt).reject;
                     break;
                 case Combine::AllSettled:
                     onFulfilled = rt.makeFunction(String(), element(0), 1);
                     onRejected = rt.makeFunction(String(), element(1), 1);
                     break;
                 default:
-                    onFulfilled = cap.resolve;
+                    onFulfilled = cap.withFunctions(rt).resolve;
                     onRejected = rt.makeFunction(String(), element(1), 1);
                     break;
             }
@@ -446,7 +472,7 @@ void installPromise(Runtime& rt)
     rt.method(ctor, "reject", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         const Capability cap = newCapability(rt2, ci.thisValue());
-        callValue(rt2, cap.reject, Value::undefined(), {ci.arg(0)});
+        cap.settle(rt2, ci.arg(0), true);
         return cap.promise;
     }, 1);
 
@@ -456,7 +482,8 @@ void installPromise(Runtime& rt)
     rt.method(ctor, "race", [](CallInfo& ci) { return combinator(ci, Combine::Race); }, 1);
     rt.method(ctor, "withResolvers", [](CallInfo& ci) -> Value {
         Runtime& rt2 = rtOf(ci);
-        const Capability cap = newCapability(rt2, ci.thisValue());
+        Capability cap = newCapability(rt2, ci.thisValue());
+        cap.withFunctions(rt2);
         DynObject* out = rt2.newObject(rt2.objectProto.get());
         Value result = detail::Access::adopt(Type::Object, out);
         out->putOwn(rt2.intern("promise"), cap.promise);
@@ -472,9 +499,9 @@ void installPromise(Runtime& rt)
         try {
             std::vector<Value> rest(ci.args().begin() + (ci.size() ? 1 : 0), ci.args().end());
             const Value result = callValue(rt2, ci.arg(0), Value::undefined(), rest);
-            callValue(rt2, cap.resolve, Value::undefined(), {result});
+            cap.settle(rt2, result, false);
         } catch (Exception& e) {
-            callValue(rt2, cap.reject, Value::undefined(), {e.value()});
+            cap.settle(rt2, e.value(), true);
         }
         return cap.promise;
     }, 1);

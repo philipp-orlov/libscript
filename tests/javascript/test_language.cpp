@@ -2726,3 +2726,57 @@ TEST(functionsTakeTheNameOfAComputedKeyOrAnAccessor)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("a1,[q],,f,ar,named,get g1,set g1,2,function,m2,get s3,x,y"));
     }
 }
+
+TEST(aFinallyWithValuesUnderItRunsInNativeCode)
+{
+    // A try/finally inside a switch or a for-in has values under it on the stack: each way into the finally brings them
+    // and each way back finds them; a JumpSub after a throw is never taken.
+    const char* program =
+        "var out = [], log = [];"
+        "function sw(x) { switch (x) { case 1: try { log.push('t1'); return 'r1'; } finally { log.push('f1'); } case 2: try { log.push('t2'); break; } finally { log.push('f2'); } default: try { if (x > 5) throw new Error('big'); } catch (e) { log.push('c'); } finally { log.push('fd'); } } return 'end' + x; }"
+        "function forin(o) { var s = ''; for (var k in o) { try { if (k === 'b') continue; if (k === 'd') break; s += k; } finally { s += '.'; } } return s; }"
+        "function nested(n) { var t = 0; for (var i = 0; i < n; i++) { switch (i % 3) { case 0: try { t += 1; } finally { t += 10; } break; case 1: try { try { t += 2; if (i % 7 == 1) throw i; } finally { t += 20; } } catch (e) { t += 100; } break; default: t += 3; } } return t; }"
+        "function dead(x) { switch (x) { case 1: try { throw \"d\"; } finally { log.push(\"fd2\"); } case 2: return 2; } }"
+        "function throwsThrough(x) { switch (x) { case 1: try { throw 'boom'; } finally { log.push('ft'); } } }"
+        "for (var k = 0; k < 3000; k++) { out[0] = sw(k % 8); out[1] = forin({a: 1, b: 2, c: 3, d: 4, e: 5}); out[2] = nested(50); out[4] = dead(2); try { dead(1); } catch (e) { out[5] = e; } try { throwsThrough(1); } catch (e) { out[3] = e; } }"
+        "out.push(log.slice(-6).join(''), log.length);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("end7 a..c.. 909 boom 2 d fd2ftcfdfd2ft 10500"));
+    }
+}
+
+TEST(aForOfWithReturnAndContinueKeepsItsIteratorInNativeCode)
+{
+    // A for-of's continue polls inside its try, before the loop head's join moves the iterator to registers of its own.
+    const char* program =
+        "function verify(nodes, set) {"
+        "    let preps = [];"
+        "    for (let n of nodes) { if (n > 2) preps.push(n); }"
+        "    for (let p of preps) { if (p > 100) return {result: false}; }"
+        "    let c = 0;"
+        "    for (let a of set) { if (a < 0) return {result: false, why: 'neg'}; if (a & 1) continue; c++; }"
+        "    return {result: true, c};"
+        "}"
+        "var r, s = new Set([1, 2, 3, 4]); for (var i = 0; i < 5000; i++) r = verify([1, 2, 3, 4, 5], s);"
+        "JSON.stringify(r)";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("{\"result\":true,\"c\":2}"));
+    }
+}

@@ -1159,19 +1159,15 @@ private:
             landing_[i] = newLabel();
             if (h.kind != HandlerKind::Finally)
                 continue;
-            // Where a JumpSub comes back to is met before the block that sends it there; with nothing on the stack, its
-            // way in needs no values settled first. A `try` inside a `switch` or a `for-in` has some.
-            if (h.stackDepth != 0)
-                refuse("a finally with values under it on the stack");
             contReg_[i] = fn_.newVreg(false);
             for (std::size_t pc = 0; pc < c.size();) {
                 const Op op = Op(c[pc]);
                 const std::uint32_t next = std::uint32_t(pc + 1 + std::size_t(operandsOf(op)) * 4);
                 if (op == Op::JumpSub && readOperand(c, pc + 1) == h.target) {
+                    // Reached when the JumpSub is: the walk below goes on past it as past a call.
                     subReturns_[i].push_back(next);
                     if (labels_[next] < 0)
                         labels_[next] = newLabel();
-                    work.push_back(next);
                 }
                 pc = next;
             }
@@ -3346,9 +3342,10 @@ private:
             }
             case Op::Jump: {
                 const std::uint32_t target = operand();
-                flowTo(target);
+                // The poll first: its exit is this place's, with the stack as it is here, before the join moves it.
                 if (target <= pc)
                     poll();
+                flowTo(target);
                 inst(IrOp::Br).imm = labels_[target];
                 return false;
             }
@@ -3420,6 +3417,7 @@ private:
                 // Into a `finally`, to come back to the next instruction: its number in the block's register.
                 const std::uint32_t target = operand();
                 std::int64_t id = 0;
+                std::size_t depth = 0;
                 for (const auto& [i, returns] : subReturns_) {
                     if (code_.handlers[i].target != target)
                         continue;
@@ -3429,11 +3427,18 @@ private:
                         set.d = contReg_[i];
                         set.imm = std::int64_t(it - returns.begin()) + 1;
                         id = set.imm;
+                        depth = code_.handlers[i].stackDepth;
                     }
                 }
                 if (!id)
                     refuse("a JumpSub to no finally");
+                // What is under the `finally` (a `switch`'s value, a `for-in`'s keys) is there again where it comes
+                // back to, which is met before the block that sends it there: that place learns the stack from here.
+                if (stack_.size() != depth)
+                    refuse("a finally entered with another stack");
                 secureWeak();
+                if (depth)
+                    flowTo(pc + 5);
                 flowTo(target);
                 inst(IrOp::Br).imm = labels_[target];
                 stack_.clear();
@@ -3448,6 +3453,9 @@ private:
                 secureWeak();
                 const std::vector<std::uint32_t>& returns = subReturns_[i];
                 for (std::size_t k = 0; k < returns.size(); ++k) {
+                    // A JumpSub no way reaches (after a `throw`) never sends anything back.
+                    if (!reachable_[returns[k]])
+                        continue;
                     const std::int32_t next = newLabel();
                     IrInst& test = inst(IrOp::BrCmp);
                     test.a = cont;

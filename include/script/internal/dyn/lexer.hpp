@@ -208,6 +208,8 @@ public:
     /// The same, with `slash` turned into the literal.
     void rescanAsRegex(Token& slash);
 
+    /// The byte reading goes on at.
+    std::size_t offset() const noexcept { return pos_; }
     /// Go on reading at byte `pos`, which is on line `line`: where a function's text starts, to read it again.
     void seek(std::size_t pos, std::uint32_t line) noexcept
     {

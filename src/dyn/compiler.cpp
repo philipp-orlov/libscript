@@ -1017,7 +1017,7 @@ public:
         for (const NodePtr& s : body.list) {
             if (s->kind != NK::ExprStatement || !s->a || s->a->kind != NK::StringLit)
                 return false;
-            if (s->a->text == ascii("use strict"))
+            if (s->a->text == u"use strict")
                 return true;
         }
         return false;
@@ -2593,7 +2593,7 @@ private:
                 checkStrictWord(n.text, n.line);
                 if (n.isPrivate && std::none_of(privateScopes_.begin(), privateScopes_.end(), [&](const std::set<String>& names) { return names.count(n.text) != 0; }))
                     fail(n.line, "a private name is not declared in any class around it: " + toUtf8(n.text));
-                if (n.text == ascii("undefined") && !findLocal(*fn_, n.text)) {
+                if (n.text == u"undefined" && !findLocal(*fn_, n.text)) {
                     emit(Op::PushUndefined);
                     return;
                 }
@@ -3421,7 +3421,7 @@ private:
     {
         if (!earlyErrors() || !inStrictCode())
             return;
-        if (name == ascii("eval") || name == ascii("arguments"))
+        if (name == u"eval" || name == u"arguments")
             fail(line, "strict code cannot bind " + toUtf8(name));
         checkStrictWord(name, line);
     }
@@ -3529,13 +3529,13 @@ private:
         for (const NodePtr& m : n.list) {
             if ((m->kind != NK::MethodDef && m->kind != NK::FieldDef) || m->computed || m->isPrivate || !m->a)
                 continue;
-            const bool isCtorName = m->a->text == ascii("constructor");
+            const bool isCtorName = m->a->text == u"constructor";
             if (m->kind == NK::FieldDef) {
-                if (isCtorName || (m->isStatic && m->a->text == ascii("prototype")))
+                if (isCtorName || (m->isStatic && m->a->text == u"prototype"))
                     fail(m->line, "a field cannot be called " + toUtf8(m->a->text));
                 continue;
             }
-            if (m->isStatic && m->a->text == ascii("prototype"))
+            if (m->isStatic && m->a->text == u"prototype")
                 fail(m->line, "a static method cannot be called prototype");
             if (m->propKind == PropKind::Constructor) {
                 if (hasConstructor)
@@ -3566,7 +3566,7 @@ private:
             if ((m->kind != NK::MethodDef && m->kind != NK::FieldDef) || !m->isPrivate)
                 continue;
             const String& name = m->a->text;
-            if (name == ascii("#constructor"))
+            if (name == u"#constructor")
                 fail(m->line, "a private name cannot be #constructor");
             const int kind = m->kind == NK::MethodDef && m->propKind == PropKind::Getter ? 1
                              : m->kind == NK::MethodDef && m->propKind == PropKind::Setter ? 2 : 4;

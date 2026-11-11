@@ -781,9 +781,9 @@ void installDate(Runtime& rt)
         const Value hint = ci.arg(0);
         const String name = hint.isString() ? String(asString(hint)->text()) : String();
         bool asNumber;
-        if (name == ascii("number"))
+        if (name == u"number")
             asNumber = true;
-        else if (name == ascii("string") || name == ascii("default"))
+        else if (name == u"string" || name == u"default")
             asNumber = false;
         else
             ci.fail(ErrorCode::TypeError, "invalid hint for Date.prototype[Symbol.toPrimitive]");

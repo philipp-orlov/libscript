@@ -1193,7 +1193,7 @@ NodePtr Parser::typeMember()
         }
         // `[Symbol.iterator]()` is the one computed key that means something.
         // It is stored under a name no identifier can spell.
-        if (name.type == Tok::Identifier && name.text == ascii("Symbol")) {
+        if (name.type == Tok::Identifier && name.text == u"Symbol") {
             advance();
             advance();
             expect(Tok::Dot, "'.'");
@@ -1828,9 +1828,12 @@ std::vector<NodePtr> Parser::argumentList()
 
 bool Parser::looksLikeArrow()
 {
+    if (auto known = arrowAfter_.find(lexer_.offset()); known != arrowAfter_.end())
+        return known->second;
     Lexer probe = lexer_;
     int depth = 1;
     Token t;
+    std::vector<std::size_t> open;
     // The scan guesses at `/` after `}` without knowing whether a block or an object literal ended there; when it guesses
     // a division and the rest is a regular expression that does not lex as tokens, what it scanned was no parameter list.
     try {
@@ -1838,13 +1841,20 @@ bool Parser::looksLikeArrow()
         while (t.type != Tok::Eof) {
             if (++lookahead_ > lookaheadLimit_)
                 fail("source is too deeply parenthesised to parse");
+            std::size_t closed = std::size_t(-1);
             if (t.type == Tok::LParen) {
                 ++depth;
+                open.push_back(probe.offset());
             } else if (t.type == Tok::RParen) {
                 if (--depth == 0)
                     break;
+                closed = open.back();
+                open.pop_back();
             }
             t = probe.next(!operandJustEnded(t.type));
+            // A `(` inside, closed: what follows its `)` is known now. A type annotation there is left to a scan of its own.
+            if (closed != std::size_t(-1) && !(typescript_ && t.type == Tok::Colon))
+                arrowAfter_.emplace(closed, t.type == Tok::Arrow);
         }
     } catch (const Error&) {
         if (lookahead_ > lookaheadLimit_)
@@ -2133,7 +2143,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
 
         if (at(Tok::LParen) || (typescript_ && at(Tok::Lt))) {
             const bool isConstructor = kind == PropKind::Method && !computed && !isStatic &&
-                                       key->text == ascii("constructor");
+                                       key->text == u"constructor";
             const std::uint32_t evalBefore = evalCalls_;
             NodePtr fn = makeNode(NK::FunctionExpr, line);
             if (!computed)
@@ -2407,7 +2417,7 @@ NodePtr Parser::primary()
         case Tok::New: {
             advance();
             if (eat(Tok::Dot)) {
-                if (cur_.text != ascii("target"))
+                if (cur_.text != u"target")
                     fail("expected 'new.target'");
                 advance();
                 return makeNode(NK::NewTarget, line);

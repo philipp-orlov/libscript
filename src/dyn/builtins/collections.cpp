@@ -605,7 +605,7 @@ String inspectValue(Runtime& rt, const Value& v, int depth)
     if (obj->proto && obj->proto.get() != rt.objectProto.get()) {
         const Value ctorValue = getPropertyOfObject(rt, obj, rt.atom.constructor.get(), v);
         if (DynFunction* ctor = asFunction(ctorValue)) {
-            if (!ctor->name.empty() && ctor->name != ascii("Object"))
+            if (!ctor->name.empty() && ctor->name != u"Object")
                 prefix = ctor->name + ascii(" ");
         }
     }

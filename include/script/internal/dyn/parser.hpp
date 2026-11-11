@@ -6,6 +6,7 @@
 
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "script/internal/dyn/ast.hpp"
@@ -152,6 +153,9 @@ private:
     /// of the nesting and the length; the cap keeps hostile input at a few times the length of the source.
     std::size_t lookahead_ = 0;
     std::size_t lookaheadLimit_ = 0;
+    /// What scanning ahead found out about the `(`s it went past, by the offset just after each: whether an arrow
+    /// follows its `)`. The tokens from there on are the same whoever reads them, so each is scanned once.
+    std::unordered_map<std::size_t, bool> arrowAfter_;
     bool ambient_ = false;   ///< inside `declare`: bodies are not required
     bool noIn_ = false;      ///< parsing a for-in head: `in` ends the expression
     /// How many calls of a name `eval` have been parsed: a function holds one if the count moved while it was parsed.

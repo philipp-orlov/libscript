@@ -507,7 +507,7 @@ const Ty* Checker::resolveTypeName(const Node& n)
             }
         }
     }
-    if (n.text == ascii("object") || n.text == ascii("this"))
+    if (n.text == u"object" || n.text == u"this")
         return arena_.anyType();
 
     TypeBinding* binding = findType(n.text);
@@ -719,7 +719,7 @@ const Ty* Checker::memberType(const Node& where, const Ty* object, StringView na
 
     // `length` and index access on arrays and tuples come before the interface
     // so that a tuple keeps its element types.
-    if (object->kind == TK::Tuple && name == ascii("length"))
+    if (object->kind == TK::Tuple && name == u"length")
         return arena_.numberLiteral(double(object->items.size()));
 
     const Ty* apparent = apparentType(object);
@@ -812,7 +812,7 @@ const Ty* Checker::elementTypeOf(const Ty* t)
     const Ty* step = method(method(t, "@@iterator"), "next");
     if (step && step->kind == TK::Object) {
         for (const TyMember& m : step->members) {
-            if (m.name == ascii("value"))
+            if (m.name == u"value")
                 return m.type;
         }
     }
@@ -1931,7 +1931,7 @@ const Ty* Checker::checkExpr(const Node& n, const Ty* contextual)
         case NK::Spread: return n.a ? checkExpr(*n.a) : arena_.anyType();
         case NK::AsExpr: {
             // `as const` keeps literal types; everything else asserts.
-            if (n.type && n.type->kind == NK::TypeRef && n.type->text == ascii("const")) {
+            if (n.type && n.type->kind == NK::TypeRef && n.type->text == u"const") {
                 ++constDepth_;
                 const Ty* value = n.a ? checkExpr(*n.a) : arena_.anyType();
                 --constDepth_;
@@ -2184,20 +2184,20 @@ void Checker::narrowByTypeOf(const Node& operand, StringView name, bool equal, F
     auto matches = [&](const Ty* part) {
         switch (part->kind) {
             case TK::Str:
-            case TK::StrLit: return name == ascii("string");
+            case TK::StrLit: return name == u"string";
             case TK::Number:
-            case TK::NumberLit: return name == ascii("number");
+            case TK::NumberLit: return name == u"number";
             case TK::Boolean:
-            case TK::BooleanLit: return name == ascii("boolean");
-            case TK::Symbol: return name == ascii("symbol");
+            case TK::BooleanLit: return name == u"boolean";
+            case TK::Symbol: return name == u"symbol";
             case TK::Undefined:
-            case TK::Void: return name == ascii("undefined");
-            case TK::Null: return name == ascii("object");
+            case TK::Void: return name == u"undefined";
+            case TK::Null: return name == u"object";
             case TK::Array:
-            case TK::Tuple: return name == ascii("object");
+            case TK::Tuple: return name == u"object";
             case TK::Object:
-                return part->callable() || !part->constructs.empty() ? name == ascii("function")
-                                                                     : name == ascii("object");
+                return part->callable() || !part->constructs.empty() ? name == u"function"
+                                                                     : name == u"object";
             default: return true;
         }
     };
@@ -2205,13 +2205,13 @@ void Checker::narrowByTypeOf(const Node& operand, StringView name, bool equal, F
     if (current->kind == TK::Any || current->kind == TK::Unknown) {
         if (!equal)
             return;
-        if (name == ascii("string"))
+        if (name == u"string")
             out[path] = arena_.stringType();
-        else if (name == ascii("number"))
+        else if (name == u"number")
             out[path] = arena_.numberType();
-        else if (name == ascii("boolean"))
+        else if (name == u"boolean")
             out[path] = arena_.booleanType();
-        else if (name == ascii("undefined"))
+        else if (name == u"undefined")
             out[path] = arena_.undefinedType();
         return;
     }
@@ -2257,7 +2257,7 @@ void Checker::narrowByTruth(const Node& operand, bool truthy, Facts& out)
 void Checker::narrowByLiteral(const Node& subject, const Node& literal, bool equal, Facts& out)
 {
     const Ty* value = literalOf(literal);
-    if (!value && literal.kind == NK::Identifier && literal.text == ascii("undefined"))
+    if (!value && literal.kind == NK::Identifier && literal.text == u"undefined")
         value = arena_.undefinedType();
     if (!value && literal.kind == NK::Member) {
         // A discriminant may be spelled as an enum member.

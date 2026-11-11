@@ -1182,7 +1182,7 @@ void Checker::checkMethodBody(TypeDecl* decl, MethodDecl* method)
     MethodInfo* info = method->info;
     if (info->isAbstract() || (!method->body && !method->expressionBody &&
                                info->accessorSlot == MethodInfo::kNoSlot &&
-                               method->name != ascii(".cctor")))
+                               method->name != u".cctor"))
         return;
 
     Function function;
@@ -1225,7 +1225,7 @@ void Checker::checkMethodBody(TypeDecl* decl, MethodDecl* method)
                 prop.init = coerce(prop.init, resolve(prop.typeRef), "assignment");
         }
     }
-    if (method->name == ascii(".cctor") && !decl->staticInitializersChecked) {
+    if (method->name == u".cctor" && !decl->staticInitializersChecked) {
         decl->staticInitializersChecked = true;
         for (FieldDecl& field : decl->fields) {
             if (field.init && (field.modifiers & ModStatic) && !(field.modifiers & ModConst))
@@ -3225,7 +3225,7 @@ void Checker::checkNotReadOnly(const Expr* target)
             const MethodInfo* method = fn_ ? fn_->method : nullptr;
             const bool inInitializer =
                 method && !fn_->lambda && fn_->owner == field->owner &&
-                (method->isConstructor() || method->name == ascii(".cctor")) &&
+                (method->isConstructor() || method->name == u".cctor") &&
                 method->isStatic() == field->isStatic;
             const bool throughThis = field->isStatic || !receiver || receiver->kind == ExprKind::This;
             if (!inInitializer || !throughThis) {

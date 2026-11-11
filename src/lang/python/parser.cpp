@@ -180,8 +180,8 @@ Parser::NodePtr Parser::parseModule()
         const bool isAssignment =
             last.kind == NK::Assign ||
             (last.kind == NK::Call && last.a->kind == NK::Member && last.a->a->kind == NK::Identifier &&
-             last.a->a->text == ascii("__py") &&
-             (last.a->text == ascii("setitem") || last.a->text == ascii("setslice")));
+             last.a->a->text == u"__py" &&
+             (last.a->text == u"setitem" || last.a->text == u"setslice"));
         if (isAssignment)
             body.back()->a = unary(JTok::Void, std::move(body.back()->a), last.line);
     }
@@ -295,12 +295,12 @@ void Parser::simpleStatement(std::vector<NodePtr>& out)
                 } else if (target->kind == NK::Member && !target->computed) {
                     out.push_back(exprStatement(unary(JTok::Delete, std::move(target), at)));
                 } else if (target->kind == NK::Call && target->a->kind == NK::Member &&
-                           target->a->text == ascii("getitem")) {
+                           target->a->text == u"getitem") {
                     // `del a[i]` parsed as `__py.getitem(a, i)`.
                     std::vector<NodePtr> args = std::move(target->list);
                     out.push_back(exprStatement(helper("delitem", std::move(args), at)));
                 } else if (target->kind == NK::Call && target->a->kind == NK::Member &&
-                           target->a->text == ascii("slice")) {
+                           target->a->text == u"slice") {
                     std::vector<NodePtr> args = std::move(target->list);
                     out.push_back(exprStatement(helper("delslice", std::move(args), at)));
                 } else {
@@ -406,15 +406,15 @@ void Parser::expressionOrAssignment(std::vector<NodePtr>& out)
 Parser::NodePtr Parser::assignTo(NodePtr target, NodePtr value, std::uint32_t at)
 {
     if (target->kind == NK::Call && target->a->kind == NK::Member &&
-        target->a->a->kind == NK::Identifier && target->a->a->text == ascii("__py")) {
+        target->a->a->kind == NK::Identifier && target->a->a->text == u"__py") {
         // Parsed as a read: `__py.getitem(a, i)` -> `__py.setitem(a, i, v)`,
         // `__py.slice(a, lo, hi, step)` -> `__py.setslice(a, lo, hi, step, v)`.
-        if (target->a->text == ascii("getitem")) {
+        if (target->a->text == u"getitem") {
             std::vector<NodePtr> args = std::move(target->list);
             args.push_back(std::move(value));
             return helper("setitem", std::move(args), at);
         }
-        if (target->a->text == ascii("slice")) {
+        if (target->a->text == u"slice") {
             std::vector<NodePtr> args = std::move(target->list);
             args.push_back(std::move(value));
             return helper("setslice", std::move(args), at);
@@ -445,7 +445,7 @@ Parser::NodePtr Parser::toTarget(NodePtr expr, bool declare)
         case NK::Call:
             // `a[i]` inside a tuple target: use a plain computed member, the
             // one place a subscript cannot go through the helper.
-            if (expr->a->kind == NK::Member && expr->a->text == ascii("getitem") &&
+            if (expr->a->kind == NK::Member && expr->a->text == u"getitem" &&
                 expr->list.size() == 2) {
                 NodePtr m = make(NK::Member, expr->line);
                 m->computed = true;
@@ -463,7 +463,7 @@ Parser::NodePtr Parser::augmentedAssign(NodePtr target, Tok op, NodePtr value, s
     // A subscript target reads and writes through the helpers; the container
     // and index expressions are evaluated twice.
     const bool isItem = target->kind == NK::Call && target->a->kind == NK::Member &&
-                        target->a->text == ascii("getitem");
+                        target->a->text == u"getitem";
     NodePtr read = clone(*target);
     NodePtr combined;
     switch (op) {
@@ -594,7 +594,7 @@ Parser::NodePtr Parser::forStatement()
 
     // `for i in range(...)` with a plain name: a counting loop, no array.
     if (target->kind == NK::Identifier && iterable->kind == NK::Call &&
-        iterable->a->kind == NK::Identifier && iterable->a->text == ascii("range") &&
+        iterable->a->kind == NK::Identifier && iterable->a->text == u"range" &&
         !iterable->list.empty() && iterable->list.size() <= 3) {
         std::vector<NodePtr>& args = iterable->list;
         bool simple = true;
@@ -827,13 +827,13 @@ Parser::NodePtr Parser::functionDef(std::vector<String> decorators, bool inClass
     kind = PropKind::Method;
     isStatic = false;
     for (const String& d : decorators) {
-        if (d == ascii("staticmethod")) {
+        if (d == u"staticmethod") {
             isStatic = true;
             bindSelf = false;
-        } else if (d == ascii("classmethod")) {
+        } else if (d == u"classmethod") {
             isStatic = true;
             bindCls = true;
-        } else if (d == ascii("property")) {
+        } else if (d == u"property") {
             kind = PropKind::Getter;
         } else if (d.size() > 7 && d.compare(d.size() - 7, 7, ascii(".setter")) == 0) {
             kind = PropKind::Setter;
@@ -866,7 +866,7 @@ Parser::NodePtr Parser::functionDef(std::vector<String> decorators, bool inClass
         }
         if (scopes_.size() == 2)
             functions_[name] = std::move(sig);
-    } else if (name == ascii("__init__")) {
+    } else if (name == u"__init__") {
         Signature sig;
         for (const NodePtr& p : params) {
             if (p->kind == NK::RestElement)
@@ -901,11 +901,11 @@ Parser::NodePtr Parser::functionDef(std::vector<String> decorators, bool inClass
         NodePtr m = make(NK::MethodDef, at);
         m->isStatic = isStatic;
         m->propKind = kind;
-        if (name == ascii("__init__")) {
+        if (name == u"__init__") {
             m->propKind = PropKind::Constructor;
             fn->text = ascii("constructor");
             m->a = string(ascii("constructor"), at);
-        } else if (name == ascii("__iter__")) {
+        } else if (name == u"__iter__") {
             m->computed = true;
             m->a = member(ident(ascii("Symbol"), at), ascii("iterator"), at);
         } else {
@@ -978,7 +978,7 @@ void Parser::classDef(std::vector<NodePtr>& out)
             if (is(Tok::Comma) && type(1) != Tok::RParen)
                 fail("multiple inheritance is not supported");
             eat(Tok::Comma);
-            if (base->kind == NK::Identifier && base->text == ascii("object")) {
+            if (base->kind == NK::Identifier && base->text == u"object") {
                 // `class X(object)` is the same as `class X`.
             } else {
                 if (base->kind == NK::Identifier)
@@ -1644,8 +1644,8 @@ Parser::NodePtr Parser::callExpression(NodePtr callee, std::uint32_t at)
 
     // super().m(args) / super().__init__(args) / super(C, self).m(args)
     if (callee->kind == NK::Member && callee->a->kind == NK::Call &&
-        callee->a->a->kind == NK::Identifier && callee->a->a->text == ascii("super")) {
-        if (callee->text == ascii("__init__")) {
+        callee->a->a->kind == NK::Identifier && callee->a->a->text == u"super") {
+        if (callee->text == u"__init__") {
             NodePtr n = make(NK::Call, at);
             n->a = make(NK::SuperExpr, at);
             n->list = std::move(args);
@@ -1667,7 +1667,7 @@ Parser::NodePtr Parser::callExpression(NodePtr callee, std::uint32_t at)
             }
             if (isSelf) {
                 args.erase(args.begin());
-                if (callee->text == ascii("__init__")) {
+                if (callee->text == u"__init__") {
                     NodePtr n = make(NK::Call, at);
                     n->a = make(NK::SuperExpr, at);
                     n->list = std::move(args);
@@ -2207,15 +2207,15 @@ bool Parser::isBoolish(const Node& n)
         case NK::Unary: return n.op == JTok::Bang;
         case NK::Call:
             if (n.a->kind == NK::Member && n.a->a->kind == NK::Identifier &&
-                n.a->a->text == ascii("__py")) {
+                n.a->a->text == u"__py") {
                 const String& h = n.a->text;
-                return h == ascii("eq") || h == ascii("contains") || h == ascii("truthy") ||
-                       h == ascii("isinstance");
+                return h == u"eq" || h == u"contains" || h == u"truthy" ||
+                       h == u"isinstance";
             }
             if (n.a->kind == NK::Identifier)
-                return n.a->text == ascii("isinstance") || n.a->text == ascii("bool") ||
-                       n.a->text == ascii("any") || n.a->text == ascii("all") ||
-                       n.a->text == ascii("hasattr") || n.a->text == ascii("callable");
+                return n.a->text == u"isinstance" || n.a->text == u"bool" ||
+                       n.a->text == u"any" || n.a->text == u"all" ||
+                       n.a->text == u"hasattr" || n.a->text == u"callable";
             return false;
         default: return false;
     }

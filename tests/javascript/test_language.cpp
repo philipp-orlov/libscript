@@ -2598,3 +2598,23 @@ TEST(superCalledTwiceIsAReferenceErrorOnceTheSuperConstructorReturns)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("ReferenceError ReferenceError ReferenceError true"));
     }
 }
+
+TEST(namesAreFoundAmongManyLocalsAndScopes)
+{
+    // A function with more locals than are looked at one by one: the innermost of a name is found, shadowing in blocks and
+    // loops, in a top level of forty variables and in a function of fourteen.
+    const char* program =
+        "var src = 'var out = [];';"
+        "for (var i = 0; i < 40; i++) src += 'var v' + i + ' = ' + i + ';';"
+        "src += '{ let v3 = \"inner\"; { let v3 = \"deeper\"; out.push(v3); } out.push(v3); } out.push(v3);';"
+        "src += 'function f(v5) { let v7 = v5 * 2; { const v7 = \"c\"; out.push(v7); } return v7 + v39; } out.push(f(4));';"
+        "src += 'for (let v0 = 100; v0 < 102; v0++) out.push(v0); out.push(v0); out.join(\",\")';"
+        "var r = (0, eval)(src);"
+        "var many = function () { var a0 = 0, a1 = 1, a2 = 2, a3 = 3, a4 = 4, a5 = 5, a6 = 6, a7 = 7, a8 = 8, a9 = 9, a10 = 10, a11 = 11, a12 = 12, a13 = 13;"
+        "  { let a13 = 'x'; { let a0 = 'y'; r += a0 + a13; } r += a0; } return a13 + a12; };"
+        "r + '|' + many()";
+    script::Context::Options options;
+    options.runtimeCode = true;
+    js::Context ctx(options);
+    CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("deeper,inner,3,c,47,100,101,0|25"));
+}

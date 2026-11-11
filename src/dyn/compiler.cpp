@@ -51,6 +51,60 @@ struct Local
     bool inTdz = false;        ///< a `let`, `const` or `class` whose declaration has not been compiled yet: its dead zone
 };
 
+/// A function's locals, innermost last, with an index by name: a function with thousands of them, a module's top level
+/// say, has each name looked up without a walk of them all. Locals come and go only at the end, as scopes open and close.
+class LocalTable
+{
+public:
+    void push_back(const Local& local)
+    {
+        byName_[hashString(local.name)].push_back(std::uint32_t(locals_.size()));
+        locals_.push_back(local);
+    }
+    void pop_back()
+    {
+        const auto it = byName_.find(hashString(locals_.back().name));
+        it->second.pop_back();
+        if (it->second.empty())
+            byName_.erase(it);
+        locals_.pop_back();
+    }
+    /// The innermost local of that name, or null.
+    const Local* find(StringView name) const
+    {
+        if (locals_.size() <= kScanUpTo) {
+            for (std::size_t i = locals_.size(); i-- > 0;) {
+                if (locals_[i].name == name)
+                    return &locals_[i];
+            }
+            return nullptr;
+        }
+        const auto it = byName_.find(hashString(name));
+        if (it == byName_.end())
+            return nullptr;
+        for (std::size_t i = it->second.size(); i-- > 0;) {
+            const Local& local = locals_[it->second[i]];
+            if (local.name == name)
+                return &local;
+        }
+        return nullptr;
+    }
+    Local& operator[](std::size_t i) { return locals_[i]; }
+    const Local& operator[](std::size_t i) const { return locals_[i]; }
+    Local& back() { return locals_.back(); }
+    const Local& back() const { return locals_.back(); }
+    std::size_t size() const noexcept { return locals_.size(); }
+    bool empty() const noexcept { return locals_.empty(); }
+    auto begin() const { return locals_.begin(); }
+    auto end() const { return locals_.end(); }
+
+private:
+    /// Few enough to look at one by one, which is quicker than a hash.
+    static constexpr std::size_t kScanUpTo = 12;
+    std::vector<Local> locals_;
+    std::unordered_map<std::size_t, std::vector<std::uint32_t>> byName_;
+};
+
 struct LoopCtx
 {
     std::vector<std::size_t> breaks;
@@ -144,7 +198,7 @@ struct FnState
 {
     FnState* parent = nullptr;
     std::shared_ptr<FunctionCode> code;
-    std::vector<Local> locals;
+    LocalTable locals;
     std::vector<String> upvalNames;
     std::vector<bool> upvalConst;  ///< parallel to upvalNames: the binding is a `const`
     NameSet captured;               ///< names a nested function mentions
@@ -904,14 +958,7 @@ private:
             fn_->locals.pop_back();
     }
 
-    static const Local* findLocal(const FnState& fs, StringView name)
-    {
-        for (std::size_t i = fs.locals.size(); i-- > 0;) {
-            if (fs.locals[i].name == name)
-                return &fs.locals[i];
-        }
-        return nullptr;
-    }
+    static const Local* findLocal(const FnState& fs, StringView name) { return fs.locals.find(name); }
 
     int resolveUpval(FnState& fs, StringView name)
     {

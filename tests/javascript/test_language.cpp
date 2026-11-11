@@ -2618,3 +2618,39 @@ TEST(namesAreFoundAmongManyLocalsAndScopes)
     js::Context ctx(options);
     CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("deeper,inner,3,c,47,100,101,0|25"));
 }
+
+TEST(whatNestedFunctionsMentionIsKeptInCellsByEveryRule)
+{
+    // Which locals nested functions mention, and so live in cells: through closures, arrows (this, super, new.target,
+    // arguments), classes and fields, parameter defaults, shadowing blocks, loops, and names that are only property keys.
+    const char* program =
+        "var out = []; function S(v) { out.push(String(v)); }"
+        "function counter() { var n = 0; return function () { return ++n; }; } var c = counter(); c(); S(c());"
+        "function arrowThis() { var f = () => this.v; return f; } S(arrowThis.call({v: 'at'})());"
+        "function nested() { var x = 1; function inner() { return () => x + 1; } x = 5; return inner()(); } S(nested());"
+        "class B { m() { return 'Bm'; } } class D extends B { m() { var f = () => super.m() + '!'; return f(); } } S(new D().m());"
+        "function NT() { var g = () => new.target === NT; return g(); } S(new NT() instanceof NT);"
+        "class F { x = 1; y = () => this.x + 1; static s = (() => 'st')(); } S(new F().y() + F.s);"
+        "function params(a, b = () => a) { a = 9; return b(); } S(params(3));"
+        "function shadow() { var v = 'outer'; { let v = 'inner'; var g = () => v; } return g() + v; } S(shadow());"
+        "var obj = { k: 1, m() { return [1, 2].map(x => x + this.k); } }; S(obj.m());"
+        "function loop() { var fs = []; for (let i = 0; i < 3; i++) fs.push(() => i); return fs.map(f => f()).join(''); } S(loop());"
+        "function arrowInFn() { return function () { return (() => this)(); }.call('t2'); } S(arrowInFn());"
+        "function classInArrow() { return (() => class { z = this; })(); } S(typeof new (classInArrow.call({}))().z);"
+        "function deep() { var a = 1; return () => () => () => a++; } var d3 = deep()()(); d3(); S(d3());"
+        "function prop() { var q = 7; return { q, r: q, [q]: 'c' }; } S(JSON.stringify(prop()));"
+        "function mem() { var key = 'k'; var o = {k: 'mk'}; return () => o[key] + o.key; } S(mem()());"
+        "function argsCap() { return () => arguments[0]; } S(argsCap('ar')());"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2 at 6 Bm! true 2st 9 innerouter 2,3 012 t2 object 2 {\"7\":\"c\",\"q\":7,\"r\":7} mkundefined ar"));
+    }
+}

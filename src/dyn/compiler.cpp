@@ -194,6 +194,32 @@ private:
     std::list<String> owned_;  ///< a list, which costs nothing while empty and never moves what it holds
 };
 
+struct CaptureIndex;
+
+/// The names functions nested in a function mention, which its locals must then keep in cells: answered from the
+/// compile's `CaptureIndex` for the parts of the tree it numbered, and held as names for the rest.
+class Captured
+{
+public:
+    bool count(StringView name) const;
+    void addOwned(const String& name) { names_.addOwned(name); }
+    NameSet& names() { return names_; }
+    void addRegion(const CaptureIndex* index, std::uint32_t begin, std::uint32_t end) { regions_.push_back({index, begin, end}); }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    /// SCRIPT_CHECK_NAMES: the same set made by the tree walk, which every answer is checked against.
+    NameSet checked;
+#endif
+
+private:
+    struct Region
+    {
+        const CaptureIndex* index;
+        std::uint32_t begin, end;
+    };
+    NameSet names_;
+    std::vector<Region> regions_;
+};
+
 struct FnState
 {
     FnState* parent = nullptr;
@@ -201,7 +227,7 @@ struct FnState
     LocalTable locals;
     std::vector<String> upvalNames;
     std::vector<bool> upvalConst;  ///< parallel to upvalNames: the binding is a `const`
-    NameSet captured;               ///< names a nested function mentions
+    Captured captured;              ///< names a nested function mentions
     std::set<const Node*> hoistedFuncs;  ///< function declarations `hoist` compiled
     std::vector<LoopCtx> loops;
     std::vector<FinallyCtx*> finallys;
@@ -256,10 +282,275 @@ void forEachChild(const Node& n, F&& visit)
     }
 }
 
+/// Where in the tree being compiled every name is mentioned from inside a function, made by one walk of the whole tree:
+/// which names functions nested in some part of it mention is then a look at the mentions numbered within that part,
+/// rather than a set of names made for every function and merged into every function around it.
+///
+/// Nodes are numbered in the order the walk meets them, so a part of the tree is a range of numbers. A name counts for
+/// a part when a function node inside the part (or the part itself) encloses the mention. `this`, `super` and
+/// `new.target` count only through arrow functions: the outermost function node inside the part must be an arrow, and
+/// none between it and the mention a plain function. These are the rules `collectNames` and `collectCaptured` follow.
+struct CaptureIndex
+{
+    struct Mention
+    {
+        std::uint32_t at;
+        std::uint32_t fn;  ///< the number of the innermost function node around it, plus one; 0 for none
+        std::uint32_t id;  ///< which name
+    };
+    /// `this`, `super` and `new.target` (as the names `this`, ` ctor`, ` nt`), with no plain function between the
+    /// mention and an arrow or class around it: the others never count.
+    struct ThisMention
+    {
+        std::uint32_t at;
+        std::uint32_t plain;  ///< the number of the innermost plain function around it, plus one; 0 for none
+        std::uint32_t chainBegin, chainEnd;  ///< in `chain`: the arrows and classes inside that, outermost first
+    };
+    struct Part
+    {
+        const Node* node;
+        std::uint32_t begin, end;
+        bool operator<(const Part& o) const noexcept { return std::less<const Node*>()(node, o.node); }
+    };
+    /// Every mention of a name in the order of the walk: what a part mentions is a stretch of this.
+    std::vector<Mention> order;
+    /// The same, name by name: those of name `id` are `byName[firstOf[id]]` up to `firstOf[id + 1]`.
+    std::vector<Mention> byName;
+    std::vector<std::uint32_t> firstOf;
+    std::vector<StringView> nameOf;
+    std::vector<ThisMention> thisMentions[3];  ///< `this`, ` ctor`, ` nt`
+    std::vector<std::uint32_t> chain;  ///< a function node's number times two, plus one for an arrow
+    /// The parts of the tree a compile asks about, by node: the root, and every function, its body and its parameters.
+    std::vector<Part> parts;
+    const Node* root = nullptr;
+    bool built = false;
+
+    void build(const Node& top)
+    {
+        built = true;
+        Walk walk{*this};
+        walk.visit(top);
+        parts.push_back({&top, 0, walk.next});
+        std::sort(parts.begin(), parts.end());
+        firstOf.assign(nameOf.size() + 1, 0);
+        for (const Mention& m : order)
+            ++firstOf[m.id + 1];
+        for (std::size_t i = 1; i < firstOf.size(); ++i)
+            firstOf[i] += firstOf[i - 1];
+        byName.resize(order.size());
+        std::vector<std::uint32_t> fill(firstOf.begin(), firstOf.end() - 1);
+        for (const Mention& m : order)
+            byName[fill[m.id]++] = m;
+        table_ = {};
+    }
+    /// The part `n` of the tree, if the walk numbered it.
+    const Part* partOf(const Node& n) const
+    {
+        auto it = std::lower_bound(parts.begin(), parts.end(), Part{&n, 0, 0});
+        return it != parts.end() && it->node == &n ? &*it : nullptr;
+    }
+    /// Every name mentioned in a part, each once, in the order first met.
+    void namesIn(const Part& part, std::vector<StringView>& out)
+    {
+        stamps_.resize(nameOf.size(), 0);
+        ++stamp_;
+        auto m = std::lower_bound(order.begin(), order.end(), part.begin, [](const Mention& x, std::uint32_t at) { return x.at < at; });
+        for (; m != order.end() && m->at < part.end; ++m) {
+            if (stamps_[m->id] != stamp_) {
+                stamps_[m->id] = stamp_;
+                out.push_back(nameOf[m->id]);
+            }
+        }
+    }
+    bool mentioned(StringView name, std::uint32_t begin, std::uint32_t end) const
+    {
+        const int self = name == u"this" ? 0 : name == u" ctor" ? 1 : name == u" nt" ? 2 : -1;
+        if (self >= 0)
+            return mentionedThis(thisMentions[self], begin, end);
+        const std::uint32_t id = find(name);
+        if (id == kNone)
+            return false;
+        auto m = std::lower_bound(byName.begin() + firstOf[id], byName.begin() + firstOf[id + 1], begin,
+                                  [](const Mention& x, std::uint32_t at) { return x.at < at; });
+        for (; m != byName.begin() + firstOf[id + 1] && m->at < end; ++m) {
+            if (m->fn > begin)
+                return true;
+        }
+        return false;
+    }
+
+private:
+    static constexpr std::uint32_t kNone = ~std::uint32_t(0);
+    std::vector<std::uint32_t> stamps_;
+    std::uint32_t stamp_ = 0;
+    /// Name to number while the walk goes: open addressing, the hash and the number in each slot.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> table_;
+    std::unordered_map<StringView, std::uint32_t> ids_;  ///< after the walk, for the few names asked about
+
+    static std::uint64_t hashOf(StringView s) noexcept
+    {
+        std::uint64_t h = 0xcbf29ce484222325ull ^ s.size();
+        for (Char c : s)
+            h = (h ^ c) * 0x100000001b3ull;
+        return h | 1;
+    }
+    std::uint32_t find(StringView name) const
+    {
+        auto it = ids_.find(name);
+        return it == ids_.end() ? kNone : it->second;
+    }
+    std::uint32_t idOf(StringView name)
+    {
+        if (table_.empty())
+            table_.assign(1024, {0, 0});
+        if (nameOf.size() * 2 >= table_.size()) {
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> old(table_.size() * 2, {0, 0});
+            old.swap(table_);
+            for (const auto& e : old) {
+                if (!e.first)
+                    continue;
+                std::size_t i = e.first & (table_.size() - 1);
+                while (table_[i].first)
+                    i = (i + 1) & (table_.size() - 1);
+                table_[i] = e;
+            }
+        }
+        const std::uint64_t h = hashOf(name);
+        std::size_t i = h & (table_.size() - 1);
+        for (;; i = (i + 1) & (table_.size() - 1)) {
+            if (!table_[i].first)
+                break;
+            if (table_[i].first == h && nameOf[table_[i].second] == name)
+                return table_[i].second;
+        }
+        const auto id = std::uint32_t(nameOf.size());
+        table_[i] = {h, id};
+        nameOf.push_back(name);
+        ids_.emplace(name, id);
+        return id;
+    }
+    bool mentionedThis(const std::vector<ThisMention>& all, std::uint32_t begin, std::uint32_t end) const
+    {
+        auto m = std::lower_bound(all.begin(), all.end(), begin, [](const ThisMention& x, std::uint32_t at) { return x.at < at; });
+        for (; m != all.end() && m->at < end; ++m) {
+            if (m->plain > begin)
+                continue;
+            for (std::uint32_t i = m->chainBegin; i < m->chainEnd; ++i) {
+                if ((chain[i] >> 1) >= begin) {
+                    if (chain[i] & 1)
+                        return true;
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+
+    struct Walk
+    {
+        CaptureIndex& index;
+        std::uint32_t next = 0;
+        std::vector<std::pair<std::uint32_t, NK>> fns;  ///< the function nodes around, by number
+
+        void mention(StringView name, std::uint32_t at)
+        {
+            index.order.push_back({at, fns.empty() ? 0 : fns.back().first + 1, index.idOf(name)});
+        }
+        void thisMention(int which, std::uint32_t at)
+        {
+            std::size_t k = fns.size();
+            while (k > 0 && fns[k - 1].second != NK::FunctionExpr)
+                --k;
+            if (k == fns.size())
+                return;
+            const auto begin = std::uint32_t(index.chain.size());
+            for (std::size_t i = k; i < fns.size(); ++i)
+                index.chain.push_back(fns[i].first * 2 + (fns[i].second == NK::ArrowExpr ? 1 : 0));
+            index.thisMentions[which].push_back({at, k ? fns[k - 1].first + 1 : 0, begin, std::uint32_t(index.chain.size())});
+        }
+        void part(const Node& n)
+        {
+            const std::uint32_t begin = next;
+            visit(n);
+            index.parts.push_back({&n, begin, next});
+        }
+        void visit(const Node& n)
+        {
+            checkNativeStack();
+            const std::uint32_t at = next++;
+            switch (n.kind) {
+                case NK::Identifier:
+                    mention(n.text, at);
+                    break;
+                case NK::ThisExpr:
+                    thisMention(0, at);
+                    break;
+                case NK::SuperExpr:
+                    thisMention(0, at);
+                    thisMention(1, at);
+                    thisMention(2, at);
+                    break;
+                case NK::NewTarget:
+                    thisMention(2, at);
+                    break;
+                default:
+                    break;
+            }
+            if (n.kind == NK::Member) {
+                if (n.a)
+                    visit(*n.a);
+                if (n.computed && n.b)
+                    visit(*n.b);
+                return;
+            }
+            if (n.kind == NK::Property && !n.computed && n.propKind != PropKind::Spread) {
+                if (n.b)
+                    visit(*n.b);
+                return;
+            }
+            const bool fn = n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr;
+            if (fn)
+                fns.push_back({at, n.kind});
+            for (const NodePtr* p : {&n.a, &n.b, &n.c, &n.d}) {
+                if (*p)
+                    fn ? part(**p) : visit(**p);
+            }
+            for (const NodePtr& kid : n.list) {
+                if (kid)
+                    fn ? part(*kid) : visit(*kid);
+            }
+            if (fn) {
+                fns.pop_back();
+                index.parts.push_back({&n, at, next});
+            }
+        }
+    };
+};
+
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+bool checkNames();
+#endif
+
+bool Captured::count(StringView name) const
+{
+    bool found = names_.count(name);
+    for (const Region& r : regions_)
+        found = found || r.index->mentioned(name, r.begin, r.end);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (checkNames() && !regions_.empty() && found != (checked.count(name) || names_.count(name))) {
+        std::fprintf(stderr, "SCRIPT_CHECK_NAMES: '%s' captured %d by the index, %d by the walk\n", toUtf8(name).c_str(), int(found),
+                     int(!found));
+        std::abort();
+    }
+#endif
+    return found;
+}
+
 /// What the passes below work out for a whole function, kept for the compile of one program: compiling each function
 /// asks about everything nested in it, so without this a function nested d deep is looked at d times.
 struct Analysis
 {
+    CaptureIndex captures;
     std::unordered_map<const Node*, NameSet> names[2];         ///< collectNames of a function node, by `inArrow`
     std::unordered_map<const Node*, bool> eval;                   ///< containsDirectEval of a function node
     std::unordered_map<const Node*, std::vector<std::pair<StringView, int>>> writes;  ///< SelfBound's counts for a nested function node, by name
@@ -363,6 +654,43 @@ void collectNamesUncached(const Node& n, NameSet& out, bool inArrow)
         return;
     }
     forEachChild(n, [&](const Node& kid) { collectNames(kid, out, inArrow); });
+}
+
+/// The compile's index of names, made the first time it is asked for; null where there is none to make.
+CaptureIndex* captureIndex()
+{
+    if (!gAnalysis || !gAnalysis->captures.root)
+        return nullptr;
+    CaptureIndex& index = gAnalysis->captures;
+    if (!index.built)
+        index.build(*index.root);
+    return &index;
+}
+
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+bool checkNames()
+{
+    static const bool check = std::getenv("SCRIPT_CHECK_NAMES") != nullptr;
+    return check;
+}
+#endif
+
+void collectCaptured(const Node& n, NameSet& out);
+
+/// Names captured by functions nested inside `n`, into a function's set: from the index, for a part of the tree it has.
+void collectCaptured(const Node& n, Captured& out)
+{
+    if (CaptureIndex* index = captureIndex()) {
+        if (const auto* part = index->partOf(n)) {
+            out.addRegion(index, part->begin, part->end);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (checkNames())
+                collectCaptured(n, out.checked);
+#endif
+            return;
+        }
+    }
+    collectCaptured(n, out.names());
 }
 
 /// Names captured by functions nested inside `n`, not entering `n` itself.
@@ -544,6 +872,22 @@ bool namedInNested(const Node& n, StringView name, bool inside)
 {
     checkNativeStack();
     if (inside && (n.kind == NK::FunctionExpr || n.kind == NK::ArrowExpr || n.kind == NK::ClassExpr)) {
+        if (CaptureIndex* index = captureIndex()) {
+            if (const auto* part = index->partOf(n)) {
+                const bool found = index->mentioned(name, part->begin, part->end);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+                if (checkNames()) {
+                    NameSet names;
+                    collectNames(n, names, n.kind == NK::ArrowExpr);
+                    if (found != (names.count(name) != 0)) {
+                        std::fprintf(stderr, "SCRIPT_CHECK_NAMES: namedInNested '%s' differs\n", toUtf8(name).c_str());
+                        std::abort();
+                    }
+                }
+#endif
+                return found;
+            }
+        }
         NameSet names;
         collectNames(n, names, n.kind == NK::ArrowExpr);
         return names.count(name) != 0;
@@ -702,6 +1046,7 @@ public:
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
 
         checkDeclarations(node.list, true);
+        analysis_.captures.root = &node;
         collectCaptured(node, fs.captured);
         fs.boxAll = containsDirectEval(node);
         if (fs.boxAll)
@@ -729,6 +1074,7 @@ public:
         const StrictScope inherited(*this, lazy.strict);
         resumed_ = &lazy;
         resumedUpvals_ = &upvals;
+        analysis_.captures.root = &node;
         function(node, lazy.name);
         fn_ = nullptr;
         return outer.code->children.back();
@@ -773,6 +1119,7 @@ public:
         const StrictScope strictProgram(*this, hasUseStrict(node));
         fs.code->sloppyThis = sloppyThis_ && strictDepth_ == 0;
         checkDeclarations(node.list, true);
+        analysis_.captures.root = &node;
         collectCaptured(node, fs.captured);
         fs.boxAll = containsDirectEval(node);
         fs.completionSlot = hiddenSlot();
@@ -1226,8 +1573,28 @@ private:
         lazy->line = node.line;
         lazy->isDeclaration = !node.namedExpr && !node.text.empty();
         lazy->strict = inStrictCode();
-        NameSet names;
-        collectNames(node, names, false);
+        std::vector<StringView> names;
+        CaptureIndex* index = captureIndex();
+        const auto* part = index ? index->partOf(node) : nullptr;
+        if (part) {
+            index->namesIn(*part, names);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (checkNames()) {
+                NameSet walked;
+                collectNames(node, walked, false);
+                std::vector<StringView> a(names), b(walked.begin(), walked.end());
+                std::sort(a.begin(), a.end());
+                if (a != b) {
+                    std::fprintf(stderr, "SCRIPT_CHECK_NAMES: lazy stub names differ (%zu, %zu)\n", a.size(), b.size());
+                    std::abort();
+                }
+            }
+#endif
+        } else {
+            NameSet walked;
+            collectNames(node, walked, false);
+            names.assign(walked.begin(), walked.end());
+        }
         for (StringView n : names) {
             // The function's own variable it reads as the callee, and holds no cell of.
             if (n == StringView(lazy->selfName))

@@ -322,6 +322,7 @@ void installArray(Runtime& rt)
     rt.methodFast(ctor, "isArray", [](Runtime& rt2, const Value&, const Value* args, std::size_t argc) {
         return Value(isArray(rt2, argc ? args[0] : Value::undefined()));
     }, 1);
+    rt.intrinsics[Runtime::ArrayIsArray].reset(detail::Access::ptr(ctor->findOwn(rt.intern("isArray"))->value));
 
     rt.method(ctor, "of", [](CallInfo& ci) { return rtOf(ci).makeArray(ci.args()); }, 0);
 

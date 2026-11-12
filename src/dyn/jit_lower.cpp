@@ -6708,7 +6708,7 @@ private:
                           (which == Runtime::StringCharCodeAt && argc == 1) ||
                           (which == Runtime::StringFromCharCode && argc == 1) || (which == Runtime::FunctionApply && argc == 2) ||
                           ((which == Runtime::MapGet || which == Runtime::MapHas || which == Runtime::SetHas || which == Runtime::SetAdd) && argc == 1) ||
-                          (which == Runtime::MapSet && argc == 2);
+                          (which == Runtime::MapSet && argc == 2) || (which == Runtime::ArrayIsArray && argc == 1);
         const bool loops = ((which == Runtime::ArrayForEach || which == Runtime::ArrayMap || which == Runtime::ArrayFilter) && (argc == 1 || argc == 2)) ||
                            (which == Runtime::ArrayReduce && argc == 2);
         if (!fits && !loops)
@@ -6772,6 +6772,34 @@ private:
                     coldCall(which == Runtime::MapGet ? reinterpret_cast<void*>(&scriptDynMapGet) : reinterpret_cast<void*>(&scriptDynMapHas),
                              {rt, cell, keyTag, keyBits}, r, t, true, popped);
                 }
+                return true;
+            }
+            case Runtime::ArrayIsArray: {
+                // An object of the array class is one; a proxy asks what it stands for, the long way; anything else is not.
+                const Entry& x = args[0];
+                IrInst& tag = inst(IrOp::MovImm);
+                tag.d = t;
+                tag.imm = std::int64_t(Type::Bool);
+                IrInst& no = inst(IrOp::MovImm);
+                no.d = r;
+                no.imm = 0;
+                if (x.rep != Rep::Tagged || x.isConst || (x.hasKnownTag && x.known != Type::Object))
+                    return true;
+                const std::int32_t done = newLabel();
+                if (!x.hasKnownTag)
+                    branchCmp(x.t, IrCond::Ne, std::int64_t(Type::Object), done);
+                const std::int32_t kind = load(x.r, kCellKindOffset, 1, false, kAliasHeader);
+                branchCmp(kind, IrCond::Ne, std::int64_t(CellKind::Object), done);
+                const std::int32_t cls = load(x.r, kClsOffset, 1, false, kAliasHeader);
+                branchCmp(cls, IrCond::Eq, std::int64_t(ObjClass::Proxy), generic);
+                IrInst& yes = inst(IrOp::Cset);
+                yes.d = r;
+                yes.a = cls;
+                yes.hasImm = true;
+                yes.imm = std::int64_t(ObjClass::Array);
+                yes.cond = IrCond::Eq;
+                yes.width = 32;
+                inst(IrOp::Label).imm = done;
                 return true;
             }
             case Runtime::StringFromCharCode: {

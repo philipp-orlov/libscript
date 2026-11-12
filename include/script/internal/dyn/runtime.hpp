@@ -186,6 +186,7 @@ struct Runtime : EngineRuntime
         SetHas,
         Eval,
         PromiseThen,
+        ArrayIsArray,
         IntrinsicCount
     };
     Ref<GCObject> intrinsics[IntrinsicCount];

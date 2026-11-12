@@ -500,3 +500,27 @@ TEST(aPatternStartingWithOneUnitIsSearchedForIt)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3000 false 20 aa-aaaaaaaaaaa-aaa 16 12 12 3010 3000 0 -1 1 3003"));
     }
 }
+
+TEST(arrayIsArrayInNativeCodeAsksAProxyTheLongWay)
+{
+    // Array.isArray done in native code: an array is one, a proxy is asked (and a revoked one throws), the rest are not.
+    const char* program =
+        "var out = [], vals = [[], [1], {}, 'x', 5, null, undefined, new Proxy([], {}), new Proxy({}, {}), new Uint8Array(2), function () {}, Object.create(Array.prototype), (function () { return arguments; })()];"
+        "function f(v) { return Array.isArray(v); }"
+        "var s = ''; for (var k = 0; k < 5000; k++) s = vals.map(f).join('');"
+        "out.push(s, Array.isArray(), Array.isArray.call(null, []), Array.isArray([], 1));"
+        "var rev = Proxy.revocable([], {}); rev.revoke(); try { Array.isArray(rev.proxy); } catch (e) { out.push(e.constructor.name); }"
+        "for (var k = 0; k < 3000; k++) { try { f(rev.proxy); } catch (e) { s = e.constructor.name; } } out.push(s);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("truetruefalsefalsefalsefalsefalsetruefalsefalsefalsefalsefalse false true true TypeError TypeError"));
+    }
+}

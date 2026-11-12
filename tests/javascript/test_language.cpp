@@ -2838,3 +2838,27 @@ TEST(aLocalGivenOnlyNumbersStaysANumberAndFindsOutOtherwise)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("99,number,0.4 61,string,NaN 63,number,0.4 66,number,-Infinity 67,number,1e-10 69,number,NaN 700/7 0/q 100/1.5 0/0 0/undefined"));
     }
 }
+
+TEST(typeofAndNamesCompareByPointerInNativeCode)
+{
+    // Strict equality with a string constant: another interned string is equal only if it is the same; no string at all
+    // is not equal; a string made at run time is compared by its text.
+    const char* program =
+        "var out = [];"
+        "function kind(x) { switch (typeof x) { case 'undefined': return 0; case 'object': return x ? 1 : 2; case 'number': return 3; case 'string': return 4; case 'boolean': return 5; case 'function': return 6; default: return 7; } }"
+        "function nm(s) { if (s === 'alpha') return 1; if (s !== 'beta') return 2; return 3; }"
+        "var t = 0; for (var i = 0; i < 20000; i++) t += kind([1, 'a', null, {}, undefined, true, kind, Symbol()][i & 7]) + nm(['alpha', 'beta', 'gam' + 'ma', 'al' + 'pha', 5, null][i % 6]);"
+        "out.push(t, nm('al' + 'pha'), nm('be' + 'ta'), nm(1), kind(1n));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("106667 1 3 2 7"));
+    }
+}

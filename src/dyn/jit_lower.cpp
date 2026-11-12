@@ -8245,6 +8245,69 @@ private:
             push(boolEntry(d));
             return;
         }
+        // Strictly against a string constant the table holds, `typeof x === "number"` and a `switch` over names above all:
+        // another string the table holds is equal only if it is the same one; no string at all is not equal. A string
+        // made at run time asks the helper.
+        const auto internedConst = [](const Entry& e) -> const StringCell* {
+            if (!e.isConst || e.rep != Rep::Tagged || !e.hasKnownTag || e.known != Type::String)
+                return nullptr;
+            const auto* cell = reinterpret_cast<const StringCell*>(e.bits);
+            return cell && cell->interned ? cell : nullptr;
+        };
+        if (strict && (internedConst(a) != nullptr) != (internedConst(b) != nullptr)) {
+            const Entry& constant = internedConst(a) ? a : b;
+            const Entry& other = internedConst(a) ? b : a;
+            const std::int32_t want = ptrReg(internedConst(constant));
+            const std::int32_t tag = tagReg(other);
+            const std::int32_t payload = payloadReg(other);
+            const std::int32_t done = newLabel();
+            const std::int32_t slow = newLabel();
+            const std::int32_t notString = newLabel();
+            branchCmp(tag, IrCond::Ne, std::int64_t(Type::String), notString);
+            {
+                IrInst& same = inst(IrOp::Cset);
+                same.d = d;
+                same.a = payload;
+                same.b = want;
+                same.cond = wantEqual ? IrCond::Eq : IrCond::Ne;
+                same.width = 64;
+            }
+            {
+                IrInst& same = inst(IrOp::BrCmp);
+                same.a = payload;
+                same.b = want;
+                same.cond = IrCond::Eq;
+                same.width = 64;
+                same.target = done;
+            }
+            const std::int32_t interned = load(payload, kStringInternedOffset, 1, false, kAliasHeader);
+            branchCmp(interned, IrCond::Ne, 0, done);
+            inst(IrOp::Br).imm = slow;
+            inst(IrOp::Label).imm = notString;
+            IrInst& no = inst(IrOp::MovImm);
+            no.d = d;
+            no.imm = wantEqual ? 0 : 1;
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdBegin);
+            inst(IrOp::Label).imm = slow;
+            {
+                const std::int32_t ct = tagReg(constant);
+                const std::int32_t same = fn_.newVreg(false);
+                coldCall(reinterpret_cast<void*>(&scriptDynStrictEquals), {tag, payload, ct, want}, same, -1, false);
+                IrInst& set = inst(IrOp::Xor);
+                set.d = d;
+                set.a = same;
+                set.hasImm = true;
+                set.imm = wantEqual ? 0 : 1;
+                set.width = 32;
+            }
+            inst(IrOp::Br).imm = done;
+            inst(IrOp::ColdEnd);
+            inst(IrOp::Label).imm = done;
+            release(other);
+            push(boolEntry(d));
+            return;
+        }
         const std::int32_t ta = tagReg(a);
         const std::int32_t pa = payloadReg(a);
         const std::int32_t tb = tagReg(b);

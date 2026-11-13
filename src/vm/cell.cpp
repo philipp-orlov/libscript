@@ -340,7 +340,9 @@ void VM::releaseRoots() noexcept
     symbolRegistry.clear();
     for (Key* k : {&atoms.length, &atoms.prototype, &atoms.constructor, &atoms.name, &atoms.value, &atoms.done, &atoms.next,
                    &atoms.symIterator, &atoms.symAsyncIterator, &atoms.symToPrimitive, &atoms.symToStringTag,
-                   &atoms.symHasInstance, &atoms.symSpecies}) {
+                   &atoms.symHasInstance, &atoms.symSpecies, &atoms.lastIndex, &atoms.index, &atoms.input,
+                   &atoms.groups, &atoms.indices, &atoms.symMatch, &atoms.symMatchAll, &atoms.symReplace, &atoms.symSearch,
+                   &atoms.symSplit}) {
         if (*k)
             detail::decRef(*k);
         *k = nullptr;
@@ -369,7 +371,7 @@ void VM::releaseRoots() noexcept
     }
     for (JSObject** p : {&protos.object, &protos.function, &protos.array, &protos.number, &protos.string, &protos.boolean,
                          &protos.symbol, &protos.bigint, &protos.generator, &protos.iterator,
-                          &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet}) {
+                          &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet, &protos.regexp}) {
         if (*p)
             detail::decRef(reinterpret_cast<CellPtr>(*p));
         *p = nullptr;

@@ -372,7 +372,10 @@ void installSymbolAndIterators(VM& vm)
     };
     for (const Well& w : {Well{"iterator", vm.atoms.symIterator}, Well{"asyncIterator", vm.atoms.symAsyncIterator},
                           Well{"toPrimitive", vm.atoms.symToPrimitive}, Well{"toStringTag", vm.atoms.symToStringTag},
-                          Well{"hasInstance", vm.atoms.symHasInstance}, Well{"species", vm.atoms.symSpecies}}) {
+                          Well{"hasInstance", vm.atoms.symHasInstance}, Well{"species", vm.atoms.symSpecies},
+                          Well{"match", vm.atoms.symMatch}, Well{"matchAll", vm.atoms.symMatchAll},
+                          Well{"replace", vm.atoms.symReplace}, Well{"search", vm.atoms.symSearch},
+                          Well{"split", vm.atoms.symSplit}}) {
         retain(JSValue::cell(w.key));
         value(vm, ctor, w.name, JSValue::cell(w.key), 0);
     }

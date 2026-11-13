@@ -55,6 +55,11 @@ struct Atoms
     Key value = nullptr;
     Key done = nullptr;
     Key next = nullptr;
+    Key lastIndex = nullptr;
+    Key index = nullptr;
+    Key input = nullptr;
+    Key groups = nullptr;
+    Key indices = nullptr;
     // The well-known symbols; each holds a count.
     Key symIterator = nullptr;
     Key symAsyncIterator = nullptr;
@@ -62,6 +67,11 @@ struct Atoms
     Key symToStringTag = nullptr;
     Key symHasInstance = nullptr;
     Key symSpecies = nullptr;
+    Key symMatch = nullptr;
+    Key symMatchAll = nullptr;
+    Key symReplace = nullptr;
+    Key symSearch = nullptr;
+    Key symSplit = nullptr;
 };
 
 /// The prototypes of what a primitive is read through. Null until something installs them; a property read on a
@@ -83,6 +93,7 @@ struct Intrinsics
     JSObject* set = nullptr;
     JSObject* weakMap = nullptr;
     JSObject* weakSet = nullptr;
+    JSObject* regexp = nullptr;
 };
 
 /// One activation on the VM stack. `R` is its register window; register 0 is `this`, then the parameters. A function called

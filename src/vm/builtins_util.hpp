@@ -143,6 +143,12 @@ JSValue definePropertyFromDescriptor(VM& vm, JSObject* o, Key key, JSObject* des
 void installMore(VM& vm);
 /// Map, Set, WeakMap, WeakSet.
 void installCollections(VM& vm);
+/// A new RegExp object (a literal's, or `new RegExp`): owned, or the exception sentinel with a SyntaxError.
+JSValue newRegExp(VM& vm, StringView pattern, StringView flags);
+void installRegExp(VM& vm);
+/// If `pattern` is an object with a `Symbol.<which>` method, call it with (string, extra) and say so in `*handled`.
+JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, const JSValue* extra, std::uint32_t extraCount,
+                         bool* handled);
 /// A global property, taking the count of `v`.
 inline void defineGlobal(VM& vm, const char* name, JSValue v)
 {

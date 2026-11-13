@@ -55,6 +55,11 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     atoms.value = internKey("value");
     atoms.done = internKey("done");
     atoms.next = internKey("next");
+    atoms.lastIndex = internKey("lastIndex");
+    atoms.index = internKey("index");
+    atoms.input = internKey("input");
+    atoms.groups = internKey("groups");
+    atoms.indices = internKey("indices");
     {
         struct Well
         {
@@ -63,7 +68,10 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
         };
         for (const Well& w : {Well{&Atoms::symIterator, "Symbol.iterator"}, Well{&Atoms::symAsyncIterator, "Symbol.asyncIterator"},
                               Well{&Atoms::symToPrimitive, "Symbol.toPrimitive"}, Well{&Atoms::symToStringTag, "Symbol.toStringTag"},
-                              Well{&Atoms::symHasInstance, "Symbol.hasInstance"}, Well{&Atoms::symSpecies, "Symbol.species"}})
+                              Well{&Atoms::symHasInstance, "Symbol.hasInstance"}, Well{&Atoms::symSpecies, "Symbol.species"},
+                              Well{&Atoms::symMatch, "Symbol.match"}, Well{&Atoms::symMatchAll, "Symbol.matchAll"},
+                              Well{&Atoms::symReplace, "Symbol.replace"}, Well{&Atoms::symSearch, "Symbol.search"},
+                              Well{&Atoms::symSplit, "Symbol.split"}})
             atoms.*(w.slot) = [&] {
                 const std::string_view ascii(w.name);
                 const String text(ascii.begin(), ascii.end());

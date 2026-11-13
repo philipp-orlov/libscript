@@ -821,7 +821,13 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         case NK::Await: unsupported(n, "async functions");
         case NK::ClassExpr: return classExpr(n, dst, String());
         case NK::BigIntLit: unsupported(n, "BigInt");
-        case NK::RegExpLit: unsupported(n, "regular expressions");
+        case NK::RegExpLit: {
+            const std::uint16_t d = dest(dst);
+            const std::uint16_t pattern = constant(fromValue(vm_, ctx_.str(n.text)));
+            const std::uint16_t flags = constant(fromValue(vm_, ctx_.str(n.extra().strs[0])));
+            emit(Op::NewRegExp, d, pattern, flags);
+            return d;
+        }
         case NK::NewTarget: {
             if (fn_->isArrow || fn_->isProgram)
                 unsupported(n, "new.target here");

@@ -1707,6 +1707,14 @@ L_IterNext: {
     NEXT();
 }
 
+L_NewRegExp: {
+    fr->pc = pc;
+    JSValue r = bi::newRegExp(vm, asString(K[ins->b])->text(), asString(K[ins->c])->text());
+    if (r.isException())
+        FAIL();
+    SET(ins->a, r);
+    NEXT();
+}
 L_Yield: {
     auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
     JSValue out = R[ins->b];

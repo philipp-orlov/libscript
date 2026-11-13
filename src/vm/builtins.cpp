@@ -1325,6 +1325,13 @@ NATIVE(stringSplit)
     if (!thisString(vm, self, &s))
         return JSValue::exception();
     StringView text = asString(s.get())->text();
+    {
+        const JSValue extra[1] = {arg(args, argc, 1)};
+        bool handled;
+        JSValue r = callSymbolMethod(vm, arg(args, argc, 0), vm.atoms.symSplit, s.get(), extra, 1, &handled);
+        if (handled)
+            return r;
+    }
     JSArray* out = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(out));
     JSValue sepArg = arg(args, argc, 0);
@@ -1417,20 +1424,44 @@ NATIVE(stringPad)
     return makeString(vm, StringView(out));
 }
 
+JSValue stringReplaceText(VM& vm, const Handle& s, JSValue pat, JSValue replacement, bool all);
+
 NATIVE(stringReplace)
 {
     UNUSED();
     Handle s;
     if (!thisString(vm, self, &s))
         return JSValue::exception();
-    JSValue pat = arg(args, argc, 0);
-    if (!isString(pat))
-        return typeError(vm, "the vm core replaces only string patterns");
-    StringView text = asString(s.get())->text(), sub = asString(pat)->text();
+    const JSValue pat = arg(args, argc, 0);
     const bool all = data != nullptr;
+    if (all && isObject(pat) && asObject(pat)->cls() == ObjClass::RegExp) {
+        // `replaceAll` takes only a global RegExp.
+        Key flagsKey = vm.internKey(std::string_view("flags"));
+        JSValue flags = getProperty(vm, pat, flagsKey);
+        detail::decRef(flagsKey);
+        if (flags.isException())
+            return flags;
+        const bool global = isString(flags) && asString(flags)->text().find(u'g') != StringView::npos;
+        release(flags);
+        if (!global)
+            return typeError(vm, "replaceAll must be called with a global RegExp");
+    }
+    const JSValue extra[1] = {arg(args, argc, 1)};
+    bool handled;
+    JSValue r = callSymbolMethod(vm, pat, vm.atoms.symReplace, s.get(), extra, 1, &handled);
+    if (handled)
+        return r;
+    Handle text = Handle::adopt(toStringValue(vm, pat));
+    if (text.get().isException())
+        return JSValue::exception();
+    return stringReplaceText(vm, s, text.get(), arg(args, argc, 1), all);
+}
+
+JSValue stringReplaceText(VM& vm, const Handle& s, JSValue pat, JSValue replacement, bool all)
+{
+    StringView text = asString(s.get())->text(), sub = asString(pat)->text();
     String out;
     std::size_t from = 0;
-    JSValue replacement = arg(args, argc, 1);
     for (;;) {
         const std::size_t at = text.find(sub, from);
         if (at == StringView::npos)
@@ -1451,7 +1482,27 @@ NATIVE(stringReplace)
             JSValue rs = toStringValue(vm, replacement);
             if (rs.isException())
                 return rs;
-            out += asString(rs)->text();
+            const StringView templ = asString(rs)->text();
+            for (std::size_t i = 0; i < templ.size(); ++i) {
+                if (templ[i] != u'$' || i + 1 >= templ.size()) {
+                    out.push_back(templ[i]);
+                    continue;
+                }
+                const char16_t n = templ[i + 1];
+                if (n == u'$') {
+                    out.push_back(u'$');
+                } else if (n == u'&') {
+                    out += sub;
+                } else if (n == u'`') {
+                    out += text.substr(0, at);
+                } else if (n == u'\'') {
+                    out += text.substr(at + sub.size());
+                } else {
+                    out.push_back(u'$');
+                    continue;
+                }
+                ++i;
+            }
             release(rs);
         }
         from = at + sub.size();
@@ -1599,6 +1650,7 @@ struct JsonWriter
     String indent;
     String out;
     std::vector<JSObject*> stack;
+    Key toJson = nullptr;  ///< held for the length of the call
 };
 
 void jsonQuote(String& out, StringView s)
@@ -1648,9 +1700,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
     VM& vm = j.vm;
     Handle value = Handle::retained(input);
     if (isObject(value.get()) || isBigInt(value.get())) {
-        Key toJson = vm.internKey(std::string_view("toJSON"));
-        JSValue fn = getProperty(vm, value.get(), toJson);
-        detail::decRef(toJson);
+        JSValue fn = getProperty(vm, value.get(), j.toJson);
         if (fn.isException())
             return 0;
         Handle fnKeep = Handle::adopt(fn);
@@ -1709,14 +1759,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
     } else if (j.hasAllow) {
         keys = j.allow;
     } else {
-        JSValue self = v;
-        JSValue list = objectKeys(vm, JSValue::undefined(), &self, 1, nullptr);
-        if (list.isException())
-            return 0;
-        Handle keep = Handle::adopt(list);
-        auto* a = static_cast<JSArray*>(asObject(list));
-        for (std::uint32_t i = 0; i < a->length; ++i)
-            keys.push_back(Handle::retained(a->at(i)));
+        ownKeys(vm, o, true, false, true, keys);
     }
     bool wroteAny = false;
     j.out.push_back(array ? u'[' : u'{');
@@ -1763,7 +1806,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
             if (prop.isException())
                 return 0;
             Handle propKeep = Handle::adopt(prop);
-            const String before = j.out;
+            const std::size_t before = j.out.size();
             const bool hadAny = wroteAny;
             separator();
             jsonQuote(j.out, asString(name.get())->text());
@@ -1774,7 +1817,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
             if (r == 0)
                 return 0;
             if (r == 2) {
-                j.out = before;
+                j.out.resize(before);
                 wroteAny = hadAny;
             }
         }
@@ -1792,7 +1835,13 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
 NATIVE(jsonStringify)
 {
     UNUSED();
-    JsonWriter j{vm, {}, {}, false, {}, {}, {}, {}};
+    JsonWriter j{vm, {}, {}, false, {}, {}, {}, {}, nullptr};
+    j.toJson = vm.internKey(std::string_view("toJSON"));
+    struct Release
+    {
+        Key k;
+        ~Release() { detail::decRef(k); }
+    } releaseKey{j.toJson};
     const JSValue replacer = arg(args, argc, 1);
     if (isFunction(replacer)) {
         j.replacerFn = Handle::retained(replacer);
@@ -2578,6 +2627,7 @@ void VM::installBuiltins()
     installSymbolAndIterators(*this);
     installMore(*this);
     installCollections(*this);
+    installRegExp(*this);
 }
 
 namespace bi {

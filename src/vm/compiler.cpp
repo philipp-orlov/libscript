@@ -135,8 +135,10 @@ void collectCaptured(const Node& n, std::set<String>& out, bool nested, bool arr
     if (n.kind == NK::NewTarget && nested && arrowChain)
         out.insert(String(u"%newtarget"));
     // A direct `eval` can name any variable around it, so none of them may live in a bare register.
-    if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval")
+    if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval") {
         out.insert(String(u"%all"));
+        out.insert(String(u"%newtarget"));
+    }
     // `super()` in an arrow function needs the constructor around it and its new.target.
     if (n.kind == NK::Call && n.a && n.a->kind == NK::SuperExpr && nested && arrowChain) {
         out.insert(String(u"%callee"));
@@ -233,6 +235,22 @@ void collectVars(const Node& n, std::vector<String>& out)
             break;
         default: break;
     }
+}
+
+/// Whether `arguments` is read by the code of `n`, in arrow functions too, which have none of their own.
+bool containsArguments(const Node& n)
+{
+    if (n.kind == NK::FunctionExpr)
+        return false;
+    if (n.kind == NK::Identifier && n.text == u"arguments")
+        return true;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child && containsArguments(**child))
+            return true;
+    for (const dyn::NodePtr& child : n.list)
+        if (child && containsArguments(*child))
+            return true;
+    return false;
 }
 
 bool mentions(const Node& n, const String& name)
@@ -753,6 +771,13 @@ private:
     void closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, std::uint16_t reg, bool isCatch = false);
 
     std::vector<String> pendingLabels_;
+    /// While a parameter's default is worked out: the parameters not yet initialised, which may not be read.
+    struct ParamTdz
+    {
+        const Fn* fn = nullptr;
+        std::map<String, std::size_t> index;
+        std::size_t current = 0;
+    } paramTdz_;
     bool loopGuard_ = false;  ///< the next loop body sits inside the iterator-closing guard of a `for...of`
 
     CodeBlock* compileFunction(const Node& n, const String& name);
@@ -871,8 +896,25 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             return d;
         }
         case NK::Identifier:
+            if (paramTdz_.fn == fn_) {
+                const auto it = paramTdz_.index.find(n.text);
+                if (it != paramTdz_.index.end() && it->second >= paramTdz_.current) {
+                    const std::uint16_t d = dest(dst);
+                    emit(Op::ThrowError, std::uint32_t(ErrorCode::ReferenceError),
+                         constant(fromValue(vm_, ctx_.str(StringView(u"Cannot access '" + n.text + u"' before initialization")))));
+                    emit(Op::LoadUndef, d);
+                    return d;
+                }
+            }
             if (n.isPrivate && resolve(n.text).kind == Ref::Global)
                 syntaxError(n, "Private field '" + toUtf8(n.text) + "' must be declared in an enclosing class");
+            if (fn_->strict && !n.isPrivate)
+                for (const char* word : {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"})
+                    if (n.text == fromUtf8(word))
+                        syntaxError(n, "Unexpected strict mode reserved word");
+            // A field initialiser has no `arguments`, and eval code in one may not name it.
+            if (fn_->isEval && n.text == u"arguments" && resolve(n.text).kind == Ref::Global && resolve(String(u"%noargs")).kind != Ref::Global)
+                syntaxError(n, "'arguments' is not allowed in class field initializer or static initialization block");
             return loadVar(n.text, dst, n);
         case NK::ThisExpr: {
             checkThisBound(n);
@@ -921,29 +963,53 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         case NK::Spread: unsupported(n, "spread");
         case NK::Yield: {
             if (!(fn_->block->flags & CodeBlock::kGenerator))
-                unsupported(n, "yield here");
+                syntaxError(n, "Yield expression not allowed in formal parameter or static block");
             const std::uint16_t mark = fn_->top;
             const std::uint16_t d = dest(dst);
             const std::uint16_t inner = fn_->top;
             const bool asyncGen = (fn_->block->flags & CodeBlock::kAsyncGen) != 0;
             if (n.prefix && asyncGen) {
-                // `yield*` in an async generator: over an async iterator (or a sync one made to look like it).
+                // `yield*` in an async generator: the inner iterator's results are awaited, and what comes out is each value.
                 const std::uint16_t src = exprAny(*n.a);
                 const std::uint16_t it = temps(2);
+                const std::uint16_t recv = temps(2);
                 const std::uint16_t res = temp();
+                const std::uint16_t flag = temp();
                 const std::uint16_t v = temp();
-                const std::uint16_t sent = temp();
-                Label top, done;
+                Label top, finished, noReturn, end, proceed;
                 emit(Op::AsyncIterInit, it, src);
+                emit(Op::LoadUndef, recv);
+                loadNumber(std::uint16_t(recv + 1), 0);
                 bind(top);
-                emit(Op::AsyncIterNext, res, it);
+                emit(Op::DelegateCallAsync, res, it, recv);
+                emitJump(Op::JHole, res, noReturn);
                 emit(Op::Await, res, res);
-                emit(Op::IterUnpack, v, res);
-                emitJump(Op::JHole, v, done);
-                emit(Op::Yield, sent, v);
+                emit(Op::DelegateDone, flag, res);
+                emitJump(Op::JTrue, flag, finished);
+                // An iterator without `throw` was closed and its answer awaited: that is the TypeError.
+                loadNumber(flag, 3);
+                emit(Op::StrictEq, flag, std::uint16_t(recv + 1), flag);
+                emitJump(Op::JFalse, flag, proceed);
+                emit(Op::ThrowError, std::uint32_t(ErrorCode::TypeError), constant(fromValue(vm_, ctx_.str("The iterator does not provide a 'throw' method"))));
+                bind(proceed);
+                emitCached(Op::GetProp, v, res, atom(String(u"value")));
+                emit(Op::YieldDelegate, recv, v, 1);
                 jump(top);
-                bind(done);
-                emit(Op::LoadUndef, d);
+                bind(finished);
+                emitCached(Op::GetProp, v, res, atom(String(u"value")));
+                loadNumber(flag, 2);
+                emit(Op::StrictEq, flag, std::uint16_t(recv + 1), flag);
+                emitJump(Op::JFalse, flag, end);
+                emit(Op::Await, v, v);
+                emitFinallyFor(0);
+                emitReturn(v);
+                bind(noReturn);
+                emit(Op::Mov, v, recv);
+                emit(Op::Await, v, v);
+                emitFinallyFor(0);
+                emitReturn(v);
+                bind(end);
+                emit(Op::Mov, d, v);
             } else if (n.prefix) {
                 // `yield*`: each resumption goes to the inner iterator's next, throw or return, whose result is given out as
                 // it is; when it says it is done its value is the value of the expression (or, for a return, the return).
@@ -996,7 +1062,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         }
         case NK::Await: {
             if (!(fn_->block->flags & CodeBlock::kAsync))
-                unsupported(n, "await here");
+                syntaxError(n, "await is only valid in async functions");
             const std::uint16_t mark = fn_->top;
             const std::uint16_t d = dest(dst);
             const std::uint16_t inner = fn_->top;
@@ -1025,10 +1091,10 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         }
         case NK::NewTarget: {
             if (fn_->isProgram)
-                unsupported(n, "new.target here");
+                syntaxError(n, "new.target expression is not allowed here");
             if (fn_->isArrow) {
                 if (resolve(String(u"%newtarget")).kind == Ref::Global)
-                    unsupported(n, "new.target here");
+                    syntaxError(n, "new.target expression is not allowed here");
                 return loadVar(String(u"%newtarget"), dst, n);
             }
             const std::uint16_t d = dest(dst);
@@ -1229,6 +1295,8 @@ void Compiler::checkClassMembers(const Node& n)
 {
     bool hasConstructor = false;
     for (const dyn::NodePtr& m : n.list) {
+        if ((m->kind == NK::FieldDef && m->b && containsArguments(*m->b)) || (m->kind == NK::StaticBlock && m->d && containsArguments(*m->d)))
+            syntaxError(*m, "'arguments' is not allowed in class field initializer or static initialization block");
         if ((m->kind != NK::MethodDef && m->kind != NK::FieldDef) || m->computed || m->isPrivate || !m->a)
             continue;
         const bool isCtorName = m->a->text == u"constructor";
@@ -1508,6 +1576,18 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
         if (isCaptured(String(u"this"))) {
             Binding& b = declare(String(u"this"), BKind::Var);
             emit(Op::Mov, b.reg, 0);
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+        }
+        if (isCaptured(String(u"%newtarget"))) {
+            Binding& b = declare(String(u"%newtarget"), BKind::Var);
+            emit(Op::LoadUndef, b.reg);
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+        }
+        if (isCaptured(String(u"%all"))) {
+            Binding& b = declare(String(u"%noargs"), BKind::Var);
+            emit(Op::LoadUndef, b.reg);
             if (b.boxed)
                 emit(Op::NewBox, b.reg);
         }
@@ -2190,8 +2270,8 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     const Node& callee = *n.a;
     const bool superCall = callee.kind == NK::SuperExpr;
     if (superCall && (isNew || (fn_->isArrow ? resolve(String(u"%callee")).kind == Ref::Global
-                                              : !(fn_->block->flags & CodeBlock::kClassConstructor))))
-        unsupported(n, "super() here");
+                                              : !((fn_->block->flags & CodeBlock::kClassConstructor) && (fn_->block->flags & CodeBlock::kDerived)))))
+        syntaxError(n, "'super' keyword unexpected here");
     if (!isNew && callee.kind == NK::Member && callee.a->kind == NK::SuperExpr) {
         const std::uint16_t at = fn_->top;
         const std::uint16_t self = thisRegister();
@@ -3315,6 +3395,19 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
                 scope.bindings.push_back(b);
         }
     }
+    bool nonSimple = false;
+    for (std::size_t i = 0; i < fixed; ++i)
+        nonSimple = nonSimple || n.list[i]->kind != NK::Identifier;
+    paramTdz_ = ParamTdz();
+    if (nonSimple) {
+        paramTdz_.fn = fn_;
+        for (std::size_t i = 0; i < fixed; ++i) {
+            std::vector<String> names;
+            collectPatternNames(n.list[i]->kind == NK::AssignPattern ? *n.list[i]->a : *n.list[i], names);
+            for (const String& name : names)
+                paramTdz_.index.emplace(name, i);
+        }
+    }
     for (std::size_t i = 0; i < fixed; ++i) {
         const Node& p = *n.list[i];
         const std::uint16_t reg = std::uint16_t(i + 1);
@@ -3322,10 +3415,12 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
         if (p.kind == NK::AssignPattern) {
             Label has;
             emitJump(Op::JNotUndefined, reg, has);
+            paramTdz_.current = i;
             exprNamed(*p.b, reg, p.a->kind == NK::Identifier ? p.a->text : String());
             bind(has);
             target = p.a.get();
         }
+        paramTdz_.current = i + 1;
         if (target->kind == NK::Identifier) {
             Binding* b = findInScopes(*fn_, target->text);
             if (b && b->reg == reg && b->boxed)
@@ -3343,6 +3438,7 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
         }
     }
 
+    paramTdz_ = ParamTdz();
     if (hasRest) {
         const Node& rest = *n.list[fixed];
         const Node& target = *rest.a;

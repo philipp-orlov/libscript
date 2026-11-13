@@ -369,7 +369,7 @@ JSArray* captureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
 }
 
 /// Add the own enumerable properties of `source` to `target`, as `{...source}` does.
-void copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* excluded)
+bool copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* excluded)
 {
     auto skip = [&](Key k) {
         if (!excluded)
@@ -389,6 +389,32 @@ void copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
         source = unwrapped(source, ObjClass::String);
     if (isObject(source)) {
         JSObject* o = asObject(source);
+        // A proxy, or a property with a getter, has to be asked as the language asks: key by key, reading each value.
+        bool plain = !proxyOf(o) && o->cls() != ObjClass::TypedArray;
+        if (plain)
+            o->forEachOwn(vm, [&](Key, std::uint8_t attrs, JSValue) {
+                if (attrs & attr::kAccessor)
+                    plain = false;
+            });
+        if (!plain) {
+            std::vector<Handle> keys;
+            bi::ownKeys(vm, o, true, true, true, keys);
+            if (!vm.exception.isUndefined())
+                return false;
+            for (Handle& key : keys) {
+                const Key k = static_cast<Key>(key.get().asCell());
+                if (skip(k))
+                    continue;
+                JSValue v = getProperty(vm, source, k);
+                if (v.isException())
+                    return false;
+                if (!defineOwn(vm, target, k, v, attr::kDefault)) {
+                    vm.throwError(ErrorCode::TypeError, "Cannot define property");
+                    return false;
+                }
+            }
+            return true;
+        }
         if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             for (std::uint32_t i = 0; i < a->length; ++i) {
@@ -418,6 +444,7 @@ void copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
             release(JSValue::cell(k));
         }
     }
+    return true;
 }
 
 }  // namespace
@@ -1607,7 +1634,9 @@ L_RestSlice: {
     NEXT();
 }
 L_SpreadObj: {
-    copyOwnProperties(vm, asObject(R[ins->a]), R[ins->b], nullptr);
+    fr->pc = pc;
+    if (!copyOwnProperties(vm, asObject(R[ins->a]), R[ins->b], nullptr))
+        FAIL();
     NEXT();
 }
 L_ObjRest: {
@@ -1619,7 +1648,9 @@ L_ObjRest: {
     }
     JSObject* out = vm.newObject(vm.protos.object);
     SET(ins->a, toJSValue(out));
-    copyOwnProperties(vm, out, src, static_cast<JSArray*>(asObject(R[ins->c])));
+    fr->pc = pc;
+    if (!copyOwnProperties(vm, out, src, static_cast<JSArray*>(asObject(R[ins->c]))))
+        FAIL();
     NEXT();
 }
 L_IterRest: {
@@ -1888,8 +1919,11 @@ L_GetIteratorObj: {
     setReg(R[ins->a], iterator);
     NEXT();
 }
+L_DelegateCallAsync:
 L_DelegateCall: {
     // One step of `yield*`: what the generator was resumed with goes to the inner iterator's next, throw or return.
+    // In an async generator the results are promises, awaited by the code that follows.
+    const bool asyncDelegate = ins->opcode() == Op::DelegateCallAsync;
     fr->pc = pc;
     const JSValue iterator = R[ins->b], nextFn = R[ins->b + 1];
     const int mode = R[ins->c + 1].asInt32();
@@ -1925,6 +1959,12 @@ L_DelegateCall: {
                 release(closer);
                 if (r.isException())
                     FAIL();
+                if (asyncDelegate) {
+                    // What `return` gives is awaited first; the code after the await raises the TypeError (mode 3).
+                    setReg(R[ins->c + 1], JSValue::int32(3));
+                    SET(ins->a, r);
+                    NEXT();
+                }
                 release(r);
             } else {
                 release(closer);
@@ -1942,7 +1982,7 @@ L_DelegateCall: {
     }
     if (res.isException())
         FAIL();
-    if (!isObject(res)) {
+    if (!asyncDelegate && !isObject(res)) {
         const std::string text = describe(vm, res);
         release(res);
         vm.throwError(ErrorCode::TypeError, "Iterator result " + text + " is not an object");
@@ -1953,6 +1993,10 @@ L_DelegateCall: {
 }
 L_DelegateDone: {
     fr->pc = pc;
+    if (!isObject(R[ins->b])) {
+        vm.throwError(ErrorCode::TypeError, "Iterator result " + describe(vm, R[ins->b]) + " is not an object");
+        FAIL();
+    }
     JSValue d = getProperty(vm, R[ins->b], vm.atoms.done);
     if (d.isException())
         FAIL();
@@ -2460,7 +2504,13 @@ L_AsyncIterInit: {
             FAIL();
         }
     } else {
+        // A method that is there and not callable is an error; only an absent one falls back to the sync iterator.
+        const bool absent = method.isNullish();
         release(method);
+        if (!absent) {
+            vm.throwError(ErrorCode::TypeError, describe(vm, src) + "[Symbol.asyncIterator] is not a function");
+            FAIL();
+        }
         Handle syncIt, syncNext;
         if (!bi::getIterator(vm, src, &syncIt, &syncNext))
             FAIL();
@@ -2563,7 +2613,8 @@ L_YieldDelegate:
 L_Yield: {
     vm.suspendedOnAwait = ins->opcode() == Op::Await;
     auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
-    g->delegating = g->raw = ins->opcode() == Op::YieldDelegate;
+    g->delegating = ins->opcode() == Op::YieldDelegate;
+    g->raw = g->delegating && ins->c == 0;  // an async generator's `yield*` yields the value, not the inner result
     JSValue out = R[ins->b];
     retain(out);
     g->pcIndex = std::uint32_t(pc - codeStart);

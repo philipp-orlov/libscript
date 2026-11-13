@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Property access through the prototype chain: the slow paths every inline cache falls back on.
+#include "script/internal/dyn/numconv.hpp"
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
@@ -89,6 +90,32 @@ bool arrayIndexOf(Key key, std::uint32_t* index) noexcept
     return true;
 }
 
+bool canonicalNumericIndex(Key key, double* out) noexcept
+{
+    if (key->kind != detail::CellKind::String)
+        return false;
+    const StringView text = static_cast<StringCell*>(key)->text();
+    if (text.empty())
+        return false;
+    const Char c = text[0];
+    if (!((c >= u'0' && c <= u'9') || c == u'-' || c == u'I' || c == u'N'))
+        return false;
+    if (text == u"-0") {
+        *out = -0.0;
+        return true;
+    }
+    const double n = dyn::stringToNumber(text);
+    if (StringView(numberToString(n)) != text)
+        return false;
+    *out = n;
+    return true;
+}
+
+bool validTypedIndex(const JSTypedArray* t, double n) noexcept
+{
+    return n == std::trunc(n) && !(n == 0 && std::signbit(n)) && n >= 0 && n < double(t->length);
+}
+
 JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key)
 {
     for (JSObject* o = start; o; o = o->proto(vm)) {
@@ -96,11 +123,9 @@ JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key)
             return proxyGet(vm, o, key, receiver);
         if (o->cls() == ObjClass::TypedArray) {
             auto* t = static_cast<JSTypedArray*>(o);
-            if (key == vm.atoms.length)
-                return number(t->length);
-            std::uint32_t index;
-            if (arrayIndexOf(key, &index))
-                return index < t->length ? typedGet(vm, t, index) : JSValue::undefined();
+            double n;
+            if (canonicalNumericIndex(key, &n))
+                return validTypedIndex(t, n) ? typedGet(vm, t, std::uint32_t(n)) : JSValue::undefined();
         }
         if (o->cls() == ObjClass::String) {
             JSValue text = unwrapped(toJSValue(o), ObjClass::String);
@@ -173,9 +198,9 @@ bool hasProperty(VM& vm, JSValue base, Key key)
         if (proxyOf(o))
             return proxyHas(vm, o, key) > 0;
         if (o->cls() == ObjClass::TypedArray) {
-            std::uint32_t index;
-            if (arrayIndexOf(key, &index))
-                return index < static_cast<JSTypedArray*>(o)->length;
+            double n;
+            if (canonicalNumericIndex(key, &n))
+                return validTypedIndex(static_cast<JSTypedArray*>(o), n);
         }
         if (o->cls() == ObjClass::String) {
             JSValue text = unwrapped(toJSValue(o), ObjClass::String);
@@ -249,9 +274,9 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
     if (proxyOf(receiver))
         return proxySet(vm, receiver, key, value, base, strict);
     if (receiver->cls() == ObjClass::TypedArray) {
-        std::uint32_t index;
-        if (arrayIndexOf(key, &index))
-            return typedSet(vm, static_cast<JSTypedArray*>(receiver), double(index), value);
+        double n;
+        if (canonicalNumericIndex(key, &n))
+            return typedSet(vm, static_cast<JSTypedArray*>(receiver), n, value);
     }
     if (receiver->cls() == ObjClass::String) {
         JSValue text = unwrapped(base, ObjClass::String);
@@ -326,9 +351,9 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
     if (proxyOf(o))
         return proxyDelete(vm, o, key, strict) > 0;
     if (o->cls() == ObjClass::TypedArray) {
-        std::uint32_t index;
-        if (arrayIndexOf(key, &index))
-            return index >= static_cast<JSTypedArray*>(o)->length || refuse(vm, strict, "Cannot delete property of a typed array");
+        double n;
+        if (canonicalNumericIndex(key, &n))
+            return !validTypedIndex(static_cast<JSTypedArray*>(o), n) || refuse(vm, strict, "Cannot delete property of a typed array");
     }
     if (hasElems(o)) {
         auto* a = static_cast<JSArray*>(o);
@@ -401,10 +426,10 @@ bool demoteIndexElement(VM& vm, JSArray* a, std::uint32_t index, Key key)
 bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t attrs)
 {
     if (object->cls() == ObjClass::TypedArray) {
-        std::uint32_t index;
-        if (arrayIndexOf(key, &index)) {
-            const bool ok = index < static_cast<JSTypedArray*>(object)->length &&
-                            typedSet(vm, static_cast<JSTypedArray*>(object), double(index), value);
+        double n;
+        if (canonicalNumericIndex(key, &n)) {
+            const bool ok = validTypedIndex(static_cast<JSTypedArray*>(object), n) &&
+                            typedSet(vm, static_cast<JSTypedArray*>(object), n, value);
             release(value);
             return ok;
         }

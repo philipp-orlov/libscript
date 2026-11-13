@@ -313,6 +313,7 @@ struct VM : EngineRuntime
     JSValue regexpCtor = JSValue::undefined();
     JSValue regexpExec = JSValue::undefined();
     JSValue promiseCtor = JSValue::undefined();  ///< the Promise constructor as made
+    JSValue typedCtors[16] = {};                 ///< the typed array constructors as made, by ElemKind
     struct RegExpSlot
     {
         JSObject* owner;  ///< holds a count

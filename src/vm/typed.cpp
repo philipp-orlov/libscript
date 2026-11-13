@@ -18,22 +18,25 @@ JSValue typedGet(VM& vm, const JSTypedArray* t, std::uint32_t i)
     return bigintFromInt64(vm, v, t->kind == ElemKind::BigUint64);
 }
 
-bool typedSet(VM& vm, JSTypedArray* t, double index, JSValue v)
+bool typedConvert(VM& vm, ElemKind kind, JSValue v, JSValue* out)
 {
-    if (isBigKind(t->kind)) {
+    if (isBigKind(kind)) {
         // ToBigInt: a BigInt, or a boolean or string that makes one.
         JSValue prim = toPrimitive(vm, v, false);
         if (prim.isException())
             return false;
-        JSValue big = JSValue::undefined();
         if (isBigInt(prim)) {
-            big = prim;
-        } else if (prim.isBool()) {
-            big = bigintFromInt64(vm, prim == JSValue::boolean(true) ? 1 : 0, false);
+            *out = prim;
+            return true;
+        }
+        if (prim.isBool()) {
+            *out = bigintFromInt64(vm, prim == JSValue::boolean(true) ? 1 : 0, false);
             release(prim);
-        } else if (isString(prim)) {
+            return true;
+        }
+        if (isString(prim)) {
             bool ok;
-            big = bigintFromText(vm, asString(prim)->text(), &ok);
+            JSValue big = bigintFromText(vm, asString(prim)->text(), &ok);
             release(prim);
             if (!ok) {
                 if (big.isException())
@@ -41,23 +44,34 @@ bool typedSet(VM& vm, JSTypedArray* t, double index, JSValue v)
                 vm.throwError(ErrorCode::SyntaxError, "Cannot convert a string to a BigInt");
                 return false;
             }
-        } else {
-            release(prim);
-            vm.throwError(ErrorCode::TypeError, "Cannot convert " + describe(vm, v) + " to a BigInt");
-            return false;
+            *out = big;
+            return true;
         }
-        if (index >= 0 && index < double(t->length)) {
-            const std::uint64_t bits = bigintLow64(big);
-            std::memcpy(t->data + std::size_t(index) * 8, &bits, 8);
-        }
-        release(big);
-        return true;
+        release(prim);
+        vm.throwError(ErrorCode::TypeError, "Cannot convert " + describe(vm, v) + " to a BigInt");
+        return false;
     }
     double d;
     if (!toNumber(vm, v, &d))
         return false;
-    if (index >= 0 && index < double(t->length))
-        storeNumber(t->kind, t->data + std::size_t(index) * kElemSize[std::size_t(t->kind)], d);
+    *out = JSValue::boxNumber(d);
+    return true;
+}
+
+bool typedSet(VM& vm, JSTypedArray* t, double index, JSValue v)
+{
+    JSValue prim;
+    if (!typedConvert(vm, t->kind, v, &prim))
+        return false;
+    if (validTypedIndex(t, index)) {
+        if (isBigKind(t->kind)) {
+            const std::uint64_t bits = bigintLow64(prim);
+            std::memcpy(t->data + std::size_t(index) * 8, &bits, 8);
+        } else {
+            storeNumber(t->kind, t->data + std::size_t(index) * kElemSize[std::size_t(t->kind)], prim.asNumber());
+        }
+    }
+    release(prim);
     return true;
 }
 

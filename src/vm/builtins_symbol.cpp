@@ -126,7 +126,13 @@ struct ArrayIter : IteratorState
         if (finished)
             return 0;
         std::uint32_t length;
-        if (isArray(target)) {
+        if (JSTypedArray* ta = typedArrayOf(target)) {
+            if (typedArrayOutOfBounds(ta)) {
+                vm.throwError(ErrorCode::TypeError, "the typed array is out of bounds");
+                return -1;
+            }
+            length = ta->length;
+        } else if (isArray(target)) {
             length = static_cast<JSArray*>(asObject(target))->length;
         } else if (isString(target)) {
             length = asString(target)->length;
@@ -319,6 +325,11 @@ NATIVE(symbolKeyFor)
 }
 
 }  // namespace
+
+JSValue makeArrayIterator(VM& vm, JSValue target, int kind)
+{
+    return newNativeIterator(vm, new ArrayIter(target, kind), kArrayIterator);
+}
 
 JSValue newNativeIterator(VM& vm, IteratorState* state, int family)
 {

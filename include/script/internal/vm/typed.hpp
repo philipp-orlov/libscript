@@ -151,6 +151,9 @@ JSValue typedGet(VM& vm, const JSTypedArray* t, std::uint32_t i);
 /// Convert `v` as the language does for this kind (even when `i` is out of range) and store it: false, with an exception
 /// pending, when the conversion failed.
 bool typedSet(VM& vm, JSTypedArray* t, double index, JSValue v);
+/// What an element of `kind` is made from `v`: a number, or a BigInt for the 64-bit kinds, owned; false with an exception
+/// pending when the conversion failed.
+bool typedConvert(VM& vm, ElemKind kind, JSValue v, JSValue* out);
 
 }  // namespace vm
 }  // namespace internal

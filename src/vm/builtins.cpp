@@ -625,7 +625,22 @@ JSValue definePropertyImpl(VM& vm, JSObject* o, Key key, JSObject* d)
     // An element of an array with attributes to be changed becomes a property of its own, which the generic steps below handle.
     if (hasElems(o) && indexKey && !demoteIndexElement(vm, static_cast<JSArray*>(o), index, key))
         return reject();
-    const bool exotic = o->cls() == ObjClass::TypedArray || (o->cls() == ObjClass::String && (indexKey || key == vm.atoms.length));
+    if (o->cls() == ObjClass::TypedArray) {
+        // The elements of a typed array: only a plain writable, enumerable, configurable data property, and only in range.
+        double n;
+        if (canonicalNumericIndex(key, &n)) {
+            auto* ta = static_cast<JSTypedArray*>(o);
+            if (!validTypedIndex(ta, n) || (desc.hasConfigurable && !desc.configurable) || (desc.hasEnumerable && !desc.enumerable) ||
+                desc.isAccessor() || (desc.hasWritable && !desc.writable))
+                return reject();
+            if (desc.hasValue) {
+                if (!typedSet(vm, ta, n, vv))
+                    return JSValue::exception();
+            }
+            return JSValue::undefined();
+        }
+    }
+    const bool exotic = o->cls() == ObjClass::String && (indexKey || key == vm.atoms.length);
     if (exotic) {
         std::uint8_t existing = attr::kDefault;
         bool exists = false;

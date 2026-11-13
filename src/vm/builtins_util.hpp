@@ -152,6 +152,12 @@ void installCollections(VM& vm);
 JSValue newRegExp(VM& vm, StringView pattern, StringView flags);
 void installRegExp(VM& vm);
 void installArrayCallbacks(VM& vm);
+/// What the typed array methods share with the constructors and the array iterators.
+JSTypedArray* typedArrayOf(JSValue v);
+bool typedArrayOutOfBounds(const JSTypedArray* t);
+JSTypedArray* newTypedArrayOf(VM& vm, ElemKind kind, std::uint32_t length);
+JSValue makeArrayIterator(VM& vm, JSValue target, int kind);
+void installTypedArrayMethods(VM& vm, JSObject* taProto, JSObject* taCtor);
 /// The mutators of Array.prototype for a receiver that is not a plain array: the language's own steps, element by element.
 JSValue arrayFillGeneric(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc);
 JSValue arrayCopyWithinGeneric(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc);

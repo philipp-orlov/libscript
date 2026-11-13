@@ -3378,6 +3378,15 @@ JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc, J
     if (protoValue.isException())
         return protoValue;
     JSObject* proto = isObject(protoValue) ? asObject(protoValue) : protos.object;
+    if (!isObject(protoValue) && (f->flags & JSFunction::kNative)) {
+        // GetPrototypeFromConstructor: without a usable `prototype` on new.target the constructor's own is what the object gets.
+        JSValue own = getProperty(*this, callee, atoms.prototype);
+        if (own.isException())
+            return own;
+        if (isObject(own))
+            proto = asObject(own);
+        release(own);
+    }
     Handle made = Handle::adopt(toJSValue(newObject(proto)));
     release(protoValue);
     JSValue result;

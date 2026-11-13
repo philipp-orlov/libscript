@@ -554,7 +554,7 @@ void JSObject::materialize(VM& vm)
         // A generator function's `prototype` is what its generators inherit from; it has no `constructor`.
         JSObject* prototype = vm.newObject((f->code->flags & CodeBlock::kAsyncGen) ? vm.protos.asyncGenerator : vm.protos.generator);
         putOwn(vm, vm.atoms.prototype, toJSValue(prototype), attr::kWritable);
-    } else if (f->flags & JSFunction::kConstructor) {
+    } else if ((f->flags & JSFunction::kConstructor) && !(f->flags & JSFunction::kNative)) {
         JSObject* prototype = vm.newObject(vm.protos.object);
         Handle keep = Handle::adopt(toJSValue(prototype));
         // The one cycle a function makes, and only for a function that is asked about its properties.

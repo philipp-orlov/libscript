@@ -549,6 +549,10 @@ void VM::releaseRoots() noexcept
     release(regexpCtor);
     release(regexpExec);
     release(promiseCtor);
+    for (JSValue& c : typedCtors) {
+        release(c);
+        c = JSValue::undefined();
+    }
     regexpCtor = regexpExec = promiseCtor = JSValue::undefined();
     release(exception);
     exception = JSValue::undefined();

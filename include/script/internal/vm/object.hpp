@@ -335,6 +335,10 @@ bool demoteIndexElement(VM& vm, JSArray* a, std::uint32_t index, Key key);
 bool defineAccessor(VM& vm, JSObject* object, Key key, JSValue getter, JSValue setter, std::uint8_t attrs);
 /// The canonical array index a property name spells, if it does.
 bool arrayIndexOf(Key key, std::uint32_t* index) noexcept;
+/// CanonicalNumericIndexString: a property name that is what the number it spells prints as (or "-0").
+bool canonicalNumericIndex(Key key, double* out) noexcept;
+/// Whether `n` is an integer index of the typed array as it is now.
+bool validTypedIndex(const JSTypedArray* t, double n) noexcept;
 
 }  // namespace vm
 }  // namespace internal

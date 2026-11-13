@@ -14,6 +14,8 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <string>
+#include <unistd.h>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -25,6 +27,7 @@
 #include "script/internal/stack_guard.hpp"
 #include "script/internal/vm/bytecode.hpp"
 #include "script/internal/vm/census.hpp"
+#include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 
 #if defined(__x86_64__) && defined(__linux__)
@@ -326,6 +329,9 @@ constexpr std::int32_t kVmFrameCount = std::int32_t(offsetof(VM, frameCount));
 constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, elems));
 constexpr std::int32_t kArrayLength = std::int32_t(offsetof(JSArray, length));
 #pragma GCC diagnostic pop
+constexpr std::int32_t kTypedData = std::int32_t(offsetof(JSTypedArray, data));
+constexpr std::int32_t kTypedLength = std::int32_t(offsetof(JSTypedArray, length));
+constexpr std::int32_t kTypedKind = std::int32_t(offsetof(JSTypedArray, kind));
 constexpr std::int32_t kObjSlots = 16;
 constexpr std::int32_t kObjInline = 24;
 constexpr std::int32_t kBoxValue = 16;
@@ -1297,13 +1303,17 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
 
 void Baseline::getElem(std::uint32_t i, const Ins& in)
 {
+    using E = ElemKind;
     Label& bad = slow(i, &helperThunk<jitGetElem>);
+    Label typed, done;
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
     needInt(RCX, bad);
     a_.test32(RCX, RCX);
     a_.jcc(CS, bad);
-    needArray(RAX, bad);
+    needObject(RAX, bad);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+    a_.jcc(CNE, typed);
     a_.mov32(RCX, RCX);
     a_.alu32(7, RCX, mem(RAX, kArrayLength));
     a_.jcc(CAE, bad);
@@ -1313,18 +1323,79 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.jcc(CE, bad);
     retain(RAX);
     write(in.a, RAX);
+    a_.jmp(done);
+
+    a_.bind(typed);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
+    a_.jcc(CNE, bad);
+    a_.mov32(RCX, RCX);
+    a_.alu32(7, RCX, mem(RAX, kTypedLength));
+    a_.jcc(CAE, bad);
+    a_.movzx8(RDX, mem(RAX, kTypedKind));
+    a_.mov(RSI, mem(RAX, kTypedData));
+    Label f64, i32, u8, s8, i16, u16, f32;
+    a_.aluI32(7, RDX, int(E::Float64));
+    a_.jcc(CE, f64);
+    a_.aluI32(7, RDX, int(E::Int32));
+    a_.jcc(CE, i32);
+    a_.aluI32(7, RDX, int(E::Uint8));
+    a_.jcc(CE, u8);
+    a_.aluI32(7, RDX, int(E::Uint8Clamped));
+    a_.jcc(CE, u8);
+    a_.aluI32(7, RDX, int(E::Int8));
+    a_.jcc(CE, s8);
+    a_.aluI32(7, RDX, int(E::Int16));
+    a_.jcc(CE, i16);
+    a_.aluI32(7, RDX, int(E::Uint16));
+    a_.jcc(CE, u16);
+    a_.aluI32(7, RDX, int(E::Float32));
+    a_.jcc(CE, f32);
+    a_.jmp(bad);
+    Label intResult;
+    a_.bind(f64);
+    a_.movsdLoad(0, mem(RSI, RCX, 8));
+    Label box;
+    a_.jmp(box);
+    a_.bind(f32);
+    a_.movssLoad(0, mem(RSI, RCX, 4));
+    a_.cvtss2sd(0, 0);
+    a_.bind(box);
+    boxDouble0();
+    write(in.a, RAX);
+    a_.jmp(done);
+    a_.bind(i32);
+    a_.mov32(RAX, mem(RSI, RCX, 4));
+    a_.jmp(intResult);
+    a_.bind(u8);
+    a_.movzx8(RAX, mem(RSI, RCX, 1));
+    a_.jmp(intResult);
+    a_.bind(s8);
+    a_.movsx8(RAX, mem(RSI, RCX, 1));
+    a_.jmp(intResult);
+    a_.bind(i16);
+    a_.movsx16(RAX, mem(RSI, RCX, 2));
+    a_.jmp(intResult);
+    a_.bind(u16);
+    a_.movzx16(RAX, mem(RSI, RCX, 2));
+    a_.bind(intResult);
+    a_.or_(RAX, R14);
+    write(in.a, RAX);
+    a_.bind(done);
 }
 
 void Baseline::putElem(std::uint32_t i, const Ins& in)
 {
+    using E = ElemKind;
     Label& bad = slow(i, &helperThunk<jitPutElem>);
-    Label isNumber;
+    Label isNumber, typed, done;
     a_.mov(RAX, R(in.a));
     a_.mov(RCX, R(in.b));
     needInt(RCX, bad);
     a_.test32(RCX, RCX);
     a_.jcc(CS, bad);
-    needArray(RAX, bad);
+    needObject(RAX, bad);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+    a_.jcc(CNE, typed);
     a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
     a_.jcc(CNE, bad);
     a_.mov32(RCX, RCX);
@@ -1341,6 +1412,59 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.mov(RDI, mem(RDX, 0));
     a_.mov(mem(RDX, 0), RSI);
     release(RDI);
+    a_.jmp(done);
+
+    // A typed array takes a number; one past its end is ignored.
+    a_.bind(typed);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
+    a_.jcc(CNE, bad);
+    a_.mov(R8, R(in.c));
+    a_.test(R8, R14);
+    a_.jcc(CE, bad);
+    a_.mov32(RCX, RCX);
+    a_.alu32(7, RCX, mem(RAX, kTypedLength));
+    a_.jcc(CAE, done);
+    a_.movzx8(RDX, mem(RAX, kTypedKind));
+    a_.mov(RSI, mem(RAX, kTypedData));
+    Label f64, i32, i8, i16, f32;
+    a_.aluI32(7, RDX, int(E::Float64));
+    a_.jcc(CE, f64);
+    a_.aluI32(7, RDX, int(E::Int32));
+    a_.jcc(CE, i32);
+    a_.aluI32(7, RDX, int(E::Uint32));
+    a_.jcc(CE, i32);
+    a_.aluI32(7, RDX, int(E::Uint8));
+    a_.jcc(CE, i8);
+    a_.aluI32(7, RDX, int(E::Int8));
+    a_.jcc(CE, i8);
+    a_.aluI32(7, RDX, int(E::Int16));
+    a_.jcc(CE, i16);
+    a_.aluI32(7, RDX, int(E::Uint16));
+    a_.jcc(CE, i16);
+    a_.aluI32(7, RDX, int(E::Float32));
+    a_.jcc(CE, f32);
+    a_.jmp(bad);
+    a_.bind(f64);
+    loadNumber(0, R8, RDX);
+    a_.movsdStore(mem(RSI, RCX, 8), 0);
+    a_.jmp(done);
+    a_.bind(f32);
+    loadNumber(0, R8, RDX);
+    a_.cvtsd2ss(0, 0);
+    a_.movssStore(mem(RSI, RCX, 4), 0);
+    a_.jmp(done);
+    a_.bind(i32);
+    int32From(RAX, R8, bad);
+    a_.mov32(mem(RSI, RCX, 4), RAX);
+    a_.jmp(done);
+    a_.bind(i8);
+    int32From(RAX, R8, bad);
+    a_.mov8(mem(RSI, RCX, 1), RAX);
+    a_.jmp(done);
+    a_.bind(i16);
+    int32From(RAX, R8, bad);
+    a_.mov16(mem(RSI, RCX, 2), RAX);
+    a_.bind(done);
 }
 
 void Baseline::initProp(std::uint32_t i, const Ins& in)
@@ -1564,6 +1688,18 @@ void compileTier1(VM& vm, CodeBlock* code)
     code->tier1 = t;
     code->tier1Failed = false;
     SCRIPT_VM_CENSUS(Tier1Compiled);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    // SCRIPT_VM_PERFMAP=1: name the code for `perf report` in /tmp/perf-<pid>.map.
+    static std::FILE* map = std::getenv("SCRIPT_VM_PERFMAP")
+                                ? std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "w")
+                                : nullptr;
+    if (map) {
+        std::fprintf(map, "%llx %zx js:%s:%u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(t->rx)),
+                     t->bytes, code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
+                     code->lines.empty() ? 0u : code->lines[0]);
+        std::fflush(map);
+    }
+#endif
 }
 
 void releaseTier1(Tier1Code* code, VM* vm) noexcept

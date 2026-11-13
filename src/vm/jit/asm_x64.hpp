@@ -371,6 +371,14 @@ public:
     void ucomisd(int x, int y) { opReg(false, 0x0F, x, y, 0x2E, 0x66); }
     void cvtsi2sd32(int x, Reg r) { opReg(false, 0x0F, x, r, 0x2A, 0xF2); }
     void cvttsd2si32(Reg r, int x) { opReg(false, 0x0F, r, x, 0x2C, 0xF2); }
+    void cvtsd2ss(int x, int y) { opReg(false, 0x0F, x, y, 0x5A, 0xF2); }
+    void cvtss2sd(int x, int y) { opReg(false, 0x0F, x, y, 0x5A, 0xF3); }
+    void movsdLoad(int x, const Mem& m) { opMem(false, 0x0F, x, m, 0x10, 0xF2); }
+    void movsdStore(const Mem& m, int x) { opMem(false, 0x0F, x, m, 0x11, 0xF2); }
+    void movssLoad(int x, const Mem& m) { opMem(false, 0x0F, x, m, 0x10, 0xF3); }
+    void movssStore(const Mem& m, int x) { opMem(false, 0x0F, x, m, 0x11, 0xF3); }
+    void movsx8(Reg d, const Mem& m) { opMem(false, 0x0F, d, m, 0xBE); }
+    void movsx16(Reg d, const Mem& m) { opMem(false, 0x0F, d, m, 0xBF); }
 };
 
 }  // namespace jit

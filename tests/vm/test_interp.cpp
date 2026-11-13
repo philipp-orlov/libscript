@@ -19,10 +19,14 @@ struct Outcome
     script::ErrorCode code = script::ErrorCode::Ok;
 };
 
-Outcome runOn(script::Context::Options::Core core, const char* source, bool runtimeCode = false)
+Outcome runOn(script::Context::Options::Core core, const char* source, bool runtimeCode = false, bool compiled = false)
 {
     script::Context::Options options;
     options.runtimeCode = runtimeCode;
+    if (compiled) {
+        // Every function compiled when first called, and loops entered in the middle: the new core's baseline code.
+        options.jit.mode = script::JitOptions::Mode::Eager;
+    }
     options.language = script::Language::JavaScript;
     options.core = core;
     script::Context ctx(options);
@@ -74,6 +78,17 @@ const char* const kSnippets[] = {
 #undef S
 };
 
+const char* const kJitSnippets[] = {
+#define S(text) text,
+#include "snippets_jit.inc"
+#undef S
+};
+
+bool sameOutcome(const Outcome& want, const Outcome& got)
+{
+    return want.threw == got.threw && want.text == got.text && want.type == got.type && want.code == got.code;
+}
+
 }  // namespace
 
 TEST(everySnippetAgreesWithTheDynamicEngine)
@@ -91,6 +106,51 @@ TEST(everySnippetAgreesWithTheDynamicEngine)
         }
     }
     std::fprintf(stderr, "%d snippets, %d differ\n", checked, failed);
+    CHECK_EQ(failed, 0);
+}
+
+// The same programs with the baseline compiler on from the first call (Eager) and after a few calls (Tiered, threshold 3),
+// and the programs of snippets_jit.inc that only compiled code could get wrong.
+TEST(everySnippetAgreesInCompiledCode)
+{
+    int failed = 0;
+    auto check = [&](const char* source, bool eager) {
+        const Outcome want = runOn(script::Context::Options::Core::Dyn, source);
+        script::Context::Options options;
+        options.language = script::Language::JavaScript;
+        options.core = script::Context::Options::Core::Vm;
+        options.jit.mode = eager ? script::JitOptions::Mode::Eager : script::JitOptions::Mode::Tiered;
+        options.jit.threshold = 3;
+        Outcome got;
+        {
+            script::Context ctx(options);
+            try {
+                script::Value v = ctx.eval(source);
+                got.text = v.toString();
+                got.type = script::toString(v.type());
+                if (got.type == "int" || got.type == "double" || got.type == "long" || got.type == "float")
+                    got.type = "number";
+            } catch (const script::Error& e) {
+                got.threw = true;
+                got.code = e.code();
+                got.text = e.what();
+            }
+        }
+        if (!sameOutcome(want, got)) {
+            ++failed;
+            std::fprintf(stderr, "MISMATCH (%s): %s\n   dyn: %s%s [%s]\n    vm: %s%s [%s]\n", eager ? "eager" : "tiered", source,
+                         want.threw ? "THROW " : "", want.text.c_str(), want.type.c_str(), got.threw ? "THROW " : "",
+                         got.text.c_str(), got.type.c_str());
+        }
+    };
+    for (const char* source : kSnippets) {
+        check(source, true);
+        check(source, false);
+    }
+    for (const char* source : kJitSnippets) {
+        check(source, true);
+        check(source, false);
+    }
     CHECK_EQ(failed, 0);
 }
 

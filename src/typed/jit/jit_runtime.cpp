@@ -20,7 +20,11 @@ namespace typed {
 
 namespace {
 
-/// The tag a reference has, from the cell it points at.
+/// The tag a reference has, from the cell it points at. A cell of the vm core has the header of a `GCObject` but no
+/// vtable, so the check of the dynamic type stands aside here.
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((no_sanitize("vptr")))
+#endif
 Type tagOfCell(const GCObject* cell) noexcept
 {
     if (!cell)

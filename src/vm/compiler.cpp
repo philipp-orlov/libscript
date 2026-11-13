@@ -837,6 +837,7 @@ private:
     std::uint16_t unary(const Node& n, int dst);
     std::uint16_t update(const Node& n, int dst, bool discard);
     std::uint16_t binary(const Node& n, int dst);
+    std::uint16_t binaryStep(const Node& n, int dst, int left);
     std::uint16_t logical(const Node& n, int dst);
     std::uint16_t assign(const Node& n, int dst, bool unused = false);
     std::uint16_t conditional(const Node& n, int dst);
@@ -1970,13 +1971,40 @@ bool smallInt(const Node& n) noexcept
 
 std::uint16_t Compiler::binary(const Node& n, int dst)
 {
+    if (n.a->kind != NK::Binary)
+        return binaryStep(n, dst, -1);
+    // `a + b + c + ...` leans to the left: a loop over the spine keeps a long chain off the native stack.
+    std::vector<const Node*> spine;
+    for (const Node* cur = &n; cur->kind == NK::Binary; cur = cur->a.get())
+        spine.push_back(cur);
+    const std::uint32_t savedLine = line_;
+    int result = -1;
+    for (std::size_t i = spine.size(); i-- > 0;) {
+        if (spine[i]->line)
+            line_ = spine[i]->line;
+        result = binaryStep(*spine[i], i == 0 ? dst : -1, result);
+    }
+    line_ = savedLine;
+    return std::uint16_t(result);
+}
+
+/// One binary operator; `left`, when not -1, is the register that already holds the left operand.
+std::uint16_t Compiler::binaryStep(const Node& n, int dst, int left)
+{
     bool ok;
     const Op op = binaryOp(n.op, &ok);
     if (!ok)
         unsupported(n, "this binary operator");
-    const std::uint16_t mark = fn_->top;
+    const std::uint16_t mark = left >= 0 ? std::uint16_t(left) : fn_->top;
+    if (left >= 0)
+        fn_->top = std::uint16_t(left + 1);
+    auto leftOperand = [&](bool keep) -> std::uint16_t {
+        if (left >= 0)
+            return std::uint16_t(left);
+        return keep ? exprAny(*n.a) : exprTemp(*n.a);
+    };
     if ((op == Op::Add || op == Op::Sub) && smallInt(*n.b)) {
-        const std::uint16_t a = exprAny(*n.a);
+        const std::uint16_t a = leftOperand(true);
         fn_->top = mark;
         const std::uint16_t d = dest(dst);
         const int imm = int(n.b->number);
@@ -1984,13 +2012,13 @@ std::uint16_t Compiler::binary(const Node& n, int dst)
         return d;
     }
     if (smallInt(*n.b) && immediateOp(op) != Op::Nop) {
-        const std::uint16_t a = exprAny(*n.a);
+        const std::uint16_t a = leftOperand(true);
         fn_->top = mark;
         const std::uint16_t d = dest(dst);
         emit(immediateOp(op), d, a, std::uint16_t(std::int16_t(int(n.b->number))));
         return d;
     }
-    const std::uint16_t a = !hasAssignment(*n.b) ? exprAny(*n.a) : exprTemp(*n.a);
+    const std::uint16_t a = leftOperand(!hasAssignment(*n.b));
     const std::uint16_t b = exprAny(*n.b);
     fn_->top = mark;
     const std::uint16_t d = dest(dst);

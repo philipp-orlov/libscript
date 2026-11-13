@@ -109,6 +109,7 @@ struct Fn
     bool isProgram = false;
     bool isEval = false;       ///< the text of a direct `eval`: arrow-like, with a completion value
     String evalEnvName;        ///< a sloppy function with a direct `eval` in it: the hidden variable that holds its eval object
+    bool isMethodFn = false;   ///< a method, accessor, class constructor or field initialiser: `super.x` is allowed in it
     bool evalOuter = false;    ///< the stand-in for the variables around a direct `eval`
     bool dynamicVars = false;  ///< sloppy eval code: its `var`s and functions go to the caller's eval object or the global
     bool completion = false;   ///< expression statements leave their value in `resultReg`
@@ -508,8 +509,9 @@ public:
     }
 
     CodeBlock* program(const Node& program);
-    CodeBlock* evalProgram(const Node& program, const std::vector<String>& names, bool strict)
+    CodeBlock* evalProgram(const Node& program, const std::vector<String>& names, bool strict, bool home)
     {
+        evalHome_ = home;
         return evalOnce(program, names, strict);
     }
 
@@ -876,7 +878,7 @@ private:
                 emit(Op::DefEnv, env, atom(name), src);
                 fn_->top = mark;
             } else if (init) {
-                emit(Op::DefGlobal, atom(name), src);
+                emit(Op::DefGlobal, atom(name), src, fn_->dynamicVars ? 1 : 0);
             } else {
                 Label done;
                 for (const Ref& e : envs) {
@@ -966,6 +968,7 @@ private:
     void closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, std::uint16_t reg, bool isCatch = false);
 
     std::vector<String> pendingLabels_;
+    bool evalHome_ = false;  ///< compiling eval code that was called from inside a method
     int classDepth_ = 0;  ///< inside a class body, all of which is strict
     /// While a parameter's default is worked out: the parameters not yet initialised, which may not be read.
     struct ParamTdz
@@ -1762,6 +1765,7 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
     block->flags |= CodeBlock::kStrict;
     block->file = file_;
     Fn child;
+    child.isMethodFn = true;
     child.parent = fn_;
     child.block = block;
     child.strict = true;
@@ -2487,8 +2491,13 @@ std::uint16_t Compiler::member(const Node& n, int dst)
 {
     if (n.a->kind == NK::SuperExpr) {
         // `super.x` needs a method around it: a program, or eval code that runs outside any function, has none.
-        if (fn_->isProgram || (fn_->isEval && resolve(String(u"this")).kind == Ref::Global))
-            syntaxError(n, "'super' keyword unexpected here");
+        {
+            const Fn* holder = fn_;
+            while (holder && holder->isArrow)
+                holder = holder->parent;
+            if (holder && (holder->evalOuter ? !evalHome_ : (holder->isProgram || !holder->isMethodFn)))
+                syntaxError(n, "'super' keyword unexpected here");
+        }
         const std::uint16_t at = fn_->top;
         if (n.computed) {
             const std::uint16_t self = thisRegister();
@@ -3603,6 +3612,7 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
         ++block->length;
     }
     Fn child;
+    child.isMethodFn = n.isMethod || (extraFlags & CodeBlock::kClassConstructor) != 0;
     child.parent = fn_;
     child.block = block;
     child.isArrow = arrow;
@@ -3755,22 +3765,48 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
                 paramTdz_.index.emplace(name, i);
         }
     }
+    // With a default or a pattern among the parameters, a closure or an `eval` in one of them can reach a parameter that
+    // comes after it, so every captured parameter has its box from the start.
+    std::vector<bool> earlyBox(fixed, false);
+    if (nonSimple) {
+        for (std::size_t i = 0; i < fixed; ++i) {
+            const Node& p = *n.list[i];
+            const Node* target = p.kind == NK::AssignPattern ? p.a.get() : &p;
+            if (target->kind != NK::Identifier)
+                continue;
+            Binding* b = findInScopes(*fn_, target->text);
+            if (b && b->reg == std::uint16_t(i + 1) && b->boxed) {
+                emit(Op::NewBox, b->reg);
+                earlyBox[i] = true;
+            }
+        }
+    }
     for (std::size_t i = 0; i < fixed; ++i) {
         const Node& p = *n.list[i];
         const std::uint16_t reg = std::uint16_t(i + 1);
         const Node* target = &p;
         if (p.kind == NK::AssignPattern) {
             Label has;
-            emitJump(Op::JNotUndefined, reg, has);
             paramTdz_.current = i;
-            exprNamed(*p.b, reg, p.a->kind == NK::Identifier ? p.a->text : String());
+            if (earlyBox[i]) {
+                const std::uint16_t mark = fn_->top;
+                const std::uint16_t t = temp();
+                emit(Op::GetBox, t, reg);
+                emitJump(Op::JNotUndefined, t, has);
+                exprNamed(*p.b, t, p.a->kind == NK::Identifier ? p.a->text : String());
+                emit(Op::PutBox, reg, t);
+                fn_->top = mark;
+            } else {
+                emitJump(Op::JNotUndefined, reg, has);
+                exprNamed(*p.b, reg, p.a->kind == NK::Identifier ? p.a->text : String());
+            }
             bind(has);
             target = p.a.get();
         }
         paramTdz_.current = i + 1;
         if (target->kind == NK::Identifier) {
             Binding* b = findInScopes(*fn_, target->text);
-            if (b && b->reg == reg && b->boxed)
+            if (b && b->reg == reg && b->boxed && !earlyBox[i])
                 emit(Op::NewBox, reg);
         } else {
             std::vector<String> names;
@@ -3863,6 +3899,13 @@ void Compiler::emitEvalScope()
         vars.push_back(v);
     }
     fn_->block->evalScopes.push_back(std::move(vars));
+    {
+        const Fn* holder = fn_;
+        while (holder && holder->isArrow)
+            holder = holder->parent;
+        // In eval code, whatever its caller allowed.
+        fn_->block->evalHome.push_back(holder && (holder->isMethodFn || (holder->evalOuter && evalHome_)) ? 1 : 0);
+    }
     emit(Op::SetEvalScope, std::uint16_t(fn_->block->evalScopes.size() - 1));
 }
 
@@ -3925,7 +3968,7 @@ CodeBlock* Compiler::evalOnce(const Node& program, const std::vector<String>& na
                     emit(Op::DeclEnv, env, atom(v));
                     fn_->top = mark;
                 } else {
-                    emit(Op::DeclGlobal, atom(v));
+                    emit(Op::DeclGlobal, atom(v), 1);
                 }
                 continue;
             }
@@ -4019,10 +4062,10 @@ CodeBlock* Compiler::programOnce(const Node& program)
 }  // namespace
 
 CodeBlock* compileEval(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source,
-                       const std::vector<String>& names, bool strict)
+                       const std::vector<String>& names, bool strict, bool home)
 {
     Compiler compiler(vm, file, std::move(source));
-    return compiler.evalProgram(program, names, strict);
+    return compiler.evalProgram(program, names, strict, home);
 }
 
 CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source)

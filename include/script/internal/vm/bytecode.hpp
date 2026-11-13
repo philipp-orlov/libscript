@@ -140,6 +140,7 @@ struct CodeBlock
     Vec<CodeBlock*> children;  ///< each holds a count
     Vec<UpvalDesc> upvals;
     Vec<Vec<EvalVar>> evalScopes;  ///< what each direct `eval` call in the function sees
+    Vec<std::uint8_t> evalHome;    ///< for each of them, whether it is in a method, where `super.x` is allowed
     Vec<Handler> handlers;
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
     Vec<InlineCache> caches;

@@ -113,7 +113,7 @@ JSValue VM::evalDirect(JSValue sourceValue)
         dyn::Parser parser(text, "<eval>", /*typescript=*/false);
         dyn::NodePtr tree = parser.parseProgram();
         code = compileEval(*this, *tree, "<eval>", std::make_shared<const std::string>(text), names,
-                           (caller->flags & CodeBlock::kStrict) != 0);
+                           (caller->flags & CodeBlock::kStrict) != 0, evalIndex < caller->evalHome.size() && caller->evalHome[evalIndex]);
     } catch (const Error& e) {
         return throwError(e.code() == ErrorCode::CompileError ? ErrorCode::SyntaxError : e.code(), e.what());
     }

@@ -748,16 +748,33 @@ L_PutGlobal: {
     ++pc;
     NEXT();
 }
+// Declarations of global code leave a property that cannot be deleted; those of `eval` code leave one that can (`c`/`b` = 1).
 L_DefGlobal: {
     Key key = atoms[ins->a];
+    const std::uint8_t attrs = ins->c ? attr::kDefault : std::uint8_t(attr::kWritable | attr::kEnumerable);
+    std::uint8_t existing = 0;
+    JSValue* slot = vm.global->findOwn(vm, key, &existing);
     retain(R[ins->b]);
-    vm.global->putOwn(vm, key, R[ins->b], attr::kDefault);
+    if (!slot) {
+        vm.global->putOwn(vm, key, R[ins->b], attrs);
+    } else if ((existing & attr::kAccessor) || (existing & attr::kConfigurable)) {
+        // A configurable property, or an accessor, is replaced; a fixed data property only gets the new value.
+        if (existing & attr::kAccessor)
+            vm.global->deleteOwn(vm, key);
+        vm.global->putOwn(vm, key, R[ins->b], attrs);
+    } else if (existing & attr::kWritable) {
+        const JSValue old = *slot;
+        *slot = R[ins->b];
+        release(old);
+    } else {
+        release(R[ins->b]);
+    }
     NEXT();
 }
 L_DeclGlobal: {
     Key key = atoms[ins->a];
     if (!vm.global->findOwn(vm, key))
-        vm.global->putOwn(vm, key, JSValue::undefined(), attr::kDefault);
+        vm.global->putOwn(vm, key, JSValue::undefined(), ins->b ? attr::kDefault : std::uint8_t(attr::kWritable | attr::kEnumerable));
     NEXT();
 }
 L_DelGlobal: {
@@ -1953,6 +1970,11 @@ L_GetSuperElem: {
     release(prim);
     if (!key)
         FAIL();
+    if (!start) {
+        release(JSValue::cell(key));
+        vm.throwError(ErrorCode::TypeError, "Cannot read properties of null (reading a property through 'super')");
+        FAIL();
+    }
     JSValue v = getPropertyFrom(vm, start, R[ins->c], key);
     release(JSValue::cell(key));
     if (v.isException())
@@ -1967,6 +1989,10 @@ L_GetSuperProp: {
     if (rr && isObject(rr->home))
         start = asObject(rr->home)->proto(vm);
     fr->pc = pc;
+    if (!start) {
+        vm.throwError(ErrorCode::TypeError, "Cannot read properties of null (reading a property through 'super')");
+        FAIL();
+    }
     JSValue v = getPropertyFrom(vm, start, R[ins->c], atoms[ins->b]);
     if (v.isException())
         FAIL();

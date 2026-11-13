@@ -843,7 +843,26 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             const std::uint16_t mark = fn_->top;
             const std::uint16_t d = dest(dst);
             const std::uint16_t inner = fn_->top;
-            if (n.prefix) {
+            const bool asyncGen = (fn_->block->flags & CodeBlock::kAsyncGen) != 0;
+            if (n.prefix && asyncGen) {
+                // `yield*` in an async generator: over an async iterator (or a sync one made to look like it).
+                const std::uint16_t src = exprAny(*n.a);
+                const std::uint16_t it = temps(2);
+                const std::uint16_t res = temp();
+                const std::uint16_t v = temp();
+                const std::uint16_t sent = temp();
+                Label top, done;
+                emit(Op::AsyncIterInit, it, src);
+                bind(top);
+                emit(Op::AsyncIterNext, res, it);
+                emit(Op::Await, res, res);
+                emit(Op::IterUnpack, v, res);
+                emitJump(Op::JHole, v, done);
+                emit(Op::Yield, sent, v);
+                jump(top);
+                bind(done);
+                emit(Op::LoadUndef, d);
+            } else if (n.prefix) {
                 // `yield*` hands out what the inner iterator does; what it sends back and its return value are not passed on.
                 const std::uint16_t src = exprAny(*n.a);
                 const std::uint16_t it = temps(2);
@@ -866,6 +885,9 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
                     v = temp();
                     emit(Op::LoadUndef, v);
                 }
+                // In an async generator the value is awaited first.
+                if (asyncGen)
+                    emit(Op::Await, v, v);
                 emit(Op::Yield, d, v);
             }
             fn_->top = inner;
@@ -879,7 +901,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             const std::uint16_t d = dest(dst);
             const std::uint16_t inner = fn_->top;
             const std::uint16_t v = exprAny(*n.a);
-            emit(Op::Yield, d, v);
+            emit(Op::Await, d, v);
             fn_->top = inner;
             (void)mark;
             return d;
@@ -2397,14 +2419,16 @@ void Compiler::forStatement(const Node& n)
 
 void Compiler::forInOf(const Node& n, bool isOf)
 {
-    if (n.isAsync)
-        unsupported(n, "for await");
+    if (n.isAsync && !(fn_->block->flags & CodeBlock::kAsync))
+        unsupported(n, "for await here");
     std::vector<String> labels;
     labels.swap(pendingLabels_);
     const std::uint16_t mark = fn_->top;
     const std::uint16_t src = exprTemp(*n.b);
     const std::uint16_t it = temps(2);
-    if (isOf) {
+    if (isOf && n.isAsync) {
+        emit(Op::AsyncIterInit, it, src);
+    } else if (isOf) {
         emit(Op::IterInit, it, src);
     } else {
         const std::uint16_t keys = temp();
@@ -2415,7 +2439,13 @@ void Compiler::forInOf(const Node& n, bool isOf)
     Label top, end;
     bind(top);
     const std::uint16_t v = temp();
-    emit(Op::IterNext, v, it, 0);
+    if (n.isAsync) {
+        emit(Op::AsyncIterNext, v, it);
+        emit(Op::Await, v, v);
+        emit(Op::IterUnpack, v, v);
+    } else {
+        emit(Op::IterNext, v, it, 0);
+    }
     emitJump(Op::JHole, v, end);
     // From here an early way out (`break`, `return`, an exception) closes the iterator.
     TryCtx guard;
@@ -2504,6 +2534,8 @@ void Compiler::returnStatement(const Node& n)
         r = temp();
         emit(Op::LoadUndef, r);
     }
+    if (fn_->block->flags & CodeBlock::kAsyncGen)
+        emit(Op::Await, r, r);
     emitFinallyFor(0);
     emit(Op::Ret, r);
     fn_->top = mark;
@@ -2757,12 +2789,12 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
     const bool arrow = n.kind == NK::ArrowExpr;
     Key nameKey = name.empty() ? nullptr : vm_.internKey(StringView(name));
     CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && !n.isGenerator && !n.isAsync && (!n.isMethod || (extraFlags & CodeBlock::kClassConstructor)));
-    if (n.isAsync && n.isGenerator)
-        unsupported(n, "async generators");
     if (n.isGenerator || n.isAsync)
         block->flags |= CodeBlock::kGenerator;
     if (n.isAsync)
         block->flags |= CodeBlock::kAsync;
+    if (n.isAsync && n.isGenerator)
+        block->flags |= CodeBlock::kAsyncGen;
     if (nameKey)
         detail::decRef(nameKey);  // `newCodeBlock` took its own count
     block->flags |= extraFlags;

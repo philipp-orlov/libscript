@@ -153,6 +153,12 @@ JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, co
 /// promise of the result. Owned.
 JSValue asyncStart(VM& vm, JSValue generator);
 void installPromise(VM& vm);
+/// The object an async generator function's call makes: it queues `next`, `throw` and `return` and drives the frame in
+/// `generator` (which it takes). Owned.
+JSValue asyncGeneratorStart(VM& vm, JSValue generator, JSObject* proto);
+/// `await`: the promise to wait on for `value`, owned.
+/// The async-from-sync wrapper `for await` puts around a sync iterator: owned iterator and its `next`.
+JSValue asyncFromSyncIterator(VM& vm, JSValue iterator, JSValue next);
 void installDate(VM& vm);
 void installTypedArrays(VM& vm);
 void installProxy(VM& vm);

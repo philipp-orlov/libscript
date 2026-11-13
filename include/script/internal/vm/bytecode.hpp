@@ -106,6 +106,7 @@ struct CodeBlock
         kUsesThis = 8,
         kClassConstructor = 32,  ///< calling it without `new` is an error
         kDerived = 64,           ///< a constructor of a class with `extends`
+        kAsyncGen = 512,         ///< an async generator
         kAsync = 256,            ///< an async function: a generator that a promise drives
         kGenerator = 128,        ///< a call makes a generator object instead of running
         kNeedsArgs = 16,  ///< the call keeps every argument in an array, in the register after the parameters

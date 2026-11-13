@@ -1950,6 +1950,84 @@ L_NewRegExp: {
     SET(ins->a, r);
     NEXT();
 }
+L_AsyncIterInit: {
+    // `for await` and `yield*` in an async generator: the object's async iterator, or its sync one wrapped to look async.
+    fr->pc = pc;
+    const JSValue src = R[ins->b];
+    if (src.isNullish()) {
+        vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not async iterable");
+        FAIL();
+    }
+    JSValue method = getProperty(vm, src, vm.atoms.symAsyncIterator);
+    if (method.isException())
+        FAIL();
+    JSValue iterator, next;
+    if (isFunction(method)) {
+        iterator = vm.call(method, src, nullptr, 0);
+        release(method);
+        if (iterator.isException())
+            FAIL();
+        if (!isObject(iterator)) {
+            release(iterator);
+            vm.throwError(ErrorCode::TypeError, "Result of the Symbol.asyncIterator method is not an object");
+            FAIL();
+        }
+        next = getProperty(vm, iterator, vm.atoms.next);
+        if (next.isException()) {
+            release(iterator);
+            FAIL();
+        }
+    } else {
+        release(method);
+        Handle syncIt, syncNext;
+        if (!bi::getIterator(vm, src, &syncIt, &syncNext))
+            FAIL();
+        iterator = bi::asyncFromSyncIterator(vm, syncIt.get(), syncNext.get());
+        if (iterator.isException())
+            FAIL();
+        next = getProperty(vm, iterator, vm.atoms.next);
+        if (next.isException()) {
+            release(iterator);
+            FAIL();
+        }
+    }
+    setReg(R[ins->a + 1], next);
+    setReg(R[ins->a], iterator);
+    NEXT();
+}
+L_AsyncIterNext: {
+    fr->pc = pc;
+    const std::uint32_t it = ins->b;
+    JSValue r = vm.call(R[it + 1], R[it], nullptr, 0);
+    if (r.isException())
+        FAIL();
+    SET(ins->a, r);
+    NEXT();
+}
+L_IterUnpack: {
+    // The result of an awaited `next()`: the hole once it is done, else its value.
+    fr->pc = pc;
+    const JSValue res = R[ins->b];
+    if (!isObject(res)) {
+        vm.throwError(ErrorCode::TypeError, "Iterator result " + describe(vm, res) + " is not an object");
+        FAIL();
+    }
+    JSValue d = getProperty(vm, res, vm.atoms.done);
+    if (d.isException())
+        FAIL();
+    const bool done = toBoolean(d);
+    release(d);
+    if (done) {
+        // The iterator is not to be closed afterwards; `it` is the pair before this instruction's operands.
+        COPY(ins->a, JSValue::hole());
+        NEXT();
+    }
+    JSValue v = getProperty(vm, res, vm.atoms.value);
+    if (v.isException())
+        FAIL();
+    SET(ins->a, v);
+    NEXT();
+}
 L_IterClose: {
     const std::uint32_t it = ins->a;
     if (!isFunction(R[it + 1]))
@@ -1998,7 +2076,9 @@ L_IterClose: {
     }
     NEXT();
 }
+L_Await:
 L_Yield: {
+    vm.suspendedOnAwait = ins->opcode() == Op::Await;
     auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
     JSValue out = R[ins->b];
     retain(out);
@@ -2130,6 +2210,7 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     release(protoValue);
     auto* g = new GenState();
     o->h.cls = std::uint8_t(ObjClass::Generator);
+    (void)protoValue;
     o->rareOf(*this).ext = g;
     g->regs.assign(c->nregs, JSValue::undefined());
     g->callee = toJSValue(f);
@@ -2146,6 +2227,8 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     }
     if (c->flags & CodeBlock::kNeedsArgs)
         g->regs[1 + c->nparams] = toJSValue(captureArguments(*this, args, argc));
+    if (c->flags & CodeBlock::kAsyncGen)
+        return bi::asyncGeneratorStart(*this, keep.take(), proto);
     if (c->flags & CodeBlock::kAsync)
         return bi::asyncStart(*this, keep.take());
     return keep.take();

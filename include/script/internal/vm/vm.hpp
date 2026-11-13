@@ -98,6 +98,7 @@ struct Intrinsics
     JSObject* weakSet = nullptr;
     JSObject* regexp = nullptr;
     JSObject* promise = nullptr;
+    JSObject* asyncGenerator = nullptr;
     JSObject* arrayBuffer = nullptr;
     JSObject* typedArrays[16] = {};  ///< by ElemKind
 };
@@ -281,6 +282,8 @@ struct VM : EngineRuntime
     JSValue returnValue = JSValue::undefined();
     /// Set while a `throw` is being delivered to a suspended generator.
     bool resumeThrow = false;
+    /// Whether the last suspension of a generator frame was an `await` rather than a `yield`.
+    bool suspendedOnAwait = false;
 
 private:
     friend struct JSObject;

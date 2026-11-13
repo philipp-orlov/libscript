@@ -554,6 +554,225 @@ NATIVE(asyncContinue)
     return JSValue::undefined();
 }
 
+
+// ---------------------------------------------------------- async generators ---
+
+struct AsyncGenRequest
+{
+    int mode;  // 0 next, 1 throw, 2 return
+    Handle value;
+    Handle promise;
+};
+
+struct AsyncGenState : NativeState
+{
+    Handle generator;  ///< the frame, which resumes through `resumeRaw`
+    std::deque<AsyncGenRequest> queue;
+    bool running = false;
+
+    void clear(VM&) noexcept override
+    {
+        generator = Handle();
+        queue.clear();
+    }
+    void values(std::vector<JSValue>& out) const override
+    {
+        out.push_back(generator.get());
+        for (const AsyncGenRequest& r : queue) {
+            out.push_back(r.value.get());
+            out.push_back(r.promise.get());
+        }
+    }
+};
+
+AsyncGenState* asyncGenOf(JSValue v)
+{
+    if (isObject(v) && asObject(v)->cls() == ObjClass::Native)
+        if (Rare* r = asObject(v)->rare())
+            return dynamic_cast<AsyncGenState*>(r->ext);
+    return nullptr;
+}
+
+void asyncGenDrain(VM& vm, JSValue outer);
+NATIVE(asyncGenContinue);
+
+void asyncGenStep(VM& vm, JSValue outer, int mode, JSValue sent)
+{
+    AsyncGenState* st = asyncGenOf(outer);
+    JSValue out;
+    bool done;
+    const bool ok = vm.resumeRaw(st->generator.get(), mode, sent, &out, &done);
+    const JSValue front = st->queue.front().promise.get();
+    if (!ok) {
+        JSValue e = takeException(vm);
+        Handle ek = Handle::adopt(e);
+        rejectPromise(vm, front, e);
+        st->queue.pop_front();
+        st->running = false;
+        asyncGenDrain(vm, outer);
+        return;
+    }
+    Handle outKeep = Handle::adopt(out);
+    if (!done && vm.suspendedOnAwait) {
+        // An `await`: go on when what was awaited settles.
+        JSValue awaited = promiseResolve(vm, out);
+        Handle awaitedKeep = Handle::adopt(awaited);
+        Handle onFul = Handle::adopt(toJSValue(closureFn(vm, asyncGenContinue, outer, JSValue::undefined(), 0)));
+        Handle onRej = Handle::adopt(toJSValue(closureFn(vm, asyncGenContinue, outer, JSValue::undefined(), 1)));
+        performThen(vm, awaited, onFul.get(), onRej.get(), JSValue::undefined());
+        return;
+    }
+    // A `yield` or the return: this request is answered.
+    JSValue result = iterResult(vm, out, done);
+    retain(out);
+    Handle resultKeep = Handle::adopt(result);
+    resolvePromise(vm, front, result);
+    st->queue.pop_front();
+    st->running = false;
+    asyncGenDrain(vm, outer);
+}
+
+void asyncGenDrain(VM& vm, JSValue outer)
+{
+    AsyncGenState* st = asyncGenOf(outer);
+    if (!st || st->running || st->queue.empty())
+        return;
+    st->running = true;
+    AsyncGenRequest& req = st->queue.front();
+    asyncGenStep(vm, outer, req.mode, req.value.get());
+}
+
+NATIVE(asyncGenContinue)
+{
+    UNUSED();
+    Rare& r = carried(data);
+    asyncGenStep(vm, r.boundTarget, int(r.fnLength), arg(args, argc, 0));
+    return JSValue::undefined();
+}
+
+NATIVE(asyncGenEnqueue)
+{
+    UNUSED();
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));
+    JSValue promise = newPromiseObject(vm);
+    Handle promiseKeep = Handle::adopt(promise);
+    AsyncGenState* st = asyncGenOf(self);
+    if (!st) {
+        JSValue e = vm.makeError(ErrorCode::TypeError, "next method called on an incompatible receiver");
+        rejectPromise(vm, promise, e);
+        release(e);
+        return promiseKeep.take();
+    }
+    Handle keep = Handle::retained(self);
+    st->queue.push_back(AsyncGenRequest{mode, Handle::retained(arg(args, argc, 0)), promiseKeep});
+    asyncGenDrain(vm, self);
+    return promiseKeep.take();
+}
+
+// ------------------------------------------------- the sync iterator in async clothes ---
+
+struct SyncWrap : NativeState
+{
+    Handle iterator, next;
+    void clear(VM&) noexcept override
+    {
+        iterator = Handle();
+        next = Handle();
+    }
+    void values(std::vector<JSValue>& out) const override
+    {
+        out.push_back(iterator.get());
+        out.push_back(next.get());
+    }
+};
+
+NATIVE(wrapUnwrap)
+{
+    UNUSED();
+    Rare& r = carried(data);
+    retain(arg(args, argc, 0));
+    return iterResult(vm, arg(args, argc, 0), r.fnLength != 0);
+}
+
+NATIVE(syncWrapStep)
+{
+    UNUSED();
+    SyncWrap* w = nullptr;
+    if (isObject(self) && asObject(self)->cls() == ObjClass::Native)
+        if (Rare* r = asObject(self)->rare())
+            w = dynamic_cast<SyncWrap*>(r->ext);
+    JSValue derived = newPromiseObject(vm);
+    Handle derivedKeep = Handle::adopt(derived);
+    if (!w) {
+        JSValue e = vm.makeError(ErrorCode::TypeError, "next method called on an incompatible receiver");
+        rejectPromise(vm, derived, e);
+        release(e);
+        return derivedKeep.take();
+    }
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 next, 1 throw, 2 return
+    JSValue r;
+    if (mode == 0) {
+        r = vm.call(w->next.get(), w->iterator.get(), args, argc > 0 ? 1 : 0);
+    } else {
+        Key k = vm.internKey(std::string_view(mode == 1 ? "throw" : "return"));
+        JSValue f = getProperty(vm, w->iterator.get(), k);
+        detail::decRef(k);
+        if (f.isException()) {
+            r = f;
+        } else if (f.isNullish()) {
+            release(f);
+            if (mode == 1) {
+                release(vm.exception);
+                vm.exception = arg(args, argc, 0);
+                retain(vm.exception);
+                vm.exceptionCode = ErrorCode::Exception;
+                r = JSValue::exception();
+            } else {
+                retain(arg(args, argc, 0));
+                r = iterResult(vm, arg(args, argc, 0), true);
+            }
+        } else {
+            Handle fk = Handle::adopt(f);
+            r = vm.call(f, w->iterator.get(), args, argc > 0 ? 1 : 0);
+        }
+    }
+    if (r.isException()) {
+        JSValue e = takeException(vm);
+        rejectPromise(vm, derived, e);
+        release(e);
+        return derivedKeep.take();
+    }
+    Handle rKeep = Handle::adopt(r);
+    if (!isObject(r)) {
+        JSValue e = vm.makeError(ErrorCode::TypeError, "Iterator result " + describe(vm, r) + " is not an object");
+        rejectPromise(vm, derived, e);
+        release(e);
+        return derivedKeep.take();
+    }
+    JSValue d = getProperty(vm, r, vm.atoms.done);
+    if (d.isException()) {
+        JSValue e = takeException(vm);
+        rejectPromise(vm, derived, e);
+        release(e);
+        return derivedKeep.take();
+    }
+    const bool done = toBoolean(d);
+    release(d);
+    JSValue v = getProperty(vm, r, vm.atoms.value);
+    if (v.isException()) {
+        JSValue e = takeException(vm);
+        rejectPromise(vm, derived, e);
+        release(e);
+        return derivedKeep.take();
+    }
+    Handle vKeep = Handle::adopt(v);
+    JSValue wrapped = promiseResolve(vm, v);
+    Handle wrappedKeep = Handle::adopt(wrapped);
+    Handle unwrap = Handle::adopt(toJSValue(closureFn(vm, wrapUnwrap, JSValue::undefined(), JSValue::undefined(), done ? 1 : 0)));
+    performThen(vm, wrapped, unwrap.get(), JSValue::undefined(), derived);
+    return derivedKeep.take();
+}
+
 }  // namespace
 
 JSValue asyncStart(VM& vm, JSValue generator)
@@ -565,8 +784,50 @@ JSValue asyncStart(VM& vm, JSValue generator)
     return promiseKeep.take();
 }
 
+JSValue asyncGeneratorStart(VM& vm, JSValue generator, JSObject* proto)
+{
+    Handle gen = Handle::adopt(generator);
+    JSObject* outer = vm.newObject(proto ? proto : vm.protos.asyncGenerator);
+    Handle outerKeep = Handle::adopt(toJSValue(outer));
+    outer->h.cls = std::uint8_t(ObjClass::Native);
+    auto* st = new AsyncGenState();
+    st->generator = gen;
+    outer->rareOf(vm).ext = st;
+    return outerKeep.take();
+}
+
+JSValue asyncFromSyncIterator(VM& vm, JSValue iterator, JSValue next)
+{
+    static_assert(true, "");
+    JSObject* o = vm.newObject(vm.protos.object);
+    Handle keep = Handle::adopt(toJSValue(o));
+    o->h.cls = std::uint8_t(ObjClass::Native);
+    auto* w = new SyncWrap();
+    w->iterator = Handle::retained(iterator);
+    w->next = Handle::retained(next);
+    o->rareOf(vm).ext = w;
+    method(vm, o, "next", syncWrapStep, 1, reinterpret_cast<void*>(0));
+    method(vm, o, "throw", syncWrapStep, 1, reinterpret_cast<void*>(1));
+    method(vm, o, "return", syncWrapStep, 1, reinterpret_cast<void*>(2));
+    return keep.take();
+}
+
 void installPromise(VM& vm)
 {
+    {
+        JSObject* agProto = vm.newObject(vm.protos.object);
+        vm.setIntrinsic(&vm.protos.asyncGenerator, agProto);
+        release(toJSValue(agProto));
+        method(vm, agProto, "next", asyncGenEnqueue, 1, reinterpret_cast<void*>(0));
+        method(vm, agProto, "throw", asyncGenEnqueue, 1, reinterpret_cast<void*>(1));
+        method(vm, agProto, "return", asyncGenEnqueue, 1, reinterpret_cast<void*>(2));
+        symbolMethod(vm, agProto, vm.atoms.symAsyncIterator, "[Symbol.asyncIterator]",
+                     [](VM&, JSValue self, const JSValue*, std::uint32_t, void*) -> JSValue {
+                         retain(self);
+                         return self;
+                     }, 0);
+        agProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("AsyncGenerator")), attr::kConfigurable);
+    }
     JSObject* proto = vm.newObject(vm.protos.object);
     vm.setIntrinsic(&vm.protos.promise, proto);
     release(toJSValue(proto));

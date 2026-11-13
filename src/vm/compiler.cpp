@@ -874,6 +874,7 @@ private:
     void closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, std::uint16_t reg, bool isCatch = false);
 
     std::vector<String> pendingLabels_;
+    int classDepth_ = 0;  ///< inside a class body, all of which is strict
     /// While a parameter's default is worked out: the parameters not yet initialised, which may not be read.
     struct ParamTdz
     {
@@ -979,11 +980,15 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
 
     switch (n.kind) {
         case NK::NumberLit: {
+            if (n.legacyOctal && fn_->strict)
+                syntaxError(n, "Octal literals are not allowed in strict mode");
             const std::uint16_t d = dest(dst);
             loadNumber(d, n.number);
             return d;
         }
         case NK::StringLit: {
+            if (n.legacyOctal && fn_->strict)
+                syntaxError(n, "Octal escape sequences are not allowed in strict mode");
             const std::uint16_t d = dest(dst);
             loadString(d, n.text);
             return d;
@@ -1441,6 +1446,12 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
 {
     const String name = cls.text.empty() ? inferredName : cls.text;
     const bool derived = cls.a != nullptr;
+    struct ClassDepth
+    {
+        int& depth;
+        explicit ClassDepth(int& d) : depth(d) { ++depth; }
+        ~ClassDepth() { --depth; }
+    } classDepth(classDepth_);
     checkClassMembers(cls);
     const Node* ctor = nullptr;
     for (const dyn::NodePtr& m : cls.list)
@@ -3443,7 +3454,7 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
     child.parent = fn_;
     child.block = block;
     child.isArrow = arrow;
-    child.strict = fn_->strict || (n.d && hasUseStrict(*n.d)) || (extraFlags & CodeBlock::kClassConstructor) != 0 || n.isMethod;
+    child.strict = fn_->strict || (n.d && hasUseStrict(*n.d)) || (extraFlags & CodeBlock::kClassConstructor) != 0 || classDepth_ > 0;
     if (child.strict)
         block->flags |= CodeBlock::kStrict;
     if (arrow)

@@ -409,6 +409,7 @@ struct ViewState : NativeState
 {
     JSValue buffer = JSValue::undefined();
     std::uint32_t offset = 0, length = 0;
+    bool tracking = false;  ///< made without a length on a resizable buffer: it follows the buffer's size
     ~ViewState() override { release(buffer); }
     void clear(VM&) noexcept override
     {
@@ -418,6 +419,24 @@ struct ViewState : NativeState
     }
     void values(std::vector<JSValue>& out) const override { out.push_back(buffer); }
 };
+
+/// The view as the buffer is now: false when it no longer fits (or the buffer is gone).
+bool viewBounds(const ViewState* v, std::size_t* length)
+{
+    const BufferState* b = bufferOf(v->buffer);
+    if (!b || b->detached)
+        return false;
+    if (v->tracking) {
+        if (v->offset > b->size)
+            return false;
+        *length = b->size - v->offset;
+        return true;
+    }
+    if (std::size_t(v->offset) + v->length > b->size)
+        return false;
+    *length = v->length;
+    return true;
+}
 
 ViewState* viewOf(JSValue v)
 {
@@ -439,19 +458,27 @@ NATIVE(dataViewCtor)
     double offset, length = -1;
     if (!toIndex(vm, arg(args, argc, 1), "DataView offset", &offset))
         return JSValue::exception();
+    if (b->detached)
+        return typeError(vm, "the buffer has been detached");
     if (offset > double(b->size))
         return vm.throwError(ErrorCode::RangeError, "Start offset " + std::to_string(std::uint64_t(offset)) + " is outside the bounds of the buffer");
-    if (!arg(args, argc, 2).isUndefined() && !toIndex(vm, args[2], "DataView length", &length))
-        return JSValue::exception();
-    if (length < 0)
+    bool follows = false;
+    if (arg(args, argc, 2).isUndefined()) {
+        if (b->resizable)
+            follows = true;
         length = double(b->size) - offset;
-    else if (offset + length > double(b->size))
-        return vm.throwError(ErrorCode::RangeError, "Invalid DataView length " + std::to_string(std::uint64_t(length)));
+    } else {
+        if (!toIndex(vm, args[2], "DataView length", &length))
+            return JSValue::exception();
+        if (offset + length > double(b->size))
+            return vm.throwError(ErrorCode::RangeError, "Invalid DataView length " + std::to_string(std::uint64_t(length)));
+    }
     auto* state = new ViewState();
     retain(buf);
     state->buffer = buf;
     state->offset = std::uint32_t(offset);
     state->length = std::uint32_t(length);
+    state->tracking = follows;
     JSObject* o = asObject(self);
     o->h.cls = std::uint8_t(ObjClass::DataView);
     delete o->rareOf(vm).ext;
@@ -466,11 +493,15 @@ NATIVE(dataViewGetter)
     ViewState* v = viewOf(self);
     if (!v)
         return typeError(vm, "not a DataView");
-    switch (reinterpret_cast<std::intptr_t>(data)) {
-        case 0: retain(v->buffer); return v->buffer;
-        case 1: return JSValue::boxNumber(double(v->length));
-        default: return JSValue::boxNumber(double(v->offset));
+    const auto which = reinterpret_cast<std::intptr_t>(data);
+    if (which == 0) {
+        retain(v->buffer);
+        return v->buffer;
     }
+    std::size_t length = 0;
+    if (!viewBounds(v, &length))
+        return typeError(vm, "the DataView is out of bounds");
+    return JSValue::boxNumber(which == 1 ? double(length) : double(v->offset));
 }
 
 NATIVE(dataViewAccess)
@@ -505,7 +536,10 @@ NATIVE(dataViewAccess)
         }
     }
     const bool little = toBoolean(arg(args, argc, isSet ? 2 : 1));
-    if (index + size > double(v->length))
+    std::size_t viewLength = 0;
+    if (!viewBounds(v, &viewLength))
+        return typeError(vm, "the DataView is out of bounds");
+    if (index + size > double(viewLength))
         return vm.throwError(ErrorCode::RangeError, "Offset is outside the bounds of the DataView");
     BufferState* b = bufferOf(v->buffer);
     std::uint8_t* p = b->data + v->offset + std::size_t(index);

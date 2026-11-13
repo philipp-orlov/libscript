@@ -16,6 +16,8 @@ namespace vm {
 bool toBoolean(JSValue v) noexcept;
 /// `ToPrimitive`; `preferString` is the hint. An owned value.
 JSValue toPrimitive(VM& vm, JSValue v, bool preferString);
+/// `hint` 0 default, 1 number, 2 string.
+JSValue toPrimitiveHint(VM& vm, JSValue v, int hint);
 /// `ToNumber` into `out`; false with an exception pending.
 bool toNumber(VM& vm, JSValue v, double* out);
 /// `ToNumeric`: a number, owned (no BigInt in this core yet).

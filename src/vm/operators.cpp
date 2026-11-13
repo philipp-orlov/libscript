@@ -175,10 +175,34 @@ bool toBoolean(JSValue v) noexcept
 
 JSValue toPrimitive(VM& vm, JSValue v, bool preferString)
 {
+    return toPrimitiveHint(vm, v, preferString ? 2 : 1);
+}
+
+JSValue toPrimitiveHint(VM& vm, JSValue v, int hint)
+{
     if (!isObject(v)) {
         retain(v);
         return v;
     }
+    // `v[Symbol.toPrimitive]`, when it has one, decides.
+    JSValue exotic = getProperty(vm, v, vm.atoms.symToPrimitive);
+    if (exotic.isException())
+        return exotic;
+    if (isFunction(exotic)) {
+        JSValue name = makeString(vm, std::string_view(hint == 0 ? "default" : hint == 1 ? "number" : "string"));
+        JSValue result = vm.call(exotic, v, &name, 1);
+        release(name);
+        release(exotic);
+        if (result.isException())
+            return result;
+        if (isObject(result)) {
+            release(result);
+            return vm.throwError(ErrorCode::TypeError, "Cannot convert object to primitive value");
+        }
+        return result;
+    }
+    release(exotic);
+    const bool preferString = hint == 2;
     const char* first = preferString ? "toString" : "valueOf";
     const char* second = preferString ? "valueOf" : "toString";
     for (const char* name : {first, second}) {
@@ -409,7 +433,7 @@ bool looseEquals(VM& vm, JSValue a, JSValue b, bool* ok)
     if (aObj != bObj) {
         // An object against a primitive: the object becomes a primitive.
         JSValue obj = aObj ? a : b;
-        JSValue prim = toPrimitive(vm, obj, false);
+        JSValue prim = toPrimitiveHint(vm, obj, 0);
         if (prim.isException()) {
             *ok = false;
             return false;
@@ -450,10 +474,10 @@ JSValue add(VM& vm, JSValue a, JSValue b)
         return JSValue::boxNumber(a.asNumber() + b.asNumber());
     if (isString(a) && isString(b))
         return concatStrings(vm, a, b);
-    JSValue pa = toPrimitive(vm, a, false);
+    JSValue pa = toPrimitiveHint(vm, a, 0);
     if (pa.isException())
         return pa;
-    JSValue pb = toPrimitive(vm, b, false);
+    JSValue pb = toPrimitiveHint(vm, b, 0);
     if (pb.isException()) {
         release(pa);
         return pb;

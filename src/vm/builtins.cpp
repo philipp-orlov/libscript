@@ -2296,13 +2296,6 @@ NATIVE(mathImul)
     return JSValue::int32(std::int32_t(std::uint32_t(toInt32(a)) * std::uint32_t(toInt32(b))));
 }
 
-NATIVE(dateNow)
-{
-    UNUSED();
-    const auto since = std::chrono::system_clock::now().time_since_epoch();
-    return JSValue::boxNumber(double(std::chrono::duration_cast<std::chrono::milliseconds>(since).count()));
-}
-
 NATIVE(performanceNow)
 {
     UNUSED();
@@ -2619,13 +2612,7 @@ void VM::installBuiltins()
     release(toJSValue(console));
     method(*this, globalObject, "print", consoleLog, 0);
     {
-        // Only what a benchmark needs of `Date` and `performance`: the clock.
-        JSObject* dateProto = newObject(objectProto);
-        JSFunction* dateCtor = constructor(*this, "Date", [](VM& vm, JSValue, const JSValue*, std::uint32_t, void*) -> JSValue {
-            return vm.throwError(ErrorCode::NotSupported, "Date objects are not supported by the vm core yet");
-        }, 7, dateProto);
-        release(toJSValue(dateProto));
-        method(*this, dateCtor, "now", dateNow, 0);
+        // The clock of `performance`; `Date` is installed with the rest at the end.
         JSObject* performance = newObject(objectProto);
         method(*this, performance, "now", performanceNow, 0);
         Key key = internKey(std::string_view("performance"));
@@ -2643,6 +2630,7 @@ void VM::installBuiltins()
     installCollections(*this);
     installRegExp(*this);
     installPromise(*this);
+    installDate(*this);
 }
 
 namespace bi {

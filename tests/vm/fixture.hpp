@@ -22,7 +22,15 @@ struct Fixture
     script::Context ctx;
     VM& vm;
 
-    Fixture() : ctx(options()), vm(ctx.impl()->vm()) {}
+    /// What the built-ins hold, which the tests do not count.
+    std::uint64_t baseCells, baseObjects, baseBytes;
+
+    Fixture() : ctx(options()), vm(ctx.impl()->vm())
+    {
+        baseCells = vm.liveCells;
+        baseObjects = ctx.impl()->liveObjects;
+        baseBytes = ctx.impl()->heapBytes;
+    }
     static script::Context::Options options()
     {
         script::Context::Options o;
@@ -33,7 +41,8 @@ struct Fixture
 
     /// An interned name; the fixture's context keeps it alive.
     Key key(const std::string& name) { return vm.internKey(std::string_view(name)); }
-    std::uint64_t liveObjects() const { return ctx.impl()->liveObjects; }
+    std::uint64_t liveObjects() const { return ctx.impl()->liveObjects - baseObjects; }
+    std::uint64_t cells() const { return vm.liveCells - baseCells; }
     std::uint64_t heapBytes() const { return ctx.impl()->heapBytes; }
 };
 

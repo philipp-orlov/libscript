@@ -303,6 +303,21 @@ void VM::releaseRoots() noexcept
     }
     release(exception);
     exception = JSValue::undefined();
+    for (CodeBlock** slot : codeRoots_)
+        if (*slot) {
+            releaseCode(*slot);
+            *slot = nullptr;
+        }
+    codeRoots_.clear();
+    if (global) {
+        detail::decRef(reinterpret_cast<CellPtr>(global));
+        global = nullptr;
+    }
+    for (JSObject*& p : errorProtos) {
+        if (p)
+            detail::decRef(reinterpret_cast<CellPtr>(p));
+        p = nullptr;
+    }
     for (Key& k : smallIndexKeys) {
         if (k)
             detail::decRef(k);

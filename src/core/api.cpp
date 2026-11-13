@@ -13,6 +13,9 @@
 #include "base/status.hpp"
 #include "sys/file.hpp"
 #include "script/internal/context.hpp"
+#if SCRIPT_VM
+#include "script/internal/vm/host.hpp"
+#endif
 
 #if SCRIPT_ENGINE_TYPED
 #include "script/internal/typed/module.hpp"
@@ -211,10 +214,20 @@ private:
 
 GCObject* cellOf(const Value& v) noexcept
 {
-    return detail::Access::ptr(v);
+    GCObject* p = detail::Access::ptr(v);
+#if SCRIPT_VM
+    // A cell of the new core has another layout: what reads the old header must not see it.
+    if (p && vm::isVmCell(p))
+        return nullptr;
+#endif
+    return p;
 }
 ContextImpl* contextOf(const Value& v) noexcept
 {
+#if SCRIPT_VM
+    if (vm::host::owns(v))
+        return &vm::host::contextOf(v);
+#endif
     GCObject* p = cellOf(v);
     return p ? p->rt : nullptr;
 }
@@ -320,6 +333,10 @@ Context* Value::context() const noexcept
 
 bool Value::isArray() const noexcept
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::isArray(*this);
+#endif
     if (tag_ == Type::Array)
         return true;
 #if SCRIPT_ENGINE_DYNAMIC
@@ -331,6 +348,10 @@ bool Value::isArray() const noexcept
 
 bool Value::isFunction() const noexcept
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::isFunction(*this);
+#endif
     if (tag_ == Type::Delegate)
         return true;
 #if SCRIPT_ENGINE_DYNAMIC
@@ -342,6 +363,10 @@ bool Value::isFunction() const noexcept
 
 bool Value::isError() const noexcept
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::isError(*this);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell || !cell->rt)
         return false;
@@ -386,6 +411,10 @@ bool Value::isNative() const noexcept
 
 std::string Value::typeName() const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::typeName(*this);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         return script::toString(tag_);
@@ -419,6 +448,10 @@ bool Value::toBool() const noexcept
 
 double Value::toDouble() const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::toDouble(*this);
+#endif
     if (!heap())
         return tag_ == Type::Undefined ? std::nan("") : numberOf(*this);
     if (tag_ == Type::String)
@@ -457,6 +490,10 @@ std::int64_t Value::toLong() const
 
 std::string Value::toString() const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::toString(*this);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         return primitiveToString(*this);
@@ -479,6 +516,10 @@ std::string Value::toString() const
 
 std::string Value::inspect() const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::inspect(*this);
+#endif
     if (isString())
         return "\"" + toString() + "\"";
     GCObject* cell = cellOf(*this);
@@ -529,6 +570,10 @@ std::string Value::inspect() const
 
 std::string Value::toJson(int indent) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        throw Error(ErrorCode::NotSupported, "the vm core has no JSON yet");
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell) {
         switch (tag_) {
@@ -560,7 +605,7 @@ std::string Value::toJson(int indent) const
 bool Value::sameReference(const Value& o) const noexcept
 {
     if (heap() || o.heap())
-        return cellOf(*this) == cellOf(o) && tag_ == o.tag_;
+        return detail::Access::ptr(*this) == detail::Access::ptr(o) && tag_ == o.tag_;
     return strictEquals(o);
 }
 
@@ -580,12 +625,16 @@ bool Value::strictEquals(const Value& o) const noexcept
             auto* b = static_cast<StringCell*>(cellOf(o));
             return a == b || (a && b && a->text() == b->text());
         }
-        default: return cellOf(*this) == cellOf(o);
+        default: return detail::Access::ptr(*this) == detail::Access::ptr(o);
     }
 }
 
 bool Value::equals(const Value& o) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return strictEquals(o);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     if (isDynamic(*this) || isDynamic(o)) {
         ContextImpl* rt = contextOf(*this);
@@ -604,6 +653,10 @@ bool Value::equals(const Value& o) const
 
 Value Value::get(std::string_view key) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::get(*this, key);
+#endif
     ContextImpl& rt = need(*this, "get");
     Guard guard(&rt);
 #if SCRIPT_ENGINE_DYNAMIC
@@ -641,6 +694,10 @@ Value Value::get(std::string_view key) const
 
 Value Value::get(std::uint32_t index) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::get(*this, index);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         throw Error(ErrorCode::NullReference, "the value is null");
@@ -676,6 +733,10 @@ Value Value::get(std::uint32_t index) const
 
 Value Value::get(const Value& key) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::get(*this, key);
+#endif
     ContextImpl& rt = need(*this, "get");
     Guard guard(&rt);
 #if SCRIPT_ENGINE_DYNAMIC
@@ -689,6 +750,10 @@ Value Value::get(const Value& key) const
 
 void Value::set(std::string_view key, const Value& v)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::set(*this, key, v);
+#endif
     ContextImpl& rt = need(*this, "set");
     Guard guard(&rt);
 #if SCRIPT_ENGINE_DYNAMIC
@@ -734,6 +799,10 @@ void Value::set(std::string_view key, const Value& v)
 
 void Value::set(std::uint32_t index, const Value& v)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::set(*this, index, v);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         throw Error(ErrorCode::NullReference, "the value is null");
@@ -765,6 +834,10 @@ void Value::set(std::uint32_t index, const Value& v)
 
 void Value::set(const Value& key, const Value& v)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::set(*this, key, v);
+#endif
     ContextImpl& rt = need(*this, "set");
     Guard guard(&rt);
 #if SCRIPT_ENGINE_DYNAMIC
@@ -781,6 +854,10 @@ void Value::set(const Value& key, const Value& v)
 
 bool Value::has(std::string_view key) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::has(*this, key);
+#endif
     ContextImpl* rt = contextOf(*this);
     if (!rt)
         return false;
@@ -802,6 +879,10 @@ bool Value::has(std::string_view key) const
 
 std::vector<std::string> Value::keys() const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::keys(*this);
+#endif
     std::vector<std::string> names;
     ContextImpl* rt = contextOf(*this);
     if (!rt)
@@ -830,6 +911,10 @@ std::vector<std::string> Value::keys() const
 
 std::uint32_t Value::length() const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::length(*this);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         return 0;
@@ -851,6 +936,10 @@ std::uint32_t Value::length() const
 
 void Value::push(const Value& v)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::push(*this, v);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         throw Error(ErrorCode::NullReference, "the value is null");
@@ -885,6 +974,10 @@ dyn::DynObject& needDynObject(const Value& v, const char* what)
 
 void Value::defineProperty(std::string_view key, const Value& v, PropertyFlags flags)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::defineProperty(*this, key, v, flags);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     ContextImpl& rt = need(*this, "defineProperty");
     Guard guard(&rt);
@@ -900,6 +993,10 @@ void Value::defineProperty(std::string_view key, const Value& v, PropertyFlags f
 void Value::defineAccessor(std::string_view key, const Value& getterFn, const Value& setterFn,
                            PropertyFlags flags)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        throw Error(ErrorCode::NotSupported, "the vm core does not define accessors from the host yet");
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     ContextImpl& rt = need(*this, "defineAccessor");
     Guard guard(&rt);
@@ -917,6 +1014,10 @@ void Value::defineAccessor(std::string_view key, const Value& getterFn, const Va
 
 bool Value::hasOwn(std::string_view key) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::hasOwn(*this, key);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     dyn::DynObject* obj = dyn::asObject(*this);
     if (!obj)
@@ -931,6 +1032,10 @@ bool Value::hasOwn(std::string_view key) const
 
 bool Value::remove(std::string_view key)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::remove(*this, key);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     ContextImpl& rt = need(*this, "remove");
     Guard guard(&rt);
@@ -943,6 +1048,10 @@ bool Value::remove(std::string_view key)
 
 Value Value::prototype() const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::prototype(*this);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     dyn::DynObject* obj = dyn::asObject(*this);
     if (!obj || !obj->proto)
@@ -955,6 +1064,10 @@ Value Value::prototype() const
 
 void Value::setPrototype(const Value& proto)
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::setPrototype(*this, proto);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     if (dyn::DynObject* obj = dyn::asObject(*this))
         obj->setProto(dyn::asObject(proto));
@@ -971,6 +1084,10 @@ Value Value::call(const std::vector<Value>& args) const
 
 Value Value::callWithThis(const Value& thisValue, const std::vector<Value>& args) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::call(*this, thisValue, args);
+#endif
     ContextImpl& rt = need(*this, "call");
     Guard guard(&rt);
 #if SCRIPT_ENGINE_TYPED
@@ -989,6 +1106,10 @@ Value Value::callWithThis(const Value& thisValue, const std::vector<Value>& args
 
 Value Value::invoke(std::string_view method, const std::vector<Value>& args) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::invoke(*this, method, args);
+#endif
     ContextImpl& rt = need(*this, "invoke");
     Guard guard(&rt);
 #if SCRIPT_ENGINE_DYNAMIC
@@ -1028,6 +1149,10 @@ Value Value::invoke(std::string_view method, const std::vector<Value>& args) con
 
 Value Value::construct(const std::vector<Value>& args) const
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::construct(*this, args);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     ContextImpl& rt = need(*this, "construct");
     Guard guard(&rt);

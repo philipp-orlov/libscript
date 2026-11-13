@@ -231,7 +231,7 @@ TEST(valuesAreCountedAndReleasedWhenReplacedOrDeleted)
     o->putOwn(f.vm, f.key("b"), num(0));
     CHECK_EQ(headerOf(cell)->rc, std::uint32_t(1));
     release(JSValue::cell(cell));
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(1));
+    CHECK_EQ(f.cells(), std::uint64_t(1));
     release(toJSValue(o));
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(0));
+    CHECK_EQ(f.cells(), std::uint64_t(0));
 }

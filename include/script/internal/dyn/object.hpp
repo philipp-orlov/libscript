@@ -4,6 +4,11 @@
 // The heap: reference-counted cells, objects, property tables.
 #pragma once
 
+#include "script/config.hpp"
+#if SCRIPT_VM
+#include "script/internal/vm/cell.hpp"
+#endif
+
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -839,6 +844,11 @@ struct DynCoroutine : DynObject
 inline DynObject* asObject(const Value& v) noexcept
 {
     GCObject* cell = detail::Access::ptr(v);
+#if SCRIPT_VM
+    // An object of the new core has no `kind` where this reads one.
+    if (cell && vm::isVmCell(cell))
+        return nullptr;
+#endif
     return cell && cell->kind == CellKind::Object ? static_cast<DynObject*>(cell) : nullptr;
 }
 inline StringCell* asString(const Value& v) noexcept

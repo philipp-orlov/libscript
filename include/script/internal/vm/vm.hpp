@@ -24,16 +24,9 @@ struct JSFunction;
 struct Box;
 struct GetterSetter;
 struct Rare;
+struct CodeBlock;
+struct Frame;
 
-/// What a function runs. The bytecode compiler (phase P2) grows this; the object model needs the name, the arity and
-/// whether it constructs. Counted, intrusively and without atomics, by the functions made from it.
-struct CodeBlock
-{
-    std::uint32_t refs = 1;
-    std::uint32_t length = 0;  ///< the `length` property
-    Key name = nullptr;        ///< holds a count; null for an anonymous function
-    bool constructor = false;
-};
 
 /// One eight-byte cell of validity: a cache or a piece of code that depends on a prototype chain holds a count of one
 /// and reads `valid` before trusting what it learned. Made by `VM::validityOf`; cleared by `VM::invalidateChain`.
@@ -72,6 +65,20 @@ struct Intrinsics
     JSObject* boolean = nullptr;
     JSObject* symbol = nullptr;
     JSObject* bigint = nullptr;
+};
+
+/// One activation on the VM stack. `R` is its register window; register 0 is `this`, then the parameters. A function called
+/// from bytecode shares its first registers with the call window of its caller.
+struct Frame
+{
+    CodeBlock* code;
+    JSFunction* fn;
+    const struct Ins* pc;       ///< where to go on in this frame: set when it calls out
+    JSValue* R;
+    std::uint16_t retDst;       ///< the caller's register that receives the result
+    std::uint32_t argc;
+    bool construct;             ///< `new`: a result that is not an object is replaced by `this`
+    bool entry;                 ///< entered from C++: leaving it returns from `run`
 };
 
 struct VM : EngineRuntime
@@ -142,9 +149,35 @@ struct VM : EngineRuntime
     /// The value being thrown while a function returns the exception sentinel; owned.
     JSValue exception = JSValue::undefined();
     ErrorCode exceptionCode = ErrorCode::Ok;
-    /// Until Error objects exist (V-9) a throw is a string with the code kept beside it.
+    /// An error object of the class `code` names, with `message`; owned.
+    JSValue makeError(ErrorCode code, std::string_view message);
+    /// Make an error and leave it pending; returns the exception sentinel, so `return vm.throwError(...)` reads well.
     JSValue throwError(ErrorCode code, std::string_view message);
     void clearException() noexcept;
+    /// The prototypes of the error classes, by `ErrorCode`, null for a code that has none: those use `Error`'s.
+    JSObject* errorProtos[48] = {};
+    JSObject* errorProto(ErrorCode code) const noexcept;
+
+    // ---- calls (interp.cpp) ----
+    /// The call stack: registers of every live frame, in one reserved range.
+    JSValue* stackBase = nullptr;
+    JSValue* stackEnd = nullptr;
+    /// First register nobody uses: what a call from C++ puts its frame at.
+    JSValue* stackTop = nullptr;
+    std::uint32_t depth = 0;
+    Vec<Frame> frames;
+    /// `callee(this, ...args)`. An owned result, or the exception sentinel with `exception` set. Runs script or native
+    /// code; may be called from native code that script called.
+    JSValue call(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc);
+    /// `new callee(...args)`.
+    JSValue construct(JSValue callee, const JSValue* args, std::uint32_t argc);
+    /// Set while a native function runs as a constructor: the function itself; otherwise undefined. A native that
+    /// constructs is handed a fresh `this` made from the function's `prototype`.
+    JSValue newTarget = JSValue::undefined();
+    /// The global object: `globalThis`. Owned.
+    JSObject* global = nullptr;
+    /// Install the global object and the built-in functions and prototypes (builtins.cpp).
+    void installBuiltins();
 
     CallHook callHook = nullptr;
     void* callHookData = nullptr;
@@ -177,6 +210,16 @@ private:
 
 public:
     static constexpr std::size_t kValidityChunkBytes = std::size_t(64) << 10;
+
+private:
+    void* stackRegionBase_ = nullptr;
+    std::size_t stackRegionBytes_ = 0;
+    Vec<CodeBlock**> codeRoots_;
+
+public:
+    /// A program's code block, which the VM lets go of when it ends if the program has not.
+    void addCodeRoot(CodeBlock** slot);
+    void removeCodeRoot(CodeBlock** slot) noexcept;
 
 private:
     Vec<void*> validityChunks_;

@@ -1,0 +1,57 @@
+// Copyright (c) 2026 Philipp Orlov
+// SPDX-License-Identifier: Apache-2.0
+
+// Conversions and operators of the language on `JSValue`, with the integer fast paths first. Results that are values
+// are owned. A function that can run script (a conversion that calls `valueOf`) can fail: it says so by returning the
+// exception sentinel or `false`, with `vm.exception` set.
+#pragma once
+
+#include "script/internal/vm/bytecode.hpp"
+#include "script/internal/vm/object.hpp"
+
+namespace script {
+namespace internal {
+namespace vm {
+
+bool toBoolean(JSValue v) noexcept;
+/// `ToPrimitive`; `preferString` is the hint. An owned value.
+JSValue toPrimitive(VM& vm, JSValue v, bool preferString);
+/// `ToNumber` into `out`; false with an exception pending.
+bool toNumber(VM& vm, JSValue v, double* out);
+/// `ToNumeric`: a number, owned (no BigInt in this core yet).
+JSValue toNumeric(VM& vm, JSValue v);
+/// `ToString`, an owned string cell.
+JSValue toStringValue(VM& vm, JSValue v);
+/// `ToObject` for the values that have a wrapper this core can make; an owned value or the exception sentinel.
+JSValue toObject(VM& vm, JSValue v);
+std::int32_t toInt32(double d) noexcept;
+inline std::uint32_t toUint32(double d) noexcept
+{
+    return std::uint32_t(toInt32(d));
+}
+/// A string made from text; owned.
+JSValue makeString(VM& vm, StringView text);
+JSValue makeString(VM& vm, std::string_view utf8);
+JSValue typeOf(VM& vm, JSValue v);
+
+bool strictEquals(JSValue a, JSValue b) noexcept;
+bool sameValueZero(JSValue a, JSValue b) noexcept;
+/// `a == b`; `*ok` is false with an exception pending.
+bool looseEquals(VM& vm, JSValue a, JSValue b, bool* ok);
+
+/// `a + b`.
+JSValue add(VM& vm, JSValue a, JSValue b);
+/// The arithmetic and bitwise operators: `op` is one of Sub..UShr (and Exp).
+JSValue arithmetic(VM& vm, Op op, JSValue a, JSValue b);
+/// `a < b` and friends: `op` is Lt, Le, Gt or Ge. 0 or 1, or -1 with an exception pending.
+int relational(VM& vm, Op op, JSValue a, JSValue b);
+/// `a instanceof b`: 0 or 1, or -1 with an exception pending.
+int instanceOf(VM& vm, JSValue a, JSValue b);
+/// `a in b`.
+int inOperator(VM& vm, JSValue a, JSValue b);
+/// The name of a value for an error message: `undefined`, `null`, `5`, `[object Object]`.
+std::string describe(VM& vm, JSValue v);
+
+}  // namespace vm
+}  // namespace internal
+}  // namespace script

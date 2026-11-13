@@ -41,11 +41,11 @@ TEST(countsReturnToTheStartAfterAMillionBoxes)
         release(JSValue::cell(reinterpret_cast<CellPtr>(f.vm.newBox(num(i)))));
     CHECK_EQ(f.liveObjects(), before);
     CHECK_EQ(f.heapBytes(), bytes);
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(0));
+    CHECK_EQ(f.cells(), std::uint64_t(0));
     std::vector<JSValue> held;
     for (int i = 0; i < 100000; ++i)
         held.push_back(JSValue::cell(reinterpret_cast<CellPtr>(f.vm.newBox(num(i)))));
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(100000));
+    CHECK_EQ(f.cells(), std::uint64_t(100000));
     CHECK_EQ(f.liveObjects(), before + 100000);
     for (JSValue v : held)
         release(v);
@@ -59,9 +59,9 @@ TEST(aLongChainOfBoxesFreesWithoutRecursing)
     JSValue head = JSValue::undefined();
     for (int i = 0; i < 300000; ++i)
         head = JSValue::cell(reinterpret_cast<CellPtr>(f.vm.newBox(head)));
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(300000));
+    CHECK_EQ(f.cells(), std::uint64_t(300000));
     release(head);
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(0));
+    CHECK_EQ(f.cells(), std::uint64_t(0));
     CHECK_EQ(f.liveObjects(), before);
 }
 
@@ -76,7 +76,7 @@ TEST(aLongChainOfObjectsFreesWithoutRecursing)
         head = toJSValue(o);
     }
     release(head);
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(0));
+    CHECK_EQ(f.cells(), std::uint64_t(0));
 }
 
 TEST(aCellHoldsItsOldFamilyChildrenAndLetsThemGo)

@@ -46,9 +46,9 @@ TEST(closuresHoldTheirBoxes)
         }
         for (vm::Box* b : boxes)
             release(JSValue::cell(reinterpret_cast<CellPtr>(b)));
-        CHECK_EQ(f.vm.liveCells, std::uint64_t(n + 1));  // the boxes live on in the closure
+        CHECK_EQ(f.cells(), std::uint64_t(n + 1));  // the boxes live on in the closure
         release(toJSValue(fn));
-        CHECK_EQ(f.vm.liveCells, std::uint64_t(0));
+        CHECK_EQ(f.cells(), std::uint64_t(0));
     }
 }
 
@@ -85,7 +85,7 @@ TEST(lengthNameAndPrototypeAppearOnDemand)
     CHECK((names == std::vector<std::string>{"length", "name", "prototype"}));
     // The prototype made a cycle: the function and its prototype outlive the last handle (until a collection).
     release(toJSValue(fn));
-    CHECK(f.vm.liveCells >= 2);
+    CHECK(f.cells() >= 2);
 }
 
 TEST(aFunctionThatIsNotAConstructorHasNoPrototype)
@@ -100,7 +100,7 @@ TEST(aFunctionThatIsNotAConstructorHasNoPrototype)
     release(name);
     CHECK_EQ(headerOf(reinterpret_cast<CellPtr>(fn))->rc, std::uint32_t(1));
     release(toJSValue(fn));
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(0));
+    CHECK_EQ(f.cells(), std::uint64_t(0));
 }
 
 TEST(nativeFunctionsKeepTheirPointerAndData)

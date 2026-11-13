@@ -3,10 +3,12 @@
 
 #include "script/internal/vm/vm.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
 #include "script/internal/vm/census.hpp"
+#include "script/internal/vm/bytecode.hpp"
 #include "script/internal/vm/object.hpp"
 #include "sys/vm.hpp"
 
@@ -33,10 +35,24 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     shapeRegionBytes_ = region.bytes;
     shapeTable_ = static_cast<Shape**>(region.base);
 
+    const std::size_t stackBytes = std::size_t(32) << 20;
+    const sys::VmRegion stack = sys::vmReserve(stackBytes);
+    sys::vmCommit(stack.base, stack.bytes);
+    stackRegionBase_ = stack.base;
+    stackRegionBytes_ = stack.bytes;
+    stackBase = stackTop = static_cast<JSValue*>(stack.base);
+    stackEnd = stackBase + stack.bytes / sizeof(JSValue);
+    // A frame is pushed without ever growing the vector, so pointers into it stay good.
+    frames.reserve(std::size_t(ctx.options.stackLimit) + 16);
+
     atoms.length = internKey("length");
     atoms.prototype = internKey("prototype");
     atoms.constructor = internKey("constructor");
     atoms.name = internKey("name");
+    callHook = [](VM& vm, JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, void*) {
+        return vm.call(callee, thisValue, args, argc);
+    };
+    installBuiltins();
 }
 
 VM::~VM()
@@ -48,9 +64,21 @@ VM::~VM()
         freePayload(chunk, kValidityChunkBytes);
     if (shapeRegionBase_)
         sys::vmUnmap(shapeRegionBase_, shapeRegionBytes_);
+    if (stackRegionBase_)
+        sys::vmUnmap(stackRegionBase_, stackRegionBytes_);
 }
 
 void VM::afterCollect() noexcept {}
+
+void VM::addCodeRoot(CodeBlock** slot)
+{
+    codeRoots_.push_back(slot);
+}
+
+void VM::removeCodeRoot(CodeBlock** slot) noexcept
+{
+    codeRoots_.erase(std::remove(codeRoots_.begin(), codeRoots_.end(), slot), codeRoots_.end());
+}
 
 std::string VM::captureStack() const
 {
@@ -76,15 +104,6 @@ void VM::setIntrinsic(JSObject** slot, JSObject* object) noexcept
     if (*slot)
         detail::decRef(reinterpret_cast<CellPtr>(*slot));
     *slot = object;
-}
-
-JSValue VM::throwError(ErrorCode code, std::string_view message)
-{
-    clearException();
-    exception = JSValue::cell(ctx.intern(ascii(message)));
-    retain(exception);
-    exceptionCode = code;
-    return JSValue::exception();
 }
 
 void VM::clearException() noexcept

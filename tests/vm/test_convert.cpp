@@ -53,12 +53,12 @@ TEST(aCellOfTheNewFamilyIsAnObject)
     CHECK(v.type() == Type::Object);
     CHECK_EQ(headerOf(reinterpret_cast<CellPtr>(o))->rc, std::uint32_t(2));
     release(toJSValue(o));
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(1));
+    CHECK_EQ(f.cells(), std::uint64_t(1));
     JSValue back = fromValue(f.vm, v);
     CHECK(back == toJSValue(o));
     release(back);
     v = Value();
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(0));  // the Value's destructor went through the hook
+    CHECK_EQ(f.cells(), std::uint64_t(0));  // the Value's destructor went through the hook
 }
 
 TEST(symbolsAndBigIntsOfTheOldFamilyCount)

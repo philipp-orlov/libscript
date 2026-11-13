@@ -161,6 +161,7 @@ TEST(aThrowingGetterGivesTheExceptionSentinel)
 TEST(aGetterWithNoHookIsATypeError)
 {
     Fixture f;
+    f.vm.callHook = nullptr;
     JSObject* o = make(f);
     JSFunction* g = f.vm.newNativeFunction(nullptr, &returnsSeven, nullptr, f.key("g"), 0);
     CHECK(defineAccessor(f.vm, o, f.key("p"), toJSValue(g), JSValue::undefined(), attr::kConfigurable));

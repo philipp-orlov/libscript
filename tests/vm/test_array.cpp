@@ -50,7 +50,7 @@ TEST(elementsAreCountedAndReleased)
     CHECK_EQ(headerOf(boxes[5])->rc, std::uint32_t(1));
     for (CellPtr c : boxes)
         release(JSValue::cell(c));
-    CHECK_EQ(f.vm.liveCells, std::uint64_t(0));
+    CHECK_EQ(f.cells(), std::uint64_t(0));
 }
 
 TEST(setAtGrowsWithHolesAndRefusesAHugeGap)

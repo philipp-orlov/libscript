@@ -1,0 +1,1958 @@
+// Copyright (c) 2026 Philipp Orlov
+// SPDX-License-Identifier: Apache-2.0
+
+// The built-in objects the new core ships with so far: enough of Object, Function, Array, String, Number, Boolean, Math
+// and the error classes to run the language's own tests. The rest of the standard library is ported from
+// src/dyn/builtins (ls-jsc.md, 9.4) one file at a time.
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+#include "script/internal/dyn/numconv.hpp"
+#include "script/internal/vm/convert.hpp"
+#include "script/internal/vm/object.hpp"
+#include "script/internal/vm/operators.hpp"
+
+namespace script {
+namespace internal {
+namespace vm {
+
+namespace {
+
+#define NATIVE(name) JSValue name(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc, void* data)
+#define UNUSED() \
+    (void)vm;    \
+    (void)self;  \
+    (void)args;  \
+    (void)argc;  \
+    (void)data
+
+inline JSValue arg(const JSValue* args, std::uint32_t argc, std::uint32_t i) noexcept
+{
+    return i < argc ? args[i] : JSValue::undefined();
+}
+
+JSValue str(VM& vm, std::string_view text)
+{
+    return makeString(vm, text);
+}
+
+JSValue typeError(VM& vm, const std::string& message)
+{
+    return vm.throwError(ErrorCode::TypeError, message);
+}
+
+/// An own, non-enumerable function property.
+JSFunction* method(VM& vm, JSObject* target, const char* name, FastNative fn, std::uint32_t length, void* data = nullptr)
+{
+    Key key = vm.internKey(std::string_view(name));
+    JSFunction* f = vm.newNativeFunction(vm.protos.function, fn, data, key, length);
+    // The property takes the creation count; the caller's pointer is good for as long as the property is.
+    target->putOwn(vm, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
+    detail::decRef(key);
+    return f;
+}
+
+void value(VM& vm, JSObject* target, const char* name, JSValue v, std::uint8_t attrs = attr::kWritable | attr::kConfigurable)
+{
+    Key key = vm.internKey(std::string_view(name));
+    target->putOwn(vm, key, v, attrs);
+    detail::decRef(key);
+}
+
+JSObject* newPlain(VM& vm, JSObject* proto)
+{
+    return vm.newObject(proto);
+}
+
+/// A constructor function with its prototype object, installed on the global object.
+JSFunction* constructor(VM& vm, const char* name, FastNative fn, std::uint32_t length, JSObject* proto)
+{
+    Key key = vm.internKey(std::string_view(name));
+    JSFunction* f = vm.newNativeFunction(vm.protos.function, fn, nullptr, key, length);
+    f->materialize(vm);
+    f->flags |= JSFunction::kConstructor;
+    retain(toJSValue(proto));
+    f->putOwn(vm, vm.atoms.prototype, toJSValue(proto), 0);
+    retain(toJSValue(f));
+    proto->putOwn(vm, vm.atoms.constructor, toJSValue(f), attr::kWritable | attr::kConfigurable);
+    vm.global->putOwn(vm, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
+    detail::decRef(key);
+    return f;
+}
+
+JSArray* thisArray(VM& vm, JSValue self)
+{
+    if (!isArray(self)) {
+        typeError(vm, "this is not an array");
+        return nullptr;
+    }
+    return static_cast<JSArray*>(asObject(self));
+}
+
+bool numberArg(VM& vm, JSValue v, double* out)
+{
+    return toNumber(vm, v, out);
+}
+
+/// A relative index, as `slice` and friends clamp it.
+bool relativeIndex(VM& vm, JSValue v, std::int64_t length, std::int64_t fallback, std::int64_t* out)
+{
+    if (v.isUndefined()) {
+        *out = fallback;
+        return true;
+    }
+    double d;
+    if (!toNumber(vm, v, &d))
+        return false;
+    if (d != d)
+        d = 0;
+    d = std::trunc(d);
+    if (d < 0)
+        d = std::max(0.0, double(length) + d);
+    else
+        d = std::min(d, double(length));
+    *out = std::int64_t(d);
+    return true;
+}
+
+// ------------------------------------------------------------------- global ---
+
+NATIVE(consoleLog)
+{
+    UNUSED();
+    std::string line;
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        if (i)
+            line += ' ';
+        JSValue s = toStringValue(vm, args[i]);
+        if (s.isException()) {
+            vm.clearException();
+            line += "[object]";
+            continue;
+        }
+        line += toUtf8(asString(s)->text());
+        release(s);
+    }
+    line += '\n';
+    vm.ctx.write(fromUtf8(line), data != nullptr);
+    return JSValue::undefined();
+}
+
+NATIVE(parseIntImpl)
+{
+    UNUSED();
+    JSValue s = toStringValue(vm, arg(args, argc, 0));
+    if (s.isException())
+        return s;
+    StringView text = asString(s)->text();
+    std::size_t i = 0;
+    while (i < text.size() && (text[i] == u' ' || text[i] == u'\t' || text[i] == u'\n' || text[i] == u'\r'))
+        ++i;
+    bool negative = false;
+    if (i < text.size() && (text[i] == u'-' || text[i] == u'+'))
+        negative = text[i++] == u'-';
+    double radixD = 10;
+    JSValue radixArg = arg(args, argc, 1);
+    if (!radixArg.isUndefined() && !toNumber(vm, radixArg, &radixD)) {
+        release(s);
+        return JSValue::exception();
+    }
+    int radix = int(toInt32(radixD));
+    if (radix == 0)
+        radix = 10;
+    if ((radix == 16 || radixArg.isUndefined()) && i + 1 < text.size() && text[i] == u'0' && (text[i + 1] == u'x' || text[i + 1] == u'X')) {
+        radix = 16;
+        i += 2;
+    }
+    JSValue result;
+    if (radix < 2 || radix > 36) {
+        result = JSValue::boxDouble(std::nan(""));
+    } else {
+        double n = 0;
+        bool any = false;
+        for (; i < text.size(); ++i) {
+            const char16_t c = text[i];
+            int digit;
+            if (c >= u'0' && c <= u'9')
+                digit = c - u'0';
+            else if (c >= u'a' && c <= u'z')
+                digit = c - u'a' + 10;
+            else if (c >= u'A' && c <= u'Z')
+                digit = c - u'A' + 10;
+            else
+                break;
+            if (digit >= radix)
+                break;
+            n = n * radix + digit;
+            any = true;
+        }
+        result = any ? JSValue::boxNumber(negative ? -n : n) : JSValue::boxDouble(std::nan(""));
+    }
+    release(s);
+    return result;
+}
+
+NATIVE(parseFloatImpl)
+{
+    UNUSED();
+    JSValue s = toStringValue(vm, arg(args, argc, 0));
+    if (s.isException())
+        return s;
+    StringView text = asString(s)->text();
+    std::size_t i = 0;
+    while (i < text.size() && (text[i] == u' ' || text[i] == u'\t' || text[i] == u'\n' || text[i] == u'\r'))
+        ++i;
+    // The longest prefix that reads as a decimal literal.
+    std::size_t end = i;
+    bool digits = false, dot = false, exp = false;
+    if (end < text.size() && (text[end] == u'-' || text[end] == u'+'))
+        ++end;
+    std::size_t sign = end;
+    if (text.substr(end, 8) == u"Infinity") {
+        release(s);
+        return JSValue::boxDouble(text[i] == u'-' ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity());
+    }
+    std::size_t good = i;
+    for (; end < text.size(); ++end) {
+        const char16_t c = text[end];
+        if (c >= u'0' && c <= u'9') {
+            digits = true;
+            good = end + 1;
+        } else if (c == u'.' && !dot && !exp) {
+            dot = true;
+        } else if ((c == u'e' || c == u'E') && digits && !exp) {
+            exp = true;
+            if (end + 1 < text.size() && (text[end + 1] == u'-' || text[end + 1] == u'+'))
+                ++end;
+        } else {
+            break;
+        }
+    }
+    (void)sign;
+    JSValue result = digits ? JSValue::boxNumber(dyn::stringToNumber(text.substr(i, good - i))) : JSValue::boxDouble(std::nan(""));
+    release(s);
+    return result;
+}
+
+NATIVE(isNaNImpl)
+{
+    UNUSED();
+    double d;
+    if (!toNumber(vm, arg(args, argc, 0), &d))
+        return JSValue::exception();
+    return JSValue::boolean(d != d);
+}
+
+NATIVE(isFiniteImpl)
+{
+    UNUSED();
+    double d;
+    if (!toNumber(vm, arg(args, argc, 0), &d))
+        return JSValue::exception();
+    return JSValue::boolean(std::isfinite(d));
+}
+
+// ------------------------------------------------------------------- Object ---
+
+NATIVE(objectCtor)
+{
+    UNUSED();
+    const JSValue v = arg(args, argc, 0);
+    if (v.isNullish()) {
+        if (isObject(self) && !vm.newTarget.isUndefined()) {
+            retain(self);
+            return self;
+        }
+        return toJSValue(newPlain(vm, vm.protos.object));
+    }
+    return toObject(vm, v);
+}
+
+NATIVE(objectKeys)
+{
+    UNUSED();
+    JSValue target = arg(args, argc, 0);
+    JSArray* out = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(out));
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 keys, 1 values, 2 entries
+    if (target.isNullish())
+        return typeError(vm, "Cannot convert undefined or null to object");
+    if (isString(target)) {
+        const std::uint32_t n = asString(target)->length;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            JSValue idx = toStringValue(vm, JSValue::int32(std::int32_t(i)));
+            if (mode == 0)
+                out->append(vm, idx);
+            else {
+                JSValue ch = makeString(vm, asString(target)->text().substr(i, 1));
+                if (mode == 1) {
+                    release(idx);
+                    out->append(vm, ch);
+                } else {
+                    JSArray* pair = vm.newArray(vm.protos.array);
+                    pair->append(vm, idx);
+                    pair->append(vm, ch);
+                    out->append(vm, toJSValue(pair));
+                }
+            }
+        }
+        return keep.take();
+    }
+    if (!isObject(target))
+        return keep.take();
+    JSObject* o = asObject(target);
+    std::vector<std::pair<std::uint32_t, Key>> indexed;
+    std::vector<std::pair<Key, JSValue>> named;
+    if (o->cls() == ObjClass::Array) {
+        auto* a = static_cast<JSArray*>(o);
+        for (std::uint32_t i = 0; i < a->length; ++i)
+            if (!a->elems[i].isHole())
+                indexed.push_back({i, nullptr});
+    }
+    o->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue v) {
+        if (!(attrs & attr::kEnumerable) || k->kind != detail::CellKind::String)
+            return;
+        std::uint32_t index;
+        if (arrayIndexOf(k, &index))
+            indexed.push_back({index, k});
+        else
+            named.push_back({k, v});
+    });
+    std::sort(indexed.begin(), indexed.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    auto emit = [&](Key k, JSValue v) -> bool {
+        retain(JSValue::cell(k));
+        JSValue keyValue = JSValue::cell(k);
+        if (mode == 0) {
+            out->append(vm, keyValue);
+            return true;
+        }
+        JSValue propValue = v;
+        if (mode == 1) {
+            retain(propValue);
+            release(keyValue);
+            out->append(vm, propValue);
+            return true;
+        }
+        JSArray* pair = vm.newArray(vm.protos.array);
+        pair->append(vm, keyValue);
+        retain(propValue);
+        pair->append(vm, propValue);
+        out->append(vm, toJSValue(pair));
+        return true;
+    };
+    for (auto& [index, key] : indexed) {
+        Key k = key ? key : toPropertyKey(vm, JSValue::boxNumber(double(index)));
+        JSValue v = o->cls() == ObjClass::Array && !key ? static_cast<JSArray*>(o)->at(index) : JSValue::undefined();
+        if (key) {
+            JSValue* slot = o->findOwn(vm, key);
+            v = slot ? *slot : JSValue::undefined();
+        }
+        emit(k, v);
+        if (!key)
+            release(JSValue::cell(k));
+    }
+    for (auto& [k, v] : named)
+        emit(k, v);
+    return keep.take();
+}
+
+NATIVE(objectGetPrototypeOf)
+{
+    UNUSED();
+    JSValue v = arg(args, argc, 0);
+    if (v.isNullish())
+        return typeError(vm, "Cannot convert undefined or null to object");
+    JSObject* p = nullptr;
+    if (isObject(v))
+        p = asObject(v)->proto(vm);
+    else if (v.isNumber())
+        p = vm.protos.number;
+    else if (isString(v))
+        p = vm.protos.string;
+    else if (v.isBool())
+        p = vm.protos.boolean;
+    if (!p)
+        return JSValue::null();
+    retain(toJSValue(p));
+    return toJSValue(p);
+}
+
+NATIVE(objectSetPrototypeOf)
+{
+    UNUSED();
+    JSValue o = arg(args, argc, 0), p = arg(args, argc, 1);
+    if (!isObject(o)) {
+        retain(o);
+        return o;
+    }
+    if (!isObject(p) && !p.isNull())
+        return typeError(vm, "Object prototype may only be an Object or null");
+    if (isObject(p) && asObject(o)->wouldCycle(vm, asObject(p)))
+        return typeError(vm, "Cyclic __proto__ value");
+    asObject(o)->setProto(vm, isObject(p) ? asObject(p) : nullptr);
+    retain(o);
+    return o;
+}
+
+NATIVE(objectCreate)
+{
+    UNUSED();
+    JSValue p = arg(args, argc, 0);
+    if (!isObject(p) && !p.isNull())
+        return typeError(vm, "Object prototype may only be an Object or null");
+    return toJSValue(newPlain(vm, isObject(p) ? asObject(p) : nullptr));
+}
+
+bool descriptorField(VM& vm, JSObject* d, const char* name, JSValue* out)
+{
+    Key key = vm.internKey(std::string_view(name));
+    const bool has = hasProperty(vm, toJSValue(d), key);
+    if (has) {
+        *out = getProperty(vm, toJSValue(d), key);
+    }
+    detail::decRef(key);
+    return has;
+}
+
+NATIVE(objectDefineProperty)
+{
+    UNUSED();
+    JSValue target = arg(args, argc, 0), keyValue = arg(args, argc, 1), desc = arg(args, argc, 2);
+    if (!isObject(target))
+        return typeError(vm, "Object.defineProperty called on non-object");
+    if (!isObject(desc))
+        return typeError(vm, "Property description must be an object");
+    JSValue prim = toPrimitive(vm, keyValue, true);
+    if (prim.isException())
+        return prim;
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        return JSValue::exception();
+    JSObject* o = asObject(target);
+    JSObject* d = asObject(desc);
+    JSValue v = JSValue::undefined(), g = JSValue::undefined(), s = JSValue::undefined(), flag;
+    const bool hasValue = descriptorField(vm, d, "value", &v);
+    const bool hasGet = descriptorField(vm, d, "get", &g);
+    const bool hasSet = descriptorField(vm, d, "set", &s);
+    std::uint8_t attrs = 0;
+    std::uint8_t existing = 0;
+    const bool exists = o->findOwn(vm, key, &existing) != nullptr || (o->cls() == ObjClass::Array && key == vm.atoms.length);
+    auto bit = [&](const char* name, std::uint8_t mask) {
+        if (descriptorField(vm, d, name, &flag)) {
+            if (toBoolean(flag))
+                attrs |= mask;
+            release(flag);
+        } else if (exists) {
+            attrs |= existing & mask;
+        }
+    };
+    bit("writable", attr::kWritable);
+    bit("enumerable", attr::kEnumerable);
+    bit("configurable", attr::kConfigurable);
+    bool ok;
+    if (hasGet || hasSet) {
+        if (hasValue) {
+            release(v);
+            release(g);
+            release(s);
+            detail::decRef(key);
+            return typeError(vm, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
+        }
+        ok = defineAccessor(vm, o, key, g, s, std::uint8_t(attrs & ~attr::kWritable));
+    } else {
+        if (!hasValue) {
+            JSValue* slot = o->findOwn(vm, key);
+            v = slot ? *slot : JSValue::undefined();
+            retain(v);
+        }
+        ok = defineOwn(vm, o, key, v, attrs);
+        v = JSValue::undefined();
+    }
+    release(v);
+    release(g);
+    release(s);
+    detail::decRef(key);
+    if (!ok)
+        return typeError(vm, "Cannot redefine property");
+    retain(target);
+    return target;
+}
+
+NATIVE(objectFreeze)
+{
+    UNUSED();
+    JSValue v = arg(args, argc, 0);
+    if (isObject(v)) {
+        JSObject* o = asObject(v);
+        o->h.flags |= cellflags::kFrozen | cellflags::kNotExtensible;
+        std::vector<Key> keys;
+        o->forEachOwn(vm, [&](Key k, std::uint8_t, JSValue) { keys.push_back(k); });
+        for (Key k : keys) {
+            std::uint8_t attrs = 0;
+            o->findOwn(vm, k, &attrs);
+            std::uint8_t frozen = attrs & ~attr::kConfigurable;
+            if (!(attrs & attr::kAccessor))
+                frozen &= ~attr::kWritable;
+            o->setAttrs(vm, k, frozen);
+        }
+    }
+    retain(v);
+    return v;
+}
+
+NATIVE(objectIsFrozen)
+{
+    UNUSED();
+    JSValue v = arg(args, argc, 0);
+    return JSValue::boolean(!isObject(v) || (asObject(v)->h.flags & cellflags::kFrozen));
+}
+
+NATIVE(objectAssign)
+{
+    UNUSED();
+    JSValue target = arg(args, argc, 0);
+    if (target.isNullish())
+        return typeError(vm, "Cannot convert undefined or null to object");
+    for (std::uint32_t i = 1; i < argc; ++i) {
+        if (!isObject(args[i]))
+            continue;
+        JSObject* src = asObject(args[i]);
+        std::vector<std::pair<Key, JSValue>> props;
+        src->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue v) {
+            if ((attrs & attr::kEnumerable) && !(attrs & attr::kAccessor))
+                props.push_back({k, v});
+        });
+        for (auto& [k, v] : props)
+            if (!setProperty(vm, target, k, v, true))
+                return JSValue::exception();
+    }
+    retain(target);
+    return target;
+}
+
+NATIVE(hasOwnProperty)
+{
+    UNUSED();
+    JSValue prim = toPrimitive(vm, arg(args, argc, 0), true);
+    if (prim.isException())
+        return prim;
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        return JSValue::exception();
+    bool has = false;
+    if (isObject(self)) {
+        JSObject* o = asObject(self);
+        std::uint32_t index;
+        if (o->cls() == ObjClass::Array) {
+            auto* a = static_cast<JSArray*>(o);
+            if (key == vm.atoms.length || (arrayIndexOf(key, &index) && !a->at(index).isHole()))
+                has = true;
+        }
+        has = has || o->findOwn(vm, key) != nullptr;
+    } else if (isString(self)) {
+        std::uint32_t index;
+        has = key == vm.atoms.length || (arrayIndexOf(key, &index) && index < asString(self)->length);
+    }
+    detail::decRef(key);
+    return JSValue::boolean(has);
+}
+
+NATIVE(objectToString)
+{
+    UNUSED();
+    const char* tag = "[object Object]";
+    if (self.isUndefined())
+        tag = "[object Undefined]";
+    else if (self.isNull())
+        tag = "[object Null]";
+    else if (isArray(self))
+        tag = "[object Array]";
+    else if (isFunction(self))
+        tag = "[object Function]";
+    else if (isObject(self) && asObject(self)->cls() == ObjClass::Error)
+        tag = "[object Error]";
+    else if (self.isNumber())
+        tag = "[object Number]";
+    else if (isString(self))
+        tag = "[object String]";
+    else if (self.isBool())
+        tag = "[object Boolean]";
+    return str(vm, tag);
+}
+
+NATIVE(objectValueOf)
+{
+    UNUSED();
+    return toObject(vm, self);
+}
+
+NATIVE(isPrototypeOf)
+{
+    UNUSED();
+    JSValue v = arg(args, argc, 0);
+    if (!isObject(v) || !isObject(self))
+        return JSValue::boolean(false);
+    for (JSObject* p = asObject(v)->proto(vm); p; p = p->proto(vm))
+        if (toJSValue(p) == self)
+            return JSValue::boolean(true);
+    return JSValue::boolean(false);
+}
+
+// ----------------------------------------------------------------- Function ---
+
+NATIVE(functionCall)
+{
+    UNUSED();
+    return vm.call(self, arg(args, argc, 0), argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0);
+}
+
+NATIVE(functionApply)
+{
+    UNUSED();
+    JSValue list = arg(args, argc, 1);
+    std::vector<JSValue> values;
+    if (isArray(list)) {
+        auto* a = static_cast<JSArray*>(asObject(list));
+        for (std::uint32_t i = 0; i < a->length; ++i)
+            values.push_back(a->elems[i].isHole() ? JSValue::undefined() : a->elems[i]);
+    } else if (!list.isNullish()) {
+        return typeError(vm, "CreateListFromArrayLike called on non-object");
+    }
+    return vm.call(self, arg(args, argc, 0), values.data(), std::uint32_t(values.size()));
+}
+
+NATIVE(functionToString)
+{
+    UNUSED();
+    if (!isFunction(self))
+        return typeError(vm, "Function.prototype.toString requires that 'this' be a Function");
+    auto* f = static_cast<JSFunction*>(asObject(self));
+    std::string name;
+    if (f->flags & JSFunction::kNative) {
+        if (Rare* r = f->rare(); r && r->fnName)
+            name = toUtf8(static_cast<StringCell*>(r->fnName)->text());
+        return str(vm, "function " + name + "() { [native code] }");
+    }
+    if (f->code->name)
+        name = toUtf8(static_cast<StringCell*>(f->code->name)->text());
+    return str(vm, "function " + name + "() { [code] }");
+}
+
+NATIVE(functionBoundNoop)
+{
+    UNUSED();
+    return JSValue::undefined();
+}
+
+// -------------------------------------------------------------------- Error ---
+
+JSValue fillError(VM& vm, JSObject* o, JSValue message)
+{
+    o->h.cls = std::uint8_t(ObjClass::Error);
+    if (!message.isUndefined()) {
+        JSValue text = toStringValue(vm, message);
+        if (text.isException())
+            return text;
+        value(vm, o, "message", text);
+    }
+    return JSValue::undefined();
+}
+
+NATIVE(errorCtor)
+{
+    UNUSED();
+    JSObject* made;
+    if (!vm.newTarget.isUndefined() && isObject(self)) {
+        made = asObject(self);
+        retain(self);
+    } else {
+        made = newPlain(vm, reinterpret_cast<JSObject*>(data));
+    }
+    Handle keep = Handle::adopt(toJSValue(made));
+    JSValue r = fillError(vm, made, arg(args, argc, 0));
+    if (r.isException())
+        return r;
+    return keep.take();
+}
+
+NATIVE(errorToString)
+{
+    UNUSED();
+    if (!isObject(self))
+        return typeError(vm, "Error.prototype.toString requires that 'this' be an Object");
+    Key nameKey = vm.internKey(std::string_view("name")), messageKey = vm.internKey(std::string_view("message"));
+    JSValue name = getProperty(vm, self, nameKey), message = getProperty(vm, self, messageKey);
+    detail::decRef(nameKey);
+    detail::decRef(messageKey);
+    if (name.isException() || message.isException()) {
+        release(name.isException() ? JSValue::undefined() : name);
+        return JSValue::exception();
+    }
+    std::string n = name.isUndefined() ? "Error" : describe(vm, name), m = message.isUndefined() ? "" : describe(vm, message);
+    release(name);
+    release(message);
+    if (n.empty())
+        return str(vm, m);
+    if (m.empty())
+        return str(vm, n);
+    return str(vm, n + ": " + m);
+}
+
+// -------------------------------------------------------------------- Array ---
+
+NATIVE(arrayCtor)
+{
+    UNUSED();
+    JSArray* a = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(a));
+    if (argc == 1 && args[0].isNumber()) {
+        const double d = args[0].asNumber();
+        if (d < 0 || d != std::floor(d) || d > 4294967295.0)
+            return vm.throwError(ErrorCode::RangeError, "Invalid array length");
+        if (d > double(JSArray::kMaxDenseGap))
+            return vm.throwError(ErrorCode::RangeError, "Array too large for the vm core");
+        a->resize(vm, std::uint32_t(d));
+    } else {
+        a->appendAll(vm, args, argc);
+    }
+    return keep.take();
+}
+
+NATIVE(arrayIsArray)
+{
+    UNUSED();
+    return JSValue::boolean(isArray(arg(args, argc, 0)));
+}
+
+NATIVE(arrayPush)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    if (a->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))
+        return typeError(vm, "Cannot add property, object is not extensible");
+    a->appendAll(vm, args, argc);
+    return JSValue::boxNumber(double(a->length));
+}
+
+NATIVE(arrayPop)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    if (a->h.flags & cellflags::kFrozen)
+        return typeError(vm, "Cannot delete property of a frozen array");
+    JSValue v = a->pop(vm);
+    return v.isHole() ? JSValue::undefined() : v;
+}
+
+NATIVE(arrayShift)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    if (!a->length)
+        return JSValue::undefined();
+    JSValue v = a->elems[0];
+    retain(v);
+    a->removeRange(vm, 0, 1);
+    return v.isHole() ? JSValue::undefined() : v;
+}
+
+NATIVE(arrayUnshift)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    a->insertGap(vm, 0, argc);
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        retain(args[i]);
+        a->elems[i] = args[i];
+    }
+    return JSValue::boxNumber(double(a->length));
+}
+
+NATIVE(arrayJoin)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    String sep = u",";
+    JSValue sepArg = arg(args, argc, 0);
+    if (!sepArg.isUndefined()) {
+        JSValue s = toStringValue(vm, sepArg);
+        if (s.isException())
+            return s;
+        sep = String(asString(s)->text());
+        release(s);
+    }
+    String out;
+    retain(self);
+    Handle keep = Handle::adopt(self);
+    for (std::uint32_t i = 0; i < a->length; ++i) {
+        if (i)
+            out += sep;
+        JSValue e = a->elems[i];
+        if (e.isNullish() || e.isHole())
+            continue;
+        JSValue s = toStringValue(vm, e);
+        if (s.isException())
+            return s;
+        out += asString(s)->text();
+        release(s);
+    }
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(arrayToString)
+{
+    UNUSED();
+    if (!isArray(self))
+        return objectToString(vm, self, args, argc, data);
+    return arrayJoin(vm, self, nullptr, 0, data);
+}
+
+NATIVE(arraySlice)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    std::int64_t from, to;
+    if (!relativeIndex(vm, arg(args, argc, 0), a->length, 0, &from) || !relativeIndex(vm, arg(args, argc, 1), a->length, a->length, &to))
+        return JSValue::exception();
+    JSArray* out = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(out));
+    for (std::int64_t i = from; i < to; ++i)
+        out->appendAll(vm, &a->elems[i], 1);
+    return keep.take();
+}
+
+NATIVE(arraySplice)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    std::int64_t start, count;
+    if (!relativeIndex(vm, arg(args, argc, 0), a->length, 0, &start))
+        return JSValue::exception();
+    if (argc == 0) {
+        count = 0;
+    } else if (argc == 1) {
+        count = a->length - start;
+    } else {
+        double d;
+        if (!toNumber(vm, args[1], &d))
+            return JSValue::exception();
+        count = std::int64_t(std::min(std::max(d != d ? 0 : std::trunc(d), 0.0), double(a->length - start)));
+    }
+    JSArray* removed = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(removed));
+    for (std::int64_t i = 0; i < count; ++i)
+        removed->appendAll(vm, &a->elems[start + i], 1);
+    a->removeRange(vm, std::uint32_t(start), std::uint32_t(count));
+    const std::uint32_t inserted = argc > 2 ? argc - 2 : 0;
+    a->insertGap(vm, std::uint32_t(start), inserted);
+    for (std::uint32_t i = 0; i < inserted; ++i) {
+        retain(args[2 + i]);
+        a->elems[start + i] = args[2 + i];
+    }
+    return keep.take();
+}
+
+NATIVE(arrayConcat)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    JSArray* out = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(out));
+    out->appendAll(vm, a->elems, a->length);
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        if (isArray(args[i])) {
+            auto* b = static_cast<JSArray*>(asObject(args[i]));
+            out->appendAll(vm, b->elems, b->length);
+        } else {
+            out->appendAll(vm, &args[i], 1);
+        }
+    }
+    return keep.take();
+}
+
+NATIVE(arrayReverse)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    std::reverse(a->elems, a->elems + a->length);
+    retain(self);
+    return self;
+}
+
+NATIVE(arrayIndexOf)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 indexOf, 1 lastIndexOf, 2 includes
+    const JSValue needle = arg(args, argc, 0);
+    if (mode == 1) {
+        for (std::int64_t i = std::int64_t(a->length) - 1; i >= 0; --i)
+            if (strictEquals(a->elems[i], needle))
+                return JSValue::int32(std::int32_t(i));
+        return JSValue::int32(-1);
+    }
+    std::int64_t from;
+    if (!relativeIndex(vm, arg(args, argc, 1), a->length, 0, &from))
+        return JSValue::exception();
+    for (std::int64_t i = from; i < a->length; ++i) {
+        const JSValue e = a->elems[i];
+        if (mode == 2 ? sameValueZero(e.isHole() ? JSValue::undefined() : e, needle) : (!e.isHole() && strictEquals(e, needle)))
+            return mode == 2 ? JSValue::boolean(true) : JSValue::int32(std::int32_t(i));
+    }
+    return mode == 2 ? JSValue::boolean(false) : JSValue::int32(-1);
+}
+
+/// forEach, map, filter, some, every, find, findIndex: one loop, the kind in `data`.
+NATIVE(arrayIterate)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    const int kind = int(reinterpret_cast<std::intptr_t>(data));
+    const JSValue callback = arg(args, argc, 0), thisArg = arg(args, argc, 1);
+    if (!isFunction(callback))
+        return typeError(vm, describe(vm, callback) + " is not a function");
+    retain(self);
+    Handle keep = Handle::adopt(self);
+    JSArray* out = nullptr;
+    Handle outKeep;
+    if (kind == 1 || kind == 2) {
+        out = vm.newArray(vm.protos.array);
+        outKeep = Handle::adopt(toJSValue(out));
+    }
+    for (std::uint32_t i = 0; i < a->length; ++i) {
+        JSValue element = a->elems[i];
+        const bool hole = element.isHole();
+        if (hole && kind <= 4)
+            continue;
+        if (hole)
+            element = JSValue::undefined();
+        Handle e = Handle::retained(element);
+        JSValue call[3] = {e.get(), JSValue::int32(std::int32_t(i)), self};
+        JSValue r = vm.call(callback, thisArg, call, 3);
+        if (r.isException())
+            return r;
+        Handle result = Handle::adopt(r);
+        switch (kind) {
+            case 0: break;
+            case 1:
+                if (out->length < i)
+                    out->resize(vm, i);
+                retain(r);
+                out->setAt(vm, i, r);
+                break;
+            case 2:
+                if (toBoolean(r)) {
+                    retain(e.get());
+                    out->append(vm, e.get());
+                }
+                break;
+            case 3:
+                if (toBoolean(r))
+                    return JSValue::boolean(true);
+                break;
+            case 4:
+                if (!toBoolean(r))
+                    return JSValue::boolean(false);
+                break;
+            case 5:
+                if (toBoolean(r))
+                    return e.take();
+                break;
+            case 6:
+                if (toBoolean(r))
+                    return JSValue::int32(std::int32_t(i));
+                break;
+        }
+    }
+    switch (kind) {
+        case 0:
+        case 5: return JSValue::undefined();
+        case 1:
+            if (out->length < a->length)
+                out->resize(vm, a->length);
+            return outKeep.get().isUndefined() ? JSValue::undefined() : (retain(outKeep.get()), outKeep.get());
+        case 2: return (retain(outKeep.get()), outKeep.get());
+        case 3: return JSValue::boolean(false);
+        case 4: return JSValue::boolean(true);
+        default: return JSValue::int32(-1);
+    }
+}
+
+NATIVE(arrayReduce)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    const bool right = data != nullptr;
+    const JSValue callback = arg(args, argc, 0);
+    if (!isFunction(callback))
+        return typeError(vm, describe(vm, callback) + " is not a function");
+    retain(self);
+    Handle keep = Handle::adopt(self);
+    std::int64_t i = right ? std::int64_t(a->length) - 1 : 0;
+    const std::int64_t step = right ? -1 : 1;
+    Handle acc;
+    if (argc >= 2) {
+        acc = Handle::retained(args[1]);
+    } else {
+        while (i >= 0 && i < a->length && a->elems[i].isHole())
+            i += step;
+        if (i < 0 || i >= a->length)
+            return typeError(vm, "Reduce of empty array with no initial value");
+        acc = Handle::retained(a->elems[i]);
+        i += step;
+    }
+    for (; i >= 0 && i < a->length; i += step) {
+        if (a->elems[i].isHole())
+            continue;
+        Handle e = Handle::retained(a->elems[i]);
+        JSValue call[4] = {acc.get(), e.get(), JSValue::int32(std::int32_t(i)), self};
+        JSValue r = vm.call(callback, JSValue::undefined(), call, 4);
+        if (r.isException())
+            return r;
+        acc = Handle::adopt(r);
+    }
+    return acc.take();
+}
+
+NATIVE(arrayFill)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    std::int64_t from, to;
+    if (!relativeIndex(vm, arg(args, argc, 1), a->length, 0, &from) || !relativeIndex(vm, arg(args, argc, 2), a->length, a->length, &to))
+        return JSValue::exception();
+    for (std::int64_t i = from; i < to; ++i)
+        a->setAt(vm, std::uint32_t(i), (retain(arg(args, argc, 0)), arg(args, argc, 0)));
+    retain(self);
+    return self;
+}
+
+NATIVE(arraySort)
+{
+    UNUSED();
+    JSArray* a = thisArray(vm, self);
+    if (!a)
+        return JSValue::exception();
+    const JSValue compare = arg(args, argc, 0);
+    if (!compare.isUndefined() && !isFunction(compare))
+        return typeError(vm, "The comparison function must be either a function or undefined");
+    retain(self);
+    Handle keep = Handle::adopt(self);
+    std::vector<JSValue> items;
+    std::uint32_t undefinedCount = 0, holes = 0;
+    for (std::uint32_t i = 0; i < a->length; ++i) {
+        const JSValue e = a->elems[i];
+        if (e.isHole())
+            ++holes;
+        else if (e.isUndefined())
+            ++undefinedCount;
+        else {
+            retain(e);
+            items.push_back(e);
+        }
+    }
+    bool failed = false;
+    std::vector<JSValue> keys;  // the strings of a default sort
+    auto less = [&](JSValue x, JSValue y) -> bool {
+        if (failed)
+            return false;
+        if (!compare.isUndefined()) {
+            JSValue pair[2] = {x, y};
+            JSValue r = vm.call(compare, JSValue::undefined(), pair, 2);
+            if (r.isException()) {
+                failed = true;
+                return false;
+            }
+            double d;
+            const bool ok = toNumber(vm, r, &d);
+            release(r);
+            if (!ok) {
+                failed = true;
+                return false;
+            }
+            return d < 0;
+        }
+        if (x.isInt32() && y.isInt32() && x.asInt32() >= 0 && y.asInt32() >= 0) {
+            // Digits compare as text: 10 sorts before 9.
+            char bx[16], by[16];
+            std::snprintf(bx, sizeof bx, "%d", x.asInt32());
+            std::snprintf(by, sizeof by, "%d", y.asInt32());
+            return std::strcmp(bx, by) < 0;
+        }
+        JSValue sx = toStringValue(vm, x);
+        if (sx.isException()) {
+            failed = true;
+            return false;
+        }
+        JSValue sy = toStringValue(vm, y);
+        if (sy.isException()) {
+            release(sx);
+            failed = true;
+            return false;
+        }
+        const bool r = compareStrings(sx, sy) < 0;
+        release(sx);
+        release(sy);
+        return r;
+    };
+    std::stable_sort(items.begin(), items.end(), less);
+    if (failed) {
+        for (JSValue v : items)
+            release(v);
+        return JSValue::exception();
+    }
+    // Write back: sorted values, then undefined, then holes. Each slot gets the count the item carries.
+    const std::uint32_t n = a->length;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const JSValue old = a->elems[i];
+        a->elems[i] = JSValue::undefined();
+        release(old);
+    }
+    std::uint32_t at = 0;
+    for (JSValue v : items)
+        a->elems[at++] = v;
+    for (std::uint32_t i = 0; i < undefinedCount; ++i)
+        a->elems[at++] = JSValue::undefined();
+    for (std::uint32_t i = 0; i < holes; ++i)
+        a->elems[at++] = JSValue::hole();
+    a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
+    retain(self);
+    return self;
+}
+
+// ------------------------------------------------------------------- String ---
+
+/// `this` as a string cell, owned in `*out`.
+bool thisString(VM& vm, JSValue self, Handle* out)
+{
+    if (self.isNullish()) {
+        typeError(vm, "String.prototype method called on null or undefined");
+        return false;
+    }
+    JSValue s = toStringValue(vm, self);
+    if (s.isException())
+        return false;
+    *out = Handle::adopt(s);
+    return true;
+}
+
+NATIVE(stringCtor)
+{
+    UNUSED();
+    JSValue v = argc ? args[0] : JSValue::cell(vm.ctx.intern(u""));
+    if (argc && isSymbol(v)) {
+        return makeString(vm, std::string_view("Symbol()"));
+    }
+    return toStringValue(vm, v);
+}
+
+NATIVE(stringFromCharCode)
+{
+    UNUSED();
+    String out;
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        double d;
+        if (!toNumber(vm, args[i], &d))
+            return JSValue::exception();
+        out += char16_t(toUint32(d) & 0xFFFF);
+    }
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(stringCharAt)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    double d = 0;
+    if (!toNumber(vm, arg(args, argc, 0), &d))
+        return JSValue::exception();
+    d = d != d ? 0 : std::trunc(d);
+    StringView text = asString(s.get())->text();
+    const bool code = data != nullptr;
+    if (d < 0 || d >= double(text.size()))
+        return code ? JSValue::boxDouble(std::nan("")) : makeString(vm, StringView());
+    return code ? JSValue::int32(text[std::size_t(d)]) : makeString(vm, text.substr(std::size_t(d), 1));
+}
+
+NATIVE(stringIndexOf)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    JSValue needle = toStringValue(vm, arg(args, argc, 0));
+    if (needle.isException())
+        return needle;
+    Handle n = Handle::adopt(needle);
+    StringView text = asString(s.get())->text(), sub = asString(needle)->text();
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 indexOf, 1 lastIndexOf, 2 includes, 3 startsWith, 4 endsWith
+    double from = 0;
+    if (argc > 1 && !args[1].isUndefined() && !toNumber(vm, args[1], &from))
+        return JSValue::exception();
+    from = from != from ? 0 : std::trunc(from);
+    const std::size_t start = std::size_t(std::min(std::max(from, 0.0), double(text.size())));
+    switch (mode) {
+        case 0: {
+            const std::size_t at = text.find(sub, start);
+            return JSValue::int32(at == StringView::npos ? -1 : std::int32_t(at));
+        }
+        case 1: {
+            const std::size_t at = text.rfind(sub);
+            return JSValue::int32(at == StringView::npos ? -1 : std::int32_t(at));
+        }
+        case 2: return JSValue::boolean(text.find(sub, start) != StringView::npos);
+        case 3: return JSValue::boolean(text.substr(start, sub.size()) == sub);
+        default: return JSValue::boolean(text.size() >= sub.size() && text.substr(text.size() - sub.size()) == sub);
+    }
+}
+
+NATIVE(stringSlice)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    StringView text = asString(s.get())->text();
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 slice, 1 substring, 2 substr
+    std::int64_t from, to;
+    const std::int64_t n = std::int64_t(text.size());
+    if (mode == 1) {
+        double a = 0, b = double(n);
+        if (!toNumber(vm, arg(args, argc, 0), &a))
+            return JSValue::exception();
+        if (argc > 1 && !args[1].isUndefined() && !toNumber(vm, args[1], &b))
+            return JSValue::exception();
+        a = std::min(std::max(a != a ? 0 : std::trunc(a), 0.0), double(n));
+        b = std::min(std::max(b != b ? 0 : std::trunc(b), 0.0), double(n));
+        from = std::int64_t(std::min(a, b));
+        to = std::int64_t(std::max(a, b));
+    } else if (mode == 2) {
+        double len = double(n);
+        if (!relativeIndex(vm, arg(args, argc, 0), n, 0, &from))
+            return JSValue::exception();
+        if (argc > 1 && !args[1].isUndefined() && !toNumber(vm, args[1], &len))
+            return JSValue::exception();
+        to = from + std::int64_t(std::min(std::max(len != len ? 0 : std::trunc(len), 0.0), double(n - from)));
+    } else {
+        if (!relativeIndex(vm, arg(args, argc, 0), n, 0, &from) || !relativeIndex(vm, arg(args, argc, 1), n, n, &to))
+            return JSValue::exception();
+    }
+    if (to < from)
+        to = from;
+    return makeString(vm, text.substr(std::size_t(from), std::size_t(to - from)));
+}
+
+NATIVE(stringCase)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    String out(asString(s.get())->text());
+    const bool upper = data != nullptr;
+    for (char16_t& c : out) {
+        if (upper && c >= u'a' && c <= u'z')
+            c = char16_t(c - 32);
+        else if (!upper && c >= u'A' && c <= u'Z')
+            c = char16_t(c + 32);
+    }
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(stringTrim)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    StringView text = asString(s.get())->text();
+    auto space = [](char16_t c) { return c == u' ' || c == u'\t' || c == u'\n' || c == u'\r' || c == u'\v' || c == u'\f' || c == 0xA0 || c == 0xFEFF; };
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 both, 1 start, 2 end
+    std::size_t a = 0, b = text.size();
+    if (mode != 2)
+        while (a < b && space(text[a]))
+            ++a;
+    if (mode != 1)
+        while (b > a && space(text[b - 1]))
+            --b;
+    return makeString(vm, text.substr(a, b - a));
+}
+
+NATIVE(stringSplit)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    StringView text = asString(s.get())->text();
+    JSArray* out = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(out));
+    JSValue sepArg = arg(args, argc, 0);
+    if (sepArg.isUndefined()) {
+        out->append(vm, makeString(vm, text));
+        return keep.take();
+    }
+    JSValue sepValue = toStringValue(vm, sepArg);
+    if (sepValue.isException())
+        return sepValue;
+    Handle sepKeep = Handle::adopt(sepValue);
+    StringView sep = asString(sepValue)->text();
+    double limit = 4294967295.0;
+    if (argc > 1 && !args[1].isUndefined()) {
+        if (!toNumber(vm, args[1], &limit))
+            return JSValue::exception();
+        limit = double(toUint32(limit));
+    }
+    auto push = [&](StringView piece) {
+        if (double(out->length) < limit)
+            out->append(vm, makeString(vm, piece));
+    };
+    if (sep.empty()) {
+        for (std::size_t i = 0; i < text.size(); ++i)
+            push(text.substr(i, 1));
+        return keep.take();
+    }
+    std::size_t from = 0;
+    for (;;) {
+        const std::size_t at = text.find(sep, from);
+        if (at == StringView::npos) {
+            push(text.substr(from));
+            break;
+        }
+        push(text.substr(from, at - from));
+        from = at + sep.size();
+    }
+    return keep.take();
+}
+
+NATIVE(stringRepeat)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    double n;
+    if (!toNumber(vm, arg(args, argc, 0), &n))
+        return JSValue::exception();
+    if (n < 0 || std::isinf(n))
+        return vm.throwError(ErrorCode::RangeError, "Invalid count value");
+    StringView text = asString(s.get())->text();
+    if (n * double(text.size()) > 1 << 28)
+        return vm.throwError(ErrorCode::RangeError, "Invalid string length");
+    String out;
+    for (std::int64_t i = 0; i < std::int64_t(n); ++i)
+        out += text;
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(stringPad)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    double len;
+    if (!toNumber(vm, arg(args, argc, 0), &len))
+        return JSValue::exception();
+    String fill = u" ";
+    if (argc > 1 && !args[1].isUndefined()) {
+        JSValue f = toStringValue(vm, args[1]);
+        if (f.isException())
+            return f;
+        fill = String(asString(f)->text());
+        release(f);
+    }
+    StringView text = asString(s.get())->text();
+    const std::size_t target = len != len || len < 0 ? 0 : std::size_t(std::min(len, double(1 << 28)));
+    if (target <= text.size() || fill.empty()) {
+        retain(s.get());
+        return s.get();
+    }
+    String pad;
+    while (pad.size() < target - text.size())
+        pad += fill;
+    pad.resize(target - text.size());
+    const bool atStart = data != nullptr;
+    String out = atStart ? pad + String(text) : String(text) + pad;
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(stringReplace)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    JSValue pat = arg(args, argc, 0);
+    if (!isString(pat))
+        return typeError(vm, "the vm core replaces only string patterns");
+    StringView text = asString(s.get())->text(), sub = asString(pat)->text();
+    const bool all = data != nullptr;
+    String out;
+    std::size_t from = 0;
+    JSValue replacement = arg(args, argc, 1);
+    for (;;) {
+        const std::size_t at = text.find(sub, from);
+        if (at == StringView::npos)
+            break;
+        out += text.substr(from, at - from);
+        if (isFunction(replacement)) {
+            JSValue callArgs[3] = {pat, JSValue::int32(std::int32_t(at)), s.get()};
+            JSValue r = vm.call(replacement, JSValue::undefined(), callArgs, 3);
+            if (r.isException())
+                return r;
+            JSValue rs = toStringValue(vm, r);
+            release(r);
+            if (rs.isException())
+                return rs;
+            out += asString(rs)->text();
+            release(rs);
+        } else {
+            JSValue rs = toStringValue(vm, replacement);
+            if (rs.isException())
+                return rs;
+            out += asString(rs)->text();
+            release(rs);
+        }
+        from = at + sub.size();
+        if (sub.empty()) {
+            if (from < text.size())
+                out += text[from];
+            ++from;
+        }
+        if (!all || from > text.size())
+            break;
+    }
+    if (from <= text.size())
+        out += text.substr(from);
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(stringConcat)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    String out(asString(s.get())->text());
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        JSValue t = toStringValue(vm, args[i]);
+        if (t.isException())
+            return t;
+        out += asString(t)->text();
+        release(t);
+    }
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(stringLocaleCompare)
+{
+    UNUSED();
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
+    JSValue t = toStringValue(vm, arg(args, argc, 0));
+    if (t.isException())
+        return t;
+    const int c = compareStrings(s.get(), t);
+    release(t);
+    return JSValue::int32(c);
+}
+
+NATIVE(stringToString)
+{
+    UNUSED();
+    if (!isString(self))
+        return typeError(vm, "String.prototype.toString requires that 'this' be a String");
+    retain(self);
+    return self;
+}
+
+// ------------------------------------------------------------ Number, Boolean ---
+
+NATIVE(numberCtor)
+{
+    UNUSED();
+    if (!argc)
+        return JSValue::int32(0);
+    double d;
+    if (!toNumber(vm, args[0], &d))
+        return JSValue::exception();
+    return JSValue::boxNumber(d);
+}
+
+NATIVE(numberIs)
+{
+    UNUSED();
+    const JSValue v = arg(args, argc, 0);
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 isInteger, 1 isNaN, 2 isFinite, 3 isSafeInteger
+    if (!v.isNumber())
+        return JSValue::boolean(false);
+    const double d = v.asNumber();
+    switch (mode) {
+        case 0: return JSValue::boolean(std::isfinite(d) && d == std::trunc(d));
+        case 1: return JSValue::boolean(d != d);
+        case 2: return JSValue::boolean(std::isfinite(d));
+        default: return JSValue::boolean(std::isfinite(d) && d == std::trunc(d) && std::fabs(d) <= 9007199254740991.0);
+    }
+}
+
+NATIVE(numberToString)
+{
+    UNUSED();
+    if (!self.isNumber())
+        return typeError(vm, "Number.prototype.toString requires that 'this' be a Number");
+    double radix = 10;
+    if (argc && !args[0].isUndefined() && !toNumber(vm, args[0], &radix))
+        return JSValue::exception();
+    if (radix < 2 || radix > 36)
+        return vm.throwError(ErrorCode::RangeError, "toString() radix must be between 2 and 36");
+    if (radix == 10)
+        return toStringValue(vm, self);
+    return makeString(vm, StringView(dyn::numberToStringRadix(self.asNumber(), int(radix))));
+}
+
+NATIVE(numberToFixed)
+{
+    UNUSED();
+    if (!self.isNumber())
+        return typeError(vm, "Number.prototype.toFixed requires that 'this' be a Number");
+    double digits = 0;
+    if (argc && !toNumber(vm, args[0], &digits))
+        return JSValue::exception();
+    if (digits < 0 || digits > 100)
+        return vm.throwError(ErrorCode::RangeError, "toFixed() digits argument must be between 0 and 100");
+    return makeString(vm, StringView(dyn::numberToFixed(self.asNumber(), int(digits))));
+}
+
+NATIVE(numberValueOf)
+{
+    UNUSED();
+    if (!self.isNumber())
+        return typeError(vm, "Number.prototype.valueOf requires that 'this' be a Number");
+    return self;
+}
+
+NATIVE(booleanCtor)
+{
+    UNUSED();
+    return JSValue::boolean(toBoolean(arg(args, argc, 0)));
+}
+
+NATIVE(booleanToString)
+{
+    UNUSED();
+    if (!self.isBool())
+        return typeError(vm, "Boolean.prototype.toString requires that 'this' be a Boolean");
+    return str(vm, self.asBool() ? "true" : "false");
+}
+
+// --------------------------------------------------------------------- Math ---
+
+NATIVE(mathUnary)
+{
+    UNUSED();
+    double d;
+    if (!toNumber(vm, arg(args, argc, 0), &d))
+        return JSValue::exception();
+    using F = double (*)(double);
+    return JSValue::boxNumber(reinterpret_cast<F>(data)(d));
+}
+
+double mathRound(double d)
+{
+    if (!std::isfinite(d) || d == 0)
+        return d;
+    return std::floor(d + 0.5) == 0 && d < 0 ? -0.0 : std::floor(d + 0.5);
+}
+double mathSign(double d)
+{
+    return d != d ? d : d > 0 ? 1 : d < 0 ? -1 : d;
+}
+double mathFloor(double d) { return std::floor(d); }
+double mathCeil(double d) { return std::ceil(d); }
+double mathTrunc(double d) { return std::trunc(d); }
+double mathAbs(double d) { return std::fabs(d); }
+double mathSqrt(double d) { return std::sqrt(d); }
+double mathSin(double d) { return std::sin(d); }
+double mathCos(double d) { return std::cos(d); }
+double mathTan(double d) { return std::tan(d); }
+double mathAtan(double d) { return std::atan(d); }
+double mathExp(double d) { return std::exp(d); }
+double mathLog(double d) { return std::log(d); }
+double mathLog2(double d) { return std::log2(d); }
+double mathLog10(double d) { return std::log10(d); }
+double mathCbrt(double d) { return std::cbrt(d); }
+
+NATIVE(mathMinMax)
+{
+    UNUSED();
+    const bool isMax = data != nullptr;
+    double result = isMax ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
+    bool nan = false;
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        double d;
+        if (!toNumber(vm, args[i], &d))
+            return JSValue::exception();
+        if (d != d)
+            nan = true;
+        else if (isMax ? (d > result || (d == 0 && result == 0 && !std::signbit(d))) : (d < result || (d == 0 && result == 0 && std::signbit(d))))
+            result = d;
+    }
+    return JSValue::boxNumber(nan ? std::nan("") : result);
+}
+
+NATIVE(mathPow)
+{
+    UNUSED();
+    return arithmetic(vm, Op::Exp, arg(args, argc, 0), arg(args, argc, 1));
+}
+
+NATIVE(mathAtan2)
+{
+    UNUSED();
+    double y, x;
+    if (!toNumber(vm, arg(args, argc, 0), &y) || !toNumber(vm, arg(args, argc, 1), &x))
+        return JSValue::exception();
+    return JSValue::boxNumber(std::atan2(y, x));
+}
+
+NATIVE(mathRandom)
+{
+    UNUSED();
+    static std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return JSValue::boxDouble(double(state >> 11) / 9007199254740992.0);
+}
+
+NATIVE(mathHypot)
+{
+    UNUSED();
+    double sum = 0;
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        double d;
+        if (!toNumber(vm, args[i], &d))
+            return JSValue::exception();
+        sum += d * d;
+    }
+    return JSValue::boxNumber(std::sqrt(sum));
+}
+
+NATIVE(mathImul)
+{
+    UNUSED();
+    double a, b;
+    if (!toNumber(vm, arg(args, argc, 0), &a) || !toNumber(vm, arg(args, argc, 1), &b))
+        return JSValue::exception();
+    return JSValue::int32(std::int32_t(std::uint32_t(toInt32(a)) * std::uint32_t(toInt32(b))));
+}
+
+}  // namespace
+
+// ------------------------------------------------------------------ install ---
+
+JSObject* VM::errorProto(ErrorCode code) const noexcept
+{
+    const std::size_t i = std::size_t(code);
+    if (i < 48 && errorProtos[i])
+        return errorProtos[i];
+    return errorProtos[std::size_t(ErrorCode::Exception)];
+}
+
+JSValue VM::makeError(ErrorCode code, std::string_view message)
+{
+    JSObject* o = newObject(errorProto(code));
+    Handle keep = Handle::adopt(toJSValue(o));
+    JSValue text = makeString(*this, message);
+    value(*this, o, "message", text);
+    o->h.cls = std::uint8_t(ObjClass::Error);
+    return keep.take();
+}
+
+JSValue VM::throwError(ErrorCode code, std::string_view message)
+{
+    clearException();
+    exception = makeError(code, message);
+    exceptionCode = code;
+    return JSValue::exception();
+}
+
+void VM::installBuiltins()
+{
+    // The two prototypes everything else hangs from.
+    JSObject* objectProto = newObject(static_cast<JSObject*>(nullptr), 7);
+    setIntrinsic(&protos.object, objectProto);
+    release(toJSValue(objectProto));
+    JSObject* functionProto = newObject(objectProto);
+    setIntrinsic(&protos.function, functionProto);
+    release(toJSValue(functionProto));
+    JSObject* globalObject = newObject(objectProto, 15);
+    global = globalObject;
+    value(*this, globalObject, "globalThis", (retain(toJSValue(global)), toJSValue(global)));
+    value(*this, globalObject, "undefined", JSValue::undefined(), 0);
+    value(*this, globalObject, "NaN", JSValue::boxDouble(std::nan("")), 0);
+    value(*this, globalObject, "Infinity", JSValue::boxDouble(std::numeric_limits<double>::infinity()), 0);
+
+    method(*this, objectProto, "hasOwnProperty", hasOwnProperty, 1);
+    method(*this, objectProto, "toString", objectToString, 0);
+    method(*this, objectProto, "valueOf", objectValueOf, 0);
+    method(*this, objectProto, "isPrototypeOf", isPrototypeOf, 1);
+    method(*this, functionProto, "call", functionCall, 1);
+    method(*this, functionProto, "apply", functionApply, 2);
+    method(*this, functionProto, "toString", functionToString, 0);
+    (void)functionBoundNoop;
+
+    JSFunction* objectCtorFn = constructor(*this, "Object", objectCtor, 1, objectProto);
+    method(*this, objectCtorFn, "keys", objectKeys, 1, reinterpret_cast<void*>(0));
+    method(*this, objectCtorFn, "values", objectKeys, 1, reinterpret_cast<void*>(1));
+    method(*this, objectCtorFn, "entries", objectKeys, 1, reinterpret_cast<void*>(2));
+    method(*this, objectCtorFn, "getPrototypeOf", objectGetPrototypeOf, 1);
+    method(*this, objectCtorFn, "setPrototypeOf", objectSetPrototypeOf, 2);
+    method(*this, objectCtorFn, "create", objectCreate, 2);
+    method(*this, objectCtorFn, "defineProperty", objectDefineProperty, 3);
+    method(*this, objectCtorFn, "freeze", objectFreeze, 1);
+    method(*this, objectCtorFn, "isFrozen", objectIsFrozen, 1);
+    method(*this, objectCtorFn, "assign", objectAssign, 2);
+
+    // The function constructor object itself; `new Function(...)` needs the compiler at run time and is not provided.
+    {
+        JSObject* fp = functionProto;
+        Key key = internKey(std::string_view("Function"));
+        JSFunction* f = newNativeFunction(functionProto, [](VM& vm, JSValue, const JSValue*, std::uint32_t, void*) -> JSValue {
+            return vm.throwError(ErrorCode::NotSupported, "Function() constructor is not supported by the vm core");
+        }, nullptr, key, 1);
+        f->materialize(*this);
+        retain(toJSValue(fp));
+        f->putOwn(*this, atoms.prototype, toJSValue(fp), 0);
+        retain(toJSValue(f));
+        fp->putOwn(*this, atoms.constructor, toJSValue(f), attr::kWritable | attr::kConfigurable);
+        globalObject->putOwn(*this, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
+        detail::decRef(key);
+    }
+
+    // Errors.
+    JSObject* errorProtoObject = newObject(objectProto);
+    errorProtos[std::size_t(ErrorCode::Exception)] = errorProtoObject;  // holds the creation count
+    value(*this, errorProtoObject, "name", str(*this, "Error"));
+    value(*this, errorProtoObject, "message", str(*this, ""));
+    method(*this, errorProtoObject, "toString", errorToString, 0);
+    {
+        JSFunction* base = constructor(*this, "Error", errorCtor, 1, errorProtoObject);
+        (void)base;
+        // `data` is the prototype the constructor makes errors of when called without `new`.
+        Rare* r = base->rare();
+        r->nativeData = errorProtoObject;
+    }
+    struct Named
+    {
+        ErrorCode code;
+        const char* name;
+    };
+    for (Named n : {Named{ErrorCode::TypeError, "TypeError"}, Named{ErrorCode::RangeError, "RangeError"},
+                    Named{ErrorCode::ReferenceError, "ReferenceError"}, Named{ErrorCode::SyntaxError, "SyntaxError"},
+                    Named{ErrorCode::EvalError, "EvalError"}, Named{ErrorCode::UriError, "URIError"}}) {
+        JSObject* p = newObject(errorProtoObject);
+        errorProtos[std::size_t(n.code)] = p;
+        value(*this, p, "name", str(*this, n.name));
+        value(*this, p, "message", str(*this, ""));
+        JSFunction* f = constructor(*this, n.name, errorCtor, 1, p);
+        f->rare()->nativeData = p;
+        // Each constructor inherits from `Error`.
+        Key errorKey = internKey(std::string_view("Error"));
+        JSValue* base = globalObject->findOwn(*this, errorKey);
+        detail::decRef(errorKey);
+        if (base)
+            f->setProto(*this, asObject(*base));
+    }
+    errorProtos[std::size_t(ErrorCode::StackOverflow)] = errorProtos[std::size_t(ErrorCode::RangeError)];
+    retain(toJSValue(errorProtos[std::size_t(ErrorCode::RangeError)]));
+    errorProtos[std::size_t(ErrorCode::InternalError)] = errorProtoObject;
+    retain(toJSValue(errorProtoObject));
+
+    // Array.
+    JSArray* arrayProtoObject = newArray(objectProto);
+    setIntrinsic(&protos.array, arrayProtoObject);
+    release(toJSValue(arrayProtoObject));
+    JSObject* ap = arrayProtoObject;
+    JSFunction* arrayCtorFn = constructor(*this, "Array", arrayCtor, 1, ap);
+    method(*this, arrayCtorFn, "isArray", arrayIsArray, 1);
+    method(*this, ap, "push", arrayPush, 1);
+    method(*this, ap, "pop", arrayPop, 0);
+    method(*this, ap, "shift", arrayShift, 0);
+    method(*this, ap, "unshift", arrayUnshift, 1);
+    method(*this, ap, "join", arrayJoin, 1);
+    method(*this, ap, "toString", arrayToString, 0);
+    method(*this, ap, "slice", arraySlice, 2);
+    method(*this, ap, "splice", arraySplice, 2);
+    method(*this, ap, "concat", arrayConcat, 1);
+    method(*this, ap, "reverse", arrayReverse, 0);
+    method(*this, ap, "indexOf", arrayIndexOf, 1, reinterpret_cast<void*>(0));
+    method(*this, ap, "lastIndexOf", arrayIndexOf, 1, reinterpret_cast<void*>(1));
+    method(*this, ap, "includes", arrayIndexOf, 1, reinterpret_cast<void*>(2));
+    method(*this, ap, "forEach", arrayIterate, 1, reinterpret_cast<void*>(0));
+    method(*this, ap, "map", arrayIterate, 1, reinterpret_cast<void*>(1));
+    method(*this, ap, "filter", arrayIterate, 1, reinterpret_cast<void*>(2));
+    method(*this, ap, "some", arrayIterate, 1, reinterpret_cast<void*>(3));
+    method(*this, ap, "every", arrayIterate, 1, reinterpret_cast<void*>(4));
+    method(*this, ap, "find", arrayIterate, 1, reinterpret_cast<void*>(5));
+    method(*this, ap, "findIndex", arrayIterate, 1, reinterpret_cast<void*>(6));
+    method(*this, ap, "reduce", arrayReduce, 1, nullptr);
+    method(*this, ap, "reduceRight", arrayReduce, 1, reinterpret_cast<void*>(1));
+    method(*this, ap, "fill", arrayFill, 1);
+    method(*this, ap, "sort", arraySort, 1);
+
+    // String.
+    JSObject* sp = newObject(objectProto);
+    setIntrinsic(&protos.string, sp);
+    release(toJSValue(sp));
+    JSFunction* stringCtorFn = constructor(*this, "String", stringCtor, 1, sp);
+    method(*this, stringCtorFn, "fromCharCode", stringFromCharCode, 1);
+    method(*this, sp, "charAt", stringCharAt, 1);
+    method(*this, sp, "charCodeAt", stringCharAt, 1, reinterpret_cast<void*>(1));
+    method(*this, sp, "indexOf", stringIndexOf, 1, reinterpret_cast<void*>(0));
+    method(*this, sp, "lastIndexOf", stringIndexOf, 1, reinterpret_cast<void*>(1));
+    method(*this, sp, "includes", stringIndexOf, 1, reinterpret_cast<void*>(2));
+    method(*this, sp, "startsWith", stringIndexOf, 1, reinterpret_cast<void*>(3));
+    method(*this, sp, "endsWith", stringIndexOf, 1, reinterpret_cast<void*>(4));
+    method(*this, sp, "slice", stringSlice, 2, reinterpret_cast<void*>(0));
+    method(*this, sp, "substring", stringSlice, 2, reinterpret_cast<void*>(1));
+    method(*this, sp, "substr", stringSlice, 2, reinterpret_cast<void*>(2));
+    method(*this, sp, "toLowerCase", stringCase, 0, nullptr);
+    method(*this, sp, "toUpperCase", stringCase, 0, reinterpret_cast<void*>(1));
+    method(*this, sp, "trim", stringTrim, 0, reinterpret_cast<void*>(0));
+    method(*this, sp, "trimStart", stringTrim, 0, reinterpret_cast<void*>(1));
+    method(*this, sp, "trimEnd", stringTrim, 0, reinterpret_cast<void*>(2));
+    method(*this, sp, "split", stringSplit, 2);
+    method(*this, sp, "repeat", stringRepeat, 1);
+    method(*this, sp, "padStart", stringPad, 2, reinterpret_cast<void*>(1));
+    method(*this, sp, "padEnd", stringPad, 2, nullptr);
+    method(*this, sp, "replace", stringReplace, 2, nullptr);
+    method(*this, sp, "replaceAll", stringReplace, 2, reinterpret_cast<void*>(1));
+    method(*this, sp, "concat", stringConcat, 1);
+    method(*this, sp, "localeCompare", stringLocaleCompare, 1);
+    method(*this, sp, "toString", stringToString, 0);
+    method(*this, sp, "valueOf", stringToString, 0);
+
+    // Number and Boolean.
+    JSObject* np = newObject(objectProto);
+    setIntrinsic(&protos.number, np);
+    release(toJSValue(np));
+    JSFunction* numberCtorFn = constructor(*this, "Number", numberCtor, 1, np);
+    method(*this, numberCtorFn, "isInteger", numberIs, 1, reinterpret_cast<void*>(0));
+    method(*this, numberCtorFn, "isNaN", numberIs, 1, reinterpret_cast<void*>(1));
+    method(*this, numberCtorFn, "isFinite", numberIs, 1, reinterpret_cast<void*>(2));
+    method(*this, numberCtorFn, "isSafeInteger", numberIs, 1, reinterpret_cast<void*>(3));
+    value(*this, numberCtorFn, "MAX_SAFE_INTEGER", JSValue::boxNumber(9007199254740991.0), 0);
+    value(*this, numberCtorFn, "MIN_SAFE_INTEGER", JSValue::boxNumber(-9007199254740991.0), 0);
+    value(*this, numberCtorFn, "MAX_VALUE", JSValue::boxDouble(std::numeric_limits<double>::max()), 0);
+    value(*this, numberCtorFn, "MIN_VALUE", JSValue::boxDouble(5e-324), 0);
+    value(*this, numberCtorFn, "EPSILON", JSValue::boxDouble(std::numeric_limits<double>::epsilon()), 0);
+    value(*this, numberCtorFn, "POSITIVE_INFINITY", JSValue::boxDouble(std::numeric_limits<double>::infinity()), 0);
+    value(*this, numberCtorFn, "NEGATIVE_INFINITY", JSValue::boxDouble(-std::numeric_limits<double>::infinity()), 0);
+    value(*this, numberCtorFn, "NaN", JSValue::boxDouble(std::nan("")), 0);
+    method(*this, np, "toString", numberToString, 1);
+    method(*this, np, "toFixed", numberToFixed, 1);
+    method(*this, np, "valueOf", numberValueOf, 0);
+    JSObject* bp = newObject(objectProto);
+    setIntrinsic(&protos.boolean, bp);
+    release(toJSValue(bp));
+    constructor(*this, "Boolean", booleanCtor, 1, bp);
+    method(*this, bp, "toString", booleanToString, 0);
+    method(*this, bp, "valueOf", [](VM& vm, JSValue self, const JSValue*, std::uint32_t, void*) -> JSValue {
+        if (!self.isBool())
+            return vm.throwError(ErrorCode::TypeError, "Boolean.prototype.valueOf requires that 'this' be a Boolean");
+        return self;
+    }, 0);
+
+    // Math.
+    JSObject* math = newObject(objectProto);
+    {
+        Key key = internKey(std::string_view("Math"));
+        retain(toJSValue(math));
+        globalObject->putOwn(*this, key, toJSValue(math), attr::kWritable | attr::kConfigurable);
+        detail::decRef(key);
+    }
+    struct Unary
+    {
+        const char* name;
+        double (*fn)(double);
+    };
+    for (Unary u : {Unary{"floor", mathFloor}, Unary{"ceil", mathCeil}, Unary{"round", mathRound}, Unary{"trunc", mathTrunc},
+                    Unary{"abs", mathAbs}, Unary{"sqrt", mathSqrt}, Unary{"sin", mathSin}, Unary{"cos", mathCos},
+                    Unary{"tan", mathTan}, Unary{"atan", mathAtan}, Unary{"exp", mathExp}, Unary{"log", mathLog},
+                    Unary{"log2", mathLog2}, Unary{"log10", mathLog10}, Unary{"cbrt", mathCbrt}, Unary{"sign", mathSign}})
+        method(*this, math, u.name, mathUnary, 1, reinterpret_cast<void*>(u.fn));
+    method(*this, math, "max", mathMinMax, 2, reinterpret_cast<void*>(1));
+    method(*this, math, "min", mathMinMax, 2, nullptr);
+    method(*this, math, "pow", mathPow, 2);
+    method(*this, math, "atan2", mathAtan2, 2);
+    method(*this, math, "random", mathRandom, 0);
+    method(*this, math, "hypot", mathHypot, 2);
+    method(*this, math, "imul", mathImul, 2);
+    value(*this, math, "PI", JSValue::boxDouble(3.141592653589793), 0);
+    value(*this, math, "E", JSValue::boxDouble(2.718281828459045), 0);
+    value(*this, math, "LN2", JSValue::boxDouble(0.6931471805599453), 0);
+    value(*this, math, "LN10", JSValue::boxDouble(2.302585092994046), 0);
+    value(*this, math, "SQRT2", JSValue::boxDouble(1.4142135623730951), 0);
+    release(toJSValue(math));
+
+    // console, print, and the number parsers.
+    JSObject* console = newObject(objectProto);
+    {
+        Key key = internKey(std::string_view("console"));
+        retain(toJSValue(console));
+        globalObject->putOwn(*this, key, toJSValue(console), attr::kWritable | attr::kConfigurable);
+        detail::decRef(key);
+    }
+    method(*this, console, "log", consoleLog, 0);
+    method(*this, console, "info", consoleLog, 0);
+    method(*this, console, "debug", consoleLog, 0);
+    method(*this, console, "error", consoleLog, 0, reinterpret_cast<void*>(1));
+    method(*this, console, "warn", consoleLog, 0, reinterpret_cast<void*>(1));
+    release(toJSValue(console));
+    method(*this, globalObject, "print", consoleLog, 0);
+    JSFunction* pi = method(*this, globalObject, "parseInt", parseIntImpl, 2);
+    JSFunction* pf = method(*this, globalObject, "parseFloat", parseFloatImpl, 1);
+    method(*this, globalObject, "isNaN", isNaNImpl, 1);
+    method(*this, globalObject, "isFinite", isFiniteImpl, 1);
+    value(*this, numberCtorFn, "parseInt", (retain(toJSValue(pi)), toJSValue(pi)));
+    value(*this, numberCtorFn, "parseFloat", (retain(toJSValue(pf)), toJSValue(pf)));
+}
+
+}  // namespace vm
+}  // namespace internal
+}  // namespace script

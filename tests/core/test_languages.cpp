@@ -153,16 +153,18 @@ TEST(coreOptionPicksTheEngine)
     script::Context::Options vm;
     vm.language = Language::JavaScript;
     vm.core = script::Context::Options::Core::Vm;
-    script::Context onVm(vm);
-    bool refused = false;
-    try {
-        onVm.eval("6 * 7");
-    } catch (const script::Error& e) {
-        refused = e.code() == script::ErrorCode::NotSupported;
+    if (SCRIPT_VM && SCRIPT_VM_LANG_JAVASCRIPT) {
+        script::Context onVm(vm);
+        CHECK_EQ(onVm.eval("6 * 7").toInt(), 42);
+        // A language the new core does not run yet is refused, not run on the other core.
+        if (SCRIPT_LANG_TYPESCRIPT)
+            CHECK_THROWS(onVm.eval("let x: number = 1; x", "a.ts"), script::ErrorCode::NotSupported);
+    } else {
+        // A build without the new core refuses to give a context to it.
+        script::Context onVm(vm);
+        CHECK_THROWS(onVm.eval("6 * 7"), script::ErrorCode::NotSupported);
     }
-    // Until the new core compiles anything, asking for it is a refusal in a build that has it and in one that has not.
-    CHECK(refused);
-    // And the default context still runs, while the new core is not the default.
+    // The default context runs on the dynamic engine while the new core is not the default.
     if (!SCRIPT_VM_DEFAULT) {
         script::Context::Options plain;
         plain.language = Language::JavaScript;

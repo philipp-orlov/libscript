@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include "script/internal/vm/bytecode.hpp"
 #include "script/internal/vm/object.hpp"
 
 #include <cstring>
@@ -86,6 +87,12 @@ void VM::releaseCode(CodeBlock* code) noexcept
         return;
     if (code->name)
         detail::decRef(code->name);
+    for (JSValue v : code->consts)
+        release(v);
+    for (Key k : code->atoms)
+        detail::decRef(k);
+    for (CodeBlock* child : code->children)
+        releaseCode(child);
     code->~CodeBlock();
     PoolAlloc<CodeBlock>().deallocate(code, 1);
 }

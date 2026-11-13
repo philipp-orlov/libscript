@@ -268,7 +268,8 @@ endif()
 if(SCRIPT_VM)
     set(SCRIPT_VM_TIER_MAX ${SCRIPT_VM_TIERS})
     list(APPEND SCRIPT_CORE_SOURCES src/vm/vm.cpp src/vm/language.cpp src/vm/cell.cpp src/vm/shape.cpp src/vm/object.cpp src/vm/property.cpp
-        src/vm/validity.cpp src/vm/convert.cpp)
+        src/vm/validity.cpp src/vm/convert.cpp src/vm/bytecode.cpp src/vm/operators.cpp
+        src/vm/compiler.cpp src/vm/interp.cpp src/vm/builtins.cpp src/vm/host.cpp)
     foreach(lang ${SCRIPT_VM_LANGS})
         if(NOT lang STREQUAL "javascript")
             message(FATAL_ERROR "SCRIPT_VM_LANGS: '${lang}' is not ported to the new core yet")

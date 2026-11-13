@@ -95,7 +95,8 @@ TEST(indexOfAgreesWithABruteForceScanForOneTo300Properties)
 TEST(aNameMadeAtRunTimeIsLimitedToThirtyTwoTransitionsPerShape)
 {
     Fixture f;
-    Shape* root = f.vm.rootShapeFor(nullptr);
+    JSObject* proto = f.vm.newObject(static_cast<JSObject*>(nullptr));
+    Shape* root = f.vm.rootShapeFor(proto);  // a root of its own: the built-ins used up the shared one's names
     std::uint32_t made = 0;
     for (int i = 0; i < 40; ++i) {
         StringCell* name = f.ctx.impl()->intern(script::internal::fromUtf8("dyn" + std::to_string(i)));

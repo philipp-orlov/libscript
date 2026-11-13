@@ -5,6 +5,7 @@
 // grows with each phase -- the VM stack and the code blocks land here.
 #pragma once
 
+#include <deque>
 #include <map>
 #include <string>
 #include <string_view>
@@ -94,6 +95,7 @@ struct Intrinsics
     JSObject* weakMap = nullptr;
     JSObject* weakSet = nullptr;
     JSObject* regexp = nullptr;
+    JSObject* promise = nullptr;
 };
 
 /// One activation on the VM stack. `R` is its register window; register 0 is `this`, then the parameters. A function called
@@ -110,6 +112,13 @@ struct Frame
     bool entry;                 ///< entered from C++: leaving it returns from `run`
     JSValue newTarget;          ///< the constructor `new` was applied to; undefined in a call (not counted: it is a callee)
     JSValue gen = JSValue::undefined();  ///< the generator this frame runs, if it does (not counted: the resumer holds it)
+};
+
+/// A queued promise job: what to run when the host runs jobs; each value holds a count.
+struct MicroJob
+{
+    int kind;  ///< 0 a reaction to a fulfilled promise, 1 to a rejected one, 2 a thenable to resolve, 3 a plain call
+    JSValue a, b, c;
 };
 
 struct VM : EngineRuntime
@@ -251,6 +260,13 @@ struct VM : EngineRuntime
     JSValue evalSource(std::string_view source, std::string_view name);
     /// Room for the boxes a closure with many captures gathers; the interpreter cannot hold a vector across its jumps.
     std::vector<Box*> boxScratch;
+    // ---- promises (builtins_promise.cpp) ----
+    std::deque<MicroJob> jobs;
+    void enqueueJob(int kind, JSValue a, JSValue b, JSValue c);
+    /// Run queued jobs, and those they queue, until none are left; how many ran.
+    std::size_t runJobs();
+    /// `resumeGenerator` without the result object: `*out` is the value (owned), `*done` whether it returned.
+    bool resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool* done);
     /// Set while a `throw` is being delivered to a suspended generator.
     bool resumeThrow = false;
 

@@ -856,7 +856,18 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             (void)mark;
             return d;
         }
-        case NK::Await: unsupported(n, "async functions");
+        case NK::Await: {
+            if (!(fn_->block->flags & CodeBlock::kAsync))
+                unsupported(n, "await here");
+            const std::uint16_t mark = fn_->top;
+            const std::uint16_t d = dest(dst);
+            const std::uint16_t inner = fn_->top;
+            const std::uint16_t v = exprAny(*n.a);
+            emit(Op::Yield, d, v);
+            fn_->top = inner;
+            (void)mark;
+            return d;
+        }
         case NK::ClassExpr: return classExpr(n, dst, String());
         case NK::BigIntLit: unsupported(n, "BigInt");
         case NK::RegExpLit: {
@@ -1010,8 +1021,6 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
 
 std::uint16_t Compiler::function(const Node& n, const String& inferredName, int dst)
 {
-    if (n.isAsync)
-        unsupported(n, "async functions");
     CodeBlock* child = compileFunction(n, n.text.empty() ? inferredName : n.text);
     const std::size_t index = fn_->block->children.size();
     fn_->block->children.push_back(child);
@@ -2650,9 +2659,13 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
 {
     const bool arrow = n.kind == NK::ArrowExpr;
     Key nameKey = name.empty() ? nullptr : vm_.internKey(StringView(name));
-    CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && !n.isGenerator && (!n.isMethod || (extraFlags & CodeBlock::kClassConstructor)));
-    if (n.isGenerator)
+    CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && !n.isGenerator && !n.isAsync && (!n.isMethod || (extraFlags & CodeBlock::kClassConstructor)));
+    if (n.isAsync && n.isGenerator)
+        unsupported(n, "async generators");
+    if (n.isGenerator || n.isAsync)
         block->flags |= CodeBlock::kGenerator;
+    if (n.isAsync)
+        block->flags |= CodeBlock::kAsync;
     if (nameKey)
         detail::decRef(nameKey);  // `newCodeBlock` took its own count
     block->flags |= extraFlags;

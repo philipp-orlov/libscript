@@ -2632,6 +2632,7 @@ void VM::installBuiltins()
     installMore(*this);
     installCollections(*this);
     installRegExp(*this);
+    installPromise(*this);
 }
 
 namespace bi {

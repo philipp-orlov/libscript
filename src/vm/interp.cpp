@@ -1996,19 +1996,34 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     }
     if (c->flags & CodeBlock::kNeedsArgs)
         g->regs[1 + c->nparams] = toJSValue(captureArguments(*this, args, argc));
+    if (c->flags & CodeBlock::kAsync)
+        return bi::asyncStart(*this, keep.take());
     return keep.take();
 }
 
 JSValue VM::resumeGenerator(JSValue generator, int mode, JSValue sent)
 {
+    JSValue value;
+    bool done;
+    if (!resumeRaw(generator, mode, sent, &value, &done))
+        return JSValue::exception();
+    return bi::iterResult(*this, value, done);
+}
+
+bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool* done)
+{
     GenState* g = nullptr;
     if (isObject(generator) && asObject(generator)->cls() == ObjClass::Generator)
         if (Rare* r = asObject(generator)->rare())
             g = static_cast<GenState*>(r->ext);
-    if (!g)
-        return throwError(ErrorCode::TypeError, "next method called on an incompatible receiver");
-    if (g->state == GenState::Running)
-        return throwError(ErrorCode::TypeError, "Generator is already running");
+    if (!g) {
+        throwError(ErrorCode::TypeError, "next method called on an incompatible receiver");
+        return false;
+    }
+    if (g->state == GenState::Running) {
+        throwError(ErrorCode::TypeError, "Generator is already running");
+        return false;
+    }
     Handle keepGenerator = Handle::retained(generator);
     Handle keepSent = Handle::retained(sent);
     if (g->state == GenState::Start && mode != 0) {
@@ -2026,17 +2041,21 @@ JSValue VM::resumeGenerator(JSValue generator, int mode, JSValue sent)
             exception = sent;
             retain(exception);
             exceptionCode = ErrorCode::Exception;
-            return JSValue::exception();
+            return false;
         }
         const JSValue v = mode == 2 ? sent : JSValue::undefined();
         retain(v);
-        return bi::iterResult(*this, v, true);
+        *out = v;
+        *done = true;
+        return true;
     }
     auto* f = static_cast<JSFunction*>(asObject(g->callee));
     CodeBlock* c = f->code;
     JSValue* R = stackTop;
-    if (frameCount + 2 >= frameCapacity || R + c->nregs + 8 > stackEnd)
-        return throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
+    if (frameCount + 2 >= frameCapacity || R + c->nregs + 8 > stackEnd) {
+        throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
+        return false;
+    }
     fillStack(R + c->nregs + 1);
     for (std::uint32_t i = 0; i < c->nregs; ++i) {
         const JSValue old = R[i];
@@ -2061,15 +2080,17 @@ JSValue VM::resumeGenerator(JSValue generator, int mode, JSValue sent)
     frameBase[frameCount++] = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, false, true, JSValue::undefined(), generator};
     const JSValue result = run(*this);
     stackTop = savedTop;
-    bool finished = g->state == GenState::Running;
+    const bool finished = g->state == GenState::Running;
     if (finished) {
         g->state = GenState::Done;
         g->clear(*this);
         clearRegs(R, 0, 1);
     }
     if (result.isException())
-        return result;
-    return bi::iterResult(*this, result, finished);
+        return false;
+    *out = result;
+    *done = finished;
+    return true;
 }
 
 JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc)

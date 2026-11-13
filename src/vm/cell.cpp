@@ -335,6 +335,12 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
 void VM::releaseRoots() noexcept
 {
     tearingDown = true;
+    for (MicroJob& job : jobs) {
+        release(job.a);
+        release(job.b);
+        release(job.c);
+    }
+    jobs.clear();
     for (auto& entry : symbolRegistry)
         detail::decRef(entry.second);
     symbolRegistry.clear();
@@ -371,7 +377,7 @@ void VM::releaseRoots() noexcept
     }
     for (JSObject** p : {&protos.object, &protos.function, &protos.array, &protos.number, &protos.string, &protos.boolean,
                          &protos.symbol, &protos.bigint, &protos.generator, &protos.iterator,
-                          &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet, &protos.regexp}) {
+                          &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet, &protos.regexp, &protos.promise}) {
         if (*p)
             detail::decRef(reinterpret_cast<CellPtr>(*p));
         *p = nullptr;

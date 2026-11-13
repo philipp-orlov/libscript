@@ -42,6 +42,32 @@ Outcome runOn(script::Context::Options::Core core, const char* source, bool runt
     return out;
 }
 
+/// Programs that leave their result in `out` once the jobs have run.
+const char* const kAsyncSnippets[] = {
+#define S(text) text,
+#include "snippets_async.inc"
+#undef S
+};
+
+Outcome runAsyncOn(script::Context::Options::Core core, const char* source)
+{
+    script::Context::Options options;
+    options.language = script::Language::JavaScript;
+    options.core = core;
+    script::Context ctx(options);
+    Outcome out;
+    try {
+        ctx.eval(source);
+        ctx.runJobs();
+        out.text = ctx.eval("String(out)").toString();
+    } catch (const script::Error& e) {
+        out.threw = true;
+        out.code = e.code();
+        out.text = e.what();
+    }
+    return out;
+}
+
 const char* const kSnippets[] = {
 #define S(text) text,
 #include "snippets.inc"
@@ -65,6 +91,21 @@ TEST(everySnippetAgreesWithTheDynamicEngine)
         }
     }
     std::fprintf(stderr, "%d snippets, %d differ\n", checked, failed);
+    CHECK_EQ(failed, 0);
+}
+
+TEST(everyAsyncSnippetAgreesWithTheDynamicEngine)
+{
+    int failed = 0;
+    for (const char* source : kAsyncSnippets) {
+        const Outcome want = runAsyncOn(script::Context::Options::Core::Dyn, source);
+        const Outcome got = runAsyncOn(script::Context::Options::Core::Vm, source);
+        if (want.threw != got.threw || want.text != got.text) {
+            ++failed;
+            std::fprintf(stderr, "MISMATCH: %s\n   dyn: %s%s\n    vm: %s%s\n", source, want.threw ? "THROW " : "", want.text.c_str(),
+                         got.threw ? "THROW " : "", got.text.c_str());
+        }
+    }
     CHECK_EQ(failed, 0);
 }
 

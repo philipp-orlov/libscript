@@ -1885,13 +1885,19 @@ Value Context::classConstructor(const void* typeKey)
 
 std::size_t Context::runJobs()
 {
-#if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
-    dyn::Runtime* rt = impl_->dynIfAny();
-    return rt ? rt->runJobs() : 0;
-#else
-    return 0;
+    std::size_t ran = 0;
+#if SCRIPT_ENGINE_DYNAMIC
+    if (dyn::Runtime* rt = impl_->dynIfAny())
+        ran += rt->runJobs();
 #endif
+#if SCRIPT_VM
+    if (vm::VM* vm = impl_->vmIfAny()) {
+        ContextImpl::ActiveEngine active(*impl_, EngineKind::Vm);
+        ran += vm->runJobs();
+    }
+#endif
+    return ran;
 }
 
 void Context::collectGarbage()

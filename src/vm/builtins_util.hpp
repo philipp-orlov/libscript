@@ -149,6 +149,10 @@ void installRegExp(VM& vm);
 /// If `pattern` is an object with a `Symbol.<which>` method, call it with (string, extra) and say so in `*handled`.
 JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, const JSValue* extra, std::uint32_t extraCount,
                          bool* handled);
+/// Begin an async function whose frame is in `generator` (taking its count): runs to the first `await` and gives back the
+/// promise of the result. Owned.
+JSValue asyncStart(VM& vm, JSValue generator);
+void installPromise(VM& vm);
 /// A global property, taking the count of `v`.
 inline void defineGlobal(VM& vm, const char* name, JSValue v)
 {

@@ -256,6 +256,22 @@ bool hasAssignment(const Node& n)
     return false;
 }
 
+/// Whether `arguments` is read in a function's body or in an arrow inside it (not in another function, which has its own).
+bool usesArguments(const Node& n)
+{
+    if (n.kind == NK::Identifier && n.text == u"arguments")
+        return true;
+    if (n.kind == NK::FunctionExpr)
+        return false;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child && usesArguments(**child))
+            return true;
+    for (const dyn::NodePtr& child : n.list)
+        if (child && usesArguments(*child))
+            return true;
+    return false;
+}
+
 bool hasUseStrict(const Node& body)
 {
     for (const dyn::NodePtr& s : body.list) {
@@ -840,8 +856,12 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
     for (const dyn::NodePtr& p : n.list) {
         const std::uint16_t inner = fn_->top;
         line_ = p->line ? p->line : line_;
-        if (p->propKind == PropKind::Spread)
-            unsupported(*p, "object spread");
+        if (p->propKind == PropKind::Spread) {
+            const std::uint16_t v = exprAny(*p->a);
+            emit(Op::SpreadObj, t, v);
+            fn_->top = inner;
+            continue;
+        }
         if (p->setsProto) {
             const std::uint16_t v = exprAny(*p->b);
             emit(Op::SetProto, t, v);
@@ -1439,16 +1459,44 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     }
     Label* savedChain = chain_;
     chain_ = nullptr;
-    for (const dyn::NodePtr& arg : n.list) {
-        if (arg->kind == NK::Spread)
-            unsupported(*arg, "spread arguments");
-        const std::uint16_t r = temp();
-        expr(*arg, r);
+    bool spread = false;
+    for (const dyn::NodePtr& arg : n.list)
+        spread = spread || arg->kind == NK::Spread;
+    std::uint32_t argc = std::uint32_t(n.list.size());
+    if (spread) {
+        // The arguments are collected into an array, which the call spreads over its window.
+        const std::uint16_t arr = temp();
+        emit(Op::NewArray, arr, 0);
+        for (const dyn::NodePtr& arg : n.list) {
+            const std::uint16_t inner = fn_->top;
+            if (arg->kind == NK::Spread) {
+                const std::uint16_t src = exprAny(*arg->a);
+                const std::uint16_t it = temps(2);
+                const std::uint16_t v = temp();
+                Label top, done;
+                emit(Op::IterInit, it, src);
+                bind(top);
+                emit(Op::IterNext, v, it, 0);
+                emitJump(Op::JHole, v, done);
+                emit(Op::ArrayPush, arr, v);
+                jump(top);
+                bind(done);
+            } else {
+                const std::uint16_t v = exprAny(*arg);
+                emit(Op::ArrayPush, arr, v);
+            }
+            fn_->top = inner;
+        }
+        argc = 0;
+    } else {
+        for (const dyn::NodePtr& arg : n.list) {
+            const std::uint16_t r = temp();
+            expr(*arg, r);
+        }
     }
     chain_ = savedChain;
-    const std::uint32_t argc = std::uint32_t(n.list.size());
     const std::uint16_t d = dst >= 0 ? std::uint16_t(dst) : base;
-    emit(isNew ? Op::New : Op::Call, d, base, argc);
+    emit(spread ? (isNew ? Op::NewSpread : Op::CallSpread) : (isNew ? Op::New : Op::Call), d, base, argc);
     fn_->top = mark;
     if (dst < 0) {
         fn_->top = mark + 1;
@@ -1620,10 +1668,31 @@ void Compiler::bindPattern(const Node& target, std::uint16_t value, bool init, V
     const std::uint16_t mark = fn_->top;
     if (target.kind == NK::ObjectPattern) {
         // Reading a property of null or undefined is the TypeError a destructuring of it should raise.
+        // The names taken so far, for a rest element that gets the others.
+        const std::uint16_t taken = temp();
+        bool needTaken = false;
+        for (const dyn::NodePtr& p : target.list)
+            needTaken = needTaken || p->kind == NK::RestElement;
+        if (needTaken)
+            emit(Op::NewArray, taken, 0);
         for (const dyn::NodePtr& p : target.list) {
-            if (p->kind == NK::RestElement)
-                unsupported(*p, "rest elements");
+            if (p->kind == NK::RestElement) {
+                const std::uint16_t inner = fn_->top;
+                const std::uint16_t v = temp();
+                emit(Op::ObjRest, v, value, taken);
+                bindTarget(*p->a, v, init, kind);
+                fn_->top = inner;
+                continue;
+            }
             const std::uint16_t inner = fn_->top;
+            if (needTaken) {
+                const std::uint16_t k = temp();
+                if (p->computed)
+                    expr(*p->a, k);
+                else
+                    loadString(k, p->text);
+                emit(Op::ArrayPush, taken, k);
+            }
             const std::uint16_t v = temp();
             if (p->computed) {
                 const std::uint16_t k = exprAny(*p->a);
@@ -1653,8 +1722,13 @@ void Compiler::bindPattern(const Node& target, std::uint16_t value, bool init, V
                 fn_->top = inner;
                 continue;
             }
-            if (e->kind == NK::RestElement)
-                unsupported(*e, "rest elements");
+            if (e->kind == NK::RestElement) {
+                const std::uint16_t r = temp();
+                emit(Op::IterRest, r, it);
+                bindTarget(*e->a, r, init, kind);
+                fn_->top = inner;
+                continue;
+            }
             const std::uint16_t v = temp();
             emit(Op::IterNext, v, it, 1);
             const Node* t = e.get();
@@ -2112,7 +2186,14 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name)
     if (nameKey)
         detail::decRef(nameKey);  // `newCodeBlock` took its own count
     block->file = file_;
-    block->nparams = std::uint16_t(n.list.size());
+    // Parameters before a rest parameter arrive in registers of their own; the rest are taken from the arguments array.
+    std::size_t fixedParams = n.list.size();
+    for (std::size_t i = 0; i < n.list.size(); ++i)
+        if (n.list[i]->kind == NK::RestElement) {
+            fixedParams = i;
+            break;
+        }
+    block->nparams = std::uint16_t(fixedParams);
     for (const dyn::NodePtr& p : n.list) {
         if (p->kind == NK::AssignPattern || p->kind == NK::RestElement)
             break;
@@ -2159,8 +2240,16 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
 {
     const bool arrow = fn_->isArrow;
     const std::size_t nparams = n.list.size();
-    fn_->top = std::uint16_t(1 + nparams);
+    const std::size_t fixed = block->nparams;
+    const bool hasRest = fixed < nparams;
+    const bool needsArgs = hasRest || (!arrow && usesArguments(*n.d));
+    // `this`, the fixed parameters, then (if any) the arguments array.
+    fn_->top = std::uint16_t(1 + fixed + (needsArgs ? 1 : 0));
     block->nregs = fn_->top;
+    if (needsArgs) {
+        block->flags |= CodeBlock::kNeedsArgs;
+        fn_->scopes.reserve(0);
+    }
 
     // A named function expression sees its own name; the scope is outside the function's own so a parameter or variable
     // of the same name wins.
@@ -2172,6 +2261,18 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
             emit(Op::NewBox, b.reg);
     }
     pushScope();
+    if (needsArgs && !arrow) {
+        // `arguments` is the array the call made, in the register after the parameters.
+        Scope& scope = fn_->scopes.back();
+        Binding b;
+        b.name = String(u"arguments");
+        b.kind = BKind::Var;
+        b.reg = std::uint16_t(1 + fixed);
+        b.boxed = fn_->captured.count(b.name) != 0;
+        scope.bindings.push_back(b);
+        if (b.boxed)
+            emit(Op::NewBox, b.reg);
+    }
     // `this` for the arrows inside.
     if (!arrow && fn_->captured.count(String(u"this"))) {
         Binding& b = declare(String(u"this"), BKind::Var);
@@ -2181,10 +2282,8 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     }
     // Parameters: the first registers after `this`.
     std::vector<Binding*> simple;
-    for (std::size_t i = 0; i < nparams; ++i) {
+    for (std::size_t i = 0; i < fixed; ++i) {
         const Node& p = *n.list[i];
-        if (p.kind == NK::RestElement)
-            unsupported(p, "rest parameters");
         const Node* target = p.kind == NK::AssignPattern ? p.a.get() : &p;
         if (target->kind == NK::Identifier) {
             Scope& scope = fn_->scopes.back();
@@ -2205,7 +2304,7 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
                 scope.bindings.push_back(b);
         }
     }
-    for (std::size_t i = 0; i < nparams; ++i) {
+    for (std::size_t i = 0; i < fixed; ++i) {
         const Node& p = *n.list[i];
         const std::uint16_t reg = std::uint16_t(i + 1);
         const Node* target = &p;
@@ -2231,6 +2330,24 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
             }
             bindPattern(*target, reg, true, VarKind::Let);
         }
+    }
+
+    if (hasRest) {
+        const Node& rest = *n.list[fixed];
+        const Node& target = *rest.a;
+        std::vector<String> names;
+        collectPatternNames(target, names);
+        for (const String& name : names) {
+            Binding& b = declare(name, BKind::Let);
+            b.initialized = true;
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+        }
+        const std::uint16_t mark = fn_->top;
+        const std::uint16_t v = temp();
+        emit(Op::RestSlice, v, std::uint16_t(1 + fixed), std::uint32_t(fixed));
+        bindTarget(target, v, true, VarKind::Let);
+        fn_->top = mark;
     }
 
     // `var` names and function declarations of the whole body, then the block's own `let`s.

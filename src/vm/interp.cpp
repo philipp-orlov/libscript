@@ -223,6 +223,65 @@ void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key ke
     ic.holder = nullptr;
 }
 
+
+/// The call's arguments, copied into an array for `arguments` and rest parameters.
+JSArray* captureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
+{
+    JSArray* all = vm.newArray(vm.protos.array, 0, argc);
+    all->appendAll(vm, args, argc);
+    return all;
+}
+
+/// Add the own enumerable properties of `source` to `target`, as `{...source}` does.
+void copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* excluded)
+{
+    auto skip = [&](Key k) {
+        if (!excluded)
+            return false;
+        for (std::uint32_t i = 0; i < excluded->length; ++i)
+            if (isString(excluded->elems[i]) && excluded->elems[i].asCell() == k)
+                return true;
+        return false;
+    };
+    auto put = [&](Key k, JSValue v) {
+        if (skip(k))
+            return;
+        retain(v);
+        target->putOwn(vm, k, v, attr::kDefault);
+    };
+    if (isObject(source)) {
+        JSObject* o = asObject(source);
+        if (o->cls() == ObjClass::Array) {
+            auto* a = static_cast<JSArray*>(o);
+            for (std::uint32_t i = 0; i < a->length; ++i) {
+                if (a->elems[i].isHole())
+                    continue;
+                Key k = toPropertyKey(vm, JSValue::boxNumber(double(i)));
+                put(k, a->elems[i]);
+                release(JSValue::cell(k));
+            }
+        }
+        std::vector<std::pair<Key, JSValue>> props;
+        o->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue v) {
+            if ((attrs & attr::kEnumerable) && !(attrs & attr::kAccessor))
+                props.push_back({k, v});
+        });
+        for (auto& [k, v] : props)
+            put(k, v);
+    } else if (isString(source)) {
+        const std::uint32_t n = asString(source)->length;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            Key k = toPropertyKey(vm, JSValue::int32(std::int32_t(i)));
+            JSValue ch = makeString(vm, asString(source)->text().substr(i, 1));
+            if (!skip(k))
+                target->putOwn(vm, k, ch, attr::kDefault);
+            else
+                release(ch);
+            release(JSValue::cell(k));
+        }
+    }
+}
+
 }  // namespace
 
 // --------------------------------------------------------------- the loop ---
@@ -246,6 +305,8 @@ JSValue run(VM& vm)
     JSFunction* fn;
     const Ins* pc;
     const Ins* ins;
+    std::uint32_t callBase = 0, callArgc = 0;
+    bool callNew = false;
 
 #define LOAD_FRAME()                    \
     do {                                \
@@ -1124,6 +1185,52 @@ L_SetProto: {
     }
     NEXT();
 }
+L_RestSlice: {
+    auto* all = static_cast<JSArray*>(asObject(R[ins->b]));
+    const std::uint32_t from = ins->c;
+    JSArray* rest = vm.newArray(vm.protos.array, 0, all->length > from ? all->length - from : 0);
+    if (all->length > from)
+        rest->appendAll(vm, all->elems + from, all->length - from);
+    SET(ins->a, toJSValue(rest));
+    NEXT();
+}
+L_SpreadObj: {
+    copyOwnProperties(vm, asObject(R[ins->a]), R[ins->b], nullptr);
+    NEXT();
+}
+L_ObjRest: {
+    const JSValue src = R[ins->b];
+    if (src.isNullish()) {
+        fr->pc = pc;
+        vm.throwError(ErrorCode::TypeError, "Cannot destructure '" + describe(vm, src) + "' as it is " + describe(vm, src) + ".");
+        FAIL();
+    }
+    JSObject* out = vm.newObject(vm.protos.object);
+    SET(ins->a, toJSValue(out));
+    copyOwnProperties(vm, out, src, static_cast<JSArray*>(asObject(R[ins->c])));
+    NEXT();
+}
+L_IterRest: {
+    const std::uint32_t it = ins->b;
+    const JSValue src = R[it];
+    std::int32_t index = R[it + 1].asInt32();
+    JSArray* out = vm.newArray(vm.protos.array);
+    SET(ins->a, toJSValue(out));
+    if (isArray(src)) {
+        auto* a = static_cast<JSArray*>(asObject(src));
+        for (; std::uint32_t(index) < a->length; ++index) {
+            const JSValue e = a->elems[index];
+            retain(e);
+            out->append(vm, e.isHole() ? JSValue::undefined() : e);
+        }
+    } else {
+        StringCell* s = asString(src);
+        for (; std::uint32_t(index) < s->length; ++index)
+            out->append(vm, makeString(vm, s->text().substr(std::size_t(index), 1)));
+    }
+    R[it + 1] = JSValue::int32(index);
+    NEXT();
+}
 L_Closure: {
     CodeBlock* child = code->children[ins->b];
     const std::uint32_t n = std::uint32_t(child->upvals.size());
@@ -1144,10 +1251,40 @@ L_Closure: {
 }
 
 // ---- calls ----
+L_CallSpread:
+L_NewSpread: {
+    // The arguments are in an array in the register after `this`: spread them over the window.
+    const std::uint32_t at = ins->b;
+    auto* list = static_cast<JSArray*>(asObject(R[at + 2]));
+    const std::uint32_t n = list->length;
+    JSValue* window = R + at + 2;
+    fr->pc = pc;
+    if (window + n + 8 > vm.stackEnd || n > (1u << 20)) {
+        vm.throwError(ErrorCode::RangeError, "Too many arguments");
+        FAIL();
+    }
+    std::vector<JSValue> items(list->elems, list->elems + n);
+    for (JSValue& v : items) {
+        if (v.isHole())
+            v = JSValue::undefined();
+        retain(v);
+    }
+    vm.fillStack(window + n + 1);
+    for (std::uint32_t i = 0; i < n; ++i)
+        setReg(window[i], items[i]);
+    callBase = at;
+    callArgc = n;
+    callNew = ins->opcode() == Op::NewSpread;
+    goto do_call;
+}
 L_Call:
-L_New: {
-    const bool isNew = ins->opcode() == Op::New;
-    const std::uint32_t base = ins->b, argc = ins->c;
+L_New:
+    callBase = ins->b;
+    callArgc = ins->c;
+    callNew = ins->opcode() == Op::New;
+do_call: {
+    const bool isNew = callNew;
+    const std::uint32_t base = callBase, argc = callArgc;
     const JSValue callee = R[base];
     fr->pc = pc;
     if (!isFunction(callee)) [[unlikely]] {
@@ -1201,6 +1338,7 @@ L_New: {
         copyReg(newR[0], toJSValue(vm.global));
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
+    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArguments(vm, newR + 1, argc) : nullptr;
     // Past what is initialised the registers are fresh; below it, what this frame sits on top of may be the caller's dead
     // temporaries or arguments the callee has no parameter for, which let go of their values now.
     if (newR + c->nregs > vm.stackInit) [[unlikely]]
@@ -1219,6 +1357,12 @@ L_New: {
             newR[i] = JSValue::undefined();
             release(v);
         }
+    }
+    if (argsArray) {
+        // The array goes in the register after the parameters, which the clearing above left empty.
+        if (newR + 1 + c->nparams >= vm.stackInit)
+            vm.fillStack(newR + 2 + c->nparams);
+        setReg(newR[1 + c->nparams], toJSValue(argsArray));
     }
     vm.frameBase[vm.frameCount++] = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, false};
     fr = &vm.frameBase[vm.frameCount - 1];
@@ -1395,11 +1539,14 @@ JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::ui
         R[1 + i] = args[i];
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
+    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArguments(*this, R + 1, argc) : nullptr;
     for (std::uint32_t i = keep; i < c->nregs; ++i) {
         const JSValue v = R[i];
         R[i] = JSValue::undefined();
         release(v);
     }
+    if (argsArray)
+        setReg(R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;
     frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, false, true};
     const JSValue result = run(*this);

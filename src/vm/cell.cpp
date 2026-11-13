@@ -138,6 +138,12 @@ void children(const detail::GCObject* cell, detail::GcList& out)
                 auto* f = static_cast<JSFunction*>(o);
                 for (std::uint32_t i = 0; i < f->nUpvals; ++i)
                     out.push_back(reinterpret_cast<CellPtr>(f->upvals()[i]));
+                if (Rare* r = f->rare()) {
+                    appendIfCell(out, r->boundTarget);
+                    appendIfCell(out, r->boundThis);
+                    if (r->boundArgs)
+                        out.push_back(reinterpret_cast<CellPtr>(r->boundArgs));
+                }
             }
             break;
         }
@@ -190,6 +196,11 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
             vm.releaseValidity(c);
         if (r->fnName)
             detail::decRef(r->fnName);
+        // At teardown these were let go of by `clearReferences`.
+        release(r->boundTarget);
+        release(r->boundThis);
+        if (r->boundArgs)
+            detail::decRef(reinterpret_cast<CellPtr>(r->boundArgs));
         if (r->dict) {
             for (const Entry& e : r->dict->entries)
                 if (e.key)
@@ -271,6 +282,14 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
                 for (std::uint32_t i = 0; i < f->nUpvals; ++i) {
                     detail::decRef(reinterpret_cast<CellPtr>(f->upvals()[i]));
                     f->upvals()[i] = nullptr;
+                }
+                if (Rare* r = f->rare()) {
+                    release(r->boundTarget);
+                    release(r->boundThis);
+                    r->boundTarget = r->boundThis = JSValue::undefined();
+                    if (r->boundArgs)
+                        detail::decRef(reinterpret_cast<CellPtr>(r->boundArgs));
+                    r->boundArgs = nullptr;
                 }
             }
             break;

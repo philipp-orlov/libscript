@@ -34,6 +34,10 @@ struct Rare
     void* nativeData = nullptr;
     Key fnName = nullptr;                 ///< holds a count
     std::uint32_t fnLength = 0;
+    // A bound function: what it calls, with what `this` and what leading arguments. Each holds a count.
+    JSValue boundTarget = JSValue::undefined();
+    JSValue boundThis = JSValue::undefined();
+    JSArray* boundArgs = nullptr;
 };
 
 struct JSObject

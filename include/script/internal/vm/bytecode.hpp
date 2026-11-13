@@ -100,6 +100,7 @@ struct CodeBlock
         kArrow = 2,
         kProgram = 4,
         kUsesThis = 8,
+        kNeedsArgs = 16,  ///< the call keeps every argument in an array, in the register after the parameters
     };
 
     std::uint32_t refs = 1;

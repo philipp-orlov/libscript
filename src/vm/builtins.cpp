@@ -643,10 +643,58 @@ NATIVE(functionToString)
     return str(vm, "function " + name + "() { [code] }");
 }
 
-NATIVE(functionBoundNoop)
+/// What a bound function runs: `data` is the function itself, which keeps what it is bound to in its rare state.
+NATIVE(boundCall)
 {
     UNUSED();
-    return JSValue::undefined();
+    auto* me = static_cast<JSFunction*>(data);
+    Rare* r = me->rare();
+    std::vector<JSValue> all;
+    if (r->boundArgs)
+        all.assign(r->boundArgs->elems, r->boundArgs->elems + r->boundArgs->length);
+    all.insert(all.end(), args, args + argc);
+    if (!vm.newTarget.isUndefined())
+        return vm.construct(r->boundTarget, all.data(), std::uint32_t(all.size()));
+    return vm.call(r->boundTarget, r->boundThis, all.data(), std::uint32_t(all.size()));
+}
+
+NATIVE(functionBind)
+{
+    UNUSED();
+    if (!isFunction(self))
+        return typeError(vm, "Bind must be called on a function");
+    auto* target = static_cast<JSFunction*>(asObject(self));
+    JSValue targetName = getProperty(vm, self, vm.atoms.name);
+    if (targetName.isException())
+        return targetName;
+    std::string name = "bound " + (isString(targetName) ? toUtf8(asString(targetName)->text()) : std::string());
+    release(targetName);
+    Key nameKey = vm.internKey(StringView(fromUtf8(name)));
+    const std::uint32_t bound = argc > 1 ? argc - 1 : 0;
+    std::uint32_t length = 0;
+    if (JSValue len = getProperty(vm, self, vm.atoms.length); len.isNumber()) {
+        const double d = len.asNumber() - bound;
+        length = d > 0 ? std::uint32_t(d) : 0;
+    } else if (len.isException()) {
+        detail::decRef(nameKey);
+        return len;
+    }
+    JSFunction* f = vm.newNativeFunction(vm.protos.function, boundCall, nullptr, nameKey, length);
+    detail::decRef(nameKey);
+    Handle keep = Handle::adopt(toJSValue(f));
+    Rare* r = f->rare();
+    r->nativeData = f;
+    retain(self);
+    r->boundTarget = self;
+    r->boundThis = arg(args, argc, 0);
+    retain(r->boundThis);
+    r->boundArgs = vm.newArray(vm.protos.array);
+    if (bound)
+        r->boundArgs->appendAll(vm, args + 1, bound);
+    const bool constructible = (target->flags & JSFunction::kNative) ? (target->flags & JSFunction::kConstructor) != 0 : target->code->constructor;
+    if (constructible)
+        f->flags |= JSFunction::kConstructor;
+    return keep.take();
 }
 
 // -------------------------------------------------------------------- Error ---
@@ -1749,7 +1797,7 @@ void VM::installBuiltins()
     method(*this, functionProto, "call", functionCall, 1);
     method(*this, functionProto, "apply", functionApply, 2);
     method(*this, functionProto, "toString", functionToString, 0);
-    (void)functionBoundNoop;
+    method(*this, functionProto, "bind", functionBind, 1);
 
     JSFunction* objectCtorFn = constructor(*this, "Object", objectCtor, 1, objectProto);
     method(*this, objectCtorFn, "keys", objectKeys, 1, reinterpret_cast<void*>(0));

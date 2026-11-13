@@ -109,6 +109,7 @@ struct Fn
     bool isEval = false;       ///< the text of a direct `eval`: arrow-like, with a completion value
     bool completion = false;   ///< expression statements leave their value in `resultReg`
     bool strict = false;
+    std::size_t varScope = 0;  ///< the scope `var` and the function's own names live in
     std::uint16_t resultReg = 0;
     std::vector<JumpCtx> jumps;
     std::vector<TryCtx> tries;
@@ -251,6 +252,106 @@ bool containsArguments(const Node& n)
         if (child && containsArguments(*child))
             return true;
     return false;
+}
+
+// Annex B.3.3: a function declared in a block of sloppy code is also a `var` of the function around it, unless a `let`,
+// `const` or class of an enclosing block (or the top of the function) would clash with that `var`.
+void annexBScan(const Node& s, const std::set<String>& lexical, std::set<String>& out);
+
+void annexBList(const std::vector<dyn::NodePtr>& list, const std::set<String>& outer, std::set<String>& out, bool top)
+{
+    std::set<String> inner = outer;
+    for (const dyn::NodePtr& s : list) {
+        if ((s->kind == NK::VarDecl && s->varKind != VarKind::Var)) {
+            std::vector<String> names;
+            for (const dyn::NodePtr& d : s->list)
+                collectPatternNames(*d->a, names);
+            inner.insert(names.begin(), names.end());
+        } else if (s->kind == NK::ClassDecl || (!top && s->kind == NK::FunctionDecl)) {
+            inner.insert(s->text);
+        }
+    }
+    if (!top)
+        for (const dyn::NodePtr& s : list)
+            if (s->kind == NK::FunctionDecl && s->a && !s->a->isGenerator && !s->a->isAsync && !outer.count(s->text))
+                out.insert(s->text);
+    for (const dyn::NodePtr& s : list)
+        annexBScan(*s, inner, out);
+}
+
+void annexBSub(const dyn::NodePtr& body, const std::set<String>& lexical, std::set<String>& out)
+{
+    if (!body)
+        return;
+    if (body->kind == NK::FunctionDecl) {
+        // `if (x) function f() {}`: a block of its own.
+        if (body->a && !body->a->isGenerator && !body->a->isAsync && !lexical.count(body->text))
+            out.insert(body->text);
+        return;
+    }
+    annexBScan(*body, lexical, out);
+}
+
+void annexBScan(const Node& s, const std::set<String>& lexical, std::set<String>& out)
+{
+    switch (s.kind) {
+        case NK::Block: annexBList(s.list, lexical, out, false); break;
+        case NK::If:
+            annexBSub(s.b, lexical, out);
+            annexBSub(s.c, lexical, out);
+            break;
+        case NK::For:
+        case NK::ForIn:
+        case NK::ForOf: {
+            std::set<String> inner = lexical;
+            std::vector<String> names;
+            if (s.kind == NK::For && s.a && s.a->kind == NK::VarDecl && s.a->varKind != VarKind::Var)
+                for (const dyn::NodePtr& d : s.a->list)
+                    collectPatternNames(*d->a, names);
+            if (s.kind != NK::For && s.a && s.varKind != VarKind::None && s.varKind != VarKind::Var)
+                collectPatternNames(*s.a, names);
+            inner.insert(names.begin(), names.end());
+            annexBSub(s.d, inner, out);
+            break;
+        }
+        case NK::While:
+        case NK::DoWhile:
+        case NK::Labeled: annexBSub(s.d, lexical, out); break;
+        case NK::Try:
+            annexBSub(s.a, lexical, out);
+            annexBSub(s.c, lexical, out);
+            annexBSub(s.d, lexical, out);
+            break;
+        case NK::Switch: {
+            std::set<String> inner = lexical;
+            for (const dyn::NodePtr& c : s.list)
+                for (const dyn::NodePtr& st : c->list) {
+                    if (st->kind == NK::VarDecl && st->varKind != VarKind::Var) {
+                        std::vector<String> names;
+                        for (const dyn::NodePtr& d : st->list)
+                            collectPatternNames(*d->a, names);
+                        inner.insert(names.begin(), names.end());
+                    } else if (st->kind == NK::ClassDecl || st->kind == NK::FunctionDecl) {
+                        inner.insert(st->text);
+                    }
+                }
+            for (const dyn::NodePtr& c : s.list)
+                for (const dyn::NodePtr& st : c->list) {
+                    if (st->kind == NK::FunctionDecl && st->a && !st->a->isGenerator && !st->a->isAsync && !lexical.count(st->text))
+                        out.insert(st->text);
+                    annexBScan(*st, inner, out);
+                }
+            break;
+        }
+        default: break;
+    }
+}
+
+/// The names of the functions in blocks of `body` that are `var`s too, for sloppy code.
+void annexBNames(const std::vector<dyn::NodePtr>& body, std::set<String>& out)
+{
+    std::set<String> top;
+    annexBList(body, top, out, true);
 }
 
 bool mentions(const Node& n, const String& name)
@@ -753,6 +854,8 @@ private:
     void blockScoped(const std::vector<dyn::NodePtr>& list, bool newScope);
     void declareLexical(const std::vector<dyn::NodePtr>& list);
     void hoistFunctions(const std::vector<dyn::NodePtr>& list);
+    void annexBCopy(const Node& n);
+    void branch(const Node& n);
     void varDecl(const Node& n);
     void ifStatement(const Node& n);
     void forStatement(const Node& n);
@@ -2572,6 +2675,34 @@ void Compiler::checkParams(const Node& fn, std::vector<String>& names)
         checkBindingName(fn.text, fn);
 }
 
+/// A function declared in a block, once evaluated, is copied to the `var` of the same name outside it (Annex B.3.3).
+void Compiler::annexBCopy(const Node& n)
+{
+    if (fn_->strict || !n.a || n.a->isGenerator || n.a->isAsync || fn_->scopes.size() <= fn_->varScope + 1)
+        return;
+    const String& name = n.text;
+    Binding* own = nullptr;
+    for (Binding& b : fn_->scopes.back().bindings)
+        if (b.name == name && b.kind == BKind::Function)
+            own = &b;
+    if (!own)
+        return;
+    for (std::size_t i = fn_->scopes.size() - 1; i-- > fn_->varScope;)
+        for (const Binding& b : fn_->scopes[i].bindings)
+            if (b.name == name && (i > fn_->varScope || b.kind == BKind::Let || b.kind == BKind::Const || b.kind == BKind::Class))
+                return;
+    const std::uint16_t mark = fn_->top;
+    const std::uint16_t t = temp();
+    loadVar(name, t, n);
+    std::vector<Scope> hidden(std::make_move_iterator(fn_->scopes.begin() + std::ptrdiff_t(fn_->varScope) + 1),
+                              std::make_move_iterator(fn_->scopes.end()));
+    fn_->scopes.erase(fn_->scopes.begin() + std::ptrdiff_t(fn_->varScope) + 1, fn_->scopes.end());
+    storeVar(name, t, false, n);
+    for (Scope& s : hidden)
+        fn_->scopes.push_back(std::move(s));
+    fn_->top = mark;
+}
+
 void Compiler::blockScoped(const std::vector<dyn::NodePtr>& list, bool newScope)
 {
     if (newScope) {
@@ -2592,8 +2723,8 @@ void Compiler::statement(const Node& n)
         line_ = n.line;
     const std::uint16_t mark = fn_->top;
     switch (n.kind) {
-        case NK::Empty:
-        case NK::FunctionDecl: break;
+        case NK::Empty: break;
+        case NK::FunctionDecl: annexBCopy(n); break;
         case NK::ExprStatement:
             if (fn_->isProgram || fn_->completion) {
                 expr(*n.a, fn_->resultReg);
@@ -2777,15 +2908,36 @@ void Compiler::bindPattern(const Node& target, std::uint16_t value, bool init, V
     fn_->top = mark;
 }
 
+/// A branch of an `if`: a function declaration there (sloppy code only) is as if in a block of its own.
+void Compiler::branch(const Node& n)
+{
+    if (n.kind != NK::FunctionDecl) {
+        statement(n);
+        return;
+    }
+    if (fn_->strict || n.a->isGenerator || n.a->isAsync)
+        syntaxError(n, "In strict mode code, functions can only be declared at top level or inside a block");
+    pushScope();
+    Binding& b = declare(n.text, BKind::Function);
+    if (b.boxed)
+        emit(Op::NewBox, b.reg);
+    const std::uint16_t mark = fn_->top;
+    const std::uint16_t t = function(*n.a, n.text, -1);
+    storeVar(n.text, t, true, n);
+    fn_->top = mark;
+    annexBCopy(n);
+    popScope();
+}
+
 void Compiler::ifStatement(const Node& n)
 {
     Label elseL, end;
     condJump(*n.a, elseL);
-    statement(*n.b);
+    branch(*n.b);
     if (n.c) {
         jump(end);
         bind(elseL);
-        statement(*n.c);
+        branch(*n.c);
         bind(end);
     } else {
         bind(elseL);
@@ -3483,6 +3635,12 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     // `var` names and function declarations of the whole body, then the block's own `let`s.
     std::vector<String> vars;
     collectVars(*n.d, vars);
+    fn_->varScope = fn_->scopes.size() - 1;
+    if (!fn_->strict) {
+        std::set<String> blockFunctions;
+        annexBNames(n.d->list, blockFunctions);
+        vars.insert(vars.end(), blockFunctions.begin(), blockFunctions.end());
+    }
     for (const String& v : vars) {
         const bool known = findInScopes(*fn_, v) && fn_->scopes.back().bindings.end() !=
                                                        std::find_if(fn_->scopes.back().bindings.begin(), fn_->scopes.back().bindings.end(),
@@ -3567,6 +3725,12 @@ CodeBlock* Compiler::evalOnce(const Node& program, const std::vector<String>& na
         emit(Op::LoadUndef, top.resultReg);
         std::vector<String> vars;
         collectVars(program, vars);
+        top.varScope = fn_->scopes.size() - 1;
+        if (!top.strict) {
+            std::set<String> blockFunctions;
+            annexBNames(program.list, blockFunctions);
+            vars.insert(vars.end(), blockFunctions.begin(), blockFunctions.end());
+        }
         for (const String& v : vars) {
             // `var x` of a name the caller has is that variable.
             if (std::find(names.begin(), names.end(), v) != names.end() ||
@@ -3634,6 +3798,12 @@ CodeBlock* Compiler::programOnce(const Node& program)
         // Declarations of the top level are properties of the global object.
         std::vector<String> vars;
         collectVars(program, vars);
+        top.varScope = fn_->scopes.size() - 1;
+        if (!top.strict) {
+            std::set<String> blockFunctions;
+            annexBNames(program.list, blockFunctions);
+            vars.insert(vars.end(), blockFunctions.begin(), blockFunctions.end());
+        }
         for (const String& v : vars)
             emit(Op::DeclGlobal, atom(v));
         for (const dyn::NodePtr& s : program.list) {

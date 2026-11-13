@@ -79,6 +79,7 @@ struct Frame
     std::uint32_t argc;
     bool construct;             ///< `new`: a result that is not an object is replaced by `this`
     bool entry;                 ///< entered from C++: leaving it returns from `run`
+    JSValue newTarget;          ///< the constructor `new` was applied to; undefined in a call (not counted: it is a callee)
 };
 
 struct VM : EngineRuntime
@@ -181,6 +182,7 @@ struct VM : EngineRuntime
     /// `callee(this, ...args)`. An owned result, or the exception sentinel with `exception` set. Runs script or native
     /// code; may be called from native code that script called.
     JSValue call(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc);
+    JSValue callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct);
     /// `new callee(...args)`.
     JSValue construct(JSValue callee, const JSValue* args, std::uint32_t argc);
     /// Set while a native function runs as a constructor: the function itself; otherwise undefined. A native that

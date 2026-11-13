@@ -141,6 +141,8 @@ void children(const detail::GCObject* cell, detail::GcList& out)
                 if (Rare* r = f->rare()) {
                     appendIfCell(out, r->boundTarget);
                     appendIfCell(out, r->boundThis);
+                    appendIfCell(out, r->home);
+                    appendIfCell(out, r->fieldInit);
                     if (r->boundArgs)
                         out.push_back(reinterpret_cast<CellPtr>(r->boundArgs));
                 }
@@ -199,6 +201,8 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
         // At teardown these were let go of by `clearReferences`.
         release(r->boundTarget);
         release(r->boundThis);
+        release(r->home);
+        release(r->fieldInit);
         if (r->boundArgs)
             detail::decRef(reinterpret_cast<CellPtr>(r->boundArgs));
         if (r->dict) {
@@ -286,7 +290,9 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
                 if (Rare* r = f->rare()) {
                     release(r->boundTarget);
                     release(r->boundThis);
-                    r->boundTarget = r->boundThis = JSValue::undefined();
+                    release(r->home);
+                    release(r->fieldInit);
+                    r->boundTarget = r->boundThis = r->home = r->fieldInit = JSValue::undefined();
                     if (r->boundArgs)
                         detail::decRef(reinterpret_cast<CellPtr>(r->boundArgs));
                     r->boundArgs = nullptr;

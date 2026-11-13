@@ -100,6 +100,8 @@ struct CodeBlock
         kArrow = 2,
         kProgram = 4,
         kUsesThis = 8,
+        kClassConstructor = 32,  ///< calling it without `new` is an error
+        kDerived = 64,           ///< a constructor of a class with `extends`
         kNeedsArgs = 16,  ///< the call keeps every argument in an array, in the register after the parameters
     };
 

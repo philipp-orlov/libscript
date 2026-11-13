@@ -38,6 +38,10 @@ struct Rare
     JSValue boundTarget = JSValue::undefined();
     JSValue boundThis = JSValue::undefined();
     JSArray* boundArgs = nullptr;
+    // A method or a class constructor: the object `super` looks the prototype of up, and (of a constructor) what runs the
+    // instance fields. Each holds a count.
+    JSValue home = JSValue::undefined();
+    JSValue fieldInit = JSValue::undefined();
 };
 
 struct JSObject
@@ -200,6 +204,8 @@ JSValue getProperty(VM& vm, JSValue base, Key key);
 /// set if `strict` or a setter threw.
 bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict = true);
 bool hasProperty(VM& vm, JSValue base, Key key);
+/// A read that starts at `start` and calls getters with `receiver` as `this`: what `super.x` does.
+JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key);
 bool deleteProperty(VM& vm, JSValue base, Key key, bool strict = true);
 /// Define an own property of an object (`Object.defineProperty` for a data property or an accessor).
 bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t attrs);

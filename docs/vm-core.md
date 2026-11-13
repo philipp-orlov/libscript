@@ -44,7 +44,9 @@ Python are refused on it (`NotSupported`); they run on the old core.
 
 ## Known limits
 
-Not compiled: classes, generators, async functions, spread, rest elements and parameters, `arguments`, tagged templates,
-regular expressions, BigInt, `with`, `super`, `new.target`, private names. Missing built-ins: Symbol, JSON, Map, Set,
-WeakMap, Promise, Date (only `Date.now`), typed arrays, Proxy, Reflect, `eval`. Cycles of new-family cells are freed only
+Not compiled: generators, async functions, tagged templates, regular expressions, BigInt, `with`, private names and
+computed instance-field names in classes, `super` and `new.target` inside arrows. Missing built-ins: Symbol, Map, Set,
+WeakMap, Promise, Date (only `Date.now`), typed arrays, Proxy, Reflect, `eval`. In a derived constructor `this` exists
+before `super()` runs (it is made from `new.target.prototype`), so reading it early gives the object, not a
+ReferenceError. Cycles of new-family cells are freed only
 when the context ends. Shapes, and the prototypes they hold, are never freed.

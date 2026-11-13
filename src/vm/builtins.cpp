@@ -1628,6 +1628,550 @@ NATIVE(booleanToString)
     return str(vm, self.asBool() ? "true" : "false");
 }
 
+// --------------------------------------------------------------------- JSON ---
+
+struct JsonWriter
+{
+    VM& vm;
+    Handle replacerFn;
+    std::vector<Handle> allow;
+    bool hasAllow = false;
+    String gap;
+    String indent;
+    String out;
+    std::vector<JSObject*> stack;
+};
+
+void jsonQuote(String& out, StringView s)
+{
+    static const char16_t hex[] = u"0123456789abcdef";
+    out.push_back(u'"');
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char16_t c = s[i];
+        switch (c) {
+            case u'"': out += u"\\\""; break;
+            case u'\\': out += u"\\\\"; break;
+            case u'\b': out += u"\\b"; break;
+            case u'\f': out += u"\\f"; break;
+            case u'\n': out += u"\\n"; break;
+            case u'\r': out += u"\\r"; break;
+            case u'\t': out += u"\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out += u"\\u00";
+                    out.push_back(hex[c >> 4]);
+                    out.push_back(hex[c & 15]);
+                } else if (c >= 0xd800 && c <= 0xdfff) {
+                    // A lone surrogate is written as an escape; a pair stands as it is.
+                    const bool high = c < 0xdc00;
+                    const bool paired = high ? (i + 1 < s.size() && s[i + 1] >= 0xdc00 && s[i + 1] <= 0xdfff)
+                                             : (i > 0 && s[i - 1] >= 0xd800 && s[i - 1] < 0xdc00);
+                    if (paired) {
+                        out.push_back(c);
+                    } else {
+                        out += u"\\u";
+                        out.push_back(hex[c >> 12]);
+                        out.push_back(hex[(c >> 8) & 15]);
+                        out.push_back(hex[(c >> 4) & 15]);
+                        out.push_back(hex[c & 15]);
+                    }
+                } else {
+                    out.push_back(c);
+                }
+        }
+    }
+    out.push_back(u'"');
+}
+
+// 0 for an exception, 1 for text written, 2 for nothing to write (undefined, a function, a symbol).
+int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
+{
+    VM& vm = j.vm;
+    Handle value = Handle::retained(input);
+    if (isObject(value.get()) || isBigInt(value.get())) {
+        Key toJson = vm.internKey(std::string_view("toJSON"));
+        JSValue fn = getProperty(vm, value.get(), toJson);
+        detail::decRef(toJson);
+        if (fn.isException())
+            return 0;
+        Handle fnKeep = Handle::adopt(fn);
+        if (isFunction(fn)) {
+            JSValue r = vm.call(fn, value.get(), &key, 1);
+            if (r.isException())
+                return 0;
+            value = Handle::adopt(r);
+        }
+    }
+    if (j.replacerFn.get() != JSValue::undefined()) {
+        JSValue callArgs[2] = {key, value.get()};
+        JSValue r = vm.call(j.replacerFn.get(), holder, callArgs, 2);
+        if (r.isException())
+            return 0;
+        value = Handle::adopt(r);
+    }
+    const JSValue v = value.get();
+    if (v.isNull()) {
+        j.out += u"null";
+        return 1;
+    }
+    if (v.isBool()) {
+        j.out += v == JSValue::boolean(true) ? u"true" : u"false";
+        return 1;
+    }
+    if (isString(v)) {
+        jsonQuote(j.out, asString(v)->text());
+        return 1;
+    }
+    if (v.isNumber()) {
+        const double d = v.asNumber();
+        j.out += std::isfinite(d) ? script::internal::numberToString(d) : String(u"null");
+        return 1;
+    }
+    if (isBigInt(v)) {
+        typeError(vm, "Do not know how to serialize a BigInt");
+        return 0;
+    }
+    if (!isObject(v) || isFunction(v))
+        return 2;
+
+    JSObject* o = asObject(v);
+    for (JSObject* seen : j.stack)
+        if (seen == o) {
+            typeError(vm, "Converting circular structure to JSON");
+            return 0;
+        }
+    j.stack.push_back(o);
+    const String stepback = j.indent;
+    j.indent += j.gap;
+    const bool array = isArray(v);
+    std::vector<Handle> keys;
+    if (array) {
+        // Elements are read through `length`, as the spec says.
+    } else if (j.hasAllow) {
+        keys = j.allow;
+    } else {
+        JSValue self = v;
+        JSValue list = objectKeys(vm, JSValue::undefined(), &self, 1, nullptr);
+        if (list.isException())
+            return 0;
+        Handle keep = Handle::adopt(list);
+        auto* a = static_cast<JSArray*>(asObject(list));
+        for (std::uint32_t i = 0; i < a->length; ++i)
+            keys.push_back(Handle::retained(a->at(i)));
+    }
+    bool wroteAny = false;
+    j.out.push_back(array ? u'[' : u'{');
+    auto separator = [&]() {
+        if (wroteAny)
+            j.out.push_back(u',');
+        wroteAny = true;
+        if (!j.gap.empty()) {
+            j.out.push_back(u'\n');
+            j.out += j.indent;
+        }
+    };
+    if (array) {
+        JSValue lenValue = getProperty(vm, v, vm.atoms.length);
+        if (lenValue.isException())
+            return 0;
+        const std::uint32_t length = std::uint32_t(lenValue.asNumber());
+        for (std::uint32_t i = 0; i < length; ++i) {
+            Handle idx = Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(i))));
+            Key k = toPropertyKey(vm, idx.get());
+            if (!k)
+                return 0;
+            JSValue element = getProperty(vm, v, k);
+            detail::decRef(k);
+            if (element.isException())
+                return 0;
+            Handle elementKeep = Handle::adopt(element);
+            separator();
+            const std::size_t mark = j.out.size();
+            const int r = jsonSerialize(j, v, idx.get(), element);
+            if (r == 0)
+                return 0;
+            if (r == 2)
+                j.out += u"null";
+            (void)mark;
+        }
+    } else {
+        for (const Handle& name : keys) {
+            Key k = toPropertyKey(vm, name.get());
+            if (!k)
+                return 0;
+            JSValue prop = getProperty(vm, v, k);
+            detail::decRef(k);
+            if (prop.isException())
+                return 0;
+            Handle propKeep = Handle::adopt(prop);
+            const String before = j.out;
+            const bool hadAny = wroteAny;
+            separator();
+            jsonQuote(j.out, asString(name.get())->text());
+            j.out.push_back(u':');
+            if (!j.gap.empty())
+                j.out.push_back(u' ');
+            const int r = jsonSerialize(j, v, name.get(), prop);
+            if (r == 0)
+                return 0;
+            if (r == 2) {
+                j.out = before;
+                wroteAny = hadAny;
+            }
+        }
+    }
+    j.indent = stepback;
+    j.stack.pop_back();
+    if (wroteAny && !j.gap.empty()) {
+        j.out.push_back(u'\n');
+        j.out += j.indent;
+    }
+    j.out.push_back(array ? u']' : u'}');
+    return 1;
+}
+
+NATIVE(jsonStringify)
+{
+    UNUSED();
+    JsonWriter j{vm, {}, {}, false, {}, {}, {}, {}};
+    const JSValue replacer = arg(args, argc, 1);
+    if (isFunction(replacer)) {
+        j.replacerFn = Handle::retained(replacer);
+    } else if (isArray(replacer)) {
+        j.hasAllow = true;
+        auto* a = static_cast<JSArray*>(asObject(replacer));
+        for (std::uint32_t i = 0; i < a->length; ++i) {
+            JSValue item = a->at(i);
+            if (isString(item) || item.isNumber()) {
+                Handle name = Handle::adopt(toStringValue(vm, item));
+                bool dup = false;
+                for (const Handle& e : j.allow)
+                    dup = dup || stringsEqual(e.get(), name.get());
+                if (!dup)
+                    j.allow.push_back(std::move(name));
+            }
+        }
+    }
+    const JSValue space = arg(args, argc, 2);
+    if (space.isNumber()) {
+        const int n = int(std::max(0.0, std::min(10.0, std::trunc(space.asNumber()))));
+        j.gap.assign(std::size_t(n), u' ');
+    } else if (isString(space)) {
+        j.gap = String(asString(space)->text().substr(0, 10));
+    }
+    JSObject* wrapper = vm.newObject(vm.protos.object);
+    Handle wrapperKeep = Handle::adopt(toJSValue(wrapper));
+    JSValue input = arg(args, argc, 0);
+    retain(input);
+    {
+        Key emptyKey = vm.internKey(std::string_view());
+        wrapper->putOwn(vm, emptyKey, input, attr::kDefault);
+        detail::decRef(emptyKey);
+    }
+    Handle empty = Handle::adopt(makeString(vm, std::string_view()));
+    const int r = jsonSerialize(j, toJSValue(wrapper), empty.get(), input);
+    if (r == 0)
+        return JSValue::exception();
+    if (r == 2)
+        return JSValue::undefined();
+    return makeString(vm, StringView(j.out));
+}
+
+struct JsonReader
+{
+    VM& vm;
+    StringView s;
+    std::size_t i = 0;
+    int depth = 0;
+
+    JSValue fail(const char* what)
+    {
+        std::string message = std::string("JSON.parse: ") + what + " at position " + std::to_string(i);
+        return vm.throwError(ErrorCode::SyntaxError, message);
+    }
+    void skip()
+    {
+        while (i < s.size() && (s[i] == u' ' || s[i] == u'\t' || s[i] == u'\n' || s[i] == u'\r'))
+            ++i;
+    }
+    bool literal(const char* word)
+    {
+        std::size_t n = 0;
+        while (word[n])
+            ++n;
+        if (s.size() - i < n)
+            return false;
+        for (std::size_t k = 0; k < n; ++k)
+            if (s[i + k] != char16_t(word[k]))
+                return false;
+        i += n;
+        return true;
+    }
+    // Owned; the exception sentinel on a syntax error.
+    JSValue string(String* text)
+    {
+        ++i;  // the quote
+        String out;
+        for (;;) {
+            if (i >= s.size())
+                return fail("unterminated string");
+            const char16_t c = s[i++];
+            if (c == u'"')
+                break;
+            if (c < 0x20)
+                return fail("bad control character in string");
+            if (c != u'\\') {
+                out.push_back(c);
+                continue;
+            }
+            if (i >= s.size())
+                return fail("unterminated string");
+            const char16_t e = s[i++];
+            switch (e) {
+                case u'"': out.push_back(u'"'); break;
+                case u'\\': out.push_back(u'\\'); break;
+                case u'/': out.push_back(u'/'); break;
+                case u'b': out.push_back(u'\b'); break;
+                case u'f': out.push_back(u'\f'); break;
+                case u'n': out.push_back(u'\n'); break;
+                case u'r': out.push_back(u'\r'); break;
+                case u't': out.push_back(u'\t'); break;
+                case u'u': {
+                    unsigned code = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        if (i >= s.size())
+                            return fail("bad escape");
+                        const char16_t h = s[i++];
+                        unsigned digit;
+                        if (h >= u'0' && h <= u'9')
+                            digit = h - u'0';
+                        else if (h >= u'a' && h <= u'f')
+                            digit = 10 + h - u'a';
+                        else if (h >= u'A' && h <= u'F')
+                            digit = 10 + h - u'A';
+                        else
+                            return fail("bad escape");
+                        code = code * 16 + digit;
+                    }
+                    out.push_back(char16_t(code));
+                    break;
+                }
+                default: return fail("bad escape");
+            }
+        }
+        if (text)
+            *text = out;
+        return JSValue::undefined();
+    }
+    JSValue number()
+    {
+        const std::size_t start = i;
+        if (s[i] == u'-')
+            ++i;
+        if (i >= s.size())
+            return fail("bad number");
+        if (s[i] == u'0') {
+            ++i;
+        } else if (s[i] >= u'1' && s[i] <= u'9') {
+            while (i < s.size() && s[i] >= u'0' && s[i] <= u'9')
+                ++i;
+        } else {
+            return fail("bad number");
+        }
+        if (i < s.size() && s[i] == u'.') {
+            ++i;
+            if (i >= s.size() || s[i] < u'0' || s[i] > u'9')
+                return fail("bad number");
+            while (i < s.size() && s[i] >= u'0' && s[i] <= u'9')
+                ++i;
+        }
+        if (i < s.size() && (s[i] == u'e' || s[i] == u'E')) {
+            ++i;
+            if (i < s.size() && (s[i] == u'+' || s[i] == u'-'))
+                ++i;
+            if (i >= s.size() || s[i] < u'0' || s[i] > u'9')
+                return fail("bad number");
+            while (i < s.size() && s[i] >= u'0' && s[i] <= u'9')
+                ++i;
+        }
+        std::string text;
+        for (std::size_t k = start; k < i; ++k)
+            text.push_back(char(s[k]));
+        return JSValue::boxNumber(std::strtod(text.c_str(), nullptr));
+    }
+    JSValue value()
+    {
+        skip();
+        if (i >= s.size())
+            return fail("unexpected end of input");
+        const char16_t c = s[i];
+        if (c == u'"') {
+            String text;
+            JSValue r = string(&text);
+            if (r.isException())
+                return r;
+            return makeString(vm, StringView(text));
+        }
+        if (c == u'-' || (c >= u'0' && c <= u'9'))
+            return number();
+        if (c == u't')
+            return literal("true") ? JSValue::boolean(true) : fail("unexpected token");
+        if (c == u'f')
+            return literal("false") ? JSValue::boolean(false) : fail("unexpected token");
+        if (c == u'n')
+            return literal("null") ? JSValue::null() : fail("unexpected token");
+        if (++depth > 2000)
+            return fail("nesting too deep");
+        struct Leave
+        {
+            int& d;
+            ~Leave() { --d; }
+        } leave{depth};
+        if (c == u'[') {
+            ++i;
+            JSArray* a = vm.newArray(vm.protos.array);
+            Handle keep = Handle::adopt(toJSValue(a));
+            skip();
+            if (i < s.size() && s[i] == u']') {
+                ++i;
+                return keep.take();
+            }
+            for (;;) {
+                JSValue item = value();
+                if (item.isException())
+                    return item;
+                a->append(vm, item);
+                skip();
+                if (i < s.size() && s[i] == u',') {
+                    ++i;
+                    continue;
+                }
+                if (i < s.size() && s[i] == u']') {
+                    ++i;
+                    return keep.take();
+                }
+                return fail("expected ',' or ']'");
+            }
+        }
+        if (c == u'{') {
+            ++i;
+            JSObject* o = vm.newObject(vm.protos.object);
+            Handle keep = Handle::adopt(toJSValue(o));
+            skip();
+            if (i < s.size() && s[i] == u'}') {
+                ++i;
+                return keep.take();
+            }
+            for (;;) {
+                skip();
+                if (i >= s.size() || s[i] != u'"')
+                    return fail("expected a property name");
+                String name;
+                JSValue r = string(&name);
+                if (r.isException())
+                    return r;
+                skip();
+                if (i >= s.size() || s[i] != u':')
+                    return fail("expected ':'");
+                ++i;
+                JSValue item = value();
+                if (item.isException())
+                    return item;
+                Handle itemKeep = Handle::adopt(item);
+                Key key = vm.internKey(StringView(name));
+                retain(item);
+                defineOwn(vm, o, key, item, attr::kDefault);
+                detail::decRef(key);
+                skip();
+                if (i < s.size() && s[i] == u',') {
+                    ++i;
+                    continue;
+                }
+                if (i < s.size() && s[i] == u'}') {
+                    ++i;
+                    return keep.take();
+                }
+                return fail("expected ',' or '}'");
+            }
+        }
+        return fail("unexpected token");
+    }
+};
+
+// The reviver walks the parsed value bottom-up. Owned result, or the exception sentinel.
+JSValue jsonRevive(VM& vm, JSValue holder, Key key, JSValue reviver)
+{
+    JSValue got = getProperty(vm, holder, key);
+    if (got.isException())
+        return got;
+    Handle value = Handle::adopt(got);
+    if (isObject(value.get())) {
+        JSValue self = value.get();
+        std::vector<Handle> names;
+        if (isArray(self)) {
+            JSValue len = getProperty(vm, self, vm.atoms.length);
+            if (len.isException())
+                return len;
+            const std::uint32_t n = std::uint32_t(len.asNumber());
+            for (std::uint32_t k = 0; k < n; ++k)
+                names.push_back(Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(k)))));
+        } else {
+            JSValue list = objectKeys(vm, JSValue::undefined(), &self, 1, nullptr);
+            if (list.isException())
+                return list;
+            Handle keep = Handle::adopt(list);
+            auto* a = static_cast<JSArray*>(asObject(list));
+            for (std::uint32_t k = 0; k < a->length; ++k)
+                names.push_back(Handle::retained(a->at(k)));
+        }
+        for (const Handle& name : names) {
+            Key k = toPropertyKey(vm, name.get());
+            if (!k)
+                return JSValue::exception();
+            JSValue r = jsonRevive(vm, self, k, reviver);
+            if (r.isException()) {
+                detail::decRef(k);
+                return r;
+            }
+            if (r.isUndefined())
+                deleteProperty(vm, self, k, false);
+            else
+                defineOwn(vm, asObject(self), k, r, attr::kDefault);
+            detail::decRef(k);
+        }
+    }
+    JSValue keyValue = JSValue::cell(key);
+    JSValue callArgs[2] = {keyValue, value.get()};
+    return vm.call(reviver, holder, callArgs, 2);
+}
+
+NATIVE(jsonParse)
+{
+    UNUSED();
+    Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
+    if (text.get().isException())
+        return JSValue::exception();
+    JsonReader reader{vm, asString(text.get())->text()};
+    JSValue result = reader.value();
+    if (result.isException())
+        return result;
+    Handle parsed = Handle::adopt(result);
+    reader.skip();
+    if (reader.i != reader.s.size())
+        return reader.fail("unexpected token after the value");
+    const JSValue reviver = arg(args, argc, 1);
+    if (!isFunction(reviver))
+        return parsed.take();
+    JSObject* root = vm.newObject(vm.protos.object);
+    Handle rootKeep = Handle::adopt(toJSValue(root));
+    Key empty = vm.internKey(std::string_view());
+    retain(parsed.get());
+    root->putOwn(vm, empty, parsed.get(), attr::kDefault);
+    JSValue r = jsonRevive(vm, toJSValue(root), empty, reviver);
+    detail::decRef(empty);
+    return r;
+}
+
 // --------------------------------------------------------------------- Math ---
 
 NATIVE(mathUnary)
@@ -1961,6 +2505,17 @@ void VM::installBuiltins()
         return self;
     }, 0);
 
+    // JSON.
+    {
+        JSObject* json = newObject(objectProto);
+        Key key = internKey(std::string_view("JSON"));
+        retain(toJSValue(json));
+        globalObject->putOwn(*this, key, toJSValue(json), attr::kWritable | attr::kConfigurable);
+        detail::decRef(key);
+        method(*this, json, "stringify", jsonStringify, 3);
+        method(*this, json, "parse", jsonParse, 2);
+        release(toJSValue(json));
+    }
     // Math.
     JSObject* math = newObject(objectProto);
     {

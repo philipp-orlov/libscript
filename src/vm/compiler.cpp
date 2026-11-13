@@ -129,6 +129,10 @@ void collectCaptured(const Node& n, std::set<String>& out, bool nested, bool arr
     if (isFunctionNode(n)) {
         childNested = true;
         childArrow = arrowChain && n.kind == NK::ArrowExpr;
+    } else if (n.kind == NK::FieldDef || n.kind == NK::StaticBlock) {
+        // Run by a function of their own, with `this` of their own.
+        childNested = true;
+        childArrow = false;
     }
     for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
         if (*child)
@@ -655,6 +659,8 @@ private:
     {
         if (isAnonymousFunction(n))
             return function(n, name, dst);
+        if (n.kind == NK::ClassExpr && n.text.empty())
+            return classExpr(n, dst, name);
         return expr(n, dst);
     }
 
@@ -684,7 +690,12 @@ private:
     std::vector<String> pendingLabels_;
 
     CodeBlock* compileFunction(const Node& n, const String& name);
-    CodeBlock* compileFunctionOnce(const Node& n, const String& name);
+    CodeBlock* compileFunctionOnce(const Node& n, const String& name, std::uint32_t extraFlags);
+    std::uint32_t pendingFlags_ = 0;  ///< flags for the next function compiled: a class constructor's
+    std::uint16_t classExpr(const Node& cls, int dst, const String& inferredName, bool innerBinding = true);
+    CodeBlock* compileInitFunction(const std::vector<const Node*>& items, bool isStatic);
+    CodeBlock* compileInitOnce(const std::vector<const Node*>& items, bool isStatic);
+    void storeThis(std::uint16_t src);
     CodeBlock* programOnce(const Node& program);
     void functionBody(const Node& n, CodeBlock* block);
 };
@@ -770,10 +781,16 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         case NK::Spread: unsupported(n, "spread");
         case NK::Yield: unsupported(n, "generators");
         case NK::Await: unsupported(n, "async functions");
-        case NK::ClassExpr: unsupported(n, "classes");
+        case NK::ClassExpr: return classExpr(n, dst, String());
         case NK::BigIntLit: unsupported(n, "BigInt");
         case NK::RegExpLit: unsupported(n, "regular expressions");
-        case NK::NewTarget: unsupported(n, "new.target");
+        case NK::NewTarget: {
+            if (fn_->isArrow || fn_->isProgram)
+                unsupported(n, "new.target here");
+            const std::uint16_t d = dest(dst);
+            emit(Op::NewTarget, d);
+            return d;
+        }
         case NK::TemplateObject: unsupported(n, "tagged templates");
         default: unsupported(n, "this expression");
     }
@@ -911,14 +928,269 @@ std::uint16_t Compiler::function(const Node& n, const String& inferredName, int 
         unsupported(n, "generators");
     if (n.isAsync)
         unsupported(n, "async functions");
-    if (n.propKind == PropKind::Constructor)
-        unsupported(n, "classes");
     CodeBlock* child = compileFunction(n, n.text.empty() ? inferredName : n.text);
     const std::size_t index = fn_->block->children.size();
     fn_->block->children.push_back(child);
     const std::uint16_t d = dest(dst);
     emit(Op::Closure, d, std::uint32_t(index));
     return d;
+}
+
+void Compiler::storeThis(std::uint16_t src)
+{
+    if (src != 0)
+        emit(Op::Mov, 0, src);
+    if (Binding* b = findInScopes(*fn_, String(u"this"))) {
+        if (b->boxed)
+            emit(Op::PutBox, b->reg, 0);
+        else
+            emit(Op::Mov, b->reg, 0);
+    }
+}
+
+std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferredName, bool innerBinding)
+{
+    const String name = cls.text.empty() ? inferredName : cls.text;
+    const bool derived = cls.a != nullptr;
+    const Node* ctor = nullptr;
+    for (const dyn::NodePtr& m : cls.list)
+        if (m->kind == NK::MethodDef && m->propKind == PropKind::Constructor && !m->declared)
+            ctor = m.get();
+    for (const dyn::NodePtr& m : cls.list) {
+        if (m->isPrivate)
+            unsupported(*m, "private class members");
+        if (m->computed && m->kind == NK::FieldDef && !m->declared)
+            unsupported(*m, "computed field names");
+        if ((m->kind == NK::MethodDef || m->kind == NK::FieldDef) && !m->computed && m->a && m->a->kind != NK::Identifier &&
+            m->a->kind != NK::StringLit && m->a->kind != NK::NumberLit)
+            unsupported(*m, "this class member name");
+    }
+
+    const std::uint16_t mark = fn_->top;
+    const std::uint16_t d = dest(dst);
+    const std::uint16_t inner = fn_->top;
+    const bool scoped = innerBinding && !cls.text.empty();
+    if (scoped) {
+        pushScope();
+        Binding& b = declare(cls.text, BKind::Const);
+        b.initialized = true;
+        emit(Op::LoadUndef, b.reg);
+        if (b.boxed)
+            emit(Op::NewBox, b.reg);
+    }
+    const std::uint16_t f = temp();
+    std::uint16_t sup = 0;
+    if (derived) {
+        sup = temp();
+        expr(*cls.a, sup);
+    }
+
+    // The constructor: the one written, or the one the class gets without it.
+    dyn::NodePtr made;
+    const Node* ctorFn = nullptr;
+    if (ctor) {
+        ctorFn = ctor->b.get();
+    } else {
+        made = std::make_unique<Node>(NK::FunctionExpr, cls.line);
+        made->isMethod = true;
+        made->d = std::make_unique<Node>(NK::Block, cls.line);
+        if (derived) {
+            dyn::NodePtr rest = std::make_unique<Node>(NK::RestElement, cls.line);
+            rest->a = std::make_unique<Node>(NK::Identifier, cls.line);
+            rest->a->text = u"args";
+            made->list.push_back(std::move(rest));
+            dyn::NodePtr call = std::make_unique<Node>(NK::Call, cls.line);
+            call->a = std::make_unique<Node>(NK::SuperExpr, cls.line);
+            dyn::NodePtr spread = std::make_unique<Node>(NK::Spread, cls.line);
+            spread->a = std::make_unique<Node>(NK::Identifier, cls.line);
+            spread->a->text = u"args";
+            call->list.push_back(std::move(spread));
+            dyn::NodePtr stmt = std::make_unique<Node>(NK::ExprStatement, cls.line);
+            stmt->a = std::move(call);
+            made->d->list.push_back(std::move(stmt));
+        }
+        ctorFn = made.get();
+    }
+    if (ctorFn->isAsync || ctorFn->isGenerator)
+        unsupported(*ctorFn, "this constructor");
+    pendingFlags_ = CodeBlock::kClassConstructor | (derived ? CodeBlock::kDerived : 0);
+    CodeBlock* ctorCode = compileFunction(*ctorFn, name);
+    {
+        const std::size_t index = fn_->block->children.size();
+        fn_->block->children.push_back(ctorCode);
+        emit(Op::NewClass, f, std::uint32_t(index), derived ? std::uint32_t(sup) + 1 : 0);
+    }
+
+    const std::uint16_t proto = temp();
+    emitCached(Op::GetProp, proto, f, atom(String(u"prototype")));
+
+    std::vector<const Node*> instanceFields, staticItems;
+    for (const dyn::NodePtr& m : cls.list) {
+        if (m->declared)
+            continue;
+        if (m->kind == NK::FieldDef) {
+            (m->isStatic ? staticItems : instanceFields).push_back(m.get());
+            continue;
+        }
+        if (m->kind == NK::StaticBlock) {
+            staticItems.push_back(m.get());
+            continue;
+        }
+        if (m->kind != NK::MethodDef || m->propKind == PropKind::Constructor)
+            continue;
+        const std::uint16_t target = m->isStatic ? f : proto;
+        const std::uint16_t at = fn_->top;
+        const Op plain = m->propKind == PropKind::Getter ? (m->computed ? Op::DefGetterElem : Op::DefGetter)
+                         : m->propKind == PropKind::Setter ? (m->computed ? Op::DefSetterElem : Op::DefSetter)
+                                                           : (m->computed ? Op::DefMethodElem : Op::DefMethod);
+        if (m->computed) {
+            const std::uint16_t k = exprTemp(*m->a);
+            const std::uint16_t t = temp();
+            function(*m->b, String(), t);
+            emit(plain, target, k, t);
+        } else {
+            const std::uint16_t t = temp();
+            function(*m->b, m->a->text, t);
+            emit(plain, target, atom(m->a->text), t);
+        }
+        fn_->top = at;
+    }
+    if (!instanceFields.empty()) {
+        const std::uint16_t at = fn_->top;
+        const std::uint16_t t = temp();
+        CodeBlock* init = compileInitFunction(instanceFields, false);
+        const std::size_t index = fn_->block->children.size();
+        fn_->block->children.push_back(init);
+        emit(Op::Closure, t, std::uint32_t(index));
+        emit(Op::SetFieldInit, f, t);
+        fn_->top = at;
+    }
+    if (scoped)
+        storeVar(cls.text, f, true, cls);
+    if (!staticItems.empty()) {
+        const std::uint16_t at = fn_->top;
+        const std::uint16_t base = temps(2);
+        CodeBlock* init = compileInitFunction(staticItems, true);
+        const std::size_t index = fn_->block->children.size();
+        fn_->block->children.push_back(init);
+        emit(Op::Closure, base, std::uint32_t(index));
+        emit(Op::Mov, base + 1, f);
+        emit(Op::Call, base, base, 0);
+        fn_->top = at;
+    }
+    emit(Op::Mov, d, f);
+    if (scoped)
+        popScope();
+    fn_->top = inner;
+    return d;
+}
+
+CodeBlock* Compiler::compileInitFunction(const std::vector<const Node*>& items, bool isStatic)
+{
+    const bool saved = noFuse_;
+    for (;;) {
+        try {
+            CodeBlock* block = compileInitOnce(items, isStatic);
+            noFuse_ = saved;
+            return block;
+        } catch (const FusionOverflow&) {
+            if (noFuse_) {
+                noFuse_ = saved;
+                throw;
+            }
+            noFuse_ = true;
+        } catch (...) {
+            noFuse_ = saved;
+            throw;
+        }
+    }
+}
+
+/// What runs a class's fields (and, for a static one, its static blocks): a method-like function whose `this` is the
+/// instance, or the class.
+CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool isStatic)
+{
+    CodeBlock* block = vm_.newCodeBlock(nullptr, 0, false);
+    block->flags |= CodeBlock::kStrict;
+    block->file = file_;
+    Fn child;
+    child.parent = fn_;
+    child.block = block;
+    child.strict = true;
+    for (const Node* item : items) {
+        if (item->kind == NK::FieldDef) {
+            if (item->b)
+                collectCaptured(*item->b, child.captured, false, true);
+        } else {
+            collectCaptured(*item->d, child.captured, false, true);
+        }
+    }
+    Fn* saved = fn_;
+    const std::uint32_t savedLine = line_;
+    Label* savedChain = chain_;
+    chain_ = nullptr;
+    std::vector<String> savedLabels;
+    savedLabels.swap(pendingLabels_);
+    fn_ = &child;
+    try {
+        fn_->top = 1;
+        block->nregs = 1;
+        pushScope();
+        if (fn_->captured.count(String(u"this"))) {
+            Binding& b = declare(String(u"this"), BKind::Var);
+            emit(Op::Mov, b.reg, 0);
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+        }
+        for (const Node* item : items) {
+            if (item->kind != NK::StaticBlock)
+                continue;
+            std::vector<String> vars;
+            collectVars(*item->d, vars);
+            for (const String& v : vars) {
+                Binding& b = declare(v, BKind::Var);
+                if (b.boxed)
+                    emit(Op::NewBox, b.reg);
+            }
+        }
+        for (const Node* item : items) {
+            line_ = item->line;
+            const std::uint16_t mark = fn_->top;
+            if (item->kind == NK::StaticBlock) {
+                statement(*item->d);
+            } else {
+                const String key = item->a->text;
+                const std::uint16_t v = temp();
+                if (item->b)
+                    exprNamed(*item->b, v, key);
+                else
+                    emit(Op::LoadUndef, v);
+                if (isStatic) {
+                    emit(Op::InitProp, 0, atom(key), v);
+                    emit(Op::Cache, kNoCache);
+                } else {
+                    emitCached(Op::InitProp, 0, atom(key), v);
+                }
+            }
+            fn_->top = mark;
+        }
+        const std::uint16_t r = temp();
+        emit(Op::LoadUndef, r);
+        emit(Op::Ret, r);
+        fn_->scopes.pop_back();
+    } catch (...) {
+        fn_ = saved;
+        line_ = savedLine;
+        chain_ = savedChain;
+        pendingLabels_.swap(savedLabels);
+        vm_.releaseCode(block);
+        throw;
+    }
+    fn_ = saved;
+    line_ = savedLine;
+    chain_ = savedChain;
+    pendingLabels_.swap(savedLabels);
+    return block;
 }
 
 std::uint16_t Compiler::unary(const Node& n, int dst)
@@ -1396,8 +1668,13 @@ std::uint16_t Compiler::chainRoot(const Node& n, int dst, bool isNew)
 
 std::uint16_t Compiler::member(const Node& n, int dst)
 {
-    if (n.a->kind == NK::SuperExpr)
-        unsupported(n, "super");
+    if (n.a->kind == NK::SuperExpr) {
+        if (fn_->isArrow || n.computed)
+            unsupported(n, "this use of super");
+        const std::uint16_t d = dest(dst);
+        emit(Op::GetSuperProp, d, atom(n.text));
+        return d;
+    }
     const std::uint16_t mark = fn_->top;
     const bool constantKey = n.computed && n.b->kind == NK::StringLit;
     const std::uint16_t o = (n.computed && !constantKey && !isPure(*n.b)) ? exprTemp(*n.a) : exprAny(*n.a);
@@ -1426,9 +1703,18 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     const std::uint16_t mark = fn_->top;
     const std::uint16_t base = temps(2);
     const Node& callee = *n.a;
-    if (callee.kind == NK::SuperExpr)
-        unsupported(n, "super");
-    if (!isNew && callee.kind == NK::Member && callee.a->kind != NK::SuperExpr) {
+    const bool superCall = callee.kind == NK::SuperExpr;
+    if (superCall && (isNew || fn_->isArrow || !(fn_->block->flags & CodeBlock::kClassConstructor)))
+        unsupported(n, "super() here");
+    if (!isNew && callee.kind == NK::Member && callee.a->kind == NK::SuperExpr) {
+        if (fn_->isArrow || callee.computed)
+            unsupported(n, "this use of super");
+        emit(Op::GetSuperProp, base, atom(callee.text));
+        emit(Op::Mov, base + 1, 0);
+    } else if (superCall) {
+        emit(Op::GetSuperCtor, base);
+        emit(Op::Mov, base + 1, 0);
+    } else if (!isNew && callee.kind == NK::Member) {
         expr(*callee.a, base + 1);
         if (callee.optional) {
             emitJump(Op::JNullish, base + 1, *chain_);
@@ -1496,7 +1782,14 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     }
     chain_ = savedChain;
     const std::uint16_t d = dst >= 0 ? std::uint16_t(dst) : base;
-    emit(spread ? (isNew ? Op::NewSpread : Op::CallSpread) : (isNew ? Op::New : Op::Call), d, base, argc);
+    emit(spread ? (superCall ? Op::SuperSpread : isNew ? Op::NewSpread : Op::CallSpread)
+                : (superCall ? Op::SuperCall : isNew ? Op::New : Op::Call),
+         d, base, argc);
+    if (superCall) {
+        // The constructor's `this` is what the parent made; the fields of this class are initialised now.
+        storeThis(d);
+        emit(Op::InitFields);
+    }
     fn_->top = mark;
     if (dst < 0) {
         fn_->top = mark + 1;
@@ -1520,8 +1813,15 @@ void Compiler::declareLexical(const std::vector<dyn::NodePtr>& list)
 {
     for (std::size_t i = 0; i < list.size(); ++i) {
         const Node& s = *list[i];
-        if (s.kind == NK::ClassDecl)
-            unsupported(s, "classes");
+        if (s.kind == NK::ClassDecl) {
+            Binding& b = declare(s.text, BKind::Let);
+            b.tdz = true;
+            b.initialized = false;
+            emit(Op::LoadUninit, b.reg);
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+            continue;
+        }
         if (s.kind != NK::VarDecl || s.varKind == VarKind::Var)
             continue;
         std::vector<String> names;
@@ -1609,7 +1909,11 @@ void Compiler::statement(const Node& n)
         case NK::Try: tryStatement(n); break;
         case NK::Switch: switchStatement(n); break;
         case NK::Labeled: labeled(n); break;
-        case NK::ClassDecl: unsupported(n, "classes");
+        case NK::ClassDecl: {
+            const std::uint16_t v = classExpr(*n.a, -1, n.text);
+            storeVar(n.text, v, true, n);
+            break;
+        }
         default: unsupported(n, "this statement");
     }
     fn_->top = mark;
@@ -2003,8 +2307,13 @@ void Compiler::switchStatement(const Node& n)
             bodies.push_back(s.get());
     // `declareLexical` and `hoistFunctions` take owning lists; walk the cases by hand with the same rules.
     for (const Node* s : bodies) {
-        if (s->kind == NK::ClassDecl)
-            unsupported(*s, "classes");
+        if (s->kind == NK::ClassDecl) {
+            Binding& b = declare(s->text, BKind::Let);
+            b.tdz = true;
+            emit(Op::LoadUninit, b.reg);
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+        }
         if (s->kind == NK::VarDecl && s->varKind != VarKind::Var) {
             std::vector<String> names;
             for (const dyn::NodePtr& d : s->list)
@@ -2160,9 +2469,11 @@ void Compiler::tryStatement(const Node& n)
 CodeBlock* Compiler::compileFunction(const Node& n, const String& name)
 {
     const bool saved = noFuse_;
+    const std::uint32_t extra = pendingFlags_;
+    pendingFlags_ = 0;
     for (;;) {
         try {
-            CodeBlock* block = compileFunctionOnce(n, name);
+            CodeBlock* block = compileFunctionOnce(n, name, extra);
             noFuse_ = saved;
             return block;
         } catch (const FusionOverflow&) {
@@ -2178,13 +2489,14 @@ CodeBlock* Compiler::compileFunction(const Node& n, const String& name)
     }
 }
 
-CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name)
+CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std::uint32_t extraFlags)
 {
     const bool arrow = n.kind == NK::ArrowExpr;
     Key nameKey = name.empty() ? nullptr : vm_.internKey(StringView(name));
-    CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && !n.isMethod);
+    CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && (!n.isMethod || (extraFlags & CodeBlock::kClassConstructor)));
     if (nameKey)
         detail::decRef(nameKey);  // `newCodeBlock` took its own count
+    block->flags |= extraFlags;
     block->file = file_;
     // Parameters before a rest parameter arrive in registers of their own; the rest are taken from the arguments array.
     std::size_t fixedParams = n.list.size();
@@ -2203,7 +2515,7 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name)
     child.parent = fn_;
     child.block = block;
     child.isArrow = arrow;
-    child.strict = fn_->strict || (n.d && hasUseStrict(*n.d));
+    child.strict = fn_->strict || (n.d && hasUseStrict(*n.d)) || (extraFlags & CodeBlock::kClassConstructor) != 0 || n.isMethod;
     if (child.strict)
         block->flags |= CodeBlock::kStrict;
     if (arrow)
@@ -2280,6 +2592,8 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
         if (b.boxed)
             emit(Op::NewBox, b.reg);
     }
+    if ((block->flags & CodeBlock::kClassConstructor) && !(block->flags & CodeBlock::kDerived))
+        emit(Op::InitFields);
     // Parameters: the first registers after `this`.
     std::vector<Binding*> simple;
     for (std::size_t i = 0; i < fixed; ++i) {
@@ -2420,8 +2734,6 @@ CodeBlock* Compiler::programOnce(const Node& program)
         for (const String& v : vars)
             emit(Op::DeclGlobal, atom(v));
         for (const dyn::NodePtr& s : program.list) {
-            if (s->kind == NK::ClassDecl)
-                unsupported(*s, "classes");
             if (s->kind == NK::FunctionDecl)
                 emit(Op::DeclGlobal, atom(s->text));
         }

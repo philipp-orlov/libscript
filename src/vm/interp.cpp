@@ -50,12 +50,13 @@ JSValue notCallable(VM& vm, JSValue callee)
 }
 
 /// Define or replace one half of an accessor property in an object literal.
-bool initAccessor(VM& vm, JSObject* object, Key key, JSValue fn, bool isGetter)
+bool initAccessor(VM& vm, JSObject* object, Key key, JSValue fn, bool isGetter,
+                  std::uint8_t attrs = attr::kEnumerable | attr::kConfigurable)
 {
     JSValue getter = JSValue::undefined(), setter = JSValue::undefined();
-    std::uint8_t attrs = 0;
-    if (JSValue* slot = object->findOwn(vm, key, &attrs)) {
-        if (attrs & attr::kAccessor) {
+    std::uint8_t existing = 0;
+    if (JSValue* slot = object->findOwn(vm, key, &existing)) {
+        if (existing & attr::kAccessor) {
             const auto* gs = reinterpret_cast<const GetterSetter*>(slot->asCell());
             getter = gs->getter;
             setter = gs->setter;
@@ -68,7 +69,7 @@ bool initAccessor(VM& vm, JSObject* object, Key key, JSValue fn, bool isGetter)
     // Keep the half that was there alive across the replacement.
     retain(getter);
     retain(setter);
-    const bool ok = defineAccessor(vm, object, key, getter, setter, attr::kEnumerable | attr::kConfigurable);
+    const bool ok = defineAccessor(vm, object, key, getter, setter, attrs);
     release(getter);
     release(setter);
     return ok;
@@ -306,7 +307,7 @@ JSValue run(VM& vm)
     const Ins* pc;
     const Ins* ins;
     std::uint32_t callBase = 0, callArgc = 0;
-    bool callNew = false;
+    int callMode = 0;  // 0 call, 1 new, 2 super(...)
 
 #define LOAD_FRAME()                    \
     do {                                \
@@ -1231,6 +1232,144 @@ L_IterRest: {
     R[it + 1] = JSValue::int32(index);
     NEXT();
 }
+L_NewClass: {
+    CodeBlock* ctor = code->children[ins->b];
+    JSObject* parent = nullptr;
+    JSObject* parentProto = vm.protos.object;
+    if (ins->c) {
+        const JSValue sup = R[ins->c - 1];
+        if (sup.isNull()) {
+            parentProto = nullptr;
+        } else if (!isFunction(sup)) {
+            fr->pc = pc;
+            vm.throwError(ErrorCode::TypeError, "Class extends value " + describe(vm, sup) + " is not a constructor or null");
+            FAIL();
+        } else {
+            parent = asObject(sup);
+            fr->pc = pc;
+            JSValue pp = getProperty(vm, sup, vm.atoms.prototype);
+            if (pp.isException())
+                FAIL();
+            if (isObject(pp)) {
+                parentProto = asObject(pp);
+            } else if (pp.isNull()) {
+                parentProto = nullptr;
+            } else {
+                release(pp);
+                vm.throwError(ErrorCode::TypeError, "Class extends value does not have valid prototype property");
+                FAIL();
+            }
+            release(pp);
+        }
+    }
+    JSFunction* f = vm.newFunction(parent ? parent : vm.protos.function, ctor, nullptr, 0);
+    Handle fKeep = Handle::adopt(toJSValue(f));
+    f->materialize(vm);  // length and name now, so that they come before `prototype`
+    f->flags |= JSFunction::kConstructor;
+    JSObject* proto = vm.newObject(parentProto);
+    Handle protoKeep = Handle::adopt(toJSValue(proto));
+    retain(toJSValue(proto));
+    f->putOwn(vm, vm.atoms.prototype, toJSValue(proto), 0);
+    retain(toJSValue(f));
+    proto->putOwn(vm, vm.atoms.constructor, toJSValue(f), attr::kWritable | attr::kConfigurable);
+    // The constructor is its own home: `super.x` in a static method looks at the class's prototype.
+    Rare& rare = f->rareOf(vm);
+    rare.home = toJSValue(proto);
+    retain(rare.home);
+    SET(ins->a, fKeep.take());
+    NEXT();
+}
+L_DefMethod:
+L_DefGetter:
+L_DefSetter: {
+    JSObject* target = asObject(R[ins->a]);
+    Key key = atoms[ins->b];
+    JSValue fnv = R[ins->c];
+    auto* fn = static_cast<JSFunction*>(asObject(fnv));
+    Rare& rr = fn->rareOf(vm);
+    release(rr.home);
+    rr.home = R[ins->a];
+    retain(rr.home);
+    if (ins->opcode() == Op::DefMethod) {
+        retain(fnv);
+        target->putOwn(vm, key, fnv, attr::kWritable | attr::kConfigurable);
+    } else {
+        initAccessor(vm, target, key, fnv, ins->opcode() == Op::DefGetter, attr::kConfigurable);
+    }
+    NEXT();
+}
+L_DefMethodElem:
+L_DefGetterElem:
+L_DefSetterElem: {
+    JSObject* target = asObject(R[ins->a]);
+    fr->pc = pc;
+    JSValue prim = toPrimitive(vm, R[ins->b], true);
+    if (prim.isException())
+        FAIL();
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        FAIL();
+    JSValue fnv = R[ins->c];
+    auto* fn = static_cast<JSFunction*>(asObject(fnv));
+    Rare& rr = fn->rareOf(vm);
+    release(rr.home);
+    rr.home = R[ins->a];
+    retain(rr.home);
+    if (ins->opcode() == Op::DefMethodElem) {
+        retain(fnv);
+        target->putOwn(vm, key, fnv, attr::kWritable | attr::kConfigurable);
+    } else {
+        initAccessor(vm, target, key, fnv, ins->opcode() == Op::DefGetterElem, attr::kConfigurable);
+    }
+    release(JSValue::cell(key));
+    NEXT();
+}
+L_SetFieldInit: {
+    Rare& rr = asObject(R[ins->a])->rareOf(vm);
+    release(rr.fieldInit);
+    rr.fieldInit = R[ins->b];
+    retain(rr.fieldInit);
+    NEXT();
+}
+L_InitFields: {
+    // The class whose constructor this is runs its field initialisers on `this`.
+    Rare* rr = fn->rare();
+    if (rr && isFunction(rr->fieldInit)) {
+        fr->pc = pc;
+        JSValue r = vm.call(rr->fieldInit, R[0], nullptr, 0);
+        if (r.isException())
+            FAIL();
+        release(r);
+    }
+    NEXT();
+}
+L_GetSuperCtor: {
+    JSObject* p = fn->proto(vm);
+    if (!p || !isFunction(toJSValue(p))) {
+        fr->pc = pc;
+        vm.throwError(ErrorCode::TypeError, "Super constructor is not a constructor");
+        FAIL();
+    }
+    COPY(ins->a, toJSValue(p));
+    NEXT();
+}
+L_GetSuperProp: {
+    // `super.name`: looked up from the prototype of the home object, with `this` as the receiver.
+    Rare* rr = fn->rare();
+    JSObject* start = nullptr;
+    if (rr && isObject(rr->home))
+        start = asObject(rr->home)->proto(vm);
+    fr->pc = pc;
+    JSValue v = getPropertyFrom(vm, start, R[0], atoms[ins->b]);
+    if (v.isException())
+        FAIL();
+    SET(ins->a, v);
+    NEXT();
+}
+L_NewTarget:
+    COPY(ins->a, fr->newTarget);
+    NEXT();
 L_Closure: {
     CodeBlock* child = code->children[ins->b];
     const std::uint32_t n = std::uint32_t(child->upvals.size());
@@ -1252,7 +1391,8 @@ L_Closure: {
 
 // ---- calls ----
 L_CallSpread:
-L_NewSpread: {
+L_NewSpread:
+L_SuperSpread: {
     // The arguments are in an array in the register after `this`: spread them over the window.
     const std::uint32_t at = ins->b;
     auto* list = static_cast<JSArray*>(asObject(R[at + 2]));
@@ -1274,16 +1414,17 @@ L_NewSpread: {
         setReg(window[i], items[i]);
     callBase = at;
     callArgc = n;
-    callNew = ins->opcode() == Op::NewSpread;
+    callMode = ins->opcode() == Op::NewSpread ? 1 : ins->opcode() == Op::SuperSpread ? 2 : 0;
     goto do_call;
 }
 L_Call:
 L_New:
+L_SuperCall:
     callBase = ins->b;
     callArgc = ins->c;
-    callNew = ins->opcode() == Op::New;
+    callMode = ins->opcode() == Op::New ? 1 : ins->opcode() == Op::SuperCall ? 2 : 0;
 do_call: {
-    const bool isNew = callNew;
+    const bool isNew = callMode == 1, isSuper = callMode == 2;
     const std::uint32_t base = callBase, argc = callArgc;
     const JSValue callee = R[base];
     fr->pc = pc;
@@ -1314,21 +1455,29 @@ do_call: {
         Rare* r = f->rare();
         vm.stackTop = R + code->nregs;
         JSValue saved = vm.newTarget;
-        vm.newTarget = isNew ? callee : JSValue::undefined();
+        vm.newTarget = isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined();
         JSValue res = r->native(vm, R[base + 1], &R[base + 2], argc, r->nativeData);
         vm.newTarget = saved;
         if (res.isException())
             FAIL();
-        if (isNew && !isObject(res)) {
+        if ((isNew || isSuper) && !isObject(res)) {
             release(res);
             res = R[base + 1];
             retain(res);
+        } else if (isSuper && res != R[base + 1] && isObject(R[base + 1]) && !asObject(res)->isProto()) {
+            // A built-in that makes its own object: it gets the prototype of the class being constructed.
+            asObject(res)->setProto(vm, asObject(R[base + 1])->proto(vm));
         }
         SET(ins->a, res);
         NEXT();
     }
     TICK();
     CodeBlock* c = f->code;
+    if ((c->flags & CodeBlock::kClassConstructor) && !isNew && !isSuper) [[unlikely]] {
+        vm.throwError(ErrorCode::TypeError, "class constructor " + (c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string()) +
+                                                " must be called with 'new'");
+        FAIL();
+    }
     JSValue* newR = R + base + 1;
     if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd) [[unlikely]] {
         vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
@@ -1364,7 +1513,8 @@ do_call: {
             vm.fillStack(newR + 2 + c->nparams);
         setReg(newR[1 + c->nparams], toJSValue(argsArray));
     }
-    vm.frameBase[vm.frameCount++] = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, false};
+    vm.frameBase[vm.frameCount++] = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew || isSuper, false,
+                                          isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
     fr = &vm.frameBase[vm.frameCount - 1];
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
@@ -1512,6 +1662,11 @@ throw_: {
 
 JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc)
 {
+    return callInternal(callee, thisValue, args, argc, false);
+}
+
+JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct)
+{
     if (!isFunction(callee))
         return notCallable(*this, callee);
     auto* f = static_cast<JSFunction*>(asObject(callee));
@@ -1524,6 +1679,9 @@ JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::ui
         return result;
     }
     CodeBlock* c = f->code;
+    if ((c->flags & CodeBlock::kClassConstructor) && !construct)
+        return throwError(ErrorCode::TypeError, "Class constructor " + (c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string()) +
+                                                    " cannot be invoked without 'new'");
     JSValue* R = stackTop;
     if (frameCount + 2 >= frameCapacity || R + std::max<std::size_t>(c->nregs, argc + 1) + 8 > stackEnd)
         return throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
@@ -1548,7 +1706,7 @@ JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::ui
     if (argsArray)
         setReg(R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;
-    frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, false, true};
+    frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, construct, true, construct ? callee : JSValue::undefined()};
     const JSValue result = run(*this);
     stackTop = savedTop;
     // The frame let go of its own registers; `this` and the arguments are ours.
@@ -1578,7 +1736,7 @@ JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc)
         result = r->native(*this, made.get(), args, argc, r->nativeData);
         newTarget = saved;
     } else {
-        result = call(callee, made.get(), args, argc);
+        result = callInternal(callee, made.get(), args, argc, true);
     }
     if (result.isException() || isObject(result))
         return result;

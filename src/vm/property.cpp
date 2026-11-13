@@ -88,6 +88,25 @@ bool arrayIndexOf(Key key, std::uint32_t* index) noexcept
     return true;
 }
 
+JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key)
+{
+    for (JSObject* o = start; o; o = o->proto(vm)) {
+        std::uint8_t attrs;
+        JSValue* slot = o->findOwn(vm, key, &attrs);
+        if (!slot)
+            continue;
+        if (attrs & attr::kAccessor) {
+            const auto* gs = reinterpret_cast<const GetterSetter*>(slot->asCell());
+            if (gs->getter.isUndefined())
+                return JSValue::undefined();
+            return callAccessor(vm, gs->getter, receiver, nullptr, 0);
+        }
+        retain(*slot);
+        return *slot;
+    }
+    return JSValue::undefined();
+}
+
 JSValue getProperty(VM& vm, JSValue base, Key key)
 {
     if (base.isNullish()) {

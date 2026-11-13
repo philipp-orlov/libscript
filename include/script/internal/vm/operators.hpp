@@ -57,6 +57,8 @@ int instanceOf(VM& vm, JSValue a, JSValue b);
 int inOperator(VM& vm, JSValue a, JSValue b);
 /// The name of a value for an error message: `undefined`, `null`, `5`, `[object Object]`.
 std::string describe(VM& vm, JSValue v);
+/// Make `o` the wrapper object of the primitive `v` (which it counts), of class `cls`.
+void wrapPrimitive(VM& vm, JSObject* o, ObjClass cls, JSValue v);
 /// BigInt arithmetic; both operands are BigInts. Owned results, or the exception sentinel.
 JSValue bigintBinary(VM& vm, Op op, JSValue a, JSValue b);
 /// 0 negation, 1 `~`, 2 `++`, 3 `--`.

@@ -47,6 +47,7 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
     h->rc = 1;
     h->gc = 0;
     ctx.heapBytes += bytes;
+    ownedBytes_ += bytes;
     ctx.totalAllocated += bytes;
     ++ctx.liveObjects;
     ++liveCells;
@@ -58,6 +59,7 @@ void* VM::allocPayload(std::size_t bytes)
     ctx.reserve(bytes);
     void* p = PoolAlloc<std::uint8_t>().allocate(bytes);
     ctx.heapBytes += bytes;
+    ownedBytes_ += bytes;
     ctx.totalAllocated += bytes;
     return p;
 }
@@ -66,6 +68,7 @@ void VM::freePayload(void* p, std::size_t bytes) noexcept
 {
     PoolAlloc<std::uint8_t>().deallocate(static_cast<std::uint8_t*>(p), bytes);
     ctx.heapBytes -= bytes;
+    ownedBytes_ -= bytes;
 }
 
 // -------------------------------------------------------------------- sizes ---
@@ -192,8 +195,10 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
             break;
         }
         case ObjClass::TypedArray: {
-            if (!vm.tearingDown)
+            if (!vm.tearingDown) {
+                forgetView(static_cast<JSTypedArray*>(o));
                 release(static_cast<JSTypedArray*>(o)->buffer);
+            }
             break;
         }
         case ObjClass::Function: {
@@ -256,6 +261,7 @@ void VM::destroyNow(CellPtr cell) noexcept
     }
     heap.deallocate(cell, bytes);
     ctx.heapBytes -= bytes;
+    ownedBytes_ -= bytes;
     --ctx.liveObjects;
     --liveCells;
 }
@@ -301,6 +307,7 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
                 r->ext->clear(vm);
             if (o->cls() == ObjClass::TypedArray) {
                 auto* t = static_cast<JSTypedArray*>(o);
+                forgetView(t);
                 release(t->buffer);
                 t->buffer = JSValue::undefined();
                 t->length = 0;
@@ -348,6 +355,127 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
 
 }  // namespace
 
+namespace {
+
+constexpr std::uint32_t kInSet = 0x80000000u, kReached = 0x40000000u, kCountMask = 0x3FFFFFFFu;
+
+}  // namespace
+
+void VM::collectCycles(bool minor) noexcept
+{
+    if (destroying_ || tearingDown)
+        return;
+    std::vector<CellPtr> everything;
+    try {
+        heap.forEachSlot([](void* list, void* slot) { static_cast<std::vector<CellPtr>*>(list)->push_back(static_cast<CellPtr>(slot)); },
+                         &everything);
+    } catch (...) {
+        return;
+    }
+    // The world: the young cells of a minor collection, every cell otherwise. What lies outside it, and a cell that is never
+    // freed, counts as a reference from outside.
+    std::vector<CellPtr> set;
+    std::vector<CellPtr> work;
+    for (CellPtr cell : everything) {
+        CellHeader* h = headerOf(cell);
+        if (h->flags & cellflags::kImmortal) {
+            // Its objects hold their prototypes without a count: what they inherit from stays.
+            if (kindOf(cell) == Kind::Object)
+                if (JSObject* p = reinterpret_cast<JSObject*>(cell)->proto(*this))
+                    work.push_back(reinterpret_cast<CellPtr>(p));
+            continue;
+        }
+        if (minor && !(h->flags & cellflags::kYoung))
+            continue;
+        h->gc = (h->rc & kCountMask) | kInSet;
+        set.push_back(cell);
+    }
+    std::vector<CellPtr>().swap(everything);
+
+    // A prototype is counted once by the root of the shapes of what inherits from it. That count is not a reference from
+    // outside, but a collection that sees the whole heap can tell: whatever inherits from it reaches it below.
+    if (!minor) {
+        for (CellPtr cell : set) {
+            if (kindOf(cell) != Kind::Object || !(headerOf(cell)->flags & cellflags::kIsProto))
+                continue;
+            Rare* r = reinterpret_cast<JSObject*>(cell)->rare();
+            CellHeader* h = headerOf(cell);
+            if (r && r->childRoot && r->childRoot->proto == reinterpret_cast<JSObject*>(cell) && (h->gc & kCountMask))
+                --h->gc;
+        }
+    }
+    detail::GcList kids;
+    for (CellPtr cell : set) {
+        kids.clear();
+        children(cell, kids);
+        for (detail::GCObject* kid : kids) {
+            if (!kid || !isVmCell(kid))
+                continue;
+            CellHeader* kh = headerOf(kid);
+            if ((kh->gc & kInSet) && (kh->gc & kCountMask))
+                --kh->gc;
+        }
+    }
+    // Whatever still has a reference is reachable from outside the world, and so is what it refers to.
+    auto reach = [&](CellPtr cell) {
+        CellHeader* h = headerOf(cell);
+        if ((h->gc & kInSet) && !(h->gc & kReached)) {
+            h->gc |= kReached;
+            work.push_back(cell);
+        }
+    };
+    std::vector<CellPtr> seeds;
+    seeds.swap(work);
+    for (CellPtr cell : seeds)
+        reach(cell);
+    for (CellPtr cell : set) {
+        CellHeader* h = headerOf(cell);
+        if (h->gc & kCountMask)
+            reach(cell);
+    }
+    while (!work.empty()) {
+        CellPtr cell = work.back();
+        work.pop_back();
+        kids.clear();
+        children(cell, kids);
+        for (detail::GCObject* kid : kids)
+            if (kid && isVmCell(kid))
+                reach(kid);
+        if (kindOf(cell) == Kind::Object)
+            if (JSObject* p = reinterpret_cast<JSObject*>(cell)->proto(*this))
+                reach(reinterpret_cast<CellPtr>(p));
+    }
+    std::vector<CellPtr> garbage;
+    for (CellPtr cell : set) {
+        CellHeader* h = headerOf(cell);
+        const bool dead = !(h->gc & kReached);
+        h->gc = 0;
+        if (dead) {
+            ++h->rc;  // held until it has been emptied: nothing frees it on the way
+            garbage.push_back(cell);
+        } else {
+            h->flags &= std::uint8_t(~cellflags::kYoung);
+        }
+    }
+    ctx.gcFreed += garbage.size();
+    for (CellPtr cell : garbage)
+        clearReferences(*this, cell);
+    // A dead prototype lets go of its root's count; the shapes stay (their ids are never reused), without it.
+    for (CellPtr cell : garbage) {
+        if (kindOf(cell) != Kind::Object || !(headerOf(cell)->flags & cellflags::kIsProto))
+            continue;
+        auto* o = reinterpret_cast<JSObject*>(cell);
+        invalidateChain(o);
+        Rare* r = o->rare();
+        if (r && r->childRoot && r->childRoot->proto == o) {
+            r->childRoot->proto = nullptr;
+            detail::decRef(cell);
+        }
+    }
+    for (CellPtr cell : garbage)
+        detail::decRef(cell);
+}
+
 void VM::releaseRoots() noexcept
 {
     tearingDown = true;
@@ -364,7 +492,7 @@ void VM::releaseRoots() noexcept
                    &atoms.symIterator, &atoms.symAsyncIterator, &atoms.symToPrimitive, &atoms.symToStringTag,
                    &atoms.symHasInstance, &atoms.symSpecies, &atoms.lastIndex, &atoms.index, &atoms.input,
                    &atoms.groups, &atoms.indices, &atoms.symMatch, &atoms.symMatchAll, &atoms.symReplace, &atoms.symSearch,
-                   &atoms.symSplit}) {
+                   &atoms.symSplit, &atoms.symIsConcatSpreadable, &atoms.symUnscopables}) {
         if (*k)
             detail::decRef(*k);
         *k = nullptr;
@@ -384,6 +512,12 @@ void VM::releaseRoots() noexcept
         detail::decRef(reinterpret_cast<CellPtr>(global));
         global = nullptr;
     }
+    for (auto& entry : hostBindings) {
+        for (JSObject* o : {entry.second.first, entry.second.second})
+            if (o)
+                detail::decRef(reinterpret_cast<CellPtr>(o));
+    }
+    hostBindings.clear();
     for (JSObject*& p : errorProtos) {
         if (p)
             detail::decRef(reinterpret_cast<CellPtr>(p));

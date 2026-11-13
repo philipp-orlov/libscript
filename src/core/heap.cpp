@@ -494,6 +494,9 @@ void ContextImpl::collectIfDue()
 void ContextImpl::collectCycles(bool minor)
 {
     ++gcRuns;
+    // An engine with cells of its own looks at them first: what it frees may leave strings nothing names.
+    for (std::size_t i = 0; i < runtimeCount_; ++i)
+        runtimes_[i]->collectCycles(minor);
     GcList kids;
 
     GcList all;
@@ -569,8 +572,11 @@ void ContextImpl::collectCycles(bool minor)
             heapBytes -= std::min<std::uint64_t>(heapBytes, was);
         }
     }
-    if (!minor)
+    if (!minor) {
         heapBytes = bytes;
+        for (std::size_t i = 0; i < runtimeCount_; ++i)
+            heapBytes += runtimes_[i]->ownedBytes();
+    }
     gcFreed += garbage.size();
     GcList().swap(all);
     for (GCObject* cell : garbage)

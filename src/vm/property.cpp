@@ -102,6 +102,16 @@ JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key)
             if (arrayIndexOf(key, &index))
                 return index < t->length ? typedGet(vm, t, index) : JSValue::undefined();
         }
+        if (o->cls() == ObjClass::String) {
+            JSValue text = unwrapped(toJSValue(o), ObjClass::String);
+            if (isString(text)) {
+                std::uint32_t index;
+                if (key == vm.atoms.length)
+                    return number(asString(text)->length);
+                if (arrayIndexOf(key, &index) && index < asString(text)->length)
+                    return makeString(vm, asString(text)->text().substr(index, 1));
+            }
+        }
         if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             if (key == vm.atoms.length)
@@ -167,6 +177,12 @@ bool hasProperty(VM& vm, JSValue base, Key key)
             if (arrayIndexOf(key, &index))
                 return index < static_cast<JSTypedArray*>(o)->length;
         }
+        if (o->cls() == ObjClass::String) {
+            JSValue text = unwrapped(toJSValue(o), ObjClass::String);
+            std::uint32_t index;
+            if (isString(text) && (key == vm.atoms.length || (arrayIndexOf(key, &index) && index < asString(text)->length)))
+                return true;
+        }
         if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             std::uint32_t index;
@@ -227,6 +243,12 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
         std::uint32_t index;
         if (arrayIndexOf(key, &index))
             return typedSet(vm, static_cast<JSTypedArray*>(receiver), double(index), value);
+    }
+    if (receiver->cls() == ObjClass::String) {
+        JSValue text = unwrapped(base, ObjClass::String);
+        std::uint32_t index;
+        if (isString(text) && (key == vm.atoms.length || (arrayIndexOf(key, &index) && index < asString(text)->length)))
+            return refuse(vm, strict, "Cannot assign to read only property of a String");
     }
     if (hasElems(receiver)) {
         auto* a = static_cast<JSArray*>(receiver);

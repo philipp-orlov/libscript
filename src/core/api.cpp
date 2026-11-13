@@ -397,6 +397,10 @@ bool Value::isPromise() const noexcept
 
 bool Value::isNative() const noexcept
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::isNative(*this);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         return false;
@@ -572,7 +576,7 @@ std::string Value::toJson(int indent) const
 {
 #if SCRIPT_VM
     if (vm::host::owns(*this))
-        throw Error(ErrorCode::NotSupported, "the vm core has no JSON yet");
+        return vm::host::toJson(*this, indent);
 #endif
     GCObject* cell = cellOf(*this);
     if (!cell) {
@@ -994,8 +998,10 @@ void Value::defineAccessor(std::string_view key, const Value& getterFn, const Va
                            PropertyFlags flags)
 {
 #if SCRIPT_VM
-    if (vm::host::owns(*this))
-        throw Error(ErrorCode::NotSupported, "the vm core does not define accessors from the host yet");
+    if (vm::host::owns(*this)) {
+        vm::host::defineAccessor(*this, key, getterFn, setterFn, flags);
+        return;
+    }
 #endif
 #if SCRIPT_ENGINE_DYNAMIC
     ContextImpl& rt = need(*this, "defineAccessor");
@@ -1165,6 +1171,10 @@ Value Value::construct(const std::vector<Value>& args) const
 
 void* Value::nativeHandle(const void* typeKey) const noexcept
 {
+#if SCRIPT_VM
+    if (vm::host::owns(*this))
+        return vm::host::nativeHandle(*this, typeKey);
+#endif
     GCObject* cell = cellOf(*this);
     if (!cell)
         return nullptr;
@@ -1212,6 +1222,10 @@ Value makeExceptionFor(ContextImpl& rt, EngineKind engine, ErrorCode code,
 #if SCRIPT_ENGINE_DYNAMIC
     if (engine == EngineKind::Dynamic)
         return dyn::makeErrorValue(rt.dyn(), code, std::string(message));
+#endif
+#if SCRIPT_VM
+    if (engine == EngineKind::Vm)
+        return vm::host::makeException(rt, code, message);
 #endif
     (void)rt;
     (void)engine;
@@ -1590,6 +1604,10 @@ void Context::declare(std::string_view declarations)
 
 Value Context::global() const
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::global(*impl_);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Guard guard(impl_.get());
     return detail::Access::make(Type::Object, impl_->dyn().globalObject.get());
@@ -1608,6 +1626,10 @@ Value Context::str(std::string_view utf8)
 
 Value Context::symbol(std::string_view description)
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::makeSymbol(*impl_, description);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     auto* s = impl_->newCell<dyn::SymbolCell>();
@@ -1621,6 +1643,10 @@ Value Context::symbol(std::string_view description)
 
 Value Context::object()
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::makeObject(*impl_);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     dyn::Runtime& rt = impl_->dyn();
@@ -1632,6 +1658,10 @@ Value Context::object()
 
 Value Context::array(std::size_t reserve)
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::makeArray(*impl_, reserve);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     return detail::Access::adopt(Type::Object, impl_->dyn().newArray(reserve));
@@ -1660,6 +1690,10 @@ Value Context::array(const std::vector<Value>& items)
         return array;
     }
 #endif
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::makeArray(*impl_, items);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     return impl_->dyn().makeArray(items);
 #else
@@ -1670,6 +1704,10 @@ Value Context::array(const std::vector<Value>& items)
 
 Value Context::function(std::string_view name, NativeFunction fn, int arity)
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::makeFunction(*impl_, name, std::move(fn), arity);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     Value made = impl_->dyn().makeFunction(fromUtf8(name), std::move(fn), arity);
@@ -1771,6 +1809,10 @@ void Context::fail(ErrorCode kind, std::string_view message)
 
 Value Context::parseJson(std::string_view text)
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::parseJson(*impl_, text);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     return dyn::jsonParse(impl_->dyn(), fromUtf8(text));
@@ -1817,6 +1859,10 @@ bool Context::isClassRegistered(const void* typeKey) const
 Value Context::native(const void* typeKey, void* instance, Finalizer finalizer, void* owner)
 {
     Lock lock(*this);
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::hostWrapper(*impl_, typeKey, instance, finalizer, owner);
+#endif
     auto* cell = impl_->newCell<NativeCell>();
     Value result = detail::Access::adopt(Type::Object, cell);
     cell->slot.typeKey = typeKey;
@@ -1839,6 +1885,13 @@ Value Context::native(const void* typeKey, void* instance, Finalizer finalizer, 
 void Context::attachNative(const Value& object, const void* typeKey, void* instance,
                            Finalizer finalizer, void* owner)
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm) {
+        Lock lock(*this);
+        vm::host::attachNative(*impl_, object, typeKey, instance, finalizer, owner);
+        return;
+    }
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     dyn::DynObject* obj = dyn::asObject(object);
@@ -1857,6 +1910,10 @@ void Context::attachNative(const Value& object, const void* typeKey, void* insta
 
 Value Context::classPrototype(const void* typeKey)
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::hostPrototype(*impl_, typeKey);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     dyn::Runtime& rt = impl_->dyn();
@@ -1870,6 +1927,10 @@ Value Context::classPrototype(const void* typeKey)
 
 Value Context::classConstructor(const void* typeKey)
 {
+#if SCRIPT_VM
+    if (impl_->core() == Context::Options::Core::Vm)
+        return vm::host::hostConstructor(*impl_, typeKey);
+#endif
 #if SCRIPT_ENGINE_DYNAMIC
     Lock lock(*this);
     dyn::Runtime& rt = impl_->dyn();

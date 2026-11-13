@@ -221,7 +221,8 @@ TableState* thisTable(VM& vm, JSValue self, ObjClass cls, const char* method)
     if (isObject(self) && asObject(self)->cls() == cls)
         if (Rare* r = asObject(self)->rare(); r && r->ext)
             return static_cast<TableState*>(r->ext);
-    typeError(vm, std::string("Method ") + method + " called on incompatible receiver " + describe(vm, self));
+    (void)method;
+    typeError(vm, std::string("not a ") + (cls == ObjClass::Map ? "Map" : cls == ObjClass::Set ? "Set" : cls == ObjClass::WeakMap ? "WeakMap" : "WeakSet"));
     return nullptr;
 }
 
@@ -242,9 +243,10 @@ const Kind& kindOf(void* data) { return kKinds[reinterpret_cast<std::intptr_t>(d
 
 bool validKey(VM& vm, const Kind& k, JSValue key)
 {
-    if (!k.weak || isObject(key))
+    // An object, or a symbol that `Symbol.for` did not make.
+    if (!k.weak || isObject(key) || (isSymbol(key) && !static_cast<dyn::SymbolCell*>(key.asCell())->registered))
         return true;
-    typeError(vm, std::string("Invalid value used ") + (k.isMap ? "as weak map key" : "in weak set"));
+    typeError(vm, k.isMap ? "invalid value used as a WeakMap key" : "invalid value used in a WeakSet");
     return false;
 }
 

@@ -36,7 +36,7 @@ JSTypedArray* thisTyped(VM& vm, JSValue self)
 {
     if (JSTypedArray* t = asTyped(self))
         return t;
-    typeError(vm, "this is not a typed array.");
+    typeError(vm, "not a typed array");
     return nullptr;
 }
 
@@ -96,37 +96,120 @@ JSTypedArray* makeTyped(VM& vm, ElemKind kind, JSObject* proto, std::uint32_t le
 NATIVE(arrayBufferCtor)
 {
     UNUSED();
+    const bool shared = data != nullptr;
     if (vm.newTarget.isUndefined() || !isObject(self))
-        return typeError(vm, "Constructor ArrayBuffer requires 'new'");
+        return typeError(vm, shared ? "Constructor SharedArrayBuffer requires 'new'" : "Constructor ArrayBuffer requires 'new'");
     double length;
     if (!toIndex(vm, arg(args, argc, 0), "array buffer length", &length))
         return JSValue::exception();
-    JSObject* o = vm.newArrayBuffer(std::size_t(length));
+    double maxLength = -1;
+    if (isObject(arg(args, argc, 1))) {
+        Key key = vm.internKey(std::string_view("maxByteLength"));
+        JSValue m = getProperty(vm, args[1], key);
+        detail::decRef(key);
+        if (m.isException())
+            return m;
+        const bool present = !m.isUndefined();
+        const bool ok = !present || toIndex(vm, m, "array buffer max length", &maxLength);
+        release(m);
+        if (!ok)
+            return JSValue::exception();
+        if (present && length > maxLength)
+            return vm.throwError(ErrorCode::RangeError, "Invalid array buffer max length");
+    }
+    JSObject* o = vm.newArrayBuffer(std::size_t(length), maxLength < 0 ? 0 : std::size_t(maxLength), maxLength >= 0);
     if (!o)
         return JSValue::exception();
     o->setProto(vm, asObject(self)->proto(vm));
+    static_cast<BufferState*>(o->rare()->ext)->shared = shared;
     return toJSValue(o);
+}
+
+/// The state of a buffer of the kind a method belongs to (`shared`), or null with a TypeError.
+BufferState* bufferFor(VM& vm, JSValue self, bool shared, const char* what)
+{
+    BufferState* b = bufferOf(self);
+    if (!b || b->shared != shared) {
+        typeError(vm, std::string("Method ") + (shared ? "SharedArrayBuffer" : "ArrayBuffer") + ".prototype" + what +
+                          " called on incompatible receiver");
+        return nullptr;
+    }
+    return b;
 }
 
 NATIVE(arrayBufferGetter)
 {
     UNUSED();
-    BufferState* b = bufferOf(self);
+    const auto which = reinterpret_cast<std::intptr_t>(data);
+    BufferState* b = bufferFor(vm, self, (which & 16) != 0, " getter");
     if (!b)
-        return typeError(vm, "Method ArrayBuffer.prototype getter called on incompatible receiver");
-    switch (reinterpret_cast<std::intptr_t>(data)) {
+        return JSValue::exception();
+    switch (which & 15) {
         case 0: return JSValue::boxNumber(double(b->size));
-        case 1: return JSValue::boolean(false);
-        default: return JSValue::boxNumber(double(b->size));
+        case 1: return JSValue::boolean(b->resizable);
+        case 3: return JSValue::boolean(b->detached);
+        default: return JSValue::boxNumber(double(b->resizable ? b->capacity : b->size));
     }
+}
+
+NATIVE(arrayBufferResize)
+{
+    UNUSED();
+    const bool shared = data != nullptr;  // grow
+    BufferState* b = bufferFor(vm, self, shared, shared ? ".grow" : ".resize");
+    if (!b)
+        return JSValue::exception();
+    if (!b->resizable)
+        return typeError(vm, "Method ArrayBuffer.prototype.resize called on incompatible receiver");
+    double length;
+    if (!toIndex(vm, arg(args, argc, 0), "array buffer length", &length))
+        return JSValue::exception();
+    if (b->detached)
+        return typeError(vm, "Cannot perform ArrayBuffer.prototype.resize on a detached ArrayBuffer");
+    if (length > double(b->capacity) || (shared && length < double(b->size)))
+        return vm.throwError(ErrorCode::RangeError, "ArrayBuffer.prototype.resize: Invalid length parameter");
+    const std::size_t n = std::size_t(length);
+    if (n < b->size)
+        std::memset(b->data + n, 0, b->size - n);
+    b->size = n;
+    b->refreshViews();
+    return JSValue::undefined();
+}
+
+/// transfer (data 0) and transferToFixedLength (1): the contents move to a new buffer and this one is detached.
+NATIVE(arrayBufferTransfer)
+{
+    UNUSED();
+    BufferState* b = bufferFor(vm, self, false, ".transfer");
+    if (!b)
+        return JSValue::exception();
+    if (b->detached)
+        return typeError(vm, "Cannot perform ArrayBuffer.prototype.transfer on a detached ArrayBuffer");
+    double length = double(b->size);
+    if (!arg(args, argc, 0).isUndefined() && !toIndex(vm, args[0], "array buffer length", &length))
+        return JSValue::exception();
+    const bool keepResizable = b->resizable && reinterpret_cast<std::intptr_t>(data) == 0;
+    JSObject* o = vm.newArrayBuffer(std::size_t(length), keepResizable ? b->capacity : 0, keepResizable);
+    if (!o)
+        return JSValue::exception();
+    auto* fresh = static_cast<BufferState*>(o->rare()->ext);
+    std::memcpy(fresh->data, b->data, std::min(std::size_t(length), b->size));
+    std::free(b->data);
+    b->data = nullptr;
+    b->size = 0;
+    b->capacity = 0;
+    b->detached = true;
+    b->refreshViews();
+    return toJSValue(o);
 }
 
 NATIVE(arrayBufferSlice)
 {
     UNUSED();
-    BufferState* b = bufferOf(self);
+    const bool shared = data != nullptr;
+    BufferState* b = bufferFor(vm, self, shared, ".slice");
     if (!b)
-        return typeError(vm, "Method ArrayBuffer.prototype.slice called on incompatible receiver");
+        return JSValue::exception();
     double from, to;
     if (!relativeArg(vm, arg(args, argc, 0), double(b->size), 0, &from) ||
         !relativeArg(vm, arg(args, argc, 1), double(b->size), double(b->size), &to))
@@ -135,6 +218,10 @@ NATIVE(arrayBufferSlice)
     JSObject* o = vm.newArrayBuffer(n);
     if (!o)
         return JSValue::exception();
+    if (shared) {
+        static_cast<BufferState*>(o->rare()->ext)->shared = true;
+        o->setProto(vm, vm.protos.sharedArrayBuffer);
+    }
     if (n)
         std::memcpy(static_cast<BufferState*>(o->rare()->ext)->data, b->data + std::size_t(from), n);
     return toJSValue(o);
@@ -190,8 +277,9 @@ NATIVE(typedCtor)
         if (!arg(args, argc, 2).isUndefined() && !toIndex(vm, args[2], "typed array length", &length))
             return JSValue::exception();
         double count;
+        const bool follows = length < 0 && b->resizable;
         if (length < 0) {
-            if (std::fmod(double(b->size), size) != 0)
+            if (!b->resizable && std::fmod(double(b->size), size) != 0)
                 return vm.throwError(ErrorCode::RangeError, std::string("byte length of ") + kNames[std::size_t(kind)] +
                                                                   " should be a multiple of " + std::to_string(size));
             if (offset > double(b->size))
@@ -202,7 +290,9 @@ NATIVE(typedCtor)
                 return vm.throwError(ErrorCode::RangeError, "Invalid typed array length: " + std::to_string(std::uint64_t(length)));
             count = length;
         }
-        return toJSValue(vm.newTypedArray(proto, kind, asObject(a0), std::uint32_t(offset), std::uint32_t(count)));
+        JSTypedArray* made = vm.newTypedArray(proto, kind, asObject(a0), std::uint32_t(offset), std::uint32_t(count));
+        made->tracking = follows;
+        return toJSValue(made);
     }
     std::vector<Handle> items;
     if (JSTypedArray* src = asTyped(a0)) {
@@ -272,7 +362,7 @@ NATIVE(typedGetter)
         return makeString(vm, std::string_view(kNames[std::size_t(t->kind)]));
     }
     if (!t)
-        return typeError(vm, "Receiver is not a typed array");
+        return typeError(vm, "not a typed array");
     switch (which) {
         case 0: return JSValue::boxNumber(double(t->length));
         case 1: return JSValue::boxNumber(double(t->length) * kElemSize[std::size_t(t->kind)]);
@@ -834,7 +924,7 @@ NATIVE(dataViewGetter)
     UNUSED();
     ViewState* v = viewOf(self);
     if (!v)
-        return typeError(vm, "Receiver is not a DataView");
+        return typeError(vm, "not a DataView");
     switch (reinterpret_cast<std::intptr_t>(data)) {
         case 0: retain(v->buffer); return v->buffer;
         case 1: return JSValue::boxNumber(double(v->length));
@@ -847,7 +937,7 @@ NATIVE(dataViewAccess)
     UNUSED();
     ViewState* v = viewOf(self);
     if (!v)
-        return typeError(vm, "Receiver is not a DataView");
+        return typeError(vm, "not a DataView");
     const auto bits = reinterpret_cast<std::intptr_t>(data);
     const ElemKind kind = ElemKind(bits & 255);
     const bool isSet = (bits >> 8) & 1;
@@ -901,6 +991,355 @@ NATIVE(dataViewAccess)
     return value;
 }
 
+
+// ---- Uint8Array and text: base64 and hex
+
+const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const char kBase64Url[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+struct Base64Options
+{
+    bool url = false;
+    int lastChunk = 0;  // 0 loose, 1 strict, 2 stop-before-partial
+};
+
+/// FromBase64: what it decodes, how far it read, and whether what it read was acceptable.
+struct Decoded
+{
+    std::vector<std::uint8_t> bytes;
+    std::size_t read = 0;
+    bool bad = false;
+};
+
+Decoded decodeBase64(StringView s, const Base64Options& options, std::size_t maxLength)
+{
+    Decoded out;
+    if (maxLength == 0)
+        return out;
+    const auto isWhite = [](Char c) { return c == 9 || c == 10 || c == 12 || c == 13 || c == 32; };
+    const auto value = [&](Char c) -> int {
+        if (c >= 'A' && c <= 'Z')
+            return c - 'A';
+        if (c >= 'a' && c <= 'z')
+            return c - 'a' + 26;
+        if (c >= '0' && c <= '9')
+            return c - '0' + 52;
+        if (c == (options.url ? '-' : '+'))
+            return 62;
+        if (c == (options.url ? '_' : '/'))
+            return 63;
+        return -1;
+    };
+    std::size_t i = 0;
+    int chunk[4];
+    int have = 0;
+    const auto flush = [&](int count) {
+        std::uint32_t bits = 0;
+        for (int k = 0; k < 4; ++k)
+            bits = (bits << 6) | std::uint32_t(k < count ? chunk[k] : 0);
+        out.bytes.push_back(std::uint8_t(bits >> 16));
+        if (count > 2)
+            out.bytes.push_back(std::uint8_t(bits >> 8));
+        if (count > 3)
+            out.bytes.push_back(std::uint8_t(bits));
+    };
+    for (;;) {
+        while (i < s.size() && isWhite(s[i]))
+            ++i;
+        if (i >= s.size()) {
+            if (have > 0) {
+                if (options.lastChunk == 2)
+                    return out;
+                if (options.lastChunk == 1 || have == 1) {
+                    out.bad = true;
+                    return out;
+                }
+                flush(have);
+            }
+            out.read = s.size();
+            return out;
+        }
+        const Char c = s[i++];
+        if (c == '=') {
+            if (have < 2) {
+                out.bad = true;
+                return out;
+            }
+            while (i < s.size() && isWhite(s[i]))
+                ++i;
+            if (have == 2) {
+                if (i >= s.size()) {
+                    if (options.lastChunk == 2) {
+                        out.read = out.read;
+                        return out;
+                    }
+                    out.bad = true;
+                    return out;
+                }
+                if (s[i] != '=') {
+                    out.bad = true;
+                    return out;
+                }
+                ++i;
+                while (i < s.size() && isWhite(s[i]))
+                    ++i;
+            }
+            if (i < s.size()) {
+                out.bad = true;
+                return out;
+            }
+            if (options.lastChunk == 1) {
+                const std::uint32_t extra = have == 2 ? std::uint32_t(chunk[1]) & 15 : std::uint32_t(chunk[2]) & 3;
+                if (extra) {
+                    out.bad = true;
+                    return out;
+                }
+            }
+            flush(have);
+            out.read = s.size();
+            return out;
+        }
+        const int v = value(c);
+        if (v < 0) {
+            out.bad = true;
+            return out;
+        }
+        const std::size_t remaining = maxLength - out.bytes.size();
+        if (remaining == 1 && options.lastChunk == 0 + 0 && have == 2 && false)
+            return out;
+        chunk[have++] = v;
+        if (have == 4) {
+            if (remaining < 3)
+                return out;
+            flush(4);
+            have = 0;
+            out.read = i;
+            if (out.bytes.size() == maxLength)
+                return out;
+        } else if (have == 2 && remaining == 1) {
+            // One byte more is all there is room for, and the next character may or may not belong to it: leave it.
+        }
+    }
+}
+
+int hexDigit(Char c) noexcept
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+
+JSTypedArray* thisBytes(VM& vm, JSValue self)
+{
+    JSTypedArray* t = asTyped(self);
+    if (!t || t->kind != ElemKind::Uint8) {
+        typeError(vm, "not a Uint8Array");
+        return nullptr;
+    }
+    return t;
+}
+
+/// The options of toBase64 and fromBase64; false with an exception pending.
+bool base64Options(VM& vm, JSValue options, bool reading, Base64Options* out, bool* omitPadding)
+{
+    *omitPadding = false;
+    if (options.isUndefined())
+        return true;
+    if (!isObject(options)) {
+        typeError(vm, "the options are not an object");
+        return false;
+    }
+    auto field = [&](const char* name, JSValue* v) {
+        Key key = vm.internKey(std::string_view(name));
+        *v = getProperty(vm, options, key);
+        detail::decRef(key);
+        return !v->isException();
+    };
+    JSValue alphabet;
+    if (!field("alphabet", &alphabet))
+        return false;
+    Handle keepAlphabet = Handle::adopt(alphabet);
+    if (!alphabet.isUndefined()) {
+        if (!isString(alphabet)) {
+            typeError(vm, "alphabet is not a string");
+            return false;
+        }
+        const StringView a = asString(alphabet)->text();
+        if (a == StringView(u"base64url")) {
+            out->url = true;
+        } else if (a != StringView(u"base64")) {
+            typeError(vm, "alphabet is not one of the two there are");
+            return false;
+        }
+    }
+    if (reading) {
+        JSValue last;
+        if (!field("lastChunkHandling", &last))
+            return false;
+        Handle keepLast = Handle::adopt(last);
+        if (!last.isUndefined()) {
+            if (!isString(last)) {
+                typeError(vm, "lastChunkHandling is not a string");
+                return false;
+            }
+            const StringView l = asString(last)->text();
+            if (l == StringView(u"strict"))
+                out->lastChunk = 1;
+            else if (l == StringView(u"stop-before-partial"))
+                out->lastChunk = 2;
+            else if (l != StringView(u"loose")) {
+                typeError(vm, "lastChunkHandling is not one of the three there are");
+                return false;
+            }
+        }
+    } else {
+        JSValue omit;
+        if (!field("omitPadding", &omit))
+            return false;
+        *omitPadding = toBoolean(omit);
+        release(omit);
+    }
+    return true;
+}
+
+NATIVE(bytesToBase64)
+{
+    UNUSED();
+    JSTypedArray* t = thisBytes(vm, self);
+    if (!t)
+        return JSValue::exception();
+    Base64Options options;
+    bool omit;
+    if (!base64Options(vm, arg(args, argc, 0), false, &options, &omit))
+        return JSValue::exception();
+    const char* table = options.url ? kBase64Url : kBase64;
+    String out;
+    std::size_t i = 0;
+    const std::size_t n = t->length;
+    const std::uint8_t* b = t->data;
+    for (; i + 3 <= n; i += 3) {
+        const std::uint32_t bits = (std::uint32_t(b[i]) << 16) | (std::uint32_t(b[i + 1]) << 8) | b[i + 2];
+        out.push_back(Char(table[bits >> 18]));
+        out.push_back(Char(table[(bits >> 12) & 63]));
+        out.push_back(Char(table[(bits >> 6) & 63]));
+        out.push_back(Char(table[bits & 63]));
+    }
+    if (n - i == 1) {
+        const std::uint32_t bits = std::uint32_t(b[i]) << 16;
+        out.push_back(Char(table[bits >> 18]));
+        out.push_back(Char(table[(bits >> 12) & 63]));
+        if (!omit)
+            out += u"==";
+    } else if (n - i == 2) {
+        const std::uint32_t bits = (std::uint32_t(b[i]) << 16) | (std::uint32_t(b[i + 1]) << 8);
+        out.push_back(Char(table[bits >> 18]));
+        out.push_back(Char(table[(bits >> 12) & 63]));
+        out.push_back(Char(table[(bits >> 6) & 63]));
+        if (!omit)
+            out.push_back(u'=');
+    }
+    return makeString(vm, StringView(out));
+}
+
+NATIVE(bytesToHex)
+{
+    UNUSED();
+    JSTypedArray* t = thisBytes(vm, self);
+    if (!t)
+        return JSValue::exception();
+    static const char kHex[] = "0123456789abcdef";
+    String out;
+    out.reserve(std::size_t(t->length) * 2);
+    for (std::size_t i = 0; i < t->length; ++i) {
+        out.push_back(Char(kHex[t->data[i] >> 4]));
+        out.push_back(Char(kHex[t->data[i] & 15]));
+    }
+    return makeString(vm, StringView(out));
+}
+
+JSValue readWritten(VM& vm, std::size_t read, std::size_t written)
+{
+    JSObject* result = vm.newObject(vm.protos.object);
+    value(vm, result, "read", JSValue::boxNumber(double(read)), attr::kDefault);
+    value(vm, result, "written", JSValue::boxNumber(double(written)), attr::kDefault);
+    return toJSValue(result);
+}
+
+/// fromBase64 (data 0), setFromBase64 (1).
+NATIVE(bytesFromBase64)
+{
+    UNUSED();
+    const bool into = data != nullptr;
+    JSTypedArray* t = nullptr;
+    if (into) {
+        t = thisBytes(vm, self);
+        if (!t)
+            return JSValue::exception();
+    }
+    if (!isString(arg(args, argc, 0)))
+        return typeError(vm, into ? "setFromBase64 takes a string" : "fromBase64 takes a string");
+    Base64Options options;
+    bool omit;
+    if (!base64Options(vm, arg(args, argc, 1), true, &options, &omit))
+        return JSValue::exception();
+    const Decoded decoded = decodeBase64(asString(args[0])->text(), options, into ? t->length : std::size_t(-1));
+    if (into) {
+        const std::size_t written = std::min<std::size_t>(decoded.bytes.size(), t->length);
+        if (written)
+            std::memcpy(t->data, decoded.bytes.data(), written);
+        if (decoded.bad)
+            return vm.throwError(ErrorCode::SyntaxError, "not valid base64");
+        return readWritten(vm, decoded.read, written);
+    }
+    if (decoded.bad)
+        return vm.throwError(ErrorCode::SyntaxError, "not valid base64");
+    JSTypedArray* out = makeTyped(vm, ElemKind::Uint8, nullptr, std::uint32_t(decoded.bytes.size()));
+    if (!out)
+        return JSValue::exception();
+    if (!decoded.bytes.empty())
+        std::memcpy(out->data, decoded.bytes.data(), decoded.bytes.size());
+    return toJSValue(out);
+}
+
+/// fromHex (data 0), setFromHex (1).
+NATIVE(bytesFromHex)
+{
+    UNUSED();
+    const bool into = data != nullptr;
+    JSTypedArray* t = nullptr;
+    if (into) {
+        t = thisBytes(vm, self);
+        if (!t)
+            return JSValue::exception();
+    }
+    if (!isString(arg(args, argc, 0)))
+        return typeError(vm, into ? "setFromHex takes a string" : "fromHex takes a string");
+    const StringView s = asString(args[0])->text();
+    if (s.size() % 2)
+        return vm.throwError(ErrorCode::SyntaxError, "an odd number of hex digits");
+    const std::size_t room = into ? t->length : s.size() / 2;
+    JSTypedArray* out = into ? t : makeTyped(vm, ElemKind::Uint8, nullptr, std::uint32_t(room));
+    if (!out)
+        return JSValue::exception();
+    Handle keep = into ? Handle() : Handle::adopt(toJSValue(out));
+    std::size_t written = 0, read = 0;
+    while (read + 1 < s.size() && written < room) {
+        const int a = hexDigit(s[read]), b = hexDigit(s[read + 1]);
+        if (a < 0 || b < 0)
+            return vm.throwError(ErrorCode::SyntaxError, "not a hex digit");
+        out->data[written++] = std::uint8_t(a * 16 + b);
+        read += 2;
+    }
+    if (into)
+        return readWritten(vm, read, written);
+    return keep.take();
+}
+
 }  // namespace
 
 void installTypedArrays(VM& vm)
@@ -922,9 +1361,25 @@ void installTypedArrays(VM& vm)
         detail::decRef(key);
         detail::decRef(fnName);
     };
+    {
+        JSObject* sabProto = vm.newObject(objectProto);
+        vm.setIntrinsic(&vm.protos.sharedArrayBuffer, sabProto);
+        release(toJSValue(sabProto));
+        constructor(vm, "SharedArrayBuffer", arrayBufferCtor, 1, sabProto)->rareOf(vm).nativeData = reinterpret_cast<void*>(1);
+        getter(sabProto, "byteLength", arrayBufferGetter, reinterpret_cast<void*>(16));
+        getter(sabProto, "growable", arrayBufferGetter, reinterpret_cast<void*>(17));
+        getter(sabProto, "maxByteLength", arrayBufferGetter, reinterpret_cast<void*>(18));
+        method(vm, sabProto, "grow", arrayBufferResize, 1, reinterpret_cast<void*>(1));
+        method(vm, sabProto, "slice", arrayBufferSlice, 2, reinterpret_cast<void*>(1));
+        sabProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("SharedArrayBuffer")), attr::kConfigurable);
+    }
     getter(abProto, "byteLength", arrayBufferGetter, reinterpret_cast<void*>(0));
     getter(abProto, "resizable", arrayBufferGetter, reinterpret_cast<void*>(1));
     getter(abProto, "maxByteLength", arrayBufferGetter, reinterpret_cast<void*>(2));
+    getter(abProto, "detached", arrayBufferGetter, reinterpret_cast<void*>(3));
+    method(vm, abProto, "resize", arrayBufferResize, 1);
+    method(vm, abProto, "transfer", arrayBufferTransfer, 0, reinterpret_cast<void*>(0));
+    method(vm, abProto, "transferToFixedLength", arrayBufferTransfer, 0, reinterpret_cast<void*>(1));
     method(vm, abProto, "slice", arrayBufferSlice, 2);
     abProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("ArrayBuffer")), attr::kConfigurable);
 
@@ -997,6 +1452,23 @@ void installTypedArrays(VM& vm)
         release(toJSValue(proto));
     }
     release(toJSValue(taProto));
+
+    // Uint8Array text.
+    {
+        JSObject* u8 = vm.protos.typedArrays[std::size_t(ElemKind::Uint8)];
+        method(vm, u8, "toBase64", bytesToBase64, 0);
+        method(vm, u8, "toHex", bytesToHex, 0);
+        method(vm, u8, "setFromBase64", bytesFromBase64, 1, reinterpret_cast<void*>(1));
+        method(vm, u8, "setFromHex", bytesFromHex, 1, reinterpret_cast<void*>(1));
+        Key ck = vm.internKey(std::string_view("constructor"));
+        JSValue* ctorSlot = u8->findOwn(vm, ck);
+        detail::decRef(ck);
+        if (ctorSlot && isObject(*ctorSlot)) {
+            JSObject* u8ctor = asObject(*ctorSlot);
+            method(vm, u8ctor, "fromBase64", bytesFromBase64, 1);
+            method(vm, u8ctor, "fromHex", bytesFromHex, 1);
+        }
+    }
 
     // DataView.
     JSObject* dvProto = vm.newObject(objectProto);

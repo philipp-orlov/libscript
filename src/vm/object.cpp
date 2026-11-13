@@ -37,16 +37,50 @@ BufferState::~BufferState()
     }
 }
 
-JSObject* VM::newArrayBuffer(std::size_t bytes)
+void BufferState::refreshViews() noexcept
 {
-    if (bytes > (std::size_t(1) << 31)) {
+    for (JSTypedArray* t : views) {
+        const std::size_t esz = kElemSize[std::size_t(t->kind)];
+        t->data = data ? data + t->byteOffset : nullptr;
+        if (detached || t->byteOffset > size) {
+            t->length = 0;
+        } else if (t->tracking) {
+            t->length = std::uint32_t((size - t->byteOffset) / esz);
+        } else {
+            t->length = t->byteOffset + std::size_t(t->fixedLength) * esz <= size ? t->fixedLength : 0;
+        }
+    }
+}
+
+void forgetView(JSTypedArray* view) noexcept
+{
+    if (!isObject(view->buffer))
+        return;
+    Rare* r = asObject(view->buffer)->rare();
+    if (!r || !r->ext)
+        return;
+    auto& views = static_cast<BufferState*>(r->ext)->views;
+    for (std::size_t i = 0; i < views.size(); ++i)
+        if (views[i] == view) {
+            views[i] = views.back();
+            views.pop_back();
+            return;
+        }
+}
+
+JSObject* VM::newArrayBuffer(std::size_t bytes, std::size_t maxBytes, bool resizable)
+{
+    const std::size_t capacity = resizable ? maxBytes : bytes;
+    if (capacity > (std::size_t(1) << 31)) {
         throwError(ErrorCode::RangeError, "Array buffer allocation failed");
         return nullptr;
     }
-    ctx.reserve(bytes);
+    ctx.reserve(capacity);
     auto* state = new BufferState();
     state->vm = this;
-    state->data = static_cast<std::uint8_t*>(std::calloc(bytes ? bytes : 1, 1));
+    state->resizable = resizable;
+    state->capacity = capacity;
+    state->data = static_cast<std::uint8_t*>(std::calloc(capacity ? capacity : 1, 1));
     if (!state->data) {
         delete state;
         throwError(ErrorCode::RangeError, "Array buffer allocation failed");
@@ -70,8 +104,11 @@ JSTypedArray* VM::newTypedArray(JSObject* proto, ElemKind kind, JSObject* buffer
     t->length = length;
     t->kind = kind;
     t->byteOffset = byteOffset;
+    t->fixedLength = length;
+    t->tracking = false;
     t->buffer = toJSValue(buffer);
     detail::incRef(reinterpret_cast<CellPtr>(buffer));
+    state->views.push_back(t);
     return t;
 }
 

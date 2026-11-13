@@ -209,6 +209,27 @@ NATIVE(dateSetter)
     return JSValue::boxNumber(d->tv);
 }
 
+NATIVE(dateSetYear)
+{
+    UNUSED();
+    DateState* d = thisDate(vm, self);
+    if (!d)
+        return JSValue::exception();
+    double y;
+    if (!numberOf(vm, args, argc, 0, &y))
+        return JSValue::exception();
+    if (std::isnan(y)) {
+        d->tv = dc::kNaN;
+        return JSValue::boxNumber(d->tv);
+    }
+    const double yi = std::trunc(y);
+    const double year = yi >= 0 && yi <= 99 ? yi + 1900 : y;
+    const double t = std::isnan(d->tv) ? 0 : dc::localTime(d->tv);
+    const double day = dc::makeDay(year, dc::monthFromTime(t), dc::dateFromTime(t));
+    d->tv = dc::timeClip(dc::utcOf(dc::makeDate(day, dc::timeWithinDay(t))));
+    return JSValue::boxNumber(d->tv);
+}
+
 NATIVE(dateSetTime)
 {
     UNUSED();
@@ -312,6 +333,7 @@ void installDate(VM& vm)
     method(vm, proto, "valueOf", dateGetTime, 0);
     method(vm, proto, "getTimezoneOffset", dateTimezoneOffset, 0);
     method(vm, proto, "getYear", dateGetYear, 0);
+    method(vm, proto, "setYear", dateSetYear, 1);
     struct Get
     {
         const char* name;

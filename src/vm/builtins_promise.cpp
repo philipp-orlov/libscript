@@ -71,6 +71,41 @@ JSValue newPromiseObject(VM& vm, JSObject* proto = nullptr)
     return keep.take();
 }
 
+/// The prototype of what `new C()` makes when `C` is a subclass of Promise: Promise's own when it is not one.
+JSObject* promiseProtoOf(VM& vm, JSValue ctor)
+{
+    if (!isFunction(ctor))
+        return vm.protos.promise;
+    JSValue p = getProperty(vm, ctor, vm.atoms.prototype);
+    if (p.isException()) {
+        vm.clearException();
+        return vm.protos.promise;
+    }
+    JSObject* out = isObject(p) ? asObject(p) : vm.protos.promise;
+    release(p);
+    return out;
+}
+
+/// An `AggregateError` for the reasons `results` holds, owned.
+JSValue makeAggregateError(VM& vm, JSValue results)
+{
+    Key name = vm.internKey(std::string_view("AggregateError"));
+    JSValue* slot = vm.global->findOwn(vm, name);
+    detail::decRef(name);
+    if (slot && isFunction(*slot)) {
+        JSValue args[2] = {results, makeString(vm, std::string_view("All promises were rejected"))};
+        JSValue r = vm.construct(*slot, args, 2);
+        release(args[1]);
+        if (!r.isException())
+            return r;
+        vm.clearException();
+    }
+    JSValue err = vm.makeError(ErrorCode::Exception, "All promises were rejected");
+    retain(results);
+    asObject(err)->putOwn(vm, vm.internKey(std::string_view("errors")), results, attr::kWritable | attr::kConfigurable);
+    return err;
+}
+
 /// The pending exception as a value of its own; the VM has none pending afterwards.
 JSValue takeException(VM& vm)
 {
@@ -288,7 +323,16 @@ NATIVE(promiseThen)
     UNUSED();
     if (!dataOf(self))
         return typeError(vm, "Promise.prototype.then called on incompatible receiver " + describe(vm, self));
-    JSValue derived = newPromiseObject(vm);
+    // The promise `then` makes is of the class of `this.constructor`.
+    JSObject* derivedProto = vm.protos.promise;
+    if (asObject(self)->proto(vm) != vm.protos.promise) {
+        JSValue ctor = getProperty(vm, self, vm.atoms.constructor);
+        if (ctor.isException())
+            return ctor;
+        derivedProto = promiseProtoOf(vm, ctor);
+        release(ctor);
+    }
+    JSValue derived = newPromiseObject(vm, derivedProto);
     Handle keep = Handle::adopt(derived);
     performThen(vm, self, arg(args, argc, 0), arg(args, argc, 1), derived);
     return keep.take();
@@ -365,14 +409,59 @@ NATIVE(promiseFinally)
 NATIVE(promiseResolveStatic)
 {
     UNUSED();
-    return promiseResolve(vm, arg(args, argc, 0));
+    JSObject* proto = promiseProtoOf(vm, self);
+    const JSValue v = arg(args, argc, 0);
+    if (dataOf(v) && asObject(v)->proto(vm) == proto) {
+        retain(v);
+        return v;
+    }
+    JSValue p = newPromiseObject(vm, proto);
+    resolvePromise(vm, p, v);
+    return p;
 }
 
 NATIVE(promiseRejectStatic)
 {
     UNUSED();
-    JSValue p = newPromiseObject(vm);
+    JSValue p = newPromiseObject(vm, promiseProtoOf(vm, self));
     rejectPromise(vm, p, arg(args, argc, 0));
+    return p;
+}
+
+NATIVE(promiseWithResolvers)
+{
+    UNUSED();
+    JSValue p = newPromiseObject(vm, promiseProtoOf(vm, self));
+    Handle promise = Handle::adopt(p);
+    Handle resolve, reject;
+    makeResolvers(vm, p, &resolve, &reject);
+    JSObject* out = vm.newObject(vm.protos.object);
+    Handle keep = Handle::adopt(toJSValue(out));
+    value(vm, out, "promise", (retain(p), p), attr::kDefault);
+    value(vm, out, "resolve", (retain(resolve.get()), resolve.get()), attr::kDefault);
+    value(vm, out, "reject", (retain(reject.get()), reject.get()), attr::kDefault);
+    return keep.take();
+}
+
+NATIVE(promiseTry)
+{
+    UNUSED();
+    JSValue p = newPromiseObject(vm, promiseProtoOf(vm, self));
+    Handle promise = Handle::adopt(p);
+    if (!isFunction(arg(args, argc, 0))) {
+        vm.throwError(ErrorCode::TypeError, describe(vm, arg(args, argc, 0)) + " is not a function");
+    } else {
+        JSValue r = vm.call(args[0], JSValue::undefined(), args + 1, argc - 1);
+        if (!r.isException()) {
+            resolvePromise(vm, p, r);
+            release(r);
+            retain(p);
+            return p;
+        }
+    }
+    Handle reason = Handle::adopt(takeException(vm));
+    rejectPromise(vm, p, reason.get());
+    retain(p);
     return p;
 }
 
@@ -411,12 +500,8 @@ NATIVE(combinatorElement)
     if (remaining == 0) {
         const JSValue promise = record->at(2);
         if (mode == 2) {
-            JSValue err = vm.makeError(ErrorCode::Exception, "All promises were rejected");
+            JSValue err = makeAggregateError(vm, toJSValue(results));
             Handle errKeep = Handle::adopt(err);
-            asObject(err)->putOwn(vm, vm.internKey(std::string_view("name")), makeString(vm, std::string_view("AggregateError")),
-                                  attr::kWritable | attr::kConfigurable);
-            retain(toJSValue(results));
-            asObject(err)->putOwn(vm, vm.internKey(std::string_view("errors")), toJSValue(results), attr::kWritable | attr::kConfigurable);
             rejectPromise(vm, promise, err);
         } else {
             settle(vm, promise, PromiseData::Fulfilled, toJSValue(results));
@@ -443,7 +528,7 @@ NATIVE(promiseCombinator)
 {
     UNUSED();
     const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 all, 1 allSettled, 2 any, 3 race
-    JSValue derived = newPromiseObject(vm);
+    JSValue derived = newPromiseObject(vm, promiseProtoOf(vm, self));
     Handle derivedKeep = Handle::adopt(derived);
     JSArray* results = vm.newArray(vm.protos.array);
     Handle resultsKeep = Handle::adopt(toJSValue(results));
@@ -503,12 +588,8 @@ NATIVE(promiseCombinator)
         record->setAt(vm, 1, JSValue::int32(remaining));
         if (remaining == 0) {
             if (mode == 2) {
-                JSValue err = vm.makeError(ErrorCode::Exception, "All promises were rejected");
+                JSValue err = makeAggregateError(vm, resultsKeep.get());
                 Handle errKeep = Handle::adopt(err);
-                asObject(err)->putOwn(vm, vm.internKey(std::string_view("name")), makeString(vm, std::string_view("AggregateError")),
-                                      attr::kWritable | attr::kConfigurable);
-                retain(resultsKeep.get());
-                asObject(err)->putOwn(vm, vm.internKey(std::string_view("errors")), resultsKeep.get(), attr::kWritable | attr::kConfigurable);
                 rejectPromise(vm, derived, err);
             } else {
                 settle(vm, derived, PromiseData::Fulfilled, resultsKeep.get());
@@ -842,6 +923,8 @@ void installPromise(VM& vm)
     method(vm, ctor, "allSettled", promiseCombinator, 1, reinterpret_cast<void*>(1));
     method(vm, ctor, "any", promiseCombinator, 1, reinterpret_cast<void*>(2));
     method(vm, ctor, "race", promiseCombinator, 1, reinterpret_cast<void*>(3));
+    method(vm, ctor, "withResolvers", promiseWithResolvers, 0);
+    method(vm, ctor, "try", promiseTry, 1);
     method(vm, vm.global, "queueMicrotask", [](VM& vm2, JSValue, const JSValue* args, std::uint32_t argc, void*) -> JSValue {
         if (!isFunction(arg(args, argc, 0)))
             return typeError(vm2, "The callback must be a function");

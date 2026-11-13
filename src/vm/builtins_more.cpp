@@ -60,6 +60,12 @@ void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
             if (!a->elems[i].isHole())
                 indexed.push_back({i, nullptr});
     }
+    if (strings && o->cls() == ObjClass::String) {
+        JSValue text = unwrapped(toJSValue(o), ObjClass::String);
+        if (isString(text))
+            for (std::uint32_t i = 0; i < asString(text)->length; ++i)
+                indexed.push_back({i, nullptr});
+    }
     o->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue) {
         if (onlyEnumerable && !(attrs & attr::kEnumerable))
             return;
@@ -133,6 +139,22 @@ bool ownDescriptor(VM& vm, JSObject* o, Key key, OwnDesc& out)
             out.attrs = attr::kDefault;
             out.value = Handle::adopt(typedGet(vm, t, index));
             return true;
+        }
+    }
+    if (o->cls() == ObjClass::String) {
+        JSValue text = unwrapped(toJSValue(o), ObjClass::String);
+        std::uint32_t index;
+        if (isString(text)) {
+            if (key == vm.atoms.length) {
+                out.attrs = 0;
+                out.value = Handle::adopt(JSValue::boxNumber(double(asString(text)->length)));
+                return true;
+            }
+            if (arrayIndexOf(key, &index) && index < asString(text)->length) {
+                out.attrs = attr::kEnumerable;
+                out.value = Handle::adopt(makeString(vm, asString(text)->text().substr(index, 1)));
+                return true;
+            }
         }
     }
     if (hasElems(o)) {
@@ -875,6 +897,7 @@ NATIVE(stringIdentity)
 NATIVE(numberFormat)
 {
     UNUSED();
+    self = unwrapped(self, ObjClass::Number);
     if (!self.isNumber())
         return typeError(vm, "Number.prototype method requires that 'this' be a Number");
     const double d = self.asNumber();
@@ -981,6 +1004,7 @@ NATIVE(bigintAsNFn)
 NATIVE(bigintToStringFn)
 {
     UNUSED();
+    self = unwrapped(self, ObjClass::BigInt);
     if (!isBigInt(self))
         return typeError(vm, "BigInt.prototype.toString requires that 'this' be a BigInt");
     bool ok;
@@ -995,6 +1019,7 @@ NATIVE(bigintToStringFn)
 NATIVE(bigintValueOfFn)
 {
     UNUSED();
+    self = unwrapped(self, ObjClass::BigInt);
     if (!isBigInt(self))
         return typeError(vm, "BigInt.prototype.valueOf requires that 'this' be a BigInt");
     retain(self);

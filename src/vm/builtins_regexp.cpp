@@ -314,6 +314,40 @@ NATIVE(regexpCtor)
     return keep.take();
 }
 
+NATIVE(regexpCompile)
+{
+    UNUSED();
+    if (!dataOf(self))
+        return typeError(vm, "RegExp.prototype.compile requires that 'this' be a RegExp object");
+    const JSValue pattern = arg(args, argc, 0), flags = arg(args, argc, 1);
+    String source, flagText;
+    if (RegExpData* d = dataOf(pattern)) {
+        if (!flags.isUndefined())
+            return typeError(vm, "flags must be undefined when the pattern is a RegExp");
+        source = d->source;
+        flagText = flagString(d->flags);
+    } else {
+        if (!pattern.isUndefined()) {
+            JSValue t = toStringValue(vm, pattern);
+            if (t.isException())
+                return t;
+            source = String(asString(t)->text());
+            release(t);
+        }
+        if (!flags.isUndefined()) {
+            JSValue t = toStringValue(vm, flags);
+            if (t.isException())
+                return t;
+            flagText = String(asString(t)->text());
+            release(t);
+        }
+    }
+    if (!initialize(vm, asObject(self), StringView(source), StringView(flagText)))
+        return JSValue::exception();
+    retain(self);
+    return self;
+}
+
 NATIVE(regexpExec)
 {
     UNUSED();
@@ -771,6 +805,7 @@ void installRegExp(VM& vm)
     JSFunction* ctor = constructor(vm, "RegExp", regexpCtor, 2, proto);
     (void)ctor;
     method(vm, proto, "exec", regexpExec, 1);
+    method(vm, proto, "compile", regexpCompile, 2);
     method(vm, proto, "test", regexpTest, 1);
     method(vm, proto, "toString", regexpToString, 0);
     symbolMethod(vm, proto, vm.atoms.symMatch, "[Symbol.match]", regexpMatch, 1);

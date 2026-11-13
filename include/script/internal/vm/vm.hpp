@@ -8,6 +8,7 @@
 #include <deque>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <string_view>
 
 #include "mem/local_heap.hpp"
@@ -75,6 +76,8 @@ struct Atoms
     Key symReplace = nullptr;
     Key symSearch = nullptr;
     Key symSplit = nullptr;
+    Key symIsConcatSpreadable = nullptr;
+    Key symUnscopables = nullptr;
 };
 
 /// The prototypes of what a primitive is read through. Null until something installs them; a property read on a
@@ -101,6 +104,7 @@ struct Intrinsics
     JSObject* asyncGenerator = nullptr;
     JSObject* arguments = nullptr;       ///< what the `arguments` of a call inherits from
     JSObject* arrayBuffer = nullptr;
+    JSObject* sharedArrayBuffer = nullptr;
     JSObject* typedArrays[16] = {};  ///< by ElemKind
 };
 
@@ -138,6 +142,9 @@ struct VM : EngineRuntime
 
     void releaseRoots() noexcept override;
     void afterCollect() noexcept override;
+    void collectCycles(bool minor) noexcept override;
+    std::uint64_t ownedBytes() const noexcept override { return ownedBytes_; }
+    std::uint64_t ownedBytes_ = 0;
     std::string captureStack() const override;
 
     // ---- cells ----
@@ -175,7 +182,8 @@ struct VM : EngineRuntime
     JSArray* newArray(JSObject* proto, std::uint32_t length = 0, std::uint32_t capacity = 0);
     Box* newBox(JSValue ownedValue);
     /// An ArrayBuffer of `bytes` zeros; owned, or null with a RangeError pending when it cannot be had.
-    JSObject* newArrayBuffer(std::size_t bytes);
+    /// A zeroed buffer of `bytes`; a resizable one has room for `maxBytes`. Null with an exception pending.
+    JSObject* newArrayBuffer(std::size_t bytes, std::size_t maxBytes = 0, bool resizable = false);
     /// A typed array over `buffer` (an ArrayBuffer object, which it counts) from `byteOffset`, `length` elements.
     JSTypedArray* newTypedArray(JSObject* proto, ElemKind kind, JSObject* buffer, std::uint32_t byteOffset, std::uint32_t length);
     GetterSetter* newGetterSetter(JSValue getter, JSValue setter);
@@ -283,6 +291,9 @@ struct VM : EngineRuntime
     JSValue evalSource(std::string_view source, std::string_view name);
     /// A direct `eval` of `source` from the function running now, which sees that function's variables.
     JSValue evalDirect(JSValue source);
+    /// The script side of each host class (`Class<T>`): its constructor (or the object of a static class) and its prototype,
+    /// each holding a count. Keyed by the class record.
+    std::unordered_map<const void*, std::pair<JSObject*, JSObject*>> hostBindings;
     /// Set by `SetEvalScope` just before a call that may be a direct `eval`.
     const CodeBlock* evalCode = nullptr;
     std::uint32_t evalIndex = 0;

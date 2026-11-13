@@ -63,6 +63,7 @@ Value runProgram(ContextImpl& ctx, CompiledUnit& unit, const std::vector<Value>&
     if (!program.code)
         throw Error(ErrorCode::InvalidOperation, "the program's context has ended");
     ContextImpl::ActiveEngine active(ctx, EngineKind::Vm);
+    host::syncHostClasses(ctx);
     JSFunction* main = vm.newFunction(vm.protos.function, program.code, nullptr, 0);
     Handle keep = Handle::adopt(toJSValue(main));
     JSValue result = vm.call(keep.get(), toJSValue(vm.global), nullptr, 0);

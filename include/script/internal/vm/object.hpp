@@ -179,6 +179,21 @@ struct JSTypedArray : JSObject
     ElemKind kind;
     JSValue buffer;        ///< the ArrayBuffer object, counted
     std::uint32_t byteOffset;
+    std::uint32_t fixedLength;  ///< the length it was made with
+    bool tracking;              ///< made without a length on a resizable buffer: it follows the buffer's size
+};
+
+/// What the wrapper object of a primitive (`new Number(1)`, `Object('x')`) keeps: the primitive.
+struct PrimitiveBox : NativeState
+{
+    JSValue value = JSValue::undefined();
+    ~PrimitiveBox() override { release(value); }
+    void values(std::vector<JSValue>& out) const override { out.push_back(value); }
+    void clear(VM&) noexcept override
+    {
+        release(value);
+        value = JSValue::undefined();
+    }
 };
 
 /// What a proxy's object keeps: where its operations go when its handler has no trap, and the handler (null once revoked).
@@ -208,10 +223,20 @@ struct ProxyState : NativeState
 struct BufferState : NativeState
 {
     std::uint8_t* data = nullptr;
-    std::size_t size = 0;
+    std::size_t size = 0;      ///< the byte length
+    std::size_t capacity = 0;  ///< what `data` holds: the size, or the maximum of a resizable buffer
+    bool resizable = false;
+    bool detached = false;
+    bool shared = false;       ///< a SharedArrayBuffer
     VM* vm = nullptr;
+    std::vector<JSTypedArray*> views;  ///< the typed arrays on this buffer, to follow a resize or a detach
     ~BufferState() override;
+    /// Give each view the length the current size leaves it (none when it no longer fits, or the buffer is detached).
+    void refreshViews() noexcept;
 };
+
+/// Take a typed array off its buffer's list of views.
+void forgetView(JSTypedArray* view) noexcept;
 
 struct Box
 {
@@ -257,6 +282,15 @@ inline bool isObject(JSValue v) noexcept
 inline bool hasElems(const JSObject* o) noexcept
 {
     return o->cls() == ObjClass::Array || o->cls() == ObjClass::Arguments;
+}
+
+/// The primitive a wrapper object of class `cls` stands for; anything else as it is.
+inline JSValue unwrapped(JSValue v, ObjClass cls) noexcept
+{
+    if (isObject(v) && asObject(v)->cls() == cls)
+        if (Rare* r = asObject(v)->rare(); r && r->ext)
+            return static_cast<PrimitiveBox*>(r->ext)->value;
+    return v;
 }
 
 inline bool hasElems(JSValue v) noexcept

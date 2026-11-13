@@ -234,6 +234,7 @@ NATIVE(generatorResume)
 
 dyn::SymbolCell* thisSymbol(VM& vm, JSValue self)
 {
+    self = unwrapped(self, ObjClass::Symbol);
     if (isSymbol(self))
         return static_cast<dyn::SymbolCell*>(self.asCell());
     typeError(vm, "Symbol.prototype method called on an incompatible receiver");
@@ -269,6 +270,7 @@ NATIVE(symbolValueOf)
     UNUSED();
     if (!thisSymbol(vm, self))
         return JSValue::exception();
+    self = unwrapped(self, ObjClass::Symbol);
     retain(self);
     return self;
 }
@@ -382,7 +384,8 @@ void installSymbolAndIterators(VM& vm)
                           Well{"hasInstance", vm.atoms.symHasInstance}, Well{"species", vm.atoms.symSpecies},
                           Well{"match", vm.atoms.symMatch}, Well{"matchAll", vm.atoms.symMatchAll},
                           Well{"replace", vm.atoms.symReplace}, Well{"search", vm.atoms.symSearch},
-                          Well{"split", vm.atoms.symSplit}}) {
+                          Well{"split", vm.atoms.symSplit}, Well{"isConcatSpreadable", vm.atoms.symIsConcatSpreadable},
+                          Well{"unscopables", vm.atoms.symUnscopables}}) {
         retain(JSValue::cell(w.key));
         value(vm, ctor, w.name, JSValue::cell(w.key), 0);
     }

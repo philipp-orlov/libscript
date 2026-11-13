@@ -3,6 +3,8 @@
 
 #include "script/internal/vm/host.hpp"
 
+#include <algorithm>
+#include <memory>
 #include <mutex>
 
 #include "script/internal/vm/convert.hpp"
@@ -139,6 +141,13 @@ std::vector<JSValue> argsOf(VM& vm, const std::vector<Value>& args, std::vector<
 }
 
 }  // namespace
+
+std::string inspectValue(VM& vm, JSValue v)
+{
+    std::string out;
+    render(vm, v, 0, out);
+    return out;
+}
 
 ContextImpl& contextOf(const Value& v) noexcept
 {
@@ -378,6 +387,44 @@ void defineProperty(const Value& v, std::string_view key, const Value& value, Pr
         throw Error(ErrorCode::TypeError, "Cannot redefine property: " + std::string(key));
 }
 
+void defineAccessor(const Value& v, std::string_view key, const Value& getterFn, const Value& setterFn, PropertyFlags flags)
+{
+    VM& vm = vmFor(v);
+    Locked lock(vm.ctx);
+    JSObject* o = asObject(JSValue::cell(detail::Access::ptr(v)));
+    Handle getter = Handle::adopt(fromValue(vm, getterFn));
+    Handle setter = Handle::adopt(fromValue(vm, setterFn));
+    Key k = keyOf(vm, key);
+    const bool ok = vm::defineAccessor(vm, o, k, getter.get(), setter.get(), std::uint8_t(std::uint8_t(flags) & ~attr::kWritable));
+    detail::decRef(k);
+    if (!ok)
+        throw Error(ErrorCode::TypeError, "Cannot redefine property: " + std::string(key));
+}
+
+std::string toJson(const Value& v, int indent)
+{
+    VM& vm = vmFor(v);
+    Locked lock(vm.ctx);
+    Key json = keyOf(vm, "JSON"), stringify = keyOf(vm, "stringify");
+    JSValue object = getProperty(vm, toJSValue(vm.global), json);
+    detail::decRef(json);
+    if (object.isException())
+        raisePending(vm);
+    Handle objectKeep = Handle::adopt(object);
+    JSValue fn = getProperty(vm, object, stringify);
+    detail::decRef(stringify);
+    if (fn.isException())
+        raisePending(vm);
+    Handle fnKeep = Handle::adopt(fn);
+    Handle value = Handle::adopt(fromValue(vm, v));
+    const JSValue args[3] = {value.get(), JSValue::undefined(), JSValue::int32(indent < 0 ? 0 : indent > 10 ? 10 : indent)};
+    JSValue r = vm.call(fn, object, args, 3);
+    if (r.isException())
+        raisePending(vm);
+    Handle result = Handle::adopt(r);
+    return isString(r) ? toUtf8(asString(r)->text()) : std::string();
+}
+
 Value prototype(const Value& v)
 {
     VM& vm = vmFor(v);
@@ -469,6 +516,318 @@ void raisePending(VM& vm)
     }
     Value value = toValue(vm, thrown);
     throw Exception(code, message, value, std::string());
+}
+
+
+// ---------------------------------------------------------------- what Context makes ---
+
+namespace {
+
+/// A function the host gave (a `NativeFunction`), kept with the function object that calls it.
+struct HostFunction : NativeState
+{
+    NativeFunction fn;
+};
+
+/// The C++ instance a wrapper object stands for: what `Context::native` and `attachNative` set.
+struct HostInstance : NativeState
+{
+    const void* typeKey = nullptr;
+    void* data = nullptr;
+    void* owner = nullptr;
+    Context::Finalizer finalizer = nullptr;
+    ~HostInstance() override
+    {
+        if (finalizer) {
+            Context::Finalizer run = finalizer;
+            finalizer = nullptr;
+            run(owner ? owner : data);
+        }
+    }
+};
+
+/// What a host function does with an exception of its own.
+JSValue hostCall(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc, void* data)
+{
+    auto* state = static_cast<HostFunction*>(data);
+    ContextImpl& ctx = vm.ctx;
+    ContextImpl::ArgBuffer buffer(ctx);
+    std::vector<Value>& values = buffer.args;
+    values.reserve(argc);
+    for (std::uint32_t i = 0; i < argc; ++i)
+        values.push_back(toValue(vm, args[i]));
+    const Value thisValue = toValue(vm, self);
+    const bool isNew = !vm.newTarget.isUndefined();
+    CallInfo info = detail::Access::makeCallInfo(ctx.owner, &thisValue, &values, isNew);
+    ContextImpl::ActiveEngine active(ctx, EngineKind::Vm);
+    try {
+        const Value result = state->fn(info);
+        return fromValue(vm, result);
+    } catch (const Exception& e) {
+        vm.clearException();
+        vm.exception = fromValue(vm, e.value());
+        vm.exceptionCode = e.code();
+    } catch (const Error& e) {
+        vm.throwError(e.code(), e.what());
+    } catch (const std::exception& e) {
+        vm.throwError(ErrorCode::InternalError, e.what());
+    }
+    return JSValue::exception();
+}
+
+/// A function object for `fn`, with the count its creation gave.
+JSFunction* newHostFunction(VM& vm, std::string_view name, NativeFunction fn, int arity)
+{
+    auto holder = std::make_unique<HostFunction>();
+    holder->fn = std::move(fn);
+    HostFunction* state = holder.get();
+    Key key = vm.internKey(fromUtf8(name));
+    JSFunction* f = vm.newNativeFunction(vm.protos.function, hostCall, state, key, std::uint32_t(arity < 0 ? 0 : arity));
+    detail::decRef(key);
+    f->rareOf(vm).ext = holder.release();
+    // What a host hands over may well be called with `new`.
+    f->flags |= JSFunction::kConstructor;
+    return f;
+}
+
+Value adopt(VM& vm, JSValue created)
+{
+    Value out = toValue(vm, created);
+    release(created);
+    return out;
+}
+
+HostInstance* instanceOf(JSValue v) noexcept
+{
+    if (!isObject(v))
+        return nullptr;
+    Rare* r = asObject(v)->rare();
+    return r && r->ext ? dynamic_cast<HostInstance*>(r->ext) : nullptr;
+}
+
+void installMember(VM& vm, JSObject* target, JSObject* proto, const HostClassInfo::Member& member)
+{
+    const HostMember& spec = member.spec;
+    const int arity = int(spec.csharpParams.size());
+    JSObject* where = spec.isStatic || spec.kind == HostMember::Constant ? target : proto;
+    if (spec.kind == HostMember::Constructor) {
+        auto* ctor = static_cast<JSFunction*>(target);
+        static_cast<HostFunction*>(ctor->rareOf(vm).ext)->fn = member.fn;
+        ctor->rareOf(vm).fnLength = std::uint32_t(arity);
+        if (!(ctor->flags & JSFunction::kLazyProps)) {
+            Key k = vm.atoms.length;
+            if (JSValue* slot = ctor->findOwn(vm, k))
+                *slot = JSValue::int32(arity);
+        }
+        return;
+    }
+    if (!where)
+        return;
+    Key key = vm.internKey(fromUtf8(spec.name));
+    if (spec.kind == HostMember::Method) {
+        JSFunction* f = newHostFunction(vm, spec.name, member.fn, arity);
+        where->putOwn(vm, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
+    } else {
+        JSFunction* getter = newHostFunction(vm, "get " + spec.name, member.fn, 0);
+        Handle getterKeep = Handle::adopt(toJSValue(getter));
+        JSValue setter = JSValue::undefined();
+        Handle setterKeep;
+        if (member.setter) {
+            JSFunction* s = newHostFunction(vm, "set " + spec.name, member.setter, 1);
+            setterKeep = Handle::adopt(toJSValue(s));
+            setter = toJSValue(s);
+        }
+        defineAccessor(vm, where, key, toJSValue(getter), setter, attr::kConfigurable | attr::kEnumerable);
+    }
+    detail::decRef(key);
+}
+
+}  // namespace
+
+void syncHostClasses(ContextImpl& ctx)
+{
+    VM& vm = ctx.vm();
+    for (auto& owned : ctx.hostClasses) {
+        HostClassInfo& info = *owned;
+        auto it = vm.hostBindings.find(&info);
+        if (it == vm.hostBindings.end()) {
+            JSObject* target;
+            JSObject* proto = nullptr;
+            if (info.typeKey) {
+                proto = vm.newObject(vm.protos.object);
+                JSFunction* ctor = newHostFunction(
+                    vm, info.name, [](CallInfo& ci) -> Value { ci.fail(ErrorCode::TypeError, "this class has no constructor"); }, 0);
+                ctor->materialize(vm);
+                detail::incRef(reinterpret_cast<CellPtr>(proto));
+                ctor->putOwn(vm, vm.atoms.prototype, toJSValue(proto), 0);
+                detail::incRef(reinterpret_cast<CellPtr>(ctor));
+                proto->putOwn(vm, vm.atoms.constructor, toJSValue(ctor), attr::kWritable | attr::kConfigurable);
+                target = ctor;
+            } else {
+                target = vm.newObject(vm.protos.object);
+            }
+            Key name = vm.internKey(fromUtf8(info.name));
+            detail::incRef(reinterpret_cast<CellPtr>(target));
+            vm.global->putOwn(vm, name, toJSValue(target), attr::kWritable | attr::kConfigurable);
+            detail::decRef(name);
+            it = vm.hostBindings.emplace(&info, std::make_pair(target, proto)).first;
+        }
+        std::size_t& done = info.installed[std::size_t(EngineKind::Vm) - 1];
+        for (; done < info.members.size(); ++done)
+            installMember(vm, it->second.first, it->second.second, info.members[done]);
+    }
+}
+
+Value global(ContextImpl& ctx)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    syncHostClasses(ctx);
+    return toValue(vm, toJSValue(vm.global));
+}
+
+Value makeSymbol(ContextImpl& ctx, std::string_view description)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    return adopt(vm, vm.newSymbol(fromUtf8(description), true));
+}
+
+Value makeObject(ContextImpl& ctx)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    return adopt(vm, toJSValue(vm.newObject(vm.protos.object)));
+}
+
+Value makeArray(ContextImpl& ctx, std::size_t reserve)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    return adopt(vm, toJSValue(vm.newArray(vm.protos.array, 0, std::uint32_t(std::min<std::size_t>(reserve, 1u << 20)))));
+}
+
+Value makeArray(ContextImpl& ctx, const std::vector<Value>& items)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    JSArray* a = vm.newArray(vm.protos.array, 0, std::uint32_t(items.size()));
+    Handle keep = Handle::adopt(toJSValue(a));
+    for (const Value& item : items)
+        a->append(vm, fromValue(vm, item));
+    return toValue(vm, keep.get());
+}
+
+Value makeFunction(ContextImpl& ctx, std::string_view name, NativeFunction fn, int arity)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    return adopt(vm, toJSValue(newHostFunction(vm, name, std::move(fn), arity)));
+}
+
+Value makeException(ContextImpl& ctx, ErrorCode code, std::string_view message)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    return adopt(vm, vm.makeError(code, message));
+}
+
+Value parseJson(ContextImpl& ctx, std::string_view text)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    Key json = keyOf(vm, "JSON"), parse = keyOf(vm, "parse");
+    JSValue object = getProperty(vm, toJSValue(vm.global), json);
+    detail::decRef(json);
+    if (object.isException())
+        raisePending(vm);
+    Handle objectKeep = Handle::adopt(object);
+    JSValue fn = getProperty(vm, object, parse);
+    detail::decRef(parse);
+    if (fn.isException())
+        raisePending(vm);
+    Handle fnKeep = Handle::adopt(fn);
+    Handle source = Handle::adopt(makeString(vm, std::string_view(text)));
+    const JSValue arg0 = source.get();
+    JSValue r = vm.call(fn, object, &arg0, 1);
+    return finish(vm, r);
+}
+
+Value hostWrapper(ContextImpl& ctx, const void* typeKey, void* instance, Context::Finalizer finalizer, void* owner)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    syncHostClasses(ctx);
+    JSObject* proto = vm.protos.object;
+    if (const HostClassInfo* info = ctx.hostClassForKey(typeKey)) {
+        const auto it = vm.hostBindings.find(info);
+        if (it != vm.hostBindings.end() && it->second.second)
+            proto = it->second.second;
+    }
+    JSObject* o = vm.newObject(proto);
+    Handle keep = Handle::adopt(toJSValue(o));
+    auto state = std::make_unique<HostInstance>();
+    state->typeKey = typeKey;
+    state->data = instance;
+    state->owner = owner;
+    state->finalizer = finalizer;
+    o->rareOf(vm).ext = state.release();
+    return toValue(vm, keep.get());
+}
+
+void attachNative(ContextImpl& ctx, const Value& object, const void* typeKey, void* instance, Context::Finalizer finalizer, void* owner)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    Handle self = Handle::adopt(fromValue(vm, object));
+    if (!isObject(self.get()))
+        throw Error(ErrorCode::TypeError, "attachNative needs a JavaScript object");
+    Rare& rare = asObject(self.get())->rareOf(vm);
+    if (rare.ext) {
+        delete rare.ext;
+        rare.ext = nullptr;
+    }
+    auto state = std::make_unique<HostInstance>();
+    state->typeKey = typeKey;
+    state->data = instance;
+    state->owner = owner;
+    state->finalizer = finalizer;
+    rare.ext = state.release();
+}
+
+Value hostPrototype(ContextImpl& ctx, const void* typeKey)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    syncHostClasses(ctx);
+    const HostClassInfo* info = ctx.hostClassForKey(typeKey);
+    const auto it = info ? vm.hostBindings.find(info) : vm.hostBindings.end();
+    if (it == vm.hostBindings.end() || !it->second.second)
+        throw Error(ErrorCode::TypeError, "this C++ type has no script class; bind it with Class<T> first");
+    return toValue(vm, toJSValue(it->second.second));
+}
+
+Value hostConstructor(ContextImpl& ctx, const void* typeKey)
+{
+    VM& vm = ctx.vm();
+    Locked lock(ctx);
+    syncHostClasses(ctx);
+    const HostClassInfo* info = ctx.hostClassForKey(typeKey);
+    const auto it = info ? vm.hostBindings.find(info) : vm.hostBindings.end();
+    if (it == vm.hostBindings.end())
+        throw Error(ErrorCode::TypeError, "this C++ type has no script class; bind it with Class<T> first");
+    return toValue(vm, toJSValue(it->second.first));
+}
+
+bool isNative(const Value& v) noexcept
+{
+    return instanceOf(JSValue::cell(detail::Access::ptr(v))) != nullptr;
+}
+
+void* nativeHandle(const Value& v, const void* typeKey) noexcept
+{
+    const HostInstance* i = instanceOf(JSValue::cell(detail::Access::ptr(v)));
+    return i && i->typeKey == typeKey ? i->data : nullptr;
 }
 
 }  // namespace host

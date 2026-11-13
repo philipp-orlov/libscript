@@ -813,6 +813,12 @@ private:
         }
         emit(Op::Ret, r);
     }
+    // ---------------------------------------------------------- early errors ---
+    void checkDeclarations(const std::vector<dyn::NodePtr>& statements, bool functionTop, const std::vector<String>* params = nullptr);
+    void checkDeclarations(const std::vector<const Node*>& statements, bool functionTop, const std::vector<String>* params = nullptr);
+    void checkBindingName(const String& name, const Node& at);
+    void checkParams(const Node& fn, std::vector<String>& names);
+    void checkClassMembers(const Node& cls);
     CodeBlock* programOnce(const Node& program);
     CodeBlock* evalOnce(const Node& program, const std::vector<String>& names, bool strict);
     void emitEvalScope();
@@ -864,7 +870,10 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             emit(Op::LoadNull, d);
             return d;
         }
-        case NK::Identifier: return loadVar(n.text, dst, n);
+        case NK::Identifier:
+            if (n.isPrivate && resolve(n.text).kind == Ref::Global)
+                syntaxError(n, "Private field '" + toUtf8(n.text) + "' must be declared in an enclosing class");
+            return loadVar(n.text, dst, n);
         case NK::ThisExpr: {
             checkThisBound(n);
             if (fn_->isEval && resolve(String(u"this")).kind == Ref::Global)
@@ -1198,10 +1207,52 @@ void Compiler::storeThis(std::uint16_t src)
     }
 }
 
+void Compiler::checkClassMembers(const Node& n)
+{
+    bool hasConstructor = false;
+    for (const dyn::NodePtr& m : n.list) {
+        if ((m->kind != NK::MethodDef && m->kind != NK::FieldDef) || m->computed || m->isPrivate || !m->a)
+            continue;
+        const bool isCtorName = m->a->text == u"constructor";
+        if (m->kind == NK::FieldDef) {
+            if (isCtorName || (m->isStatic && m->a->text == u"prototype"))
+                syntaxError(*m, "Classes may not have a field named '" + toUtf8(m->a->text) + "'");
+            continue;
+        }
+        if (m->isStatic && m->a->text == u"prototype")
+            syntaxError(*m, "Classes may not have a static property named 'prototype'");
+        if (m->propKind == PropKind::Constructor) {
+            if (hasConstructor)
+                syntaxError(*m, "A class may only have one constructor");
+            hasConstructor = true;
+            if (m->b->isGenerator || m->b->isAsync)
+                syntaxError(*m, "Class constructor may not be a generator or async");
+        } else if (isCtorName && !m->isStatic) {
+            syntaxError(*m, "Class constructor may not be an accessor, a generator or async");
+        }
+    }
+    // Private names: one declaration each, except a getter and a setter of the same kind of member.
+    std::map<String, int> kinds;  // 1 getter, 2 setter, 4 anything else, 8 static
+    for (const dyn::NodePtr& m : n.list) {
+        if ((m->kind != NK::MethodDef && m->kind != NK::FieldDef) || !m->isPrivate)
+            continue;
+        const String& pn = m->a->text;
+        if (pn == u"#constructor")
+            syntaxError(*m, "Classes may not have a private field named '#constructor'");
+        const int kind = m->kind == NK::MethodDef && m->propKind == PropKind::Getter ? 1
+                         : m->kind == NK::MethodDef && m->propKind == PropKind::Setter ? 2 : 4;
+        const auto seen = kinds.find(pn);
+        if (seen != kinds.end() && (kind == 4 || (seen->second & 7 & kind) || (seen->second & 4) || bool(seen->second & 8) != m->isStatic))
+            syntaxError(*m, "Identifier '" + toUtf8(pn) + "' has already been declared");
+        kinds[pn] |= kind | (m->isStatic ? 8 : 0);
+    }
+}
+
 std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferredName, bool innerBinding)
 {
     const String name = cls.text.empty() ? inferredName : cls.text;
     const bool derived = cls.a != nullptr;
+    checkClassMembers(cls);
     const Node* ctor = nullptr;
     for (const dyn::NodePtr& m : cls.list)
         if (m->kind == NK::MethodDef && m->propKind == PropKind::Constructor && !m->declared)
@@ -1569,6 +1620,10 @@ std::uint16_t Compiler::unary(const Node& n, int dst)
         }
         case Tok::Delete: {
             const Node& target = *n.a;
+            if (target.kind == NK::Identifier && fn_->strict)
+                syntaxError(n, "Delete of an unqualified identifier in strict mode.");
+            if (target.kind == NK::Member && target.computed && target.b && target.b->kind == NK::Identifier && target.b->isPrivate)
+                syntaxError(n, "Private fields can not be deleted");
             if (target.kind == NK::Member) {
                 const std::uint16_t o = exprTemp(*target.a);
                 if (target.computed) {
@@ -2303,10 +2358,101 @@ void Compiler::hoistFunctions(const std::vector<dyn::NodePtr>& list)
     }
 }
 
+/// A name declared twice in one scope, or both lexically and by a `var` that passes through it. At the top of a function or
+/// program a function declaration counts as a `var`; in a block it is lexical, and only plain ones may repeat in code that
+/// is not strict.
+void Compiler::checkDeclarations(const std::vector<dyn::NodePtr>& statements, bool functionTop, const std::vector<String>* params)
+{
+    std::vector<const Node*> plain;
+    plain.reserve(statements.size());
+    for (const dyn::NodePtr& s : statements)
+        plain.push_back(s.get());
+    checkDeclarations(plain, functionTop, params);
+}
+
+void Compiler::checkDeclarations(const std::vector<const Node*>& statements, bool functionTop, const std::vector<String>* params)
+{
+    if (statements.empty())
+        return;
+    std::set<String> lexical, plainFunctions, vars;
+    const auto declareName = [&](const String& name, const Node& at) {
+        if (!lexical.insert(name).second)
+            syntaxError(at, "Identifier '" + toUtf8(name) + "' has already been declared");
+    };
+    for (const Node* s : statements) {
+        std::vector<String> names;
+        if (s->kind == NK::VarDecl && s->varKind != VarKind::Var) {
+            for (const dyn::NodePtr& d : s->list)
+                if (d->a)
+                    collectPatternNames(*d->a, names);
+            for (const String& name : names)
+                declareName(name, *s);
+        } else if (s->kind == NK::ClassDecl) {
+            declareName(s->text, *s);
+        } else if (s->kind == NK::FunctionDecl) {
+            if (functionTop) {
+                vars.insert(s->text);
+            } else if (!fn_->strict && s->a && !s->a->isGenerator && !s->a->isAsync) {
+                if (!plainFunctions.insert(s->text).second)
+                    continue;
+                if (lexical.count(s->text))
+                    syntaxError(*s, "Identifier '" + toUtf8(s->text) + "' has already been declared");
+                lexical.insert(s->text);
+            } else {
+                declareName(s->text, *s);
+            }
+        } else {
+            collectVars(*s, names);
+            vars.insert(names.begin(), names.end());
+        }
+    }
+    for (const String& name : vars)
+        if (lexical.count(name))
+            syntaxError(*statements.front(), "Identifier '" + toUtf8(name) + "' has already been declared");
+    if (params)
+        for (const String& name : *params)
+            if (lexical.count(name))
+                syntaxError(*statements.front(), "Identifier '" + toUtf8(name) + "' has already been declared");
+}
+
+void Compiler::checkBindingName(const String& name, const Node& at)
+{
+    if (!fn_->strict)
+        return;
+    if (name == u"eval" || name == u"arguments")
+        syntaxError(at, "Unexpected eval or arguments in strict mode");
+    for (const char* word : {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"})
+        if (name == fromUtf8(word))
+            syntaxError(at, "Unexpected strict mode reserved word");
+}
+
+/// The names the parameters bind; a duplicate is an error in strict code, with a non-simple list, in an arrow and in a method.
+void Compiler::checkParams(const Node& fn, std::vector<String>& names)
+{
+    bool simple = true;
+    for (const dyn::NodePtr& p : fn.list) {
+        simple = simple && p->kind == NK::Identifier;
+        collectPatternNames(*p, names);
+    }
+    if (!simple && fn.d && hasUseStrict(*fn.d))
+        syntaxError(fn, "Illegal 'use strict' directive in function with non-simple parameter list");
+    std::set<String> seen;
+    for (const String& name : names) {
+        checkBindingName(name, fn);
+        if (!seen.insert(name).second && (fn_->strict || !simple || fn_->isArrow || fn.isMethod))
+            syntaxError(fn, "Duplicate parameter name not allowed in this context");
+    }
+    if (!fn.text.empty() && fn.kind == NK::FunctionExpr && !fn.isMethod)
+        checkBindingName(fn.text, fn);
+}
+
 void Compiler::blockScoped(const std::vector<dyn::NodePtr>& list, bool newScope)
 {
-    if (newScope)
+    if (newScope) {
+        if (!list.empty())
+            checkDeclarations(list, false);
         pushScope();
+    }
     declareLexical(list);
     hoistFunctions(list);
     statements(list);
@@ -2798,6 +2944,7 @@ void Compiler::switchStatement(const Node& n)
     for (const dyn::NodePtr& c : n.list)
         for (const dyn::NodePtr& s : c->list)
             bodies.push_back(s.get());
+    checkDeclarations(bodies, false);
     // `declareLexical` and `hoistFunctions` take owning lists; walk the cases by hand with the same rules.
     for (const Node* s : bodies) {
         if (s->kind == NK::ClassDecl) {
@@ -3186,6 +3333,11 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
         fn_->top = mark;
     }
 
+    {
+        std::vector<String> paramNames;
+        checkParams(n, paramNames);
+        checkDeclarations(n.d->list, true, &paramNames);
+    }
     // `var` names and function declarations of the whole body, then the block's own `let`s.
     std::vector<String> vars;
     collectVars(*n.d, vars);
@@ -3333,6 +3485,7 @@ CodeBlock* Compiler::programOnce(const Node& program)
             if (b.boxed)
                 emit(Op::NewBox, b.reg);
         }
+        checkDeclarations(program.list, true);
         // Declarations of the top level are properties of the global object.
         std::vector<String> vars;
         collectVars(program, vars);

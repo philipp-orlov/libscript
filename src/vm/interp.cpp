@@ -385,6 +385,8 @@ void copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
         retain(v);
         target->putOwn(vm, k, v, attr::kDefault);
     };
+    if (isObject(source) && asObject(source)->cls() == ObjClass::String)
+        source = unwrapped(source, ObjClass::String);
     if (isObject(source)) {
         JSObject* o = asObject(source);
         if (hasElems(o)) {

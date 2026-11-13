@@ -82,7 +82,9 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
                               Well{&Atoms::symHasInstance, "Symbol.hasInstance"}, Well{&Atoms::symSpecies, "Symbol.species"},
                               Well{&Atoms::symMatch, "Symbol.match"}, Well{&Atoms::symMatchAll, "Symbol.matchAll"},
                               Well{&Atoms::symReplace, "Symbol.replace"}, Well{&Atoms::symSearch, "Symbol.search"},
-                              Well{&Atoms::symSplit, "Symbol.split"}})
+                              Well{&Atoms::symSplit, "Symbol.split"},
+                              Well{&Atoms::symIsConcatSpreadable, "Symbol.isConcatSpreadable"},
+                              Well{&Atoms::symUnscopables, "Symbol.unscopables"}})
             atoms.*(w.slot) = [&] {
                 const std::string_view ascii(w.name);
                 const String text(ascii.begin(), ascii.end());

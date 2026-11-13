@@ -164,6 +164,8 @@ JSValue asyncFromSyncIterator(VM& vm, JSValue iterator, JSValue next);
 void installDate(VM& vm);
 void installTypedArrays(VM& vm);
 void installProxy(VM& vm);
+/// The URI functions, String's HTML methods and String.raw, groupBy.
+void installExtras(VM& vm);
 /// The keys a proxy's `ownKeys` trap (or its target) gives.
 bool proxyOwnKeys(VM& vm, JSObject* proxy, std::vector<Handle>& out);
 /// `getOwnPropertyDescriptor` through the proxy: a descriptor object, undefined, or the exception sentinel.

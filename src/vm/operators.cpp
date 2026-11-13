@@ -354,6 +354,17 @@ JSValue toStringValue(VM& vm, JSValue v)
     return makeString(vm, std::string_view("undefined"));
 }
 
+void wrapPrimitive(VM& vm, JSObject* o, ObjClass cls, JSValue v)
+{
+    auto* box = new PrimitiveBox();
+    retain(v);
+    box->value = v;
+    Rare& rare = o->rareOf(vm);
+    delete rare.ext;
+    rare.ext = box;
+    o->h.cls = std::uint8_t(cls);
+}
+
 JSValue toObject(VM& vm, JSValue v)
 {
     if (isObject(v)) {
@@ -362,10 +373,28 @@ JSValue toObject(VM& vm, JSValue v)
     }
     if (v.isNullish())
         return vm.throwError(ErrorCode::TypeError, "Cannot convert undefined or null to object");
-    // Wrappers for primitives are not made by this core yet: a primitive stands in for its own wrapper, since every use
-    // the interpreter has for one is a property read, and that goes through the prototype.
-    retain(v);
-    return v;
+    JSObject* proto;
+    ObjClass cls;
+    if (v.isNumber()) {
+        proto = vm.protos.number;
+        cls = ObjClass::Number;
+    } else if (v.isBool()) {
+        proto = vm.protos.boolean;
+        cls = ObjClass::Boolean;
+    } else if (isString(v)) {
+        proto = vm.protos.string;
+        cls = ObjClass::String;
+    } else if (isSymbol(v)) {
+        proto = vm.protos.symbol;
+        cls = ObjClass::Symbol;
+    } else {
+        proto = vm.protos.bigint;
+        cls = ObjClass::BigInt;
+    }
+    JSObject* o = vm.newObject(proto);
+    Handle keep = Handle::adopt(toJSValue(o));
+    wrapPrimitive(vm, o, cls, v);
+    return keep.take();
 }
 
 std::int32_t toInt32(double d) noexcept

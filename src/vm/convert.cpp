@@ -68,8 +68,10 @@ Key toPropertyKey(VM& vm, JSValue v)
         const std::int32_t i = v.asInt32();
         if (i >= 0 && i < std::int32_t(VM::kSmallIndexKeys)) {
             Key& slot = vm.smallIndexKeys[i];
-            if (!slot)
+            if (!slot) {
                 slot = vm.ctx.intern(numberToString(double(i)));
+                detail::incRef(slot);  // the table's own count: a sweep of unused names must leave it be
+            }
             detail::incRef(slot);
             return slot;
         }

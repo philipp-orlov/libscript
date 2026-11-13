@@ -219,6 +219,8 @@ struct VM : EngineRuntime
     std::uint32_t ticks = 4096;
     /// Calls (and loop back edges) of a function before the baseline compiler translates it; 0 keeps everything interpreted.
     std::uint32_t tier1Threshold = 0;
+    /// The lowest machine stack address compiled code may reach before a call is made the slow way (0: no limit).
+    std::uintptr_t jitStackFloor = 0;
     Frame* frameBase = nullptr;
     std::uint32_t frameCount = 0;
     std::uint32_t frameCapacity = 0;

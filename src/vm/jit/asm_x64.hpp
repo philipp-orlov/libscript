@@ -282,6 +282,11 @@ public:
         opReg(true, 0xF7, 0, a);
         d32(std::uint32_t(imm));
     }
+    void testI32(const Mem& m, std::uint32_t imm)
+    {
+        opMem(false, 0xF7, 0, m);
+        d32(imm);
+    }
     void cmpI8(const Mem& m, std::uint8_t imm)
     {
         opMem(false, 0x80, 7, m);

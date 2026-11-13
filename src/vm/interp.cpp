@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "script/internal/dyn/object.hpp"
+#include "script/internal/stack_guard.hpp"
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/jit.hpp"
@@ -1871,8 +1872,10 @@ do_call: {
         SET(ins->a, made);
         NEXT();
     }
+    if (!c->tier1 && !c->tier1Failed && vm.tier1Threshold && ++c->hotness >= vm.tier1Threshold)
+        compileTier1(vm, c);
     JSValue* newR = R + base + 1;
-    if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd) [[unlikely]] {
+    if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd || (c->tier1 && nativeStackLow())) [[unlikely]] {
         vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
         FAIL();
     }
@@ -1908,8 +1911,6 @@ do_call: {
     }
     vm.frameBase[vm.frameCount++] = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew || isSuper, false,
                                           isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
-    if (!c->tier1 && !c->tier1Failed && vm.tier1Threshold && ++c->hotness >= vm.tier1Threshold)
-        compileTier1(vm, c);
     if (c->tier1) {
         // Compiled code runs on the machine stack: the frame is its own entry, and the result comes back here.
         vm.frameBase[vm.frameCount - 1].entry = true;
@@ -2346,6 +2347,15 @@ std::uint64_t stepInstruction(VM& vm, std::uint32_t index)
     const Ins* fall = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
     fr->pc = at;
     return runImpl<true>(vm, fall).bits;
+}
+
+std::uint64_t stepThrow(VM& vm, std::uint32_t index)
+{
+    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    const Ins* at = fr->code->code.data() + index;
+    fr->pc = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
+    vm.resumeThrow = true;
+    return runImpl<true>(vm, nullptr).bits;
 }
 
 // ----------------------------------------------------------------- calling ---

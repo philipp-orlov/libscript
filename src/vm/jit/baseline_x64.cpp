@@ -16,7 +16,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <algorithm>
 #include <exception>
+#include <utility>
 
 #include "script/internal/stack_guard.hpp"
 #include "script/internal/vm/bytecode.hpp"
@@ -75,10 +77,10 @@ extern "C" void* scriptVmJitTarget(VM* vm)
     return fr->code->tier1->addressFor(std::uint32_t(fr->pc - fr->code->code.data()));
 }
 
-/// A C++ exception cannot cross compiled frames (they carry no unwind information): it is parked here, the compiled
-/// code returns to `enterTier1` as it would for any result, and that throws it again.
+/// A C++ exception cannot cross compiled frames (they carry no unwind information): it is parked here and the compiled
+/// code leaves with the exception sentinel, as it does for a script exception; every frame that sees the sentinel
+/// finds the parked exception and goes on leaving, and `enterTier1` throws it again.
 thread_local std::exception_ptr pendingException;
-constexpr std::uint64_t kStepThrow = 0x32;
 
 extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
 {
@@ -86,7 +88,106 @@ extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
         return stepInstruction(*vm, index);
     } catch (...) {
         pendingException = std::current_exception();
-        return kStepThrow;
+        return 0;
+    }
+}
+
+/// A call made from compiled code came back with the exception sentinel.
+extern "C" std::uint64_t scriptVmJitThrow(VM* vm, std::uint32_t index)
+{
+    if (pendingException)
+        return 0;
+    try {
+        return stepThrow(*vm, index);
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
+struct CallResult
+{
+    std::uint64_t a, b;
+};
+
+/// A `Call` from compiled code. {0, 0}: not handled here, nothing changed; run the instruction in the interpreter.
+/// {result, 1}: a native function ran; the result is owned, or 0 for an exception. {frame, code}: a script function,
+/// its frame pushed and ready; enter `code` with it.
+CallResult callPrepare(VM& vm, std::uint32_t index)
+{
+    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    CodeBlock* code = fr->code;
+    const Ins* ins = code->code.data() + index;
+    JSValue* R = fr->R;
+    const std::uint32_t base = ins->b, argc = ins->c;
+    const JSValue callee = R[base];
+    if (!isFunction(callee))
+        return {0, 0};
+    auto* f = static_cast<JSFunction*>(asObject(callee));
+    if (f->flags & JSFunction::kNative) {
+        fr->pc = ins + 1;
+        Rare* r = f->rare();
+        vm.stackTop = R + code->nregs;
+        const JSValue saved = vm.newTarget;
+        vm.newTarget = JSValue::undefined();
+        const JSValue res = r->native(vm, R[base + 1], &R[base + 2], argc, r->nativeData);
+        vm.newTarget = saved;
+        return {res.bits, 1};
+    }
+    CodeBlock* c = f->code;
+    if (c->flags & (CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
+                    CodeBlock::kNeedsArgs))
+        return {0, 0};
+    if (!c->tier1) {
+        if (c->tier1Failed || !vm.tier1Threshold || ++c->hotness < vm.tier1Threshold)
+            return {0, 0};
+        compileTier1(vm, c);
+        if (!c->tier1)
+            return {0, 0};
+    }
+    JSValue* newR = R + base + 1;
+    if (vm.ticks <= 1 || vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd || nativeStackLow())
+        return {0, 0};
+    fr->pc = ins + 1;
+    --vm.ticks;
+    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && newR[0].isNullish()) {
+        const JSValue old = newR[0];
+        newR[0] = toJSValue(vm.global);
+        retain(newR[0]);
+        release(old);
+    }
+    const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
+    if (newR + c->nregs > vm.stackInit) [[unlikely]]
+        vm.fillStack(newR + c->nregs);
+    {
+        // What the frame sits on may be the caller's dead temporaries, or arguments the callee has no parameter for.
+        JSValue* callerEnd = R + code->nregs;
+        const std::uint32_t overlap =
+            callerEnd > newR ? std::uint32_t(std::min<std::ptrdiff_t>(callerEnd - newR, c->nregs)) : 0;
+        for (std::uint32_t i = keep; i < overlap; ++i) {
+            const JSValue v = newR[i];
+            newR[i] = JSValue::undefined();
+            release(v);
+        }
+        for (std::uint32_t i = std::max(keep, overlap); i < 1 + argc && i < c->nregs; ++i) {
+            const JSValue v = newR[i];
+            newR[i] = JSValue::undefined();
+            release(v);
+        }
+    }
+    vm.frameBase[vm.frameCount++] =
+        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, false, true, JSValue::undefined()};
+    return {reinterpret_cast<std::uint64_t>(&vm.frameBase[vm.frameCount - 1]),
+            reinterpret_cast<std::uint64_t>(c->tier1->addressFor(0))};
+}
+
+extern "C" CallResult scriptVmJitCall(VM* vm, std::uint32_t index)
+{
+    try {
+        return callPrepare(*vm, index);
+    } catch (...) {
+        pendingException = std::current_exception();
+        return {0, 1};
     }
 }
 
@@ -109,6 +210,27 @@ extern "C" void scriptVmJitClear(JSValue* first, std::uint32_t count)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 constexpr std::int32_t kFrameFn = std::int32_t(offsetof(Frame, fn));
+constexpr std::int32_t kFrameCode = std::int32_t(offsetof(Frame, code));
+constexpr std::int32_t kFramePc = std::int32_t(offsetof(Frame, pc));
+constexpr std::int32_t kFrameR = std::int32_t(offsetof(Frame, R));
+constexpr std::int32_t kFrameRetDst = std::int32_t(offsetof(Frame, retDst));
+constexpr std::int32_t kFrameEntry = std::int32_t(offsetof(Frame, entry));
+constexpr std::int32_t kFrameNewTarget = std::int32_t(offsetof(Frame, newTarget));
+constexpr std::int32_t kFrameGen = std::int32_t(offsetof(Frame, gen));
+static_assert(offsetof(Frame, argc) == offsetof(Frame, retDst) + 4, "retDst and argc are stored together");
+static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "construct and entry are stored together");
+constexpr std::int32_t kVmStackEnd = std::int32_t(offsetof(VM, stackEnd));
+constexpr std::int32_t kVmStackInit = std::int32_t(offsetof(VM, stackInit));
+constexpr std::int32_t kVmFrameCapacity = std::int32_t(offsetof(VM, frameCapacity));
+constexpr std::int32_t kVmFrameBase = std::int32_t(offsetof(VM, frameBase));
+constexpr std::int32_t kVmStackFloor = std::int32_t(offsetof(VM, jitStackFloor));
+constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
+constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
+constexpr std::int32_t kCbTier1 = std::int32_t(offsetof(CodeBlock, tier1));
+constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
+constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
+constexpr std::int32_t kCbNregs = std::int32_t(offsetof(CodeBlock, nregs));
+constexpr std::int32_t kTierEntry = std::int32_t(offsetof(Tier1Code, entry));
 constexpr std::int32_t kFrameArgc = std::int32_t(offsetof(Frame, argc));
 constexpr std::int32_t kFrameConstruct = std::int32_t(offsetof(Frame, construct));
 constexpr std::int32_t kVmTicks = std::int32_t(offsetof(VM, ticks));
@@ -150,6 +272,7 @@ public:
         auto* t = new Tier1Code;
         t->rx = span.rx;
         t->bytes = span.bytes;
+        t->entry = t->rx + offsets_[0];
         t->labels = std::move(offsets_);
         return t;
     }
@@ -161,7 +284,8 @@ private:
     X64 a_;
     std::vector<Label> at_;
     std::vector<std::uint32_t> offsets_;
-    Label step_, tail_, dispatch_, exit_, free_;
+    Label step_, tail_, dispatch_, exit_, free_, call_, throw_;
+    std::deque<std::pair<std::uint32_t, Label>> throws_;
     struct Slow
     {
         std::uint32_t index;
@@ -350,6 +474,8 @@ private:
     void getElem(std::uint32_t i, const Ins& in);
     void putElem(std::uint32_t i, const Ins& in);
     void ret(std::uint32_t i, const Ins& in);
+    void call(std::uint32_t i, const Ins& in);
+    void getGlobal(std::uint32_t i, const Ins& in);
 };
 
 void Baseline::emitTails()
@@ -363,8 +489,21 @@ void Baseline::emitTails()
         a_.jcc(CNE, tail_);
         a_.jmp(at_[s.index + length(s.index)]);
     }
+    for (auto& t : throws_) {
+        a_.bind(t.second);
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, t.first);
+        a_.call(throw_);
+        a_.jmp(tail_);
+    }
     a_.bind(step_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitStep));
+    a_.jmp(RAX);
+    a_.bind(call_);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitCall));
+    a_.jmp(RAX);
+    a_.bind(throw_);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitThrow));
     a_.jmp(RAX);
     a_.bind(free_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFree));
@@ -486,6 +625,13 @@ void Baseline::emit(std::uint32_t i)
         return;
     case Op::Ret:
         ret(i, in);
+        return;
+    case Op::Call:
+        call(i, in);
+        return;
+    case Op::GetGlobal:
+    case Op::GetGlobalOrUndef:
+        getGlobal(i, in);
         return;
     default:
         emitStep(i);
@@ -910,6 +1056,134 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     release(RDI);
 }
 
+void Baseline::getGlobal(std::uint32_t i, const Ins& in)
+{
+    const std::uint16_t cacheId = code_->code[i + 1].a;
+    const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
+    if (!ic || ic->shape == 0 || ic->holder) {
+        emitStep(i);
+        return;
+    }
+    Label& bad = slow(i);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(vm_.global));
+    a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
+    a_.jcc(CNE, bad);
+    slotAddress(ic->index);
+    a_.mov(RAX, mem(RDX, 0));
+    retain(RAX);
+    write(in.a, RAX);
+}
+
+void Baseline::call(std::uint32_t i, const Ins& in)
+{
+    Label& bad = slow(i);
+    throws_.emplace_back(i, Label{});
+    Label& exc = throws_.back().second;
+    Label helper, enter, native;
+    const unsigned base = in.b, argc = in.c;
+    const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
+    const bool fast = window <= 1 + argc + 6;
+    if (fast) {
+        // A script function that is compiled, takes at least as many parameters as there are arguments and needs nothing
+        // the interpreter's call sequence does on the side: its frame is pushed here.
+        a_.mov(RAX, R(base));
+        needObject(RAX, helper);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, helper);
+        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+        a_.jcc(CNE, helper);
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.mov(RDX, mem(RCX, kCbTier1));
+        a_.test(RDX, RDX);
+        a_.jcc(CE, helper);
+        a_.testI32(mem(RCX, kCbFlags), CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync |
+                                           CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs);
+        a_.jcc(CNE, helper);
+        a_.movzx16(RSI, mem(RCX, kCbNparams));
+        a_.aluI32(7, RSI, std::int32_t(argc));
+        a_.jcc(CB, helper);
+        a_.mov32(RSI, mem(RCX, kCbNregs));
+        a_.lea(R9, R(base + 1));
+        a_.lea(R10, mem(R9, RSI, 8, 64));
+        a_.alu(7, R10, mem(R12, kVmStackEnd));
+        a_.jcc(CA, helper);
+        a_.lea(R10, mem(R9, RSI, 8));
+        a_.alu(7, R10, mem(R12, kVmStackInit));
+        a_.jcc(CA, helper);
+        a_.mov32(R10, mem(R12, kVmFrameCount));
+        a_.aluI32(0, R10, 2);
+        a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+        a_.jcc(CAE, helper);
+        a_.cmpI32(mem(R12, kVmTicks), 1);
+        a_.jcc(CBE, helper);
+        a_.alu(7, RSP, mem(R12, kVmStackFloor));
+        a_.jcc(CB, helper);
+        // What the frame sits on: caller registers above the arguments hold stale values; the call sequence of the
+        // interpreter lets them go. Plain values are overwritten here; a cell takes the long way.
+        for (unsigned r = 1 + argc; r < window; ++r) {
+            Label skip;
+            a_.aluI32(7, RSI, std::int32_t(r));
+            a_.jcc(CBE, skip);
+            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
+            a_.test(RDI, R15);
+            a_.jcc(CE, helper);
+            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+            a_.bind(skip);
+        }
+        {
+            // A sloppy function called with no `this` gets the global object.
+            Label thisOk;
+            a_.testI32(mem(RCX, kCbFlags), CodeBlock::kStrict | CodeBlock::kArrow);
+            a_.jcc(CNE, thisOk);
+            a_.mov(RDI, R(base + 1));
+            a_.aluI(4, RDI, -9);
+            a_.cmpI(RDI, std::int32_t(kNull));
+            a_.jcc(CNE, thisOk);
+            a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
+            a_.inc32(mem(RDI, kHdrRc));
+            a_.mov(R(base + 1), RDI);
+            a_.bind(thisOk);
+        }
+        a_.dec32(mem(R12, kVmTicks));
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+        a_.mov(mem(R13, kFramePc), RDI);
+        a_.mov32(R10, mem(R12, kVmFrameCount));
+        a_.mov(R11, mem(R12, kVmFrameBase));
+        a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
+        a_.add(R11, RDI);
+        a_.inc32(mem(R12, kVmFrameCount));
+        a_.mov(mem(R11, kFrameCode), RCX);
+        a_.mov(mem(R11, kFrameFn), RAX);
+        a_.mov(mem(R11, kFramePc), 0);
+        a_.mov(mem(R11, kFrameR), R9);
+        a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
+        a_.mov(mem(R11, kFrameRetDst), RDI);
+        a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
+        a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+        a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+        a_.mov(RSI, R11);
+        a_.mov(RDX, mem(RDX, kTierEntry));
+        a_.jmp(enter);
+    }
+    a_.bind(helper);
+    a_.mov(RDI, R12);
+    a_.movImm(RSI, i);
+    a_.call(call_);
+    a_.test(RDX, RDX);
+    a_.jcc(CE, bad);
+    a_.cmpI(RDX, 1);
+    a_.jcc(CE, native);
+    a_.mov(RSI, RAX);
+    a_.bind(enter);
+    a_.mov(RDI, R12);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(entryStub()));
+    a_.callReg(RAX);
+    a_.bind(native);
+    a_.test(RAX, RAX);
+    a_.jcc(CE, exc);
+    write(in.a, RAX);
+}
+
 void Baseline::ret(std::uint32_t i, const Ins& in)
 {
     Label& bad = slow(i);
@@ -983,8 +1257,14 @@ void releaseTier1(Tier1Code* code) noexcept
 JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
 {
     Frame* fr = vm.frameBase + vm.frameCount - 1;
+    {
+        std::uintptr_t floor = nativeStackFloorCache;
+        if (floor == 0)
+            floor = nativeStackFloorLookup();
+        vm.jitStackFloor = floor == 1 ? 0 : floor + kStackReserve;
+    }
     const std::uint64_t bits = entryStub()(&vm, fr, code->addressFor(index));
-    if (bits == kStepThrow) [[unlikely]] {
+    if (bits == 0 && pendingException) [[unlikely]] {
         std::exception_ptr e = std::move(pendingException);
         pendingException = nullptr;
         std::rethrow_exception(e);

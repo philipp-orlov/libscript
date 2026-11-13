@@ -31,6 +31,7 @@ struct CodeSpan;
 struct Tier1Code
 {
     std::uint8_t* rx = nullptr;               ///< where the code runs
+    void* entry = nullptr;                    ///< the code for the first instruction
     std::size_t bytes = 0;
     std::vector<std::uint32_t> labels;        ///< per instruction index: offset from `rx` of its code, or ~0u
     std::uint32_t exits = 0;
@@ -51,6 +52,9 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index);
 inline constexpr std::uint64_t kStepFall = kHole;
 inline constexpr std::uint64_t kStepJump = kUninit;
 std::uint64_t stepInstruction(VM& vm, std::uint32_t index);
+/// What the interpreter does when the call that the instruction at `index` made returned the exception sentinel: look for
+/// a handler in the top frame; `kStepJump` if there is one, else the frame is left and the exception sentinel returned.
+std::uint64_t stepThrow(VM& vm, std::uint32_t index);
 
 }  // namespace vm
 }  // namespace internal

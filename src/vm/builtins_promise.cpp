@@ -162,16 +162,16 @@ void resolvePromise(VM& vm, JSValue promise, JSValue resolution)
 }
 
 /// A native function that carries two values and an integer.
-JSFunction* closureFn(VM& vm, FastNative fn, JSValue a, JSValue b, std::uint32_t n)
+JSFunction* closureFn(VM& vm, FastNative fn, JSValue a, JSValue b, std::uint32_t n, std::uint32_t length = 1)
 {
-    JSFunction* f = vm.newNativeFunction(vm.protos.function, fn, nullptr, nullptr, 1);
+    JSFunction* f = vm.newNativeFunction(vm.protos.function, fn, nullptr, nullptr, length);
     Rare& r = f->rareOf(vm);
     r.nativeData = f;
     retain(a);
     retain(b);
     r.boundTarget = a;
     r.boundThis = b;
-    r.fnLength = n;
+    r.fnState = n;
     return f;
 }
 
@@ -186,7 +186,7 @@ NATIVE(resolverFn)
     if (flag->at(0) == JSValue::boolean(true))
         return JSValue::undefined();
     flag->setAt(vm, 0, JSValue::boolean(true));
-    if (r.fnLength == 0)
+    if (r.fnState == 0)
         resolvePromise(vm, r.boundTarget, arg(args, argc, 0));
     else
         rejectPromise(vm, r.boundTarget, arg(args, argc, 0));
@@ -237,27 +237,37 @@ void runJob(VM& vm, const MicroJob& job)
     switch (job.kind) {
         case 0:
         case 1: {
-            // a: handler, b: the derived promise (or undefined), c: the value.
+            // a: handler, b: the derived promise or `[promise, resolve, reject]` (or undefined), c: the value.
             const bool isReject = job.kind == 1;
-            if (job.a.isUndefined()) {
-                if (!job.b.isUndefined()) {
-                    if (isReject)
-                        rejectPromise(vm, job.b, job.c);
+            auto settleDerived = [&](bool reject, JSValue v) {
+                if (job.b.isUndefined())
+                    return;
+                if (isArray(job.b)) {
+                    JSValue f = static_cast<JSArray*>(asObject(job.b))->at(reject ? 2 : 1);
+                    JSValue r = vm.call(f, JSValue::undefined(), &v, 1);
+                    if (r.isException())
+                        release(takeException(vm));
                     else
-                        resolvePromise(vm, job.b, job.c);
+                        release(r);
+                    return;
                 }
+                if (reject)
+                    rejectPromise(vm, job.b, v);
+                else
+                    resolvePromise(vm, job.b, v);
+            };
+            if (job.a.isUndefined()) {
+                settleDerived(isReject, job.c);
                 return;
             }
             JSValue r = vm.call(job.a, JSValue::undefined(), &job.c, 1);
             if (r.isException()) {
                 JSValue e = takeException(vm);
-                if (!job.b.isUndefined())
-                    rejectPromise(vm, job.b, e);
+                settleDerived(true, e);
                 release(e);
                 return;
             }
-            if (!job.b.isUndefined())
-                resolvePromise(vm, job.b, r);
+            settleDerived(false, r);
             release(r);
             return;
         }
@@ -290,6 +300,246 @@ void runJob(VM& vm, const MicroJob& job)
 
 // ------------------------------------------------------------- the language ---
 
+// A promise capability: a promise and the functions that settle it.
+struct Capability
+{
+    Handle promise, resolve, reject;
+};
+
+/// The executor `NewPromiseCapability` gives a constructor that is not Promise itself: it keeps the two functions it is
+/// given in the array it carries (`[resolve, reject]`).
+NATIVE(capabilityExecutor)
+{
+    UNUSED();
+    Rare& r = carried(data);
+    auto* holder = static_cast<JSArray*>(asObject(r.boundTarget));
+    if (!holder->at(0).isUndefined() || !holder->at(1).isUndefined())
+        return typeError(vm, "Promise executor has already been invoked with non-undefined arguments");
+    retain(arg(args, argc, 0));
+    holder->setAt(vm, 0, arg(args, argc, 0));
+    retain(arg(args, argc, 1));
+    holder->setAt(vm, 1, arg(args, argc, 1));
+    return JSValue::undefined();
+}
+
+/// NewPromiseCapability(C); false with an exception pending.
+bool newCapability(VM& vm, JSValue c, Capability* out)
+{
+    if (!isConstructor(c)) {
+        vm.throwError(ErrorCode::TypeError, describe(vm, c) + " is not a constructor");
+        return false;
+    }
+    if (c.bits == vm.promiseCtor.bits) {
+        out->promise = Handle::adopt(newPromiseObject(vm));
+        makeResolvers(vm, out->promise.get(), &out->resolve, &out->reject);
+        return true;
+    }
+    JSArray* holder = vm.newArray(vm.protos.array);
+    Handle holderKeep = Handle::adopt(toJSValue(holder));
+    holder->append(vm, JSValue::undefined());
+    holder->append(vm, JSValue::undefined());
+    Handle executor = Handle::adopt(toJSValue(closureFn(vm, capabilityExecutor, holderKeep.get(), JSValue::undefined(), 0, 2)));
+    const JSValue executorArg = executor.get();
+    JSValue made = vm.construct(c, &executorArg, 1);
+    if (made.isException())
+        return false;
+    out->promise = Handle::adopt(made);
+    if (!isFunction(holder->at(0)) || !isFunction(holder->at(1))) {
+        vm.throwError(ErrorCode::TypeError, "Promise resolve or reject function is not callable");
+        return false;
+    }
+    out->resolve = Handle::retained(holder->at(0));
+    out->reject = Handle::retained(holder->at(1));
+    return true;
+}
+
+/// The array a reaction carries for a capability that is not one of ours: `[promise, resolve, reject]`.
+JSValue capabilityRecord(VM& vm, const Capability& c)
+{
+    JSArray* record = vm.newArray(vm.protos.array, 0, 3);
+    Handle keep = Handle::adopt(toJSValue(record));
+    record->append(vm, (retain(c.promise.get()), c.promise.get()));
+    record->append(vm, (retain(c.resolve.get()), c.resolve.get()));
+    record->append(vm, (retain(c.reject.get()), c.reject.get()));
+    return keep.take();
+}
+
+NATIVE(promiseThen)
+{
+    UNUSED();
+    if (!dataOf(self))
+        return typeError(vm, "Promise.prototype.then called on incompatible receiver " + describe(vm, self));
+    Handle ctor = Handle::adopt(speciesConstructor(vm, self, vm.promiseCtor));
+    if (ctor.get().isException())
+        return ctor.get();
+    if (ctor.get().bits == vm.promiseCtor.bits) {
+        JSValue derived = newPromiseObject(vm);
+        Handle keep = Handle::adopt(derived);
+        performThen(vm, self, arg(args, argc, 0), arg(args, argc, 1), derived);
+        return keep.take();
+    }
+    Capability cap;
+    if (!newCapability(vm, ctor.get(), &cap))
+        return JSValue::exception();
+    Handle record = Handle::adopt(capabilityRecord(vm, cap));
+    performThen(vm, self, arg(args, argc, 0), arg(args, argc, 1), record.get());
+    return cap.promise.take();
+}
+
+/// `target.then(a, b)`: Invoke.
+JSValue invokeThen(VM& vm, JSValue target, JSValue onFulfilled, JSValue onRejected, std::uint32_t argc)
+{
+    Key thenKey = vm.internKey(std::string_view("then"));
+    JSValue then = getProperty(vm, target, thenKey);
+    detail::decRef(thenKey);
+    if (then.isException())
+        return then;
+    Handle keep = Handle::adopt(then);
+    if (!isFunction(then))
+        return vm.throwError(ErrorCode::TypeError, "Promise.prototype.then is not a function");
+    JSValue callArgs[2] = {onFulfilled, onRejected};
+    return vm.call(then, target, callArgs, argc);
+}
+
+NATIVE(promiseCatch)
+{
+    UNUSED();
+    return invokeThen(vm, self, JSValue::undefined(), arg(args, argc, 0), 2);
+}
+
+/// PromiseResolve(C, x), owned; the exception sentinel on a failure.
+JSValue promiseResolveWith(VM& vm, JSValue c, JSValue x)
+{
+    if (dataOf(x)) {
+        JSValue xc = getProperty(vm, x, vm.atoms.constructor);
+        if (xc.isException())
+            return xc;
+        const bool same = xc.bits == c.bits;
+        release(xc);
+        if (same) {
+            retain(x);
+            return x;
+        }
+    }
+    Capability cap;
+    if (!newCapability(vm, c, &cap))
+        return JSValue::exception();
+    JSValue r = vm.call(cap.resolve.get(), JSValue::undefined(), &x, 1);
+    if (r.isException())
+        return r;
+    release(r);
+    return cap.promise.take();
+}
+
+NATIVE(finallyReturn)
+{
+    UNUSED();
+    Rare& r = carried(data);
+    // fnState: 0 returns boundTarget, 1 throws it.
+    if (r.fnState == 1) {
+        release(vm.exception);
+        vm.exception = r.boundTarget;
+        retain(vm.exception);
+        vm.exceptionCode = ErrorCode::Exception;
+        return JSValue::exception();
+    }
+    retain(r.boundTarget);
+    return r.boundTarget;
+}
+
+NATIVE(finallyStep)
+{
+    UNUSED();
+    Rare& r = carried(data);
+    // boundTarget: onFinally; boundThis: the constructor; fnState: 0 after a fulfilment, 1 after a rejection.
+    JSValue res = vm.call(r.boundTarget, JSValue::undefined(), nullptr, 0);
+    if (res.isException())
+        return res;
+    Handle resKeep = Handle::adopt(res);
+    Handle p = Handle::adopt(promiseResolveWith(vm, r.boundThis, res));
+    if (p.get().isException())
+        return p.get();
+    Handle thunk = Handle::adopt(toJSValue(closureFn(vm, finallyReturn, arg(args, argc, 0), JSValue::undefined(), r.fnState, 0)));
+    return invokeThen(vm, p.get(), thunk.get(), JSValue::undefined(), 1);
+}
+
+NATIVE(promiseFinally)
+{
+    UNUSED();
+    if (!isObject(self))
+        return typeError(vm, "Promise.prototype.finally called on a non-object");
+    Handle ctor = Handle::adopt(speciesConstructor(vm, self, vm.promiseCtor));
+    if (ctor.get().isException())
+        return ctor.get();
+    const JSValue onFinally = arg(args, argc, 0);
+    if (!isFunction(onFinally))
+        return invokeThen(vm, self, onFinally, onFinally, 2);
+    Handle a = Handle::adopt(toJSValue(closureFn(vm, finallyStep, onFinally, ctor.get(), 0)));
+    Handle b = Handle::adopt(toJSValue(closureFn(vm, finallyStep, onFinally, ctor.get(), 1)));
+    return invokeThen(vm, self, a.get(), b.get(), 2);
+}
+
+NATIVE(promiseResolveStatic)
+{
+    UNUSED();
+    if (!isObject(self))
+        return typeError(vm, "PromiseResolve called on non-object");
+    return promiseResolveWith(vm, self, arg(args, argc, 0));
+}
+
+NATIVE(promiseRejectStatic)
+{
+    UNUSED();
+    Capability cap;
+    if (!newCapability(vm, self, &cap))
+        return JSValue::exception();
+    JSValue reason = arg(args, argc, 0);
+    JSValue r = vm.call(cap.reject.get(), JSValue::undefined(), &reason, 1);
+    if (r.isException())
+        return r;
+    release(r);
+    return cap.promise.take();
+}
+
+NATIVE(promiseWithResolvers)
+{
+    UNUSED();
+    Capability cap;
+    if (!newCapability(vm, self, &cap))
+        return JSValue::exception();
+    JSObject* out = vm.newObject(vm.protos.object);
+    Handle keep = Handle::adopt(toJSValue(out));
+    value(vm, out, "promise", (retain(cap.promise.get()), cap.promise.get()), attr::kDefault);
+    value(vm, out, "resolve", (retain(cap.resolve.get()), cap.resolve.get()), attr::kDefault);
+    value(vm, out, "reject", (retain(cap.reject.get()), cap.reject.get()), attr::kDefault);
+    return keep.take();
+}
+
+NATIVE(promiseTry)
+{
+    UNUSED();
+    if (!isObject(self))
+        return typeError(vm, "Promise.try called on a non-object");
+    Capability cap;
+    if (!newCapability(vm, self, &cap))
+        return JSValue::exception();
+    JSValue r = isFunction(arg(args, argc, 0)) ? vm.call(args[0], JSValue::undefined(), args + 1, argc - 1)
+                                                : vm.throwError(ErrorCode::TypeError, describe(vm, arg(args, argc, 0)) + " is not a function");
+    JSValue settled;
+    if (r.isException()) {
+        Handle reason = Handle::adopt(takeException(vm));
+        const JSValue reasonValue = reason.get();
+        settled = vm.call(cap.reject.get(), JSValue::undefined(), &reasonValue, 1);
+    } else {
+        Handle resultKeep = Handle::adopt(r);
+        settled = vm.call(cap.resolve.get(), JSValue::undefined(), &r, 1);
+    }
+    if (settled.isException())
+        return settled;
+    release(settled);
+    return cap.promise.take();
+}
+
 NATIVE(promiseCtor)
 {
     UNUSED();
@@ -318,154 +568,31 @@ NATIVE(promiseCtor)
     return self;
 }
 
-NATIVE(promiseThen)
-{
-    UNUSED();
-    if (!dataOf(self))
-        return typeError(vm, "Promise.prototype.then called on incompatible receiver " + describe(vm, self));
-    // The promise `then` makes is of the class of `this.constructor`.
-    JSObject* derivedProto = vm.protos.promise;
-    if (asObject(self)->proto(vm) != vm.protos.promise) {
-        JSValue ctor = getProperty(vm, self, vm.atoms.constructor);
-        if (ctor.isException())
-            return ctor;
-        derivedProto = promiseProtoOf(vm, ctor);
-        release(ctor);
-    }
-    JSValue derived = newPromiseObject(vm, derivedProto);
-    Handle keep = Handle::adopt(derived);
-    performThen(vm, self, arg(args, argc, 0), arg(args, argc, 1), derived);
-    return keep.take();
-}
+// ----------------------------------------------------------------- the combinators ---
 
-NATIVE(promiseCatch)
+/// IteratorClose after a throw: the exception pending stays, and nothing closing raises matters.
+void closeAfterThrow(VM& vm, JSValue iterator)
 {
-    UNUSED();
-    Key thenKey = vm.internKey(std::string_view("then"));
-    JSValue then = getProperty(vm, self, thenKey);
-    detail::decRef(thenKey);
-    if (then.isException())
-        return then;
-    Handle keep = Handle::adopt(then);
-    JSValue callArgs[2] = {JSValue::undefined(), arg(args, argc, 0)};
-    return vm.call(then, self, callArgs, 2);
-}
-
-NATIVE(finallyReturn)
-{
-    UNUSED();
-    Rare& r = carried(data);
-    // boundThis: 0 returns boundTarget, 1 throws it.
-    if (r.fnLength == 1) {
-        release(vm.exception);
-        vm.exception = r.boundTarget;
-        retain(vm.exception);
-        vm.exceptionCode = ErrorCode::Exception;
-        return JSValue::exception();
-    }
-    retain(r.boundTarget);
-    return r.boundTarget;
-}
-
-NATIVE(finallyStep)
-{
-    UNUSED();
-    Rare& r = carried(data);
-    // boundTarget: onFinally; fnLength: 0 after a fulfilment, 1 after a rejection.
-    JSValue res = vm.call(r.boundTarget, JSValue::undefined(), nullptr, 0);
-    if (res.isException())
-        return res;
-    Handle resKeep = Handle::adopt(res);
-    JSValue p = promiseResolve(vm, res);
-    Handle pKeep = Handle::adopt(p);
-    JSFunction* thunk = closureFn(vm, finallyReturn, arg(args, argc, 0), JSValue::undefined(), r.fnLength);
-    Handle thunkKeep = Handle::adopt(toJSValue(thunk));
-    JSValue derived = newPromiseObject(vm);
-    Handle derivedKeep = Handle::adopt(derived);
-    performThen(vm, p, thunkKeep.get(), JSValue::undefined(), derived);
-    return derivedKeep.take();
-}
-
-NATIVE(promiseFinally)
-{
-    UNUSED();
-    const JSValue onFinally = arg(args, argc, 0);
-    Key thenKey = vm.internKey(std::string_view("then"));
-    JSValue then = getProperty(vm, self, thenKey);
-    detail::decRef(thenKey);
-    if (then.isException())
-        return then;
-    Handle keep = Handle::adopt(then);
-    if (!isFunction(onFinally)) {
-        JSValue callArgs[2] = {onFinally, onFinally};
-        return vm.call(then, self, callArgs, 2);
-    }
-    Handle a = Handle::adopt(toJSValue(closureFn(vm, finallyStep, onFinally, JSValue::undefined(), 0)));
-    Handle b = Handle::adopt(toJSValue(closureFn(vm, finallyStep, onFinally, JSValue::undefined(), 1)));
-    JSValue callArgs[2] = {a.get(), b.get()};
-    return vm.call(then, self, callArgs, 2);
-}
-
-NATIVE(promiseResolveStatic)
-{
-    UNUSED();
-    JSObject* proto = promiseProtoOf(vm, self);
-    const JSValue v = arg(args, argc, 0);
-    if (dataOf(v) && asObject(v)->proto(vm) == proto) {
-        retain(v);
-        return v;
-    }
-    JSValue p = newPromiseObject(vm, proto);
-    resolvePromise(vm, p, v);
-    return p;
-}
-
-NATIVE(promiseRejectStatic)
-{
-    UNUSED();
-    JSValue p = newPromiseObject(vm, promiseProtoOf(vm, self));
-    rejectPromise(vm, p, arg(args, argc, 0));
-    return p;
-}
-
-NATIVE(promiseWithResolvers)
-{
-    UNUSED();
-    JSValue p = newPromiseObject(vm, promiseProtoOf(vm, self));
-    Handle promise = Handle::adopt(p);
-    Handle resolve, reject;
-    makeResolvers(vm, p, &resolve, &reject);
-    JSObject* out = vm.newObject(vm.protos.object);
-    Handle keep = Handle::adopt(toJSValue(out));
-    value(vm, out, "promise", (retain(p), p), attr::kDefault);
-    value(vm, out, "resolve", (retain(resolve.get()), resolve.get()), attr::kDefault);
-    value(vm, out, "reject", (retain(reject.get()), reject.get()), attr::kDefault);
-    return keep.take();
-}
-
-NATIVE(promiseTry)
-{
-    UNUSED();
-    JSValue p = newPromiseObject(vm, promiseProtoOf(vm, self));
-    Handle promise = Handle::adopt(p);
-    if (!isFunction(arg(args, argc, 0))) {
-        vm.throwError(ErrorCode::TypeError, describe(vm, arg(args, argc, 0)) + " is not a function");
-    } else {
-        JSValue r = vm.call(args[0], JSValue::undefined(), args + 1, argc - 1);
-        if (!r.isException()) {
-            resolvePromise(vm, p, r);
-            release(r);
-            retain(p);
-            return p;
+    Handle pending = Handle::adopt(takeException(vm));
+    Key returnKey = vm.internKey(std::string_view("return"));
+    JSValue method = getProperty(vm, iterator, returnKey);
+    detail::decRef(returnKey);
+    if (!method.isException()) {
+        Handle keep = Handle::adopt(method);
+        if (isFunction(method)) {
+            JSValue r = vm.call(method, iterator, nullptr, 0);
+            if (!r.isException())
+                release(r);
         }
     }
-    Handle reason = Handle::adopt(takeException(vm));
-    rejectPromise(vm, p, reason.get());
-    retain(p);
-    return p;
+    vm.clearException();
+    release(vm.exception);
+    vm.exception = pending.take();
+    vm.exceptionCode = ErrorCode::Exception;
 }
 
-// all, allSettled, any: one record per call, `[results, remaining, promise]`, and a function per element.
+/// What a combinator shares among the functions it hands out: `[values, remaining, capability record]`, a function per
+/// element, and one flag per element (or per pair, for allSettled).
 NATIVE(combinatorElement)
 {
     UNUSED();
@@ -475,132 +602,148 @@ NATIVE(combinatorElement)
     if (flag->at(0) == JSValue::boolean(true))
         return JSValue::undefined();
     flag->setAt(vm, 0, JSValue::boolean(true));
-    // fnLength: bit 0 rejection side; bits 1-2 the mode (0 all, 1 allSettled, 2 any); the rest the index.
-    const std::uint32_t code = r.fnLength;
-    const int mode = int((code >> 1) & 3);
-    const std::uint32_t index = code >> 3;
-    const bool rejection = (code & 1) != 0;
-    auto* results = static_cast<JSArray*>(asObject(record->at(0)));
-    JSValue v = arg(args, argc, 0);
+    // fnState: bit 0 the rejection side; bits 1-2 the mode (0 all, 1 allSettled, 2 any); the rest the index.
+    const std::uint32_t bits = r.fnState;
+    const bool rejection = (bits & 1) != 0;
+    const int mode = int((bits >> 1) & 3);
+    const std::uint32_t index = bits >> 3;
+    auto* values = static_cast<JSArray*>(asObject(record->at(0)));
+    JSValue x = arg(args, argc, 0);
     if (mode == 1) {
         JSObject* o = vm.newObject(vm.protos.object);
         Handle keep = Handle::adopt(toJSValue(o));
-        o->putOwn(vm, vm.internKey(std::string_view("status")), makeString(vm, std::string_view(rejection ? "rejected" : "fulfilled")),
-                  attr::kDefault);
-        retain(v);
-        o->putOwn(vm, vm.internKey(std::string_view(rejection ? "reason" : "value")), v, attr::kDefault);
+        value(vm, o, "status", makeString(vm, std::string_view(rejection ? "rejected" : "fulfilled")), attr::kDefault);
+        retain(x);
+        value(vm, o, rejection ? "reason" : "value", x, attr::kDefault);
         retain(keep.get());
-        results->setAt(vm, index, keep.get());
+        values->setAt(vm, index, keep.get());
     } else {
-        retain(v);
-        results->setAt(vm, index, v);
+        retain(x);
+        values->setAt(vm, index, x);
     }
-    const std::int32_t remaining = record->at(1).asInt32() - 1;
-    record->setAt(vm, 1, JSValue::int32(remaining));
-    if (remaining == 0) {
-        const JSValue promise = record->at(2);
-        if (mode == 2) {
-            JSValue err = makeAggregateError(vm, toJSValue(results));
-            Handle errKeep = Handle::adopt(err);
-            rejectPromise(vm, promise, err);
-        } else {
-            settle(vm, promise, PromiseData::Fulfilled, toJSValue(results));
-        }
+    const double remaining = record->at(1).asNumber() - 1;
+    record->setAt(vm, 1, JSValue::boxNumber(remaining));
+    if (remaining != 0)
+        return JSValue::undefined();
+    auto* cap = static_cast<JSArray*>(asObject(record->at(2)));
+    if (mode == 2) {
+        Handle error = Handle::adopt(makeAggregateError(vm, toJSValue(values)));
+        const JSValue e = error.get();
+        return vm.call(cap->at(2), JSValue::undefined(), &e, 1);
     }
-    return JSValue::undefined();
+    const JSValue all = toJSValue(values);
+    return vm.call(cap->at(1), JSValue::undefined(), &all, 1);
 }
 
-NATIVE(rejectDerived)
-{
-    UNUSED();
-    rejectPromise(vm, carried(data).boundTarget, arg(args, argc, 0));
-    return JSValue::undefined();
-}
-
-NATIVE(resolveDerived)
-{
-    UNUSED();
-    resolvePromise(vm, carried(data).boundTarget, arg(args, argc, 0));
-    return JSValue::undefined();
-}
-
+/// Promise.all, allSettled, any and race (data 0 to 3).
 NATIVE(promiseCombinator)
 {
     UNUSED();
-    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 all, 1 allSettled, 2 any, 3 race
-    JSValue derived = newPromiseObject(vm, promiseProtoOf(vm, self));
-    Handle derivedKeep = Handle::adopt(derived);
-    JSArray* results = vm.newArray(vm.protos.array);
-    Handle resultsKeep = Handle::adopt(toJSValue(results));
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));
+    if (!isObject(self))
+        return typeError(vm, "Promise combinator called on a non-object");
+    Capability cap;
+    if (!newCapability(vm, self, &cap))
+        return JSValue::exception();
+    // Whatever goes wrong from here is the promise's rejection.
+    auto rejectWith = [&]() -> JSValue {
+        Handle reason = Handle::adopt(takeException(vm));
+        const JSValue reasonValue = reason.get();
+        JSValue r = vm.call(cap.reject.get(), JSValue::undefined(), &reasonValue, 1);
+        if (r.isException())
+            return r;
+        release(r);
+        return cap.promise.take();
+    };
+    Key resolveKey = vm.internKey(std::string_view("resolve"));
+    Handle promiseResolve = Handle::adopt(getProperty(vm, self, resolveKey));
+    detail::decRef(resolveKey);
+    if (promiseResolve.get().isException())
+        return rejectWith();
+    if (!isFunction(promiseResolve.get())) {
+        vm.throwError(ErrorCode::TypeError, "Promise resolve is not a function");
+        return rejectWith();
+    }
+    Handle iterator, next;
+    if (!getIterator(vm, arg(args, argc, 0), &iterator, &next))
+        return rejectWith();
+
+    JSArray* values = vm.newArray(vm.protos.array);
+    Handle valuesKeep = Handle::adopt(toJSValue(values));
     JSArray* record = vm.newArray(vm.protos.array);
     Handle recordKeep = Handle::adopt(toJSValue(record));
-    retain(resultsKeep.get());
-    record->append(vm, resultsKeep.get());
-    record->append(vm, JSValue::int32(1));  // one for the loop itself, so it cannot finish early
-    retain(derived);
-    record->append(vm, derived);
-    std::uint32_t index = 0;
-    JSValue resolveStatic = JSValue::undefined();
-    (void)resolveStatic;
-    const bool ok = forEachIterated(vm, arg(args, argc, 0), [&](JSValue item) {
-        JSValue p = promiseResolve(vm, item);
-        Handle pKeep = Handle::adopt(p);
-        if (mode == 3) {
-            Handle res = Handle::adopt(toJSValue(closureFn(vm, resolveDerived, derived, JSValue::undefined(), 0)));
-            Handle rej = Handle::adopt(toJSValue(closureFn(vm, rejectDerived, derived, JSValue::undefined(), 0)));
-            JSValue d2 = newPromiseObject(vm);
-            Handle d2Keep = Handle::adopt(d2);
-            performThen(vm, p, res.get(), rej.get(), d2);
-            return Step::Continue;
-        }
-        results->append(vm, JSValue::undefined());
-        record->setAt(vm, 1, JSValue::int32(record->at(1).asInt32() + 1));
-        JSArray* flag = vm.newArray(vm.protos.array);
-        Handle flagKeep = Handle::adopt(toJSValue(flag));
-        flag->append(vm, JSValue::boolean(false));
-        const std::uint32_t base = (index << 3) | (std::uint32_t(mode) << 1);
-        Handle onFul, onRej;
-        if (mode == 0) {
-            onFul = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base)));
-            onRej = Handle::adopt(toJSValue(closureFn(vm, rejectDerived, derived, JSValue::undefined(), 0)));
-        } else if (mode == 1) {
-            onFul = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base)));
-            onRej = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base | 1)));
-        } else {
-            onFul = Handle::adopt(toJSValue(closureFn(vm, resolveDerived, derived, JSValue::undefined(), 0)));
-            onRej = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base | 1)));
-        }
-        JSValue d2 = newPromiseObject(vm);
-        Handle d2Keep = Handle::adopt(d2);
-        performThen(vm, p, onFul.get(), onRej.get(), d2);
-        ++index;
-        return Step::Continue;
-    });
-    if (!ok) {
-        JSValue e = takeException(vm);
-        rejectPromise(vm, derived, e);
-        release(e);
-        retain(derived);
-        return derived;
-    }
-    if (mode != 3) {
-        const std::int32_t remaining = record->at(1).asInt32() - 1;
-        record->setAt(vm, 1, JSValue::int32(remaining));
-        if (remaining == 0) {
-            if (mode == 2) {
-                JSValue err = makeAggregateError(vm, resultsKeep.get());
-                Handle errKeep = Handle::adopt(err);
-                rejectPromise(vm, derived, err);
-            } else {
-                settle(vm, derived, PromiseData::Fulfilled, resultsKeep.get());
-            }
-        }
-    }
-    retain(derived);
-    return derived;
-}
+    Handle capRecord = Handle::adopt(capabilityRecord(vm, cap));
+    retain(valuesKeep.get());
+    record->append(vm, valuesKeep.get());
+    record->append(vm, JSValue::int32(1));
+    retain(capRecord.get());
+    record->append(vm, capRecord.get());
 
-// -------------------------------------------------------------------- async ---
+    std::uint32_t index = 0;
+    for (;;) {
+        JSValue v;
+        const int step = iteratorStep(vm, iterator.get(), next.get(), &v);
+        if (step < 0)
+            return rejectWith();  // the iterator itself failed: it is not closed
+        if (step == 0) {
+            if (mode == 3)
+                return cap.promise.take();
+            const double remaining = record->at(1).asNumber() - 1;
+            record->setAt(vm, 1, JSValue::boxNumber(remaining));
+            if (remaining == 0) {
+                JSValue settled;
+                if (mode == 2) {
+                    Handle err = Handle::adopt(makeAggregateError(vm, valuesKeep.get()));
+                    const JSValue e = err.get();
+                    settled = vm.call(cap.reject.get(), JSValue::undefined(), &e, 1);
+                } else {
+                    const JSValue all = valuesKeep.get();
+                    settled = vm.call(cap.resolve.get(), JSValue::undefined(), &all, 1);
+                }
+                if (settled.isException())
+                    return rejectWith();
+                release(settled);
+            }
+            return cap.promise.take();
+        }
+        Handle element = Handle::adopt(v);
+        JSValue nextPromise = vm.call(promiseResolve.get(), self, &v, 1);
+        if (nextPromise.isException()) {
+            closeAfterThrow(vm, iterator.get());
+            return rejectWith();
+        }
+        Handle nextKeep = Handle::adopt(nextPromise);
+        JSValue result;
+        if (mode == 3) {
+            result = invokeThen(vm, nextPromise, cap.resolve.get(), cap.reject.get(), 2);
+        } else {
+            values->append(vm, JSValue::undefined());
+            record->setAt(vm, 1, JSValue::boxNumber(record->at(1).asNumber() + 1));
+            JSArray* flag = vm.newArray(vm.protos.array);
+            Handle flagKeep = Handle::adopt(toJSValue(flag));
+            flag->append(vm, JSValue::boolean(false));
+            const std::uint32_t base = (index << 3) | (std::uint32_t(mode) << 1);
+            Handle onFulfilled, onRejected;
+            if (mode == 2) {
+                onFulfilled = Handle::retained(cap.resolve.get());
+                onRejected = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base | 1)));
+            } else if (mode == 1) {
+                onFulfilled = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base)));
+                onRejected = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base | 1)));
+            } else {
+                onFulfilled = Handle::adopt(toJSValue(closureFn(vm, combinatorElement, recordKeep.get(), flagKeep.get(), base)));
+                onRejected = Handle::retained(cap.reject.get());
+            }
+            result = invokeThen(vm, nextPromise, onFulfilled.get(), onRejected.get(), 2);
+            ++index;
+        }
+        if (result.isException()) {
+            closeAfterThrow(vm, iterator.get());
+            return rejectWith();
+        }
+        release(result);
+    }
+}
 
 NATIVE(asyncContinue);
 
@@ -631,7 +774,7 @@ NATIVE(asyncContinue)
 {
     UNUSED();
     Rare& r = carried(data);
-    asyncStep(vm, r.boundTarget, r.boundThis, int(r.fnLength), arg(args, argc, 0));
+    asyncStep(vm, r.boundTarget, r.boundThis, int(r.fnState), arg(args, argc, 0));
     return JSValue::undefined();
 }
 
@@ -727,7 +870,7 @@ NATIVE(asyncGenContinue)
 {
     UNUSED();
     Rare& r = carried(data);
-    asyncGenStep(vm, r.boundTarget, int(r.fnLength), arg(args, argc, 0));
+    asyncGenStep(vm, r.boundTarget, int(r.fnState), arg(args, argc, 0));
     return JSValue::undefined();
 }
 
@@ -772,7 +915,7 @@ NATIVE(wrapUnwrap)
     UNUSED();
     Rare& r = carried(data);
     retain(arg(args, argc, 0));
-    return iterResult(vm, arg(args, argc, 0), r.fnLength != 0);
+    return iterResult(vm, arg(args, argc, 0), r.fnState != 0);
 }
 
 NATIVE(syncWrapStep)
@@ -913,6 +1056,8 @@ void installPromise(VM& vm)
     vm.setIntrinsic(&vm.protos.promise, proto);
     release(toJSValue(proto));
     JSFunction* ctor = constructor(vm, "Promise", promiseCtor, 1, proto);
+    vm.promiseCtor = toJSValue(ctor);
+    retain(vm.promiseCtor);
     method(vm, proto, "then", promiseThen, 2);
     method(vm, proto, "catch", promiseCatch, 1);
     method(vm, proto, "finally", promiseFinally, 1);

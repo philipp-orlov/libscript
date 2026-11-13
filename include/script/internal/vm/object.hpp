@@ -49,6 +49,7 @@ struct Rare
     void* nativeData = nullptr;
     Key fnName = nullptr;                 ///< holds a count
     std::uint32_t fnLength = 0;
+    std::uint32_t fnState = 0;            ///< a native closure's own number, apart from its `length`
     // A bound function: what it calls, with what `this` and what leading arguments. Each holds a count.
     JSValue boundTarget = JSValue::undefined();
     JSValue boundThis = JSValue::undefined();
@@ -329,6 +330,8 @@ JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key);
 bool deleteProperty(VM& vm, JSValue base, Key key, bool strict = true);
 /// Define an own property of an object (`Object.defineProperty` for a data property or an accessor).
 bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t attrs);
+/// Move the element at `index` of an array to a property of its own (by name, behind a hole), so that its attributes can change.
+bool demoteIndexElement(VM& vm, JSArray* a, std::uint32_t index, Key key);
 bool defineAccessor(VM& vm, JSObject* object, Key key, JSValue getter, JSValue setter, std::uint8_t attrs);
 /// The canonical array index a property name spells, if it does.
 bool arrayIndexOf(Key key, std::uint32_t* index) noexcept;

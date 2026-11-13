@@ -609,8 +609,23 @@ JSValue definePropertyImpl(VM& vm, JSObject* o, Key key, JSObject* d)
     // What an array's own `length` and indices, a typed array's elements and a String's characters allow is their own rule.
     std::uint32_t index;
     const bool indexKey = arrayIndexOf(key, &index);
-    const bool exotic = (hasElems(o) && (indexKey || key == vm.atoms.length)) || o->cls() == ObjClass::TypedArray ||
-                        (o->cls() == ObjClass::String && (indexKey || key == vm.atoms.length));
+    if (hasElems(o) && key == vm.atoms.length) {
+        // ArraySetLength: the value is converted twice and must come out as the same Uint32; nothing else about `length` can change.
+        if (desc.isAccessor() || (desc.hasConfigurable && desc.configurable) || (desc.hasEnumerable && desc.enumerable))
+            return reject();
+        const bool writable = !(o->h.flags & cellflags::kFrozen);
+        if (desc.hasWritable && desc.writable && !writable)
+            return reject();
+        if (!desc.hasValue)
+            return JSValue::undefined();
+        if (!setProperty(vm, toJSValue(o), vm.atoms.length, vv, true))
+            return JSValue::exception();
+        return JSValue::undefined();
+    }
+    // An element of an array with attributes to be changed becomes a property of its own, which the generic steps below handle.
+    if (hasElems(o) && indexKey && !demoteIndexElement(vm, static_cast<JSArray*>(o), index, key))
+        return reject();
+    const bool exotic = o->cls() == ObjClass::TypedArray || (o->cls() == ObjClass::String && (indexKey || key == vm.atoms.length));
     if (exotic) {
         std::uint8_t existing = attr::kDefault;
         bool exists = false;

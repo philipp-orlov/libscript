@@ -312,6 +312,7 @@ struct VM : EngineRuntime
     /// The RegExp constructor and `RegExp.prototype.exec` as made, and the slots a plain RegExp counts on staying as they are.
     JSValue regexpCtor = JSValue::undefined();
     JSValue regexpExec = JSValue::undefined();
+    JSValue promiseCtor = JSValue::undefined();  ///< the Promise constructor as made
     struct RegExpSlot
     {
         JSObject* owner;  ///< holds a count

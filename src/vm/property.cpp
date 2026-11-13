@@ -382,6 +382,22 @@ bool makeIndexHole(VM& vm, JSArray* a, std::uint32_t index, Key key)
 
 }  // namespace
 
+bool demoteIndexElement(VM& vm, JSArray* a, std::uint32_t index, Key key)
+{
+    if (index >= a->length || a->elems[index].isHole())
+        return true;
+    if (a->h.flags & cellflags::kFrozen)
+        return false;
+    const JSValue value = a->elems[index];
+    retain(value);
+    if (!makeIndexHole(vm, a, index, key)) {
+        release(value);
+        return false;
+    }
+    a->putOwn(vm, key, value, attr::kDefault);
+    return true;
+}
+
 bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t attrs)
 {
     if (object->cls() == ObjClass::TypedArray) {

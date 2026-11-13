@@ -548,7 +548,8 @@ void VM::releaseRoots() noexcept
     regexpSlots.clear();
     release(regexpCtor);
     release(regexpExec);
-    regexpCtor = regexpExec = JSValue::undefined();
+    release(promiseCtor);
+    regexpCtor = regexpExec = promiseCtor = JSValue::undefined();
     release(exception);
     exception = JSValue::undefined();
     release(returnMarker);

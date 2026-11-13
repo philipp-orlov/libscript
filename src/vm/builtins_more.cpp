@@ -167,11 +167,12 @@ bool ownDescriptor(VM& vm, JSObject* o, Key key, OwnDesc& out)
         std::uint32_t index;
         if (arrayIndexOf(key, &index)) {
             const JSValue e = a->at(index);
-            if (e.isHole())
-                return false;
-            out.attrs = frozen ? attr::kEnumerable : attr::kDefault;
-            out.value = Handle::retained(e);
-            return true;
+            if (!e.isHole()) {
+                out.attrs = frozen ? attr::kEnumerable : attr::kDefault;
+                out.value = Handle::retained(e);
+                return true;
+            }
+            // A hole may stand for an index property with attributes of its own, kept by name.
         }
     }
     std::uint8_t attrs = 0;

@@ -571,9 +571,10 @@ JSValue speciesConstructor(VM& vm, JSValue object, JSValue fallback)
     Handle ctor = Handle::adopt(getProperty(vm, object, vm.atoms.constructor));
     if (ctor.get().isException())
         return ctor.get();
-    if (ctor.get().isUndefined())
+    if (ctor.get().isUndefined()) {
         retain(fallback);
         return fallback;
+    }
     if (!isObject(ctor.get()))
         return vm.throwError(ErrorCode::TypeError, "object.constructor is not an object");
     Handle species = Handle::adopt(getProperty(vm, ctor.get(), vm.atoms.symSpecies));

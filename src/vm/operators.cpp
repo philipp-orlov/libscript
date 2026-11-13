@@ -354,6 +354,24 @@ JSValue toStringValue(VM& vm, JSValue v)
     return makeString(vm, std::string_view("undefined"));
 }
 
+bool arrayIterationIntact(VM& vm, JSValue v)
+{
+    if (!isObject(v))
+        return false;
+    JSObject* a = asObject(v);
+    if (a->cls() != ObjClass::Array || a->proto(vm) != vm.protos.array)
+        return false;
+    if (!vm.arrayRootShape)
+        vm.arrayRootShape = vm.rootShapeFor(vm.protos.array)->id;
+    if (a->h.shape != vm.arrayRootShape && a->findOwn(vm, vm.atoms.symIterator))
+        return false;
+    JSValue* it = vm.protos.array->findOwn(vm, vm.atoms.symIterator);
+    if (!it || *it != vm.origArrayValues)
+        return false;
+    JSValue* next = vm.protos.nativeIterator->findOwn(vm, vm.atoms.next);
+    return next && *next == vm.origIteratorNext;
+}
+
 void wrapPrimitive(VM& vm, JSObject* o, ObjClass cls, JSValue v)
 {
     auto* box = new PrimitiveBox();

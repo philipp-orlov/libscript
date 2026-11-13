@@ -465,7 +465,31 @@ NATIVE(objectCreate)
     JSValue p = arg(args, argc, 0);
     if (!isObject(p) && !p.isNull())
         return typeError(vm, "Object prototype may only be an Object or null");
-    return toJSValue(newPlain(vm, isObject(p) ? asObject(p) : nullptr));
+    JSValue made = toJSValue(newPlain(vm, isObject(p) ? asObject(p) : nullptr));
+    const JSValue props = arg(args, argc, 1);
+    if (props.isUndefined())
+        return made;
+    // The properties go through `Object.defineProperties`.
+    Handle keep = Handle::adopt(made);
+    Key objectKey = vm.internKey(std::string_view("Object")), definePropsKey = vm.internKey(std::string_view("defineProperties"));
+    JSValue ctor = getProperty(vm, toJSValue(vm.global), objectKey);
+    detail::decRef(objectKey);
+    if (ctor.isException()) {
+        detail::decRef(definePropsKey);
+        return ctor;
+    }
+    Handle ctorKeep = Handle::adopt(ctor);
+    JSValue fn = getProperty(vm, ctor, definePropsKey);
+    detail::decRef(definePropsKey);
+    if (fn.isException())
+        return fn;
+    Handle fnKeep = Handle::adopt(fn);
+    const JSValue callArgs[2] = {made, props};
+    JSValue r = vm.call(fn, ctor, callArgs, 2);
+    if (r.isException())
+        return r;
+    release(r);
+    return keep.take();
 }
 
 bool descriptorField(VM& vm, JSObject* d, const char* name, JSValue* out)
@@ -480,61 +504,233 @@ bool descriptorField(VM& vm, JSObject* d, const char* name, JSValue* out)
 }
 
 /// Define `key` on `o` as the descriptor object `d` says. Undefined, or the exception sentinel.
+/// A property descriptor object, read the way ToPropertyDescriptor does: in order, noting which fields are there.
+struct PropDesc
+{
+    bool hasValue = false, hasWritable = false, hasGet = false, hasSet = false, hasEnumerable = false, hasConfigurable = false;
+    bool writable = false, enumerable = false, configurable = false;
+    Handle value, get, set;
+    bool isAccessor() const { return hasGet || hasSet; }
+    bool isData() const { return hasValue || hasWritable; }
+};
+
+bool readPropDesc(VM& vm, JSObject* d, PropDesc* out)
+{
+    auto field = [&](const char* name, bool* has, Handle* keep) -> bool {
+        JSValue v = JSValue::undefined();
+        Key key = vm.internKey(std::string_view(name));
+        const bool present = hasProperty(vm, toJSValue(d), key);
+        if (present) {
+            v = getProperty(vm, toJSValue(d), key);
+            if (v.isException()) {
+                detail::decRef(key);
+                return false;
+            }
+            *keep = Handle::adopt(v);
+        }
+        detail::decRef(key);
+        *has = present;
+        return true;
+    };
+    Handle flag;
+    if (!field("enumerable", &out->hasEnumerable, &flag))
+        return false;
+    out->enumerable = out->hasEnumerable && toBoolean(flag.get());
+    flag = Handle();
+    if (!field("configurable", &out->hasConfigurable, &flag))
+        return false;
+    out->configurable = out->hasConfigurable && toBoolean(flag.get());
+    flag = Handle();
+    if (!field("value", &out->hasValue, &out->value) || !field("writable", &out->hasWritable, &flag))
+        return false;
+    out->writable = out->hasWritable && toBoolean(flag.get());
+    if (!field("get", &out->hasGet, &out->get))
+        return false;
+    if (out->hasGet && !out->get.get().isUndefined() && !isFunction(out->get.get())) {
+        typeError(vm, "Getter must be a function: " + describe(vm, out->get.get()));
+        return false;
+    }
+    if (!field("set", &out->hasSet, &out->set))
+        return false;
+    if (out->hasSet && !out->set.get().isUndefined() && !isFunction(out->set.get())) {
+        typeError(vm, "Setter must be a function: " + describe(vm, out->set.get()));
+        return false;
+    }
+    if (out->isAccessor() && out->isData()) {
+        typeError(vm, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
+        return false;
+    }
+    return true;
+}
+
+/// A property key as an error message shows it.
+std::string keyText(Key key)
+{
+    if (key->kind == detail::CellKind::Symbol) {
+        const auto* sym = static_cast<const dyn::SymbolCell*>(key);
+        return "Symbol(" + toUtf8(sym->description) + ")";
+    }
+    return toUtf8(static_cast<StringCell*>(key)->text());
+}
+
+bool sameValueOf(JSValue a, JSValue b)
+{
+    if (a.isNumber() && b.isNumber()) {
+        const double x = a.asNumber(), y = b.asNumber();
+        if (x != x && y != y)
+            return true;
+        return x == y && std::signbit(x) == std::signbit(y);
+    }
+    return strictEquals(a, b);
+}
+
 JSValue definePropertyImpl(VM& vm, JSObject* o, Key key, JSObject* d)
 {
     if (proxyOf(o))
         return proxyDefine(vm, o, key, d);
-    JSValue v = JSValue::undefined(), g = JSValue::undefined(), s = JSValue::undefined(), flag;
-    const bool hasValue = descriptorField(vm, d, "value", &v);
-    const bool hasGet = descriptorField(vm, d, "get", &g);
-    const bool hasSet = descriptorField(vm, d, "set", &s);
-    std::uint8_t attrs = 0;
-    std::uint8_t existing = 0;
-    bool exists = o->findOwn(vm, key, &existing) != nullptr;
-    if (!exists && hasElems(o)) {
-        std::uint32_t index;
-        if (key == vm.atoms.length) {
-            exists = true;
-        } else if (arrayIndexOf(key, &index) && !static_cast<JSArray*>(o)->at(index).isHole()) {
-            exists = true;
-            existing = attr::kDefault;
+    PropDesc desc;
+    if (!readPropDesc(vm, d, &desc))
+        return JSValue::exception();
+    const JSValue vv = desc.hasValue ? desc.value.get() : JSValue::undefined();
+    auto reject = [&]() { return typeError(vm, "Cannot redefine property: " + keyText(key)); };
+
+    // What an array's own `length` and indices, a typed array's elements and a String's characters allow is their own rule.
+    std::uint32_t index;
+    const bool indexKey = arrayIndexOf(key, &index);
+    const bool exotic = (hasElems(o) && (indexKey || key == vm.atoms.length)) || o->cls() == ObjClass::TypedArray ||
+                        (o->cls() == ObjClass::String && (indexKey || key == vm.atoms.length));
+    if (exotic) {
+        std::uint8_t existing = attr::kDefault;
+        bool exists = false;
+        if (hasElems(o)) {
+            exists = key == vm.atoms.length || (indexKey && !static_cast<JSArray*>(o)->at(index).isHole());
+            if (key == vm.atoms.length)
+                existing = (o->h.flags & cellflags::kFrozen) ? 0 : attr::kWritable;
         }
-    }
-    auto bit = [&](const char* name, std::uint8_t mask) {
-        if (descriptorField(vm, d, name, &flag)) {
-            if (toBoolean(flag))
+        if (!exists)
+            exists = o->findOwn(vm, key, &existing) != nullptr;
+        std::uint8_t attrs = 0;
+        auto bit = [&](bool has, bool value, std::uint8_t mask) {
+            if (has ? value : (exists && (existing & mask)))
                 attrs |= mask;
-            release(flag);
-        } else if (exists) {
-            attrs |= existing & mask;
+        };
+        bit(desc.hasWritable, desc.writable, attr::kWritable);
+        bit(desc.hasEnumerable, desc.enumerable, attr::kEnumerable);
+        bit(desc.hasConfigurable, desc.configurable, attr::kConfigurable);
+        bool ok;
+        if (desc.isAccessor()) {
+            ok = defineAccessor(vm, o, key, desc.get.get(), desc.set.get(), std::uint8_t(attrs & ~attr::kWritable));
+        } else {
+            JSValue value = vv;
+            Handle current;
+            if (!desc.hasValue) {
+                JSValue got = exists ? getProperty(vm, toJSValue(o), key) : JSValue::undefined();
+                if (got.isException())
+                    return got;
+                current = Handle::adopt(got);
+                value = got;
+            }
+            retain(value);
+            ok = defineOwn(vm, o, key, value, attrs);
         }
-    };
-    bit("writable", attr::kWritable);
-    bit("enumerable", attr::kEnumerable);
-    bit("configurable", attr::kConfigurable);
-    bool ok;
-    if (hasGet || hasSet) {
-        if (hasValue) {
-            release(v);
-            release(g);
-            release(s);
-            return typeError(vm, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
-        }
-        ok = defineAccessor(vm, o, key, g, s, std::uint8_t(attrs & ~attr::kWritable));
-    } else {
-        if (!hasValue) {
-            JSValue* slot = o->findOwn(vm, key);
-            v = slot ? *slot : JSValue::undefined();
-            retain(v);
-        }
-        ok = defineOwn(vm, o, key, v, attrs);
-        v = JSValue::undefined();
+        return ok ? JSValue::undefined() : reject();
     }
-    release(v);
-    release(g);
-    release(s);
-    if (!ok)
-        return typeError(vm, "Cannot redefine property");
+
+    std::uint8_t cur = 0;
+    JSValue* slot = o->findOwn(vm, key, &cur);
+    if (!slot) {
+        if (o->h.flags & cellflags::kNotExtensible)
+            return typeError(vm, "Cannot define property " + keyText(key) + ", object is not extensible");
+        std::uint8_t attrs = 0;
+        if (desc.enumerable)
+            attrs |= attr::kEnumerable;
+        if (desc.configurable)
+            attrs |= attr::kConfigurable;
+        if (desc.isAccessor()) {
+            if (!defineAccessor(vm, o, key, desc.hasGet ? desc.get.get() : JSValue::undefined(),
+                                desc.hasSet ? desc.set.get() : JSValue::undefined(), attrs))
+                return reject();
+        } else {
+            if (desc.writable)
+                attrs |= attr::kWritable;
+            retain(vv);
+            if (!defineOwn(vm, o, key, vv, attrs))
+                return reject();
+        }
+        return JSValue::undefined();
+    }
+
+    const bool curAccessor = (cur & attr::kAccessor) != 0;
+    const bool curConfigurable = (cur & attr::kConfigurable) != 0;
+    const bool curEnumerable = (cur & attr::kEnumerable) != 0;
+    const bool curWritable = (cur & attr::kWritable) != 0;
+    GetterSetter* curPair = curAccessor ? reinterpret_cast<GetterSetter*>(slot->asCell()) : nullptr;
+    if (!curConfigurable) {
+        if (desc.hasConfigurable && desc.configurable)
+            return reject();
+        if (desc.hasEnumerable && desc.enumerable != curEnumerable)
+            return reject();
+        const bool generic = !desc.isAccessor() && !desc.isData();
+        if (!generic) {
+            if (curAccessor != desc.isAccessor())
+                return reject();
+            if (curAccessor) {
+                if (desc.hasGet && !sameValueOf(desc.get.get(), curPair->getter))
+                    return reject();
+                if (desc.hasSet && !sameValueOf(desc.set.get(), curPair->setter))
+                    return reject();
+            } else if (!curWritable) {
+                if (desc.hasWritable && desc.writable)
+                    return reject();
+                if (desc.hasValue && !sameValueOf(vv, *slot))
+                    return reject();
+            }
+        }
+    }
+    // Apply: what the descriptor does not mention stays, except across a change between data and accessor.
+    std::uint8_t attrs = 0;
+    if (desc.hasEnumerable ? desc.enumerable : curEnumerable)
+        attrs |= attr::kEnumerable;
+    if (desc.hasConfigurable ? desc.configurable : curConfigurable)
+        attrs |= attr::kConfigurable;
+    auto replaceValue = [&](JSValue fresh, std::uint8_t newAttrs) {
+        // `fresh` carries a count that the slot takes.
+        o->setAttrs(vm, key, newAttrs);
+        JSValue* where = o->findOwn(vm, key);
+        const JSValue old = *where;
+        *where = fresh;
+        release(old);
+    };
+    if (desc.isAccessor()) {
+        const JSValue getter = desc.hasGet ? desc.get.get() : (curAccessor ? curPair->getter : JSValue::undefined());
+        const JSValue setter = desc.hasSet ? desc.set.get() : (curAccessor ? curPair->setter : JSValue::undefined());
+        retain(getter);
+        retain(setter);
+        GetterSetter* gs;
+        try {
+            gs = vm.newGetterSetter(getter, setter);
+        } catch (...) {
+            release(getter);
+            release(setter);
+            throw;
+        }
+        replaceValue(JSValue::cell(reinterpret_cast<CellPtr>(gs)), std::uint8_t(attrs | attr::kAccessor));
+        return JSValue::undefined();
+    }
+    if (desc.isData() || !curAccessor) {
+        std::uint8_t dataAttrs = attrs;
+        const bool writable = desc.hasWritable ? desc.writable : (curAccessor ? false : curWritable);
+        if (writable)
+            dataAttrs |= attr::kWritable;
+        JSValue fresh = desc.hasValue ? vv : (curAccessor ? JSValue::undefined() : *slot);
+        retain(fresh);
+        replaceValue(fresh, dataAttrs);
+        return JSValue::undefined();
+    }
+    // An accessor given only attributes.
+    if (std::uint8_t(attrs | attr::kAccessor) != cur) {
+        o->setAttrs(vm, key, std::uint8_t(attrs | attr::kAccessor));
+    }
     return JSValue::undefined();
 }
 
@@ -3283,6 +3479,7 @@ void VM::installBuiltins()
     installTypedArrays(*this);
     installProxy(*this);
     installExtras(*this);
+    installIteratorHelpers(*this);
     returnMarker = toJSValue(newObject(static_cast<JSObject*>(nullptr)));
 }
 

@@ -102,7 +102,7 @@ enum class Step { Continue, Stop, Fail };
 template <class F>
 bool forEachIterated(VM& vm, JSValue src, F&& fn)
 {
-    if (isArray(src)) {
+    if (arrayIterationIntact(vm, src)) {
         Handle keep = Handle::retained(src);
         auto* a = static_cast<JSArray*>(asObject(src));
         for (std::uint32_t i = 0; i < a->length; ++i) {
@@ -166,6 +166,8 @@ void installTypedArrays(VM& vm);
 void installProxy(VM& vm);
 /// The URI functions, String's HTML methods and String.raw, groupBy.
 void installExtras(VM& vm);
+/// The global Iterator and the iterator helpers.
+void installIteratorHelpers(VM& vm);
 /// The keys a proxy's `ownKeys` trap (or its target) gives.
 bool proxyOwnKeys(VM& vm, JSObject* proxy, std::vector<Handle>& out);
 /// `getOwnPropertyDescriptor` through the proxy: a descriptor object, undefined, or the exception sentinel.

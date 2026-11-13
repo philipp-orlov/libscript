@@ -105,6 +105,8 @@ struct Intrinsics
     JSObject* arguments = nullptr;       ///< what the `arguments` of a call inherits from
     JSObject* arrayBuffer = nullptr;
     JSObject* sharedArrayBuffer = nullptr;
+    JSObject* iteratorHelper = nullptr;         ///< %IteratorHelperPrototype%
+    JSObject* wrapForValidIterator = nullptr;   ///< %WrapForValidIteratorPrototype%
     JSObject* typedArrays[16] = {};  ///< by ElemKind
 };
 
@@ -294,6 +296,11 @@ struct VM : EngineRuntime
     /// The script side of each host class (`Class<T>`): its constructor (or the object of a static class) and its prototype,
     /// each holding a count. Keyed by the class record.
     std::unordered_map<const void*, std::pair<JSObject*, JSObject*>> hostBindings;
+    /// The original `Array.prototype[Symbol.iterator]` and `%ArrayIteratorPrototype%.next`: while they are in place an
+    /// array is iterated by index. Not counted (the prototypes hold them).
+    JSValue origArrayValues = JSValue::undefined();
+    JSValue origIteratorNext = JSValue::undefined();
+    std::uint32_t arrayRootShape = 0;
     /// Set by `SetEvalScope` just before a call that may be a direct `eval`.
     const CodeBlock* evalCode = nullptr;
     std::uint32_t evalIndex = 0;

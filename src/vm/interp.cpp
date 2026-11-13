@@ -435,6 +435,7 @@ struct GenState : NativeState
     std::uint32_t pcIndex = 0;
     std::uint16_t resumeDst = 0;
     State state = Start;
+    bool prologue = false;  ///< running the parameters and declarations, up to `GenStart`
 
     ~GenState() override { clear_(); }
     void values(std::vector<JSValue>& out) const override
@@ -1832,6 +1833,21 @@ L_SetEvalScope:
     vm.evalIndex = ins->a;
     vm.evalFrames = vm.frameCount;
     NEXT();
+L_GenStart: {
+    // The end of what a call of a generator function does: it stands at the start of the body until resumed.
+    auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
+    if (!g->prologue)
+        NEXT();
+    g->prologue = false;
+    g->pcIndex = std::uint32_t(pc - codeStart);
+    g->state = GenState::Start;
+    for (std::uint32_t i = 0; i < code->nregs; ++i) {
+        g->regs[i] = R[i];
+        R[i] = JSValue::undefined();
+    }
+    --vm.frameCount;
+    return JSValue::undefined();
+}
 L_SetNewTarget:
     // An arrow function that calls `super()` runs it with the new.target of the constructor around it.
     fr->newTarget = R[ins->a];
@@ -2116,7 +2132,7 @@ L_KeysOf: {
 }
 L_IterInit: {
     const JSValue src = R[ins->b];
-    if (!isArray(src) && !isString(src)) {
+    if (!arrayIterationIntact(vm, src) && !isString(src)) {
         fr->pc = pc;
         if (src.isNullish()) {
             vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
@@ -3016,10 +3032,17 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     }
     if (c->flags & CodeBlock::kNeedsArgs)
         g->regs[1 + c->nparams] = toJSValue(captureArguments(*this, args, argc));
+    if ((c->flags & CodeBlock::kAsync) && !(c->flags & CodeBlock::kAsyncGen))
+        return bi::asyncStart(*this, keep.take());
+    // The parameters (their defaults may throw) and the declarations run now.
+    g->prologue = true;
+    JSValue ignored;
+    bool finished;
+    if (!resumeRaw(keep.get(), 0, JSValue::undefined(), &ignored, &finished))
+        return JSValue::exception();
+    release(ignored);
     if (c->flags & CodeBlock::kAsyncGen)
         return bi::asyncGeneratorStart(*this, keep.take(), proto);
-    if (c->flags & CodeBlock::kAsync)
-        return bi::asyncStart(*this, keep.take());
     return keep.take();
 }
 
@@ -3108,6 +3131,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     const JSValue result = run(*this);
     stackTop = savedTop;
     const bool finished = g->state == GenState::Running;
+    g->prologue = false;
     if (finished) {
         g->state = GenState::Done;
         g->clear(*this);

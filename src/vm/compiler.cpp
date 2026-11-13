@@ -3353,6 +3353,9 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     }
     declareLexical(n.d->list);
     hoistFunctions(n.d->list);
+    // The parameters and the declarations are done when a generator is called, not when it is first resumed.
+    if ((block->flags & CodeBlock::kGenerator) && (!(block->flags & CodeBlock::kAsync) || (block->flags & CodeBlock::kAsyncGen)))
+        emit(Op::GenStart);
     statements(n.d->list);
     const std::uint16_t r = temp();
     emit(Op::LoadUndef, r);

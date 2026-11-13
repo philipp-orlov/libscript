@@ -1153,7 +1153,7 @@ NATIVE(arrayCtor)
         if (d < 0 || d != std::floor(d) || d > 4294967295.0)
             return vm.throwError(ErrorCode::RangeError, "Invalid array length");
         if (d > double(JSArray::kMaxDenseGap))
-            return vm.throwError(ErrorCode::RangeError, "arrays are dense; this length is too large");
+            throw Error(ErrorCode::OutOfMemory, "arrays are dense; this length is too large");
         a->resize(vm, std::uint32_t(d));
     } else {
         a->appendAll(vm, args, argc);
@@ -1936,9 +1936,12 @@ NATIVE(stringRepeat)
     double n;
     if (!toNumber(vm, arg(args, argc, 0), &n))
         return JSValue::exception();
+    n = n != n ? 0 : std::trunc(n);
     if (n < 0 || std::isinf(n))
         return vm.throwError(ErrorCode::RangeError, "Invalid count value");
     StringView text = asString(s.get())->text();
+    if (n == 0 || text.empty())
+        return makeString(vm, StringView());
     if (n * double(text.size()) > 1 << 28)
         return vm.throwError(ErrorCode::RangeError, "Invalid string length");
     String out;
@@ -1965,11 +1968,14 @@ NATIVE(stringPad)
         release(f);
     }
     StringView text = asString(s.get())->text();
-    const std::size_t target = len != len || len < 0 ? 0 : std::size_t(std::min(len, double(1 << 28)));
-    if (target <= text.size() || fill.empty()) {
+    len = len != len ? 0 : std::trunc(len);
+    if (len <= double(text.size()) || fill.empty()) {
         retain(s.get());
         return s.get();
     }
+    if (len > double(1 << 28))
+        return vm.throwError(ErrorCode::RangeError, "Invalid string length");
+    const std::size_t target = std::size_t(len);
     String pad;
     while (pad.size() < target - text.size())
         pad += fill;
@@ -3124,6 +3130,8 @@ void VM::installBuiltins()
     release(toJSValue(arrayProtoObject));
     JSObject* ap = arrayProtoObject;
     JSFunction* arrayCtorFn = constructor(*this, "Array", arrayCtor, 1, ap);
+    arrayConstructor = toJSValue(arrayCtorFn);
+    retain(arrayConstructor);
     method(*this, arrayCtorFn, "isArray", arrayIsArray, 1);
     method(*this, ap, "push", arrayPush, 1);
     method(*this, ap, "pop", arrayPop, 0);

@@ -98,7 +98,7 @@ JSValue arrayCreate(VM& vm, double length)
     if (length > 4294967295.0)
         return vm.throwError(ErrorCode::RangeError, "Invalid array length");
     if (length > double(JSArray::kMaxDenseGap))
-        return vm.throwError(ErrorCode::RangeError, "arrays are dense; this length is too large");
+        throw Error(ErrorCode::OutOfMemory, "arrays are dense; this length is too large");
     JSArray* a = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(a));
     if (length > 0)
@@ -320,6 +320,109 @@ bool thisAndLength(VM& vm, JSValue self, Handle* o, double* len)
     if (o->get().isException())
         return false;
     return lengthOf(vm, o->get(), len);
+}
+
+/// `Array.from` and `Array.of`: the result is made by `this` when that is a constructor other than Array.
+bool generic(VM& vm, JSValue self)
+{
+    return isConstructor(self) && self.bits != vm.arrayConstructor.bits;
+}
+
+/// Set `A.length` after the elements went in, as the generic path must.
+bool finishLength(VM& vm, JSValue a, double n)
+{
+    return setProperty(vm, a, vm.atoms.length, JSValue::boxNumber(n), true);
+}
+
+NATIVE(arrayFrom)
+{
+    UNUSED();
+    const JSValue items = arg(args, argc, 0), mapFn = arg(args, argc, 1), thisArg = arg(args, argc, 2);
+    if (!mapFn.isUndefined() && !isFunction(mapFn))
+        return typeError(vm, describe(vm, mapFn) + " is not a function");
+    const bool viaCtor = generic(vm, self);
+    Handle out;
+    double index = 0;
+    auto put = [&](JSValue v) -> Step {
+        if ((std::uint64_t(index) & 1023) == 1023 && vm.ctx.interruptAsked()) {
+            vm.throwError(ErrorCode::Interrupted, "execution was interrupted");
+            return Step::Fail;
+        }
+        Handle mapped;
+        if (!mapFn.isUndefined()) {
+            JSValue callArgs[2] = {v, JSValue::boxNumber(index)};
+            mapped = Handle::adopt(vm.call(mapFn, thisArg, callArgs, 2));
+            if (mapped.get().isException())
+                return Step::Fail;
+            v = mapped.get();
+        }
+        if (!createData(vm, out.get(), index, v))
+            return Step::Fail;
+        ++index;
+        return Step::Continue;
+    };
+    if (items.isNullish())
+        return typeError(vm, describe(vm, items) + " is not iterable");
+    Handle method = Handle::adopt(getProperty(vm, items, vm.atoms.symIterator));
+    if (method.get().isException())
+        return method.get();
+    if (!method.get().isNullish()) {
+        if (!isFunction(method.get()))
+            return typeError(vm, "Symbol.iterator is not a function");
+        out = Handle::adopt(viaCtor ? vm.construct(self, nullptr, 0) : toJSValue(vm.newArray(vm.protos.array)));
+        if (out.get().isException())
+            return out.get();
+        if (!forEachIterated(vm, items, put))
+            return JSValue::exception();
+        if (!finishLength(vm, out.get(), index))
+            return JSValue::exception();
+        return out.take();
+    }
+    Handle arrayLike = Handle::adopt(toObject(vm, items));
+    if (arrayLike.get().isException())
+        return arrayLike.get();
+    double len = 0;
+    if (!lengthOf(vm, arrayLike.get(), &len))
+        return JSValue::exception();
+    if (viaCtor) {
+        JSValue n = JSValue::boxNumber(len);
+        out = Handle::adopt(vm.construct(self, &n, 1));
+    } else {
+        // Grown element by element, so the memory limit and the interrupt handler see a huge length coming.
+        out = Handle::adopt(len > 4294967295.0 ? arrayCreate(vm, len) : toJSValue(vm.newArray(vm.protos.array)));
+    }
+    if (out.get().isException())
+        return out.get();
+    for (double k = 0; k < len; ++k) {
+        Handle value;
+        if (readIndex(vm, arrayLike.get(), k, &value, false) < 0)
+            return JSValue::exception();
+        if (put(value.get()) == Step::Fail)
+            return JSValue::exception();
+    }
+    if (!finishLength(vm, out.get(), len))
+        return JSValue::exception();
+    return out.take();
+}
+
+NATIVE(arrayOf)
+{
+    UNUSED();
+    Handle out;
+    if (generic(vm, self)) {
+        JSValue n = JSValue::int32(std::int32_t(argc));
+        out = Handle::adopt(vm.construct(self, &n, 1));
+    } else {
+        out = Handle::adopt(arrayCreate(vm, double(argc)));
+    }
+    if (out.get().isException())
+        return out.get();
+    for (std::uint32_t i = 0; i < argc; ++i)
+        if (!createData(vm, out.get(), double(i), args[i]))
+            return JSValue::exception();
+    if (!finishLength(vm, out.get(), double(argc)))
+        return JSValue::exception();
+    return out.take();
 }
 
 NATIVE(arrayAtGeneric)
@@ -731,6 +834,10 @@ void installArrayCallbacks(VM& vm)
     for (const Entry& e : {Entry{"forEach", 0}, Entry{"map", 1}, Entry{"filter", 2}, Entry{"some", 3}, Entry{"every", 4},
                            Entry{"find", 5}, Entry{"findIndex", 6}, Entry{"findLast", 7}, Entry{"findLastIndex", 8}})
         method(vm, ap, e.name, arrayIterate, 1, reinterpret_cast<void*>(e.kind));
+    if (JSObject* ctor = isObject(vm.arrayConstructor) ? asObject(vm.arrayConstructor) : nullptr) {
+        method(vm, static_cast<JSFunction*>(ctor), "from", arrayFrom, 1);
+        method(vm, static_cast<JSFunction*>(ctor), "of", arrayOf, 0);
+    }
     method(vm, ap, "at", arrayAtGeneric, 1);
     method(vm, ap, "toReversed", arrayToReversedGeneric, 0);
     method(vm, ap, "with", arrayWithGeneric, 2);

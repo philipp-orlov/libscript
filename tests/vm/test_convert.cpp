@@ -29,7 +29,7 @@ TEST(everyTypeRoundTrips)
     CHECK_EQ(trip(Value(1.5f)).toDouble(), 1.5);
     CHECK_EQ(trip(Value(2.25)).toDouble(), 2.25);
     CHECK(trip(Value(2.25)).type() == Type::Double);
-    CHECK(trip(Value(3.0)).type() == Type::Int);  // a whole double comes back as an int32
+    CHECK_EQ(trip(Value(3.0)).toDouble(), 3.0);  // numbers come back as doubles, as the old core's do
     CHECK(std::signbit(trip(Value(-0.0)).toDouble()));
     CHECK(std::isnan(trip(Value(std::nan(""))).toDouble()));
     CHECK_EQ(trip(Value(std::int64_t(5))).toDouble(), 5.0);

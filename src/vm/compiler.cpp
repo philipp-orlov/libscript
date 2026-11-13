@@ -128,6 +128,7 @@ bool isFunctionNode(const Node& n) noexcept
 /// live in boxes. A name used by any nested function counts, whichever scope declares it, which over-approximates.
 void collectCaptured(const Node& n, std::set<String>& out, bool nested, bool arrowChain)
 {
+    checkNativeStack();
     if (n.kind == NK::Identifier && nested)
         out.insert(n.text);
     if ((n.kind == NK::ThisExpr || n.kind == NK::SuperExpr) && nested && arrowChain) {
@@ -167,6 +168,7 @@ void collectVars(const Node& n, std::vector<String>& out);
 
 void collectPatternNames(const Node& n, std::vector<String>& out)
 {
+    checkNativeStack();
     switch (n.kind) {
         case NK::Identifier: out.push_back(n.text); break;
         case NK::AssignPattern: collectPatternNames(*n.a, out); break;
@@ -190,6 +192,7 @@ void collectPatternNames(const Node& n, std::vector<String>& out)
 
 void collectVars(const Node& n, std::vector<String>& out)
 {
+    checkNativeStack();
     switch (n.kind) {
         case NK::VarDecl:
             if (n.varKind == VarKind::Var)
@@ -242,6 +245,7 @@ void collectVars(const Node& n, std::vector<String>& out)
 /// Whether `arguments` is read by the code of `n`, in arrow functions too, which have none of their own.
 bool containsArguments(const Node& n)
 {
+    checkNativeStack();
     if (n.kind == NK::FunctionExpr)
         return false;
     if (n.kind == NK::Identifier && n.text == u"arguments")
@@ -295,6 +299,7 @@ void annexBSub(const dyn::NodePtr& body, const std::set<String>& lexical, std::s
 
 void annexBScan(const Node& s, const std::set<String>& lexical, std::set<String>& out)
 {
+    checkNativeStack();
     switch (s.kind) {
         case NK::Block: annexBList(s.list, lexical, out, false); break;
         case NK::If:
@@ -357,6 +362,7 @@ void annexBNames(const std::vector<dyn::NodePtr>& body, std::set<String>& out)
 
 bool mentions(const Node& n, const String& name)
 {
+    checkNativeStack();
     if (n.kind == NK::Identifier && n.text == name)
         return true;
     for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
@@ -384,6 +390,7 @@ bool needsTdz(const std::vector<dyn::NodePtr>& statements, std::size_t declIndex
 /// Whether evaluating a node can assign to a variable of this function.
 bool hasAssignment(const Node& n)
 {
+    checkNativeStack();
     if (n.kind == NK::Assign || n.kind == NK::Update)
         return true;
     if (isFunctionNode(n))
@@ -400,6 +407,7 @@ bool hasAssignment(const Node& n)
 /// Whether `arguments` is read in a function's body or in an arrow inside it (not in another function, which has its own).
 bool usesArguments(const Node& n)
 {
+    checkNativeStack();
     if (n.kind == NK::Identifier && n.text == u"arguments")
         return true;
     if (n.kind == NK::FunctionExpr)
@@ -415,6 +423,7 @@ bool usesArguments(const Node& n)
 
 bool usesSuper(const Node& n)
 {
+    checkNativeStack();
     if (n.kind == NK::SuperExpr)
         return true;
     if (n.kind == NK::FunctionExpr)
@@ -431,6 +440,7 @@ bool usesSuper(const Node& n)
 /// Whether the member or call chain `n` has an optional link (`?.`) in it.
 bool hasOptionalLink(const Node& n)
 {
+    checkNativeStack();
     for (const Node* p = &n; p; p = p->a.get()) {
         if (p->optional)
             return true;
@@ -960,6 +970,7 @@ private:
 
 void Compiler::exprVia(const Node& n, int dst, std::uint16_t result)
 {
+    checkNativeStack();
     (void)n;
     if (dst >= 0 && dst != result)
         emit(Op::Mov, std::uint16_t(dst), result);
@@ -2027,6 +2038,7 @@ std::uint16_t Compiler::conditional(const Node& n, int dst)
 
 void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
 {
+    checkNativeStack();
     if (cond.kind == NK::Binary && !noFuse_) {
         Op fused = Op::Nop;
         switch (cond.op) {
@@ -2061,6 +2073,7 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
 
 void Compiler::condJump(const Node& cond, Label& whenFalse)
 {
+    checkNativeStack();
     if (cond.kind == NK::Logical && cond.op == Tok::AndAnd) {
         condJump(*cond.a, whenFalse);
         condJump(*cond.b, whenFalse);
@@ -2822,6 +2835,7 @@ void Compiler::varDecl(const Node& n)
 
 void Compiler::bindTarget(const Node& target, std::uint16_t value, bool init, VarKind kind)
 {
+    checkNativeStack();
     if (target.kind == NK::Identifier) {
         storeVar(target.text, value, init, target);
     } else if (target.kind == NK::ArrayPattern || target.kind == NK::ObjectPattern) {
@@ -2843,6 +2857,7 @@ void Compiler::bindTarget(const Node& target, std::uint16_t value, bool init, Va
 
 void Compiler::bindPattern(const Node& target, std::uint16_t value, bool init, VarKind kind)
 {
+    checkNativeStack();
     const std::uint16_t mark = fn_->top;
     if (target.kind == NK::ObjectPattern) {
         // Reading a property of null or undefined is the TypeError a destructuring of it should raise.
@@ -3060,6 +3075,7 @@ void Compiler::forStatement(const Node& n)
 
 void Compiler::forInOf(const Node& n, bool isOf)
 {
+    checkNativeStack();
     if (n.isAsync && !(fn_->block->flags & CodeBlock::kAsync))
         unsupported(n, "for await here");
     std::vector<String> labels;

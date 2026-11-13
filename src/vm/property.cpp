@@ -252,8 +252,7 @@ bool setArrayLength(VM& vm, JSArray* a, JSValue value, bool strict)
         return refuse(vm, strict, "Cannot assign to read only property 'length' of a frozen array");
     }
     if (wanted > a->length && (wanted - a->length) > (1u << 26)) {
-        vm.throwError(ErrorCode::RangeError, "arrays are dense; this length is too large");
-        return false;
+        throw Error(ErrorCode::OutOfMemory, "arrays are dense; this length is too large");
     }
     a->resize(vm, wanted);
     return true;

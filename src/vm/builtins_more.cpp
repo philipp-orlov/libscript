@@ -674,67 +674,6 @@ double toIntegerOr(VM& vm, JSValue v, double fallback, bool* ok)
     return d != d ? 0 : std::trunc(d);
 }
 
-NATIVE(arrayFrom)
-{
-    UNUSED();
-    const JSValue items = arg(args, argc, 0), mapFn = arg(args, argc, 1), thisArg = arg(args, argc, 2);
-    if (!mapFn.isUndefined() && !isFunction(mapFn))
-        return typeError(vm, describe(vm, mapFn) + " is not a function");
-    if (items.isNullish())
-        return typeError(vm, describe(vm, items) + " is not iterable");
-    JSArray* out = vm.newArray(vm.protos.array);
-    Handle keep = Handle::adopt(toJSValue(out));
-    std::uint32_t index = 0;
-    auto add = [&](JSValue v) -> Step {
-        if (!mapFn.isUndefined()) {
-            JSValue callArgs[2] = {v, JSValue::int32(std::int32_t(index))};
-            JSValue r = vm.call(mapFn, thisArg, callArgs, 2);
-            if (r.isException())
-                return Step::Fail;
-            out->append(vm, r);
-        } else {
-            retain(v);
-            out->append(vm, v);
-        }
-        ++index;
-        return Step::Continue;
-    };
-    JSValue method = getProperty(vm, items, vm.atoms.symIterator);
-    if (method.isException())
-        return method;
-    const bool iterable = isFunction(method);
-    release(method);
-    if (iterable) {
-        if (!forEachIterated(vm, items, add))
-            return JSValue::exception();
-        return keep.take();
-    }
-    std::vector<Handle> list;
-    if (isString(items)) {
-        for (std::uint32_t i = 0; i < asString(items)->length; ++i)
-            list.push_back(Handle::adopt(makeString(vm, asString(items)->text().substr(i, 1))));
-    } else if (isObject(items)) {
-        if (!listFromArrayLike(vm, items, list))
-            return JSValue::exception();
-    }
-    for (Handle& h : list)
-        if (add(h.get()) == Step::Fail)
-            return JSValue::exception();
-    return keep.take();
-}
-
-NATIVE(arrayOf)
-{
-    UNUSED();
-    JSArray* out = vm.newArray(vm.protos.array, 0, argc);
-    Handle keep = Handle::adopt(toJSValue(out));
-    for (std::uint32_t i = 0; i < argc; ++i) {
-        retain(args[i]);
-        out->append(vm, args[i]);
-    }
-    return keep.take();
-}
-
 // ------------------------------------------------------------------- String ---
 
 NATIVE(stringAt)
@@ -1003,8 +942,6 @@ void installMore(VM& vm)
     Key arrayKey = vm.internKey(std::string_view("Array"));
     auto* arrayCtorFn = static_cast<JSFunction*>(asObject(*vm.global->findOwn(vm, arrayKey)));
     detail::decRef(arrayKey);
-    method(vm, arrayCtorFn, "from", arrayFrom, 1);
-    method(vm, arrayCtorFn, "of", arrayOf, 0);
     JSObject* ap = vm.protos.array;
 
     // String.

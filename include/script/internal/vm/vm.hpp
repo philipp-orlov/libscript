@@ -111,6 +111,7 @@ struct Intrinsics
     JSObject* iteratorHelper = nullptr;         ///< %IteratorHelperPrototype%
     JSObject* wrapForValidIterator = nullptr;   ///< %WrapForValidIteratorPrototype%
     JSObject* typedArrays[16] = {};  ///< by ElemKind
+    JSObject* iteratorFamilies[6] = {};  ///< by `IteratorFamily`; 0 is unused
 };
 
 /// One activation on the VM stack. `R` is its register window; register 0 is `this`, then the parameters. A function called

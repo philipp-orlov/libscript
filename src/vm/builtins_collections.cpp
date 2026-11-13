@@ -406,7 +406,7 @@ NATIVE(tableIterator)
     const Kind& k = kKinds[packed & 3];
     if (!thisTable(vm, self, k.cls, "iterator"))
         return JSValue::exception();
-    return newNativeIterator(vm, new TableIter(self, int(packed >> 2)));
+    return newNativeIterator(vm, new TableIter(self, int(packed >> 2)), k.cls == ObjClass::Map ? kMapIterator : kSetIterator);
 }
 
 // ---------------------------------------------------------- WeakRef and friends ---

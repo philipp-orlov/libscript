@@ -702,6 +702,7 @@ void installExtras(VM& vm)
     detail::decRef(mapKey);
     if (mapCtor && isObject(*mapCtor))
         method(vm, asObject(*mapCtor), "groupBy", groupBy, 2, reinterpret_cast<void*>(1));
+    installArrayCallbacks(vm);
     recordRegExpOriginals(vm);
 }
 

@@ -206,9 +206,18 @@ bool refuse(VM& vm, bool strict, const char* message)
 
 bool setArrayLength(VM& vm, JSArray* a, JSValue value, bool strict)
 {
-    if (!value.isNumber() || value.asNumber() < 0 || value.asNumber() != double(std::uint32_t(value.asNumber()))) {
-        if (strict)
-            vm.throwError(ErrorCode::RangeError, "Invalid array length");
+    // ArraySetLength reads the value twice, as a Uint32 and as a Number, and a difference is a RangeError.
+    double asNumber = 0;
+    if (value.isNumber()) {
+        asNumber = value.asNumber();
+    } else {
+        double first = 0;
+        if (!toNumber(vm, value, &first) || !toNumber(vm, value, &asNumber))
+            return false;
+        value = JSValue::boxNumber(asNumber);
+    }
+    if (!(asNumber >= 0) || asNumber != double(std::uint32_t(asNumber))) {
+        vm.throwError(ErrorCode::RangeError, "Invalid array length");
         return false;
     }
     const std::uint32_t wanted = std::uint32_t(value.asNumber());

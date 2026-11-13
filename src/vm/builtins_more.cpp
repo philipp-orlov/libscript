@@ -734,101 +734,6 @@ NATIVE(arrayOf)
     return keep.take();
 }
 
-NATIVE(arrayAt)
-{
-    UNUSED();
-    if (!hasElems(self))
-        return typeError(vm, "this is not an array");
-    auto* a = static_cast<JSArray*>(asObject(self));
-    bool ok;
-    double i = toIntegerOr(vm, arg(args, argc, 0), 0, &ok);
-    if (!ok)
-        return JSValue::exception();
-    if (i < 0)
-        i += a->length;
-    if (i < 0 || i >= a->length || a->at(std::uint32_t(i)).isHole())
-        return JSValue::undefined();
-    retain(a->at(std::uint32_t(i)));
-    return a->at(std::uint32_t(i));
-}
-
-bool flattenInto(VM& vm, JSArray* out, JSValue source, double depth, JSValue mapFn, JSValue thisArg, bool mapTop)
-{
-    Handle keep = Handle::retained(source);
-    auto* a = static_cast<JSArray*>(asObject(source));
-    for (std::uint32_t i = 0; i < a->length; ++i) {
-        if (a->at(i).isHole())
-            continue;
-        Handle e = Handle::retained(a->at(i));
-        if (mapTop) {
-            JSValue callArgs[3] = {e.get(), JSValue::int32(std::int32_t(i)), source};
-            JSValue r = vm.call(mapFn, thisArg, callArgs, 3);
-            if (r.isException())
-                return false;
-            e = Handle::adopt(r);
-        }
-        if (isArray(e.get()) && (mapTop ? depth >= 1 : depth > 0)) {
-            if (!flattenInto(vm, out, e.get(), mapTop ? depth - 1 : depth - 1, JSValue::undefined(), JSValue::undefined(), false))
-                return false;
-        } else {
-            retain(e.get());
-            out->append(vm, e.get());
-        }
-    }
-    return true;
-}
-
-NATIVE(arrayFlat)
-{
-    UNUSED();
-    if (!hasElems(self))
-        return typeError(vm, "this is not an array");
-    const bool map = data != nullptr;
-    JSValue mapFn = JSValue::undefined();
-    double depth = 1;
-    if (map) {
-        mapFn = arg(args, argc, 0);
-        if (!isFunction(mapFn))
-            return typeError(vm, describe(vm, mapFn) + " is not a function");
-    } else {
-        bool ok;
-        depth = toIntegerOr(vm, arg(args, argc, 0), 1, &ok);
-        if (!ok)
-            return JSValue::exception();
-    }
-    JSArray* out = vm.newArray(vm.protos.array);
-    Handle keep = Handle::adopt(toJSValue(out));
-    if (!flattenInto(vm, out, self, depth, mapFn, arg(args, argc, 1), map))
-        return JSValue::exception();
-    return keep.take();
-}
-
-NATIVE(arrayFindLast)
-{
-    UNUSED();
-    if (!hasElems(self))
-        return typeError(vm, "this is not an array");
-    const JSValue callback = arg(args, argc, 0);
-    if (!isFunction(callback))
-        return typeError(vm, describe(vm, callback) + " is not a function");
-    Handle keep = Handle::retained(self);
-    auto* a = static_cast<JSArray*>(asObject(self));
-    for (std::uint32_t n = a->length; n-- > 0;) {
-        if (n >= a->length)
-            continue;
-        Handle e = Handle::retained(a->at(n).isHole() ? JSValue::undefined() : a->at(n));
-        JSValue callArgs[3] = {e.get(), JSValue::int32(std::int32_t(n)), self};
-        JSValue r = vm.call(callback, arg(args, argc, 1), callArgs, 3);
-        if (r.isException())
-            return r;
-        const bool hit = toBoolean(r);
-        release(r);
-        if (hit)
-            return data ? JSValue::int32(std::int32_t(n)) : e.take();
-    }
-    return data ? JSValue::int32(-1) : JSValue::undefined();
-}
-
 // ------------------------------------------------------------------- String ---
 
 NATIVE(stringAt)
@@ -1100,11 +1005,6 @@ void installMore(VM& vm)
     method(vm, arrayCtorFn, "from", arrayFrom, 1);
     method(vm, arrayCtorFn, "of", arrayOf, 0);
     JSObject* ap = vm.protos.array;
-    method(vm, ap, "at", arrayAt, 1);
-    method(vm, ap, "flat", arrayFlat, 0, nullptr);
-    method(vm, ap, "flatMap", arrayFlat, 1, reinterpret_cast<void*>(1));
-    method(vm, ap, "findLast", arrayFindLast, 1, nullptr);
-    method(vm, ap, "findLastIndex", arrayFindLast, 1, reinterpret_cast<void*>(1));
 
     // String.
     Key stringKey = vm.internKey(std::string_view("String"));

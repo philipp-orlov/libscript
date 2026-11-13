@@ -1244,17 +1244,18 @@ NATIVE(arrayToString)
     UNUSED();
     if (isArray(self))
         return arrayJoin(vm, self, nullptr, 0, data);
-    if (isObject(self)) {
-        Key joinKey = vm.internKey(std::string_view("join"));
-        JSValue join = getProperty(vm, self, joinKey);
-        detail::decRef(joinKey);
-        if (join.isException())
-            return join;
-        Handle keep = Handle::adopt(join);
-        if (isFunction(join))
-            return vm.call(join, self, nullptr, 0);
-    }
-    return objectToString(vm, self, args, argc, data);
+    Handle object = Handle::adopt(toObject(vm, self));
+    if (object.get().isException())
+        return object.get();
+    Key joinKey = vm.internKey(std::string_view("join"));
+    JSValue join = getProperty(vm, object.get(), joinKey);
+    detail::decRef(joinKey);
+    if (join.isException())
+        return join;
+    Handle keep = Handle::adopt(join);
+    if (isFunction(join))
+        return vm.call(join, object.get(), nullptr, 0);
+    return objectToString(vm, object.get(), args, argc, data);
 }
 
 NATIVE(arraySlice)
@@ -1341,6 +1342,10 @@ NATIVE(arrayConcat)
 NATIVE(arrayReverseImpl)
 {
     UNUSED();
+    if (hasElems(self) && static_cast<JSArray*>(asObject(self))->length < 2) {
+        retain(self);
+        return self;
+    }
     JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
@@ -1381,171 +1386,6 @@ bool elementOrInherited(VM& vm, JSValue self, JSArray* a, std::uint32_t i, JSVal
     }
     detail::decRef(k);
     return true;
-}
-
-NATIVE(arrayIndexOf)
-{
-    UNUSED();
-    ArrayView view(vm, self);
-    JSArray* a = view.a;
-    if (!a)
-        return JSValue::exception();
-    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 indexOf, 1 lastIndexOf, 2 includes
-    const JSValue needle = arg(args, argc, 0);
-    const std::int64_t len = a->length;
-    if (mode == 1) {
-        std::int64_t from = len - 1;
-        if (argc > 1) {
-            double d;
-            if (!toNumber(vm, args[1], &d))
-                return JSValue::exception();
-            d = d != d ? 0 : std::trunc(d);
-            from = d < 0 ? std::int64_t(std::max(d + double(len), -1.0)) : std::int64_t(std::min(d, double(len) - 1));
-        }
-        for (std::int64_t i = from; i >= 0; --i) {
-            JSValue e;
-            Handle keep;
-            bool found;
-            if (!elementOrInherited(vm, self, a, std::uint32_t(i), &e, &keep, &found))
-                return JSValue::exception();
-            if (found && strictEquals(e, needle))
-                return JSValue::int32(std::int32_t(i));
-        }
-        return JSValue::int32(-1);
-    }
-    std::int64_t from;
-    if (!relativeIndex(vm, arg(args, argc, 1), len, 0, &from))
-        return JSValue::exception();
-    for (std::int64_t i = from; i < len; ++i) {
-        JSValue e;
-        Handle keep;
-        bool found;
-        if (!elementOrInherited(vm, self, a, std::uint32_t(i), &e, &keep, &found))
-            return JSValue::exception();
-        if (mode == 2 ? sameValueZero(found ? e : JSValue::undefined(), needle) : (found && strictEquals(e, needle)))
-            return mode == 2 ? JSValue::boolean(true) : JSValue::int32(std::int32_t(i));
-    }
-    return mode == 2 ? JSValue::boolean(false) : JSValue::int32(-1);
-}
-
-/// forEach, map, filter, some, every, find, findIndex: one loop, the kind in `data`.
-NATIVE(arrayIterate)
-{
-    UNUSED();
-    ArrayView view(vm, self);
-    JSArray* a = view.a;
-    if (!a)
-        return JSValue::exception();
-    const int kind = int(reinterpret_cast<std::intptr_t>(data));
-    const JSValue callback = arg(args, argc, 0), thisArg = arg(args, argc, 1);
-    if (!isFunction(callback))
-        return typeError(vm, describe(vm, callback) + " is not a function");
-    retain(self);
-    Handle keep = Handle::adopt(self);
-    JSArray* out = nullptr;
-    Handle outKeep;
-    if (kind == 1 || kind == 2) {
-        out = vm.newArray(vm.protos.array);
-        outKeep = Handle::adopt(toJSValue(out));
-    }
-    // The callback may grow or shrink the array; the loop goes as far as it reached at the start.
-    const std::uint32_t len = a->length;
-    for (std::uint32_t i = 0; i < len; ++i) {
-        JSValue element = a->at(i);
-        const bool hole = element.isHole();
-        if (hole && kind <= 4)
-            continue;
-        if (hole)
-            element = JSValue::undefined();
-        Handle e = Handle::retained(element);
-        JSValue call[3] = {e.get(), JSValue::int32(std::int32_t(i)), self};
-        JSValue r = vm.call(callback, thisArg, call, 3);
-        if (r.isException())
-            return r;
-        Handle result = Handle::adopt(r);
-        switch (kind) {
-            case 0: break;
-            case 1:
-                if (out->length < i)
-                    out->resize(vm, i);
-                retain(r);
-                out->setAt(vm, i, r);
-                break;
-            case 2:
-                if (toBoolean(r)) {
-                    retain(e.get());
-                    out->append(vm, e.get());
-                }
-                break;
-            case 3:
-                if (toBoolean(r))
-                    return JSValue::boolean(true);
-                break;
-            case 4:
-                if (!toBoolean(r))
-                    return JSValue::boolean(false);
-                break;
-            case 5:
-                if (toBoolean(r))
-                    return e.take();
-                break;
-            case 6:
-                if (toBoolean(r))
-                    return JSValue::int32(std::int32_t(i));
-                break;
-        }
-    }
-    switch (kind) {
-        case 0:
-        case 5: return JSValue::undefined();
-        case 1:
-            if (out->length < len)
-                out->resize(vm, len);
-            return outKeep.get().isUndefined() ? JSValue::undefined() : (retain(outKeep.get()), outKeep.get());
-        case 2: return (retain(outKeep.get()), outKeep.get());
-        case 3: return JSValue::boolean(false);
-        case 4: return JSValue::boolean(true);
-        default: return JSValue::int32(-1);
-    }
-}
-
-NATIVE(arrayReduce)
-{
-    UNUSED();
-    ArrayView view(vm, self);
-    JSArray* a = view.a;
-    if (!a)
-        return JSValue::exception();
-    const bool right = data != nullptr;
-    const JSValue callback = arg(args, argc, 0);
-    if (!isFunction(callback))
-        return typeError(vm, describe(vm, callback) + " is not a function");
-    retain(self);
-    Handle keep = Handle::adopt(self);
-    std::int64_t i = right ? std::int64_t(a->length) - 1 : 0;
-    const std::int64_t step = right ? -1 : 1;
-    Handle acc;
-    if (argc >= 2) {
-        acc = Handle::retained(args[1]);
-    } else {
-        while (i >= 0 && i < a->length && a->elems[i].isHole())
-            i += step;
-        if (i < 0 || i >= a->length)
-            return typeError(vm, "Reduce of empty array with no initial value");
-        acc = Handle::retained(a->elems[i]);
-        i += step;
-    }
-    for (; i >= 0 && i < a->length; i += step) {
-        if (a->elems[i].isHole())
-            continue;
-        Handle e = Handle::retained(a->elems[i]);
-        JSValue call[4] = {acc.get(), e.get(), JSValue::int32(std::int32_t(i)), self};
-        JSValue r = vm.call(callback, JSValue::undefined(), call, 4);
-        if (r.isException())
-            return r;
-        acc = Handle::adopt(r);
-    }
-    return acc.take();
 }
 
 NATIVE(arrayFillImpl)
@@ -1732,11 +1572,15 @@ NATIVE(arraySplice)
 
 NATIVE(arrayReverse)
 {
+    if (!hasElems(self))
+        return arrayReverseGeneric(vm, self);
     return mutateGeneric(vm, self, args, argc, data, arrayReverseImpl);
 }
 
 NATIVE(arrayFill)
 {
+    if (!hasElems(self))
+        return arrayFillGeneric(vm, self, args, argc);
     return mutateGeneric(vm, self, args, argc, data, arrayFillImpl);
 }
 
@@ -1772,96 +1616,20 @@ NATIVE(arrayCopyWithinImpl)
 }
 
 /// A fresh array of the elements of `self`, a hole read as undefined: what toReversed, toSorted, toSpliced and with start from.
-JSArray* denseCopyOf(VM& vm, JSValue self, Handle& keep)
-{
-    ArrayView view(vm, self);
-    JSArray* a = view.a;
-    if (!a)
-        return nullptr;
-    JSArray* out = vm.newArray(vm.protos.array, 0, a->length);
-    keep = Handle::adopt(toJSValue(out));
-    for (std::uint32_t i = 0; i < a->length; ++i) {
-        const JSValue v = a->elems[i].isHole() ? JSValue::undefined() : a->elems[i];
-        retain(v);
-        out->append(vm, v);
-    }
-    return out;
-}
-
-NATIVE(arrayToReversed)
-{
-    UNUSED();
-    Handle keep;
-    JSArray* out = denseCopyOf(vm, self, keep);
-    if (!out)
-        return JSValue::exception();
-    std::reverse(out->elems, out->elems + out->length);
-    return keep.take();
-}
-
-NATIVE(arrayToSorted)
-{
-    UNUSED();
-    const JSValue compare = arg(args, argc, 0);
-    if (!compare.isUndefined() && !isFunction(compare))
-        return typeError(vm, "The comparison function must be either a function or undefined");
-    Handle keep;
-    JSArray* out = denseCopyOf(vm, self, keep);
-    if (!out)
-        return JSValue::exception();
-    JSValue r = arraySortImpl(vm, toJSValue(out), args, argc, nullptr);
-    if (r.isException())
-        return r;
-    release(r);
-    return keep.take();
-}
-
-NATIVE(arrayToSpliced)
-{
-    UNUSED();
-    Handle keep;
-    JSArray* out = denseCopyOf(vm, self, keep);
-    if (!out)
-        return JSValue::exception();
-    JSValue r = arraySpliceImpl(vm, toJSValue(out), args, argc, nullptr);
-    if (r.isException())
-        return r;
-    release(r);
-    return keep.take();
-}
-
-NATIVE(arrayWith)
-{
-    UNUSED();
-    Handle keep;
-    JSArray* out = denseCopyOf(vm, self, keep);
-    if (!out)
-        return JSValue::exception();
-    double d;
-    if (!toNumber(vm, arg(args, argc, 0), &d))
-        return JSValue::exception();
-    d = d != d ? 0 : std::trunc(d);
-    const double index = d < 0 ? double(out->length) + d : d;
-    if (index < 0 || index >= double(out->length))
-        return vm.throwError(ErrorCode::RangeError, "Invalid index : " + describe(vm, arg(args, argc, 0)));
-    const JSValue v = arg(args, argc, 1);
-    retain(v);
-    const JSValue old = out->elems[std::size_t(index)];
-    out->elems[std::size_t(index)] = v;
-    release(old);
-    out->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
-    return keep.take();
-}
-
 NATIVE(arrayCopyWithin)
 {
+    if (!hasElems(self))
+        return arrayCopyWithinGeneric(vm, self, args, argc);
     return mutateGeneric(vm, self, args, argc, data, arrayCopyWithinImpl);
 }
 
 NATIVE(arraySort)
 {
+    if (!hasElems(self))
+        return arraySortGeneric(vm, self, args, argc);
     return mutateGeneric(vm, self, args, argc, data, arraySortImpl);
 }
+
 
 
 // ------------------------------------------------------------------- String ---
@@ -3108,6 +2876,16 @@ NATIVE(performanceNow)
 
 }  // namespace
 
+namespace bi {
+
+JSValue sortDenseArray(VM& vm, JSValue array, JSValue compare)
+{
+    const JSValue args[1] = {compare};
+    return arraySortImpl(vm, array, args, 1, nullptr);
+}
+
+}  // namespace bi
+
 // ------------------------------------------------------------------ install ---
 
 JSObject* VM::errorProto(ErrorCode code) const noexcept
@@ -3318,23 +3096,7 @@ void VM::installBuiltins()
     method(*this, ap, "splice", arraySplice, 2);
     method(*this, ap, "concat", arrayConcat, 1);
     method(*this, ap, "reverse", arrayReverse, 0);
-    method(*this, ap, "indexOf", arrayIndexOf, 1, reinterpret_cast<void*>(0));
-    method(*this, ap, "lastIndexOf", arrayIndexOf, 1, reinterpret_cast<void*>(1));
-    method(*this, ap, "includes", arrayIndexOf, 1, reinterpret_cast<void*>(2));
     method(*this, ap, "copyWithin", arrayCopyWithin, 2);
-    method(*this, ap, "toReversed", arrayToReversed, 0);
-    method(*this, ap, "toSorted", arrayToSorted, 1);
-    method(*this, ap, "toSpliced", arrayToSpliced, 2);
-    method(*this, ap, "with", arrayWith, 2);
-    method(*this, ap, "forEach", arrayIterate, 1, reinterpret_cast<void*>(0));
-    method(*this, ap, "map", arrayIterate, 1, reinterpret_cast<void*>(1));
-    method(*this, ap, "filter", arrayIterate, 1, reinterpret_cast<void*>(2));
-    method(*this, ap, "some", arrayIterate, 1, reinterpret_cast<void*>(3));
-    method(*this, ap, "every", arrayIterate, 1, reinterpret_cast<void*>(4));
-    method(*this, ap, "find", arrayIterate, 1, reinterpret_cast<void*>(5));
-    method(*this, ap, "findIndex", arrayIterate, 1, reinterpret_cast<void*>(6));
-    method(*this, ap, "reduce", arrayReduce, 1, nullptr);
-    method(*this, ap, "reduceRight", arrayReduce, 1, reinterpret_cast<void*>(1));
     method(*this, ap, "fill", arrayFill, 1);
     method(*this, ap, "sort", arraySort, 1);
 

@@ -580,6 +580,11 @@ void VM::releaseRoots() noexcept
             detail::decRef(k);
         k = nullptr;
     }
+    for (JSObject*& p : protos.iteratorFamilies) {
+        if (p)
+            detail::decRef(reinterpret_cast<CellPtr>(p));
+        p = nullptr;
+    }
     for (JSObject*& p : protos.typedArrays) {
         if (p)
             detail::decRef(reinterpret_cast<CellPtr>(p));

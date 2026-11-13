@@ -82,11 +82,14 @@ inline JSFunction* constructor(VM& vm, const char* name, FastNative fn, std::uin
 /// An iterator made by native code: `step` yields the next value (owned) and says whether there was one.
 struct IteratorState : NativeState
 {
+    int family = 0;  ///< an `IteratorFamily`, set by `newNativeIterator`
     /// 1: `*out` is the next value; 0: finished; -1: an exception is pending.
     virtual int step(VM& vm, JSValue* out) = 0;
 };
+/// Which prototype a native iterator has: its own for each of these, `next` checking the receiver is of its kind.
+enum IteratorFamily : int { kPlainIterator = 0, kArrayIterator, kStringIterator, kMapIterator, kSetIterator, kRegExpStringIterator, kIteratorFamilies };
 /// An iterator object over `state`, which it takes. Owned.
-JSValue newNativeIterator(VM& vm, IteratorState* state);
+JSValue newNativeIterator(VM& vm, IteratorState* state, int family = kPlainIterator);
 /// `{ value, done }`, taking the count of `value`. Owned.
 JSValue iterResult(VM& vm, JSValue value, bool done);
 /// Install `Symbol`, the iterator prototypes and the generator prototype; the array and string iterators.
@@ -148,6 +151,16 @@ void installCollections(VM& vm);
 /// A new RegExp object (a literal's, or `new RegExp`): owned, or the exception sentinel with a SyntaxError.
 JSValue newRegExp(VM& vm, StringView pattern, StringView flags);
 void installRegExp(VM& vm);
+void installArrayCallbacks(VM& vm);
+/// The mutators of Array.prototype for a receiver that is not a plain array: the language's own steps, element by element.
+JSValue arrayFillGeneric(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc);
+JSValue arrayCopyWithinGeneric(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc);
+JSValue arrayReverseGeneric(VM& vm, JSValue self);
+JSValue arraySortGeneric(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc);
+/// Sort a dense array in place with `compare` (or by default); an owned value, or the exception sentinel.
+JSValue sortDenseArray(VM& vm, JSValue array, JSValue compare);
+/// `ArraySpeciesCreate(original, length)`, owned; the exception sentinel on a failure.
+JSValue arraySpeciesCreate(VM& vm, JSValue original, double length);
 /// Note what a plain RegExp counts on staying as it is; once all that goes on the prototype and the constructor is there.
 void recordRegExpOriginals(VM& vm);
 /// `IsRegExp`: an object with a truthy `Symbol.match` or that is a RegExp. `*ok` is false with an exception pending.

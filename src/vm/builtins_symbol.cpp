@@ -85,6 +85,8 @@ NATIVE(iteratorNext)
         Rare* r = asObject(self)->rare();
         if (r && r->ext) {
             auto* state = static_cast<IteratorState*>(r->ext);
+            if (state->family != int(reinterpret_cast<std::intptr_t>(data)))
+                return typeError(vm, "next method called on an incompatible receiver");
             JSValue out = JSValue::undefined();
             const int step = state->step(vm, &out);
             if (step < 0)
@@ -209,7 +211,7 @@ NATIVE(arrayIterator)
     UNUSED();
     if (self.isNullish())
         return typeError(vm, "Array.prototype iterator called on null or undefined");
-    return newNativeIterator(vm, new ArrayIter(self, int(reinterpret_cast<std::intptr_t>(data))));
+    return newNativeIterator(vm, new ArrayIter(self, int(reinterpret_cast<std::intptr_t>(data))), kArrayIterator);
 }
 
 NATIVE(stringIterator)
@@ -221,7 +223,7 @@ NATIVE(stringIterator)
     if (text.isException())
         return text;
     Handle keep = Handle::adopt(text);
-    return newNativeIterator(vm, new StringIter(text));
+    return newNativeIterator(vm, new StringIter(text), kStringIterator);
 }
 
 NATIVE(generatorResume)
@@ -318,10 +320,11 @@ NATIVE(symbolKeyFor)
 
 }  // namespace
 
-JSValue newNativeIterator(VM& vm, IteratorState* state)
+JSValue newNativeIterator(VM& vm, IteratorState* state, int family)
 {
     std::unique_ptr<IteratorState> owned(state);
-    JSObject* o = vm.newObject(vm.protos.nativeIterator);
+    owned->family = family;
+    JSObject* o = vm.newObject(vm.protos.iteratorFamilies[family] ? vm.protos.iteratorFamilies[family] : vm.protos.nativeIterator);
     Handle keep = Handle::adopt(toJSValue(o));
     o->h.cls = std::uint8_t(ObjClass::Iterator);
     o->rareOf(vm).ext = owned.release();
@@ -342,6 +345,16 @@ void installSymbolAndIterators(VM& vm)
     release(toJSValue(nativeProto));
     method(vm, nativeProto, "next", iteratorNext, 0);
     nativeProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("Iterator")), attr::kConfigurable);
+    {
+        const char* const tags[] = {nullptr, "Array Iterator", "String Iterator", "Map Iterator", "Set Iterator", "RegExp String Iterator"};
+        for (int family = 1; family < kIteratorFamilies; ++family) {
+            JSObject* proto = vm.newObject(vm.protos.iterator);
+            vm.setIntrinsic(&vm.protos.iteratorFamilies[family], proto);
+            release(toJSValue(proto));
+            method(vm, proto, "next", iteratorNext, 0, reinterpret_cast<void*>(std::intptr_t(family)));
+            proto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view(tags[family])), attr::kConfigurable);
+        }
+    }
 
     // Generators.
     JSObject* generatorProto = vm.newObject(vm.protos.iterator);

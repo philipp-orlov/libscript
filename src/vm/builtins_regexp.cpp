@@ -1217,7 +1217,8 @@ NATIVE(regexpMatchAll)
     if (!setProperty(vm, matcher.get(), vm.atoms.lastIndex, JSValue::boxNumber(last), true))
         return JSValue::exception();
     return newNativeIterator(vm, new MatchAllIter(matcher.get(), text.get(), flags.find(u'g') != String::npos,
-                                                  flags.find(u'u') != String::npos || flags.find(u'v') != String::npos));
+                                                  flags.find(u'u') != String::npos || flags.find(u'v') != String::npos),
+                             kRegExpStringIterator);
 }
 
 // ------------------------------------------------------------------ String ---

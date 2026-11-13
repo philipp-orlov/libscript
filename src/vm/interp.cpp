@@ -24,14 +24,28 @@ namespace {
 
 constexpr std::uint32_t kInterruptInterval = 4096;
 
-inline void setReg(JSValue& slot, JSValue value) noexcept
+/// `===`, with what is common settled without a call: equal bits, numbers, and values that are not both cells.
+[[gnu::always_inline]] inline bool fastStrictEquals(JSValue a, JSValue b) noexcept
+{
+    if (a.isInt32() && b.isInt32())
+        return a.bits == b.bits;
+    if (a.isNumber() && b.isNumber())
+        return a.asNumber() == b.asNumber();
+    if (a.bits == b.bits)
+        return true;
+    if (!a.isCell() || !b.isCell())
+        return false;
+    return strictEquals(a, b);
+}
+
+[[gnu::always_inline]] inline void setReg(JSValue& slot, JSValue value) noexcept
 {
     const JSValue old = slot;
     slot = value;
     release(old);
 }
 
-inline void copyReg(JSValue& slot, JSValue value) noexcept
+[[gnu::always_inline]] inline void copyReg(JSValue& slot, JSValue value) noexcept
 {
     retain(value);
     setReg(slot, value);
@@ -638,7 +652,8 @@ L_Add: {
         }
     }
     if (a.isNumber() && b.isNumber()) {
-        SET(ins->a, JSValue::boxNumber(a.asNumber() + b.asNumber()));
+        // A double stays a double: narrowing it back to an int32 costs more than it saves.
+        SET(ins->a, JSValue::boxDouble(a.asNumber() + b.asNumber()));
         NEXT();
     }
     if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b))
@@ -705,15 +720,20 @@ ARITH(Sub, {
         SET(ins->a, JSValue::int32(r));
         NEXT();
     }
-}, { SET(ins->a, JSValue::boxNumber(a.asNumber() - b.asNumber())); NEXT(); })
+}, { SET(ins->a, JSValue::boxDouble(a.asNumber() - b.asNumber())); NEXT(); })
 ARITH(Mul, {
     std::int32_t r;
     if (!__builtin_mul_overflow(x, y, &r) && (r != 0 || (x >= 0 && y >= 0))) {
         SET(ins->a, JSValue::int32(r));
         NEXT();
     }
-}, { SET(ins->a, JSValue::boxNumber(a.asNumber() * b.asNumber())); NEXT(); })
-ARITH(Div, {}, { SET(ins->a, JSValue::boxNumber(a.asNumber() / b.asNumber())); NEXT(); })
+}, { SET(ins->a, JSValue::boxDouble(a.asNumber() * b.asNumber())); NEXT(); })
+ARITH(Div, {}, {
+    const double q = a.asNumber() / b.asNumber();
+    // Two integers may divide evenly: that is an int32 again.
+    SET(ins->a, a.isInt32() && b.isInt32() ? JSValue::boxNumber(q) : JSValue::boxDouble(q));
+    NEXT();
+})
 ARITH(Mod, {
     if (x >= 0 && y > 0) {
         SET(ins->a, JSValue::int32(x % y));
@@ -783,7 +803,7 @@ L_Ne: {
 }
 L_StrictEq:
 L_StrictNe: {
-    const bool eq = strictEquals(R[ins->b], R[ins->c]);
+    const bool eq = fastStrictEquals(R[ins->b], R[ins->c]);
     SET(ins->a, JSValue::boolean(ins->opcode() == Op::StrictEq ? eq : !eq));
     NEXT();
 }
@@ -1026,8 +1046,99 @@ L_JNotGe: {
 }
 L_JStrictNe:
 L_JStrictEq: {
-    const bool eq = strictEquals(R[ins->a], R[ins->b]);
+    const bool eq = fastStrictEquals(R[ins->a], R[ins->b]);
     if (eq == (ins->opcode() == Op::JStrictEq))
+        TAKE16();
+    NEXT();
+}
+L_MulI:
+L_ModI:
+L_BitAndI:
+L_BitOrI:
+L_BitXorI:
+L_ShlI:
+L_ShrI:
+L_UShrI: {
+    const JSValue a = R[ins->b];
+    const std::int32_t y = std::int32_t(std::int16_t(ins->c));
+    const Op op = ins->opcode();
+    if (a.isInt32()) {
+        const std::int32_t x = a.asInt32();
+        std::int32_t r;
+        switch (op) {
+            case Op::MulI:
+                if (!__builtin_mul_overflow(x, y, &r) && (r != 0 || (x >= 0 && y >= 0))) {
+                    SET(ins->a, JSValue::int32(r));
+                    NEXT();
+                }
+                break;
+            case Op::ModI:
+                if (x >= 0 && y > 0) {
+                    SET(ins->a, JSValue::int32(x % y));
+                    NEXT();
+                }
+                break;
+            case Op::BitAndI: SET(ins->a, JSValue::int32(x & y)); NEXT();
+            case Op::BitOrI: SET(ins->a, JSValue::int32(x | y)); NEXT();
+            case Op::BitXorI: SET(ins->a, JSValue::int32(x ^ y)); NEXT();
+            case Op::ShlI: SET(ins->a, JSValue::int32(std::int32_t(std::uint32_t(x) << (y & 31)))); NEXT();
+            case Op::ShrI: SET(ins->a, JSValue::int32(x >> (y & 31))); NEXT();
+            default: SET(ins->a, JSValue::boxNumber(double(std::uint32_t(x) >> (y & 31)))); NEXT();
+        }
+    } else if (op == Op::MulI && a.isDouble()) {
+        SET(ins->a, JSValue::boxDouble(a.asDouble() * double(y)));
+        NEXT();
+    }
+    fr->pc = pc;
+    const Op generic = op == Op::MulI ? Op::Mul : op == Op::ModI ? Op::Mod : op == Op::BitAndI ? Op::BitAnd : op == Op::BitOrI ? Op::BitOr
+                       : op == Op::BitXorI ? Op::BitXor : op == Op::ShlI ? Op::Shl : op == Op::ShrI ? Op::Shr : Op::UShr;
+    const JSValue r = arithmetic(vm, generic, a, JSValue::int32(y));
+    if (r.isException())
+        FAIL();
+    SET(ins->a, r);
+    NEXT();
+}
+L_JLtI:
+L_JLeI:
+L_JGtI:
+L_JGeI:
+L_JNotLtI:
+L_JNotLeI:
+L_JNotGtI:
+L_JNotGeI: {
+    const JSValue a = R[ins->a];
+    const std::int32_t y = std::int32_t(std::int16_t(ins->b));
+    const Op op = ins->opcode();
+    bool holds;
+    if (a.isInt32() || a.isDouble()) {
+        const double x = a.asNumber();
+        const double yy = double(y);
+        switch (op) {
+            case Op::JLtI: case Op::JNotLtI: holds = x < yy; break;
+            case Op::JLeI: case Op::JNotLeI: holds = x <= yy; break;
+            case Op::JGtI: case Op::JNotGtI: holds = x > yy; break;
+            default: holds = x >= yy; break;
+        }
+    } else {
+        fr->pc = pc;
+        const Op rel = (op == Op::JLtI || op == Op::JNotLtI) ? Op::Lt : (op == Op::JLeI || op == Op::JNotLeI) ? Op::Le
+                       : (op == Op::JGtI || op == Op::JNotGtI) ? Op::Gt : Op::Ge;
+        const int r = relational(vm, rel, a, JSValue::int32(y));
+        if (r < 0)
+            FAIL();
+        holds = r != 0;
+    }
+    const bool negated = op == Op::JNotLtI || op == Op::JNotLeI || op == Op::JNotGtI || op == Op::JNotGeI;
+    if (holds != negated)
+        TAKE16();
+    NEXT();
+}
+L_JStrictNeI:
+L_JStrictEqI: {
+    const JSValue a = R[ins->a];
+    const std::int32_t y = std::int32_t(std::int16_t(ins->b));
+    const bool eq = a.isInt32() ? a.asInt32() == y : (a.isDouble() && a.asDouble() == double(y));
+    if (eq == (ins->opcode() == Op::JStrictEqI))
         TAKE16();
     NEXT();
 }
@@ -1143,7 +1254,13 @@ L_PutProp: {
     NEXT();
 }
 L_GetElem: {
-    const JSValue base = R[ins->b], k = R[ins->c];
+    const JSValue base = R[ins->b];
+    JSValue k = R[ins->c];
+    if (k.isDouble()) [[unlikely]] {
+        const double d = k.asDouble();
+        if (d >= 0 && d < 2147483648.0 && double(std::int32_t(d)) == d)
+            k = JSValue::int32(std::int32_t(d));
+    }
     if (k.isInt32() && k.asInt32() >= 0) {
         if (isObject(base) && asObject(base)->cls() == ObjClass::Array) {
             auto* a = static_cast<JSArray*>(asObject(base));
@@ -1197,7 +1314,13 @@ L_GetElem: {
     NEXT();
 }
 L_PutElem: {
-    const JSValue base = R[ins->a], k = R[ins->b];
+    const JSValue base = R[ins->a];
+    JSValue k = R[ins->b];
+    if (k.isDouble()) [[unlikely]] {
+        const double d = k.asDouble();
+        if (d >= 0 && d < 2147483648.0 && double(std::int32_t(d)) == d)
+            k = JSValue::int32(std::int32_t(d));
+    }
     if (k.isInt32() && k.asInt32() >= 0 && R[ins->c].isNumber() && isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
         auto* t = static_cast<JSTypedArray*>(asObject(base));
         const std::uint32_t i = std::uint32_t(k.asInt32());
@@ -1649,12 +1772,21 @@ do_call: {
             vm.throwError(ErrorCode::TypeError, describe(vm, callee) + " is not a constructor");
             FAIL();
         }
-        JSValue protoValue = getProperty(vm, callee, vm.atoms.prototype);
-        if (protoValue.isException())
-            FAIL();
-        JSObject* proto = isObject(protoValue) ? asObject(protoValue) : vm.protos.object;
-        JSObject* made = vm.newObject(proto);
-        release(protoValue);
+        JSObject* made;
+        if (f->h.shape == vm.fnProtoShape) [[likely]] {
+            // The shape every ordinary function has once its `prototype` is made: `length`, `name`, `prototype`.
+            const JSValue pv = *f->slotAt(2);
+            made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object);
+        } else {
+            JSValue protoValue = getProperty(vm, callee, vm.atoms.prototype);
+            if (protoValue.isException())
+                FAIL();
+            JSObject* proto = isObject(protoValue) ? asObject(protoValue) : vm.protos.object;
+            made = vm.newObject(proto);
+            release(protoValue);
+            if (!(f->flags & JSFunction::kNative) && !f->isDictionary(vm) && f->shapeOf(vm)->indexOf(vm.atoms.prototype) == 2)
+                vm.fnProtoShape = f->h.shape;
+        }
         setReg(R[base + 1], toJSValue(made));
     }
     if (f->flags & JSFunction::kNative) {

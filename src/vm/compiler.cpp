@@ -294,6 +294,18 @@ bool usesSuper(const Node& n)
     return false;
 }
 
+/// Whether the member or call chain `n` has an optional link (`?.`) in it.
+bool hasOptionalLink(const Node& n)
+{
+    for (const Node* p = &n; p; p = p->a.get()) {
+        if (p->optional)
+            return true;
+        if (p->kind != NK::Member && p->kind != NK::Call)
+            return false;
+    }
+    return false;
+}
+
 bool hasUseStrict(const Node& body)
 {
     for (const dyn::NodePtr& s : body.list) {
@@ -673,7 +685,7 @@ private:
     std::uint16_t update(const Node& n, int dst, bool discard);
     std::uint16_t binary(const Node& n, int dst);
     std::uint16_t logical(const Node& n, int dst);
-    std::uint16_t assign(const Node& n, int dst);
+    std::uint16_t assign(const Node& n, int dst, bool unused = false);
     std::uint16_t conditional(const Node& n, int dst);
     std::uint16_t objectLit(const Node& n, int dst);
     std::uint16_t arrayLit(const Node& n, int dst);
@@ -814,7 +826,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         case NK::Update: return update(n, dst, discard);
         case NK::Binary: return binary(n, dst);
         case NK::Logical: return logical(n, dst);
-        case NK::Assign: return assign(n, dst);
+        case NK::Assign: return assign(n, dst, discard);
         case NK::Conditional: return conditional(n, dst);
         case NK::Call: return chainRoot(n, dst, false);
         case NK::NewExpr: return call(n, dst, true);
@@ -1559,6 +1571,39 @@ Op compoundOp(Tok t, bool* ok)
     }
 }
 
+/// The form of an arithmetic or bitwise operator that takes a small integer constant, or Nop.
+Op immediateOp(Op op) noexcept
+{
+    switch (op) {
+        case Op::Mul: return Op::MulI;
+        case Op::Mod: return Op::ModI;
+        case Op::BitAnd: return Op::BitAndI;
+        case Op::BitOr: return Op::BitOrI;
+        case Op::BitXor: return Op::BitXorI;
+        case Op::Shl: return Op::ShlI;
+        case Op::Shr: return Op::ShrI;
+        case Op::UShr: return Op::UShrI;
+        default: return Op::Nop;
+    }
+}
+
+Op immediateJump(Op op) noexcept
+{
+    switch (op) {
+        case Op::JLt: return Op::JLtI;
+        case Op::JLe: return Op::JLeI;
+        case Op::JGt: return Op::JGtI;
+        case Op::JGe: return Op::JGeI;
+        case Op::JNotLt: return Op::JNotLtI;
+        case Op::JNotLe: return Op::JNotLeI;
+        case Op::JNotGt: return Op::JNotGtI;
+        case Op::JNotGe: return Op::JNotGeI;
+        case Op::JStrictNe: return Op::JStrictNeI;
+        case Op::JStrictEq: return Op::JStrictEqI;
+        default: return Op::Nop;
+    }
+}
+
 bool smallInt(const Node& n) noexcept
 {
     return n.kind == NK::NumberLit && n.number == double(std::int16_t(n.number)) && !(n.number == 0 && std::signbit(n.number));
@@ -1581,7 +1626,14 @@ std::uint16_t Compiler::binary(const Node& n, int dst)
         emit(op == Op::Add ? Op::AddI : Op::SubI, d, a, std::uint16_t(std::int16_t(imm)));
         return d;
     }
-    const std::uint16_t a = isPure(*n.b) ? exprAny(*n.a) : exprTemp(*n.a);
+    if (smallInt(*n.b) && immediateOp(op) != Op::Nop) {
+        const std::uint16_t a = exprAny(*n.a);
+        fn_->top = mark;
+        const std::uint16_t d = dest(dst);
+        emit(immediateOp(op), d, a, std::uint16_t(std::int16_t(int(n.b->number))));
+        return d;
+    }
+    const std::uint16_t a = !hasAssignment(*n.b) ? exprAny(*n.a) : exprTemp(*n.a);
     const std::uint16_t b = exprAny(*n.b);
     fn_->top = mark;
     const std::uint16_t d = dest(dst);
@@ -1642,6 +1694,12 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
         }
         if (fused != Op::Nop) {
             const std::uint16_t mark = fn_->top;
+            if (smallInt(*cond.b)) {
+                const std::uint16_t a = exprAny(*cond.a);
+                emitFusedJump(immediateJump(fused), a, std::uint16_t(std::int16_t(int(cond.b->number))), whenTrue);
+                fn_->top = mark;
+                return;
+            }
             const std::uint16_t a = isPure(*cond.b) ? exprAny(*cond.a) : exprTemp(*cond.a);
             const std::uint16_t b = exprAny(*cond.b);
             emitFusedJump(fused, a, b, whenTrue);
@@ -1675,6 +1733,12 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
         }
         if (fused != Op::Nop) {
             const std::uint16_t mark = fn_->top;
+            if (smallInt(*cond.b)) {
+                const std::uint16_t a = exprAny(*cond.a);
+                emitFusedJump(immediateJump(fused), a, std::uint16_t(std::int16_t(int(cond.b->number))), whenFalse);
+                fn_->top = mark;
+                return;
+            }
             const std::uint16_t a = isPure(*cond.b) ? exprAny(*cond.a) : exprTemp(*cond.a);
             const std::uint16_t b = exprAny(*cond.b);
             emitFusedJump(fused, a, b, whenFalse);
@@ -1746,7 +1810,7 @@ std::uint16_t Compiler::update(const Node& n, int dst, bool discard)
     syntaxError(n, "Invalid left-hand side expression in " + std::string(n.prefix ? "prefix" : "postfix") + " operation");
 }
 
-std::uint16_t Compiler::assign(const Node& n, int dst)
+std::uint16_t Compiler::assign(const Node& n, int dst, bool unused)
 {
     const std::uint16_t mark = fn_->top;
     const Node& target = *n.a;
@@ -1755,6 +1819,11 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
     const bool isLogical = n.op == Tok::AndAssign || n.op == Tok::OrAssign || n.op == Tok::NullishAssign;
 
     auto finish = [&](std::uint16_t value) -> std::uint16_t {
+        if (unused && dst < 0) {
+            // Nobody looks at the value.
+            fn_->top = mark;
+            return value >= mark ? mark : value;
+        }
         if (dst >= 0) {
             if (dst != value)
                 emit(Op::Mov, std::uint16_t(dst), value);
@@ -1816,6 +1885,8 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
                 const std::uint16_t reg = r.binding->reg;
                 if ((op == Op::Add || op == Op::Sub) && smallInt(*n.b))
                     emit(op == Op::Add ? Op::AddI : Op::SubI, reg, reg, std::uint16_t(std::int16_t(n.b->number)));
+                else if (smallInt(*n.b) && immediateOp(op) != Op::Nop)
+                    emit(immediateOp(op), reg, reg, std::uint16_t(std::int16_t(n.b->number)));
                 else {
                     const std::uint16_t v = exprAny(*n.b);
                     emit(op, reg, reg, v);
@@ -1832,11 +1903,13 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
     }
 
     if (target.kind == NK::Member) {
-        const std::uint16_t o = exprTemp(*target.a);
+        // A local the right side cannot assign needs no copy.
+        const bool stable = !hasAssignment(*n.b) && (!target.computed || !hasAssignment(*target.b));
+        const std::uint16_t o = stable ? exprAny(*target.a) : exprTemp(*target.a);
         std::uint16_t k = 0;
         const bool computed = target.computed;
         if (computed)
-            k = exprTemp(*target.b);
+            k = stable ? exprAny(*target.b) : exprTemp(*target.b);
         const std::uint16_t nameAtom = computed ? 0 : atom(target.text);
         auto put = [&](std::uint16_t value) {
             if (computed)
@@ -1851,8 +1924,9 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
                 emitCached(Op::GetProp, into, o, nameAtom);
         };
         if (n.op == Tok::Assign) {
-            const std::uint16_t v = temp();
-            expr(*n.b, v);
+            const std::uint16_t v = stable ? exprAny(*n.b) : temp();
+            if (!stable)
+                expr(*n.b, v);
             put(v);
             return finish(v);
         }
@@ -1889,7 +1963,9 @@ std::uint16_t Compiler::chainRoot(const Node& n, int dst, bool isNew)
         chainUsed_ = false;
     }
     const std::uint16_t mark = fn_->top;
-    const std::uint16_t t = temp();
+    // Without a `?.` in it nothing can short-circuit, so the result goes straight to where it is wanted.
+    const bool direct = dst >= 0 && !hasOptionalLink(n);
+    const std::uint16_t t = direct ? std::uint16_t(dst) : temp();
     if (n.kind == NK::Call)
         call(n, t, isNew);
     else
@@ -1905,6 +1981,10 @@ std::uint16_t Compiler::chainRoot(const Node& n, int dst, bool isNew)
             emit(Op::LoadUndef, t);
             bind(end);
         }
+    }
+    if (direct) {
+        fn_->top = mark;
+        return std::uint16_t(dst);
     }
     if (dst >= 0) {
         emit(Op::Mov, std::uint16_t(dst), t);
@@ -1928,7 +2008,7 @@ std::uint16_t Compiler::member(const Node& n, int dst)
     }
     const std::uint16_t mark = fn_->top;
     const bool constantKey = n.computed && n.b->kind == NK::StringLit;
-    const std::uint16_t o = (n.computed && !constantKey && !isPure(*n.b)) ? exprTemp(*n.a) : exprAny(*n.a);
+    const std::uint16_t o = (n.computed && !constantKey && hasAssignment(*n.b)) ? exprTemp(*n.a) : exprAny(*n.a);
     if (n.optional) {
         emitJump(Op::JNullish, o, *chain_);
         chainUsed_ = true;
@@ -2181,6 +2261,18 @@ void Compiler::varDecl(const Node& n)
         if (target.kind == NK::Identifier) {
             const std::uint16_t mark = fn_->top;
             if (d->b) {
+                Ref r = resolve(target.text);
+                const NK k = d->b->kind;
+                if (r.kind == Ref::Local && !r.binding->boxed && !r.isFnName &&
+                    (k == NK::NumberLit || k == NK::StringLit || k == NK::Binary || k == NK::Call || k == NK::Identifier ||
+                     k == NK::Unary || k == NK::Member || k == NK::FunctionExpr || k == NK::ArrowExpr || k == NK::BoolLit ||
+                     k == NK::NullLit || k == NK::NewExpr || k == NK::ThisExpr)) {
+                    // Straight into the variable's register.
+                    exprNamed(*d->b, r.binding->reg, target.text);
+                    r.binding->initialized = true;
+                    fn_->top = mark;
+                    continue;
+                }
                 const std::uint16_t v = exprNamed(*d->b, -1, target.text);
                 storeVar(target.text, v, lexical, target);
             } else if (lexical) {

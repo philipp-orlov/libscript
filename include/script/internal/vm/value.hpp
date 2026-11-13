@@ -106,13 +106,13 @@ struct JSValue
 static_assert(sizeof(JSValue) == 8, "a value is eight bytes");
 
 /// One more count for the cell a value holds, if it holds one.
-inline void retain(JSValue v) noexcept
+[[gnu::always_inline]] inline void retain(JSValue v) noexcept
 {
     if (v.isCell())
         detail::incRef(v.asCell());
 }
 /// One count fewer; the cell is destroyed at zero.
-inline void release(JSValue v) noexcept
+[[gnu::always_inline]] inline void release(JSValue v) noexcept
 {
     if (v.isCell())
         detail::decRef(v.asCell());

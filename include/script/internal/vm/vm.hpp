@@ -250,6 +250,8 @@ struct VM : EngineRuntime
     static constexpr std::size_t kSmallIndexKeys = 1024;
     Key smallIndexKeys[kSmallIndexKeys] = {};
     Intrinsics protos;
+    /// The shape of an ordinary function whose `prototype` is its third property (0 until one is seen).
+    std::uint32_t fnProtoShape = 0;
     /// Install a prototype into one of `protos`'s fields, counting it and letting go of the one it replaces.
     void setIntrinsic(JSObject** slot, JSObject* object) noexcept;
     /// `intern` for the text of a name; the cell is the table's and the caller's (a count is added).

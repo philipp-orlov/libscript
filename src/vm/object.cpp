@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include "script/internal/vm/bytecode.hpp"
 #include "script/internal/vm/object.hpp"
+#include "script/internal/vm/jit.hpp"
 
 #include <cstring>
 
@@ -143,6 +144,10 @@ void VM::releaseCode(CodeBlock* code) noexcept
             releaseValidity(c.validity);
     for (CodeBlock* child : code->children)
         releaseCode(child);
+    if (code->tier1) {
+        releaseTier1(code->tier1, this);
+        code->tier1 = nullptr;
+    }
     code->~CodeBlock();
     PoolAlloc<CodeBlock>().deallocate(code, 1);
 }

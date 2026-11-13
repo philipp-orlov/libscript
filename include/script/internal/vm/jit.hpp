@@ -34,7 +34,7 @@ struct Tier1Code
     void* entry = nullptr;                    ///< the code for the first instruction
     std::size_t bytes = 0;
     std::vector<std::uint32_t> labels;        ///< per instruction index: offset from `rx` of its code, or ~0u
-    std::uint32_t exits = 0;
+    std::vector<ValidityCell*> validities;    ///< cells the code reads, each held with a count of its own
     void* addressFor(std::uint32_t index) const noexcept { return rx + labels[index]; }
 };
 
@@ -42,7 +42,7 @@ struct Tier1Code
 bool tier1Available() noexcept;
 /// Translate `code`; sets `code->tier1` or, when the function is not suitable, `code->tier1Failed`.
 void compileTier1(VM& vm, CodeBlock* code);
-void releaseTier1(Tier1Code* code) noexcept;
+void releaseTier1(Tier1Code* code, VM* vm) noexcept;
 /// Run the top frame, which belongs to a compiled function, from the instruction at `index`. Returns what `run` would.
 JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index);
 
@@ -55,6 +55,17 @@ std::uint64_t stepInstruction(VM& vm, std::uint32_t index);
 /// What the interpreter does when the call that the instruction at `index` made returned the exception sentinel: look for
 /// a handler in the top frame; `kStepJump` if there is one, else the frame is left and the exception sentinel returned.
 std::uint64_t stepThrow(VM& vm, std::uint32_t index);
+
+/// One instruction's work without the interpreter's dispatch (interp.cpp): 1 when done, 0 for a pending exception, with
+/// the frame's pc set after the instruction. For compiled code that has no template of its own for the instruction, or
+/// whose template gave up.
+int jitGetGlobal(VM& vm, std::uint32_t index);
+int jitGetProp(VM& vm, std::uint32_t index);
+int jitPutProp(VM& vm, std::uint32_t index);
+int jitInitProp(VM& vm, std::uint32_t index);
+int jitNewObject(VM& vm, std::uint32_t index);
+int jitNewArray(VM& vm, std::uint32_t index);
+int jitArrayPush(VM& vm, std::uint32_t index);
 
 }  // namespace vm
 }  // namespace internal

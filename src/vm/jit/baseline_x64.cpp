@@ -13,9 +13,11 @@
 #include "script/internal/vm/jit.hpp"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <algorithm>
 #include <exception>
 #include <utility>
@@ -82,8 +84,37 @@ extern "C" void* scriptVmJitTarget(VM* vm)
 /// finds the parked exception and goes on leaving, and `enterTier1` throws it again.
 thread_local std::exception_ptr pendingException;
 
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+/// SCRIPT_VM_STEPS=1: at exit, how often compiled code ran each opcode in the interpreter.
+std::uint64_t stepCounts[std::size_t(Op::Count)];
+std::map<std::pair<CodeBlock*, std::uint32_t>, std::uint64_t> stepSites;
+const bool stepCensus = [] {
+    if (!std::getenv("SCRIPT_VM_STEPS"))
+        return false;
+    std::atexit([] {
+        for (std::size_t k = 0; k < std::size_t(Op::Count); ++k)
+            if (stepCounts[k])
+                std::fprintf(stderr, "step %-20s %14llu\n", opName(Op(k)), static_cast<unsigned long long>(stepCounts[k]));
+        for (auto& e : stepSites)
+            if (e.second > 100000)
+                std::fprintf(stderr, "site %s line %u %s: %llu\n", e.first.first->name ? "fn" : "anon",
+                             e.first.first->lines.size() > e.first.second ? e.first.first->lines[e.first.second] : 0,
+                             opName(Op(e.first.first->code[e.first.second].op)), static_cast<unsigned long long>(e.second));
+    });
+    return true;
+}();
+#endif
+
 extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
 {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (stepCensus) {
+        Frame* fr = vm->frameBase + vm->frameCount - 1;
+        ++stepCounts[fr->code->code[index].op];
+        if (std::getenv("SCRIPT_VM_STEPS")[0] == '2')
+            ++stepSites[{fr->code, index}];
+    }
+#endif
     try {
         return stepInstruction(*vm, index);
     } catch (...) {
@@ -99,6 +130,20 @@ extern "C" std::uint64_t scriptVmJitThrow(VM* vm, std::uint32_t index)
         return 0;
     try {
         return stepThrow(*vm, index);
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
+using HelperFn = int (*)(VM*, std::uint32_t);
+
+/// An interpreter helper (see jit.hpp) with C++ exceptions parked as in `scriptVmJitStep`.
+template <int (*F)(VM&, std::uint32_t)>
+int helperThunk(VM* vm, std::uint32_t index)
+{
+    try {
+        return F(*vm, index);
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -121,9 +166,12 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     JSValue* R = fr->R;
     const std::uint32_t base = ins->b, argc = ins->c;
     const JSValue callee = R[base];
+    const bool isNew = ins->opcode() == Op::New;
     if (!isFunction(callee))
         return {0, 0};
     auto* f = static_cast<JSFunction*>(asObject(callee));
+    if (isNew && ((f->flags & JSFunction::kNative) || !f->code->constructor || f->h.shape != vm.fnProtoShape))
+        return {0, 0};
     if (f->flags & JSFunction::kNative) {
         fr->pc = ins + 1;
         Rare* r = f->rare();
@@ -135,8 +183,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         return {res.bits, 1};
     }
     CodeBlock* c = f->code;
-    if (c->flags & (CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                    CodeBlock::kNeedsArgs))
+    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs) ||
+        ((c->flags & CodeBlock::kClassConstructor) && !isNew))
         return {0, 0};
     if (!c->tier1) {
         if (c->tier1Failed || !vm.tier1Threshold || ++c->hotness < vm.tier1Threshold)
@@ -150,6 +198,13 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         return {0, 0};
     fr->pc = ins + 1;
     --vm.ticks;
+    if (isNew) {
+        const JSValue pv = *f->slotAt(2);
+        JSObject* made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object);
+        const JSValue old = R[base + 1];
+        R[base + 1] = toJSValue(made);
+        release(old);
+    }
     if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && newR[0].isNullish()) {
         const JSValue old = newR[0];
         newR[0] = toJSValue(vm.global);
@@ -176,7 +231,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         }
     }
     vm.frameBase[vm.frameCount++] =
-        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, false, true, JSValue::undefined()};
+        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, true, isNew ? callee : JSValue::undefined()};
     return {reinterpret_cast<std::uint64_t>(&vm.frameBase[vm.frameCount - 1]),
             reinterpret_cast<std::uint64_t>(c->tier1->addressFor(0))};
 }
@@ -266,13 +321,17 @@ public:
         a_.int3();  // the code never falls off its end
         emitTails();
         CodeSpan span = allocateCode(a_.buf.size());
-        if (!span)
+        if (!span) {
+            for (ValidityCell* v : validities_)
+                vm_.releaseValidity(v);
             return nullptr;
+        }
         std::memcpy(span.rw, a_.buf.data(), a_.buf.size());
         auto* t = new Tier1Code;
         t->rx = span.rx;
         t->bytes = span.bytes;
         t->entry = t->rx + offsets_[0];
+        t->validities = std::move(validities_);
         t->labels = std::move(offsets_);
         return t;
     }
@@ -284,12 +343,20 @@ private:
     X64 a_;
     std::vector<Label> at_;
     std::vector<std::uint32_t> offsets_;
+    std::vector<ValidityCell*> validities_;
+    /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
+    void hold(ValidityCell* cell)
+    {
+        vm_.retainValidity(cell);
+        validities_.push_back(cell);
+    }
     Label step_, tail_, dispatch_, exit_, free_, call_, throw_;
     std::deque<std::pair<std::uint32_t, Label>> throws_;
     struct Slow
     {
         std::uint32_t index;
         Label label;
+        HelperFn helper;
     };
     std::deque<Slow> slows_;
 
@@ -299,10 +366,25 @@ private:
     }
     static Mem R(unsigned r) { return mem(RBX, std::int32_t(r) * 8); }
     /// A label that runs instruction `i` in the interpreter and then goes on after it.
-    Label& slow(std::uint32_t i)
+    Label& slow(std::uint32_t i, HelperFn helper = nullptr)
     {
-        slows_.push_back(Slow{i, Label{}});
+        slows_.push_back(Slow{i, Label{}, helper});
         return slows_.back().label;
+    }
+    Label& exception(std::uint32_t i)
+    {
+        throws_.emplace_back(i, Label{});
+        return throws_.back().second;
+    }
+    /// Run the instruction's helper from here; no template.
+    void helperOp(std::uint32_t i, HelperFn fn)
+    {
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, i);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(fn));
+        a_.callReg(RAX);
+        a_.aluI32(7, RAX, 1);
+        a_.jcc(CNE, exception(i));
     }
 
     // ---- counting ----
@@ -469,6 +551,9 @@ private:
     void arithImm(std::uint32_t i, const Ins& in);
     void compare(std::uint32_t i, const Ins& in);
     void jumps(std::uint32_t i, const Ins& in);
+    void strictCore(Label& eq, Label& neq, Label& bad);
+    void strictJump(std::uint32_t i, const Ins& in);
+    void strictValue(std::uint32_t i, const Ins& in);
     void getProp(std::uint32_t i, const Ins& in);
     void putProp(std::uint32_t i, const Ins& in);
     void getElem(std::uint32_t i, const Ins& in);
@@ -476,6 +561,7 @@ private:
     void ret(std::uint32_t i, const Ins& in);
     void call(std::uint32_t i, const Ins& in);
     void getGlobal(std::uint32_t i, const Ins& in);
+    void initProp(std::uint32_t i, const Ins& in);
 };
 
 void Baseline::emitTails()
@@ -484,9 +570,18 @@ void Baseline::emitTails()
     for (std::size_t k = 0; k < slows_.size(); ++k) {
         Slow& s = slows_[k];
         a_.bind(s.label);
-        callStep(s.index);
-        a_.cmpI(RAX, std::int32_t(kStepFall));
-        a_.jcc(CNE, tail_);
+        if (s.helper) {
+            a_.mov(RDI, R12);
+            a_.movImm(RSI, s.index);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(s.helper));
+            a_.callReg(RAX);
+            a_.aluI32(7, RAX, 1);
+            a_.jcc(CNE, exception(s.index));
+        } else {
+            callStep(s.index);
+            a_.cmpI(RAX, std::int32_t(kStepFall));
+            a_.jcc(CNE, tail_);
+        }
         a_.jmp(at_[s.index + length(s.index)]);
     }
     for (auto& t : throws_) {
@@ -529,6 +624,12 @@ void Baseline::emitTails()
 void Baseline::emit(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
+    if (const char* off = std::getenv("JT_OFF")) {
+        if (std::strstr(off, opName(in.opcode()))) {
+            emitStep(i);
+            return;
+        }
+    }
     switch (in.opcode()) {
     case Op::Nop:
         return;
@@ -627,11 +728,24 @@ void Baseline::emit(std::uint32_t i)
         ret(i, in);
         return;
     case Op::Call:
+    case Op::New:
         call(i, in);
         return;
     case Op::GetGlobal:
     case Op::GetGlobalOrUndef:
         getGlobal(i, in);
+        return;
+    case Op::InitProp:
+        initProp(i, in);
+        return;
+    case Op::NewObject:
+        helperOp(i, &helperThunk<jitNewObject>);
+        return;
+    case Op::NewArray:
+        helperOp(i, &helperThunk<jitNewArray>);
+        return;
+    case Op::ArrayPush:
+        helperOp(i, &helperThunk<jitArrayPush>);
         return;
     default:
         emitStep(i);
@@ -796,8 +910,89 @@ Relation relationOf(Op op)
 
 }  // namespace
 
+/// rax === rcx: go to `eq` or `neq`, or to `bad` when only the interpreter can tell (strings, doubles).
+void Baseline::strictCore(Label& eq, Label& neq, Label& bad)
+{
+    Label differ, aNumber;
+    a_.cmp(RAX, RCX);
+    a_.jcc(CNE, differ);
+    a_.cmp(RAX, RBP);  // the same bits are equal, unless a double is not a number
+    a_.jcc(CB, eq);
+    a_.cmp(RAX, R14);
+    a_.jcc(CAE, eq);
+    a_.jmp(bad);
+    a_.bind(differ);
+    a_.cmp(RAX, RBP);
+    a_.jcc(CAE, aNumber);
+    a_.testI(RAX, 2);  // null, undefined and booleans are only equal to themselves
+    a_.jcc(CNE, neq);
+    a_.cmp(RCX, RBP);
+    a_.jcc(CAE, neq);
+    a_.testI(RCX, 2);
+    a_.jcc(CNE, neq);
+    a_.jmp(bad);  // two cells: strings and bigints can still be equal
+    a_.bind(aNumber);
+    a_.cmp(RCX, RBP);
+    a_.jcc(CB, neq);
+    a_.mov(RDX, RAX);
+    a_.and_(RDX, RCX);
+    a_.cmp(RDX, R14);
+    a_.jcc(CAE, neq);  // two int32 that differ
+    a_.jmp(bad);
+}
+
+void Baseline::strictJump(std::uint32_t i, const Ins& in)
+{
+    const Op op = in.opcode();
+    const bool imm = op == Op::JStrictEqI || op == Op::JStrictNeI;
+    const bool wantEqual = op == Op::JStrictEq || op == Op::JStrictEqI;
+    const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
+    Label& bad = slow(i);
+    Label eq, neq;
+    a_.mov(RAX, R(in.a));
+    if (imm) {
+        Label isInt;
+        a_.cmp(RAX, R14);
+        a_.jcc(CAE, isInt);
+        a_.cmp(RAX, RBP);
+        a_.jcc(CAE, bad);  // a double
+        a_.jmp(neq);
+        a_.bind(isInt);
+        a_.aluI32(7, RAX, std::int32_t(std::int16_t(in.b)));
+        a_.jcc(CE, eq);
+        a_.jmp(neq);
+    } else {
+        a_.mov(RCX, R(in.b));
+        strictCore(eq, neq, bad);
+    }
+    a_.bind(wantEqual ? eq : neq);
+    go(i, target);
+    a_.bind(wantEqual ? neq : eq);
+}
+
+void Baseline::strictValue(std::uint32_t i, const Ins& in)
+{
+    const bool wantEqual = in.opcode() == Op::StrictEq;
+    Label& bad = slow(i);
+    Label eq, neq, store;
+    a_.mov(RAX, R(in.b));
+    a_.mov(RCX, R(in.c));
+    strictCore(eq, neq, bad);
+    a_.bind(eq);
+    a_.movImm(RAX, wantEqual ? kTrue : kFalse);
+    a_.jmp(store);
+    a_.bind(neq);
+    a_.movImm(RAX, wantEqual ? kFalse : kTrue);
+    a_.bind(store);
+    write(in.a, RAX);
+}
+
 void Baseline::compare(std::uint32_t i, const Ins& in)
 {
+    if (in.opcode() == Op::StrictEq || in.opcode() == Op::StrictNe) {
+        strictValue(i, in);
+        return;
+    }
     const Relation rel = relationOf(in.opcode());
     Label& bad = slow(i);
     Label dbl, done;
@@ -831,6 +1026,10 @@ void Baseline::compare(std::uint32_t i, const Ins& in)
 void Baseline::jumps(std::uint32_t i, const Ins& in)
 {
     const Op op = in.opcode();
+    if (op == Op::JStrictEq || op == Op::JStrictNe || op == Op::JStrictEqI || op == Op::JStrictNeI) {
+        strictJump(i, in);
+        return;
+    }
     switch (op) {
     case Op::Jmp:
         go(i, i + 1 + std::uint32_t(in.jump()));
@@ -935,10 +1134,10 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     const bool known = ic && ic->shape != 0 && (!ic->holder || ic->validity);
     const bool isLength = key == vm_.atoms.length;
     if (!known && !isLength) {
-        emitStep(i);
+        helperOp(i, &helperThunk<jitGetProp>);
         return;
     }
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitGetProp>);
     Label done, lengthPath;
     a_.mov(RAX, R(in.b));
     needObject(RAX, bad);
@@ -946,6 +1145,7 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
         a_.jcc(CNE, isLength ? lengthPath : bad);
         if (ic->holder) {
+            hold(ic->validity);
             a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic->validity));
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
@@ -978,10 +1178,10 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
     const std::uint16_t cacheId = code_->code[i + 1].a;
     const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
     if (!ic || ic->shape == 0 || ic->holder) {
-        emitStep(i);
+        helperOp(i, &helperThunk<jitPutProp>);
         return;
     }
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitPutProp>);
     a_.mov(RAX, R(in.a));
     needObject(RAX, bad);
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
@@ -996,6 +1196,7 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
         return;
     }
     if (ic->validity) {
+        hold(ic->validity);
         a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic->validity));
         a_.cmpI32(mem(RCX, kValidityValid), 0);
         a_.jcc(CE, bad);
@@ -1056,15 +1257,33 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     release(RDI);
 }
 
+void Baseline::initProp(std::uint32_t i, const Ins& in)
+{
+    const std::uint16_t cacheId = code_->code[i + 1].a;
+    const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
+    if (!ic || ic->shape == 0 || ic->next == 0) {
+        helperOp(i, &helperThunk<jitInitProp>);
+        return;
+    }
+    Label& bad = slow(i, &helperThunk<jitInitProp>);
+    a_.mov(RAX, R(in.a));
+    a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
+    a_.jcc(CNE, bad);
+    a_.mov(RCX, R(in.c));
+    retain(RCX);
+    a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic->index)), RCX);
+    a_.mov32(mem(RAX, 0), std::int32_t(ic->next));
+}
+
 void Baseline::getGlobal(std::uint32_t i, const Ins& in)
 {
     const std::uint16_t cacheId = code_->code[i + 1].a;
     const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
     if (!ic || ic->shape == 0 || ic->holder) {
-        emitStep(i);
+        helperOp(i, &helperThunk<jitGetGlobal>);
         return;
     }
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitGetGlobal>);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(vm_.global));
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
     a_.jcc(CNE, bad);
@@ -1082,7 +1301,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     Label helper, enter, native;
     const unsigned base = in.b, argc = in.c;
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
-    const bool fast = window <= 1 + argc + 6;
+    const bool fast = in.opcode() == Op::Call && window <= 1 + argc + 6;
     if (fast) {
         // A script function that is compiled, takes at least as many parameters as there are arguments and needs nothing
         // the interpreter's call sequence does on the side: its frame is pushed here.
@@ -1186,12 +1405,22 @@ void Baseline::call(std::uint32_t i, const Ins& in)
 
 void Baseline::ret(std::uint32_t i, const Ins& in)
 {
-    Label& bad = slow(i);
-    if (code_->constructor || (code_->flags & CodeBlock::kClassConstructor)) {
-        a_.cmpI8(mem(R13, kFrameConstruct), 0);
-        a_.jcc(CNE, bad);
-    }
+    (void)i;
+    Label have;
     a_.mov(RAX, R(in.a));
+    if (code_->constructor || (code_->flags & CodeBlock::kClassConstructor)) {
+        // A constructor's result that is not an object is `this`.
+        Label useThis;
+        a_.cmpI8(mem(R13, kFrameConstruct), 0);
+        a_.jcc(CE, have);
+        a_.test(RAX, R15);
+        a_.jcc(CNE, useThis);
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CE, have);
+        a_.bind(useThis);
+        a_.mov(RAX, R(0));
+    }
+    a_.bind(have);
     retain(RAX);
     a_.mov(mem(RSP, 0), RAX);
     // Registers a call put its arguments in belong to the caller; those the call did not fill and everything above the
@@ -1243,10 +1472,13 @@ void compileTier1(VM& vm, CodeBlock* code)
     SCRIPT_VM_CENSUS(Tier1Compiled);
 }
 
-void releaseTier1(Tier1Code* code) noexcept
+void releaseTier1(Tier1Code* code, VM* vm) noexcept
 {
     if (!code)
         return;
+    if (vm)
+        for (ValidityCell* v : code->validities)
+            vm->releaseValidity(v);
     CodeSpan span;
     span.rx = code->rx;
     span.bytes = code->bytes;
@@ -1276,7 +1508,7 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
 
 bool tier1Available() noexcept { return false; }
 void compileTier1(VM&, CodeBlock* code) { code->tier1Failed = true; }
-void releaseTier1(Tier1Code*) noexcept {}
+void releaseTier1(Tier1Code*, VM*) noexcept {}
 JSValue enterTier1(VM&, Tier1Code*, std::uint32_t) { return JSValue::exception(); }
 
 #endif
@@ -1284,7 +1516,7 @@ JSValue enterTier1(VM&, Tier1Code*, std::uint32_t) { return JSValue::exception()
 CodeBlock::~CodeBlock()
 {
     if (tier1)
-        releaseTier1(tier1);
+        releaseTier1(tier1, nullptr);
 }
 
 }  // namespace vm

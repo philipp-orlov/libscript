@@ -6,6 +6,8 @@
 // instruction. Registers own their values: every write releases what was there.
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "script/internal/dyn/object.hpp"
@@ -2347,6 +2349,210 @@ std::uint64_t stepInstruction(VM& vm, std::uint32_t index)
     const Ins* fall = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
     fr->pc = at;
     return runImpl<true>(vm, fall).bits;
+}
+
+
+// ------------------------------------------------- helpers for compiled code ---
+// What the interpreter does for one instruction, without the dispatch: compiled code calls these where it has no template
+// of its own, or for what a template gives up on. Each returns 1 when done and 0 for an exception (pending, the frame's
+// pc set just after the instruction), as the handlers above do. They must agree with the handlers.
+
+namespace {
+struct JitCtx
+{
+    Frame* fr;
+    CodeBlock* code;
+    const Ins* ins;
+    JSValue* R;
+    Key* atoms;
+    std::uint16_t cacheId;
+    InlineCache* ic(InlineCache& scratch) const { return cacheId == kNoCache ? &scratch : &code->caches[cacheId]; }
+};
+
+inline JitCtx jitCtx(VM& vm, std::uint32_t index, bool hasCache)
+{
+    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    CodeBlock* code = fr->code;
+    const Ins* ins = code->code.data() + index;
+    fr->pc = ins + (hasCache ? 2 : 1);
+    vm.stackTop = fr->R + code->nregs;
+    return JitCtx{fr, code, ins, fr->R, code->atoms.data(), hasCache ? ins[1].a : std::uint16_t(kNoCache)};
+}
+}  // namespace
+
+int jitGetGlobal(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, true);
+    const Ins* ins = c.ins;
+    Key key = c.atoms[ins->b];
+    InlineCache scratch;
+    InlineCache& ic = *c.ic(scratch);
+    JSObject* g = vm.global;
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm, key, &attrs);
+    if (slot && !(attrs & attr::kAccessor)) {
+        if (c.cacheId != kNoCache && cacheable(vm, g)) {
+            ic.shape = g->h.shape;
+            ic.index = std::uint32_t(g->shapeOf(vm)->indexOf(key));
+        }
+        copyReg(c.R[ins->a], *slot);
+        return 1;
+    }
+    if (!hasProperty(vm, toJSValue(g), key)) {
+        if (ins->opcode() == Op::GetGlobalOrUndef) {
+            setReg(c.R[ins->a], JSValue::undefined());
+            return 1;
+        }
+        vm.throwError(ErrorCode::ReferenceError, toUtf8(static_cast<StringCell*>(key)->text()) + " is not defined");
+        return 0;
+    }
+    JSValue v = getProperty(vm, toJSValue(g), key);
+    if (v.isException())
+        return 0;
+    setReg(c.R[ins->a], v);
+    return 1;
+}
+
+int jitGetProp(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, true);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const JSValue base = R[ins->b];
+    Key key = c.atoms[ins->c];
+    InlineCache scratch;
+    InlineCache& ic = *c.ic(scratch);
+    if (isObject(base)) {
+        JSObject* o = asObject(base);
+        if (o->h.shape == ic.shape) {
+            if (!ic.holder) {
+                copyReg(R[ins->a], *o->slotAt(ic.index));
+                return 1;
+            }
+            if (ic.validity->valid) {
+                copyReg(R[ins->a], *ic.holder->slotAt(ic.index));
+                return 1;
+            }
+        }
+        if (key == vm.atoms.length && o->cls() == ObjClass::Array) {
+            const std::uint32_t n = static_cast<JSArray*>(o)->length;
+            setReg(R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            return 1;
+        }
+        if (key == vm.atoms.length && o->cls() == ObjClass::TypedArray) {
+            const std::uint32_t n = static_cast<JSTypedArray*>(o)->length;
+            setReg(R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            return 1;
+        }
+        if (c.cacheId != kNoCache && learnRead(vm, ic, o, key)) {
+            copyReg(R[ins->a], ic.holder ? *ic.holder->slotAt(ic.index) : *o->slotAt(ic.index));
+            return 1;
+        }
+    } else if (isString(base) && key == vm.atoms.length) {
+        setReg(R[ins->a], JSValue::int32(std::int32_t(asString(base)->length)));
+        return 1;
+    }
+    const JSValue v = getProperty(vm, base, key);
+    if (v.isException())
+        return 0;
+    setReg(R[ins->a], v);
+    return 1;
+}
+
+int jitPutProp(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, true);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const JSValue base = R[ins->a];
+    Key key = c.atoms[ins->b];
+    InlineCache scratch;
+    InlineCache& ic = *c.ic(scratch);
+    const bool strict = (c.code->flags & CodeBlock::kStrict) != 0;
+    if (isObject(base)) {
+        JSObject* o = asObject(base);
+        if (o->h.shape == ic.shape) {
+            if (ic.next == 0) {
+                JSValue* slot = o->slotAt(ic.index);
+                const JSValue old = *slot;
+                *slot = R[ins->c];
+                retain(*slot);
+                release(old);
+                return 1;
+            }
+            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
+                JSValue* slot = &o->inl()[ic.index];
+                *slot = R[ins->c];
+                retain(*slot);
+                o->h.shape = ic.next;
+                return 1;
+            }
+        }
+        const std::uint32_t before = o->h.shape;
+        if (!setProperty(vm, base, key, R[ins->c], strict)) {
+            if (!vm.exception.isUndefined())
+                return 0;
+            return 1;
+        }
+        if (c.cacheId != kNoCache) {
+            if (o->h.shape == before)
+                learnOwnWrite(vm, ic, o, key);
+            else
+                learnAdd(vm, ic, o, before, key, true);
+        }
+        return 1;
+    }
+    if (!setProperty(vm, base, key, R[ins->c], strict) && !vm.exception.isUndefined())
+        return 0;
+    return 1;
+}
+
+int jitInitProp(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, true);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    JSObject* o = asObject(R[ins->a]);
+    InlineCache scratch;
+    InlineCache& ic = *c.ic(scratch);
+    if (o->h.shape == ic.shape) {
+        JSValue* slot = &o->inl()[ic.index];
+        *slot = R[ins->c];
+        retain(*slot);
+        o->h.shape = ic.next;
+        return 1;
+    }
+    const std::uint32_t before = o->h.shape;
+    retain(R[ins->c]);
+    o->putOwn(vm, c.atoms[ins->b], R[ins->c], attr::kDefault);
+    if (c.cacheId != kNoCache)
+        learnAdd(vm, ic, o, before, c.atoms[ins->b], false);
+    return 1;
+}
+
+int jitNewObject(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    JSObject* o = vm.newObject(vm.protos.object, std::uint8_t(c.ins->b));
+    setReg(c.R[c.ins->a], toJSValue(o));
+    return 1;
+}
+
+int jitNewArray(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    JSArray* a = vm.newArray(vm.protos.array, 0, c.ins->b);
+    setReg(c.R[c.ins->a], toJSValue(a));
+    return 1;
+}
+
+int jitArrayPush(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    auto* a = static_cast<JSArray*>(asObject(c.R[c.ins->a]));
+    retain(c.R[c.ins->b]);
+    a->append(vm, c.R[c.ins->b]);
+    return 1;
 }
 
 std::uint64_t stepThrow(VM& vm, std::uint32_t index)

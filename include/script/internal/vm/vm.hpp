@@ -275,6 +275,10 @@ struct VM : EngineRuntime
     std::size_t runJobs();
     /// `resumeGenerator` without the result object: `*out` is the value (owned), `*done` whether it returned.
     bool resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool* done);
+    /// What a generator'"'"'s `return(v)` throws at the `yield` it waits in, so that `finally` blocks run and `catch` blocks do
+    /// not; `returnValue` is `v`. Both owned.
+    JSValue returnMarker = JSValue::undefined();
+    JSValue returnValue = JSValue::undefined();
     /// Set while a `throw` is being delivered to a suspended generator.
     bool resumeThrow = false;
 

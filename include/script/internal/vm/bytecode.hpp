@@ -76,6 +76,7 @@ struct Handler
     std::uint32_t end;
     std::uint32_t target;
     std::uint16_t reg;
+    bool isCatch = false;  ///< a `catch` clause: a generator's `return` passes over it
 };
 
 /// What a property instruction learned, kept as data beside the code (ls-jsc.md, 4.6). `shape` is the receiver's shape id

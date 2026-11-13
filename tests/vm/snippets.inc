@@ -433,3 +433,12 @@ S("var r; try { new Uint8Array(-1); } catch (e) { r = e.name; } try { new Int32A
 S("var x = new Uint8Array(3); x[5] = 1; x['1'] = 7; x.foo = 2; [x.join(), x.length, x.foo].join()")
 S("new Uint8Array([3, 1, 2]).sort(function(a, b) { return b - a; }).join()")
 S("var a = new Uint8Array([1, 2, 3, 4]); var r = []; for (var k in a) r.push(k); r.join() + a.filter(function(x) { return x % 2; }).join()")
+
+S("var log = []; var itb = {[Symbol.iterator]() { return {next() { return {value: 1, done: false}; }, return() { log.push('r'); return {}; }}; }}; for (var v of itb) break; var [q] = itb; function f() { for (var v of itb) { return 5; } } f(); try { for (var v of itb) { throw new Error('x'); } } catch (e) { log.push(e.message); } log.join()")
+S("function* f() { try { yield 1; } finally { yield 2; } } var i = f(); i.next(); var a = i.return(9); var b = i.next(); a.value + ':' + b.value + ':' + b.done + ':' + i.next().done")
+S("function* f() { try { yield 1; } catch (e) { yield 'caught'; } finally { } } var i = f(); i.next(); var r = i.return(3); r.value + ':' + r.done")
+S("[...'a𝌆b'].length + ':' + 'ß'.toUpperCase() + ':' + 'İ'.toLowerCase().length + ':' + 'ΑΣ'.toLowerCase()")
+S("[[1, 2, 3, 1].lastIndexOf(1, -2), [1, 2, 3, 1].lastIndexOf(1, 0), [1, 2, 3].lastIndexOf(3, -5), [NaN].indexOf(NaN)].join()")
+S("Array.prototype.slice.call({length: 3, 0: 'a', 1: 'b', 2: 'c'}, 1).join() + Array.prototype.map.call('abc', function(c) { return c + c; }).join()")
+S("var fe = function me() { me = 1; return typeof me; }; fe()")
+S("var fe = function me() { 'use strict'; try { me = 1; } catch (e) { return e.name; } return 'no'; }; fe()")

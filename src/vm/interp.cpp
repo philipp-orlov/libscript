@@ -1391,13 +1391,17 @@ L_IterRest: {
     SET(ins->a, toJSValue(out));
     if (!R[it + 1].isInt32()) {
         fr->pc = pc;
-        for (;;) {
+        while (isFunction(R[it + 1])) {
             JSValue value;
             const int step = iteratorStep(vm, R[it], R[it + 1], &value);
-            if (step < 0)
-                FAIL();
-            if (step == 0)
+            if (step <= 0) {
+                const JSValue old = R[it + 1];
+                R[it + 1] = JSValue::undefined();
+                release(old);
+                if (step < 0)
+                    FAIL();
                 break;
+            }
             out->append(vm, value);
         }
         NEXT();
@@ -1411,8 +1415,15 @@ L_IterRest: {
         }
     } else {
         StringCell* s = asString(src);
-        for (; std::uint32_t(index) < s->length; ++index)
-            out->append(vm, makeString(vm, s->text().substr(std::size_t(index), 1)));
+        const StringView text = s->text();
+        while (std::uint32_t(index) < s->length) {
+            std::size_t n = 1;
+            if (text[std::size_t(index)] >= 0xd800 && text[std::size_t(index)] < 0xdc00 && std::size_t(index) + 1 < text.size() &&
+                text[std::size_t(index) + 1] >= 0xdc00 && text[std::size_t(index) + 1] < 0xe000)
+                n = 2;
+            out->append(vm, makeString(vm, text.substr(std::size_t(index), n)));
+            index += std::int32_t(n);
+        }
     }
     R[it + 1] = JSValue::int32(index);
     NEXT();
@@ -1811,20 +1822,31 @@ L_IterNext: {
     const std::uint32_t it = ins->b;
     if (!R[it + 1].isInt32()) [[unlikely]] {
         fr->pc = pc;
+        if (!isFunction(R[it + 1])) {
+            // Finished already.
+            COPY(ins->a, ins->c ? JSValue::undefined() : JSValue::hole());
+            NEXT();
+        }
         JSValue value;
         const int step = iteratorStep(vm, R[it], R[it + 1], &value);
-        if (step < 0)
-            FAIL();
-        if (step == 0)
+        if (step <= 0) {
+            // Done, or `next` itself failed: either way the iterator is not closed afterwards.
+            const JSValue old = R[it + 1];
+            R[it + 1] = JSValue::undefined();
+            release(old);
+            if (step < 0)
+                FAIL();
             COPY(ins->a, ins->c ? JSValue::undefined() : JSValue::hole());
-        else
+        } else {
             SET(ins->a, value);
+        }
         NEXT();
     }
     const JSValue src = R[it];
     const std::int32_t index = R[it + 1].asInt32();
     JSValue out = JSValue::undefined();
     bool owned = false, done;
+    std::int32_t step = 1;
     if (isArray(src)) {
         auto* a = static_cast<JSArray*>(asObject(src));
         done = std::uint32_t(index) >= a->length;
@@ -1835,8 +1857,14 @@ L_IterNext: {
         done = std::uint32_t(index) >= s->length;
         if (!done) {
             fr->pc = pc;
-            out = makeString(vm, s->text().substr(std::size_t(index), 1));
+            const StringView text = s->text();
+            std::size_t n = 1;
+            if (text[std::size_t(index)] >= 0xd800 && text[std::size_t(index)] < 0xdc00 && std::size_t(index) + 1 < text.size() &&
+                text[std::size_t(index) + 1] >= 0xdc00 && text[std::size_t(index) + 1] < 0xe000)
+                n = 2;
+            out = makeString(vm, text.substr(std::size_t(index), n));
             owned = true;
+            step = std::int32_t(n);
         }
     }
     if (done) {
@@ -1844,7 +1872,7 @@ L_IterNext: {
         if (!ins->c)
             out = JSValue::hole();
     } else {
-        R[it + 1] = JSValue::int32(index + 1);
+        R[it + 1] = JSValue::int32(index + step);
     }
     if (owned)
         SET(ins->a, out);
@@ -1922,6 +1950,54 @@ L_NewRegExp: {
     SET(ins->a, r);
     NEXT();
 }
+L_IterClose: {
+    const std::uint32_t it = ins->a;
+    if (!isFunction(R[it + 1]))
+        NEXT();
+    const bool quiet = ins->b != 0;
+    const JSValue iterator = R[it];
+    {
+        const JSValue old = R[it + 1];
+        R[it + 1] = JSValue::undefined();
+        release(old);
+    }
+    fr->pc = pc;
+    Key returnKey = vm.internKey(std::string_view("return"));
+    JSValue f = getProperty(vm, iterator, returnKey);
+    detail::decRef(returnKey);
+    if (f.isException()) {
+        if (!quiet)
+            FAIL();
+        vm.clearException();
+        NEXT();
+    }
+    if (f.isNullish()) {
+        NEXT();
+    }
+    if (!isFunction(f)) {
+        release(f);
+        if (!quiet) {
+            vm.throwError(ErrorCode::TypeError, "iterator.return is not a function");
+            FAIL();
+        }
+        NEXT();
+    }
+    JSValue r = vm.call(f, iterator, nullptr, 0);
+    release(f);
+    if (r.isException()) {
+        if (!quiet)
+            FAIL();
+        vm.clearException();
+        NEXT();
+    }
+    const bool object = isObject(r);
+    release(r);
+    if (!quiet && !object) {
+        vm.throwError(ErrorCode::TypeError, "iterator.return() did not return an object");
+        FAIL();
+    }
+    NEXT();
+}
 L_Yield: {
     auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
     JSValue out = R[ins->b];
@@ -1943,7 +2019,7 @@ throw_: {
         const std::size_t at = std::size_t(fr->pc - code->code.data()) - 1;
         const Handler* found = nullptr;
         for (const Handler& h : code->handlers)
-            if (at >= h.start && at < h.end) {
+            if (at >= h.start && at < h.end && !(h.isCatch && vm.exception == vm.returnMarker)) {
                 found = &h;
                 break;
             }
@@ -2104,11 +2180,6 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         g->state = GenState::Done;
         g->clear(*this);
     }
-    // A `return` into a suspended generator ends it where it stands: the `finally` blocks around the `yield` do not run.
-    if (g->state == GenState::Suspended && mode == 2) {
-        g->state = GenState::Done;
-        g->clear(*this);
-    }
     if (g->state == GenState::Done) {
         if (mode == 1) {
             release(exception);
@@ -2141,11 +2212,21 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         if (mode == 0) {
             setReg(R[g->resumeDst], sent);
             retain(sent);
-        } else {
+        } else if (mode == 1) {
             release(exception);
             exception = sent;
             retain(exception);
             exceptionCode = ErrorCode::Exception;
+            resumeThrow = true;
+        } else {
+            // `return(v)`: a throw only `finally` blocks see; what it ends in is `v`.
+            release(exception);
+            exception = returnMarker;
+            retain(exception);
+            exceptionCode = ErrorCode::Exception;
+            release(returnValue);
+            returnValue = sent;
+            retain(returnValue);
             resumeThrow = true;
         }
     }
@@ -2160,8 +2241,16 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         g->clear(*this);
         clearRegs(R, 0, 1);
     }
-    if (result.isException())
+    if (result.isException()) {
+        if (finished && exception == returnMarker) {
+            clearException();
+            *out = returnValue;
+            returnValue = JSValue::undefined();
+            *done = true;
+            return true;
+        }
         return false;
+    }
     *out = result;
     *done = finished;
     return true;

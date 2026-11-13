@@ -130,6 +130,9 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         // A set's iterator goes on over what was added after it started, and skips what was deleted.
         {"var s = new Set([1, 2, 3]); var it = s[Symbol.iterator](); s.delete(1); String(it.next().value)", "2"},
         {"var s = new Set(); s.add(1); s.add(2); for (var x of s) { if (x < 5) s.add(x + 2); } [...s].join()", "1,2,3,4,5,6"},
+        // The stack text starts with the error's own; `trim` takes every space of the language.
+        {"var e = new Error('m'); String(e.stack.indexOf('Error: m'))", "0"},
+        {"'x'.padEnd(3, 'ab') + ' abc '.trim().length + '\\u2003x\\u3000'.trim().length", "xab31"},
         // Code made at run time, when the host allows it.
         {"var f = new Function('a', 'b', 'return a * b'); String(f(3, 4))", "12"},
         {"String(eval('1 + 2') + eval('var zz = 5; zz * 2'))", "13"},

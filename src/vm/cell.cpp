@@ -369,6 +369,9 @@ void VM::releaseRoots() noexcept
     }
     release(exception);
     exception = JSValue::undefined();
+    release(returnMarker);
+    release(returnValue);
+    returnMarker = returnValue = JSValue::undefined();
     for (CodeBlock** slot : codeRoots_)
         if (*slot) {
             releaseCode(*slot);

@@ -79,7 +79,9 @@ struct Label
 
 struct TryCtx
 {
-    const Node* finallyBody = nullptr;  ///< null for the catch part: nothing to run on the way out
+    const Node* finallyBody = nullptr;
+    bool closesIterator = false;  ///< a `for...of` loop: leaving it early closes its iterator
+    std::uint16_t iterReg = 0;  ///< null for the catch part: nothing to run on the way out
     std::uint32_t start = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> holes;
 };
@@ -92,6 +94,7 @@ struct JumpCtx
     Label* breakTo = nullptr;
     Label* continueTo = nullptr;
     std::size_t tryDepth = 0;
+    std::size_t breakDepth = 0;  ///< the `tries` a `break` leaves from: a `for...of` closes its iterator on the way out
 };
 
 struct Fn
@@ -509,6 +512,7 @@ private:
         std::uint16_t upval = 0;
         bool checked = false;  ///< a read needs the hole check
         bool isConst = false;
+        bool isFnName = false;  ///< a named function expression's own name: stores are ignored (an error in strict code)
     };
 
     Ref resolve(const String& name)
@@ -523,6 +527,7 @@ private:
             r.kind = Ref::Local;
             r.binding = b;
             r.isConst = b->kind == BKind::Const;
+            r.isFnName = b->kind == BKind::FnName;
             r.checked = b->tdz && !b->initialized;
             return r;
         }
@@ -554,6 +559,7 @@ private:
         r.kind = Ref::Upval;
         r.upval = index;
         r.isConst = outer.isConst;
+        r.isFnName = outer.isFnName;
         r.checked = outer.checked;
         return r;
     }
@@ -601,6 +607,11 @@ private:
     void storeVar(const String& name, std::uint16_t src, bool init, const Node& at)
     {
         Ref r = resolve(name);
+        if (!init && r.isFnName) {
+            if (fn_->strict)
+                emit(Op::ThrowError, std::uint32_t(ErrorCode::TypeError), constant(fromValue(vm_, ctx_.str("Assignment to constant variable."))));
+            return;
+        }
         if (!init && r.isConst) {
             emit(Op::ThrowError, std::uint32_t(ErrorCode::TypeError), constant(fromValue(vm_, ctx_.str("Assignment to constant variable."))));
             return;
@@ -704,9 +715,10 @@ private:
     void emitFinallyFor(std::size_t fromDepth);
     void bindPattern(const Node& target, std::uint16_t value, bool init, VarKind kind);
     void bindTarget(const Node& target, std::uint16_t value, bool init, VarKind kind);
-    void closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, std::uint16_t reg);
+    void closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, std::uint16_t reg, bool isCatch = false);
 
     std::vector<String> pendingLabels_;
+    bool loopGuard_ = false;  ///< the next loop body sits inside the iterator-closing guard of a `for...of`
 
     CodeBlock* compileFunction(const Node& n, const String& name);
     CodeBlock* compileFunctionOnce(const Node& n, const String& name, std::uint32_t extraFlags);
@@ -1661,7 +1673,7 @@ std::uint16_t Compiler::update(const Node& n, int dst, bool discard)
     const Op step = n.op == Tok::PlusPlus ? Op::Inc : Op::Dec;
     if (target.kind == NK::Identifier) {
         Ref r = resolve(target.text);
-        if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst) {
+        if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst && !r.isFnName) {
             const std::uint16_t reg = r.binding->reg;
             if (n.prefix || discard) {
                 emit(step, reg, reg);
@@ -1750,7 +1762,7 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
     if (target.kind == NK::Identifier) {
         if (n.op == Tok::Assign) {
             Ref r = resolve(target.text);
-            if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst &&
+            if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst && !r.isFnName &&
                 (n.b->kind == NK::NumberLit || n.b->kind == NK::StringLit || n.b->kind == NK::Binary ||
                  n.b->kind == NK::Call || n.b->kind == NK::Identifier || n.b->kind == NK::Unary ||
                  n.b->kind == NK::Member || n.b->kind == NK::FunctionExpr || n.b->kind == NK::ArrowExpr ||
@@ -1778,7 +1790,7 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
         {
             // A local no other function can see, updated in place: no copy out and back.
             Ref r = resolve(target.text);
-            if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst && !hasAssignment(*n.b)) {
+            if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst && !r.isFnName && !hasAssignment(*n.b)) {
                 const std::uint16_t reg = r.binding->reg;
                 if ((op == Op::Add || op == Op::Sub) && smallInt(*n.b))
                     emit(op == Op::Add ? Op::AddI : Op::SubI, reg, reg, std::uint16_t(std::int16_t(n.b->number)));
@@ -2266,6 +2278,8 @@ void Compiler::bindPattern(const Node& target, std::uint16_t value, bool init, V
             bindTarget(*t, v, init, kind);
             fn_->top = inner;
         }
+        // An iterator the pattern did not use up is closed.
+        emit(Op::IterClose, it, 0);
     }
     fn_->top = mark;
 }
@@ -2293,6 +2307,8 @@ void Compiler::loopBody(const Node& body, Label& breakL, Label& continueL, std::
     ctx.breakTo = &breakL;
     ctx.continueTo = &continueL;
     ctx.tryDepth = fn_->tries.size();
+    ctx.breakDepth = loopGuard_ ? ctx.tryDepth - 1 : ctx.tryDepth;
+    loopGuard_ = false;
     fn_->jumps.push_back(std::move(ctx));
     statement(body);
     fn_->jumps.pop_back();
@@ -2401,6 +2417,15 @@ void Compiler::forInOf(const Node& n, bool isOf)
     const std::uint16_t v = temp();
     emit(Op::IterNext, v, it, 0);
     emitJump(Op::JHole, v, end);
+    // From here an early way out (`break`, `return`, an exception) closes the iterator.
+    TryCtx guard;
+    if (isOf) {
+        guard.closesIterator = true;
+        guard.iterReg = it;
+        guard.start = pc();
+        fn_->tries.push_back(std::move(guard));
+        loopGuard_ = true;
+    }
     pushScope();
     const Node& left = *n.a;
     if (left.kind == NK::VarDecl) {
@@ -2421,7 +2446,20 @@ void Compiler::forInOf(const Node& n, bool isOf)
     }
     loopBody(*n.d, end, top, std::move(labels));
     popScope();
-    jump(top);
+    if (isOf) {
+        TryCtx done = std::move(fn_->tries.back());
+        fn_->tries.pop_back();
+        const std::uint32_t bodyEnd = pc();
+        jump(top);
+        // An exception out of the body: close the iterator, then throw it again.
+        const std::uint32_t excStart = pc();
+        const std::uint16_t exc = temp();
+        closeTry(done, bodyEnd, excStart, exc);
+        emit(Op::IterClose, it, 1);
+        emit(Op::Throw, exc);
+    } else {
+        jump(top);
+    }
     bind(end);
     fn_->top = mark;
 }
@@ -2436,9 +2474,12 @@ void Compiler::emitFinallyFor(std::size_t fromDepth)
         // While a finally copy runs, only the tries outside it are active.
         fn_->tries.assign(std::make_move_iterator(saved.begin()), std::make_move_iterator(saved.begin() + i));
         const Node* body = saved[i].finallyBody;
-        if (body) {
+        if (body || saved[i].closesIterator) {
             const std::uint32_t start = pc();
-            statement(*body);
+            if (body)
+                statement(*body);
+            else
+                emit(Op::IterClose, saved[i].iterReg, 0);
             const std::uint32_t endPc = pc();
             for (std::size_t j = i; j < saved.size(); ++j)
                 saved[j].holes.push_back({start, endPc});
@@ -2485,7 +2526,7 @@ void Compiler::breakContinue(const Node& n, bool isBreak)
     }
     if (!target)
         syntaxError(n, isBreak ? "Illegal break statement" : "Illegal continue statement");
-    emitFinallyFor(target->tryDepth);
+    emitFinallyFor(isBreak ? target->breakDepth : target->tryDepth);
     jump(isBreak ? *target->breakTo : *target->continueTo);
 }
 
@@ -2506,6 +2547,7 @@ void Compiler::labeled(const Node& n)
     ctx.labels.swap(pendingLabels_);
     ctx.breakTo = &end;
     ctx.tryDepth = fn_->tries.size();
+    ctx.breakDepth = ctx.tryDepth;
     fn_->jumps.push_back(std::move(ctx));
     statement(body);
     fn_->jumps.pop_back();
@@ -2580,6 +2622,7 @@ void Compiler::switchStatement(const Node& n)
     ctx.isSwitch = true;
     ctx.breakTo = &end;
     ctx.tryDepth = fn_->tries.size();
+    ctx.breakDepth = ctx.tryDepth;
     fn_->jumps.push_back(std::move(ctx));
     for (std::size_t i = 0; i < n.list.size(); ++i) {
         bind(caseLabels[i]);
@@ -2591,7 +2634,7 @@ void Compiler::switchStatement(const Node& n)
     fn_->top = mark;
 }
 
-void Compiler::closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, std::uint16_t reg)
+void Compiler::closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, std::uint16_t reg, bool isCatch)
 {
     // The protected range with the finally copies cut out of it.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> holes = ctx.holes;
@@ -2599,11 +2642,11 @@ void Compiler::closeTry(TryCtx& ctx, std::uint32_t end, std::uint32_t target, st
     std::uint32_t from = ctx.start;
     for (const auto& h : holes) {
         if (h.first > from)
-            fn_->block->handlers.push_back(Handler{from, h.first, target, reg});
+            fn_->block->handlers.push_back(Handler{from, h.first, target, reg, isCatch});
         from = std::max(from, h.second);
     }
     if (end > from)
-        fn_->block->handlers.push_back(Handler{from, end, target, reg});
+        fn_->block->handlers.push_back(Handler{from, end, target, reg, isCatch});
 }
 
 void Compiler::tryStatement(const Node& n)
@@ -2633,7 +2676,7 @@ void Compiler::tryStatement(const Node& n)
         const std::uint32_t tryEnd = pc();
         jump(afterCatch);
         const std::uint32_t catchStart = pc();
-        closeTry(done, tryEnd, catchStart, catchReg);
+        closeTry(done, tryEnd, catchStart, catchReg, true);
         // The catch clause: its parameter, then its body.
         pushScope();
         if (n.b) {

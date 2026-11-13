@@ -11,6 +11,7 @@
 #include <limits>
 
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/dyn/unicode.hpp"
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
@@ -34,6 +35,57 @@ JSArray* thisArray(VM& vm, JSValue self)
     }
     return static_cast<JSArray*>(asObject(self));
 }
+
+/// The array a read-only method works on: the receiver itself, or, for an array-like (an object with a `length`, a
+/// string, a typed array), a copy of its elements that lives as long as this does.
+struct ArrayView
+{
+    Handle holder;
+    JSArray* a = nullptr;
+
+    ArrayView(VM& vm, JSValue self)
+    {
+        if (isArray(self)) {
+            a = static_cast<JSArray*>(asObject(self));
+            return;
+        }
+        if (self.isNullish() || !(isObject(self) || isString(self))) {
+            typeError(vm, "Array.prototype method called on incompatible receiver " + describe(vm, self));
+            return;
+        }
+        double n = 0;
+        if (isString(self)) {
+            n = asString(self)->length;
+        } else {
+            JSValue len = getProperty(vm, self, vm.atoms.length);
+            if (len.isException())
+                return;
+            const bool ok = toNumber(vm, len, &n);
+            release(len);
+            if (!ok)
+                return;
+            n = n != n ? 0 : std::max(0.0, std::trunc(n));
+            if (n > 4294967295.0) {
+                vm.throwError(ErrorCode::RangeError, "Invalid array length");
+                return;
+            }
+        }
+        JSArray* copy = vm.newArray(vm.protos.array, 0, std::uint32_t(std::min(n, 1048576.0)));
+        holder = Handle::adopt(toJSValue(copy));
+        for (std::uint32_t i = 0; i < std::uint32_t(n); ++i) {
+            Key k = toPropertyKey(vm, JSValue::boxNumber(double(i)));
+            if (!k)
+                return;
+            const bool has = isString(self) || hasProperty(vm, self, k);
+            JSValue v = has ? getProperty(vm, self, k) : JSValue::hole();
+            detail::decRef(k);
+            if (v.isException())
+                return;
+            copy->append(vm, v);
+        }
+        a = copy;
+    }
+};
 
 bool numberArg(VM& vm, JSValue v, double* out)
 {
@@ -684,7 +736,9 @@ NATIVE(functionBind)
 
 // -------------------------------------------------------------------- Error ---
 
-JSValue fillError(VM& vm, JSObject* o, JSValue message)
+NATIVE(errorToString);
+
+JSValue fillError(VM& vm, JSObject* o, JSValue message, JSValue options = JSValue::undefined())
 {
     o->h.cls = std::uint8_t(ObjClass::Error);
     if (!message.isUndefined()) {
@@ -692,6 +746,44 @@ JSValue fillError(VM& vm, JSObject* o, JSValue message)
         if (text.isException())
             return text;
         value(vm, o, "message", text);
+    }
+    if (isObject(options)) {
+        Key causeKey = vm.internKey(std::string_view("cause"));
+        if (hasProperty(vm, options, causeKey)) {
+            JSValue cause = getProperty(vm, options, causeKey);
+            if (cause.isException()) {
+                detail::decRef(causeKey);
+                return cause;
+            }
+            o->putOwn(vm, causeKey, cause, attr::kWritable | attr::kConfigurable);
+        }
+        detail::decRef(causeKey);
+    }
+    return JSValue::undefined();
+}
+
+/// `error.stack`: the error's text and a place to put the frames; made when asked for.
+NATIVE(errorStackGetter)
+{
+    UNUSED();
+    if (!isObject(self))
+        return JSValue::undefined();
+    JSValue text = errorToString(vm, self, nullptr, 0, nullptr);
+    if (text.isException())
+        return text;
+    Handle keep = Handle::adopt(text);
+    return makeString(vm, StringView(String(asString(text)->text()) + u"\n    at <anonymous>"));
+}
+
+NATIVE(errorStackSetter)
+{
+    UNUSED();
+    if (isObject(self)) {
+        Key k = vm.internKey(std::string_view("stack"));
+        JSValue v = arg(args, argc, 0);
+        retain(v);
+        asObject(self)->putOwn(vm, k, v, attr::kWritable | attr::kConfigurable);
+        detail::decRef(k);
     }
     return JSValue::undefined();
 }
@@ -707,7 +799,7 @@ NATIVE(errorCtor)
         made = newPlain(vm, reinterpret_cast<JSObject*>(data));
     }
     Handle keep = Handle::adopt(toJSValue(made));
-    JSValue r = fillError(vm, made, arg(args, argc, 0));
+    JSValue r = fillError(vm, made, arg(args, argc, 0), arg(args, argc, 1));
     if (r.isException())
         return r;
     return keep.take();
@@ -817,7 +909,8 @@ NATIVE(arrayUnshift)
 NATIVE(arrayJoin)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    ArrayView view(vm, self);
+    JSArray* a = view.a;
     if (!a)
         return JSValue::exception();
     String sep = u",";
@@ -858,7 +951,8 @@ NATIVE(arrayToString)
 NATIVE(arraySlice)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    ArrayView view(vm, self);
+    JSArray* a = view.a;
     if (!a)
         return JSValue::exception();
     std::int64_t from, to;
@@ -938,14 +1032,23 @@ NATIVE(arrayReverse)
 NATIVE(arrayIndexOf)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    ArrayView view(vm, self);
+    JSArray* a = view.a;
     if (!a)
         return JSValue::exception();
     const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 indexOf, 1 lastIndexOf, 2 includes
     const JSValue needle = arg(args, argc, 0);
     if (mode == 1) {
-        for (std::int64_t i = std::int64_t(a->length) - 1; i >= 0; --i)
-            if (strictEquals(a->elems[i], needle))
+        std::int64_t from = std::int64_t(a->length) - 1;
+        if (argc > 1) {
+            double d;
+            if (!toNumber(vm, args[1], &d))
+                return JSValue::exception();
+            d = d != d ? 0 : std::trunc(d);
+            from = d < 0 ? std::int64_t(std::max(d + double(a->length), -1.0)) : std::int64_t(std::min(d, double(a->length) - 1));
+        }
+        for (std::int64_t i = from; i >= 0; --i)
+            if (i < a->length && !a->elems[i].isHole() && strictEquals(a->elems[i], needle))
                 return JSValue::int32(std::int32_t(i));
         return JSValue::int32(-1);
     }
@@ -964,7 +1067,8 @@ NATIVE(arrayIndexOf)
 NATIVE(arrayIterate)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    ArrayView view(vm, self);
+    JSArray* a = view.a;
     if (!a)
         return JSValue::exception();
     const int kind = int(reinterpret_cast<std::intptr_t>(data));
@@ -1041,7 +1145,8 @@ NATIVE(arrayIterate)
 NATIVE(arrayReduce)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    ArrayView view(vm, self);
+    JSArray* a = view.a;
     if (!a)
         return JSValue::exception();
     const bool right = data != nullptr;
@@ -1314,13 +1419,48 @@ NATIVE(stringCase)
     Handle s;
     if (!thisString(vm, self, &s))
         return JSValue::exception();
-    String out(asString(s.get())->text());
+    const StringView text = asString(s.get())->text();
     const bool upper = data != nullptr;
-    for (char16_t& c : out) {
-        if (upper && c >= u'a' && c <= u'z')
-            c = char16_t(c - 32);
-        else if (!upper && c >= u'A' && c <= u'Z')
-            c = char16_t(c + 32);
+    String out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        char32_t c = text[i];
+        if (c < 0x80) {
+            // ASCII is the common case.
+            if (upper && c >= u'a' && c <= u'z')
+                c -= 32;
+            else if (!upper && c >= u'A' && c <= u'Z')
+                c += 32;
+            out.push_back(char16_t(c));
+            continue;
+        }
+        if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.size() && text[i + 1] >= 0xdc00 && text[i + 1] <= 0xdfff)
+            c = 0x10000 + ((c - 0xd800) << 10) + (text[++i] - 0xdc00);
+        char32_t mapped[3];
+        int n = 1;
+        if (upper) {
+            n = dyn::unicode::fullUpper(c, mapped);
+        } else if (c == 0x130) {
+            mapped[0] = u'i';
+            mapped[1] = 0x307;
+            n = 2;
+        } else if (c == 0x3a3) {
+            // Final sigma: after a letter and not before one.
+            const bool afterLetter = i > 0 && dyn::unicode::isIdContinue(text[i - 1]);
+            const bool beforeLetter = i + 1 < text.size() && dyn::unicode::isIdContinue(text[i + 1]);
+            mapped[0] = afterLetter && !beforeLetter ? 0x3c2 : 0x3c3;
+        } else {
+            mapped[0] = dyn::unicode::simpleLower(c);
+        }
+        for (int k = 0; k < n; ++k) {
+            const char32_t m = mapped[k];
+            if (m >= 0x10000) {
+                out.push_back(char16_t(0xd800 + ((m - 0x10000) >> 10)));
+                out.push_back(char16_t(0xdc00 + ((m - 0x10000) & 0x3ff)));
+            } else {
+                out.push_back(char16_t(m));
+            }
+        }
     }
     return makeString(vm, StringView(out));
 }
@@ -1332,7 +1472,10 @@ NATIVE(stringTrim)
     if (!thisString(vm, self, &s))
         return JSValue::exception();
     StringView text = asString(s.get())->text();
-    auto space = [](char16_t c) { return c == u' ' || c == u'\t' || c == u'\n' || c == u'\r' || c == u'\v' || c == u'\f' || c == 0xA0 || c == 0xFEFF; };
+    auto space = [](char16_t c) {
+        return c == u' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0xFEFF || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+               c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+    };
     const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 both, 1 start, 2 end
     std::size_t a = 0, b = text.size();
     if (mode != 2)
@@ -2448,6 +2591,18 @@ void VM::installBuiltins()
     value(*this, errorProtoObject, "message", str(*this, ""));
     method(*this, errorProtoObject, "toString", errorToString, 0);
     {
+        Key key = internKey(std::string_view("stack"));
+        Key gname = internKey(std::string_view("get stack")), sname = internKey(std::string_view("set stack"));
+        JSFunction* g = newNativeFunction(functionProto, errorStackGetter, nullptr, gname, 0);
+        Handle gk = Handle::adopt(toJSValue(g));
+        JSFunction* st = newNativeFunction(functionProto, errorStackSetter, nullptr, sname, 1);
+        Handle sk = Handle::adopt(toJSValue(st));
+        defineAccessor(*this, errorProtoObject, key, toJSValue(g), toJSValue(st), attr::kConfigurable);
+        detail::decRef(key);
+        detail::decRef(gname);
+        detail::decRef(sname);
+    }
+    {
         JSFunction* base = constructor(*this, "Error", errorCtor, 1, errorProtoObject);
         (void)base;
         // `data` is the prototype the constructor makes errors of when called without `new`.
@@ -2654,6 +2809,7 @@ void VM::installBuiltins()
     installPromise(*this);
     installDate(*this);
     installTypedArrays(*this);
+    returnMarker = toJSValue(newObject(static_cast<JSObject*>(nullptr)));
 }
 
 namespace bi {

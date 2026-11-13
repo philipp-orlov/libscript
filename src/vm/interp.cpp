@@ -12,6 +12,7 @@
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
+#include "builtins_util.hpp"
 
 namespace script {
 namespace internal {
@@ -289,6 +290,36 @@ void copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
 
 namespace {
 
+/// A suspended generator: the registers of its frame, and where to go on.
+struct GenState : NativeState
+{
+    enum State : std::uint8_t { Start, Suspended, Running, Done };
+    std::vector<JSValue> regs;
+    JSValue callee = JSValue::undefined();
+    std::uint32_t pcIndex = 0;
+    std::uint16_t resumeDst = 0;
+    State state = Start;
+
+    ~GenState() override { clear_(); }
+    void values(std::vector<JSValue>& out) const override
+    {
+        out.push_back(callee);
+        out.insert(out.end(), regs.begin(), regs.end());
+    }
+    void clear(VM&) noexcept override { clear_(); }
+    void clear_() noexcept
+    {
+        for (JSValue& v : regs) {
+            release(v);
+            v = JSValue::undefined();
+        }
+        release(callee);
+        callee = JSValue::undefined();
+    }
+};
+
+using bi::iteratorStep;
+
 JSValue run(VM& vm)
 {
     static const void* const kLabels[] = {
@@ -354,6 +385,11 @@ JSValue run(VM& vm)
 
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
+    if (vm.resumeThrow) [[unlikely]] {
+        vm.resumeThrow = false;
+        fr->pc = pc;
+        goto throw_;
+    }
     NEXT();
 
 L_Nop:
@@ -1214,9 +1250,22 @@ L_ObjRest: {
 L_IterRest: {
     const std::uint32_t it = ins->b;
     const JSValue src = R[it];
-    std::int32_t index = R[it + 1].asInt32();
+    std::int32_t index = R[it + 1].isInt32() ? R[it + 1].asInt32() : 0;
     JSArray* out = vm.newArray(vm.protos.array);
     SET(ins->a, toJSValue(out));
+    if (!R[it + 1].isInt32()) {
+        fr->pc = pc;
+        for (;;) {
+            JSValue value;
+            const int step = iteratorStep(vm, R[it], R[it + 1], &value);
+            if (step < 0)
+                FAIL();
+            if (step == 0)
+                break;
+            out->append(vm, value);
+        }
+        NEXT();
+    }
     if (isArray(src)) {
         auto* a = static_cast<JSArray*>(asObject(src));
         for (; std::uint32_t(index) < a->length; ++index) {
@@ -1478,6 +1527,13 @@ do_call: {
                                                 " must be called with 'new'");
         FAIL();
     }
+    if (c->flags & CodeBlock::kGenerator) [[unlikely]] {
+        JSValue made = vm.makeGenerator(f, R[base + 1], &R[base + 2], argc);
+        if (made.isException())
+            FAIL();
+        SET(ins->a, made);
+        NEXT();
+    }
     JSValue* newR = R + base + 1;
     if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd) [[unlikely]] {
         vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
@@ -1567,8 +1623,36 @@ L_IterInit: {
     const JSValue src = R[ins->b];
     if (!isArray(src) && !isString(src)) {
         fr->pc = pc;
-        vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
-        FAIL();
+        if (src.isNullish()) {
+            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+            FAIL();
+        }
+        JSValue method = getProperty(vm, src, vm.atoms.symIterator);
+        if (method.isException())
+            FAIL();
+        if (!isFunction(method)) {
+            release(method);
+            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+            FAIL();
+        }
+        JSValue iterator = vm.call(method, src, nullptr, 0);
+        release(method);
+        if (iterator.isException())
+            FAIL();
+        if (!isObject(iterator)) {
+            release(iterator);
+            vm.throwError(ErrorCode::TypeError, "Result of the Symbol.iterator method is not an object");
+            FAIL();
+        }
+        JSValue next = getProperty(vm, iterator, vm.atoms.next);
+        if (next.isException()) {
+            release(iterator);
+            FAIL();
+        }
+        // Registers a and a+1: the iterator and its `next`; the pair is an index for an array or a string.
+        setReg(R[ins->a + 1], next);
+        setReg(R[ins->a], iterator);
+        NEXT();
     }
     // Registers a and a+1: the sequence and the next index.
     const JSValue keep = src;
@@ -1579,6 +1663,18 @@ L_IterInit: {
 }
 L_IterNext: {
     const std::uint32_t it = ins->b;
+    if (!R[it + 1].isInt32()) [[unlikely]] {
+        fr->pc = pc;
+        JSValue value;
+        const int step = iteratorStep(vm, R[it], R[it + 1], &value);
+        if (step < 0)
+            FAIL();
+        if (step == 0)
+            COPY(ins->a, ins->c ? JSValue::undefined() : JSValue::hole());
+        else
+            SET(ins->a, value);
+        NEXT();
+    }
     const JSValue src = R[it];
     const std::int32_t index = R[it + 1].asInt32();
     JSValue out = JSValue::undefined();
@@ -1609,6 +1705,21 @@ L_IterNext: {
     else
         COPY(ins->a, out);
     NEXT();
+}
+
+L_Yield: {
+    auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
+    JSValue out = R[ins->b];
+    retain(out);
+    g->pcIndex = std::uint32_t(pc - codeStart);
+    g->resumeDst = ins->a;
+    g->state = GenState::Suspended;
+    for (std::uint32_t i = 0; i < code->nregs; ++i) {
+        g->regs[i] = R[i];
+        R[i] = JSValue::undefined();
+    }
+    --vm.frameCount;
+    return out;
 }
 
 throw_: {
@@ -1680,8 +1791,10 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     }
     CodeBlock* c = f->code;
     if ((c->flags & CodeBlock::kClassConstructor) && !construct)
-        return throwError(ErrorCode::TypeError, "Class constructor " + (c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string()) +
-                                                    " cannot be invoked without 'new'");
+        return throwError(ErrorCode::TypeError, "class constructor " + (c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string()) +
+                                                    " must be called with 'new'");
+    if (c->flags & CodeBlock::kGenerator)
+        return makeGenerator(f, thisValue, args, argc);
     JSValue* R = stackTop;
     if (frameCount + 2 >= frameCapacity || R + std::max<std::size_t>(c->nregs, argc + 1) + 8 > stackEnd)
         return throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
@@ -1712,6 +1825,110 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     // The frame let go of its own registers; `this` and the arguments are ours.
     clearRegs(R, 0, 1 + argc);
     return result;
+}
+
+JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args, std::uint32_t argc)
+{
+    CodeBlock* c = f->code;
+    JSValue protoValue = getProperty(*this, toJSValue(f), atoms.prototype);
+    if (protoValue.isException())
+        return protoValue;
+    JSObject* proto = isObject(protoValue) ? asObject(protoValue) : protos.generator;
+    JSObject* o = newObject(proto);
+    Handle keep = Handle::adopt(toJSValue(o));
+    release(protoValue);
+    auto* g = new GenState();
+    o->h.cls = std::uint8_t(ObjClass::Generator);
+    o->rareOf(*this).ext = g;
+    g->regs.assign(c->nregs, JSValue::undefined());
+    g->callee = toJSValue(f);
+    retain(g->callee);
+    JSValue self = thisValue;
+    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self.isNullish())
+        self = toJSValue(global);
+    retain(self);
+    g->regs[0] = self;
+    const std::uint32_t keep_ = argc < c->nparams ? argc : c->nparams;
+    for (std::uint32_t i = 0; i < keep_; ++i) {
+        retain(args[i]);
+        g->regs[1 + i] = args[i];
+    }
+    if (c->flags & CodeBlock::kNeedsArgs)
+        g->regs[1 + c->nparams] = toJSValue(captureArguments(*this, args, argc));
+    return keep.take();
+}
+
+JSValue VM::resumeGenerator(JSValue generator, int mode, JSValue sent)
+{
+    GenState* g = nullptr;
+    if (isObject(generator) && asObject(generator)->cls() == ObjClass::Generator)
+        if (Rare* r = asObject(generator)->rare())
+            g = static_cast<GenState*>(r->ext);
+    if (!g)
+        return throwError(ErrorCode::TypeError, "next method called on an incompatible receiver");
+    if (g->state == GenState::Running)
+        return throwError(ErrorCode::TypeError, "Generator is already running");
+    Handle keepGenerator = Handle::retained(generator);
+    Handle keepSent = Handle::retained(sent);
+    if (g->state == GenState::Start && mode != 0) {
+        g->state = GenState::Done;
+        g->clear(*this);
+    }
+    // A `return` into a suspended generator ends it where it stands: the `finally` blocks around the `yield` do not run.
+    if (g->state == GenState::Suspended && mode == 2) {
+        g->state = GenState::Done;
+        g->clear(*this);
+    }
+    if (g->state == GenState::Done) {
+        if (mode == 1) {
+            release(exception);
+            exception = sent;
+            retain(exception);
+            exceptionCode = ErrorCode::Exception;
+            return JSValue::exception();
+        }
+        const JSValue v = mode == 2 ? sent : JSValue::undefined();
+        retain(v);
+        return bi::iterResult(*this, v, true);
+    }
+    auto* f = static_cast<JSFunction*>(asObject(g->callee));
+    CodeBlock* c = f->code;
+    JSValue* R = stackTop;
+    if (frameCount + 2 >= frameCapacity || R + c->nregs + 8 > stackEnd)
+        return throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
+    fillStack(R + c->nregs + 1);
+    for (std::uint32_t i = 0; i < c->nregs; ++i) {
+        const JSValue old = R[i];
+        R[i] = g->regs[i];
+        g->regs[i] = JSValue::undefined();
+        release(old);
+    }
+    if (g->state == GenState::Suspended) {
+        if (mode == 0) {
+            setReg(R[g->resumeDst], sent);
+            retain(sent);
+        } else {
+            release(exception);
+            exception = sent;
+            retain(exception);
+            exceptionCode = ErrorCode::Exception;
+            resumeThrow = true;
+        }
+    }
+    g->state = GenState::Running;
+    JSValue* savedTop = stackTop;
+    frameBase[frameCount++] = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, false, true, JSValue::undefined(), generator};
+    const JSValue result = run(*this);
+    stackTop = savedTop;
+    bool finished = g->state == GenState::Running;
+    if (finished) {
+        g->state = GenState::Done;
+        g->clear(*this);
+        clearRegs(R, 0, 1);
+    }
+    if (result.isException())
+        return result;
+    return bi::iterResult(*this, result, finished);
 }
 
 JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc)

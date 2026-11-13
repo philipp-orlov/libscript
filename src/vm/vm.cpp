@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/vm.hpp"
 
 #include <algorithm>
@@ -51,6 +52,24 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     atoms.prototype = internKey("prototype");
     atoms.constructor = internKey("constructor");
     atoms.name = internKey("name");
+    atoms.value = internKey("value");
+    atoms.done = internKey("done");
+    atoms.next = internKey("next");
+    {
+        struct Well
+        {
+            Key Atoms::*slot;
+            const char* name;
+        };
+        for (const Well& w : {Well{&Atoms::symIterator, "Symbol.iterator"}, Well{&Atoms::symAsyncIterator, "Symbol.asyncIterator"},
+                              Well{&Atoms::symToPrimitive, "Symbol.toPrimitive"}, Well{&Atoms::symToStringTag, "Symbol.toStringTag"},
+                              Well{&Atoms::symHasInstance, "Symbol.hasInstance"}, Well{&Atoms::symSpecies, "Symbol.species"}})
+            atoms.*(w.slot) = [&] {
+                const std::string_view ascii(w.name);
+                const String text(ascii.begin(), ascii.end());
+                return static_cast<Key>(newSymbol(StringView(text), true).asCell());
+            }();
+    }
     callHook = [](VM& vm, JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, void*) {
         return vm.call(callee, thisValue, args, argc);
     };
@@ -87,6 +106,14 @@ void VM::removeCodeRoot(CodeBlock** slot) noexcept
 std::string VM::captureStack() const
 {
     return {};
+}
+
+JSValue VM::newSymbol(StringView description, bool hasDescription)
+{
+    auto* sym = ctx.newCell<dyn::SymbolCell>();
+    sym->hasDescription = hasDescription;
+    sym->description = String(description);
+    return JSValue::cell(sym);
 }
 
 Key VM::internKey(StringView text)

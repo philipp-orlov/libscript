@@ -134,7 +134,14 @@ void children(const detail::GCObject* cell, detail::GcList& out)
                 auto* a = static_cast<JSArray*>(o);
                 for (std::uint32_t i = 0; i < a->length; ++i)
                     appendIfCell(out, a->elems[i]);
-            } else if (o->cls() == ObjClass::Function) {
+            }
+            if (Rare* r = o->rare(); r && r->ext) {
+                std::vector<JSValue> held;
+                r->ext->values(held);
+                for (JSValue v : held)
+                    appendIfCell(out, v);
+            }
+            if (o->cls() == ObjClass::Function) {
                 auto* f = static_cast<JSFunction*>(o);
                 for (std::uint32_t i = 0; i < f->nUpvals; ++i)
                     out.push_back(reinterpret_cast<CellPtr>(f->upvals()[i]));
@@ -205,6 +212,11 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
         release(r->fieldInit);
         if (r->boundArgs)
             detail::decRef(reinterpret_cast<CellPtr>(r->boundArgs));
+        if (r->ext) {
+            r->ext->clear(vm);
+            delete r->ext;
+            r->ext = nullptr;
+        }
         if (r->dict) {
             for (const Entry& e : r->dict->entries)
                 if (e.key)
@@ -275,6 +287,8 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
                 release(*o->slotAt(i));
                 *o->slotAt(i) = JSValue::undefined();
             }
+            if (Rare* r = o->rare(); r && r->ext)
+                r->ext->clear(vm);
             if (o->cls() == ObjClass::Array) {
                 auto* a = static_cast<JSArray*>(o);
                 for (std::uint32_t i = 0; i < a->length; ++i) {
@@ -321,7 +335,12 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
 void VM::releaseRoots() noexcept
 {
     tearingDown = true;
-    for (Key* k : {&atoms.length, &atoms.prototype, &atoms.constructor, &atoms.name}) {
+    for (auto& entry : symbolRegistry)
+        detail::decRef(entry.second);
+    symbolRegistry.clear();
+    for (Key* k : {&atoms.length, &atoms.prototype, &atoms.constructor, &atoms.name, &atoms.value, &atoms.done, &atoms.next,
+                   &atoms.symIterator, &atoms.symAsyncIterator, &atoms.symToPrimitive, &atoms.symToStringTag,
+                   &atoms.symHasInstance, &atoms.symSpecies}) {
         if (*k)
             detail::decRef(*k);
         *k = nullptr;
@@ -349,7 +368,8 @@ void VM::releaseRoots() noexcept
         k = nullptr;
     }
     for (JSObject** p : {&protos.object, &protos.function, &protos.array, &protos.number, &protos.string, &protos.boolean,
-                         &protos.symbol, &protos.bigint}) {
+                         &protos.symbol, &protos.bigint, &protos.generator, &protos.iterator,
+                          &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet}) {
         if (*p)
             detail::decRef(reinterpret_cast<CellPtr>(*p));
         *p = nullptr;

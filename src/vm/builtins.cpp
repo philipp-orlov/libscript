@@ -14,6 +14,7 @@
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
+#include "builtins_util.hpp"
 
 namespace script {
 namespace internal {
@@ -21,67 +22,7 @@ namespace vm {
 
 namespace {
 
-#define NATIVE(name) JSValue name(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc, void* data)
-#define UNUSED() \
-    (void)vm;    \
-    (void)self;  \
-    (void)args;  \
-    (void)argc;  \
-    (void)data
-
-inline JSValue arg(const JSValue* args, std::uint32_t argc, std::uint32_t i) noexcept
-{
-    return i < argc ? args[i] : JSValue::undefined();
-}
-
-JSValue str(VM& vm, std::string_view text)
-{
-    return makeString(vm, text);
-}
-
-JSValue typeError(VM& vm, const std::string& message)
-{
-    return vm.throwError(ErrorCode::TypeError, message);
-}
-
-/// An own, non-enumerable function property.
-JSFunction* method(VM& vm, JSObject* target, const char* name, FastNative fn, std::uint32_t length, void* data = nullptr)
-{
-    Key key = vm.internKey(std::string_view(name));
-    JSFunction* f = vm.newNativeFunction(vm.protos.function, fn, data, key, length);
-    // The property takes the creation count; the caller's pointer is good for as long as the property is.
-    target->putOwn(vm, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
-    detail::decRef(key);
-    return f;
-}
-
-void value(VM& vm, JSObject* target, const char* name, JSValue v, std::uint8_t attrs = attr::kWritable | attr::kConfigurable)
-{
-    Key key = vm.internKey(std::string_view(name));
-    target->putOwn(vm, key, v, attrs);
-    detail::decRef(key);
-}
-
-JSObject* newPlain(VM& vm, JSObject* proto)
-{
-    return vm.newObject(proto);
-}
-
-/// A constructor function with its prototype object, installed on the global object.
-JSFunction* constructor(VM& vm, const char* name, FastNative fn, std::uint32_t length, JSObject* proto)
-{
-    Key key = vm.internKey(std::string_view(name));
-    JSFunction* f = vm.newNativeFunction(vm.protos.function, fn, nullptr, key, length);
-    f->materialize(vm);
-    f->flags |= JSFunction::kConstructor;
-    retain(toJSValue(proto));
-    f->putOwn(vm, vm.atoms.prototype, toJSValue(proto), 0);
-    retain(toJSValue(f));
-    proto->putOwn(vm, vm.atoms.constructor, toJSValue(f), attr::kWritable | attr::kConfigurable);
-    vm.global->putOwn(vm, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
-    detail::decRef(key);
-    return f;
-}
+using namespace bi;
 
 JSArray* thisArray(VM& vm, JSValue self)
 {
@@ -417,23 +358,9 @@ bool descriptorField(VM& vm, JSObject* d, const char* name, JSValue* out)
     return has;
 }
 
-NATIVE(objectDefineProperty)
+/// Define `key` on `o` as the descriptor object `d` says. Undefined, or the exception sentinel.
+JSValue definePropertyImpl(VM& vm, JSObject* o, Key key, JSObject* d)
 {
-    UNUSED();
-    JSValue target = arg(args, argc, 0), keyValue = arg(args, argc, 1), desc = arg(args, argc, 2);
-    if (!isObject(target))
-        return typeError(vm, "Object.defineProperty called on non-object");
-    if (!isObject(desc))
-        return typeError(vm, "Property description must be an object");
-    JSValue prim = toPrimitive(vm, keyValue, true);
-    if (prim.isException())
-        return prim;
-    Key key = toPropertyKey(vm, prim);
-    release(prim);
-    if (!key)
-        return JSValue::exception();
-    JSObject* o = asObject(target);
-    JSObject* d = asObject(desc);
     JSValue v = JSValue::undefined(), g = JSValue::undefined(), s = JSValue::undefined(), flag;
     const bool hasValue = descriptorField(vm, d, "value", &v);
     const bool hasGet = descriptorField(vm, d, "get", &g);
@@ -459,7 +386,6 @@ NATIVE(objectDefineProperty)
             release(v);
             release(g);
             release(s);
-            detail::decRef(key);
             return typeError(vm, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
         }
         ok = defineAccessor(vm, o, key, g, s, std::uint8_t(attrs & ~attr::kWritable));
@@ -475,9 +401,30 @@ NATIVE(objectDefineProperty)
     release(v);
     release(g);
     release(s);
-    detail::decRef(key);
     if (!ok)
         return typeError(vm, "Cannot redefine property");
+    return JSValue::undefined();
+}
+
+NATIVE(objectDefineProperty)
+{
+    UNUSED();
+    JSValue target = arg(args, argc, 0), keyValue = arg(args, argc, 1), desc = arg(args, argc, 2);
+    if (!isObject(target))
+        return typeError(vm, "Object.defineProperty called on non-object");
+    if (!isObject(desc))
+        return typeError(vm, "Property description must be an object");
+    JSValue prim = toPrimitive(vm, keyValue, true);
+    if (prim.isException())
+        return prim;
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        return JSValue::exception();
+    JSValue r = definePropertyImpl(vm, asObject(target), key, asObject(desc));
+    detail::decRef(key);
+    if (r.isException())
+        return r;
     retain(target);
     return target;
 }
@@ -582,6 +529,16 @@ NATIVE(objectToString)
         tag = "[object String]";
     else if (self.isBool())
         tag = "[object Boolean]";
+    else if (isSymbol(self))
+        tag = "[object Symbol]";
+    if (!self.isNullish()) {
+        JSValue custom = getProperty(vm, self, vm.atoms.symToStringTag);
+        if (custom.isException())
+            return custom;
+        Handle keep = Handle::adopt(custom);
+        if (isString(custom))
+            return makeString(vm, StringView(String(u"[object ") + String(asString(custom)->text()) + u"]"));
+    }
     return str(vm, tag);
 }
 
@@ -638,9 +595,11 @@ NATIVE(functionToString)
             name = toUtf8(static_cast<StringCell*>(r->fnName)->text());
         return str(vm, "function " + name + "() { [native code] }");
     }
+    if (f->code->source && f->code->srcEnd > f->code->srcStart && f->code->srcEnd <= f->code->source->size())
+        return str(vm, std::string_view(*f->code->source).substr(f->code->srcStart, f->code->srcEnd - f->code->srcStart));
     if (f->code->name)
         name = toUtf8(static_cast<StringCell*>(f->code->name)->text());
-    return str(vm, "function " + name + "() { [code] }");
+    return str(vm, "function " + name + "() { [native code] }");
 }
 
 /// What a bound function runs: `data` is the function itself, which keeps what it is bound to in its rare state.
@@ -2355,13 +2314,36 @@ void VM::installBuiltins()
     method(*this, objectCtorFn, "isFrozen", objectIsFrozen, 1);
     method(*this, objectCtorFn, "assign", objectAssign, 2);
 
-    // The function constructor object itself; `new Function(...)` needs the compiler at run time and is not provided.
+    // `Function(...)` and the global `eval`: both compile at run time, in the global scope.
     {
         JSObject* fp = functionProto;
         Key key = internKey(std::string_view("Function"));
-        JSFunction* f = newNativeFunction(functionProto, [](VM& vm, JSValue, const JSValue*, std::uint32_t, void*) -> JSValue {
-            return vm.throwError(ErrorCode::NotSupported, "Function() constructor is not supported by the vm core");
+        JSFunction* f = newNativeFunction(functionProto, [](VM& vm, JSValue, const JSValue* args, std::uint32_t argc, void*) -> JSValue {
+            if (!vm.ctx.options.runtimeCode)
+                return vm.throwError(ErrorCode::EvalError,
+                                     "the Function constructor is disabled: the engine runs only the source its host gives it");
+            String params;
+            for (std::uint32_t i = 0; i + 1 < argc; ++i) {
+                JSValue p = toStringValue(vm, args[i]);
+                if (p.isException())
+                    return p;
+                if (i)
+                    params += u",";
+                params += asString(p)->text();
+                release(p);
+            }
+            String body;
+            if (argc) {
+                JSValue b = toStringValue(vm, args[argc - 1]);
+                if (b.isException())
+                    return b;
+                body = String(asString(b)->text());
+                release(b);
+            }
+            const String text = u"(function anonymous(" + params + u"\n) {\n" + body + u"\n})";
+            return vm.evalSource(toUtf8(text), "<function>");
         }, nullptr, key, 1);
+        f->flags |= JSFunction::kConstructor;
         f->materialize(*this);
         retain(toJSValue(fp));
         f->putOwn(*this, atoms.prototype, toJSValue(fp), 0);
@@ -2369,6 +2351,16 @@ void VM::installBuiltins()
         fp->putOwn(*this, atoms.constructor, toJSValue(f), attr::kWritable | attr::kConfigurable);
         globalObject->putOwn(*this, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
         detail::decRef(key);
+        method(*this, globalObject, "eval", [](VM& vm, JSValue, const JSValue* args, std::uint32_t argc, void*) -> JSValue {
+            if (!vm.ctx.options.runtimeCode)
+                return vm.throwError(ErrorCode::EvalError, "eval is disabled: the engine runs only the source its host gives it");
+            const JSValue x = arg(args, argc, 0);
+            if (!isString(x)) {
+                retain(x);
+                return x;
+            }
+            return vm.evalSource(toUtf8(asString(x)->text()), "<eval>");
+        }, 1);
     }
 
     // Errors.
@@ -2583,7 +2575,17 @@ void VM::installBuiltins()
     method(*this, globalObject, "isFinite", isFiniteImpl, 1);
     value(*this, numberCtorFn, "parseInt", (retain(toJSValue(pi)), toJSValue(pi)));
     value(*this, numberCtorFn, "parseFloat", (retain(toJSValue(pf)), toJSValue(pf)));
+    installSymbolAndIterators(*this);
+    installMore(*this);
+    installCollections(*this);
 }
+
+namespace bi {
+JSValue definePropertyFromDescriptor(VM& vm, JSObject* o, Key key, JSObject* descriptor)
+{
+    return definePropertyImpl(vm, o, key, descriptor);
+}
+}  // namespace bi
 
 }  // namespace vm
 }  // namespace internal

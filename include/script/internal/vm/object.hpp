@@ -21,6 +21,17 @@ struct SlotsHeader
 };
 static_assert(sizeof(SlotsHeader) == 16, "slots stay 16-byte aligned behind their header");
 
+/// The payload of an object that is more than properties: a generator's saved registers, the entries of a Map. Owned by
+/// the object's `Rare`, deleted with it.
+struct NativeState
+{
+    virtual ~NativeState() = default;
+    /// The values it holds, for the walk that finds cycles at teardown.
+    virtual void values(std::vector<JSValue>& out) const { (void)out; }
+    /// Let go of every value it holds, now; safe to call twice.
+    virtual void clear(VM& vm) noexcept { (void)vm; }
+};
+
 /// Per-object state few objects have. Made on first need; its presence is `kHasRare`.
 struct Rare
 {
@@ -42,6 +53,7 @@ struct Rare
     // instance fields. Each holds a count.
     JSValue home = JSValue::undefined();
     JSValue fieldInit = JSValue::undefined();
+    NativeState* ext = nullptr;           ///< owned
 };
 
 struct JSObject

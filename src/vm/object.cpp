@@ -442,7 +442,11 @@ void JSObject::materialize(VM& vm)
     if (name)
         detail::incRef(text);
     putOwn(vm, vm.atoms.name, JSValue::cell(text), kReadOnlyConfigurable);
-    if (f->flags & JSFunction::kConstructor) {
+    if (!(f->flags & JSFunction::kNative) && (f->code->flags & CodeBlock::kGenerator)) {
+        // A generator function's `prototype` is what its generators inherit from; it has no `constructor`.
+        JSObject* prototype = vm.newObject(vm.protos.generator);
+        putOwn(vm, vm.atoms.prototype, toJSValue(prototype), attr::kWritable);
+    } else if (f->flags & JSFunction::kConstructor) {
         JSObject* prototype = vm.newObject(vm.protos.object);
         Handle keep = Handle::adopt(toJSValue(prototype));
         // The one cycle a function makes, and only for a function that is asked about its properties.

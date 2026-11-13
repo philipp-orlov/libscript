@@ -306,7 +306,10 @@ bool isPure(const Node& n) noexcept
 class Compiler
 {
 public:
-    Compiler(VM& vm, std::string_view file) : vm_(vm), ctx_(vm.ctx), file_(fromUtf8(file)) {}
+    Compiler(VM& vm, std::string_view file, std::shared_ptr<const std::string> source)
+        : vm_(vm), ctx_(vm.ctx), file_(fromUtf8(file)), source_(std::move(source))
+    {
+    }
 
     CodeBlock* program(const Node& program);
 
@@ -314,6 +317,7 @@ private:
     VM& vm_;
     ContextImpl& ctx_;
     String file_;
+    std::shared_ptr<const std::string> source_;
     Fn* fn_ = nullptr;
     std::uint32_t line_ = 0;
     Label* chain_ = nullptr;
@@ -779,7 +783,41 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         }
         case NK::SuperExpr: unsupported(n, "super");
         case NK::Spread: unsupported(n, "spread");
-        case NK::Yield: unsupported(n, "generators");
+        case NK::Yield: {
+            if (!(fn_->block->flags & CodeBlock::kGenerator))
+                unsupported(n, "yield here");
+            const std::uint16_t mark = fn_->top;
+            const std::uint16_t d = dest(dst);
+            const std::uint16_t inner = fn_->top;
+            if (n.prefix) {
+                // `yield*` hands out what the inner iterator does; what it sends back and its return value are not passed on.
+                const std::uint16_t src = exprAny(*n.a);
+                const std::uint16_t it = temps(2);
+                const std::uint16_t v = temp();
+                const std::uint16_t sent = temp();
+                Label top, done;
+                emit(Op::IterInit, it, src);
+                bind(top);
+                emit(Op::IterNext, v, it, 0);
+                emitJump(Op::JHole, v, done);
+                emit(Op::Yield, sent, v);
+                jump(top);
+                bind(done);
+                emit(Op::LoadUndef, d);
+            } else {
+                std::uint16_t v;
+                if (n.a) {
+                    v = exprAny(*n.a);
+                } else {
+                    v = temp();
+                    emit(Op::LoadUndef, v);
+                }
+                emit(Op::Yield, d, v);
+            }
+            fn_->top = inner;
+            (void)mark;
+            return d;
+        }
         case NK::Await: unsupported(n, "async functions");
         case NK::ClassExpr: return classExpr(n, dst, String());
         case NK::BigIntLit: unsupported(n, "BigInt");
@@ -924,8 +962,6 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
 
 std::uint16_t Compiler::function(const Node& n, const String& inferredName, int dst)
 {
-    if (n.isGenerator)
-        unsupported(n, "generators");
     if (n.isAsync)
         unsupported(n, "async functions");
     CodeBlock* child = compileFunction(n, n.text.empty() ? inferredName : n.text);
@@ -1015,6 +1051,11 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         unsupported(*ctorFn, "this constructor");
     pendingFlags_ = CodeBlock::kClassConstructor | (derived ? CodeBlock::kDerived : 0);
     CodeBlock* ctorCode = compileFunction(*ctorFn, name);
+    if (cls.srcEnd) {
+        // A class's text is its constructor's.
+        ctorCode->srcStart = cls.srcStart;
+        ctorCode->srcEnd = cls.srcEnd;
+    }
     {
         const std::size_t index = fn_->block->children.size();
         fn_->block->children.push_back(ctorCode);
@@ -2493,11 +2534,16 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
 {
     const bool arrow = n.kind == NK::ArrowExpr;
     Key nameKey = name.empty() ? nullptr : vm_.internKey(StringView(name));
-    CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && (!n.isMethod || (extraFlags & CodeBlock::kClassConstructor)));
+    CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && !n.isGenerator && (!n.isMethod || (extraFlags & CodeBlock::kClassConstructor)));
+    if (n.isGenerator)
+        block->flags |= CodeBlock::kGenerator;
     if (nameKey)
         detail::decRef(nameKey);  // `newCodeBlock` took its own count
     block->flags |= extraFlags;
     block->file = file_;
+    block->source = source_;
+    block->srcStart = n.srcStart;
+    block->srcEnd = n.srcEnd;
     // Parameters before a rest parameter arrive in registers of their own; the rest are taken from the arguments array.
     std::size_t fixedParams = n.list.size();
     for (std::size_t i = 0; i < n.list.size(); ++i)
@@ -2752,9 +2798,9 @@ CodeBlock* Compiler::programOnce(const Node& program)
 
 }  // namespace
 
-CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file)
+CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source)
 {
-    Compiler compiler(vm, file);
+    Compiler compiler(vm, file, std::move(source));
     return compiler.program(program);
 }
 

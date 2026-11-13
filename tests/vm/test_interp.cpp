@@ -19,9 +19,10 @@ struct Outcome
     script::ErrorCode code = script::ErrorCode::Ok;
 };
 
-Outcome runOn(script::Context::Options::Core core, const char* source)
+Outcome runOn(script::Context::Options::Core core, const char* source, bool runtimeCode = false)
 {
     script::Context::Options options;
+    options.runtimeCode = runtimeCode;
     options.language = script::Language::JavaScript;
     options.core = core;
     script::Context ctx(options);
@@ -85,9 +86,15 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         {"function P(a, b) { this.s = a + b; } var B = P.bind(null, 1); new B(2).s", "3"},
         // A `let` read in its own initialiser is in its dead zone.
         {"var r; try { let v = (function () { return v; })(); } catch (e) { r = e.name; } r", "ReferenceError"},
+        // A set's iterator goes on over what was added after it started, and skips what was deleted.
+        {"var s = new Set([1, 2, 3]); var it = s[Symbol.iterator](); s.delete(1); String(it.next().value)", "2"},
+        {"var s = new Set(); s.add(1); s.add(2); for (var x of s) { if (x < 5) s.add(x + 2); } [...s].join()", "1,2,3,4,5,6"},
+        // Code made at run time, when the host allows it.
+        {"var f = new Function('a', 'b', 'return a * b'); String(f(3, 4))", "12"},
+        {"String(eval('1 + 2') + eval('var zz = 5; zz * 2'))", "13"},
     };
     for (const Expect& e : expected) {
-        const Outcome got = runOn(script::Context::Options::Core::Vm, e.source);
+        const Outcome got = runOn(script::Context::Options::Core::Vm, e.source, true);
         if (got.threw || got.text != e.value)
             std::fprintf(stderr, "wanted %s from %s, got %s%s\n", e.value, e.source, got.threw ? "THROW " : "", got.text.c_str());
         CHECK(!got.threw);

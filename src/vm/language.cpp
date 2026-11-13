@@ -47,7 +47,7 @@ std::shared_ptr<CompiledUnit> compileJavaScript(ContextImpl& ctx, std::string_vi
     unit->context = &ctx;
     unit->alive = ctx.alive;
     unit->vm = &vm;
-    unit->code = compileProgram(vm, *tree, name);
+    unit->code = compileProgram(vm, *tree, name, std::make_shared<const std::string>(source));
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("SCRIPT_VM_DUMP"))
         std::fputs(dump(*unit->code).c_str(), stderr);
@@ -74,6 +74,22 @@ Value runProgram(ContextImpl& ctx, CompiledUnit& unit, const std::vector<Value>&
 }
 
 }  // namespace
+
+JSValue VM::evalSource(std::string_view source, std::string_view name)
+{
+    CodeBlock* code = nullptr;
+    try {
+        dyn::Parser parser(source, std::string(name), /*typescript=*/false);
+        dyn::NodePtr tree = parser.parseProgram();
+        code = compileProgram(*this, *tree, name, std::make_shared<const std::string>(source));
+    } catch (const Error& e) {
+        return throwError(e.code() == ErrorCode::CompileError ? ErrorCode::SyntaxError : e.code(), e.what());
+    }
+    JSFunction* main = newFunction(protos.function, code, nullptr, 0);
+    releaseCode(code);  // the function has its own count
+    Handle keep = Handle::adopt(toJSValue(main));
+    return call(keep.get(), toJSValue(global), nullptr, 0);
+}
 
 const LanguageInfo& javascriptLanguage() noexcept
 {

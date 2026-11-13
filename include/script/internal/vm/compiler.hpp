@@ -13,7 +13,8 @@ namespace vm {
 
 /// Compile a whole program. The block has one count, which the caller owns. Throws `Error(SyntaxError)` for what the
 /// language forbids and `Error(NotSupported)` for what this core does not compile yet.
-CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file);
+CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file,
+                          std::shared_ptr<const std::string> source = nullptr);
 
 }  // namespace vm
 }  // namespace internal

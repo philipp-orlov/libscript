@@ -12,6 +12,9 @@
 // optimisation on top of the same operand kinds and is left for the interpreter-tuning phase.
 #pragma once
 
+#include <memory>
+#include <string>
+
 #include <cstdint>
 #include <string>
 
@@ -102,6 +105,7 @@ struct CodeBlock
         kUsesThis = 8,
         kClassConstructor = 32,  ///< calling it without `new` is an error
         kDerived = 64,           ///< a constructor of a class with `extends`
+        kGenerator = 128,        ///< a call makes a generator object instead of running
         kNeedsArgs = 16,  ///< the call keeps every argument in an array, in the register after the parameters
     };
 
@@ -122,6 +126,9 @@ struct CodeBlock
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
     Vec<InlineCache> caches;   
     String file;
+    /// The program text, shared by every function of it, and where this function's own text lies in it (bytes).
+    std::shared_ptr<const std::string> source;
+    std::uint32_t srcStart = 0, srcEnd = 0;
 
     CodeBlock() = default;
     CodeBlock(const CodeBlock&) = delete;

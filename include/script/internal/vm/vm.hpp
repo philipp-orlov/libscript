@@ -5,6 +5,7 @@
 // grows with each phase -- the VM stack and the code blocks land here.
 #pragma once
 
+#include <map>
 #include <string>
 #include <string_view>
 
@@ -51,6 +52,16 @@ struct Atoms
     Key prototype = nullptr;
     Key constructor = nullptr;
     Key name = nullptr;
+    Key value = nullptr;
+    Key done = nullptr;
+    Key next = nullptr;
+    // The well-known symbols; each holds a count.
+    Key symIterator = nullptr;
+    Key symAsyncIterator = nullptr;
+    Key symToPrimitive = nullptr;
+    Key symToStringTag = nullptr;
+    Key symHasInstance = nullptr;
+    Key symSpecies = nullptr;
 };
 
 /// The prototypes of what a primitive is read through. Null until something installs them; a property read on a
@@ -65,6 +76,13 @@ struct Intrinsics
     JSObject* boolean = nullptr;
     JSObject* symbol = nullptr;
     JSObject* bigint = nullptr;
+    JSObject* generator = nullptr;       ///< what a generator function's `prototype` inherits from
+    JSObject* iterator = nullptr;        ///< %IteratorPrototype%
+    JSObject* nativeIterator = nullptr;  ///< array, map and set iterators
+    JSObject* map = nullptr;
+    JSObject* set = nullptr;
+    JSObject* weakMap = nullptr;
+    JSObject* weakSet = nullptr;
 };
 
 /// One activation on the VM stack. `R` is its register window; register 0 is `this`, then the parameters. A function called
@@ -80,6 +98,7 @@ struct Frame
     bool construct;             ///< `new`: a result that is not an object is replaced by `this`
     bool entry;                 ///< entered from C++: leaving it returns from `run`
     JSValue newTarget;          ///< the constructor `new` was applied to; undefined in a call (not counted: it is a callee)
+    JSValue gen = JSValue::undefined();  ///< the generator this frame runs, if it does (not counted: the resumer holds it)
 };
 
 struct VM : EngineRuntime
@@ -207,6 +226,20 @@ struct VM : EngineRuntime
     /// `intern` for the text of a name; the cell is the table's and the caller's (a count is added).
     Key internKey(std::string_view ascii);
     Key internKey(StringView text);
+    /// A new symbol, owned. `registry` symbols are what `Symbol.for` makes.
+    JSValue newSymbol(StringView description, bool hasDescription);
+    std::map<String, Key> symbolRegistry;  ///< each holds a count
+
+    // ---- generators (interp.cpp) ----
+    /// What a generator function's call makes: an object holding the registers of the call. Owned.
+    JSValue makeGenerator(JSFunction* fn, JSValue thisValue, const JSValue* args, std::uint32_t argc);
+    /// `next`, `throw` and `return` (mode 0, 1, 2) of a generator: an owned iterator result, or the exception sentinel.
+    JSValue resumeGenerator(JSValue generator, int mode, JSValue sent);
+    /// Compile `source` as a program and run it on the global object: `eval` and `new Function`. An owned result, or the
+    /// exception sentinel (a syntax error is a pending SyntaxError).
+    JSValue evalSource(std::string_view source, std::string_view name);
+    /// Set while a `throw` is being delivered to a suspended generator.
+    bool resumeThrow = false;
 
 private:
     friend struct JSObject;

@@ -157,9 +157,9 @@ struct JSArray : JSObject
 /// The element types of typed arrays and what a DataView reads.
 enum class ElemKind : std::uint8_t
 {
-    Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float32, Float64, BigInt64, BigUint64, Count,
+    Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float32, Float64, BigInt64, BigUint64, Float16, Count,
 };
-inline constexpr std::uint32_t kElemSize[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
+inline constexpr std::uint32_t kElemSize[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8, 2};
 
 struct ProxyState;
 /// The proxy state of an object that is a proxy, else null.

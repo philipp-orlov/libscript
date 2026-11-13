@@ -17,7 +17,7 @@ namespace bi {
 namespace {
 
 const char* const kNames[] = {"Int8Array",  "Uint8Array",   "Uint8ClampedArray", "Int16Array",    "Uint16Array",   "Int32Array",
-                              "Uint32Array", "Float32Array", "Float64Array",      "BigInt64Array", "BigUint64Array"};
+                              "Uint32Array", "Float32Array", "Float64Array",      "BigInt64Array", "BigUint64Array", "Float16Array"};
 
 BufferState* bufferOf(JSValue v)
 {
@@ -1477,7 +1477,7 @@ void installTypedArrays(VM& vm)
     getter(dvProto, "buffer", dataViewGetter, reinterpret_cast<void*>(0));
     getter(dvProto, "byteLength", dataViewGetter, reinterpret_cast<void*>(1));
     getter(dvProto, "byteOffset", dataViewGetter, reinterpret_cast<void*>(2));
-    static const char* const viewNames[] = {"Int8", "Uint8", nullptr, "Int16", "Uint16", "Int32", "Uint32", "Float32", "Float64", "BigInt64", "BigUint64"};
+    static const char* const viewNames[] = {"Int8", "Uint8", nullptr, "Int16", "Uint16", "Int32", "Uint32", "Float32", "Float64", "BigInt64", "BigUint64", "Float16"};
     for (int k = 0; k < int(ElemKind::Count); ++k) {
         if (!viewNames[k])
             continue;

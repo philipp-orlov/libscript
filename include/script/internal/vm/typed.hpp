@@ -14,6 +14,43 @@ namespace script {
 namespace internal {
 namespace vm {
 
+/// IEEE half precision: the nearest half (ties to even) of a double, as its bits, and back.
+inline std::uint16_t doubleToHalf(double d) noexcept
+{
+    if (d != d)
+        return 0x7E00;
+    const std::uint16_t sign = std::signbit(d) ? 0x8000 : 0;
+    const double a = std::fabs(d);
+    if (a >= 65520.0)
+        return std::uint16_t(sign | 0x7C00);
+    if (a < 6.103515625e-05) {  // 2^-14: subnormal halves
+        const double m = std::nearbyint(a * 16777216.0);  // 2^24
+        return std::uint16_t(sign | std::uint16_t(m));
+    }
+    int ex;
+    const double m = std::frexp(a, &ex);  // m in [0.5, 1)
+    int e = ex - 1;
+    double mantissa = std::nearbyint((m * 2 - 1) * 1024);
+    if (mantissa >= 1024) {
+        mantissa = 0;
+        ++e;
+    }
+    if (e > 15)
+        return std::uint16_t(sign | 0x7C00);
+    return std::uint16_t(sign | ((e + 15) << 10) | std::uint16_t(mantissa));
+}
+
+inline double halfToDouble(std::uint16_t h) noexcept
+{
+    const double sign = (h & 0x8000) ? -1.0 : 1.0;
+    const int exp = (h >> 10) & 31, mant = h & 1023;
+    if (exp == 0)
+        return sign * std::ldexp(double(mant), -24);
+    if (exp == 31)
+        return mant ? std::nan("") : sign * HUGE_VAL;
+    return sign * std::ldexp(double(1024 + mant), exp - 25);
+}
+
 /// A number written to an element of a kind that holds numbers, as the language converts it (modulo 2^n, clamped).
 inline void storeNumber(ElemKind kind, std::uint8_t* p, double d) noexcept
 {
@@ -52,6 +89,11 @@ inline void storeNumber(ElemKind kind, std::uint8_t* p, double d) noexcept
             break;
         }
         case ElemKind::Float64: std::memcpy(p, &d, 8); break;
+        case ElemKind::Float16: {
+            const std::uint16_t v = doubleToHalf(d);
+            std::memcpy(p, &v, 2);
+            break;
+        }
         default: break;
     }
 }
@@ -92,6 +134,11 @@ inline JSValue loadNumber(ElemKind kind, const std::uint8_t* p) noexcept
             double v;
             std::memcpy(&v, p, 8);
             return JSValue::boxNumber(v);
+        }
+        case ElemKind::Float16: {
+            std::uint16_t v;
+            std::memcpy(&v, p, 2);
+            return JSValue::boxNumber(halfToDouble(v));
         }
         default: return JSValue::undefined();
     }

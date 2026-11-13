@@ -3480,6 +3480,7 @@ void VM::installBuiltins()
     installProxy(*this);
     installExtras(*this);
     installIteratorHelpers(*this);
+    installAtomics(*this);
     returnMarker = toJSValue(newObject(static_cast<JSObject*>(nullptr)));
 }
 

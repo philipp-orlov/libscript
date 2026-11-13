@@ -11,6 +11,7 @@
 #include "builtins_util.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/operators.hpp"
+#include "script/internal/vm/typed.hpp"
 
 namespace script {
 namespace internal {
@@ -516,6 +517,15 @@ NATIVE(getOrInsert)
     return v;
 }
 
+NATIVE(mathF16round)
+{
+    UNUSED();
+    double d;
+    if (!toNumber(vm, arg(args, argc, 0), &d))
+        return JSValue::exception();
+    return JSValue::boxNumber(halfToDouble(doubleToHalf(d)));
+}
+
 NATIVE(returnThis)
 {
     UNUSED();
@@ -527,6 +537,13 @@ NATIVE(returnThis)
 
 void installExtras(VM& vm)
 {
+    {
+        Key k = vm.internKey(std::string_view("Math"));
+        JSValue* slot = vm.global->findOwn(vm, k);
+        detail::decRef(k);
+        if (slot && isObject(*slot))
+            method(vm, asObject(*slot), "f16round", mathF16round, 1);
+    }
     // The tags of the namespace objects, and `Symbol.species` of the constructors that have one.
     for (const char* name : {"JSON", "Reflect"}) {
         Key k = vm.internKey(std::string_view(name));

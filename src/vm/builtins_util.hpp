@@ -168,6 +168,7 @@ void installProxy(VM& vm);
 void installExtras(VM& vm);
 /// The global Iterator and the iterator helpers.
 void installIteratorHelpers(VM& vm);
+void installAtomics(VM& vm);
 /// The keys a proxy's `ownKeys` trap (or its target) gives.
 bool proxyOwnKeys(VM& vm, JSObject* proxy, std::vector<Handle>& out);
 /// `getOwnPropertyDescriptor` through the proxy: a descriptor object, undefined, or the exception sentinel.

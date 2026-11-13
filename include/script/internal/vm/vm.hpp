@@ -249,6 +249,8 @@ struct VM : EngineRuntime
     /// Compile `source` as a program and run it on the global object: `eval` and `new Function`. An owned result, or the
     /// exception sentinel (a syntax error is a pending SyntaxError).
     JSValue evalSource(std::string_view source, std::string_view name);
+    /// Room for the boxes a closure with many captures gathers; the interpreter cannot hold a vector across its jumps.
+    std::vector<Box*> boxScratch;
     /// Set while a `throw` is being delivered to a suspended generator.
     bool resumeThrow = false;
 

@@ -1386,12 +1386,17 @@ L_NewClass: {
         }
     }
     const std::uint32_t nUp = std::uint32_t(ctor->upvals.size());
-    std::vector<Box*> upBoxes(nUp);
+    Box* upSmall[16];
+    Box** upBoxes = upSmall;
+    if (nUp > 16) {
+        vm.boxScratch.resize(nUp);
+        upBoxes = vm.boxScratch.data();
+    }
     for (std::uint32_t i = 0; i < nUp; ++i) {
         const UpvalDesc& d = ctor->upvals[i];
         upBoxes[i] = d.fromParentLocal ? reinterpret_cast<Box*>(R[d.index].asCell()) : fn->upvals()[d.index];
     }
-    JSFunction* f = vm.newFunction(parent ? parent : vm.protos.function, ctor, upBoxes.data(), nUp);
+    JSFunction* f = vm.newFunction(parent ? parent : vm.protos.function, ctor, upBoxes, nUp);
     Handle fKeep = Handle::adopt(toJSValue(f));
     f->materialize(vm);  // length and name now, so that they come before `prototype`
     f->flags |= JSFunction::kConstructor;
@@ -1503,11 +1508,10 @@ L_Closure: {
     CodeBlock* child = code->children[ins->b];
     const std::uint32_t n = std::uint32_t(child->upvals.size());
     Box* small[16];
-    std::vector<Box*> big;
     Box** boxes = small;
     if (n > 16) {
-        big.resize(n);
-        boxes = big.data();
+        vm.boxScratch.resize(n);
+        boxes = vm.boxScratch.data();
     }
     for (std::uint32_t i = 0; i < n; ++i) {
         const UpvalDesc& d = child->upvals[i];

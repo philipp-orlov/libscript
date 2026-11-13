@@ -47,6 +47,10 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     frameCapacity = std::uint32_t(ctx.options.stackLimit) + 16;
     frameBase = static_cast<Frame*>(allocPayload(sizeof(Frame) * frameCapacity));
     stackInit = stackBase;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* t = std::getenv("SCRIPT_VM_TIER1"))
+        tier1Threshold = std::uint32_t(std::atoi(t));
+#endif
 
     atoms.length = internKey("length");
     atoms.prototype = internKey("prototype");

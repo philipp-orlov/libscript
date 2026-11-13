@@ -127,13 +127,18 @@ struct CodeBlock
     Vec<UpvalDesc> upvals;
     Vec<Handler> handlers;
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
-    Vec<InlineCache> caches;   
+    Vec<InlineCache> caches;
+    /// Baseline machine code for this function, once it has run hot enough (jit.hpp); owned.
+    struct Tier1Code* tier1 = nullptr;
+    std::uint32_t hotness = 0;
+    bool tier1Failed = false;  ///< the compiler declined this function: never ask again
     String file;
     /// The program text, shared by every function of it, and where this function's own text lies in it (bytes).
     std::shared_ptr<const std::string> source;
     std::uint32_t srcStart = 0, srcEnd = 0;
 
     CodeBlock() = default;
+    ~CodeBlock();
     CodeBlock(const CodeBlock&) = delete;
     CodeBlock& operator=(const CodeBlock&) = delete;
 };

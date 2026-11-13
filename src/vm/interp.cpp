@@ -11,6 +11,7 @@
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
+#include "script/internal/vm/jit.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
 #include "script/internal/vm/typed.hpp"
@@ -400,7 +401,10 @@ struct GenState : NativeState
 
 using bi::iteratorStep;
 
-JSValue run(VM& vm)
+/// The interpreter. With `Step`, it runs the top frame's one instruction (and whatever that calls) and then returns
+/// `kStepFall` or `kStepJump` instead of going on; see jit.hpp.
+template <bool Step>
+JSValue runImpl(VM& vm, const Ins* stepFall)
 {
     static const void* const kLabels[] = {
 #define OP(name, kinds) &&L_##name,
@@ -409,6 +413,7 @@ JSValue run(VM& vm)
     };
 
     Frame* fr = vm.frameBase + vm.frameCount - 1;
+    [[maybe_unused]] Frame* const home = fr;
     CodeBlock* code;
     const Ins* codeStart;
     const JSValue* K;
@@ -430,10 +435,20 @@ JSValue run(VM& vm)
         fn = fr->fn;                    \
         pc = fr->pc ? fr->pc : codeStart; \
     } while (0)
-#define NEXT()          \
+#define DISPATCH()      \
     do {                \
         ins = pc++;     \
         goto* kLabels[ins->op]; \
+    } while (0)
+#define NEXT()                                                                           \
+    do {                                                                                 \
+        if constexpr (Step) {                                                            \
+            if (fr == home) [[unlikely]] {                                               \
+                fr->pc = pc;                                                             \
+                return JSValue::raw(pc == stepFall ? kStepFall : kStepJump);             \
+            }                                                                            \
+        }                                                                                \
+        DISPATCH();                                                                      \
     } while (0)
 /// A loop's back edge or a call counts towards asking the host whether to stop.
 #define TICK()                                                                           \
@@ -470,7 +485,7 @@ JSValue run(VM& vm)
         fr->pc = pc;
         goto throw_;
     }
-    NEXT();
+    DISPATCH();
 
 L_Nop:
     NEXT();
@@ -1860,6 +1875,18 @@ do_call: {
     }
     vm.frameBase[vm.frameCount++] = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew || isSuper, false,
                                           isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
+    if (!c->tier1 && !c->tier1Failed && vm.tier1Threshold && ++c->hotness >= vm.tier1Threshold)
+        compileTier1(vm, c);
+    if (c->tier1) {
+        // Compiled code runs on the machine stack: the frame is its own entry, and the result comes back here.
+        vm.frameBase[vm.frameCount - 1].entry = true;
+        const JSValue res = enterTier1(vm, c->tier1, 0);
+        vm.stackTop = R + code->nregs;
+        if (res.isException())
+            FAIL();
+        SET(ins->a, res);
+        NEXT();
+    }
     fr = &vm.frameBase[vm.frameCount - 1];
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
@@ -2261,6 +2288,7 @@ throw_: {
     }
 }
 #undef LOAD_FRAME
+#undef DISPATCH
 #undef NEXT
 #undef TICK
 #undef TAKE16
@@ -2270,7 +2298,21 @@ throw_: {
 #undef STRICT
 }
 
+JSValue run(VM& vm)
+{
+    return runImpl<false>(vm, nullptr);
+}
+
 }  // namespace
+
+std::uint64_t stepInstruction(VM& vm, std::uint32_t index)
+{
+    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    const Ins* at = fr->code->code.data() + index;
+    const Ins* fall = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
+    fr->pc = at;
+    return runImpl<true>(vm, fall).bits;
+}
 
 // ----------------------------------------------------------------- calling ---
 
@@ -2323,7 +2365,9 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
         setReg(R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;
     frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, construct, true, construct ? callee : JSValue::undefined()};
-    const JSValue result = run(*this);
+    if (!c->tier1 && !c->tier1Failed && tier1Threshold && ++c->hotness >= tier1Threshold)
+        compileTier1(*this, c);
+    const JSValue result = c->tier1 ? enterTier1(*this, c->tier1, 0) : run(*this);
     stackTop = savedTop;
     // The frame let go of its own registers; `this` and the arguments are ours.
     clearRegs(R, 0, 1 + argc);

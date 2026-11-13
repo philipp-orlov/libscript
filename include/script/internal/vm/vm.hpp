@@ -217,6 +217,8 @@ struct VM : EngineRuntime
     /// The live frames, innermost last, in an array that never moves; `frameCapacity` is the call depth the context allows.
     /// Back edges and calls left before the host is asked whether to stop.
     std::uint32_t ticks = 4096;
+    /// Calls (and loop back edges) of a function before the baseline compiler translates it; 0 keeps everything interpreted.
+    std::uint32_t tier1Threshold = 0;
     Frame* frameBase = nullptr;
     std::uint32_t frameCount = 0;
     std::uint32_t frameCapacity = 0;

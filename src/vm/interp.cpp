@@ -27,6 +27,8 @@ namespace vm {
 namespace {
 
 constexpr std::uint32_t kInterruptInterval = 4096;
+/// Calls and back edges a function has had when the interpreter moves a loop that keeps going into compiled code.
+constexpr std::uint32_t kOsrAfter = 1000;
 
 /// `===`, with what is common settled without a call: equal bits, numbers, and values that are not both cells.
 [[gnu::always_inline]] inline bool fastStrictEquals(JSValue a, JSValue b) noexcept
@@ -468,35 +470,29 @@ JSValue runImpl(VM& vm, const Ins* stepFall)
 /// A loop's back edge: as TICK, and a function that keeps looping moves into compiled code in the middle of the loop.
 #define LOOP_TICK()                                                                      \
     do {                                                                                 \
-        if (--vm.ticks == 0) [[unlikely]] {                                              \
-            vm.ticks = kInterruptInterval;                                               \
-            fr->pc = pc;                                                                 \
-            if (vm.ctx.interruptAsked()) {                                               \
-                vm.throwError(ErrorCode::Interrupted, "execution was interrupted");      \
-                FAIL();                                                                  \
-            }                                                                            \
-            if constexpr (!Step) {                                                       \
-                if (vm.tier1Threshold && !code->tier1Failed) {                           \
-                    if (!code->tier1)                                                    \
-                        compileTier1(vm, code);                                          \
-                    if (code->tier1) {                                                   \
-                        const bool wasEntry_ = fr->entry;                                \
-                        const std::uint16_t dst_ = fr->retDst;                           \
-                        fr->entry = true;                                                \
-                        const JSValue res_ = enterTier1(vm, code->tier1, std::uint32_t(pc - codeStart)); \
-                        if (wasEntry_)                                                   \
-                            return res_;                                                 \
-                        fr = &vm.frameBase[vm.frameCount - 1];                           \
-                        LOAD_FRAME();                                                    \
-                        vm.stackTop = R + code->nregs;                                   \
-                        if (res_.isException())                                          \
-                            goto throw_;                                                 \
-                        SET(dst_, res_);                                                 \
-                        NEXT();                                                          \
-                    }                                                                    \
+        if constexpr (!Step) {                                                           \
+            if (vm.tier1Threshold && !code->tier1Failed && ++code->hotness >= kOsrAfter) [[unlikely]] { \
+                fr->pc = pc;                                                             \
+                if (!code->tier1)                                                        \
+                    compileTier1(vm, code);                                              \
+                if (code->tier1) {                                                       \
+                    const bool wasEntry_ = fr->entry;                                    \
+                    const std::uint16_t dst_ = fr->retDst;                               \
+                    fr->entry = true;                                                    \
+                    const JSValue res_ = enterTier1(vm, code->tier1, std::uint32_t(pc - codeStart)); \
+                    if (wasEntry_)                                                       \
+                        return res_;                                                     \
+                    fr = &vm.frameBase[vm.frameCount - 1];                               \
+                    LOAD_FRAME();                                                        \
+                    vm.stackTop = R + code->nregs;                                       \
+                    if (res_.isException())                                              \
+                        goto throw_;                                                     \
+                    SET(dst_, res_);                                                     \
+                    NEXT();                                                              \
                 }                                                                        \
             }                                                                            \
         }                                                                                \
+        TICK();                                                                          \
     } while (0)
 #define TAKE16()                  \
     do {                          \

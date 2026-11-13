@@ -43,33 +43,65 @@ namespace {
 
 using namespace jit;
 
-using Stub = std::uint64_t (*)(VM*, Frame*, void*);
+/// run(vm, frame, label, entry): set the registers compiled code keeps fixed and call `entry` with the frame in rsi and
+/// `label` in rdx. A function's own entry (its prologue) ignores `label`; `osrEnter` jumps to it.
+using Stub = std::uint64_t (*)(VM*, Frame*, void*, void*);
 
-Stub entryStub()
+struct Stubs
 {
-    static Stub stub = [] {
+    Stub run = nullptr;
+    void* osrEnter = nullptr;
+};
+
+void emitPrologue(X64& a)
+{
+    a.push(RBX);
+    a.push(R13);
+    a.aluI(5, RSP, 8);
+    a.mov(R13, RSI);
+    a.mov(RBX, mem(R13, std::int32_t(offsetof(Frame, R))));
+}
+
+const Stubs& stubs()
+{
+    static Stubs result = [] {
+        Stubs st;
         X64 a;
         a.push(RBP);
-        a.push(RBX);
         a.push(R12);
-        a.push(R13);
         a.push(R14);
         a.push(R15);
         a.aluI(5, RSP, 8);
         a.mov(R12, RDI);
-        a.mov(R13, RSI);
-        a.mov(RBX, mem(RSI, std::int32_t(offsetof(Frame, R))));
         a.movImm(R14, kNumberTag);
         a.movImm(R15, kNotCellMask);
         a.movImm(RBP, kDoubleOffset);
+        a.mov(RAX, RCX);
+        a.callReg(RAX);
+        a.aluI(0, RSP, 8);
+        a.pop(R15);
+        a.pop(R14);
+        a.pop(R12);
+        a.pop(RBP);
+        a.ret();
+        a.align(16);
+        const std::int32_t osr = a.here();
+        emitPrologue(a);
         a.jmp(RDX);
         CodeSpan span = allocateCode(a.buf.size());
         if (!span)
-            return Stub(nullptr);
+            return st;
         std::memcpy(span.rw, a.buf.data(), a.buf.size());
-        return reinterpret_cast<Stub>(span.rx);
+        st.run = reinterpret_cast<Stub>(span.rx);
+        st.osrEnter = span.rx + osr;
+        return st;
     }();
-    return stub;
+    return result;
+}
+
+Stub entryStub()
+{
+    return stubs().run;
 }
 
 /// Where compiled code goes on after a handler or a jump the interpreter took: the top frame's pc.
@@ -233,7 +265,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     vm.frameBase[vm.frameCount++] =
         Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, true, isNew ? callee : JSValue::undefined()};
     return {reinterpret_cast<std::uint64_t>(&vm.frameBase[vm.frameCount - 1]),
-            reinterpret_cast<std::uint64_t>(c->tier1->addressFor(0))};
+            reinterpret_cast<std::uint64_t>(c->tier1->entry)};
 }
 
 extern "C" CallResult scriptVmJitCall(VM* vm, std::uint32_t index)
@@ -312,6 +344,7 @@ public:
 
     Tier1Code* compile()
     {
+        emitPrologue(a_);
         for (std::uint32_t i = 0; i < n_;) {
             a_.bind(at_[i]);
             offsets_[i] = std::uint32_t(a_.here());
@@ -331,7 +364,7 @@ public:
         auto* t = new Tier1Code;
         t->rx = span.rx;
         t->bytes = span.bytes;
-        t->entry = t->rx + offsets_[0];
+        t->entry = t->rx;
         t->validities = std::move(validities_);
         t->labels = std::move(offsets_);
         return t;
@@ -609,12 +642,8 @@ void Baseline::emitTails()
     a_.jcc(CE, dispatch_);
     a_.bind(exit_);
     a_.aluI(0, RSP, 8);
-    a_.pop(R15);
-    a_.pop(R14);
     a_.pop(R13);
-    a_.pop(R12);
     a_.pop(RBX);
-    a_.pop(RBP);
     a_.ret();
     a_.bind(dispatch_);
     a_.mov(RDI, R12);
@@ -1404,9 +1433,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     a_.jcc(CE, native);
     a_.mov(RSI, RAX);
     a_.bind(enter);
-    a_.mov(RDI, R12);
-    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(entryStub()));
-    a_.callReg(RAX);
+    a_.callReg(RDX);
     a_.bind(native);
     a_.test(RAX, RAX);
     a_.jcc(CE, exc);
@@ -1505,7 +1532,9 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
             floor = nativeStackFloorLookup();
         vm.jitStackFloor = floor == 1 ? 0 : floor + kStackReserve;
     }
-    const std::uint64_t bits = entryStub()(&vm, fr, code->addressFor(index));
+    const Stubs& st = stubs();
+    const std::uint64_t bits = index == 0 ? st.run(&vm, fr, nullptr, code->entry)
+                                          : st.run(&vm, fr, code->addressFor(index), st.osrEnter);
     if (bits == 0 && pendingException) [[unlikely]] {
         std::exception_ptr e = std::move(pendingException);
         pendingException = nullptr;

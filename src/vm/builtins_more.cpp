@@ -472,6 +472,73 @@ NATIVE(objectToLocaleString)
     return vm.call(f, self, nullptr, 0);
 }
 
+/// `__defineGetter__` and `__defineSetter__` (data 0 or 1).
+NATIVE(objectDefineAccessorLegacy)
+{
+    UNUSED();
+    const bool setter = data != nullptr;
+    Handle obj = Handle::adopt(toObject(vm, self));
+    if (obj.get().isException())
+        return obj.get();
+    const JSValue fn = arg(args, argc, 1);
+    if (!isFunction(fn))
+        return typeError(vm, "Object.prototype.__define" + std::string(setter ? "Setter" : "Getter") + "__: Expecting function");
+    Key k = keyArg(vm, arg(args, argc, 0));
+    if (!k)
+        return JSValue::exception();
+    PropDesc desc;
+    desc.hasEnumerable = desc.hasConfigurable = true;
+    desc.enumerable = desc.configurable = true;
+    (setter ? desc.hasSet : desc.hasGet) = true;
+    (setter ? desc.set : desc.get) = Handle::retained(fn);
+    const int r = objDefineOwnProperty(vm, asObject(obj.get()), k, desc);
+    detail::decRef(k);
+    if (r < 0)
+        return JSValue::exception();
+    if (!r)
+        return typeError(vm, "Cannot redefine property");
+    return JSValue::undefined();
+}
+
+/// `__lookupGetter__` and `__lookupSetter__` (data 0 or 1).
+NATIVE(objectLookupAccessorLegacy)
+{
+    UNUSED();
+    const bool setter = data != nullptr;
+    Handle cur = Handle::adopt(toObject(vm, self));
+    if (cur.get().isException())
+        return cur.get();
+    Key k = keyArg(vm, arg(args, argc, 0));
+    if (!k)
+        return JSValue::exception();
+    JSValue result = JSValue::undefined();
+    for (;;) {
+        PropDesc d;
+        const int has = objGetOwnProperty(vm, asObject(cur.get()), k, &d);
+        if (has < 0) {
+            result = JSValue::exception();
+            break;
+        }
+        if (has) {
+            if (d.isAccessor()) {
+                result = (setter ? d.set : d.get).get();
+                retain(result);
+            }
+            break;
+        }
+        Handle next;
+        if (objGetPrototypeOf(vm, asObject(cur.get()), &next) < 0) {
+            result = JSValue::exception();
+            break;
+        }
+        if (!isObject(next.get()))
+            break;
+        cur = std::move(next);
+    }
+    detail::decRef(k);
+    return result;
+}
+
 NATIVE(protoGetter)
 {
     UNUSED();
@@ -924,6 +991,10 @@ void installMore(VM& vm)
     method(vm, objectCtorFn, "isSealed", objectExtensibility, 1, reinterpret_cast<void*>(3));
     method(vm, objectProto, "propertyIsEnumerable", objectPropertyIsEnumerable, 1);
     method(vm, objectProto, "toLocaleString", objectToLocaleString, 0);
+    method(vm, objectProto, "__defineGetter__", objectDefineAccessorLegacy, 2, nullptr);
+    method(vm, objectProto, "__defineSetter__", objectDefineAccessorLegacy, 2, reinterpret_cast<void*>(1));
+    method(vm, objectProto, "__lookupGetter__", objectLookupAccessorLegacy, 1, nullptr);
+    method(vm, objectProto, "__lookupSetter__", objectLookupAccessorLegacy, 1, reinterpret_cast<void*>(1));
     {
         Key key = vm.internKey(std::string_view("__proto__"));
         Key gname = vm.internKey(std::string_view("get __proto__"));

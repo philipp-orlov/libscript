@@ -282,6 +282,26 @@ public:
         opReg(true, 0xF7, 0, a);
         d32(std::uint32_t(imm));
     }
+    void cmpI8(const Mem& m, std::uint8_t imm)
+    {
+        opMem(false, 0x80, 7, m);
+        b(imm);
+    }
+    void testI8(const Mem& m, std::uint8_t imm)
+    {
+        opMem(false, 0xF6, 0, m);
+        b(imm);
+    }
+    void andI8(const Mem& m, std::uint8_t imm)
+    {
+        opMem(false, 0x80, 4, m);
+        b(imm);
+    }
+    void imulI32(Reg d, Reg s, std::int32_t imm)
+    {
+        opReg(false, 0x69, d, s);
+        d32(std::uint32_t(imm));
+    }
     void imul32(Reg d, Reg s) { opReg(false, 0x0F, d, s, 0xAF); }
     void neg32(Reg r) { opReg(false, 0xF7, 3, r); }
     void not32(Reg r) { opReg(false, 0xF7, 2, r); }

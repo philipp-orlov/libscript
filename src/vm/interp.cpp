@@ -462,12 +462,45 @@ JSValue runImpl(VM& vm, const Ins* stepFall)
             }                                                                            \
         }                                                                                \
     } while (0)
+/// A loop's back edge: as TICK, and a function that keeps looping moves into compiled code in the middle of the loop.
+#define LOOP_TICK()                                                                      \
+    do {                                                                                 \
+        if (--vm.ticks == 0) [[unlikely]] {                                              \
+            vm.ticks = kInterruptInterval;                                               \
+            fr->pc = pc;                                                                 \
+            if (vm.ctx.interruptAsked()) {                                               \
+                vm.throwError(ErrorCode::Interrupted, "execution was interrupted");      \
+                FAIL();                                                                  \
+            }                                                                            \
+            if constexpr (!Step) {                                                       \
+                if (vm.tier1Threshold && !code->tier1Failed) {                           \
+                    if (!code->tier1)                                                    \
+                        compileTier1(vm, code);                                          \
+                    if (code->tier1) {                                                   \
+                        const bool wasEntry_ = fr->entry;                                \
+                        const std::uint16_t dst_ = fr->retDst;                           \
+                        fr->entry = true;                                                \
+                        const JSValue res_ = enterTier1(vm, code->tier1, std::uint32_t(pc - codeStart)); \
+                        if (wasEntry_)                                                   \
+                            return res_;                                                 \
+                        fr = &vm.frameBase[vm.frameCount - 1];                           \
+                        LOAD_FRAME();                                                    \
+                        vm.stackTop = R + code->nregs;                                   \
+                        if (res_.isException())                                          \
+                            goto throw_;                                                 \
+                        SET(dst_, res_);                                                 \
+                        NEXT();                                                          \
+                    }                                                                    \
+                }                                                                        \
+            }                                                                            \
+        }                                                                                \
+    } while (0)
 #define TAKE16()                  \
     do {                          \
         const int o_ = ins->jump16(); \
         pc += o_;                 \
         if (o_ < 0)               \
-            TICK();               \
+            LOOP_TICK();          \
     } while (0)
 #define SET(r, v) setReg(R[r], v)
 #define COPY(r, v) copyReg(R[r], v)
@@ -954,7 +987,7 @@ L_Jmp: {
     const std::int32_t offset = ins->jump();
     pc += offset;
     if (offset < 0)
-        TICK();
+        LOOP_TICK();
     NEXT();
 }
 L_JTrue:
@@ -962,7 +995,7 @@ L_JTrue:
         const std::int32_t offset = ins->jump();
         pc += offset;
         if (offset < 0)
-            TICK();
+            LOOP_TICK();
     }
     NEXT();
 L_JFalse: {
@@ -2291,6 +2324,7 @@ throw_: {
 #undef DISPATCH
 #undef NEXT
 #undef TICK
+#undef LOOP_TICK
 #undef TAKE16
 #undef SET
 #undef COPY

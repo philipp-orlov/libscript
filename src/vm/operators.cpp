@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/operators.hpp"
 
@@ -13,6 +14,131 @@
 namespace script {
 namespace internal {
 namespace vm {
+
+namespace {
+
+dyn::bigint::Env bigEnv(VM& vm)
+{
+    return dyn::bigint::Env{vm.ctx,
+                            [](void*, ErrorCode code, const char* message) { throw Error(code, message); }, &vm,
+                            [](void*, std::size_t) {}};
+}
+
+dyn::BigIntCell* bigCell(JSValue v) noexcept { return static_cast<dyn::BigIntCell*>(v.asCell()); }
+
+}  // namespace
+
+JSValue bigintBinary(VM& vm, Op op, JSValue a, JSValue b)
+{
+    using dyn::bigint::BinaryOp;
+    BinaryOp which;
+    switch (op) {
+        case Op::Add: which = BinaryOp::Add; break;
+        case Op::Sub: which = BinaryOp::Sub; break;
+        case Op::Mul: which = BinaryOp::Mul; break;
+        case Op::Div: which = BinaryOp::Div; break;
+        case Op::Mod: which = BinaryOp::Mod; break;
+        case Op::Exp: which = BinaryOp::Pow; break;
+        case Op::BitAnd: which = BinaryOp::And; break;
+        case Op::BitOr: which = BinaryOp::Or; break;
+        case Op::BitXor: which = BinaryOp::Xor; break;
+        case Op::Shl: which = BinaryOp::Shl; break;
+        case Op::Shr: which = BinaryOp::Shr; break;
+        default: return vm.throwError(ErrorCode::TypeError, "BigInts have no unsigned right shift, use >> instead");
+    }
+    try {
+        dyn::bigint::Env env = bigEnv(vm);
+        return fromValue(vm, dyn::bigint::binary(env, which, bigCell(a), bigCell(b)));
+    } catch (const Error& e) {
+        return vm.throwError(e.code(), e.what());
+    }
+}
+
+JSValue bigintUnary(VM& vm, int kind, JSValue a)
+{
+    try {
+        dyn::bigint::Env env = bigEnv(vm);
+        switch (kind) {
+            case 0: return fromValue(vm, dyn::bigint::negate(env, bigCell(a)));
+            case 1: return fromValue(vm, dyn::bigint::bitNot(env, bigCell(a)));
+            case 2: return fromValue(vm, dyn::bigint::increment(env, bigCell(a), 1));
+            default: return fromValue(vm, dyn::bigint::increment(env, bigCell(a), -1));
+        }
+    } catch (const Error& e) {
+        return vm.throwError(e.code(), e.what());
+    }
+}
+
+JSValue bigintFromText(VM& vm, StringView text, bool* ok)
+{
+    try {
+        dyn::bigint::Env env = bigEnv(vm);
+        Value v;
+        *ok = dyn::bigint::parseString(env, text, v);
+        return *ok ? fromValue(vm, v) : JSValue::undefined();
+    } catch (const Error& e) {
+        *ok = false;
+        return vm.throwError(e.code(), e.what());
+    }
+}
+
+JSValue bigintFromDouble(VM& vm, double d)
+{
+    try {
+        dyn::bigint::Env env = bigEnv(vm);
+        return fromValue(vm, dyn::bigint::fromDouble(env, d));
+    } catch (const Error& e) {
+        return vm.throwError(e.code(), e.what());
+    }
+}
+
+JSValue bigintToString(VM& vm, JSValue v, int radix)
+{
+    return makeString(vm, StringView(dyn::bigint::toString(bigCell(v), radix)));
+}
+
+JSValue bigintAsN(VM& vm, std::uint64_t bits, JSValue a, bool isSigned)
+{
+    try {
+        dyn::bigint::Env env = bigEnv(vm);
+        return fromValue(vm, dyn::bigint::asIntN(env, bits, bigCell(a), isSigned));
+    } catch (const Error& e) {
+        return vm.throwError(e.code(), e.what());
+    }
+}
+
+double bigintToDouble(JSValue v) { return dyn::bigint::toDouble(bigCell(v)); }
+
+bool bigintIsZero(JSValue v) noexcept { return bigCell(v)->digits.empty(); }
+
+/// -1, 0 or 1, or 2 when they cannot be ordered (a NaN, a string that is no integer). `a` is a BigInt.
+int bigintCompareWith(VM& vm, JSValue a, JSValue other, bool* ok)
+{
+    *ok = true;
+    if (isBigInt(other))
+        return dyn::bigint::compare(bigCell(a), bigCell(other));
+    if (isString(other)) {
+        bool parsed;
+        JSValue b = bigintFromText(vm, asString(other)->text(), &parsed);
+        if (!parsed) {
+            if (b.isException()) {
+                *ok = false;
+                vm.clearException();
+            }
+            return 2;
+        }
+        const int c = dyn::bigint::compare(bigCell(a), bigCell(b));
+        release(b);
+        return c;
+    }
+    double d;
+    if (!toNumber(vm, other, &d)) {
+        *ok = false;
+        return 2;
+    }
+    return dyn::bigint::compareDouble(bigCell(a), d);
+}
+
 
 
 JSValue makeString(VM& vm, StringView text)
@@ -40,6 +166,8 @@ bool toBoolean(JSValue v) noexcept
     if (v.isCell()) {
         if (!isVmCell(v.asCell()) && v.asCell()->kind == detail::CellKind::String)
             return static_cast<StringCell*>(v.asCell())->length != 0;
+        if (!isVmCell(v.asCell()) && v.asCell()->kind == detail::CellKind::BigInt)
+            return !bigintIsZero(v);
         return true;
     }
     return false;
@@ -105,7 +233,7 @@ bool toNumber(VM& vm, JSValue v, double* out)
         return false;
     }
     if (isBigInt(v)) {
-        vm.throwError(ErrorCode::TypeError, "BigInt is not supported by the vm core");
+        vm.throwError(ErrorCode::TypeError, "Cannot convert a BigInt value to a number");
         return false;
     }
     if (isObject(v)) {
@@ -124,8 +252,23 @@ JSValue toNumeric(VM& vm, JSValue v)
 {
     if (v.isNumber())
         return v;
+    JSValue prim = v;
+    if (isObject(v)) {
+        prim = toPrimitive(vm, v, false);
+        if (prim.isException())
+            return prim;
+    }
+    if (isBigInt(prim)) {
+        retain(prim);
+        if (prim != v)
+            release(prim);
+        return prim;
+    }
     double d;
-    if (!toNumber(vm, v, &d))
+    const bool ok = toNumber(vm, prim, &d);
+    if (prim != v)
+        release(prim);
+    if (!ok)
         return JSValue::exception();
     return JSValue::boxNumber(d);
 }
@@ -163,7 +306,7 @@ JSValue toStringValue(VM& vm, JSValue v)
     if (isSymbol(v))
         return vm.throwError(ErrorCode::TypeError, "Cannot convert a Symbol value to a string");
     if (isBigInt(v))
-        return vm.throwError(ErrorCode::TypeError, "BigInt is not supported by the vm core");
+        return bigintToString(vm, v, 10);
     if (isObject(v)) {
         JSValue prim = toPrimitive(vm, v, true);
         if (prim.isException())
@@ -233,6 +376,8 @@ bool strictEquals(JSValue a, JSValue b) noexcept
         return true;
     if (isString(a) && isString(b))
         return stringsEqual(a, b);
+    if (isBigInt(a) && isBigInt(b))
+        return dyn::bigint::equal(bigCell(a), bigCell(b));
     return false;
 }
 
@@ -275,6 +420,14 @@ bool looseEquals(VM& vm, JSValue a, JSValue b, bool* ok)
     }
     if (isSymbol(a) || isSymbol(b))
         return a == b;
+    if (isBigInt(a) || isBigInt(b)) {
+        const JSValue big = isBigInt(a) ? a : b, other = isBigInt(a) ? b : a;
+        bool fine;
+        const int c = bigintCompareWith(vm, big, other, &fine);
+        if (!fine)
+            *ok = false;
+        return fine && c == 0;
+    }
     double x, y;
     if (!toNumber(vm, a, &x) || !toNumber(vm, b, &y)) {
         *ok = false;
@@ -318,6 +471,11 @@ JSValue add(VM& vm, JSValue a, JSValue b)
             release(sa);
             release(sb);
         }
+    } else if (isBigInt(pa) || isBigInt(pb)) {
+        if (isBigInt(pa) && isBigInt(pb))
+            result = bigintBinary(vm, Op::Add, pa, pb);
+        else
+            result = vm.throwError(ErrorCode::TypeError, "Cannot mix BigInt and other types, use explicit conversions");
     } else {
         double x, y;
         if (toNumber(vm, pa, &x) && toNumber(vm, pb, &y))
@@ -408,6 +566,28 @@ JSValue arithmetic(VM& vm, Op op, JSValue a, JSValue b)
             default: break;
         }
     }
+    if ((a.isCell() || b.isCell()) && (isBigInt(a) || isBigInt(b) || isObject(a) || isObject(b))) {
+        JSValue pa = toPrimitive(vm, a, false);
+        if (pa.isException())
+            return pa;
+        JSValue pb = toPrimitive(vm, b, false);
+        if (pb.isException()) {
+            release(pa);
+            return pb;
+        }
+        if (isBigInt(pa) || isBigInt(pb)) {
+            JSValue r = isBigInt(pa) && isBigInt(pb)
+                            ? bigintBinary(vm, op, pa, pb)
+                            : vm.throwError(ErrorCode::TypeError, "Cannot mix BigInt and other types, use explicit conversions");
+            release(pa);
+            release(pb);
+            return r;
+        }
+        JSValue r = arithmetic(vm, op, pa, pb);
+        release(pa);
+        release(pb);
+        return r;
+    }
     double x, y;
     if (!toNumber(vm, a, &x) || !toNumber(vm, b, &y))
         return JSValue::exception();
@@ -450,6 +630,22 @@ int relational(VM& vm, Op op, JSValue a, JSValue b)
     if (isString(pa) && isString(pb)) {
         const int c = compareStrings(pa, pb);
         result = op == Op::Lt ? c < 0 : op == Op::Le ? c <= 0 : op == Op::Gt ? c > 0 : c >= 0;
+    } else if (isBigInt(pa) || isBigInt(pb)) {
+        bool fine;
+        int c;
+        if (isBigInt(pa)) {
+            c = bigintCompareWith(vm, pa, pb, &fine);
+        } else {
+            c = bigintCompareWith(vm, pb, pa, &fine);
+            if (c != 2)
+                c = -c;
+        }
+        if (!fine)
+            result = -1;
+        else if (c == 2)
+            result = 0;
+        else
+            result = op == Op::Lt ? c < 0 : op == Op::Le ? c <= 0 : op == Op::Gt ? c > 0 : c >= 0;
     } else {
         double x, y;
         if (!toNumber(vm, pa, &x) || !toNumber(vm, pb, &y)) {

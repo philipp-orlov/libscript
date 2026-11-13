@@ -5,10 +5,10 @@
 // so `x = a + b` for a local `x` is one `Add`. A variable a nested function reads or writes lives in a `Box`, held in its
 // register; every other local is just its register. Top-level declarations are properties of the global object.
 //
-// Not compiled yet, and refused with `NotSupported`: classes, generators, async functions, `for await`, spread, rest
-// elements, tagged templates, regular expression and BigInt literals, `with`, `arguments`, `super`, `new.target`, private
-// names, and getters and setters other than in object literals.
+// Not compiled yet, and refused with `NotSupported`: async generators and `for await`, BigInt literals, `with`, `super()`
+// and `new.target` inside arrows, and computed names of `super[...]` reads.
 #include "script/internal/vm/compiler.hpp"
+#include "script/internal/vm/operators.hpp"
 
 #include <algorithm>
 #include <map>
@@ -715,6 +715,10 @@ private:
     CodeBlock* compileInitFunction(const std::vector<const Node*>& items, bool isStatic);
     CodeBlock* compileInitOnce(const std::vector<const Node*>& items, bool isStatic);
     void storeThis(std::uint16_t src);
+    static String computedKeyName(const Node& field)
+    {
+        return u"%key" + fromUtf8(std::to_string(reinterpret_cast<std::uintptr_t>(&field)));
+    }
     /// A method of an object literal that mentions `super` looks the prototype up from the literal.
     void homeFor(const Node& value, std::uint16_t fnReg, std::uint16_t object)
     {
@@ -869,7 +873,15 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             return d;
         }
         case NK::ClassExpr: return classExpr(n, dst, String());
-        case NK::BigIntLit: unsupported(n, "BigInt");
+        case NK::BigIntLit: {
+            bool ok = false;
+            JSValue v = bigintFromText(vm_, n.text, &ok);
+            if (!ok)
+                syntaxError(n, "Invalid BigInt literal");
+            const std::uint16_t d = dest(dst);
+            emit(Op::LoadK, d, constant(v));
+            return d;
+        }
         case NK::RegExpLit: {
             const std::uint16_t d = dest(dst);
             const std::uint16_t pattern = constant(fromValue(vm_, ctx_.str(n.text)));
@@ -884,7 +896,27 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             emit(Op::NewTarget, d);
             return d;
         }
-        case NK::TemplateObject: unsupported(n, "tagged templates");
+        case NK::TemplateObject: {
+            // One frozen array for the place in the source, with its `raw` twin.
+            auto frozenArray = [&](const std::vector<String>& items) {
+                JSArray* a = vm_.newArray(vm_.protos.array, 0, std::uint32_t(items.size()));
+                JSValue handle = toJSValue(a);
+                for (const String& item : items)
+                    a->append(vm_, fromValue(vm_, ctx_.str(item)));
+                a->h.flags |= cellflags::kFrozen | cellflags::kNotExtensible;
+                return handle;
+            };
+            JSValue cooked = frozenArray(n.extra().strs);
+            JSValue raw = frozenArray(n.extra().raws);
+            {
+                Key rawKey = vm_.internKey(std::string_view("raw"));
+                asObject(cooked)->putOwn(vm_, rawKey, raw, 0);
+                detail::decRef(rawKey);
+            }
+            const std::uint16_t d = dest(dst);
+            emit(Op::LoadK, d, constant(cooked));
+            return d;
+        }
         default: unsupported(n, "this expression");
     }
 }
@@ -1057,8 +1089,6 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         if (m->kind == NK::MethodDef && m->propKind == PropKind::Constructor && !m->declared)
             ctor = m.get();
     for (const dyn::NodePtr& m : cls.list) {
-        if (m->computed && m->kind == NK::FieldDef && !m->declared)
-            unsupported(*m, "computed field names");
         if ((m->kind == NK::MethodDef || m->kind == NK::FieldDef) && !m->computed && m->a && m->a->kind != NK::Identifier &&
             m->a->kind != NK::StringLit && m->a->kind != NK::NumberLit)
             unsupported(*m, "this class member name");
@@ -1148,6 +1178,21 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         if (m->declared)
             continue;
         if (m->kind == NK::FieldDef) {
+            if (m->computed) {
+                // The key is worked out here, once, in the order the class is written.
+                const String holder = computedKeyName(*m);
+                fn_->captured.insert(holder);
+                Binding& hb = declare(holder, BKind::Const);
+                hb.initialized = true;
+                const std::uint16_t at = fn_->top;
+                const std::uint16_t t = temp();
+                expr(*m->a, t);
+                emit(Op::ToKey, t, t);
+                emit(Op::Mov, hb.reg, t);
+                if (hb.boxed)
+                    emit(Op::NewBox, hb.reg);
+                fn_->top = at;
+            }
             (m->isStatic ? staticItems : instanceFields).push_back(m.get());
             continue;
         }
@@ -1321,6 +1366,15 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
                 else
                     emit(Op::LoadUndef, v);
                 emit(Op::DefPrivate, 0, sym, v);
+            } else if (item->computed) {
+                const std::uint16_t key = temp();
+                loadVar(computedKeyName(*item), key, *item);
+                const std::uint16_t v = temp();
+                if (item->b)
+                    expr(*item->b, v);
+                else
+                    emit(Op::LoadUndef, v);
+                emit(Op::InitElem, 0, key, v);
             } else {
                 const String key = item->a->text;
                 const std::uint16_t v = temp();

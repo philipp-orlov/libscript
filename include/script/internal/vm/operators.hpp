@@ -55,6 +55,17 @@ int instanceOf(VM& vm, JSValue a, JSValue b);
 int inOperator(VM& vm, JSValue a, JSValue b);
 /// The name of a value for an error message: `undefined`, `null`, `5`, `[object Object]`.
 std::string describe(VM& vm, JSValue v);
+/// BigInt arithmetic; both operands are BigInts. Owned results, or the exception sentinel.
+JSValue bigintBinary(VM& vm, Op op, JSValue a, JSValue b);
+/// 0 negation, 1 `~`, 2 `++`, 3 `--`.
+JSValue bigintUnary(VM& vm, int kind, JSValue a);
+JSValue bigintFromText(VM& vm, StringView text, bool* ok);
+JSValue bigintFromDouble(VM& vm, double d);
+JSValue bigintToString(VM& vm, JSValue v, int radix);
+JSValue bigintAsN(VM& vm, std::uint64_t bits, JSValue a, bool isSigned);
+double bigintToDouble(JSValue v);
+bool bigintIsZero(JSValue v) noexcept;
+int bigintCompareWith(VM& vm, JSValue a, JSValue other, bool* ok);
 
 }  // namespace vm
 }  // namespace internal

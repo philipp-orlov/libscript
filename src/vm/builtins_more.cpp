@@ -866,6 +866,82 @@ double clz32(double x)
     return v ? double(__builtin_clz(v)) : 32.0;
 }
 
+// ------------------------------------------------------------------- BigInt ---
+
+NATIVE(bigintCtor)
+{
+    UNUSED();
+    if (!vm.newTarget.isUndefined())
+        return typeError(vm, "BigInt is not a constructor");
+    JSValue prim = toPrimitive(vm, arg(args, argc, 0), false);
+    if (prim.isException())
+        return prim;
+    Handle keep = Handle::adopt(prim);
+    if (isBigInt(prim)) {
+        retain(prim);
+        return prim;
+    }
+    if (prim.isNumber()) {
+        const double d = prim.asNumber();
+        if (!std::isfinite(d) || d != std::trunc(d))
+            return vm.throwError(ErrorCode::RangeError, "The number " + toUtf8(StringView(script::internal::numberToString(d))) +
+                                                              " cannot be converted to a BigInt because it is not an integer");
+        return bigintFromDouble(vm, d);
+    }
+    if (prim.isBool())
+        return bigintFromDouble(vm, prim == JSValue::boolean(true) ? 1 : 0);
+    if (isString(prim)) {
+        bool ok;
+        JSValue r = bigintFromText(vm, asString(prim)->text(), &ok);
+        if (!ok) {
+            if (r.isException())
+                return r;
+            return vm.throwError(ErrorCode::SyntaxError, "Cannot convert " + toUtf8(asString(prim)->text()) + " to a BigInt");
+        }
+        return r;
+    }
+    return typeError(vm, "Cannot convert " + describe(vm, prim) + " to a BigInt");
+}
+
+NATIVE(bigintAsNFn)
+{
+    UNUSED();
+    const bool isSigned = data == nullptr;
+    bool ok;
+    const double bits = toIntegerOr(vm, arg(args, argc, 0), 0, &ok);
+    if (!ok)
+        return JSValue::exception();
+    if (bits < 0 || bits > 9007199254740991.0)
+        return vm.throwError(ErrorCode::RangeError, "Invalid value: not (convertible to) a safe integer");
+    const JSValue v = arg(args, argc, 1);
+    if (!isBigInt(v))
+        return typeError(vm, "Cannot convert " + describe(vm, v) + " to a BigInt");
+    return bigintAsN(vm, std::uint64_t(bits), v, isSigned);
+}
+
+NATIVE(bigintToStringFn)
+{
+    UNUSED();
+    if (!isBigInt(self))
+        return typeError(vm, "BigInt.prototype.toString requires that 'this' be a BigInt");
+    bool ok;
+    const double radix = toIntegerOr(vm, arg(args, argc, 0), 10, &ok);
+    if (!ok)
+        return JSValue::exception();
+    if (radix < 2 || radix > 36)
+        return vm.throwError(ErrorCode::RangeError, "toString() radix must be between 2 and 36");
+    return bigintToString(vm, self, int(radix));
+}
+
+NATIVE(bigintValueOfFn)
+{
+    UNUSED();
+    if (!isBigInt(self))
+        return typeError(vm, "BigInt.prototype.valueOf requires that 'this' be a BigInt");
+    retain(self);
+    return self;
+}
+
 }  // namespace
 
 void installMore(VM& vm)
@@ -991,6 +1067,20 @@ void installMore(VM& vm)
         detail::decRef(to);
     }
 
+    // BigInt.
+    {
+        JSObject* bp = vm.newObject(objectProto);
+        vm.setIntrinsic(&vm.protos.bigint, bp);
+        release(toJSValue(bp));
+        JSFunction* bigCtor = constructor(vm, "BigInt", bigintCtor, 1, bp);
+        bigCtor->flags &= ~JSFunction::kConstructor;
+        method(vm, bigCtor, "asIntN", bigintAsNFn, 2, nullptr);
+        method(vm, bigCtor, "asUintN", bigintAsNFn, 2, reinterpret_cast<void*>(1));
+        method(vm, bp, "toString", bigintToStringFn, 0);
+        method(vm, bp, "toLocaleString", bigintToStringFn, 0);
+        method(vm, bp, "valueOf", bigintValueOfFn, 0);
+        bp->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("BigInt")), attr::kConfigurable);
+    }
     // Math.
     Key mathKey = vm.internKey(std::string_view("Math"));
     JSObject* math = asObject(*vm.global->findOwn(vm, mathKey));

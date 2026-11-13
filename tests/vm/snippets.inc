@@ -396,3 +396,14 @@ S("class A { #a = 1; #b = this.#a + 1; get() { return this.#a + this.#b; } } new
 
 S("function mk(x) { class K { constructor() { this.v = x; } get() { return x + 1; } } return new K(); } var k = mk(5); k.v + ':' + k.get()")
 S("function mk(x) { return class extends Object { constructor() { super(); this.v = x; } }; } new (mk(3))().v")
+
+S("var a = 2n ** 100n; [a, a + 1n, a * a, a / 3n, a % 7n, -a, ~5n, 5n << 70n, a >> 90n, typeof a].join()")
+S("[1n < 2n, 2n > 1, 1n == 1, 1n === 1, '5' == 5n, 10n > 9.5, 0n ? 't' : 'f', BigInt(10) + BigInt('20'), BigInt.asUintN(8, 257n)].join()")
+S("var x = 5n; x++; x += 2n; [x, x.toString(2), (255n).toString(16), Number(2n ** 53n), String(7n), `${8n}`, 0x1fn, 1_000n].join()")
+S("var r; try { 1n + 1; } catch (e) { r = e.name; } r")
+S("var r; try { BigInt(1.5); } catch (e) { r = e.name; } r")
+S("var r; try { 1n / 0n; } catch (e) { r = e.name; } r")
+S("var m = new Map([[1n, 'a']]); m.get(1n) + [3n, 1n, 2n].sort().join()")
+S("(2n ** 64n - 1n === BigInt.asUintN(64, -1n)) + ':' + BigInt.asIntN(8, 255n)")
+S("var f = 1n; for (var i = 1n; i <= 25n; i++) f *= i; f.toString()")
+S("-(2n ** 63n) < 0 && 0n === -0n && (3n > 2n) && (2n >= 2n) && !(2n < 2n)")

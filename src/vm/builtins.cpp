@@ -1570,8 +1570,18 @@ NATIVE(numberCtor)
     UNUSED();
     if (!argc)
         return JSValue::int32(0);
+    JSValue prim = toPrimitive(vm, args[0], false);
+    if (prim.isException())
+        return prim;
+    if (isBigInt(prim)) {
+        const double big = bigintToDouble(prim);
+        release(prim);
+        return JSValue::boxNumber(big);
+    }
     double d;
-    if (!toNumber(vm, args[0], &d))
+    const bool ok = toNumber(vm, prim, &d);
+    release(prim);
+    if (!ok)
         return JSValue::exception();
     return JSValue::boxNumber(d);
 }

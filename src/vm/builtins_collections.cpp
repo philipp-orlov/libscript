@@ -8,6 +8,7 @@
 #include <functional>
 #include <unordered_map>
 
+#include "script/internal/dyn/object.hpp"
 #include "builtins_util.hpp"
 
 namespace script {
@@ -36,6 +37,13 @@ struct KeyHash
         }
         if (isString(v))
             return std::hash<StringView>()(asString(v)->text());
+        if (isBigInt(v)) {
+            const auto* big = static_cast<const dyn::BigIntCell*>(v.asCell());
+            std::size_t h = big->negative ? 0x51ed27u : 0x2545f491u;
+            for (std::uint32_t digit : big->digits)
+                h = h * 1099511628211ull + digit;
+            return h;
+        }
         return std::hash<std::uint64_t>()(v.bits);
     }
 };

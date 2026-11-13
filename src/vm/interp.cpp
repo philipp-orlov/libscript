@@ -806,14 +806,21 @@ L_Neg: {
         NEXT();
     }
     fr->pc = pc;
-    double d;
-    if (!toNumber(vm, a, &d))
+    JSValue n = toNumeric(vm, a);
+    if (n.isException())
         FAIL();
-    SET(ins->a, JSValue::boxNumber(-d));
+    if (isBigInt(n)) {
+        JSValue r = bigintUnary(vm, 0, n);
+        release(n);
+        if (r.isException())
+            FAIL();
+        SET(ins->a, r);
+        NEXT();
+    }
+    SET(ins->a, JSValue::boxNumber(-n.asNumber()));
     NEXT();
 }
-L_ToNumber:
-L_ToNumeric: {
+L_ToNumber: {
     const JSValue a = R[ins->b];
     if (a.isNumber()) {
         COPY(ins->a, a);
@@ -824,6 +831,19 @@ L_ToNumeric: {
     if (!toNumber(vm, a, &d))
         FAIL();
     SET(ins->a, JSValue::boxNumber(d));
+    NEXT();
+}
+L_ToNumeric: {
+    const JSValue a = R[ins->b];
+    if (a.isNumber()) {
+        COPY(ins->a, a);
+        NEXT();
+    }
+    fr->pc = pc;
+    JSValue n = toNumeric(vm, a);
+    if (n.isException())
+        FAIL();
+    SET(ins->a, n);
     NEXT();
 }
 L_ToString: {
@@ -844,10 +864,18 @@ L_BitNot: {
         NEXT();
     }
     fr->pc = pc;
-    double d;
-    if (!toNumber(vm, a, &d))
+    JSValue n = toNumeric(vm, a);
+    if (n.isException())
         FAIL();
-    SET(ins->a, JSValue::int32(~toInt32(d)));
+    if (isBigInt(n)) {
+        JSValue r = bigintUnary(vm, 1, n);
+        release(n);
+        if (r.isException())
+            FAIL();
+        SET(ins->a, r);
+        NEXT();
+    }
+    SET(ins->a, JSValue::int32(~toInt32(n.asNumber())));
     NEXT();
 }
 L_TypeOf: {
@@ -867,10 +895,18 @@ L_Dec: {
         }
     }
     fr->pc = pc;
-    double d;
-    if (!toNumber(vm, a, &d))
+    JSValue n = toNumeric(vm, a);
+    if (n.isException())
         FAIL();
-    SET(ins->a, JSValue::boxNumber(d + delta));
+    if (isBigInt(n)) {
+        JSValue r = bigintUnary(vm, delta > 0 ? 2 : 3, n);
+        release(n);
+        if (r.isException())
+            FAIL();
+        SET(ins->a, r);
+        NEXT();
+    }
+    SET(ins->a, JSValue::boxNumber(n.asNumber() + delta));
     NEXT();
 }
 
@@ -1825,6 +1861,18 @@ L_DefPrivSetter: {
     } else {
         initAccessor(vm, target, R[ins->b].asCell(), R[ins->c], which == Op::DefPrivGetter, attr::kConfigurable);
     }
+    NEXT();
+}
+L_ToKey: {
+    fr->pc = pc;
+    JSValue prim = toPrimitive(vm, R[ins->b], true);
+    if (prim.isException())
+        FAIL();
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        FAIL();
+    SET(ins->a, JSValue::cell(key));
     NEXT();
 }
 L_GetHome: {

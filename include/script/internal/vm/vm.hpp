@@ -166,6 +166,8 @@ struct VM : EngineRuntime
     JSValue* stackTop = nullptr;
     std::uint32_t depth = 0;
     /// The live frames, innermost last, in an array that never moves; `frameCapacity` is the call depth the context allows.
+    /// Back edges and calls left before the host is asked whether to stop.
+    std::uint32_t ticks = 4096;
     Frame* frameBase = nullptr;
     std::uint32_t frameCount = 0;
     std::uint32_t frameCapacity = 0;

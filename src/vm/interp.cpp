@@ -19,6 +19,8 @@ namespace vm {
 
 namespace {
 
+constexpr std::uint32_t kInterruptInterval = 4096;
+
 inline void setReg(JSValue& slot, JSValue value) noexcept
 {
     const JSValue old = slot;
@@ -259,6 +261,25 @@ JSValue run(VM& vm)
     do {                \
         ins = pc++;     \
         goto* kLabels[ins->op]; \
+    } while (0)
+/// A loop's back edge or a call counts towards asking the host whether to stop.
+#define TICK()                                                                           \
+    do {                                                                                 \
+        if (--vm.ticks == 0) [[unlikely]] {                                              \
+            vm.ticks = kInterruptInterval;                                               \
+            fr->pc = pc;                                                                 \
+            if (vm.ctx.interruptAsked()) {                                               \
+                vm.throwError(ErrorCode::Interrupted, "execution was interrupted");      \
+                FAIL();                                                                  \
+            }                                                                            \
+        }                                                                                \
+    } while (0)
+#define TAKE16()                  \
+    do {                          \
+        const int o_ = ins->jump16(); \
+        pc += o_;                 \
+        if (o_ < 0)               \
+            TICK();               \
     } while (0)
 #define SET(r, v) setReg(R[r], v)
 #define COPY(r, v) copyReg(R[r], v)
@@ -694,12 +715,20 @@ L_Dec: {
 }
 
 // ---- jumps ----
-L_Jmp:
-    pc += ins->jump();
+L_Jmp: {
+    const std::int32_t offset = ins->jump();
+    pc += offset;
+    if (offset < 0)
+        TICK();
     NEXT();
+}
 L_JTrue:
-    if (toBoolean(R[ins->a]))
-        pc += ins->jump();
+    if (toBoolean(R[ins->a])) {
+        const std::int32_t offset = ins->jump();
+        pc += offset;
+        if (offset < 0)
+            TICK();
+    }
     NEXT();
 L_JFalse: {
     const JSValue v = R[ins->a];
@@ -758,7 +787,7 @@ L_JGe: {
         holds = r != 0;
     }
     if (holds)
-        pc += ins->jump16();
+        TAKE16();
     NEXT();
 }
 L_JNotLt:
@@ -799,7 +828,7 @@ L_JStrictNe:
 L_JStrictEq: {
     const bool eq = strictEquals(R[ins->a], R[ins->b]);
     if (eq == (ins->opcode() == Op::JStrictEq))
-        pc += ins->jump16();
+        TAKE16();
     NEXT();
 }
 L_Cache:
@@ -1161,6 +1190,7 @@ L_New: {
         SET(ins->a, res);
         NEXT();
     }
+    TICK();
     CodeBlock* c = f->code;
     JSValue* newR = R + base + 1;
     if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd) [[unlikely]] {
@@ -1324,6 +1354,8 @@ throw_: {
 }
 #undef LOAD_FRAME
 #undef NEXT
+#undef TICK
+#undef TAKE16
 #undef SET
 #undef COPY
 #undef FAIL

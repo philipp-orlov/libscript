@@ -1750,7 +1750,8 @@ void Compiler::forStatement(const Node& n)
             varDecl(*n.a);
         else {
             const std::uint16_t mark = fn_->top;
-            expr(*n.a, -1);
+            // The parser keeps an expression here as a statement.
+            expr(n.a->kind == NK::ExprStatement ? *n.a->a : *n.a, -1);
             fn_->top = mark;
         }
     }

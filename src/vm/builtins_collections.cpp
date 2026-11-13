@@ -392,6 +392,66 @@ NATIVE(tableIterator)
     return newNativeIterator(vm, new TableIter(self, int(packed >> 2)));
 }
 
+// ---------------------------------------------------------- WeakRef and friends ---
+
+struct RefState : NativeState
+{
+    JSValue target = JSValue::undefined();
+    ~RefState() override { release(target); }
+    void clear(VM&) noexcept override
+    {
+        release(target);
+        target = JSValue::undefined();
+    }
+    void values(std::vector<JSValue>& out) const override { out.push_back(target); }
+};
+
+NATIVE(weakRefCtor)
+{
+    UNUSED();
+    if (vm.newTarget.isUndefined() || !isObject(self))
+        return typeError(vm, "Constructor WeakRef requires 'new'");
+    const JSValue t = arg(args, argc, 0);
+    if (!isObject(t) && !isSymbol(t))
+        return typeError(vm, "WeakRef: invalid target");
+    auto* state = new RefState();
+    retain(t);
+    state->target = t;
+    delete asObject(self)->rareOf(vm).ext;
+    asObject(self)->rareOf(vm).ext = state;
+    retain(self);
+    return self;
+}
+
+NATIVE(weakRefDeref)
+{
+    UNUSED();
+    if (isObject(self))
+        if (Rare* r = asObject(self)->rare())
+            if (auto* state = dynamic_cast<RefState*>(r->ext)) {
+                retain(state->target);
+                return state->target;
+            }
+    return typeError(vm, "WeakRef.prototype.deref called on incompatible receiver");
+}
+
+NATIVE(registryCtor)
+{
+    UNUSED();
+    if (vm.newTarget.isUndefined() || !isObject(self))
+        return typeError(vm, "Constructor FinalizationRegistry requires 'new'");
+    if (!isFunction(arg(args, argc, 0)))
+        return typeError(vm, "FinalizationRegistry: cleanup must be callable");
+    retain(self);
+    return self;
+}
+
+NATIVE(registryNoop)
+{
+    UNUSED();
+    return data ? JSValue::boolean(false) : JSValue::undefined();
+}
+
 }  // namespace
 
 void installCollections(VM& vm)
@@ -415,6 +475,20 @@ void installCollections(VM& vm)
         method(vm, proto, "has", tableHas, 1, data);
         method(vm, proto, "delete", tableDelete, 1, data);
         proto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view(k.name)), attr::kConfigurable);
+        if (k.weak && i == 3) {
+            // The last of the weak ones: the references that go with them.
+            JSObject* refProto = vm.newObject(vm.protos.object);
+            constructor(vm, "WeakRef", weakRefCtor, 1, refProto);
+            method(vm, refProto, "deref", weakRefDeref, 0);
+            refProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("WeakRef")), attr::kConfigurable);
+            release(toJSValue(refProto));
+            JSObject* regProto = vm.newObject(vm.protos.object);
+            constructor(vm, "FinalizationRegistry", registryCtor, 1, regProto);
+            method(vm, regProto, "register", registryNoop, 2);
+            method(vm, regProto, "unregister", registryNoop, 1, reinterpret_cast<void*>(1));
+            regProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("FinalizationRegistry")), attr::kConfigurable);
+            release(toJSValue(regProto));
+        }
         if (k.weak)
             continue;
         method(vm, proto, "clear", tableClear, 0, data);

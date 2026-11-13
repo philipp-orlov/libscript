@@ -972,9 +972,19 @@ NATIVE(arrayJoin)
 NATIVE(arrayToString)
 {
     UNUSED();
-    if (!isArray(self))
-        return objectToString(vm, self, args, argc, data);
-    return arrayJoin(vm, self, nullptr, 0, data);
+    if (isArray(self))
+        return arrayJoin(vm, self, nullptr, 0, data);
+    if (isObject(self)) {
+        Key joinKey = vm.internKey(std::string_view("join"));
+        JSValue join = getProperty(vm, self, joinKey);
+        detail::decRef(joinKey);
+        if (join.isException())
+            return join;
+        Handle keep = Handle::adopt(join);
+        if (isFunction(join))
+            return vm.call(join, self, nullptr, 0);
+    }
+    return objectToString(vm, self, args, argc, data);
 }
 
 NATIVE(arraySlice)
@@ -2404,7 +2414,10 @@ double mathRound(double d)
 {
     if (!std::isfinite(d) || d == 0)
         return d;
-    return std::floor(d + 0.5) == 0 && d < 0 ? -0.0 : std::floor(d + 0.5);
+    // Not `floor(d + 0.5)`, which is wrong for the largest value under a half.
+    const double f = std::floor(d);
+    const double r = d - f >= 0.5 ? f + 1 : f;
+    return r == 0 && d < 0 ? -0.0 : r;
 }
 double mathSign(double d)
 {

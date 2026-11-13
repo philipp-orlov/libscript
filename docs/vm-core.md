@@ -27,7 +27,7 @@ Python are refused on it (`NotSupported`); they run on the old core.
 | `operators.hpp`, `convert.hpp`, `host.hpp` | the language's operators; `Value` conversion; what the public `Value` API does with a new-core object |
 | `src/vm/compiler.cpp` | AST to bytecode |
 | `src/vm/interp.cpp` | the interpreter: computed-goto dispatch, calls without C++ recursion, inline caches |
-| `src/vm/builtins.cpp` | the built-in objects so far |
+| `src/vm/builtins.cpp`, `builtins_*.cpp` | the built-in objects: Object/Function/Array/String/Number/Math/Error/JSON (`builtins.cpp`), Symbol, iterators and generator prototypes (`_symbol`), the rest of Object, Reflect, Array/String/Number/Math and BigInt (`_more`), Map/Set/Weak\* (`_collections`), RegExp (`_regexp`), Promise and async functions and generators (`_promise`), Date (`_date`), ArrayBuffer, typed arrays and DataView (`_typed`), Proxy (`_proxy`) |
 | `tests/vm`, `tests/vm/snippets.inc` | unit tests; programs both cores must agree on |
 | `tools/vm_fuzz.py`, `bench/micro` | differential fuzzer; micro-benchmarks that also run under JSC and node |
 
@@ -42,11 +42,25 @@ Python are refused on it (`NotSupported`); they run on the old core.
 - Property instructions carry their inline cache in the word after them: own property, prototype property (with a validity
   cell that any change to the chain clears), add-a-property (shape before and after), global.
 
+## What runs
+
+Everything the language test suite (`javascript.language`) asks of the vm core is there except what is listed below:
+classes (fields, private names, static blocks, accessors, `super`), generators, async functions and generators, `for await`,
+destructuring, spread and rest, tagged templates, regular expressions, BigInt, Symbol, Map/Set/WeakMap/WeakSet/WeakRef,
+Promise (the host drains the queue with `Context::runJobs`), Proxy and Reflect, typed arrays and DataView, Date, JSON, and
+`eval`/`new Function` when the host allows run-time code (always in the global scope).
+
+Generators keep their registers in a copy and resume through a nested `run`; an async function is a generator that a promise
+drives; a generator's `return(v)` throws a marker that `finally` blocks see and `catch` blocks do not.
+
 ## Known limits
 
-Not compiled: generators, async functions, tagged templates, regular expressions, BigInt, `with`, private names and
-computed instance-field names in classes, `super` and `new.target` inside arrows. Missing built-ins: Symbol, Map, Set,
-WeakMap, Promise, Date (only `Date.now`), typed arrays, Proxy, Reflect, `eval`. In a derived constructor `this` exists
-before `super()` runs (it is made from `new.target.prototype`), so reading it early gives the object, not a
-ReferenceError. Cycles of new-family cells are freed only
-when the context ends. Shapes, and the prototypes they hold, are never freed.
+- Not compiled: `with`, `super()` and `new.target` inside arrows, `super[...]` reads.
+- Direct `eval` sees only the global scope; so does `new Function`.
+- In a derived constructor `this` exists before `super()` runs (it is made from `new.target.prototype`), so reading it
+  early gives the object, not a ReferenceError.
+- A generator's parameters are evaluated when it first runs, not when it is called.
+- Buffers do not resize or detach; there is no `Float16Array` or `SharedArrayBuffer`; the weak collections and `WeakRef`
+  hold their targets (the context's end frees them).
+- The `Array.prototype` methods that read work on array-likes (by copying); those that write need an array.
+- Cycles of new-family cells are freed only when the context ends. Shapes, and the prototypes they hold, are never freed.

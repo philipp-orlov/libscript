@@ -13,8 +13,11 @@ SCRIPT_CORE=vm SCRIPT_VM_DUMP=1 build/vm-dev/tools/libscript program.js   # prin
 ```
 
 `SCRIPT_JS_CORE` is `dyn` (default), `vm` or `both`. `vm` builds the new core but keeps the old one as the default context
-until milestone M0. In code, `Context::Options::core = Context::Options::Core::Vm` picks it per context. TypeScript and
-Python are refused on it (`NotSupported`); they run on the old core.
+until the switch-over (`SCRIPT_VM_DEFAULT`, off). In code, `Context::Options::core = Context::Options::Core::Vm` picks it per
+context; builds with `SCRIPT_JIT_ENV_OVERRIDE` also read `SCRIPT_CORE=dyn|vm`. `-DSCRIPT_VM_LANGS="javascript;typescript;python"`
+(a cache variable: reconfigure to change it) says which languages the new core runs: TypeScript goes through the shared
+parser, checker and type eraser and then the vm compiler (`src/vm/language.cpp`); Python runs the shared prelude on the vm
+core's natives (`src/vm/python.cpp`). `Context::core()` says which core a context has.
 
 ## Layout
 
@@ -28,7 +31,9 @@ Python are refused on it (`NotSupported`); they run on the old core.
 | `src/vm/compiler.cpp` | AST to bytecode |
 | `src/vm/interp.cpp` | the interpreter: computed-goto dispatch, calls without C++ recursion, inline caches |
 | `src/vm/jit/`, `include/script/internal/vm/jit.hpp` | the baseline compiler (x86-64, Linux): `asm_x64.hpp` (macro assembler), `code_region.cpp` (dual-mapped code memory), `baseline_x64.cpp` (templates, calls, entry stubs) |
-| `src/vm/builtins.cpp`, `builtins_*.cpp` | the built-in objects: Object/Function/Array/String/Number/Math/Error/JSON (`builtins.cpp`), Symbol, iterators and generator prototypes (`_symbol`), the rest of Object, Reflect, Array/String/Number/Math and BigInt (`_more`), Map/Set/Weak\* (`_collections`), RegExp (`_regexp`), Promise and async functions and generators (`_promise`), Date (`_date`), ArrayBuffer, typed arrays and DataView (`_typed`), Proxy (`_proxy`) |
+| `src/vm/builtins.cpp`, `builtins_*.cpp` | the built-in objects: Object/Function/Array/String/Number/Math/Error/JSON (`builtins.cpp`), Symbol, iterator families and generator prototypes (`_symbol`), the rest of Object, Reflect, Array/String/Number/Math and BigInt (`_more`), the Array methods that call back (`_array`), Map/Set/Weak\*/WeakRef/FinalizationRegistry (`_collections`), RegExp (`_regexp`: the spec's `exec`/species paths, a fast path for an untouched RegExp, the legacy `RegExp.$1` statics, `RegExp.escape`), Promise with capabilities and the combinators, async functions and generators (`_promise`), Date (`_date`), ArrayBuffer (resizable, shared), typed arrays and DataView (`_typed`, `_typedarray`), Atomics, iterator helpers, Proxy (`_proxy`: callable proxies) |
+| `src/vm/objmodel.cpp` | the internal methods of an object -- [[GetOwnProperty]], [[DefineOwnProperty]], [[Set]], [[GetPrototypeOf]], [[OwnPropertyKeys]] and the rest -- for ordinary objects and proxies, with every invariant check a proxy's traps are held to; `Object` and `Reflect` are built on them |
+| `src/vm/python.cpp`, `src/vm/language.cpp` | Python and TypeScript on the new core |
 | `tests/vm`, `tests/vm/snippets.inc` | unit tests; programs both cores must agree on |
 | `tools/vm_fuzz.py`, `bench/micro` | differential fuzzer; micro-benchmarks that also run under JSC and node |
 
@@ -65,6 +70,13 @@ includes what it calls), and an exception handler is entered by looking its labe
   its high bit set, which is how `detail::destroyUnreferenced` and the public API tell the families apart. Every register of
   a live frame owns its value.
 - A cell is at most 8 KiB (larger storage is out of line), so `LocalHeap::ownerOf` finds the VM from any cell.
+- Cycles are found by a collector that runs when the context's heap budget is passed, and also when the cells alive pass
+  a budget of their own (`VM::cellBudget_`: 8192 to begin with, then a little more than what survived), because the heap
+  budget does not see the buffers of arrays and strings. A minor collection looks at the young cells; a whole one runs when
+  the cells have doubled since the last. The collector's own vectors come from the payload pool, so a steady-state workload
+  makes no call to the general allocator (`core.steady_state`).
+- A proxy is an object in dictionary mode whose class is `Proxy` (or a function, for a callable target): no inline cache
+  can match it, so every read and write of one reaches its traps. The caches also refuse a prototype chain with a proxy in it.
 - Cells are below 2^47. On a machine whose allocator may return higher addresses this aborts with a message; the address
   hint (LC-1) is still to do.
 - Property instructions carry their inline cache in the word after them: own property, prototype property (with a validity
@@ -72,26 +84,46 @@ includes what it calls), and an exception handler is entered by looking its labe
 
 ## What runs
 
-Everything the language test suite (`javascript.language`) asks of the vm core is there except what is listed below:
-classes (fields, private names, static blocks, accessors, `super`), generators, async functions and generators, `for await`,
-destructuring, spread and rest, tagged templates, regular expressions, BigInt, Symbol, Map/Set/WeakMap/WeakSet/WeakRef,
-Promise (the host drains the queue with `Context::runJobs`), Proxy and Reflect, typed arrays and DataView, Date, JSON, and
-`eval`/`new Function` when the host allows run-time code (always in the global scope).
+Everything the JavaScript, TypeScript and Python suites ask of it (`ctest` with `SCRIPT_CORE=vm`: all 53 pass): classes
+(fields, private names, static blocks, accessors, `super`), generators, async functions and generators (including `yield*` in
+both), `for await`, destructuring, spread and rest, tagged templates, regular expressions (named groups, lookbehind, `d`, `v`),
+BigInt, Symbol, Map/Set/WeakMap/WeakSet/WeakRef/FinalizationRegistry, Promise (the host drains the queue with
+`Context::runJobs`), Proxy and Reflect, typed arrays (resizable buffers, `Float16Array`), DataView, Atomics, SharedArrayBuffer,
+Date, JSON, iterator helpers, `eval` and `new Function` when the host allows run-time code, Annex B (function-in-block
+hoisting, `__proto__`, `__defineGetter__` and kin, the legacy RegExp statics).
+
+Direct `eval`: a sloppy function that has one gets a hidden object (`%evalenv#N`, made at entry, held in a box so closures
+and nested `eval` reach it); the `var`s and functions its `eval` code declares go there, and a name that nothing declares is
+looked up on those objects (innermost first) before the global object. Global code's `eval` declares on the global object
+with configurable properties; global code's own `var`s and functions are not configurable. A name that is declared somewhere
+(a local, an outer function's variable) is always that variable: an `eval` `var` that shadows an outer function's variable
+from inside a nested function is not seen by name lookups that were resolved statically.
+
+The host API (`Value`, `Context`, `Object`, `call`, `construct`, wrappers, `declare`, the cycle collector, `Interrupted`,
+`StackOverflow`, memory limits) works on it; `javascript.*`, `typescript.*`, `python.*`, `core.*` and `vm.*` pass.
 
 Generators keep their registers in a copy and resume through a nested `run`; an async function is a generator that a promise
 drives; a generator's `return(v)` throws a marker that `finally` blocks see and `catch` blocks do not.
 
+## test262
+
+`tools/run_test262.py` with `SCRIPT_CORE=vm`: 38,456 of 48,795 pass on x86-64 (the old core: 36,984), after the work above
+more. What fails on both cores is mostly `$262.createRealm` and `$262.agent` (cross-realm and threads), Intl-adjacent
+Unicode property tables and a few features the shared front end does not parse. What the old core passes and this one does
+not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
+
 ## Known limits
 
-- The compiler is the baseline tier only: no type specialisation, register allocation or inlining (P5 and later); aarch64
-  has no compiler yet and interprets.
-
-- Not compiled: `with`, `super()` and `new.target` inside arrows, `super[...]` reads.
-- Direct `eval` sees only the global scope; so does `new Function`.
-- In a derived constructor `this` exists before `super()` runs (it is made from `new.target.prototype`), so reading it
-  early gives the object, not a ReferenceError.
-- A generator's parameters are evaluated when it first runs, not when it is called.
-- Buffers do not resize or detach; there is no `Float16Array` or `SharedArrayBuffer`; the weak collections and `WeakRef`
-  hold their targets (the context's end frees them).
-- The `Array.prototype` methods that read work on array-likes (by copying); those that write need an array.
-- Cycles of new-family cells are freed only when the context ends. Shapes, and the prototypes they hold, are never freed.
+- Tier 1 (the baseline compiler) is the default; tier 2 (the first optimizing form) is off unless `SCRIPT_VM_TIER2=<calls>` (a threshold; 0 is off) is set in a
+  build with `SCRIPT_JIT_ENV_OVERRIDE`. aarch64 has no compiler yet and interprets (no aarch64 hardware was available).
+- Not compiled by tier 1: generators and async functions (they stay in the interpreter), functions of more than 20,000
+  instructions.
+- Arrays are dense: a length past what a gap of `JSArray::kMaxDenseGap` allows (`a.length = 2**32 - 1`) ends in
+  `OutOfMemory` where the language would give a sparse array.
+- Weak collections, `WeakRef` and `FinalizationRegistry` hold their targets for as long as the program can name the
+  collection; the registry's callback never runs.
+- A parameter list with a default has no separate environment for the body's `var`s (a closure in a default sees a body
+  `var` of the same name).
+- Direct `eval` `var`s do not reach a name that was resolved to an outer function's variable (see above); `eval` code does not
+  check its `var`s against the lexical bindings between it and the variable scope.
+- `$262.createRealm` and `$262.agent` do not exist: the vm core has one realm per context.

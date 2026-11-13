@@ -19,6 +19,7 @@
 #include "script/internal/dyn/vm.hpp"
 #include "script/internal/language.hpp"
 #include "script/internal/python/parser.hpp"
+#include "script/internal/python/prelude.hpp"
 
 namespace script {
 namespace internal {
@@ -1230,7 +1231,7 @@ void installPrelude(Runtime& rt)
     if (!global->findOwn(rt.intern("globalThis")))
         rt.constant(global, "globalThis", detail::Access::make(Type::Object, global));
 
-    Parser parser(kPrelude, "<python>", /*typescript=*/false);
+    Parser parser(python::prelude(), "<python>", /*typescript=*/false);
     NodePtr program = parser.parseProgram();
     runProgram(rt, compileProgram(rt, *program, "<python>"));
 }
@@ -1270,5 +1271,11 @@ const LanguageInfo& pythonLanguage() noexcept
 }
 
 }  // namespace dyn
+
+namespace python {
+
+const char* prelude() noexcept { return dyn::kPrelude; }
+
+}  // namespace python
 }  // namespace internal
 }  // namespace script

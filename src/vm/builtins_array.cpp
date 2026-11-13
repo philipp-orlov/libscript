@@ -5,6 +5,7 @@
 // language asks, so what a callback or a getter changes along the way is seen. Dense arrays are read directly.
 #include <algorithm>
 
+#include "script/internal/stack_guard.hpp"
 #include "builtins_util.hpp"
 
 namespace script {
@@ -451,6 +452,10 @@ NATIVE(arrayToSortedGeneric)
 /// FlattenIntoArray; false with an exception pending.
 bool flatten(VM& vm, JSValue target, JSValue source, double sourceLen, double* targetIndex, double depth, JSValue mapper, JSValue thisArg)
 {
+    if (nativeStackLow()) {
+        vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
+        return false;
+    }
     for (double i = 0; i < sourceLen; ++i) {
         Handle element;
         const int found = readIndex(vm, source, i, &element, true);

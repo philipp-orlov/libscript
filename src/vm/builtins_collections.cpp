@@ -471,6 +471,36 @@ NATIVE(registryNoop)
 
 }  // namespace
 
+double collectionSize(JSValue v, ObjClass cls)
+{
+    if (isObject(v) && asObject(v)->cls() == cls)
+        if (Rare* r = asObject(v)->rare(); r && r->ext)
+            return double(static_cast<TableState*>(r->ext)->size());
+    return -1;
+}
+
+int mapLookup(JSValue map, JSValue key, JSValue* out)
+{
+    if (isObject(map) && asObject(map)->cls() == ObjClass::Map)
+        if (Rare* r = asObject(map)->rare(); r && r->ext)
+            if (Entry_* e = static_cast<TableState*>(r->ext)->find(key)) {
+                retain(e->value);
+                *out = e->value;
+                return 1;
+            }
+    return 0;
+}
+
+bool mapStore(JSValue map, JSValue key, JSValue value)
+{
+    if (isObject(map) && asObject(map)->cls() == ObjClass::Map)
+        if (Rare* r = asObject(map)->rare(); r && r->ext) {
+            static_cast<TableState*>(r->ext)->set(key, value);
+            return true;
+        }
+    return false;
+}
+
 void installCollections(VM& vm)
 {
     JSObject* objectProto = vm.protos.object;

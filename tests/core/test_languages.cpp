@@ -156,9 +156,9 @@ TEST(coreOptionPicksTheEngine)
     if (SCRIPT_VM && SCRIPT_VM_LANG_JAVASCRIPT) {
         script::Context onVm(vm);
         CHECK_EQ(onVm.eval("6 * 7").toInt(), 42);
-        // A language the new core does not run yet is refused, not run on the other core.
-        if (SCRIPT_LANG_TYPESCRIPT)
-            CHECK_THROWS(onVm.eval("let x: number = 1; x", "a.ts"), script::ErrorCode::NotSupported);
+        // The dynamic languages run on it too, each through the front end it shares with the other core.
+        if (SCRIPT_LANG_TYPESCRIPT && SCRIPT_VM_LANG_TYPESCRIPT)
+            CHECK_EQ(onVm.eval("let x: number = 1; x + 1", "a.ts").toInt(), 2);
     } else {
         // A build without the new core refuses to give a context to it.
         script::Context onVm(vm);

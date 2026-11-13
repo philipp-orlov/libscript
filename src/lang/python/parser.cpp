@@ -1058,6 +1058,23 @@ void Parser::classDef(std::vector<NodePtr>& out)
                 std::vector<NodePtr>& body = m->b->d->list;
                 body.insert(body.begin(), exprStatement(std::move(superCall)));
             }
+            // `self` is `this`, which a derived constructor has only once `super()` has run: its binding goes after the
+            // first statement that makes the call.
+            std::vector<NodePtr>& body = m->b->d->list;
+            std::size_t selfAt = body.size(), superAt = body.size();
+            for (std::size_t i = 0; i < body.size(); ++i) {
+                const Node& st = *body[i];
+                if (selfAt == body.size() && st.kind == NK::VarDecl && st.list.size() == 1 && st.list[0]->b &&
+                    st.list[0]->b->kind == NK::ThisExpr)
+                    selfAt = i;
+                if (superAt == body.size() && containsSuperCall(st))
+                    superAt = i;
+            }
+            if (selfAt < superAt && superAt < body.size()) {
+                NodePtr self = std::move(body[selfAt]);
+                body.erase(body.begin() + std::ptrdiff_t(selfAt));
+                body.insert(body.begin() + std::ptrdiff_t(superAt), std::move(self));
+            }
         }
     }
 

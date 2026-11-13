@@ -7,6 +7,7 @@
 //
 // Not compiled yet, and refused with `NotSupported`: async generators and `for await`, BigInt literals, `with`, `super()`
 // and `new.target` inside arrows, and computed names of `super[...]` reads.
+#include "script/internal/stack_guard.hpp"
 #include "script/internal/vm/compiler.hpp"
 #include "script/internal/vm/operators.hpp"
 
@@ -966,6 +967,7 @@ void Compiler::exprVia(const Node& n, int dst, std::uint16_t result)
 
 std::uint16_t Compiler::expr(const Node& n, int dst)
 {
+    checkNativeStack();
     const bool discard = discard_;
     discard_ = false;
     const std::uint32_t savedLine = line_;
@@ -2379,6 +2381,10 @@ std::uint16_t Compiler::member(const Node& n, int dst)
     }
     fn_->top = mark;
     const std::uint16_t d = dest(dst);
+    if (n.bindMethod) {
+        emit(Op::GetPropBound, d, o, atom(constantKey ? n.b->text : n.text));
+        return d;
+    }
     emitCached(Op::GetProp, d, o, atom(constantKey ? n.b->text : n.text));
     return d;
 }
@@ -2730,6 +2736,7 @@ void Compiler::blockScoped(const std::vector<dyn::NodePtr>& list, bool newScope)
 
 void Compiler::statement(const Node& n)
 {
+    checkNativeStack();
     if (n.line)
         line_ = n.line;
     const std::uint16_t mark = fn_->top;

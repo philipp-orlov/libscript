@@ -501,7 +501,7 @@ void raisePending(VM& vm)
     }
     // An error keeps its class across the boundary: the code is the one whose prototype it inherits from.
     ErrorCode code = ErrorCode::Exception;
-    if (raised == ErrorCode::StackOverflow) {
+    if (raised == ErrorCode::StackOverflow || raised == ErrorCode::Interrupted) {
         code = raised;
     } else if (isObject(thrown)) {
         for (JSObject* p = asObject(thrown)->proto(vm); p && code == ErrorCode::Exception; p = p->proto(vm)) {
@@ -514,8 +514,24 @@ void raisePending(VM& vm)
             }
         }
     }
+    // The frames an error captured when it was made, without the heading line.
+    std::string frames;
+    if (isObject(thrown)) {
+        JSValue stack = getProperty(vm, thrown, vm.internKey(std::string_view("stack")));
+        if (!stack.isException()) {
+            if (isString(stack)) {
+                const std::string whole = toUtf8(asString(stack)->text());
+                const std::size_t at = whole.find("\n    at ");
+                if (at != std::string::npos)
+                    frames = whole.substr(at + 1);
+            }
+            release(stack);
+        } else {
+            vm.clearException();
+        }
+    }
     Value value = toValue(vm, thrown);
-    throw Exception(code, message, value, std::string());
+    throw Exception(code, message, value, frames);
 }
 
 

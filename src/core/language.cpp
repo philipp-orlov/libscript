@@ -81,6 +81,11 @@ namespace vm {
 const LanguageInfo& typescriptLanguage() noexcept;
 }
 #endif
+#if SCRIPT_VM && SCRIPT_VM_LANG_PYTHON
+namespace vm {
+const LanguageInfo& pythonLanguage() noexcept;
+}
+#endif
 
 const LanguageInfo* languageInfoFor(const ContextImpl& rt, Language id) noexcept
 {
@@ -92,6 +97,10 @@ const LanguageInfo* languageInfoFor(const ContextImpl& rt, Language id) noexcept
 #if SCRIPT_VM && SCRIPT_VM_LANG_TYPESCRIPT
         if (id == Language::TypeScript)
             return &vm::typescriptLanguage();
+#endif
+#if SCRIPT_VM && SCRIPT_VM_LANG_PYTHON
+        if (id == Language::Python)
+            return &vm::pythonLanguage();
 #endif
         // Asked for the new core, and this language is not on it: a refusal, never a silent run on the other core.
         return languageInfo(id) && languageInfo(id)->engine == EngineKind::Dynamic ? nullptr : languageInfo(id);

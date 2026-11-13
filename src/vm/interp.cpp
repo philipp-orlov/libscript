@@ -1395,6 +1395,45 @@ L_PutProp: {
     ++pc;
     NEXT();
 }
+L_GetPropBound: {
+    // Python's attribute read: a method read as a value is bound to its receiver by the prelude's `__py.bindRead`.
+    fr->pc = pc;
+    const JSValue base = R[ins->b];
+    Key key = static_cast<Key>(code->atoms[ins->c]);
+    JSValue read = getProperty(vm, base, key);
+    if (read.isException())
+        FAIL();
+    if (isFunction(read) || read.isUndefined()) {
+        Key pyKey = vm.internKey(std::string_view("__py"));
+        JSValue py = getProperty(vm, toJSValue(vm.global), pyKey);
+        detail::decRef(pyKey);
+        if (py.isException()) {
+            release(read);
+            FAIL();
+        }
+        Handle pyKeep = Handle::adopt(py);
+        if (isObject(py)) {
+            Key hookKey = vm.internKey(std::string_view("bindRead"));
+            JSValue hook = getProperty(vm, py, hookKey);
+            detail::decRef(hookKey);
+            if (hook.isException()) {
+                release(read);
+                FAIL();
+            }
+            Handle hookKeep = Handle::adopt(hook);
+            if (isFunction(hook)) {
+                const JSValue callArgs[3] = {base, JSValue::cell(key), read};
+                JSValue bound = vm.call(hook, JSValue::undefined(), callArgs, 3);
+                release(read);
+                if (bound.isException())
+                    FAIL();
+                read = bound;
+            }
+        }
+    }
+    SET(ins->a, read);
+    NEXT();
+}
 L_GetElem: {
     const JSValue base = R[ins->b];
     JSValue k = R[ins->c];
@@ -3139,6 +3178,13 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
 {
     if (!isFunction(callee))
         return notCallable(*this, callee);
+    if (nativeStackLow() && !overflowing) {
+        // Making the error calls code of its own, which must be let through on what stack is left.
+        overflowing = true;
+        JSValue e = throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
+        overflowing = false;
+        return e;
+    }
     auto* f = static_cast<JSFunction*>(asObject(callee));
     if (f->flags & JSFunction::kNative) {
         Rare* r = f->rare();

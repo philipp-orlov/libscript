@@ -313,6 +313,7 @@ struct VM : EngineRuntime
     JSValue regexpCtor = JSValue::undefined();
     JSValue regexpExec = JSValue::undefined();
     JSValue promiseCtor = JSValue::undefined();  ///< the Promise constructor as made
+    bool overflowing = false;                    ///< raising a stack overflow right now
     std::string ambient;                         ///< TypeScript declarations the embedder added with `Context::declare`
     JSValue typedCtors[16] = {};                 ///< the typed array constructors as made, by ElemKind
     struct RegExpSlot

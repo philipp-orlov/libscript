@@ -148,6 +148,12 @@ JSValue definePropertyFromDescriptor(VM& vm, JSObject* o, Key key, JSObject* des
 void installMore(VM& vm);
 /// Map, Set, WeakMap, WeakSet.
 void installCollections(VM& vm);
+/// A Map or a Set as the embedding sees it: its size, or -1 when `v` is not one of that class.
+double collectionSize(JSValue v, ObjClass cls);
+/// `map.get(key)`: 1 with `*out` owned, 0 when the key is absent.
+int mapLookup(JSValue map, JSValue key, JSValue* out);
+/// `map.set(key, value)` for a Map; the caller keeps its counts.
+bool mapStore(JSValue map, JSValue key, JSValue value);
 /// A new RegExp object (a literal's, or `new RegExp`): owned, or the exception sentinel with a SyntaxError.
 JSValue newRegExp(VM& vm, StringView pattern, StringView flags);
 void installRegExp(VM& vm);

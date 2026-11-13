@@ -47,8 +47,9 @@ JSValue fromValue(VM&, const Value& v)
 
 Value toValue(VM&, JSValue v)
 {
+    // A script's numbers are doubles to the host, as they are on the other core.
     if (v.isInt32())
-        return Value(v.asInt32());
+        return Value(double(v.asInt32()));
     if (v.isDouble())
         return Value(v.asDouble());
     if (v.isCell())

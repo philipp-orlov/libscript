@@ -12,6 +12,7 @@
 #include <limits>
 
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/stack_guard.hpp"
 #include "script/internal/dyn/unicode.hpp"
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/convert.hpp"
@@ -2288,6 +2289,10 @@ void jsonQuote(String& out, StringView s)
 int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
 {
     VM& vm = j.vm;
+    if (nativeStackLow()) {
+        vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
+        return 0;
+    }
     Handle value = Handle::retained(input);
     if (isObject(value.get()) || isBigInt(value.get())) {
         JSValue fn = getProperty(vm, value.get(), j.toJson);
@@ -2361,6 +2366,10 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
             typeError(vm, "Converting circular structure to JSON");
             return 0;
         }
+    if (j.stack.size() >= 1000) {
+        vm.throwError(ErrorCode::RangeError, "JSON.stringify: the data is nested too deeply");
+        return 0;
+    }
     j.stack.push_back(o);
     const String stepback = j.indent;
     j.indent += j.gap;

@@ -128,7 +128,11 @@ std::string VM::captureStack() const
 {
     std::string out;
     int shown = 0;
-    for (std::size_t i = frameCount; i-- > 0 && shown < 16; ++shown) {
+    std::size_t top = frameCount;
+    // The constructors of the error classes being built are not where the error was made.
+    while (top > 1 && (frameBase[top - 1].code->flags & CodeBlock::kClassConstructor))
+        --top;
+    for (std::size_t i = top; i-- > 0 && shown < 16; ++shown) {
         const Frame& f = frameBase[i];
         const CodeBlock* c = f.code;
         std::string name = c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string();

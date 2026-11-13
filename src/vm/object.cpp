@@ -251,6 +251,8 @@ bool JSObject::wouldCycle(VM& vm, JSObject* next) const noexcept
 
 void JSObject::toDictionary(VM& vm)
 {
+    if (this == vm.global)
+        ++vm.globalEpoch;
     Shape* s = shapeOf(vm);
     if (s->isDictionary())
         return;
@@ -379,6 +381,8 @@ void JSObject::putOwn(VM& vm, Key key, JSValue value, std::uint8_t attrs)
 
 bool JSObject::setAttrs(VM& vm, Key key, std::uint8_t attrs)
 {
+    if (this == vm.global)
+        ++vm.globalEpoch;
     materialize(vm);
     Shape* s = shapeOf(vm);
     if (s->isDictionary()) {
@@ -428,6 +432,8 @@ void JSObject::compactDictionary(VM& vm)
 
 bool JSObject::deleteOwn(VM& vm, Key key)
 {
+    if (this == vm.global)
+        ++vm.globalEpoch;
     materialize(vm);
     Shape* s = shapeOf(vm);
     JSValue removed;

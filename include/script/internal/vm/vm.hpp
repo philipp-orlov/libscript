@@ -242,6 +242,9 @@ struct VM : EngineRuntime
     JSValue newTarget = JSValue::undefined();
     /// The global object: `globalThis`. Owned.
     JSObject* global = nullptr;
+    /// Counts the changes to the global object that can move or remove a property it already has (a delete, new attributes);
+    /// compiled code that reads a global from a fixed place checks it.
+    std::uint32_t globalEpoch = 0;
     /// Install the global object and the built-in functions and prototypes (builtins.cpp).
     void installBuiltins();
 

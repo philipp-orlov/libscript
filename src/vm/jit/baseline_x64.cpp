@@ -278,6 +278,7 @@ constexpr std::int32_t kVmStackEnd = std::int32_t(offsetof(VM, stackEnd));
 constexpr std::int32_t kVmStackInit = std::int32_t(offsetof(VM, stackInit));
 constexpr std::int32_t kVmFrameCapacity = std::int32_t(offsetof(VM, frameCapacity));
 constexpr std::int32_t kVmFrameBase = std::int32_t(offsetof(VM, frameBase));
+constexpr std::int32_t kVmGlobalEpoch = std::int32_t(offsetof(VM, globalEpoch));
 constexpr std::int32_t kVmStackFloor = std::int32_t(offsetof(VM, jitStackFloor));
 constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
 constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
@@ -1277,17 +1278,26 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
 
 void Baseline::getGlobal(std::uint32_t i, const Ins& in)
 {
-    const std::uint16_t cacheId = code_->code[i + 1].a;
-    const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
-    if (!ic || ic->shape == 0 || ic->holder) {
+    // A data property the global object has now stays where it is until something deletes it or changes its attributes,
+    // which the epoch counts.
+    JSObject* g = vm_.global;
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm_, code_->atoms[in.b], &attrs);
+    if (!slot || (attrs & attr::kAccessor)) {
         helperOp(i, &helperThunk<jitGetGlobal>);
         return;
     }
+    std::uint32_t index;
+    JSValue* inlineBase = g->inl();
+    if (slot >= inlineBase && slot < inlineBase + g->h.aux)
+        index = std::uint32_t(slot - inlineBase);
+    else
+        index = std::uint32_t(slot - g->slots) + g->h.aux;
     Label& bad = slow(i, &helperThunk<jitGetGlobal>);
-    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(vm_.global));
-    a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
+    a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, bad);
-    slotAddress(ic->index);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(g));
+    slotAddress(index);
     a_.mov(RAX, mem(RDX, 0));
     retain(RAX);
     write(in.a, RAX);

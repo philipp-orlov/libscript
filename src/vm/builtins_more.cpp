@@ -934,10 +934,31 @@ NATIVE(bigintAsNFn)
         return JSValue::exception();
     if (bits < 0 || bits > 9007199254740991.0)
         return vm.throwError(ErrorCode::RangeError, "Invalid value: not (convertible to) a safe integer");
-    const JSValue v = arg(args, argc, 1);
-    if (!isBigInt(v))
-        return typeError(vm, "Cannot convert " + describe(vm, v) + " to a BigInt");
-    return bigintAsN(vm, std::uint64_t(bits), v, isSigned);
+    // ToBigInt: a BigInt, or a boolean or string that makes one, after ToPrimitive.
+    Handle big;
+    {
+        JSValue prim = toPrimitive(vm, arg(args, argc, 1), false);
+        if (prim.isException())
+            return prim;
+        Handle keep = Handle::adopt(prim);
+        if (isBigInt(prim)) {
+            big = Handle::retained(prim);
+        } else if (prim.isBool()) {
+            big = Handle::adopt(bigintFromDouble(vm, prim == JSValue::boolean(true) ? 1 : 0));
+        } else if (isString(prim)) {
+            bool ok;
+            JSValue r = bigintFromText(vm, asString(prim)->text(), &ok);
+            if (!ok) {
+                if (r.isException())
+                    return r;
+                return vm.throwError(ErrorCode::SyntaxError, "Cannot convert " + toUtf8(asString(prim)->text()) + " to a BigInt");
+            }
+            big = Handle::adopt(r);
+        } else {
+            return typeError(vm, "Cannot convert " + describe(vm, prim) + " to a BigInt");
+        }
+    }
+    return bigintAsN(vm, std::uint64_t(bits), big.get(), isSigned);
 }
 
 NATIVE(bigintToStringFn)

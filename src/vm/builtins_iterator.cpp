@@ -635,6 +635,11 @@ NATIVE(weirdAccessor)
 
 }  // namespace
 
+bool iteratorClose(VM& vm, JSValue iterator, bool throwing)
+{
+    return closeIterator(vm, iterator, throwing);
+}
+
 void installIteratorHelpers(VM& vm)
 {
     JSObject* ip = vm.protos.iterator;

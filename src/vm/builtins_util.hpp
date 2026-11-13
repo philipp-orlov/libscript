@@ -146,6 +146,8 @@ bool getIterator(VM& vm, JSValue src, Handle* iterator, Handle* next);
 /// false to stop. False from this with an exception pending when iterating failed or `fn` raised it (`fn` returns
 /// `Stop`).
 enum class Step { Continue, Stop, Fail };
+/// IteratorClose of `iterator`: with `throwing` the exception already pending stays and what closing raises is dropped.
+bool iteratorClose(VM& vm, JSValue iterator, bool throwing);
 template <class F>
 bool forEachIterated(VM& vm, JSValue src, F&& fn)
 {
@@ -174,10 +176,12 @@ bool forEachIterated(VM& vm, JSValue src, F&& fn)
             return true;
         Handle e = Handle::adopt(v);
         const Step s = fn(e.get());
-        if (s == Step::Fail)
+        if (s == Step::Fail) {
+            iteratorClose(vm, iterator.get(), true);
             return false;
+        }
         if (s == Step::Stop)
-            return true;
+            return iteratorClose(vm, iterator.get(), false);
     }
 }
 /// `base[i]`, owned; the exception sentinel when a getter throws.

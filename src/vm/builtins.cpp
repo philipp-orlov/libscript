@@ -1703,16 +1703,31 @@ NATIVE(stringIndexOf)
     Handle s;
     if (!thisString(vm, self, &s))
         return JSValue::exception();
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 indexOf, 1 lastIndexOf, 2 includes, 3 startsWith, 4 endsWith
+    if (mode >= 2) {
+        bool ok = true;
+        if (isRegExpValue(vm, arg(args, argc, 0), &ok))
+            return typeError(vm, std::string("First argument to String.prototype.") + (mode == 2 ? "includes" : mode == 3 ? "startsWith" : "endsWith") +
+                                     " must not be a regular expression");
+        if (!ok)
+            return JSValue::exception();
+    }
     JSValue needle = toStringValue(vm, arg(args, argc, 0));
     if (needle.isException())
         return needle;
     Handle n = Handle::adopt(needle);
     StringView text = asString(s.get())->text(), sub = asString(needle)->text();
-    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 indexOf, 1 lastIndexOf, 2 includes, 3 startsWith, 4 endsWith
-    double from = 0;
-    if (argc > 1 && !args[1].isUndefined() && !toNumber(vm, args[1], &from))
+    // ToIntegerOrInfinity of the position; `lastIndexOf` takes NaN as the end of the string, and `endsWith` an absent one.
+    double from = mode == 1 ? std::numeric_limits<double>::quiet_NaN() : 0;
+    const JSValue positionArg = arg(args, argc, 1);
+    if (!positionArg.isUndefined() && !toNumber(vm, positionArg, &from))
         return JSValue::exception();
-    from = from != from ? 0 : std::trunc(from);
+    if (mode == 1)
+        from = from != from ? std::numeric_limits<double>::infinity() : std::trunc(from);
+    else
+        from = from != from ? 0 : std::trunc(from);
+    if (mode == 4 && positionArg.isUndefined())
+        from = double(text.size());
     const std::size_t start = std::size_t(std::min(std::max(from, 0.0), double(text.size())));
     switch (mode) {
         case 0: {
@@ -1720,12 +1735,12 @@ NATIVE(stringIndexOf)
             return JSValue::int32(at == StringView::npos ? -1 : std::int32_t(at));
         }
         case 1: {
-            const std::size_t at = text.rfind(sub);
+            const std::size_t at = text.rfind(sub, start);
             return JSValue::int32(at == StringView::npos ? -1 : std::int32_t(at));
         }
         case 2: return JSValue::boolean(text.find(sub, start) != StringView::npos);
-        case 3: return JSValue::boolean(text.substr(start, sub.size()) == sub);
-        default: return JSValue::boolean(text.size() >= sub.size() && text.substr(text.size() - sub.size()) == sub);
+        case 3: return JSValue::boolean(start + sub.size() <= text.size() && text.substr(start, sub.size()) == sub);
+        default: return JSValue::boolean(sub.size() <= start && text.substr(start - sub.size(), sub.size()) == sub);
     }
 }
 

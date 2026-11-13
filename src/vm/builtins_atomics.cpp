@@ -37,8 +37,8 @@ JSTypedArray* validate(VM& vm, JSValue ta, JSValue indexValue, bool waitable, st
     auto* t = static_cast<JSTypedArray*>(asObject(ta));
     const BufferState* b = bufferStateOf(t);
     if (waitable ? !(t->kind == ElemKind::Int32 || t->kind == ElemKind::BigInt64)
-                 : (t->kind == ElemKind::Float32 || t->kind == ElemKind::Float64 || t->kind == ElemKind::Uint8Clamped ||
-                    t->kind >= ElemKind::Count)) {
+                 : (t->kind == ElemKind::Float32 || t->kind == ElemKind::Float64 || t->kind == ElemKind::Float16 ||
+                    t->kind == ElemKind::Uint8Clamped || t->kind >= ElemKind::Count)) {
         typeError(vm, "Argument is not an integer typed array");
         return nullptr;
     }

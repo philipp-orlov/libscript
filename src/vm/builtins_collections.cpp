@@ -268,6 +268,8 @@ bool validKey(VM& vm, const Kind& k, JSValue key)
     return false;
 }
 
+NATIVE(tableSet);
+
 NATIVE(tableCtor)
 {
     UNUSED();
@@ -280,16 +282,34 @@ NATIVE(tableCtor)
     o->rareOf(vm).ext = t;
     const JSValue init = arg(args, argc, 0);
     if (!init.isNullish()) {
+        // The entries go in through the `set` or `add` the new object has, which a subclass may have replaced.
+        Key adderKey = vm.internKey(std::string_view(k.isMap ? "set" : "add"));
+        Handle adder = Handle::adopt(getProperty(vm, self, adderKey));
+        detail::decRef(adderKey);
+        if (adder.get().isException())
+            return JSValue::exception();
+        if (!isFunction(adder.get()))
+            return typeError(vm, std::string("'") + (k.isMap ? "set" : "add") + "' returned for property of the new " + k.name + " is not a function");
+        auto* fn = static_cast<JSFunction*>(asObject(adder.get()));
+        const bool pristine = (fn->flags & JSFunction::kNative) && fn->rare() && fn->rare()->native == tableSet &&
+                              fn->rare()->nativeData == data;
         const bool ok = forEachIterated(vm, init, [&](JSValue item) {
-            if (!k.isMap) {
-                if (!validKey(vm, k, item))
-                    return Step::Fail;
-                t->set(item, JSValue::undefined());
-                return Step::Continue;
-            }
-            if (!isObject(item)) {
+            if (k.isMap && !isObject(item)) {
                 typeError(vm, "Iterator value " + describe(vm, item) + " is not an entry object");
                 return Step::Fail;
+            }
+            if (!k.isMap) {
+                if (pristine) {
+                    if (!validKey(vm, k, item))
+                        return Step::Fail;
+                    t->set(item, JSValue::undefined());
+                    return Step::Continue;
+                }
+                JSValue r = vm.call(adder.get(), self, &item, 1);
+                if (r.isException())
+                    return Step::Fail;
+                release(r);
+                return Step::Continue;
             }
             JSValue key = getIndex(vm, item, 0);
             if (key.isException())
@@ -299,9 +319,17 @@ NATIVE(tableCtor)
             if (value.isException())
                 return Step::Fail;
             Handle vv = Handle::adopt(value);
-            if (!validKey(vm, k, key))
+            if (pristine) {
+                if (!validKey(vm, k, key))
+                    return Step::Fail;
+                t->set(key, value);
+                return Step::Continue;
+            }
+            JSValue pair[2] = {key, value};
+            JSValue r = vm.call(adder.get(), self, pair, 2);
+            if (r.isException())
                 return Step::Fail;
-            t->set(key, value);
+            release(r);
             return Step::Continue;
         });
         if (!ok)
@@ -455,6 +483,45 @@ NATIVE(weakRefDeref)
     return typeError(vm, "WeakRef.prototype.deref called on incompatible receiver");
 }
 
+/// A FinalizationRegistry keeps its callback and the unregister tokens of its cells. The collector here counts references, so a
+/// target never goes away while the program can name it and nothing is ever called back; what a program can observe -- the
+/// checks `register` and `unregister` make, and what `unregister` answers -- is kept.
+struct RegistryState : NativeState
+{
+    JSValue cleanup = JSValue::undefined();
+    Vec<JSValue> tokens;
+    ~RegistryState() override { clear_(); }
+    void clear(VM&) noexcept override { clear_(); }
+    void clear_() noexcept
+    {
+        release(cleanup);
+        cleanup = JSValue::undefined();
+        for (JSValue t : tokens)
+            release(t);
+        tokens.clear();
+    }
+    void values(Vec<JSValue>& out) const override
+    {
+        out.push_back(cleanup);
+        out.insert(out.end(), tokens.begin(), tokens.end());
+    }
+};
+
+bool canBeHeldWeakly(JSValue v)
+{
+    return isObject(v) || (isSymbol(v) && !static_cast<dyn::SymbolCell*>(v.asCell())->registered);
+}
+
+RegistryState* thisRegistry(VM& vm, JSValue self, const char* method)
+{
+    if (isObject(self))
+        if (Rare* r = asObject(self)->rare())
+            if (auto* state = dynamic_cast<RegistryState*>(r->ext))
+                return state;
+    typeError(vm, std::string("FinalizationRegistry.prototype.") + method + " called on incompatible receiver");
+    return nullptr;
+}
+
 NATIVE(registryCtor)
 {
     UNUSED();
@@ -462,14 +529,56 @@ NATIVE(registryCtor)
         return typeError(vm, "Constructor FinalizationRegistry requires 'new'");
     if (!isFunction(arg(args, argc, 0)))
         return typeError(vm, "FinalizationRegistry: cleanup must be callable");
+    auto* state = new RegistryState();
+    retain(args[0]);
+    state->cleanup = args[0];
+    delete asObject(self)->rareOf(vm).ext;
+    asObject(self)->rareOf(vm).ext = state;
     retain(self);
     return self;
 }
 
-NATIVE(registryNoop)
+NATIVE(registryRegister)
 {
     UNUSED();
-    return data ? JSValue::boolean(false) : JSValue::undefined();
+    RegistryState* state = thisRegistry(vm, self, "register");
+    if (!state)
+        return JSValue::exception();
+    const JSValue target = arg(args, argc, 0), held = arg(args, argc, 1), token = arg(args, argc, 2);
+    if (!canBeHeldWeakly(target))
+        return typeError(vm, "FinalizationRegistry.prototype.register: invalid target");
+    if (target == held || (target.isNumber() && held.isNumber() && target.asNumber() == held.asNumber()))
+        return typeError(vm, "FinalizationRegistry.prototype.register: target and holdings must not be same");
+    if (!canBeHeldWeakly(token)) {
+        if (!token.isUndefined())
+            return typeError(vm, "FinalizationRegistry.prototype.register: invalid unregister token");
+    } else {
+        retain(token);
+        state->tokens.push_back(token);
+    }
+    return JSValue::undefined();
+}
+
+NATIVE(registryUnregister)
+{
+    UNUSED();
+    RegistryState* state = thisRegistry(vm, self, "unregister");
+    if (!state)
+        return JSValue::exception();
+    const JSValue token = arg(args, argc, 0);
+    if (!canBeHeldWeakly(token))
+        return typeError(vm, "FinalizationRegistry.prototype.unregister: invalid unregister token");
+    bool removed = false;
+    for (std::size_t i = 0; i < state->tokens.size();) {
+        if (state->tokens[i] == token) {
+            release(state->tokens[i]);
+            state->tokens.erase(state->tokens.begin() + std::ptrdiff_t(i));
+            removed = true;
+        } else {
+            ++i;
+        }
+    }
+    return JSValue::boolean(removed);
 }
 
 }  // namespace
@@ -534,8 +643,8 @@ void installCollections(VM& vm)
             release(toJSValue(refProto));
             JSObject* regProto = vm.newObject(vm.protos.object);
             constructor(vm, "FinalizationRegistry", registryCtor, 1, regProto);
-            method(vm, regProto, "register", registryNoop, 2);
-            method(vm, regProto, "unregister", registryNoop, 1, reinterpret_cast<void*>(1));
+            method(vm, regProto, "register", registryRegister, 2);
+            method(vm, regProto, "unregister", registryUnregister, 1);
             regProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("FinalizationRegistry")), attr::kConfigurable);
             release(toJSValue(regProto));
         }

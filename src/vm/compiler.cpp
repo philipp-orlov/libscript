@@ -731,7 +731,7 @@ private:
     std::uint16_t objectLit(const Node& n, int dst);
     std::uint16_t arrayLit(const Node& n, int dst);
     std::uint16_t templateLit(const Node& n, int dst);
-    std::uint16_t function(const Node& n, const String& inferredName, int dst);
+    std::uint16_t function(const Node& n, const String& inferredName, int dst, bool exactName = false);
     void condJump(const Node& cond, Label& whenFalse);
     void condJumpTrue(const Node& cond, Label& whenTrue);
     bool isAnonymousFunction(const Node& n) const
@@ -1237,7 +1237,7 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
             const String name = p->text;
             if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter) {
                 const std::uint16_t f = temp();
-                function(*p->b, name, f);
+                function(*p->b, (p->propKind == PropKind::Getter ? u"get " : u"set ") + name, f, true);
                 homeFor(*p->b, f, t);
                 emit(p->propKind == PropKind::Getter ? Op::InitGetter : Op::InitSetter, t, atom(name), f);
             } else {
@@ -1258,9 +1258,9 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
     return t;
 }
 
-std::uint16_t Compiler::function(const Node& n, const String& inferredName, int dst)
+std::uint16_t Compiler::function(const Node& n, const String& inferredName, int dst, bool exactName)
 {
-    CodeBlock* child = compileFunction(n, n.text.empty() ? inferredName : n.text);
+    CodeBlock* child = compileFunction(n, n.text.empty() || exactName ? inferredName : n.text);
     const std::size_t index = fn_->block->children.size();
     fn_->block->children.push_back(child);
     const std::uint16_t d = dest(dst);
@@ -1403,6 +1403,7 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
             dyn::NodePtr spread = std::make_unique<Node>(NK::Spread, cls.line);
             spread->a = std::make_unique<Node>(NK::Identifier, cls.line);
             spread->a->text = u"args";
+            spread->declared = true;  // the rest array is passed on as it is, not iterated
             call->list.push_back(std::move(spread));
             dyn::NodePtr stmt = std::make_unique<Node>(NK::ExprStatement, cls.line);
             stmt->a = std::move(call);
@@ -1467,7 +1468,7 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
             hb.initialized = true;
             const std::uint16_t at = fn_->top;
             const std::uint16_t t = temp();
-            function(*m->b, pn, t);
+            function(*m->b, m->propKind == PropKind::Getter ? u"get " + pn : m->propKind == PropKind::Setter ? u"set " + pn : pn, t, true);
             emit(Op::SetHome, t, target);
             emit(Op::Mov, hb.reg, t);
             if (hb.boxed)
@@ -1487,7 +1488,7 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
             emit(plain, target, k, t);
         } else {
             const std::uint16_t t = temp();
-            function(*m->b, m->a->text, t);
+            function(*m->b, m->propKind == PropKind::Getter ? u"get " + m->a->text : m->propKind == PropKind::Setter ? u"set " + m->a->text : m->a->text, t, true);
             emit(plain, target, atom(m->a->text), t);
         }
         fn_->top = at;
@@ -1499,6 +1500,7 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         const std::size_t index = fn_->block->children.size();
         fn_->block->children.push_back(init);
         emit(Op::Closure, t, std::uint32_t(index));
+        emit(Op::SetHome, t, proto);
         emit(Op::SetFieldInit, f, t);
         fn_->top = at;
     }
@@ -1511,6 +1513,7 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         const std::size_t index = fn_->block->children.size();
         fn_->block->children.push_back(init);
         emit(Op::Closure, base, std::uint32_t(index));
+        emit(Op::SetHome, base, f);
         emit(Op::Mov, base + 1, f);
         emit(Op::Call, base, base, 0);
         fn_->top = at;
@@ -2225,6 +2228,9 @@ std::uint16_t Compiler::chainRoot(const Node& n, int dst, bool isNew)
 std::uint16_t Compiler::member(const Node& n, int dst)
 {
     if (n.a->kind == NK::SuperExpr) {
+        // `super.x` needs a method around it: a program, or eval code that runs outside any function, has none.
+        if (fn_->isProgram || (fn_->isEval && resolve(String(u"this")).kind == Ref::Global))
+            syntaxError(n, "'super' keyword unexpected here");
         const std::uint16_t at = fn_->top;
         if (n.computed) {
             const std::uint16_t self = thisRegister();
@@ -2333,8 +2339,14 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     if (spread) {
         // The arguments are collected into an array, which the call spreads over its window.
         const std::uint16_t arr = temp();
-        emit(Op::NewArray, arr, 0);
+        if (n.list.size() == 1 && n.list[0]->declared) {
+            expr(*n.list[0]->a, arr);
+        } else {
+            emit(Op::NewArray, arr, 0);
+        }
         for (const dyn::NodePtr& arg : n.list) {
+            if (arg->declared)
+                continue;
             const std::uint16_t inner = fn_->top;
             if (arg->kind == NK::Spread) {
                 const std::uint16_t src = exprAny(*arg->a);
@@ -2365,16 +2377,16 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     const std::uint16_t d = dst >= 0 ? std::uint16_t(dst) : base;
     if (!isNew && callee.kind == NK::Identifier && callee.text == u"eval" && resolve(String(u"eval")).kind == Ref::Global)
         emitEvalScope();
+    emit(spread ? (superCall ? Op::SuperSpread : isNew ? Op::NewSpread : Op::CallSpread)
+                : (superCall ? Op::SuperCall : isNew ? Op::New : Op::Call),
+         d, base, argc);
     if (superCall && thisBindsLate()) {
-        // A second `super()` is an error once its arguments are evaluated, before another object is made.
+        // A second `super()` runs the parent constructor again and is an error once it has returned.
         const std::uint16_t at = fn_->top;
         const std::uint16_t flag = loadVar(String(u"%bound"), -1, n);
         emit(Op::CheckUnbound, flag);
         fn_->top = at;
     }
-    emit(spread ? (superCall ? Op::SuperSpread : isNew ? Op::NewSpread : Op::CallSpread)
-                : (superCall ? Op::SuperCall : isNew ? Op::New : Op::Call),
-         d, base, argc);
     if (superCall) {
         // The constructor's `this` is what the parent made; the fields of this class are initialised now.
         const std::uint16_t at = fn_->top;

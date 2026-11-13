@@ -3187,16 +3187,12 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
 JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args, std::uint32_t argc)
 {
     CodeBlock* c = f->code;
-    JSValue protoValue = getProperty(*this, toJSValue(f), atoms.prototype);
-    if (protoValue.isException())
-        return protoValue;
-    JSObject* proto = isObject(protoValue) ? asObject(protoValue) : protos.generator;
-    JSObject* o = newObject(proto);
+    // The generator's prototype is read once the parameters have been worked out, and falls back to its realm's.
+    JSObject* fallback = (c->flags & CodeBlock::kAsyncGen) ? protos.asyncGenerator : protos.generator;
+    JSObject* o = newObject(fallback);
     Handle keep = Handle::adopt(toJSValue(o));
-    release(protoValue);
     auto* g = new GenState();
     o->h.cls = std::uint8_t(ObjClass::Generator);
-    (void)protoValue;
     o->rareOf(*this).ext = g;
     g->regs.assign(c->nregs, JSValue::undefined());
     g->callee = toJSValue(f);
@@ -3222,6 +3218,13 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     if (!resumeRaw(keep.get(), 0, JSValue::undefined(), &ignored, &finished))
         return JSValue::exception();
     release(ignored);
+    JSValue protoValue = getProperty(*this, toJSValue(f), atoms.prototype);
+    if (protoValue.isException())
+        return protoValue;
+    JSObject* proto = isObject(protoValue) ? asObject(protoValue) : fallback;
+    if (proto != fallback)
+        o->setProto(*this, proto);
+    release(protoValue);
     if (c->flags & CodeBlock::kAsyncGen)
         return bi::asyncGeneratorStart(*this, keep.take(), proto);
     return keep.take();

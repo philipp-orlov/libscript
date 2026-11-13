@@ -213,7 +213,10 @@ JSValue toPrimitiveHint(VM& vm, JSValue v, int hint)
         }
         return result;
     }
+    const bool present = !exotic.isNullish();
     release(exotic);
+    if (present)
+        return vm.throwError(ErrorCode::TypeError, "Symbol.toPrimitive is not a function");
     const bool preferString = hint == 2;
     const char* first = preferString ? "toString" : "valueOf";
     const char* second = preferString ? "valueOf" : "toString";

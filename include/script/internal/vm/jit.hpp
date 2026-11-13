@@ -38,6 +38,10 @@ struct Tier1Code
     void* addressFor(std::uint32_t index) const noexcept { return rx + labels[index]; }
 };
 
+/// The native behind `Math.floor`, `Math.sqrt` and the other one-argument functions of `Math`: a function whose `data` is
+/// a `double (*)(double)`, which compiled code calls directly.
+FastNative mathUnaryNative() noexcept;
+
 /// Whether this build and host can run compiled code at all.
 bool tier1Available() noexcept;
 /// Translate `code`; sets `code->tier1` or, when the function is not suitable, `code->tier1Failed`.

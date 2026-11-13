@@ -332,6 +332,8 @@ constexpr std::int32_t kArrayLength = std::int32_t(offsetof(JSArray, length));
 constexpr std::int32_t kTypedData = std::int32_t(offsetof(JSTypedArray, data));
 constexpr std::int32_t kTypedLength = std::int32_t(offsetof(JSTypedArray, length));
 constexpr std::int32_t kTypedKind = std::int32_t(offsetof(JSTypedArray, kind));
+constexpr std::int32_t kRareNative = std::int32_t(offsetof(Rare, native));
+constexpr std::int32_t kRareData = std::int32_t(offsetof(Rare, nativeData));
 constexpr std::int32_t kObjSlots = 16;
 constexpr std::int32_t kObjInline = 24;
 constexpr std::int32_t kBoxValue = 16;
@@ -545,6 +547,28 @@ private:
         a_.cvttsd2si32(dst, 0);
         a_.aluI32(7, dst, INT32_MIN);
         a_.jcc(CE, bad);
+        a_.bind(done);
+    }
+    /// xmm0 as the number `JSValue::boxNumber` makes of it, in rax: an int32 when it is one, else a double.
+    void boxNumber0()
+    {
+        Label asDouble, isInt, done;
+        a_.cvttsd2si32(RDX, 0);
+        a_.cvtsi2sd32(1, RDX);
+        a_.ucomisd(0, 1);
+        a_.jcc(CNE, asDouble);
+        a_.jcc(CP, asDouble);
+        a_.test32(RDX, RDX);
+        a_.jcc(CNE, isInt);
+        a_.movqFromX(RAX, 0);  // a zero is an int unless it is a negative zero
+        a_.test(RAX, RAX);
+        a_.jcc(CS, asDouble);
+        a_.bind(isInt);
+        a_.mov32(RAX, RDX);
+        a_.or_(RAX, R14);
+        a_.jmp(done);
+        a_.bind(asDouble);
+        boxDouble0();
         a_.bind(done);
     }
     /// xmm0 as a boxed double in rax; every NaN becomes the canonical one.
@@ -1517,7 +1541,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     Label& bad = slow(i);
     throws_.emplace_back(i, Label{});
     Label& exc = throws_.back().second;
-    Label helper, enter, native;
+    Label helper, enter, native, afterCall;
     const unsigned base = in.b, argc = in.c;
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     const bool fast = in.opcode() == Op::Call && window <= 1 + argc + 6;
@@ -1604,6 +1628,30 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jmp(enter);
     }
     a_.bind(helper);
+    if (in.opcode() == Op::Call && argc == 1) {
+        // `Math.floor(x)` and its kind: a native whose data is a function of one double, called without the interpreter.
+        Label generic, notInt;
+        a_.mov(RAX, R(base));
+        needObject(RAX, generic);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, generic);
+        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+        a_.jcc(CE, generic);
+        a_.mov(RCX, mem(RAX, kObjSlots));
+        a_.mov(RCX, mem(RCX, -16));
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(mathUnaryNative()));
+        a_.cmp(RDX, mem(RCX, kRareNative));
+        a_.jcc(CNE, generic);
+        a_.mov(RSI, R(base + 2));
+        needNumber(RSI, generic);
+        a_.mov(RAX, mem(RCX, kRareData));
+        loadNumber(0, RSI, RDX);
+        a_.callReg(RAX);
+        boxNumber0();
+        write(in.a, RAX);
+        a_.jmp(afterCall);
+        a_.bind(generic);
+    }
     a_.mov(RDI, R12);
     a_.movImm(RSI, i);
     a_.call(call_);
@@ -1618,6 +1666,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     a_.test(RAX, RAX);
     a_.jcc(CE, exc);
     write(in.a, RAX);
+    a_.bind(afterCall);
 }
 
 void Baseline::ret(std::uint32_t i, const Ins& in)

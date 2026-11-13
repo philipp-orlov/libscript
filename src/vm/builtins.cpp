@@ -2862,6 +2862,11 @@ JSValue definePropertyFromDescriptor(VM& vm, JSObject* o, Key key, JSObject* des
 }
 }  // namespace bi
 
+FastNative mathUnaryNative() noexcept
+{
+    return mathUnary;
+}
+
 }  // namespace vm
 }  // namespace internal
 }  // namespace script

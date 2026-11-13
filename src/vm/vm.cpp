@@ -47,6 +47,11 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     frameCapacity = std::uint32_t(ctx.options.stackLimit) + 16;
     frameBase = static_cast<Frame*>(allocPayload(sizeof(Frame) * frameCapacity));
     stackInit = stackBase;
+    switch (ctx.options.jit.mode) {
+    case JitOptions::Mode::Off: tier1Threshold = 0; break;
+    case JitOptions::Mode::Eager: tier1Threshold = 1; break;
+    default: tier1Threshold = ctx.options.jit.threshold ? ctx.options.jit.threshold : 1; break;
+    }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_TIER1"))
         tier1Threshold = std::uint32_t(std::atoi(t));

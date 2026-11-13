@@ -521,6 +521,26 @@ private:
         a_.movqToX(x, tmp);
         a_.bind(done);
     }
+    /// The int32 a number in `src` converts to, into `dst`: a plain int32, or a double that truncates without going out of
+    /// range (NaN and the rest go to `bad`). Clobbers rdx and xmm0.
+    void int32From(Reg dst, Reg src, Label& bad)
+    {
+        Label dbl, done;
+        a_.cmp(src, R14);
+        a_.jcc(CB, dbl);
+        a_.mov32(dst, src);
+        a_.jmp(done);
+        a_.bind(dbl);
+        a_.test(src, R14);
+        a_.jcc(CE, bad);
+        a_.mov(RDX, src);
+        a_.sub(RDX, RBP);
+        a_.movqToX(0, RDX);
+        a_.cvttsd2si32(dst, 0);
+        a_.aluI32(7, dst, INT32_MIN);
+        a_.jcc(CE, bad);
+        a_.bind(done);
+    }
     /// xmm0 as a boxed double in rax; every NaN becomes the canonical one.
     void boxDouble0()
     {
@@ -693,7 +713,7 @@ void Baseline::emit(std::uint32_t i)
         write(in.a, RAX);
         return;
     }
-    case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr: case Op::BitXor:
+    case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::BitAnd: case Op::BitOr: case Op::BitXor:
     case Op::Shl: case Op::Shr: case Op::UShr:
         arith(i, in);
         return;
@@ -768,6 +788,12 @@ void Baseline::emit(std::uint32_t i)
     case Op::InitProp:
         initProp(i, in);
         return;
+    case Op::Closure:
+        helperOp(i, &helperThunk<jitClosure>);
+        return;
+    case Op::NewBox:
+        helperOp(i, &helperThunk<jitNewBox>);
+        return;
     case Op::NewObject:
         helperOp(i, &helperThunk<jitNewObject>);
         return;
@@ -786,13 +812,18 @@ void Baseline::emit(std::uint32_t i)
 void Baseline::arith(std::uint32_t i, const Ins& in)
 {
     const Op op = in.opcode();
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitBinary>);
     Label dbl, done;
     const bool numeric = op == Op::Add || op == Op::Sub || op == Op::Mul;
+    const bool bitwise = !numeric && op != Op::Div;
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
-    if (op != Op::Div)
-        needInts(RAX, RCX, numeric ? dbl : bad);
+    if (bitwise) {
+        int32From(RAX, RAX, bad);
+        int32From(RCX, RCX, bad);
+    } else if (op != Op::Div) {
+        needInts(RAX, RCX, dbl);
+    }
     switch (op) {
     case Op::Add: a_.mov32(RDX, RAX); a_.alu32(0, RDX, RCX); a_.jcc(CO, dbl); a_.mov32(RAX, RDX); break;
     case Op::Sub: a_.mov32(RDX, RAX); a_.alu32(5, RDX, RCX); a_.jcc(CO, dbl); a_.mov32(RAX, RDX); break;
@@ -868,12 +899,19 @@ void Baseline::arithImm(std::uint32_t i, const Ins& in)
     const bool isRR = op == Op::Inc || op == Op::Dec;
     const std::int32_t imm = isRR ? (op == Op::Inc ? 1 : -1) : std::int32_t(std::int16_t(in.c));
     if (op == Op::ModI && imm <= 0) {
-        emitStep(i);
+        helperOp(i, &helperThunk<jitBinaryImm>);
         return;
     }
-    Label& bad = slow(i);
+    Label& bad = slow(i, isRR ? nullptr : &helperThunk<jitBinaryImm>);
+    const bool bitwise = op == Op::BitAndI || op == Op::BitOrI || op == Op::BitXorI || op == Op::ShlI || op == Op::ShrI ||
+                         op == Op::UShrI;
+    const bool dblOk = op == Op::AddI || op == Op::SubI || op == Op::MulI;
+    Label dbl, done;
     a_.mov(RAX, R(in.b));
-    needInt(RAX, bad);
+    if (bitwise)
+        int32From(RAX, RAX, bad);
+    else
+        needInt(RAX, dblOk ? dbl : bad);
     switch (op) {
     case Op::AddI: case Op::Inc: case Op::Dec: a_.aluI32(0, RAX, imm); a_.jcc(CO, bad); break;
     case Op::SubI: a_.aluI32(5, RAX, imm); a_.jcc(CO, bad); break;
@@ -908,6 +946,24 @@ void Baseline::arithImm(std::uint32_t i, const Ins& in)
     }
     a_.or_(RAX, R14);
     write(in.a, RAX, in.a == in.b);
+    if (dblOk) {
+        // A double operand: the result is a double (the interpreter's number path).
+        a_.jmp(done);
+        a_.bind(dbl);
+        needNumber(RAX, bad);
+        loadNumber(0, RAX, RDX);
+        a_.movImm(RCX, std::uint32_t(imm));
+        a_.cvtsi2sd32(1, RCX);
+        if (op == Op::AddI)
+            a_.addsd(0, 1);
+        else if (op == Op::SubI)
+            a_.subsd(0, 1);
+        else
+            a_.mulsd(0, 1);
+        boxDouble0();
+        write(in.a, RAX, in.a == in.b);
+    }
+    a_.bind(done);
 }
 
 namespace {
@@ -1003,7 +1059,7 @@ void Baseline::strictJump(std::uint32_t i, const Ins& in)
 void Baseline::strictValue(std::uint32_t i, const Ins& in)
 {
     const bool wantEqual = in.opcode() == Op::StrictEq;
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitBinary>);
     Label eq, neq, store;
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
@@ -1024,7 +1080,7 @@ void Baseline::compare(std::uint32_t i, const Ins& in)
         return;
     }
     const Relation rel = relationOf(in.opcode());
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitBinary>);
     Label dbl, done;
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
@@ -1241,7 +1297,7 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
 
 void Baseline::getElem(std::uint32_t i, const Ins& in)
 {
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitGetElem>);
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
     needInt(RCX, bad);
@@ -1261,7 +1317,7 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
 
 void Baseline::putElem(std::uint32_t i, const Ins& in)
 {
-    Label& bad = slow(i);
+    Label& bad = slow(i, &helperThunk<jitPutElem>);
     Label isNumber;
     a_.mov(RAX, R(in.a));
     a_.mov(RCX, R(in.b));
@@ -1498,7 +1554,8 @@ void compileTier1(VM& vm, CodeBlock* code)
     code->tier1Failed = true;
     if (code->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen))
         return;
-    if (code->code.size() > 20000 || !entryStub())
+    const std::size_t limit = vm.ctx.options.jit.codeCacheLimit;
+    if (code->code.size() > 20000 || !entryStub() || (limit && codeInUse() > limit))
         return;
     Baseline compiler(vm, code);
     Tier1Code* t = compiler.compile();

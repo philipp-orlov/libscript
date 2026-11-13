@@ -2551,6 +2551,223 @@ int jitArrayPush(VM& vm, std::uint32_t index)
     return 1;
 }
 
+
+int jitBinary(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const JSValue a = R[ins->b], b = R[ins->c];
+    const Op op = ins->opcode();
+    JSValue r;
+    switch (op) {
+    case Op::Add:
+        if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b))
+            return 1;
+        r = add(vm, a, b);
+        break;
+    case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: {
+        const int rel = relational(vm, op, a, b);
+        if (rel < 0)
+            return 0;
+        r = JSValue::boolean(rel != 0);
+        break;
+    }
+    case Op::Eq: case Op::Ne: {
+        bool ok = true;
+        const bool eq = looseEquals(vm, a, b, &ok);
+        if (!ok)
+            return 0;
+        r = JSValue::boolean(op == Op::Eq ? eq : !eq);
+        break;
+    }
+    case Op::StrictEq: case Op::StrictNe: {
+        const bool eq = fastStrictEquals(a, b);
+        r = JSValue::boolean(op == Op::StrictEq ? eq : !eq);
+        break;
+    }
+    default:
+        r = arithmetic(vm, op, a, b);
+        break;
+    }
+    if (r.isException())
+        return 0;
+    setReg(R[ins->a], r);
+    return 1;
+}
+
+int jitBinaryImm(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const JSValue a = R[ins->b];
+    const JSValue y = JSValue::int32(std::int16_t(ins->c));
+    const Op op = ins->opcode();
+    const Op generic = op == Op::AddI ? Op::Add : op == Op::SubI ? Op::Sub : op == Op::MulI ? Op::Mul : op == Op::ModI ? Op::Mod
+                       : op == Op::BitAndI ? Op::BitAnd : op == Op::BitOrI ? Op::BitOr : op == Op::BitXorI ? Op::BitXor
+                       : op == Op::ShlI ? Op::Shl : op == Op::ShrI ? Op::Shr : Op::UShr;
+    const JSValue r = generic == Op::Add ? add(vm, a, y) : arithmetic(vm, generic, a, y);
+    if (r.isException())
+        return 0;
+    setReg(R[ins->a], r);
+    return 1;
+}
+
+int jitGetElem(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const JSValue base = R[ins->b];
+    JSValue k = R[ins->c];
+    if (k.isDouble()) {
+        const double d = k.asDouble();
+        if (d >= 0 && d < 2147483648.0 && double(std::int32_t(d)) == d)
+            k = JSValue::int32(std::int32_t(d));
+    }
+    if (k.isInt32() && k.asInt32() >= 0) {
+        if (isObject(base) && asObject(base)->cls() == ObjClass::Array) {
+            auto* a = static_cast<JSArray*>(asObject(base));
+            const std::uint32_t i = std::uint32_t(k.asInt32());
+            if (i < a->length && !a->elems[i].isHole()) {
+                copyReg(R[ins->a], a->elems[i]);
+                return 1;
+            }
+        } else if (isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
+            auto* t = static_cast<JSTypedArray*>(asObject(base));
+            const std::uint32_t i = std::uint32_t(k.asInt32());
+            if (i < t->length && !isBigKind(t->kind)) {
+                setReg(R[ins->a], loadNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)]));
+                return 1;
+            }
+        } else if (isString(base)) {
+            StringCell* s = asString(base);
+            const std::uint32_t i = std::uint32_t(k.asInt32());
+            if (i < s->length) {
+                const JSValue ch = makeString(vm, s->text().substr(i, 1));
+                setReg(R[ins->a], ch);
+                return 1;
+            }
+        }
+    }
+    if (base.isNullish()) {
+        vm.throwError(ErrorCode::TypeError, "Cannot read properties of " + std::string(base.isNull() ? "null" : "undefined"));
+        return 0;
+    }
+    if (isPrivateKey(k)) {
+        const JSValue v = privateGet(vm, base, k);
+        if (v.isException())
+            return 0;
+        setReg(R[ins->a], v);
+        return 1;
+    }
+    JSValue prim = toPrimitive(vm, k, true);
+    if (prim.isException())
+        return 0;
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        return 0;
+    const JSValue v = getProperty(vm, base, key);
+    release(JSValue::cell(key));
+    if (v.isException())
+        return 0;
+    setReg(R[ins->a], v);
+    return 1;
+}
+
+int jitPutElem(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const JSValue base = R[ins->a];
+    JSValue k = R[ins->b];
+    if (k.isDouble()) {
+        const double d = k.asDouble();
+        if (d >= 0 && d < 2147483648.0 && double(std::int32_t(d)) == d)
+            k = JSValue::int32(std::int32_t(d));
+    }
+    if (k.isInt32() && k.asInt32() >= 0 && R[ins->c].isNumber() && isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
+        auto* t = static_cast<JSTypedArray*>(asObject(base));
+        const std::uint32_t i = std::uint32_t(k.asInt32());
+        if (!isBigKind(t->kind)) {
+            if (i < t->length)
+                storeNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)], R[ins->c].asNumber());
+            return 1;
+        }
+    }
+    if (k.isInt32() && k.asInt32() >= 0 && isObject(base) && asObject(base)->cls() == ObjClass::Array &&
+        !(asObject(base)->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
+        auto* a = static_cast<JSArray*>(asObject(base));
+        const std::uint32_t i = std::uint32_t(k.asInt32());
+        if (i < a->length) {
+            const JSValue old = a->elems[i];
+            a->elems[i] = R[ins->c];
+            retain(a->elems[i]);
+            if (!a->elems[i].isNumber())
+                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
+            release(old);
+            return 1;
+        }
+        if (i == a->length) {
+            retain(R[ins->c]);
+            a->append(vm, R[ins->c]);
+            return 1;
+        }
+    }
+    if (base.isNullish()) {
+        vm.throwError(ErrorCode::TypeError, "Cannot set properties of " + std::string(base.isNull() ? "null" : "undefined"));
+        return 0;
+    }
+    if (isPrivateKey(k)) {
+        return privatePut(vm, base, k, R[ins->c]) ? 1 : 0;
+    }
+    JSValue prim = toPrimitive(vm, k, true);
+    if (prim.isException())
+        return 0;
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        return 0;
+    const bool ok = setProperty(vm, base, key, R[ins->c], (c.code->flags & CodeBlock::kStrict) != 0);
+    release(JSValue::cell(key));
+    if (!ok && !vm.exception.isUndefined())
+        return 0;
+    return 1;
+}
+
+int jitClosure(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    CodeBlock* child = c.code->children[ins->b];
+    const std::uint32_t n = std::uint32_t(child->upvals.size());
+    Box* small[16];
+    Box** boxes = small;
+    if (n > 16) {
+        vm.boxScratch.resize(n);
+        boxes = vm.boxScratch.data();
+    }
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const UpvalDesc& d = child->upvals[i];
+        boxes[i] = d.fromParentLocal ? reinterpret_cast<Box*>(R[d.index].asCell()) : c.fr->fn->upvals()[d.index];
+    }
+    JSFunction* f = vm.newFunction(vm.protos.function, child, boxes, n);
+    setReg(R[ins->a], toJSValue(f));
+    return 1;
+}
+
+int jitNewBox(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    Box* box = vm.newBox(c.R[c.ins->a]);
+    c.R[c.ins->a] = JSValue::cell(reinterpret_cast<CellPtr>(box));
+    return 1;
+}
+
 std::uint64_t stepThrow(VM& vm, std::uint32_t index)
 {
     Frame* fr = vm.frameBase + vm.frameCount - 1;

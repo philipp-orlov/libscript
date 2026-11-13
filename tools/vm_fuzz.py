@@ -260,7 +260,7 @@ def one(args):
     with open(path, 'w') as f:
         f.write(Gen(seed).program())
     base = run(tool, {'SCRIPT_CORE': 'dyn', 'SCRIPT_JIT': 'off'}, path)
-    got = run(tool, {'SCRIPT_CORE': 'vm'}, path)
+    got = run(tool, {'SCRIPT_CORE': 'vm', 'SCRIPT_VM_TIER1': os.environ.get('FUZZ_TIER1', '0')}, path)
     if base[0] != 0 and got[0] != 0:
         # Both refuse the program: the text of the message differs.
         os.unlink(path)

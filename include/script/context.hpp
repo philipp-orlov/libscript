@@ -371,6 +371,8 @@ public:
     /// reference counting and does not need this.
     void collectGarbage();
     Stats stats() const;
+    /// The execution core that runs the dynamic languages here: never `Auto`.
+    Options::Core core() const noexcept;
     /// The active code generator, e.g. "interpreter" or "arm64".
     const char* jitBackend() const noexcept;
 

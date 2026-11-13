@@ -2075,17 +2075,19 @@ NATIVE(stringTrim)
 NATIVE(stringSplit)
 {
     UNUSED();
+    if (self.isNullish())
+        return typeError(vm, "String.prototype.split called on null or undefined");
+    {
+        const JSValue extra[1] = {arg(args, argc, 1)};
+        bool handled;
+        JSValue r = callSymbolMethod(vm, arg(args, argc, 0), vm.atoms.symSplit, self, extra, 1, &handled);
+        if (handled)
+            return r;
+    }
     Handle s;
     if (!thisString(vm, self, &s))
         return JSValue::exception();
     StringView text = asString(s.get())->text();
-    {
-        const JSValue extra[1] = {arg(args, argc, 1)};
-        bool handled;
-        JSValue r = callSymbolMethod(vm, arg(args, argc, 0), vm.atoms.symSplit, s.get(), extra, 1, &handled);
-        if (handled)
-            return r;
-    }
     JSArray* out = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(out));
     JSValue sepArg = arg(args, argc, 0);
@@ -2183,28 +2185,38 @@ JSValue stringReplaceText(VM& vm, const Handle& s, JSValue pat, JSValue replacem
 NATIVE(stringReplace)
 {
     UNUSED();
-    Handle s;
-    if (!thisString(vm, self, &s))
-        return JSValue::exception();
+    if (self.isNullish())
+        return typeError(vm, "String.prototype.replace called on null or undefined");
     const JSValue pat = arg(args, argc, 0);
     const bool all = data != nullptr;
-    if (all && isObject(pat) && asObject(pat)->cls() == ObjClass::RegExp) {
+    if (all && isObject(pat)) {
         // `replaceAll` takes only a global RegExp.
-        Key flagsKey = vm.internKey(std::string_view("flags"));
-        JSValue flags = getProperty(vm, pat, flagsKey);
-        detail::decRef(flagsKey);
-        if (flags.isException())
-            return flags;
-        const bool global = isString(flags) && asString(flags)->text().find(u'g') != StringView::npos;
-        release(flags);
-        if (!global)
-            return typeError(vm, "replaceAll must be called with a global RegExp");
+        bool ok = true;
+        if (isRegExpValue(vm, pat, &ok)) {
+            Key flagsKey = vm.internKey(std::string_view("flags"));
+            Handle flags = Handle::adopt(getProperty(vm, pat, flagsKey));
+            detail::decRef(flagsKey);
+            if (flags.get().isException())
+                return flags.get();
+            if (flags.get().isNullish())
+                return typeError(vm, "String.prototype.replaceAll called with a RegExp whose flags are missing");
+            Handle text = Handle::adopt(toStringValue(vm, flags.get()));
+            if (text.get().isException())
+                return text.get();
+            if (asString(text.get())->text().find(u'g') == StringView::npos)
+                return typeError(vm, "replaceAll must be called with a global RegExp");
+        } else if (!ok) {
+            return JSValue::exception();
+        }
     }
     const JSValue extra[1] = {arg(args, argc, 1)};
     bool handled;
-    JSValue r = callSymbolMethod(vm, pat, vm.atoms.symReplace, s.get(), extra, 1, &handled);
+    JSValue r = callSymbolMethod(vm, pat, vm.atoms.symReplace, self, extra, 1, &handled);
     if (handled)
         return r;
+    Handle s;
+    if (!thisString(vm, self, &s))
+        return JSValue::exception();
     Handle text = Handle::adopt(toStringValue(vm, pat));
     if (text.get().isException())
         return JSValue::exception();

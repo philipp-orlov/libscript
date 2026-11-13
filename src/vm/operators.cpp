@@ -383,6 +383,14 @@ void wrapPrimitive(VM& vm, JSObject* o, ObjClass cls, JSValue v)
     o->h.cls = std::uint8_t(cls);
 }
 
+bool isConstructor(JSValue v) noexcept
+{
+    if (!isFunction(v))
+        return false;
+    const auto* f = static_cast<const JSFunction*>(asObject(v));
+    return (f->flags & JSFunction::kNative) ? (f->flags & JSFunction::kConstructor) != 0 : f->code->constructor;
+}
+
 JSValue toObject(VM& vm, JSValue v)
 {
     if (isObject(v)) {

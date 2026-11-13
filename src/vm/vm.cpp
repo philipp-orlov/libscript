@@ -128,7 +128,7 @@ std::string VM::captureStack() const
 {
     std::string out;
     int shown = 0;
-    for (std::size_t i = frameCount; i-- > 0 && shown < 10; ++shown) {
+    for (std::size_t i = frameCount; i-- > 0 && shown < 16; ++shown) {
         const Frame& f = frameBase[i];
         const CodeBlock* c = f.code;
         std::string name = c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string();

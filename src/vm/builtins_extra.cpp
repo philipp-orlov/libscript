@@ -566,6 +566,28 @@ NATIVE(returnThis)
 
 }  // namespace
 
+JSValue speciesConstructor(VM& vm, JSValue object, JSValue fallback)
+{
+    Handle ctor = Handle::adopt(getProperty(vm, object, vm.atoms.constructor));
+    if (ctor.get().isException())
+        return ctor.get();
+    if (ctor.get().isUndefined())
+        retain(fallback);
+        return fallback;
+    if (!isObject(ctor.get()))
+        return vm.throwError(ErrorCode::TypeError, "object.constructor is not an object");
+    Handle species = Handle::adopt(getProperty(vm, ctor.get(), vm.atoms.symSpecies));
+    if (species.get().isException())
+        return species.get();
+    if (species.get().isNullish()) {
+        retain(fallback);
+        return fallback;
+    }
+    if (isConstructor(species.get()))
+        return species.take();
+    return vm.throwError(ErrorCode::TypeError, "object.constructor[Symbol.species] is not a constructor");
+}
+
 void installExtras(VM& vm)
 {
     {
@@ -680,6 +702,7 @@ void installExtras(VM& vm)
     detail::decRef(mapKey);
     if (mapCtor && isObject(*mapCtor))
         method(vm, asObject(*mapCtor), "groupBy", groupBy, 2, reinterpret_cast<void*>(1));
+    recordRegExpOriginals(vm);
 }
 
 }  // namespace bi

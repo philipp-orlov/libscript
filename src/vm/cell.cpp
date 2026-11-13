@@ -126,7 +126,7 @@ void appendIfCell(detail::GcList& out, JSValue v)
 
 }  // namespace
 
-void children(const detail::GCObject* cell, detail::GcList& out)
+void children(const detail::GCObject* cell, detail::GcList& out, bool tracing)
 {
     VM& vm = vmOf(cell);
     switch (kindOf(cell)) {
@@ -142,7 +142,7 @@ void children(const detail::GCObject* cell, detail::GcList& out)
             } else if (o->cls() == ObjClass::TypedArray) {
                 appendIfCell(out, static_cast<JSTypedArray*>(o)->buffer);
             }
-            if (Rare* r = o->rare(); r && r->ext) {
+            if (Rare* r = o->rare(); r && r->ext && !(tracing && r->ext->ephemeron())) {
                 std::vector<JSValue> held;
                 r->ext->values(held);
                 for (JSValue v : held)
@@ -433,30 +433,65 @@ void VM::collectCycles(bool minor) noexcept
         if (h->gc & kCountMask)
             reach(cell);
     }
+    std::vector<JSObject*> tables;
     while (!work.empty()) {
         CellPtr cell = work.back();
         work.pop_back();
         kids.clear();
-        children(cell, kids);
+        children(cell, kids, true);
         for (detail::GCObject* kid : kids)
             if (kid && isVmCell(kid))
                 reach(kid);
-        if (kindOf(cell) == Kind::Object)
-            if (JSObject* p = reinterpret_cast<JSObject*>(cell)->proto(*this))
+        if (kindOf(cell) == Kind::Object) {
+            auto* o = reinterpret_cast<JSObject*>(cell);
+            if (JSObject* p = o->proto(*this))
                 reach(reinterpret_cast<CellPtr>(p));
+            if (Rare* r = o->rare(); r && r->ext && r->ext->ephemeron())
+                tables.push_back(o);
+        }
+        if (work.empty() && !tables.empty()) {
+            // A weak table keeps a value while its key is reached; a key outside the world counts as reached.
+            for (JSObject* t : tables) {
+                std::vector<JSValue> held;
+                t->rare()->ext->values(held);
+                for (std::size_t i = 0; i + 1 < held.size(); i += 2) {
+                    const JSValue key = held[i], value = held[i + 1];
+                    if (!value.isCell() || !isVmCell(value.asCell()))
+                        continue;
+                    bool alive = true;
+                    if (key.isCell() && isVmCell(key.asCell())) {
+                        CellHeader* kh = headerOf(key.asCell());
+                        alive = !(kh->gc & kInSet) || (kh->gc & kReached);
+                    }
+                    if (alive)
+                        reach(value.asCell());
+                }
+            }
+        }
     }
     std::vector<CellPtr> garbage;
     for (CellPtr cell : set) {
         CellHeader* h = headerOf(cell);
-        const bool dead = !(h->gc & kReached);
-        h->gc = 0;
-        if (dead) {
+        if (!(h->gc & kReached)) {
             ++h->rc;  // held until it has been emptied: nothing frees it on the way
-            garbage.push_back(cell);
+            garbage.push_back(cell);  // keeps its gc word, for the tables below to tell it is dead
         } else {
+            h->gc = 0;
             h->flags &= std::uint8_t(~cellflags::kYoung);
         }
     }
+    // A table that lives lets go of the entries of keys that do not.
+    for (JSObject* t : tables)
+        t->rare()->ext->dropEntries(
+            [](void*, JSValue key) {
+                if (!key.isCell() || !isVmCell(key.asCell()))
+                    return false;
+                const std::uint32_t gc = headerOf(key.asCell())->gc;
+                return (gc & kInSet) && !(gc & kReached);
+            },
+            nullptr);
+    for (CellPtr cell : garbage)
+        headerOf(cell)->gc = 0;
     ctx.gcFreed += garbage.size();
     for (CellPtr cell : garbage)
         clearReferences(*this, cell);
@@ -497,6 +532,15 @@ void VM::releaseRoots() noexcept
             detail::decRef(*k);
         *k = nullptr;
     }
+    for (const RegExpSlot& s : regexpSlots) {
+        release(s.value);
+        release(toJSValue(s.owner));
+        detail::decRef(s.key);
+    }
+    regexpSlots.clear();
+    release(regexpCtor);
+    release(regexpExec);
+    regexpCtor = regexpExec = JSValue::undefined();
     release(exception);
     exception = JSValue::undefined();
     release(returnMarker);

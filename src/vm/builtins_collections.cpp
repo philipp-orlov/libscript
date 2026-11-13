@@ -92,6 +92,21 @@ struct TableState : NativeState
                 out.push_back(e.value);
             }
     }
+    bool ephemeron() const override { return weak; }
+    void dropEntries(bool (*isDead)(void*, JSValue), void* context) override
+    {
+        for (Entry_& e : entries) {
+            if (!e.live || !isDead(context, e.key))
+                continue;
+            index.erase(KeyBox{e.key});
+            const JSValue k = e.key, v = e.value;
+            e.live = false;
+            e.key = e.value = JSValue::undefined();
+            ++dead;
+            release(k);
+            release(v);
+        }
+    }
     std::size_t size() const noexcept { return entries.size() - dead; }
 
     Entry_* find(JSValue key)

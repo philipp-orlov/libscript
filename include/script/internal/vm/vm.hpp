@@ -305,6 +305,16 @@ struct VM : EngineRuntime
     /// array is iterated by index. Not counted (the prototypes hold them).
     JSValue origArrayValues = JSValue::undefined();
     JSValue origIteratorNext = JSValue::undefined();
+    /// The RegExp constructor and `RegExp.prototype.exec` as made, and the slots a plain RegExp counts on staying as they are.
+    JSValue regexpCtor = JSValue::undefined();
+    JSValue regexpExec = JSValue::undefined();
+    struct RegExpSlot
+    {
+        JSObject* owner;  ///< holds a count
+        Key key;          ///< holds a count
+        JSValue value;    ///< holds a count
+    };
+    std::vector<RegExpSlot> regexpSlots;
     std::uint32_t arrayRootShape = 0;
     /// Set by `SetEvalScope` just before a call that may be a direct `eval`.
     const CodeBlock* evalCode = nullptr;
@@ -378,7 +388,8 @@ inline VM& vmOf(const void* cell) noexcept
 /// The bytes a cell of the new family occupies, as it was allocated.
 std::size_t cellBytesOf(const detail::GCObject* cell) noexcept;
 /// Every cell the cell holds a count of, appended to `out`.
-void children(const detail::GCObject* cell, detail::GcList& out);
+/// With `tracing`, what a weak table holds is left out: the collector follows it by its keys.
+void children(const detail::GCObject* cell, detail::GcList& out, bool tracing = false);
 /// Bytes the cell and its out-of-line storage hold.
 std::size_t heapSizeOf(const detail::GCObject* cell) noexcept;
 

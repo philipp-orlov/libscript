@@ -148,6 +148,12 @@ void installCollections(VM& vm);
 /// A new RegExp object (a literal's, or `new RegExp`): owned, or the exception sentinel with a SyntaxError.
 JSValue newRegExp(VM& vm, StringView pattern, StringView flags);
 void installRegExp(VM& vm);
+/// Note what a plain RegExp counts on staying as it is; once all that goes on the prototype and the constructor is there.
+void recordRegExpOriginals(VM& vm);
+/// `IsRegExp`: an object with a truthy `Symbol.match` or that is a RegExp. `*ok` is false with an exception pending.
+bool isRegExpValue(VM& vm, JSValue v, bool* ok);
+/// `SpeciesConstructor(object, fallback)`, owned; the exception sentinel on a failure.
+JSValue speciesConstructor(VM& vm, JSValue object, JSValue fallback);
 /// If `pattern` is an object with a `Symbol.<which>` method, call it with (string, extra) and say so in `*handled`.
 JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, const JSValue* extra, std::uint32_t extraCount,
                          bool* handled);

@@ -30,6 +30,10 @@ struct NativeState
     virtual void values(std::vector<JSValue>& out) const { (void)out; }
     /// Let go of every value it holds, now; safe to call twice.
     virtual void clear(VM& vm) noexcept { (void)vm; }
+    /// A weak table: `values` lists its entries as key, value pairs, and a value lives as long as its key does.
+    virtual bool ephemeron() const { return false; }
+    /// Drop the entries whose key `dead` calls dead, letting go of both.
+    virtual void dropEntries(bool (*dead)(void* context, JSValue key), void* context) { (void)dead; (void)context; }
 };
 
 /// Per-object state few objects have. Made on first need; its presence is `kHasRare`.

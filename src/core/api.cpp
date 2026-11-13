@@ -1969,6 +1969,11 @@ void Context::collectGarbage()
     internal::payload_cache::flushThisThread();
 }
 
+Context::Options::Core Context::core() const noexcept
+{
+    return impl_->core();
+}
+
 Context::Stats Context::stats() const
 {
     Guard guard(impl_.get());

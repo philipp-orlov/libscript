@@ -22,6 +22,13 @@ double num(const char* source)
     return ctx.eval(source, "<test>").toDouble();
 }
 
+/// What the dynamic engine's native code and lazy compile do, which another core does not have: a test about them stands aside.
+bool otherCore()
+{
+    js::Context ctx;
+    return ctx.core() != script::Context::Options::Core::Dyn;
+}
+
 }  // namespace
 
 TEST(arithmeticFollowsTheSpec)
@@ -1550,6 +1557,8 @@ TEST(aLargeFunctionCompiledElsewhereGivesTheSameAnswers)
 
 TEST(appendingToACapturedStringInNativeCodeGrowsItInPlace)
 {
+    if (otherCore())
+        return;
     // `s` is a cell, since a closure shares it; native code appending to it holds a copy of its own, which is no reason to
     // copy the string. Copying would allocate the square of its length.
     js::Context ctx;
@@ -1759,6 +1768,8 @@ TEST(nativeForOfClosesWhatItLeaves)
 
 TEST(aBigProgramCompilesAFunctionWhenItIsFirstCalled)
 {
+    if (otherCore())
+        return;
     // Past 64 KiB of source a plain function is compiled on its first call, from its text, against what it captured
     // when it was made: the answers are the ones compiling it at once would give.
     std::string program = "/*" + std::string(70000, ' ') + "*/";
@@ -1893,6 +1904,8 @@ TEST(aStringBuiltPieceByPieceIsJoinedOnce)
 
 TEST(nativeCodeNoFunctionEntersIsFreed)
 {
+    if (otherCore())
+        return;
     // Code a function stops entering, after a bail, goes back to the cache once no frame is in it: a small cache keeps
     // taking new code for as long as old code is let go.
     script::Context::Options options;

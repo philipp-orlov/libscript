@@ -23,6 +23,7 @@ struct RegExpData : NativeState
     std::shared_ptr<const regex::Program> program;
     String source;
     unsigned flags = 0;
+    bool legacy = true;  ///< made by the RegExp constructor itself, so it may be recompiled
     regex::Matcher matcher;
 };
 
@@ -87,32 +88,35 @@ bool initialize(VM& vm, JSObject* o, StringView pattern, StringView flagText)
     Rare& rare = o->rareOf(vm);
     delete rare.ext;
     rare.ext = data;
-    if (!o->findOwn(vm, vm.atoms.lastIndex))
+    if (!o->findOwn(vm, vm.atoms.lastIndex)) {
         o->putOwn(vm, vm.atoms.lastIndex, JSValue::int32(0), attr::kWritable);
-    else
-        *o->findOwn(vm, vm.atoms.lastIndex) = JSValue::int32(0);
+        return true;
+    }
+    return setProperty(vm, toJSValue(o), vm.atoms.lastIndex, JSValue::int32(0), true);
+}
+
+/// ToLength of a value; false with an exception pending.
+bool toLengthOf(VM& vm, JSValue v, double* out)
+{
+    double d = 0;
+    if (!toNumber(vm, v, &d))
+        return false;
+    d = d != d ? 0 : std::trunc(d);
+    *out = d <= 0 ? 0 : std::min(d, 9007199254740991.0);
     return true;
 }
 
-double readLastIndex(VM& vm, JSObject* o)
+/// `ToLength(rx.lastIndex)`; false with an exception pending.
+bool readLastIndex(VM& vm, JSObject* o, double* out)
 {
     JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex);
-    if (!slot)
-        return 0;
-    double d = 0;
-    if (!toNumber(vm, *slot, &d))
-        return -1;
-    return d != d ? 0 : std::trunc(d);
+    return toLengthOf(vm, slot ? *slot : JSValue::undefined(), out);
 }
 
-void writeLastIndex(VM& vm, JSObject* o, double v)
+/// `rx.lastIndex = v`, throwing when it cannot be written; false with the exception pending.
+bool writeLastIndex(VM& vm, JSObject* o, double v)
 {
-    JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex);
-    if (slot) {
-        const JSValue old = *slot;
-        *slot = JSValue::boxNumber(v);
-        release(old);
-    }
+    return setProperty(vm, toJSValue(o), vm.atoms.lastIndex, JSValue::boxNumber(v), true);
 }
 
 /// The capture bounds of the last successful match.
@@ -202,24 +206,24 @@ JSValue builtinExec(VM& vm, JSValue re, JSValue input)
         return JSValue::exception();
     StringView s = asString(text.get())->text();
     const bool useIndex = (d->flags & (regex::kGlobal | regex::kSticky)) != 0;
-    double last = readLastIndex(vm, o);
-    if (last < 0)
+    double last = 0;
+    if (!readLastIndex(vm, o, &last))
         return JSValue::exception();
     if (!useIndex)
         last = 0;
     if (last > double(s.size())) {
-        if (useIndex)
-            writeLastIndex(vm, o, 0);
+        if (useIndex && !writeLastIndex(vm, o, 0))
+            return JSValue::exception();
         return JSValue::null();
     }
     Match m;
     if (!runExec(d, s, std::size_t(last), &m)) {
-        if (useIndex)
-            writeLastIndex(vm, o, 0);
+        if (useIndex && !writeLastIndex(vm, o, 0))
+            return JSValue::exception();
         return JSValue::null();
     }
-    if (useIndex)
-        writeLastIndex(vm, o, m.end());
+    if (useIndex && !writeLastIndex(vm, o, m.end()))
+        return JSValue::exception();
     return matchArray(vm, d, text.get(), s, m);
 }
 
@@ -277,40 +281,204 @@ String flagString(unsigned f)
     return out;
 }
 
+// ------------------------------------------------------------- the generic path ---
+// What the specification does with any object that has `exec`, `flags` and `lastIndex`. A plain RegExp whose prototype
+// is as it was made takes the shorter way below.
+
+struct Name
+{
+    Key key;
+    Name(VM& vm, const char* text) : key(vm.internKey(std::string_view(text))) {}
+    Name(const Name&) = delete;
+    Name& operator=(const Name&) = delete;
+    ~Name() { detail::decRef(key); }
+};
+
+bool sameValueOf(JSValue a, JSValue b)
+{
+    if (a.isNumber() && b.isNumber()) {
+        const double x = a.asNumber(), y = b.asNumber();
+        if (x != x && y != y)
+            return true;
+        return x == y && std::signbit(x) == std::signbit(y);
+    }
+    return sameValueZero(a, b);
+}
+
+/// IsRegExp: an object with a truthy `Symbol.match`, or else one that is a RegExp. False with `*ok` false on an exception.
+bool isRegExpArg(VM& vm, JSValue v, bool* ok)
+{
+    *ok = true;
+    if (!isObject(v))
+        return false;
+    Handle matcher = Handle::adopt(getProperty(vm, v, vm.atoms.symMatch));
+    if (matcher.get().isException()) {
+        *ok = false;
+        return false;
+    }
+    if (!matcher.get().isUndefined())
+        return toBoolean(matcher.get());
+    return dataOf(v) != nullptr;
+}
+
+/// A plain RegExp made by this engine, with nothing on it or its prototype that a match could notice.
+bool pristine(VM& vm, JSValue rx)
+{
+    RegExpData* d = dataOf(rx);
+    if (!d)
+        return false;
+    JSObject* o = asObject(rx);
+    if (o->proto(vm) != vm.protos.regexp)
+        return false;
+    Rare* r = o->rare();
+    if (!r || r->dict || vm.shapeById(o->h.shape)->count != 1)
+        return false;
+    std::uint8_t attrs = 0;
+    JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex, &attrs);
+    if (!slot || attrs != attr::kWritable || !slot->isNumber())
+        return false;
+    for (const VM::RegExpSlot& s : vm.regexpSlots) {
+        JSValue* now = s.owner->findOwn(vm, s.key);
+        if (!now || now->bits != s.value.bits)
+            return false;
+    }
+    return true;
+}
+
+/// `ToLength(rx.lastIndex)`, read as the language does.
+bool getLastIndex(VM& vm, JSValue rx, double* out)
+{
+    Handle v = Handle::adopt(getProperty(vm, rx, vm.atoms.lastIndex));
+    if (v.get().isException())
+        return false;
+    return toLengthOf(vm, v.get(), out);
+}
+
+/// The text of `rx.flags`; false with an exception pending.
+bool flagsOf(VM& vm, JSValue rx, String* out)
+{
+    Name flags(vm, "flags");
+    Handle v = Handle::adopt(getProperty(vm, rx, flags.key));
+    if (v.get().isException())
+        return false;
+    Handle text = Handle::adopt(toStringValue(vm, v.get()));
+    if (text.get().isException())
+        return false;
+    *out = String(asString(text.get())->text());
+    return true;
+}
+
+/// RegExpExec: `rx.exec(S)`, or the built-in when `rx` has none.
+JSValue regExpExec(VM& vm, JSValue rx, JSValue S)
+{
+    Name exec(vm, "exec");
+    Handle fn = Handle::adopt(getProperty(vm, rx, exec.key));
+    if (fn.get().isException())
+        return fn.get();
+    if (isFunction(fn.get())) {
+        if (fn.get().bits == vm.regexpExec.bits && dataOf(rx))
+            return builtinExec(vm, rx, S);
+        JSValue r = vm.call(fn.get(), rx, &S, 1);
+        if (r.isException())
+            return r;
+        if (!isObject(r) && !r.isNull()) {
+            release(r);
+            return typeError(vm, "the result of exec must be an object or null");
+        }
+        return r;
+    }
+    if (!dataOf(rx))
+        return typeError(vm, "RegExp.prototype.exec requires that 'this' be a RegExp object");
+    return builtinExec(vm, rx, S);
+}
+
+/// `ToString(result[0])`.
+bool matchedText(VM& vm, JSValue result, Handle* out)
+{
+    Handle first = Handle::adopt(getIndex(vm, result, 0));
+    if (first.get().isException())
+        return false;
+    *out = Handle::adopt(toStringValue(vm, first.get()));
+    return !out->get().isException();
+}
+
+/// After an empty match of a global search: `rx.lastIndex` moves on by one character.
+bool stepPastEmpty(VM& vm, JSValue rx, StringView s, bool unicode)
+{
+    double at = 0;
+    if (!getLastIndex(vm, rx, &at))
+        return false;
+    const double next = at >= double(s.size()) ? at + 1 : double(advance(s, std::size_t(at), unicode));
+    return writeLastIndex(vm, asObject(rx), next);
+}
+
 NATIVE(regexpCtor)
 {
     UNUSED();
     const JSValue pattern = arg(args, argc, 0), flags = arg(args, argc, 1);
-    String source, flagText;
+    const bool called = vm.newTarget.isUndefined();
+    bool ok = true;
+    const bool patternIsRegExp = isRegExpArg(vm, pattern, &ok);
+    if (!ok)
+        return JSValue::exception();
+    if (called && patternIsRegExp && flags.isUndefined()) {
+        Name ctorName(vm, "constructor");
+        Handle pc = Handle::adopt(getProperty(vm, pattern, ctorName.key));
+        if (pc.get().isException())
+            return pc.get();
+        if (sameValueOf(vm.regexpCtor, pc.get())) {
+            retain(pattern);
+            return pattern;
+        }
+    }
+    Handle sourceValue, flagValue;
     if (RegExpData* d = dataOf(pattern)) {
-        source = d->source;
-        flagText = flags.isUndefined() ? flagString(d->flags) : String();
-    } else if (!pattern.isUndefined()) {
-        JSValue t = toStringValue(vm, pattern);
+        sourceValue = Handle::adopt(makeString(vm, StringView(d->source)));
+        flagValue = flags.isUndefined() ? Handle::adopt(makeString(vm, StringView(flagString(d->flags)))) : Handle::retained(flags);
+    } else if (patternIsRegExp) {
+        Name source(vm, "source");
+        sourceValue = Handle::adopt(getProperty(vm, pattern, source.key));
+        if (sourceValue.get().isException())
+            return sourceValue.get();
+        if (flags.isUndefined()) {
+            Name flagsName(vm, "flags");
+            flagValue = Handle::adopt(getProperty(vm, pattern, flagsName.key));
+            if (flagValue.get().isException())
+                return flagValue.get();
+        } else {
+            flagValue = Handle::retained(flags);
+        }
+    } else {
+        sourceValue = Handle::retained(pattern);
+        flagValue = Handle::retained(flags);
+    }
+    JSObject* o;
+    Handle keep;
+    if (called) {
+        o = vm.newObject(vm.protos.regexp);
+        keep = Handle::adopt(toJSValue(o));
+    } else {
+        o = asObject(self);
+        keep = Handle::retained(self);
+    }
+    String source, flagText;
+    if (!sourceValue.get().isUndefined()) {
+        JSValue t = toStringValue(vm, sourceValue.get());
         if (t.isException())
             return t;
         source = String(asString(t)->text());
         release(t);
     }
-    if (!flags.isUndefined()) {
-        JSValue t = toStringValue(vm, flags);
+    if (!flagValue.get().isUndefined()) {
+        JSValue t = toStringValue(vm, flagValue.get());
         if (t.isException())
             return t;
         flagText = String(asString(t)->text());
         release(t);
     }
-    JSObject* o;
-    Handle keep;
-    if (!vm.newTarget.isUndefined() && isObject(self)) {
-        o = asObject(self);
-        retain(self);
-        keep = Handle::adopt(self);
-    } else {
-        o = vm.newObject(vm.protos.regexp);
-        keep = Handle::adopt(toJSValue(o));
-    }
     if (!initialize(vm, o, StringView(source), StringView(flagText)))
         return JSValue::exception();
+    dataOf(keep.get())->legacy = called || sameValueOf(vm.newTarget, vm.regexpCtor);
     return keep.take();
 }
 
@@ -319,6 +487,9 @@ NATIVE(regexpCompile)
     UNUSED();
     if (!dataOf(self))
         return typeError(vm, "RegExp.prototype.compile requires that 'this' be a RegExp object");
+    // Only a RegExp made by the RegExp constructor itself may be recompiled: a subclass would lose what it was made as.
+    if (!dataOf(self)->legacy)
+        return typeError(vm, "RegExp.prototype.compile called on an incompatible receiver");
     const JSValue pattern = arg(args, argc, 0), flags = arg(args, argc, 1);
     String source, flagText;
     if (RegExpData* d = dataOf(pattern)) {
@@ -344,6 +515,7 @@ NATIVE(regexpCompile)
     }
     if (!initialize(vm, asObject(self), StringView(source), StringView(flagText)))
         return JSValue::exception();
+    dataOf(self)->legacy = true;
     retain(self);
     return self;
 }
@@ -359,9 +531,12 @@ NATIVE(regexpExec)
 NATIVE(regexpTest)
 {
     UNUSED();
-    if (!thisRegExp(vm, self, "test"))
+    if (!isObject(self))
+        return typeError(vm, "RegExp.prototype.test requires that 'this' be an Object");
+    Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
+    if (text.get().isException())
         return JSValue::exception();
-    JSValue r = builtinExec(vm, self, arg(args, argc, 0));
+    JSValue r = regExpExec(vm, self, text.get());
     if (r.isException())
         return r;
     const bool hit = !r.isNull();
@@ -374,25 +549,57 @@ NATIVE(regexpToString)
     UNUSED();
     if (!isObject(self))
         return typeError(vm, "RegExp.prototype.toString requires that 'this' be an Object");
-    if (RegExpData* d = dataOf(self))
-        return makeString(vm, StringView(u"/" + escapeSource(d->source) + u"/" + flagString(d->flags)));
-    return typeError(vm, "RegExp.prototype.toString requires that 'this' be a RegExp object");
+    Name source(vm, "source"), flags(vm, "flags");
+    Handle src = Handle::adopt(getProperty(vm, self, source.key));
+    if (src.get().isException())
+        return src.get();
+    Handle srcText = Handle::adopt(toStringValue(vm, src.get()));
+    if (srcText.get().isException())
+        return srcText.get();
+    Handle fl = Handle::adopt(getProperty(vm, self, flags.key));
+    if (fl.get().isException())
+        return fl.get();
+    Handle flText = Handle::adopt(toStringValue(vm, fl.get()));
+    if (flText.get().isException())
+        return flText.get();
+    return makeString(vm, StringView(u"/" + String(asString(srcText.get())->text()) + u"/" + String(asString(flText.get())->text())));
 }
+
+constexpr std::intptr_t kFlagsGetter = 1 << 20;
 
 NATIVE(regexpFlagGetter)
 {
     UNUSED();
-    const std::intptr_t which = reinterpret_cast<std::intptr_t>(data);  // 0 source, 1 flags, else the bit
+    const std::intptr_t which = reinterpret_cast<std::intptr_t>(data);  // 0 source, kFlagsGetter flags, else the bit
+    if (!isObject(self))
+        return typeError(vm, "RegExp.prototype getter requires that 'this' be an Object");
+    if (which == kFlagsGetter) {
+        // Read through the flag properties, so a subclass or an object of its own is heard.
+        struct Flag
+        {
+            const char* name;
+            char16_t letter;
+        };
+        String out;
+        for (const Flag& f : {Flag{"hasIndices", u'd'}, Flag{"global", u'g'}, Flag{"ignoreCase", u'i'}, Flag{"multiline", u'm'},
+                              Flag{"dotAll", u's'}, Flag{"unicode", u'u'}, Flag{"unicodeSets", u'v'}, Flag{"sticky", u'y'}}) {
+            Name key(vm, f.name);
+            Handle v = Handle::adopt(getProperty(vm, self, key.key));
+            if (v.get().isException())
+                return v.get();
+            if (toBoolean(v.get()))
+                out.push_back(f.letter);
+        }
+        return makeString(vm, StringView(out));
+    }
     RegExpData* d = dataOf(self);
     if (!d) {
-        if (isObject(self) && asObject(self) == vm.protos.regexp)
-            return which == 0 ? makeString(vm, std::string_view("(?:)")) : which == 1 ? makeString(vm, std::string_view()) : JSValue::undefined();
+        if (asObject(self) == vm.protos.regexp)
+            return which == 0 ? makeString(vm, std::string_view("(?:)")) : JSValue::undefined();
         return typeError(vm, "RegExp.prototype getter requires that 'this' be a RegExp object");
     }
     if (which == 0)
         return makeString(vm, StringView(escapeSource(d->source)));
-    if (which == 1)
-        return makeString(vm, StringView(flagString(d->flags)));
     return JSValue::boolean((d->flags & unsigned(which)) != 0);
 }
 
@@ -458,18 +665,254 @@ void expand(String& out, StringView templ, StringView s, const Match& m, RegExpD
     }
 }
 
+/// GetSubstitution over captures that are values: what the generic path has instead of match bounds.
+bool substitute(VM& vm, String& out, StringView matched, StringView s, std::size_t position, const std::vector<Handle>& captures,
+                JSValue named, StringView templ)
+{
+    const std::size_t m = captures.size();
+    const std::size_t tail = std::min(position + matched.size(), s.size());
+    for (std::size_t i = 0; i < templ.size(); ++i) {
+        const char16_t c = templ[i];
+        if (c != u'$' || i + 1 >= templ.size()) {
+            out.push_back(c);
+            continue;
+        }
+        const char16_t n = templ[i + 1];
+        if (n == u'$') {
+            out.push_back(u'$');
+            ++i;
+        } else if (n == u'&') {
+            out += matched;
+            ++i;
+        } else if (n == u'`') {
+            out += s.substr(0, std::min(position, s.size()));
+            ++i;
+        } else if (n == u'\'') {
+            out += s.substr(tail);
+            ++i;
+        } else if (n >= u'0' && n <= u'9') {
+            const bool two = i + 2 < templ.size() && templ[i + 2] >= u'0' && templ[i + 2] <= u'9';
+            std::size_t index = two ? std::size_t(n - u'0') * 10 + (templ[i + 2] - u'0') : std::size_t(n - u'0');
+            std::size_t digits = two ? 2 : 1;
+            if (two && index > m) {
+                digits = 1;
+                index = std::size_t(n - u'0');
+            }
+            if (index >= 1 && index <= m) {
+                const JSValue cap = captures[index - 1].get();
+                if (isString(cap))
+                    out += asString(cap)->text();
+                i += digits;
+            } else {
+                out.push_back(c);
+            }
+        } else if (n == u'<') {
+            const std::size_t close = named.isUndefined() ? StringView::npos : templ.find(u'>', i + 2);
+            if (close == StringView::npos) {
+                out.push_back(c);
+                continue;
+            }
+            Key key = vm.internKey(templ.substr(i + 2, close - i - 2));
+            Handle v = Handle::adopt(getProperty(vm, named, key));
+            detail::decRef(key);
+            if (v.get().isException())
+                return false;
+            if (!v.get().isUndefined()) {
+                Handle text = Handle::adopt(toStringValue(vm, v.get()));
+                if (text.get().isException())
+                    return false;
+                out += asString(text.get())->text();
+            }
+            i = close;
+        } else {
+            out.push_back(c);
+        }
+    }
+    return true;
+}
+
+/// Symbol.replace for a plain RegExp: the matches first, then what replaces them.
+JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSValue replacement, bool functional, JSValue templValue)
+{
+    JSObject* o = asObject(self);
+    StringView s = asString(textValue)->text();
+    const bool global = (d->flags & regex::kGlobal) != 0, sticky = (d->flags & regex::kSticky) != 0;
+    const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
+    std::size_t at = 0;
+    if (global) {
+        if (!writeLastIndex(vm, o, 0))
+            return JSValue::exception();
+    } else if (sticky) {
+        double last = 0;
+        if (!readLastIndex(vm, o, &last))
+            return JSValue::exception();
+        at = last > double(s.size()) ? s.size() + 1 : std::size_t(last);
+    }
+    std::vector<Match> found;
+    for (;;) {
+        Match m;
+        if (at > s.size() || !runExec(d, s, at, &m)) {
+            if ((sticky || global) && !writeLastIndex(vm, o, 0))
+                return JSValue::exception();
+            break;
+        }
+        const std::size_t ms = std::size_t(m.start()), me = std::size_t(m.end());
+        found.push_back(m);
+        if (!global) {
+            if (sticky && !writeLastIndex(vm, o, double(me)))
+                return JSValue::exception();
+            break;
+        }
+        at = me == ms ? advance(s, me, unicode) : me;
+    }
+    String out;
+    std::size_t copied = 0;
+    for (const Match& m : found) {
+        const std::size_t ms = std::size_t(m.start()), me = std::size_t(m.end());
+        if (ms < copied)
+            continue;
+        out += s.substr(copied, ms - copied);
+        if (functional) {
+            std::vector<Handle> callArgs;
+            for (std::size_t g = 0; g < m.groups(); ++g)
+                callArgs.push_back(Handle::adopt(captureString(vm, s, m, g)));
+            callArgs.push_back(Handle::adopt(JSValue::int32(std::int32_t(ms))));
+            callArgs.push_back(Handle::retained(textValue));
+            if (!regex::namedGroups(*d->program).empty())
+                callArgs.push_back(Handle::adopt(namedGroupsObject(vm, d, s, m)));
+            std::vector<JSValue> raw;
+            for (const Handle& h : callArgs)
+                raw.push_back(h.get());
+            JSValue r = vm.call(replacement, JSValue::undefined(), raw.data(), std::uint32_t(raw.size()));
+            if (r.isException())
+                return r;
+            JSValue rs = toStringValue(vm, r);
+            release(r);
+            if (rs.isException())
+                return rs;
+            out += asString(rs)->text();
+            release(rs);
+        } else {
+            expand(out, asString(templValue)->text(), s, m, d);
+        }
+        copied = me;
+    }
+    if (copied < s.size())
+        out += s.substr(copied);
+    return makeString(vm, StringView(out));
+}
+
+JSValue genericReplace(VM& vm, JSValue rx, JSValue S, JSValue replaceValue, bool functional, JSValue templValue)
+{
+    StringView s = asString(S)->text();
+    String flags;
+    if (!flagsOf(vm, rx, &flags))
+        return JSValue::exception();
+    const bool global = flags.find(u'g') != String::npos;
+    const bool unicode = flags.find(u'u') != String::npos || flags.find(u'v') != String::npos;
+    if (global && !writeLastIndex(vm, asObject(rx), 0))
+        return JSValue::exception();
+    std::vector<Handle> results;
+    for (;;) {
+        JSValue r = regExpExec(vm, rx, S);
+        if (r.isException())
+            return r;
+        if (r.isNull())
+            break;
+        results.push_back(Handle::adopt(r));
+        if (!global)
+            break;
+        Handle matched;
+        if (!matchedText(vm, r, &matched))
+            return JSValue::exception();
+        if (asString(matched.get())->length == 0 && !stepPastEmpty(vm, rx, s, unicode))
+            return JSValue::exception();
+    }
+    Name lengthName(vm, "length"), indexName(vm, "index"), groupsName(vm, "groups");
+    String out;
+    std::size_t next = 0;
+    for (const Handle& rh : results) {
+        const JSValue result = rh.get();
+        Handle lengthValue = Handle::adopt(getProperty(vm, result, lengthName.key));
+        if (lengthValue.get().isException())
+            return lengthValue.get();
+        double resultLength = 0;
+        if (!toLengthOf(vm, lengthValue.get(), &resultLength))
+            return JSValue::exception();
+        const double nCaptures = std::max(resultLength - 1, 0.0);
+        Handle matched;
+        if (!matchedText(vm, result, &matched))
+            return JSValue::exception();
+        const StringView matchedView = asString(matched.get())->text();
+        Handle indexValue = Handle::adopt(getProperty(vm, result, indexName.key));
+        if (indexValue.get().isException())
+            return indexValue.get();
+        double position = 0;
+        if (!toNumber(vm, indexValue.get(), &position))
+            return JSValue::exception();
+        position = position != position ? 0 : std::trunc(position);
+        position = std::max(0.0, std::min(position, double(s.size())));
+        std::vector<Handle> captures;
+        for (double n = 1; n <= nCaptures; ++n) {
+            Handle cap = Handle::adopt(getIndex(vm, result, std::uint32_t(n)));
+            if (cap.get().isException())
+                return cap.get();
+            if (!cap.get().isUndefined()) {
+                cap = Handle::adopt(toStringValue(vm, cap.get()));
+                if (cap.get().isException())
+                    return cap.get();
+            }
+            captures.push_back(std::move(cap));
+        }
+        Handle named = Handle::adopt(getProperty(vm, result, groupsName.key));
+        if (named.get().isException())
+            return named.get();
+        String replacement;
+        if (functional) {
+            std::vector<JSValue> callArgs;
+            callArgs.push_back(matched.get());
+            for (const Handle& c : captures)
+                callArgs.push_back(c.get());
+            callArgs.push_back(JSValue::boxNumber(position));
+            callArgs.push_back(S);
+            if (!named.get().isUndefined())
+                callArgs.push_back(named.get());
+            JSValue r = vm.call(replaceValue, JSValue::undefined(), callArgs.data(), std::uint32_t(callArgs.size()));
+            if (r.isException())
+                return r;
+            Handle rs = Handle::adopt(toStringValue(vm, r));
+            release(r);
+            if (rs.get().isException())
+                return rs.get();
+            replacement = String(asString(rs.get())->text());
+        } else {
+            if (!named.get().isUndefined()) {
+                named = Handle::adopt(toObject(vm, named.get()));
+                if (named.get().isException())
+                    return named.get();
+            }
+            if (!substitute(vm, replacement, matchedView, s, std::size_t(position), captures, named.get(), asString(templValue)->text()))
+                return JSValue::exception();
+        }
+        if (std::size_t(position) >= next) {
+            out += s.substr(next, std::size_t(position) - next);
+            out += replacement;
+            next = std::size_t(position) + matchedView.size();
+        }
+    }
+    if (next < s.size())
+        out += s.substr(next);
+    return makeString(vm, StringView(out));
+}
+
 NATIVE(regexpReplace)
 {
     UNUSED();
-    RegExpData* d = thisRegExp(vm, self, "[Symbol.replace]");
-    if (!d)
-        return JSValue::exception();
-    JSObject* o = asObject(self);
-    Handle keep = Handle::retained(self);
+    if (!isObject(self))
+        return typeError(vm, "RegExp.prototype[Symbol.replace] requires that 'this' be an Object");
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
-    StringView s = asString(text.get())->text();
     const JSValue replacement = arg(args, argc, 1);
     const bool functional = isFunction(replacement);
     Handle templ;
@@ -478,130 +921,77 @@ NATIVE(regexpReplace)
         if (templ.get().isException())
             return JSValue::exception();
     }
-    const bool global = (d->flags & regex::kGlobal) != 0, sticky = (d->flags & regex::kSticky) != 0;
-    const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
-    std::size_t at = 0;
-    if (global) {
-        writeLastIndex(vm, o, 0);
-    } else if (sticky) {
-        const double last = readLastIndex(vm, o);
-        if (last < 0)
-            return JSValue::exception();
-        at = last > double(s.size()) ? s.size() + 1 : std::size_t(last);
-    }
-    String out;
-    std::size_t copied = 0;
-    for (;;) {
-        Match m;
-        if (at > s.size() || !runExec(d, s, at, &m)) {
-            if (sticky && !global)
-                writeLastIndex(vm, o, 0);
-            break;
-        }
-        const std::size_t ms = std::size_t(m.start()), me = std::size_t(m.end());
-        if (ms >= copied) {
-            out += s.substr(copied, ms - copied);
-            if (functional) {
-                std::vector<Handle> callArgs;
-                for (std::size_t g = 0; g < m.groups(); ++g)
-                    callArgs.push_back(Handle::adopt(captureString(vm, s, m, g)));
-                callArgs.push_back(Handle::adopt(JSValue::int32(std::int32_t(ms))));
-                callArgs.push_back(text);
-                const bool named = !regex::namedGroups(*d->program).empty();
-                if (named)
-                    callArgs.push_back(Handle::adopt(namedGroupsObject(vm, d, s, m)));
-                std::vector<JSValue> raw;
-                for (const Handle& h : callArgs)
-                    raw.push_back(h.get());
-                JSValue r = vm.call(replacement, JSValue::undefined(), raw.data(), std::uint32_t(raw.size()));
-                if (r.isException())
-                    return r;
-                JSValue rs = toStringValue(vm, r);
-                release(r);
-                if (rs.isException())
-                    return rs;
-                out += asString(rs)->text();
-                release(rs);
-            } else {
-                expand(out, asString(templ.get())->text(), s, m, d);
-            }
-            copied = me;
-        }
-        if (!global) {
-            if (sticky)
-                writeLastIndex(vm, o, double(me));
-            break;
-        }
-        at = me == ms ? advance(s, me, unicode) : me;
-    }
-    if (copied < s.size())
-        out += s.substr(copied);
-    return makeString(vm, StringView(out));
+    if (pristine(vm, self))
+        return fastReplace(vm, self, dataOf(self), text.get(), replacement, functional, templ.get());
+    return genericReplace(vm, self, text.get(), replacement, functional, templ.get());
 }
 
 NATIVE(regexpMatch)
 {
     UNUSED();
-    RegExpData* d = thisRegExp(vm, self, "[Symbol.match]");
-    if (!d)
-        return JSValue::exception();
-    if (!(d->flags & regex::kGlobal))
-        return builtinExec(vm, self, arg(args, argc, 0));
-    JSObject* o = asObject(self);
+    if (!isObject(self))
+        return typeError(vm, "RegExp.prototype[Symbol.match] requires that 'this' be an Object");
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
+    String flags;
+    if (!flagsOf(vm, self, &flags))
+        return JSValue::exception();
+    if (flags.find(u'g') == String::npos)
+        return regExpExec(vm, self, text.get());
+    const bool unicode = flags.find(u'u') != String::npos || flags.find(u'v') != String::npos;
     StringView s = asString(text.get())->text();
-    const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
-    writeLastIndex(vm, o, 0);
+    if (!writeLastIndex(vm, asObject(self), 0))
+        return JSValue::exception();
     JSArray* out = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(out));
-    std::size_t at = 0;
-    Match m;
-    while (at <= s.size() && runExec(d, s, at, &m)) {
-        out->append(vm, captureString(vm, s, m, 0));
-        at = m.start() == m.end() ? advance(s, std::size_t(m.end()), unicode) : std::size_t(m.end());
+    for (;;) {
+        JSValue r = regExpExec(vm, self, text.get());
+        if (r.isException())
+            return r;
+        if (r.isNull())
+            return out->length == 0 ? JSValue::null() : keep.take();
+        Handle result = Handle::adopt(r);
+        Handle matched;
+        if (!matchedText(vm, r, &matched))
+            return JSValue::exception();
+        retain(matched.get());
+        out->append(vm, matched.get());
+        if (asString(matched.get())->length == 0 && !stepPastEmpty(vm, self, s, unicode))
+            return JSValue::exception();
     }
-    writeLastIndex(vm, o, 0);
-    if (out->length == 0)
-        return JSValue::null();
-    return keep.take();
 }
 
 NATIVE(regexpSearch)
 {
     UNUSED();
-    RegExpData* d = thisRegExp(vm, self, "[Symbol.search]");
-    if (!d)
-        return JSValue::exception();
+    if (!isObject(self))
+        return typeError(vm, "RegExp.prototype[Symbol.search] requires that 'this' be an Object");
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
-    StringView s = asString(text.get())->text();
-    Match m;
-    // Searches from the start whatever `lastIndex` says, and leaves it alone.
-    if (d->flags & regex::kSticky ? !runExec(d, s, 0, &m) : !runExec(d, s, 0, &m))
+    Handle previous = Handle::adopt(getProperty(vm, self, vm.atoms.lastIndex));
+    if (previous.get().isException())
+        return previous.get();
+    if (!sameValueOf(previous.get(), JSValue::int32(0)) && !setProperty(vm, self, vm.atoms.lastIndex, JSValue::int32(0), true))
+        return JSValue::exception();
+    JSValue r = regExpExec(vm, self, text.get());
+    if (r.isException())
+        return r;
+    Handle result = Handle::adopt(r);
+    Handle current = Handle::adopt(getProperty(vm, self, vm.atoms.lastIndex));
+    if (current.get().isException())
+        return current.get();
+    if (!sameValueOf(current.get(), previous.get()) && !setProperty(vm, self, vm.atoms.lastIndex, previous.get(), true))
+        return JSValue::exception();
+    if (result.get().isNull())
         return JSValue::int32(-1);
-    return JSValue::int32(m.start());
+    return getProperty(vm, result.get(), vm.atoms.index);
 }
 
-NATIVE(regexpSplit)
+/// Symbol.split for a plain RegExp: searches ahead for the next match rather than trying every position.
+JSValue fastSplit(VM& vm, RegExpData* d, StringView s, double limit)
 {
-    UNUSED();
-    RegExpData* d = thisRegExp(vm, self, "[Symbol.split]");
-    if (!d)
-        return JSValue::exception();
-    Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
-    if (text.get().isException())
-        return JSValue::exception();
-    StringView s = asString(text.get())->text();
-    double limit = 4294967295.0;
-    if (!arg(args, argc, 1).isUndefined()) {
-        double l;
-        if (!toNumber(vm, args[1], &l))
-            return JSValue::exception();
-        limit = double(toUint32(l));
-    }
     JSArray* out = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(out));
     if (limit == 0)
@@ -639,11 +1029,11 @@ NATIVE(regexpSplit)
             continue;
         }
         out->append(vm, makeString(vm, s.substr(p, ms - p)));
-        if (out->length == limit)
+        if (double(out->length) == limit)
             return keep.take();
         for (std::size_t g = 1; g < m.groups(); ++g) {
             out->append(vm, captureString(vm, s, m, g));
-            if (out->length == limit)
+            if (double(out->length) == limit)
                 return keep.take();
         }
         p = end;
@@ -653,11 +1043,110 @@ NATIVE(regexpSplit)
     return keep.take();
 }
 
+NATIVE(regexpSplit)
+{
+    UNUSED();
+    if (!isObject(self))
+        return typeError(vm, "RegExp.prototype[Symbol.split] requires that 'this' be an Object");
+    Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
+    if (text.get().isException())
+        return JSValue::exception();
+    StringView s = asString(text.get())->text();
+    if (pristine(vm, self)) {
+        double limit = 4294967295.0;
+        if (!arg(args, argc, 1).isUndefined()) {
+            double l;
+            if (!toNumber(vm, args[1], &l))
+                return JSValue::exception();
+            limit = double(toUint32(l));
+        }
+        return fastSplit(vm, dataOf(self), s, limit);
+    }
+    Handle ctor = Handle::adopt(speciesConstructor(vm, self, vm.regexpCtor));
+    if (ctor.get().isException())
+        return ctor.get();
+    String flags;
+    if (!flagsOf(vm, self, &flags))
+        return JSValue::exception();
+    const bool unicode = flags.find(u'u') != String::npos || flags.find(u'v') != String::npos;
+    const String newFlags = flags.find(u'y') != String::npos ? flags : flags + u"y";
+    Handle flagsValue = Handle::adopt(makeString(vm, StringView(newFlags)));
+    const JSValue ctorArgs[2] = {self, flagsValue.get()};
+    Handle splitter = Handle::adopt(vm.construct(ctor.get(), ctorArgs, 2));
+    if (splitter.get().isException())
+        return splitter.get();
+    double limit = 4294967295.0;
+    if (!arg(args, argc, 1).isUndefined()) {
+        double l;
+        if (!toNumber(vm, args[1], &l))
+            return JSValue::exception();
+        limit = double(toUint32(l));
+    }
+    JSArray* out = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(out));
+    if (limit == 0)
+        return keep.take();
+    if (s.empty()) {
+        JSValue z = regExpExec(vm, splitter.get(), text.get());
+        if (z.isException())
+            return z;
+        const bool matched = !z.isNull();
+        release(z);
+        if (!matched)
+            out->append(vm, makeString(vm, s));
+        return keep.take();
+    }
+    std::size_t p = 0, q = 0;
+    Name lengthName(vm, "length");
+    while (q < s.size()) {
+        if (!writeLastIndex(vm, asObject(splitter.get()), double(q)))
+            return JSValue::exception();
+        JSValue z = regExpExec(vm, splitter.get(), text.get());
+        if (z.isException())
+            return z;
+        if (z.isNull()) {
+            q = advance(s, q, unicode);
+            continue;
+        }
+        Handle result = Handle::adopt(z);
+        double e = 0;
+        if (!getLastIndex(vm, splitter.get(), &e))
+            return JSValue::exception();
+        e = std::min(e, double(s.size()));
+        if (std::size_t(e) == p) {
+            q = advance(s, q, unicode);
+            continue;
+        }
+        out->append(vm, makeString(vm, s.substr(p, q - p)));
+        if (double(out->length) == limit)
+            return keep.take();
+        p = std::size_t(e);
+        Handle lengthValue = Handle::adopt(getProperty(vm, z, lengthName.key));
+        if (lengthValue.get().isException())
+            return lengthValue.get();
+        double count = 0;
+        if (!toLengthOf(vm, lengthValue.get(), &count))
+            return JSValue::exception();
+        for (double i = 1; i < count; ++i) {
+            JSValue cap = getIndex(vm, z, std::uint32_t(i));
+            if (cap.isException())
+                return cap;
+            out->append(vm, cap);
+            if (double(out->length) == limit)
+                return keep.take();
+        }
+        q = p;
+    }
+    out->append(vm, makeString(vm, s.substr(p)));
+    return keep.take();
+}
+
 struct MatchAllIter : IteratorState
 {
     JSValue re, text;
+    bool global, unicode;
     bool done = false;
-    MatchAllIter(JSValue r, JSValue t) : re(r), text(t)
+    MatchAllIter(JSValue r, JSValue t, bool g, bool u) : re(r), text(t), global(g), unicode(u)
     {
         retain(re);
         retain(text);
@@ -679,22 +1168,23 @@ struct MatchAllIter : IteratorState
     {
         if (done)
             return 0;
-        RegExpData* d = dataOf(re);
-        JSValue r = builtinExec(vm, re, text);
-        if (r.isException())
+        JSValue r = regExpExec(vm, re, text);
+        if (r.isException()) {
+            done = true;
             return -1;
+        }
         if (r.isNull()) {
             done = true;
             return 0;
         }
-        if (!(d->flags & regex::kGlobal)) {
+        if (!global) {
             done = true;
         } else {
-            JSValue first = static_cast<JSArray*>(asObject(r))->at(0);
-            if (isString(first) && asString(first)->length == 0) {
-                JSObject* o = asObject(re);
-                const double last = readLastIndex(vm, o);
-                writeLastIndex(vm, o, double(advance(asString(text)->text(), std::size_t(last), (d->flags & regex::kUnicode) != 0)));
+            Handle matched;
+            if (!matchedText(vm, r, &matched) || (asString(matched.get())->length == 0 && !stepPastEmpty(vm, re, asString(text)->text(), unicode))) {
+                release(r);
+                done = true;
+                return -1;
             }
         }
         *out = r;
@@ -705,26 +1195,34 @@ struct MatchAllIter : IteratorState
 NATIVE(regexpMatchAll)
 {
     UNUSED();
-    RegExpData* d = thisRegExp(vm, self, "[Symbol.matchAll]");
-    if (!d)
-        return JSValue::exception();
+    if (!isObject(self))
+        return typeError(vm, "RegExp.prototype[Symbol.matchAll] requires that 'this' be an Object");
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
-    // The iterator works on a copy, so the original's `lastIndex` stays as it was.
-    JSObject* copy = vm.newObject(vm.protos.regexp);
-    Handle copyKeep = Handle::adopt(toJSValue(copy));
-    if (!initialize(vm, copy, StringView(d->source), StringView(flagString(d->flags))))
+    Handle ctor = Handle::adopt(speciesConstructor(vm, self, vm.regexpCtor));
+    if (ctor.get().isException())
+        return ctor.get();
+    String flags;
+    if (!flagsOf(vm, self, &flags))
         return JSValue::exception();
-    writeLastIndex(vm, copy, readLastIndex(vm, asObject(self)));
-    return newNativeIterator(vm, new MatchAllIter(copyKeep.get(), text.get()));
+    Handle flagsValue = Handle::adopt(makeString(vm, StringView(flags)));
+    const JSValue ctorArgs[2] = {self, flagsValue.get()};
+    Handle matcher = Handle::adopt(vm.construct(ctor.get(), ctorArgs, 2));
+    if (matcher.get().isException())
+        return matcher.get();
+    double last = 0;
+    if (!getLastIndex(vm, self, &last))
+        return JSValue::exception();
+    if (!setProperty(vm, matcher.get(), vm.atoms.lastIndex, JSValue::boxNumber(last), true))
+        return JSValue::exception();
+    return newNativeIterator(vm, new MatchAllIter(matcher.get(), text.get(), flags.find(u'g') != String::npos,
+                                                  flags.find(u'u') != String::npos || flags.find(u'v') != String::npos));
 }
 
 // ------------------------------------------------------------------ String ---
 
-bool isRegExpValue(JSValue v) { return dataOf(v) != nullptr; }
-
-/// `String.prototype.match` and `search`: a pattern that is not a RegExp is made into one.
+/// `String.prototype.match`, `search` and `matchAll`: a pattern that is not a RegExp is made into one.
 NATIVE(stringMatchOrSearch)
 {
     UNUSED();
@@ -733,15 +1231,31 @@ NATIVE(stringMatchOrSearch)
     const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 match, 1 search, 2 matchAll
     const JSValue pattern = arg(args, argc, 0);
     Key symbol = mode == 0 ? vm.atoms.symMatch : mode == 1 ? vm.atoms.symSearch : vm.atoms.symMatchAll;
+    if (mode == 2 && isObject(pattern)) {
+        bool ok = true;
+        if (isRegExpArg(vm, pattern, &ok)) {
+            Name flagsName(vm, "flags");
+            Handle flags = Handle::adopt(getProperty(vm, pattern, flagsName.key));
+            if (flags.get().isException())
+                return flags.get();
+            if (flags.get().isNullish())
+                return typeError(vm, "String.prototype.matchAll called with a RegExp whose flags are missing");
+            Handle text = Handle::adopt(toStringValue(vm, flags.get()));
+            if (text.get().isException())
+                return text.get();
+            if (asString(text.get())->text().find(u'g') == StringView::npos)
+                return typeError(vm, "String.prototype.matchAll called with a non-global RegExp argument");
+        } else if (!ok) {
+            return JSValue::exception();
+        }
+    }
+    bool handled = false;
+    JSValue r = callSymbolMethod(vm, pattern, symbol, self, nullptr, 0, &handled);
+    if (handled)
+        return r;
     Handle text = Handle::adopt(toStringValue(vm, self));
     if (text.get().isException())
         return JSValue::exception();
-    if (mode == 2 && isRegExpValue(pattern) && !(dataOf(pattern)->flags & regex::kGlobal))
-        return typeError(vm, "String.prototype.matchAll called with a non-global RegExp argument");
-    bool handled = false;
-    JSValue r = callSymbolMethod(vm, pattern, symbol, text.get(), nullptr, 0, &handled);
-    if (handled)
-        return r;
     // A pattern that is not a RegExp is made into one.
     String source;
     if (!pattern.isUndefined()) {
@@ -788,6 +1302,11 @@ JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, co
     return vm.call(method, pattern, callArgs, 1 + extraCount);
 }
 
+bool isRegExpValue(VM& vm, JSValue v, bool* ok)
+{
+    return isRegExpArg(vm, v, ok);
+}
+
 JSValue newRegExp(VM& vm, StringView pattern, StringView flags)
 {
     JSObject* o = vm.newObject(vm.protos.regexp);
@@ -803,8 +1322,11 @@ void installRegExp(VM& vm)
     vm.setIntrinsic(&vm.protos.regexp, proto);
     release(toJSValue(proto));
     JSFunction* ctor = constructor(vm, "RegExp", regexpCtor, 2, proto);
-    (void)ctor;
-    method(vm, proto, "exec", regexpExec, 1);
+    vm.regexpCtor = toJSValue(ctor);
+    retain(vm.regexpCtor);
+    JSFunction* exec = method(vm, proto, "exec", regexpExec, 1);
+    vm.regexpExec = toJSValue(exec);
+    retain(vm.regexpExec);
     method(vm, proto, "compile", regexpCompile, 2);
     method(vm, proto, "test", regexpTest, 1);
     method(vm, proto, "toString", regexpToString, 0);
@@ -818,11 +1340,10 @@ void installRegExp(VM& vm)
         const char* name;
         std::intptr_t which;
     };
-    for (const Getter& g : {Getter{"source", 0}, Getter{"flags", 1}, Getter{"global", regex::kGlobal},
-                            Getter{"ignoreCase", regex::kIgnoreCase}, Getter{"multiline", regex::kMultiline},
-                            Getter{"dotAll", regex::kDotAll}, Getter{"unicode", regex::kUnicode},
-                            Getter{"unicodeSets", regex::kUnicodeSets}, Getter{"sticky", regex::kSticky},
-                            Getter{"hasIndices", regex::kHasIndices}}) {
+    for (const Getter& g : {Getter{"dotAll", regex::kDotAll}, Getter{"flags", kFlagsGetter}, Getter{"global", regex::kGlobal},
+                            Getter{"hasIndices", regex::kHasIndices}, Getter{"ignoreCase", regex::kIgnoreCase},
+                            Getter{"multiline", regex::kMultiline}, Getter{"source", 0}, Getter{"sticky", regex::kSticky},
+                            Getter{"unicode", regex::kUnicode}, Getter{"unicodeSets", regex::kUnicodeSets}}) {
         Key key = vm.internKey(std::string_view(g.name));
         Key fnName = vm.internKey(std::string_view(std::string("get ") + g.name));
         JSFunction* getter = vm.newNativeFunction(vm.protos.function, regexpFlagGetter, reinterpret_cast<void*>(g.which), fnName, 0);
@@ -835,6 +1356,32 @@ void installRegExp(VM& vm)
     method(vm, sp, "match", stringMatchOrSearch, 1, reinterpret_cast<void*>(0));
     method(vm, sp, "search", stringMatchOrSearch, 1, reinterpret_cast<void*>(1));
     method(vm, sp, "matchAll", stringMatchOrSearch, 1, reinterpret_cast<void*>(2));
+}
+
+/// What a plain RegExp counts on staying as it is, taken once everything that goes on the prototype and the constructor is there.
+void recordRegExpOriginals(VM& vm)
+{
+    JSObject* proto = vm.protos.regexp;
+    JSObject* ctor = asObject(vm.regexpCtor);
+    const char* const names[] = {"exec", "constructor", "flags", "global", "ignoreCase", "multiline", "dotAll", "unicode",
+                                 "unicodeSets", "sticky", "hasIndices"};
+    auto add = [&](JSObject* owner, Key key) {
+        JSValue* slot = owner->findOwn(vm, key);
+        if (!slot)
+            return;
+        retain(*slot);
+        retain(toJSValue(owner));
+        detail::incRef(key);
+        vm.regexpSlots.push_back(VM::RegExpSlot{owner, key, *slot});
+    };
+    for (const char* name : names) {
+        Key key = vm.internKey(std::string_view(name));
+        add(proto, key);
+        detail::decRef(key);
+    }
+    add(ctor, vm.atoms.symSpecies);
+    for (Key key : {vm.atoms.symMatch, vm.atoms.symReplace, vm.atoms.symSplit, vm.atoms.symMatchAll, vm.atoms.symSearch})
+        add(proto, key);
 }
 
 }  // namespace bi

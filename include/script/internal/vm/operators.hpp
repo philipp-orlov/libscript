@@ -14,6 +14,8 @@ namespace internal {
 namespace vm {
 
 bool toBoolean(JSValue v) noexcept;
+/// Whether `new v(...)` can work: a function made to be a constructor.
+bool isConstructor(JSValue v) noexcept;
 /// `ToPrimitive`; `preferString` is the hint. An owned value.
 JSValue toPrimitive(VM& vm, JSValue v, bool preferString);
 /// `hint` 0 default, 1 number, 2 string.

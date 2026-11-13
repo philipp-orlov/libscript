@@ -8,6 +8,8 @@
 
 #include <cstring>
 
+#include "script/internal/context.hpp"
+
 #include "script/config.hpp"
 
 namespace script {
@@ -67,6 +69,25 @@ const std::vector<const LanguageInfo*>& languageTable() noexcept
 #endif
     };
     return table;
+}
+
+#if SCRIPT_VM && SCRIPT_VM_LANG_JAVASCRIPT
+namespace vm {
+const LanguageInfo& javascriptLanguage() noexcept;
+}
+#endif
+
+const LanguageInfo* languageInfoFor(const ContextImpl& rt, Language id) noexcept
+{
+    if (rt.core() == Context::Options::Core::Vm) {
+#if SCRIPT_VM && SCRIPT_VM_LANG_JAVASCRIPT
+        if (id == Language::JavaScript)
+            return &vm::javascriptLanguage();
+#endif
+        // Asked for the new core, and this language is not on it: a refusal, never a silent run on the other core.
+        return languageInfo(id) && languageInfo(id)->engine == EngineKind::Dynamic ? nullptr : languageInfo(id);
+    }
+    return languageInfo(id);
 }
 
 const LanguageInfo* languageInfo(Language id) noexcept

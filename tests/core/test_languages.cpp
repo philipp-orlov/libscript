@@ -139,3 +139,34 @@ TEST(diagnosticsCarryTheirLanguage)
     t.message = "not assignable";
     CHECK_EQ(t.toString(), std::string("a.ts(3): error: not assignable"));
 }
+
+TEST(coreOptionPicksTheEngine)
+{
+    if (!SCRIPT_LANG_JAVASCRIPT)
+        return;
+    script::Context::Options dyn;
+    dyn.language = Language::JavaScript;
+    dyn.core = script::Context::Options::Core::Dyn;
+    script::Context onDyn(dyn);
+    CHECK_EQ(onDyn.eval("6 * 7").toInt(), 42);
+
+    script::Context::Options vm;
+    vm.language = Language::JavaScript;
+    vm.core = script::Context::Options::Core::Vm;
+    script::Context onVm(vm);
+    bool refused = false;
+    try {
+        onVm.eval("6 * 7");
+    } catch (const script::Error& e) {
+        refused = e.code() == script::ErrorCode::NotSupported;
+    }
+    // Until the new core compiles anything, asking for it is a refusal in a build that has it and in one that has not.
+    CHECK(refused);
+    // And the default context still runs, while the new core is not the default.
+    if (!SCRIPT_VM_DEFAULT) {
+        script::Context::Options plain;
+        plain.language = Language::JavaScript;
+        script::Context onDefault(plain);
+        CHECK_EQ(onDefault.eval("6 * 7").toInt(), 42);
+    }
+}

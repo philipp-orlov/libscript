@@ -21,6 +21,28 @@ option(SCRIPT_LANG_C "C: statically typed, on the typed engine" ON)
 option(SCRIPT_LANG_CPP "C++: the C front end's dialect with classes and the standard containers, on the typed engine" ON)
 option(SCRIPT_ENABLE_JIT "Compile the arm64 and x86-64 code generators for the typed engine" ON)
 
+# ---- the second JavaScript core ---------------------------------------------
+# The new execution core (ls-jsc.md) is built beside the dynamic engine, which stays the oracle until the switch-over.
+#   dyn   (default) the dynamic engine only
+#   vm    the new core is the default of every context; the dynamic engine is still built for the languages not yet ported
+#   both  both are built; Context::Options::core, or SCRIPT_CORE with SCRIPT_JIT_ENV_OVERRIDE, picks one per context
+set(SCRIPT_JS_CORE "dyn" CACHE STRING "dyn, vm or both")
+set_property(CACHE SCRIPT_JS_CORE PROPERTY STRINGS dyn vm both)
+if(NOT SCRIPT_JS_CORE MATCHES "^(dyn|vm|both)$")
+    message(FATAL_ERROR "SCRIPT_JS_CORE must be dyn, vm or both, not '${SCRIPT_JS_CORE}'")
+endif()
+set(SCRIPT_VM_TIERS "0" CACHE STRING "Highest tier of the new core compiled in: 0 interpreter, 1 baseline, 2 optimizing")
+set_property(CACHE SCRIPT_VM_TIERS PROPERTY STRINGS 0 1 2)
+if(NOT SCRIPT_VM_TIERS MATCHES "^[012]$")
+    message(FATAL_ERROR "SCRIPT_VM_TIERS must be 0, 1 or 2, not '${SCRIPT_VM_TIERS}'")
+endif()
+set(SCRIPT_VM_LANGS "javascript" CACHE STRING "Languages the new core runs (a language is added by its port task)")
+set(SCRIPT_VM_DISPATCH "goto" CACHE STRING "Interpreter dispatch: goto, or tail (guaranteed tail calls)")
+set_property(CACHE SCRIPT_VM_DISPATCH PROPERTY STRINGS goto tail)
+if(NOT SCRIPT_VM_DISPATCH MATCHES "^(goto|tail)$")
+    message(FATAL_ERROR "SCRIPT_VM_DISPATCH must be goto or tail, not '${SCRIPT_VM_DISPATCH}'")
+endif()
+
 # ---- how big ------------------------------------------------------------------
 # One switch for the trade between a small embeddable binary and top speed; each feature it decides stays an option of
 # its own, so a build can pick differently.
@@ -230,6 +252,43 @@ if(SCRIPT_ENABLE_JIT AND NOT SCRIPT_ENGINE_TYPED)
     set(SCRIPT_ENABLE_JIT OFF)
 endif()
 
+# The new core needs the dynamic engine's front end and shared cells, so it exists only where that does. Until it runs
+# every JavaScript suite (milestone M0) it is never the default: `vm` then builds it and keeps `dyn` as the default.
+set(SCRIPT_VM OFF)
+set(SCRIPT_VM_DEFAULT OFF)
+if(NOT SCRIPT_JS_CORE STREQUAL "dyn" AND SCRIPT_ENGINE_DYNAMIC)
+    set(SCRIPT_VM ON)
+    set(SCRIPT_VM_CORE_COMPLETE OFF)
+    if(SCRIPT_JS_CORE STREQUAL "vm" AND SCRIPT_VM_CORE_COMPLETE)
+        set(SCRIPT_VM_DEFAULT ON)
+    elseif(SCRIPT_JS_CORE STREQUAL "vm")
+        message(WARNING "libscript: the new core is not complete; SCRIPT_JS_CORE=vm builds it but contexts default to the dynamic engine")
+    endif()
+endif()
+if(SCRIPT_VM)
+    set(SCRIPT_VM_TIER_MAX ${SCRIPT_VM_TIERS})
+    list(APPEND SCRIPT_CORE_SOURCES src/vm/vm.cpp src/vm/language.cpp)
+    foreach(lang ${SCRIPT_VM_LANGS})
+        if(NOT lang STREQUAL "javascript")
+            message(FATAL_ERROR "SCRIPT_VM_LANGS: '${lang}' is not ported to the new core yet")
+        endif()
+        if(NOT SCRIPT_LANG_JAVASCRIPT)
+            message(FATAL_ERROR "SCRIPT_VM_LANGS names javascript but SCRIPT_LANG_JAVASCRIPT is off")
+        endif()
+    endforeach()
+else()
+    set(SCRIPT_VM_TIER_MAX 0)
+endif()
+set(SCRIPT_VM_LANG_JAVASCRIPT OFF)
+if(SCRIPT_VM AND "javascript" IN_LIST SCRIPT_VM_LANGS)
+    set(SCRIPT_VM_LANG_JAVASCRIPT ON)
+endif()
+if(SCRIPT_VM_DISPATCH STREQUAL "tail")
+    set(SCRIPT_VM_DISPATCH_TAIL_01 1)
+else()
+    set(SCRIPT_VM_DISPATCH_TAIL_01 0)
+endif()
+
 set(SCRIPT_SOURCES ${SCRIPT_CORE_SOURCES} ${SCRIPT_LANGUAGE_SOURCES})
 if(SCRIPT_ENGINE_TYPED)
     list(APPEND SCRIPT_SOURCES ${SCRIPT_TYPED_SOURCES})
@@ -269,7 +328,8 @@ endif()
 # ---- the generated configuration header ---------------------------------------
 foreach(flag SCRIPT_LANG_CSHARP SCRIPT_LANG_TYPESCRIPT SCRIPT_LANG_JAVASCRIPT
              SCRIPT_LANG_PYTHON SCRIPT_LANG_C SCRIPT_LANG_CPP SCRIPT_ENGINE_TYPED
-             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT SCRIPT_ENABLE_DYN_JIT SCRIPT_ENABLE_JIT_THREAD SCRIPT_UNICODE_PROPERTIES)
+             SCRIPT_ENGINE_DYNAMIC SCRIPT_ENABLE_JIT SCRIPT_ENABLE_DYN_JIT SCRIPT_ENABLE_JIT_THREAD SCRIPT_UNICODE_PROPERTIES
+             SCRIPT_VM SCRIPT_VM_DEFAULT SCRIPT_VM_LANG_JAVASCRIPT)
     if(${flag})
         set(${flag}_01 1)
     else()
@@ -326,7 +386,7 @@ set_target_properties(script PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-message(STATUS "libscript: languages ${SCRIPT_LANGUAGE_NAMES}; typed engine ${SCRIPT_ENGINE_TYPED}; dynamic engine ${SCRIPT_ENGINE_DYNAMIC}; profile ${SCRIPT_PROFILE}; jit ${SCRIPT_ENABLE_JIT}; lto ${SCRIPT_ENABLE_LTO}")
+message(STATUS "libscript: languages ${SCRIPT_LANGUAGE_NAMES}; typed engine ${SCRIPT_ENGINE_TYPED}; dynamic engine ${SCRIPT_ENGINE_DYNAMIC}; profile ${SCRIPT_PROFILE}; js core ${SCRIPT_JS_CORE} (vm ${SCRIPT_VM}, tiers ${SCRIPT_VM_TIER_MAX}); jit ${SCRIPT_ENABLE_JIT}; lto ${SCRIPT_ENABLE_LTO}")
 
 # ---- the rest ----------------------------------------------------------------
 include(GNUInstallDirs)

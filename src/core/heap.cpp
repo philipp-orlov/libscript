@@ -13,6 +13,9 @@
 #if SCRIPT_ENGINE_DYNAMIC
 #include "script/internal/dyn/census.hpp"
 #include "script/internal/dyn/runtime.hpp"
+#if SCRIPT_VM
+#include "script/internal/vm/vm.hpp"
+#endif
 #endif
 
 namespace script {
@@ -282,6 +285,7 @@ ContextImpl::~ContextImpl()
 
     typed_.reset();
     dyn_.reset();
+    vm_.reset();
 }
 
 /// Let go of what `count` values refer to, as a dying cell does: nothing is destroyed from here, so a long chain of them
@@ -764,6 +768,35 @@ dyn::Runtime& ContextImpl::dyn()
 #endif
 }
 
+vm::VM& ContextImpl::vm()
+{
+#if SCRIPT_VM
+    if (!vm_) {
+        vm_ = std::make_unique<vm::VM>(*this);
+        runtimes_[runtimeCount_++] = vm_.get();
+    }
+    return *vmIfAny();
+#else
+    throw Error(ErrorCode::NotSupported, "this build of libscript does not contain the vm core");
+#endif
+}
+
+vm::VM* ContextImpl::vmIfAny() const noexcept
+{
+#if SCRIPT_VM
+    return static_cast<vm::VM*>(vm_.get());
+#else
+    return nullptr;
+#endif
+}
+
+Context::Options::Core ContextImpl::core() const noexcept
+{
+    if (options.core != Context::Options::Core::Auto)
+        return options.core;
+    return SCRIPT_VM_DEFAULT ? Context::Options::Core::Vm : Context::Options::Core::Dyn;
+}
+
 typed::Runtime* ContextImpl::typedIfAny() const noexcept
 {
 #if SCRIPT_ENGINE_TYPED
@@ -792,10 +825,12 @@ EngineKind ContextImpl::engineFor(Language language) const noexcept
     }
     if (lastEngine != EngineKind::None)
         return lastEngine;
-    if (typed_ && !dyn_)
+    if (typed_ && !dyn_ && !vm_)
         return EngineKind::Typed;
-    if (dyn_ && !typed_)
+    if (dyn_ && !typed_ && !vm_)
         return EngineKind::Dynamic;
+    if (vm_ && !typed_ && !dyn_)
+        return EngineKind::Vm;
     const auto& table = languageTable();
     return table.empty() ? EngineKind::None : table.front()->engine;
 }

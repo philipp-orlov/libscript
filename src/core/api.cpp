@@ -1200,6 +1200,12 @@ Context::Options withEnvironment(const Context::Options& options)
 {
     Context::Options out = options;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* core = std::getenv("SCRIPT_CORE")) {
+        if (std::strcmp(core, "dyn") == 0)
+            out.core = Context::Options::Core::Dyn;
+        else if (std::strcmp(core, "vm") == 0)
+            out.core = Context::Options::Core::Vm;
+    }
     if (const char* mode = std::getenv("SCRIPT_JIT")) {
         if (std::strcmp(mode, "eager") == 0) {
             out.jit.mode = JitOptions::Mode::Eager;
@@ -1281,12 +1287,15 @@ const LanguageInfo& frontEndFor(ContextImpl& rt, std::string_view name, Language
         const auto& table = languageTable();
         if (table.empty())
             throw Error(ErrorCode::NotSupported, "this build of libscript contains no language");
-        return *table.front();
+        language = table.front()->id;
     }
-    const LanguageInfo* info = languageInfo(language);
-    if (!info)
+    const LanguageInfo* info = languageInfoFor(rt, language);
+    if (!info) {
+        if (rt.core() == Context::Options::Core::Vm && languageInfo(language))
+            throw Error(ErrorCode::NotSupported, std::string("the vm core does not run ") + toString(language) + " yet");
         throw Error(ErrorCode::NotSupported, std::string("this build of libscript has no ") +
                                                  toString(language) + " support");
+    }
     return *info;
 }
 
@@ -1294,7 +1303,9 @@ const LanguageInfo& frontEndOf(const Assembly& assembly)
 {
     if (!assembly)
         throw Error(ErrorCode::ArgumentException, "the assembly is empty");
-    const LanguageInfo* info = languageInfo(assembly.language());
+    // The core that compiled it runs it: the unit's context says which.
+    const internal::ContextImpl* owner = assembly.impl()->context;
+    const LanguageInfo* info = owner ? languageInfoFor(*owner, assembly.language()) : languageInfo(assembly.language());
     if (!info)
         throw Error(ErrorCode::NotSupported, "the assembly's language is not in this build");
     return *info;

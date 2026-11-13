@@ -33,6 +33,7 @@ enum class EngineKind : std::uint8_t
     None = 0,
     Typed,    ///< resolved, typed AST in -> typed bytecode, optionally native code
     Dynamic,  ///< ECMAScript AST in -> dynamic bytecode
+    Vm,       ///< ECMAScript AST in -> register bytecode on the new core (src/vm)
 };
 
 /// A compiled program of any language: what `Assembly` wraps. Each engine
@@ -76,8 +77,11 @@ struct LanguageInfo
 
 /// The languages compiled into this build, in `Auto` preference order.
 const std::vector<const LanguageInfo*>& languageTable() noexcept;
-/// The info for a language, or null when the build lacks it.
+/// The info for a language, or null when the build lacks it. This is the dynamic engine's for a language both cores run.
 const LanguageInfo* languageInfo(Language id) noexcept;
+/// The info `rt` runs a language with: the new core's when the context's core is `Vm` and the language is ported to it,
+/// null when the context asks for a core this build or language does not have.
+const LanguageInfo* languageInfoFor(const ContextImpl& rt, Language id) noexcept;
 
 }  // namespace internal
 }  // namespace script

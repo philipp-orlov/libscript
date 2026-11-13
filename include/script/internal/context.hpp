@@ -32,6 +32,9 @@ struct Runtime;
 namespace dyn {
 struct Runtime;
 }
+namespace vm {
+struct VM;
+}
 
 /// What an engine's runtime owes the shared heap.
 struct EngineRuntime
@@ -64,7 +67,7 @@ struct HostClassInfo
     const void* typeKey = nullptr;  ///< set by `Class<T>`, null for a static class
     std::vector<Member> members;
     /// How many members each engine has installed, indexed by `EngineKind - 1`.
-    std::size_t installed[2] = {0, 0};
+    std::size_t installed[3] = {0, 0, 0};
 };
 
 struct ContextImpl
@@ -269,6 +272,11 @@ struct ContextImpl
     /// pays for one engine.
     typed::Runtime& typed();
     dyn::Runtime& dyn();
+    /// The new core's runtime; `Error(NotSupported)` in a build without it.
+    vm::VM& vm();
+    vm::VM* vmIfAny() const noexcept;
+    /// The core this context runs the dynamic languages on, never `Auto`.
+    Context::Options::Core core() const noexcept;
     typed::Runtime* typedIfAny() const noexcept;
     dyn::Runtime* dynIfAny() const noexcept;
     /// The engine that should shape a new host wrapper: the one running, else
@@ -320,7 +328,8 @@ private:
     void trimBuffers() noexcept;
     std::unique_ptr<EngineRuntime> typed_;
     std::unique_ptr<EngineRuntime> dyn_;
-    EngineRuntime* runtimes_[2] = {nullptr, nullptr};
+    std::unique_ptr<EngineRuntime> vm_;
+    EngineRuntime* runtimes_[3] = {nullptr, nullptr, nullptr};
     std::size_t runtimeCount_ = 0;
 };
 

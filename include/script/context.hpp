@@ -190,6 +190,15 @@ public:
         CompileOptions compile;              ///< how the C# front end compiles
         CheckOptions check;                  ///< how strictly TypeScript is checked
         JitOptions jit;                      ///< native code generation
+        /// Which execution core runs the dynamic languages. `Auto` is what the build chose (`SCRIPT_JS_CORE`); `Vm`
+        /// is refused with `Error(NotSupported)` by a build without the new core or a language it has not ported.
+        enum class Core : std::uint8_t
+        {
+            Auto,
+            Dyn,
+            Vm,
+        };
+        Core core = Core::Auto;
         /// `eval` and `new Function` compile and run strings a program makes. Off, the engine runs only the source its
         /// host hands it, and both are a TypeError.
         bool runtimeCode = false;

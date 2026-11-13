@@ -13,6 +13,7 @@
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
+#include "script/internal/vm/typed.hpp"
 #include "builtins_util.hpp"
 
 namespace script {
@@ -160,6 +161,9 @@ JSValue forInKeys(VM& vm, JSValue value)
             for (std::uint32_t i = 0; i < a->length; ++i)
                 if (!a->elems[i].isHole())
                     indexes.push_back(i);
+        } else if (o->cls() == ObjClass::TypedArray) {
+            for (std::uint32_t i = 0; i < static_cast<JSTypedArray*>(o)->length; ++i)
+                indexes.push_back(i);
         }
         o->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue) {
             if (!(attrs & attr::kEnumerable) || k->kind != detail::CellKind::String)
@@ -1058,6 +1062,12 @@ L_GetProp: {
             ++pc;
             NEXT();
         }
+        if (key == vm.atoms.length && o->cls() == ObjClass::TypedArray) {
+            const std::uint32_t n = static_cast<JSTypedArray*>(o)->length;
+            SET(ins->a, n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            ++pc;
+            NEXT();
+        }
         SCRIPT_VM_CENSUS(SlowGetProp);
         if (cacheId != kNoCache) {
             if (learnRead(vm, ic, o, key)) {
@@ -1142,6 +1152,13 @@ L_GetElem: {
                 COPY(ins->a, a->elems[i]);
                 NEXT();
             }
+        } else if (isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
+            auto* t = static_cast<JSTypedArray*>(asObject(base));
+            const std::uint32_t i = std::uint32_t(k.asInt32());
+            if (i < t->length && !isBigKind(t->kind)) {
+                SET(ins->a, loadNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)]));
+                NEXT();
+            }
         } else if (isString(base)) {
             StringCell* s = asString(base);
             const std::uint32_t i = std::uint32_t(k.asInt32());
@@ -1181,6 +1198,15 @@ L_GetElem: {
 }
 L_PutElem: {
     const JSValue base = R[ins->a], k = R[ins->b];
+    if (k.isInt32() && k.asInt32() >= 0 && R[ins->c].isNumber() && isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
+        auto* t = static_cast<JSTypedArray*>(asObject(base));
+        const std::uint32_t i = std::uint32_t(k.asInt32());
+        if (!isBigKind(t->kind)) {
+            if (i < t->length)
+                storeNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)], R[ins->c].asNumber());
+            NEXT();
+        }
+    }
     if (k.isInt32() && k.asInt32() >= 0 && isObject(base) && asObject(base)->cls() == ObjClass::Array &&
         !(asObject(base)->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
         auto* a = static_cast<JSArray*>(asObject(base));

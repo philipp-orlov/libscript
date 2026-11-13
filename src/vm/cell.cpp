@@ -77,6 +77,7 @@ std::size_t cellBytesOf(const detail::GCObject* cell) noexcept
             const auto* o = reinterpret_cast<const JSObject*>(cell);
             switch (o->cls()) {
                 case ObjClass::Array: return sizeof(JSArray);
+                case ObjClass::TypedArray: return sizeof(JSTypedArray);
                 case ObjClass::Function: return JSFunction::bytesFor(static_cast<const JSFunction*>(o)->nUpvals);
                 default: return JSObject::bytesFor(o->h.aux);
             }
@@ -134,6 +135,8 @@ void children(const detail::GCObject* cell, detail::GcList& out)
                 auto* a = static_cast<JSArray*>(o);
                 for (std::uint32_t i = 0; i < a->length; ++i)
                     appendIfCell(out, a->elems[i]);
+            } else if (o->cls() == ObjClass::TypedArray) {
+                appendIfCell(out, static_cast<JSTypedArray*>(o)->buffer);
             }
             if (Rare* r = o->rare(); r && r->ext) {
                 std::vector<JSValue> held;
@@ -184,6 +187,11 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
                     release(a->elems[i]);
             if (a->elems)
                 vm.freePayload(a->elems, 8u * a->capacity);
+            break;
+        }
+        case ObjClass::TypedArray: {
+            if (!vm.tearingDown)
+                release(static_cast<JSTypedArray*>(o)->buffer);
             break;
         }
         case ObjClass::Function: {
@@ -289,6 +297,12 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
             }
             if (Rare* r = o->rare(); r && r->ext)
                 r->ext->clear(vm);
+            if (o->cls() == ObjClass::TypedArray) {
+                auto* t = static_cast<JSTypedArray*>(o);
+                release(t->buffer);
+                t->buffer = JSValue::undefined();
+                t->length = 0;
+            }
             if (o->cls() == ObjClass::Array) {
                 auto* a = static_cast<JSArray*>(o);
                 for (std::uint32_t i = 0; i < a->length; ++i) {
@@ -375,9 +389,14 @@ void VM::releaseRoots() noexcept
             detail::decRef(k);
         k = nullptr;
     }
+    for (JSObject*& p : protos.typedArrays) {
+        if (p)
+            detail::decRef(reinterpret_cast<CellPtr>(p));
+        p = nullptr;
+    }
     for (JSObject** p : {&protos.object, &protos.function, &protos.array, &protos.number, &protos.string, &protos.boolean,
                          &protos.symbol, &protos.bigint, &protos.generator, &protos.iterator,
-                          &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet, &protos.regexp, &protos.promise}) {
+                          &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet, &protos.regexp, &protos.promise, &protos.arrayBuffer}) {
         if (*p)
             detail::decRef(reinterpret_cast<CellPtr>(*p));
         *p = nullptr;

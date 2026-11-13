@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "script/internal/vm/bytecode.hpp"
 #include "script/internal/vm/object.hpp"
 
@@ -25,6 +26,52 @@ JSObject* VM::newObject(Shape* root, std::uint8_t aux)
 JSObject* VM::newObject(JSObject* proto, std::uint8_t aux)
 {
     return newObject(rootShapeFor(proto), aux);
+}
+
+BufferState::~BufferState()
+{
+    if (data) {
+        std::free(data);
+        data = nullptr;
+    }
+}
+
+JSObject* VM::newArrayBuffer(std::size_t bytes)
+{
+    if (bytes > (std::size_t(1) << 31)) {
+        throwError(ErrorCode::RangeError, "Array buffer allocation failed");
+        return nullptr;
+    }
+    ctx.reserve(bytes);
+    auto* state = new BufferState();
+    state->vm = this;
+    state->data = static_cast<std::uint8_t*>(std::calloc(bytes ? bytes : 1, 1));
+    if (!state->data) {
+        delete state;
+        throwError(ErrorCode::RangeError, "Array buffer allocation failed");
+        return nullptr;
+    }
+    state->size = bytes;
+    JSObject* o = newObject(protos.arrayBuffer);
+    o->h.cls = std::uint8_t(ObjClass::ArrayBuffer);
+    o->rareOf(*this).ext = state;
+    return o;
+}
+
+JSTypedArray* VM::newTypedArray(JSObject* proto, ElemKind kind, JSObject* buffer, std::uint32_t byteOffset, std::uint32_t length)
+{
+    Shape* root = rootShapeFor(proto);
+    auto* t = static_cast<JSTypedArray*>(allocCell(sizeof(JSTypedArray), Kind::Object, ObjClass::TypedArray, 0));
+    t->h.shape = root->id;
+    t->slots = nullptr;
+    auto* state = static_cast<BufferState*>(buffer->rare()->ext);
+    t->data = state->data + byteOffset;
+    t->length = length;
+    t->kind = kind;
+    t->byteOffset = byteOffset;
+    t->buffer = toJSValue(buffer);
+    detail::incRef(reinterpret_cast<CellPtr>(buffer));
+    return t;
 }
 
 JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capacity)

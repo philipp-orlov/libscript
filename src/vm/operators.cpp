@@ -97,6 +97,18 @@ JSValue bigintToString(VM& vm, JSValue v, int radix)
     return makeString(vm, StringView(dyn::bigint::toString(bigCell(v), radix)));
 }
 
+JSValue bigintFromInt64(VM& vm, std::int64_t v, bool isUnsigned)
+{
+    try {
+        dyn::bigint::Env env = bigEnv(vm);
+        return fromValue(vm, isUnsigned ? dyn::bigint::fromUint64(env, std::uint64_t(v)) : dyn::bigint::fromInt64(env, v));
+    } catch (const Error& e) {
+        return vm.throwError(e.code(), e.what());
+    }
+}
+
+std::uint64_t bigintLow64(JSValue v) { return dyn::bigint::toUint64(bigCell(v)); }
+
 JSValue bigintAsN(VM& vm, std::uint64_t bits, JSValue a, bool isSigned)
 {
     try {

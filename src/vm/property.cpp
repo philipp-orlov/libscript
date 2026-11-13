@@ -5,6 +5,7 @@
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
+#include "script/internal/vm/typed.hpp"
 
 namespace script {
 namespace internal {
@@ -123,6 +124,14 @@ JSValue getProperty(VM& vm, JSValue base, Key key)
         base.asCell()->kind == detail::CellKind::Object)
         return vm.throwError(ErrorCode::TypeError, "an object of the dynamic engine is not readable by the vm core");
     for (; o; o = o->proto(vm)) {
+        if (o->cls() == ObjClass::TypedArray) {
+            auto* t = static_cast<JSTypedArray*>(o);
+            if (key == vm.atoms.length)
+                return number(t->length);
+            std::uint32_t index;
+            if (arrayIndexOf(key, &index))
+                return index < t->length ? typedGet(vm, t, index) : JSValue::undefined();
+        }
         if (o->cls() == ObjClass::Array) {
             auto* a = static_cast<JSArray*>(o);
             if (key == vm.atoms.length)
@@ -163,6 +172,11 @@ bool hasProperty(VM& vm, JSValue base, Key key)
     }
     (void)direct;
     for (o = asObject(base); o; o = o->proto(vm)) {
+        if (o->cls() == ObjClass::TypedArray) {
+            std::uint32_t index;
+            if (arrayIndexOf(key, &index))
+                return index < static_cast<JSTypedArray*>(o)->length;
+        }
         if (o->cls() == ObjClass::Array) {
             auto* a = static_cast<JSArray*>(o);
             std::uint32_t index;
@@ -207,6 +221,11 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
     if (!isObject(base))
         return refuse(vm, strict, "Cannot create property on a primitive value");
     JSObject* receiver = asObject(base);
+    if (receiver->cls() == ObjClass::TypedArray) {
+        std::uint32_t index;
+        if (arrayIndexOf(key, &index))
+            return typedSet(vm, static_cast<JSTypedArray*>(receiver), double(index), value);
+    }
     if (receiver->cls() == ObjClass::Array) {
         auto* a = static_cast<JSArray*>(receiver);
         std::uint32_t index;
@@ -265,6 +284,11 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
     if (!isObject(base))
         return true;
     JSObject* o = asObject(base);
+    if (o->cls() == ObjClass::TypedArray) {
+        std::uint32_t index;
+        if (arrayIndexOf(key, &index))
+            return index >= static_cast<JSTypedArray*>(o)->length || refuse(vm, strict, "Cannot delete property of a typed array");
+    }
     if (o->cls() == ObjClass::Array) {
         auto* a = static_cast<JSArray*>(o);
         std::uint32_t index;
@@ -290,6 +314,15 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
 
 bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t attrs)
 {
+    if (object->cls() == ObjClass::TypedArray) {
+        std::uint32_t index;
+        if (arrayIndexOf(key, &index)) {
+            const bool ok = index < static_cast<JSTypedArray*>(object)->length &&
+                            typedSet(vm, static_cast<JSTypedArray*>(object), double(index), value);
+            release(value);
+            return ok;
+        }
+    }
     if (object->cls() == ObjClass::Array) {
         auto* a = static_cast<JSArray*>(object);
         std::uint32_t index;

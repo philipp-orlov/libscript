@@ -64,6 +64,8 @@ JSValue bigintUnary(VM& vm, int kind, JSValue a);
 JSValue bigintFromText(VM& vm, StringView text, bool* ok);
 JSValue bigintFromDouble(VM& vm, double d);
 JSValue bigintToString(VM& vm, JSValue v, int radix);
+JSValue bigintFromInt64(VM& vm, std::int64_t v, bool isUnsigned);
+std::uint64_t bigintLow64(JSValue v);
 JSValue bigintAsN(VM& vm, std::uint64_t bits, JSValue a, bool isSigned);
 double bigintToDouble(JSValue v);
 bool bigintIsZero(JSValue v) noexcept;

@@ -154,6 +154,33 @@ struct JSArray : JSObject
     bool allNumbers() const noexcept { return (h.flags & cellflags::kAllNumbers) != 0; }
 };
 
+/// The element types of typed arrays and what a DataView reads.
+enum class ElemKind : std::uint8_t
+{
+    Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float32, Float64, BigInt64, BigUint64, Count,
+};
+inline constexpr std::uint32_t kElemSize[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
+
+/// A typed array: a window on an ArrayBuffer. `data` points into the buffer, which this holds a count of; the buffer
+/// does not move (the buffers of this core do not resize), so the pointer stays good.
+struct JSTypedArray : JSObject
+{
+    std::uint8_t* data;
+    std::uint32_t length;  ///< elements
+    ElemKind kind;
+    JSValue buffer;        ///< the ArrayBuffer object, counted
+    std::uint32_t byteOffset;
+};
+
+/// What an ArrayBuffer's object keeps (in its `Rare::ext`).
+struct BufferState : NativeState
+{
+    std::uint8_t* data = nullptr;
+    std::size_t size = 0;
+    VM* vm = nullptr;
+    ~BufferState() override;
+};
+
 struct Box
 {
     CellHeader h;

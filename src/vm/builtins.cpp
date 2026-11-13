@@ -15,6 +15,7 @@
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
+#include "script/internal/vm/typed.hpp"
 #include "builtins_util.hpp"
 
 namespace script {
@@ -246,6 +247,27 @@ NATIVE(objectKeys)
     if (!isObject(target))
         return keep.take();
     JSObject* o = asObject(target);
+    if (o->cls() == ObjClass::TypedArray) {
+        auto* ta = static_cast<JSTypedArray*>(o);
+        for (std::uint32_t i = 0; i < ta->length; ++i) {
+            JSValue idx = toStringValue(vm, JSValue::int32(std::int32_t(i)));
+            if (mode == 0) {
+                out->append(vm, idx);
+                continue;
+            }
+            JSValue v = typedGet(vm, ta, i);
+            if (mode == 1) {
+                release(idx);
+                out->append(vm, v);
+            } else {
+                JSArray* pair = vm.newArray(vm.protos.array);
+                pair->append(vm, idx);
+                pair->append(vm, v);
+                out->append(vm, toJSValue(pair));
+            }
+        }
+        return keep.take();
+    }
     std::vector<std::pair<std::uint32_t, Key>> indexed;
     std::vector<std::pair<Key, JSValue>> named;
     if (o->cls() == ObjClass::Array) {
@@ -2631,6 +2653,7 @@ void VM::installBuiltins()
     installRegExp(*this);
     installPromise(*this);
     installDate(*this);
+    installTypedArrays(*this);
 }
 
 namespace bi {

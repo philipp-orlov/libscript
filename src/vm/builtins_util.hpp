@@ -154,6 +154,7 @@ JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, co
 JSValue asyncStart(VM& vm, JSValue generator);
 void installPromise(VM& vm);
 void installDate(VM& vm);
+void installTypedArrays(VM& vm);
 /// A global property, taking the count of `v`.
 inline void defineGlobal(VM& vm, const char* name, JSValue v)
 {

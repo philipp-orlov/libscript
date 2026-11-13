@@ -23,6 +23,8 @@ namespace vm {
 struct JSObject;
 struct JSArray;
 struct JSFunction;
+struct JSTypedArray;
+enum class ElemKind : std::uint8_t;
 struct Box;
 struct GetterSetter;
 struct Rare;
@@ -96,6 +98,8 @@ struct Intrinsics
     JSObject* weakSet = nullptr;
     JSObject* regexp = nullptr;
     JSObject* promise = nullptr;
+    JSObject* arrayBuffer = nullptr;
+    JSObject* typedArrays[16] = {};  ///< by ElemKind
 };
 
 /// One activation on the VM stack. `R` is its register window; register 0 is `this`, then the parameters. A function called
@@ -168,6 +172,10 @@ struct VM : EngineRuntime
     JSObject* newObject(JSObject* proto, std::uint8_t aux = 3);
     JSArray* newArray(JSObject* proto, std::uint32_t length = 0, std::uint32_t capacity = 0);
     Box* newBox(JSValue ownedValue);
+    /// An ArrayBuffer of `bytes` zeros; owned, or null with a RangeError pending when it cannot be had.
+    JSObject* newArrayBuffer(std::size_t bytes);
+    /// A typed array over `buffer` (an ArrayBuffer object, which it counts) from `byteOffset`, `length` elements.
+    JSTypedArray* newTypedArray(JSObject* proto, ElemKind kind, JSObject* buffer, std::uint32_t byteOffset, std::uint32_t length);
     GetterSetter* newGetterSetter(JSValue getter, JSValue setter);
     /// A closure over `n` boxes, each of which gets a count, and a count of `code`. `length`, `name` and, for a
     /// constructor, `prototype` appear as properties on first use.

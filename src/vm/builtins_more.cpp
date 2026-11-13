@@ -8,6 +8,7 @@
 
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/object.hpp"
+#include "script/internal/vm/typed.hpp"
 #include "builtins_util.hpp"
 
 namespace script {
@@ -20,6 +21,9 @@ void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
     o->materialize(vm);
     std::vector<std::pair<std::uint32_t, Key>> indexed;
     std::vector<Key> named, syms;
+    if (strings && o->cls() == ObjClass::TypedArray)
+        for (std::uint32_t i = 0; i < static_cast<JSTypedArray*>(o)->length; ++i)
+            indexed.push_back({i, nullptr});
     if (strings && o->cls() == ObjClass::Array) {
         auto* a = static_cast<JSArray*>(o);
         for (std::uint32_t i = 0; i < a->length; ++i)
@@ -90,6 +94,17 @@ bool ownDescriptor(VM& vm, JSObject* o, Key key, OwnDesc& out)
 {
     o->materialize(vm);
     const bool frozen = (o->h.flags & cellflags::kFrozen) != 0;
+    if (o->cls() == ObjClass::TypedArray) {
+        auto* t = static_cast<JSTypedArray*>(o);
+        std::uint32_t index;
+        if (arrayIndexOf(key, &index)) {
+            if (index >= t->length)
+                return false;
+            out.attrs = attr::kDefault;
+            out.value = Handle::adopt(typedGet(vm, t, index));
+            return true;
+        }
+    }
     if (o->cls() == ObjClass::Array) {
         auto* a = static_cast<JSArray*>(o);
         if (key == vm.atoms.length) {

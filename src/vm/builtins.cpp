@@ -317,7 +317,7 @@ NATIVE(objectKeys)
         return keep.take();
     JSObject* o = asObject(target);
     if (proxyOf(o)) {
-        std::vector<Handle> names;
+        Vec<Handle> names;
         ownKeys(vm, o, true, false, true, names);
         if (!vm.exception.isUndefined())
             return JSValue::exception();
@@ -845,7 +845,7 @@ NATIVE(objectAssign)
         if (source.isException())
             return source;
         Handle sourceKeep = Handle::adopt(source);
-        std::vector<Handle> keys;
+        Vec<Handle> keys;
         ownKeys(vm, asObject(source), true, true, true, keys);
         for (Handle& key : keys) {
             const Key k = static_cast<Key>(key.get().asCell());
@@ -961,7 +961,7 @@ NATIVE(functionApply)
 {
     UNUSED();
     JSValue list = arg(args, argc, 1);
-    std::vector<Handle> held;
+    Vec<Handle> held;
     if (!list.isNullish() && !listFromArrayLike(vm, list, held))
         return JSValue::exception();
     std::vector<JSValue> values;
@@ -1445,7 +1445,7 @@ NATIVE(arraySortImpl)
         return typeError(vm, "The comparison function must be either a function or undefined");
     retain(self);
     Handle keep = Handle::adopt(self);
-    std::vector<JSValue> items;
+    Vec<JSValue> items;
     std::uint32_t undefinedCount = 0, holes = 0;
     for (std::uint32_t i = 0; i < a->length; ++i) {
         const JSValue e = a->elems[i];
@@ -1502,7 +1502,7 @@ NATIVE(arraySortImpl)
         release(sy);
         return r;
     };
-    std::stable_sort(items.begin(), items.end(), less);
+    mergeSort(items.data(), items.data() + items.size(), less);
     if (failed) {
         for (JSValue v : items)
             release(v);
@@ -2241,12 +2241,12 @@ struct JsonWriter
 {
     VM& vm;
     Handle replacerFn;
-    std::vector<Handle> allow;
+    Vec<Handle> allow;
     bool hasAllow = false;
     String gap;
     String indent;
     String out;
-    std::vector<JSObject*> stack;
+    Vec<JSObject*> stack;
     Key toJson = nullptr;  ///< held for the length of the call
 };
 
@@ -2380,7 +2380,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
     const String stepback = j.indent;
     j.indent += j.gap;
     const bool array = isArray(v);
-    std::vector<Handle> keys;
+    Vec<Handle> keys;
     if (array) {
         // Elements are read through `length`, as the spec says.
     } else if (j.hasAllow) {
@@ -2742,7 +2742,7 @@ JSValue jsonRevive(VM& vm, JSValue holder, Key key, JSValue reviver)
     Handle value = Handle::adopt(got);
     if (isObject(value.get())) {
         JSValue self = value.get();
-        std::vector<Handle> names;
+        Vec<Handle> names;
         if (isArray(self)) {
             JSValue len = getProperty(vm, self, vm.atoms.length);
             if (len.isException())

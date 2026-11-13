@@ -30,7 +30,7 @@ struct Helper : NativeState
     double counter = 0;
     Handle innerIterator, innerNext;                     ///< flatMap's and concat's current iterable
     bool inInner = false;
-    std::vector<Handle> iterables, methods;              ///< concat's
+    Vec<Handle> iterables, methods;              ///< concat's
     std::size_t at = 0;
 
     void values(std::vector<JSValue>& out) const override

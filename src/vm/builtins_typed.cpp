@@ -326,7 +326,7 @@ NATIVE(typedCtor)
         made->tracking = follows;
         return toJSValue(made);
     }
-    std::vector<Handle> items;
+    Vec<Handle> items;
     if (JSTypedArray* src = asTyped(a0)) {
         if (isBigKind(src->kind) != isBigKind(kind))
             return typeError(vm, "Cannot mix BigInt and other types, use explicit conversions");

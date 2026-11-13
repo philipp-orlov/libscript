@@ -135,7 +135,7 @@ namespace {
 /// What the embedder installed on the global object is visible to a script, so the checker has to know it is there.
 std::vector<String> hostGlobals(VM& vm)
 {
-    std::vector<Handle> keys;
+    Vec<Handle> keys;
     bi::ownKeys(vm, vm.global, true, false, false, keys);
     std::vector<String> names;
     for (const Handle& k : keys)

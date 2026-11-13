@@ -104,7 +104,7 @@ NATIVE(typedIterate)
         if (mapped.get().isException())
             return mapped.get();
     }
-    std::vector<Handle> kept;
+    Vec<Handle> kept;
     const bool backwards = kind >= 7;
     for (double step = 0; step < len; ++step) {
         const double i = backwards ? len - 1 - step : step;
@@ -468,7 +468,7 @@ NATIVE(typedToLocaleString)
 
 /// The elements of `t` sorted: numerically unless `compare` says otherwise, -0 before +0 and NaN last. False with an
 /// exception pending.
-bool sortElements(VM& vm, std::vector<Handle>& items, JSValue compare)
+bool sortElements(VM& vm, Vec<Handle>& items, JSValue compare)
 {
     bool failed = false;
     auto less = [&](const Handle& a, const Handle& b) -> bool {
@@ -506,7 +506,7 @@ bool sortElements(VM& vm, std::vector<Handle>& items, JSValue compare)
             return false;
         return dx == 0 && dy == 0 && std::signbit(dx) && !std::signbit(dy);
     };
-    std::stable_sort(items.begin(), items.end(), less);
+    mergeSort(items.data(), items.data() + items.size(), less);
     return !failed;
 }
 
@@ -521,7 +521,7 @@ NATIVE(typedSort)
         return JSValue::exception();
     const double len = t->length;
     Handle keep = Handle::retained(self);
-    std::vector<Handle> items;
+    Vec<Handle> items;
     items.reserve(std::size_t(len));
     for (double k = 0; k < len; ++k)
         items.push_back(Handle::adopt(typedGet(vm, t, std::uint32_t(k))));
@@ -566,7 +566,7 @@ NATIVE(typedToSorted)
         return JSValue::exception();
     Handle keep = Handle::adopt(toJSValue(out));
     Handle selfKeep = Handle::retained(self);
-    std::vector<Handle> items;
+    Vec<Handle> items;
     for (std::uint32_t k = 0; k < len; ++k)
         items.push_back(Handle::adopt(typedGet(vm, t, k)));
     if (!sortElements(vm, items, compare))
@@ -636,7 +636,7 @@ NATIVE(typedSet_)
             return JSValue::undefined();
         }
         // Different kinds on one buffer: read the source first, as it was.
-        std::vector<Handle> values;
+        Vec<Handle> values;
         for (double k = 0; k < srcLength; ++k)
             values.push_back(Handle::adopt(typedGet(vm, src, std::uint32_t(k))));
         for (double k = 0; k < srcLength; ++k)
@@ -715,7 +715,7 @@ NATIVE(typedFrom)
         return usingIterator.get();
     if (!usingIterator.get().isNullish() && !isFunction(usingIterator.get()))
         return typeError(vm, "object[Symbol.iterator] is not a function");
-    std::vector<Handle> values;
+    Vec<Handle> values;
     if (!usingIterator.get().isNullish()) {
         Handle iterator = Handle::adopt(vm.call(usingIterator.get(), source, nullptr, 0));
         if (iterator.get().isException())

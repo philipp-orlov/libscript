@@ -397,7 +397,7 @@ bool copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
                     plain = false;
             });
         if (!plain) {
-            std::vector<Handle> keys;
+            Vec<Handle> keys;
             bi::ownKeys(vm, o, true, true, true, keys);
             if (!vm.exception.isUndefined())
                 return false;

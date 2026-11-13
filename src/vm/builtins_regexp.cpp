@@ -666,7 +666,7 @@ void expand(String& out, StringView templ, StringView s, const Match& m, RegExpD
 }
 
 /// GetSubstitution over captures that are values: what the generic path has instead of match bounds.
-bool substitute(VM& vm, String& out, StringView matched, StringView s, std::size_t position, const std::vector<Handle>& captures,
+bool substitute(VM& vm, String& out, StringView matched, StringView s, std::size_t position, const Vec<Handle>& captures,
                 JSValue named, StringView templ)
 {
     const std::size_t m = captures.size();
@@ -773,7 +773,7 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
             continue;
         out += s.substr(copied, ms - copied);
         if (functional) {
-            std::vector<Handle> callArgs;
+            Vec<Handle> callArgs;
             for (std::size_t g = 0; g < m.groups(); ++g)
                 callArgs.push_back(Handle::adopt(captureString(vm, s, m, g)));
             callArgs.push_back(Handle::adopt(JSValue::int32(std::int32_t(ms))));
@@ -812,7 +812,7 @@ JSValue genericReplace(VM& vm, JSValue rx, JSValue S, JSValue replaceValue, bool
     const bool unicode = flags.find(u'u') != String::npos || flags.find(u'v') != String::npos;
     if (global && !writeLastIndex(vm, asObject(rx), 0))
         return JSValue::exception();
-    std::vector<Handle> results;
+    Vec<Handle> results;
     for (;;) {
         JSValue r = regExpExec(vm, rx, S);
         if (r.isException())
@@ -852,7 +852,7 @@ JSValue genericReplace(VM& vm, JSValue rx, JSValue S, JSValue replaceValue, bool
             return JSValue::exception();
         position = position != position ? 0 : std::trunc(position);
         position = std::max(0.0, std::min(position, double(s.size())));
-        std::vector<Handle> captures;
+        Vec<Handle> captures;
         for (double n = 1; n <= nCaptures; ++n) {
             Handle cap = Handle::adopt(getIndex(vm, result, std::uint32_t(n)));
             if (cap.get().isException())

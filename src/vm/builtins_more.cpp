@@ -16,10 +16,10 @@ namespace internal {
 namespace vm {
 namespace bi {
 
-void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, std::vector<Handle>& out)
+void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, Vec<Handle>& out)
 {
     if (proxyOf(o)) {
-        std::vector<Handle> all;
+        Vec<Handle> all;
         if (!proxyOwnKeys(vm, o, all))
             return;
         for (Handle& k : all) {
@@ -49,8 +49,8 @@ void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
         return;
     }
     o->materialize(vm);
-    std::vector<std::pair<std::uint32_t, Key>> indexed;
-    std::vector<Key> named, syms;
+    Vec<std::pair<std::uint32_t, Key>> indexed;
+    Vec<Key> named, syms;
     if (strings && o->cls() == ObjClass::TypedArray)
         for (std::uint32_t i = 0; i < static_cast<JSTypedArray*>(o)->length; ++i)
             indexed.push_back({i, nullptr});
@@ -82,7 +82,7 @@ void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
         else
             named.push_back(k);
     });
-    std::stable_sort(indexed.begin(), indexed.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    mergeSort(indexed.data(), indexed.data() + indexed.size(), [](const auto& x, const auto& y) { return x.first < y.first; });
     for (auto& [index, key] : indexed) {
         if (key) {
             out.push_back(Handle::retained(JSValue::cell(key)));
@@ -242,7 +242,7 @@ Key keyArg(VM& vm, JSValue v)
     return k;
 }
 
-JSValue keysArray(VM& vm, std::vector<Handle>& keys)
+JSValue keysArray(VM& vm, Vec<Handle>& keys)
 {
     JSArray* out = vm.newArray(vm.protos.array, 0, std::uint32_t(keys.size()));
     Handle keep = Handle::adopt(toJSValue(out));
@@ -268,7 +268,7 @@ NATIVE(objectGetOwnPropertyNames)
     const JSValue v = arg(args, argc, 0);
     if (v.isNullish())
         return typeError(vm, "Cannot convert undefined or null to object");
-    std::vector<Handle> keys;
+    Vec<Handle> keys;
     const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 names, 1 symbols
     if (isObject(v)) {
         ownKeys(vm, asObject(v), mode == 0, mode == 1, false, keys);
@@ -302,7 +302,7 @@ NATIVE(objectGetOwnPropertyDescriptors)
         return JSValue::exception();
     JSObject* out = vm.newObject(vm.protos.object);
     Handle keep = Handle::adopt(toJSValue(out));
-    std::vector<Handle> keys;
+    Vec<Handle> keys;
     ownKeys(vm, o, true, true, false, keys);
     for (Handle& k : keys) {
         Key key = static_cast<Key>(k.get().asCell());
@@ -325,7 +325,7 @@ NATIVE(objectDefineProperties)
     const JSValue props = arg(args, argc, 1);
     if (!isObject(props))
         return typeError(vm, "Property description must be an object");
-    std::vector<Handle> keys;
+    Vec<Handle> keys;
     ownKeys(vm, asObject(props), true, true, true, keys);
     for (Handle& k : keys) {
         Key key = static_cast<Key>(k.get().asCell());
@@ -507,7 +507,7 @@ NATIVE(protoSetter)
 
 }  // namespace
 
-bool listFromArrayLike(VM& vm, JSValue list, std::vector<Handle>& out)
+bool listFromArrayLike(VM& vm, JSValue list, Vec<Handle>& out)
 {
     if (!isObject(list)) {
         typeError(vm, "CreateListFromArrayLike called on non-object");
@@ -538,7 +538,7 @@ bool listFromArrayLike(VM& vm, JSValue list, std::vector<Handle>& out)
 
 namespace {
 
-std::vector<JSValue> raw(const std::vector<Handle>& hs)
+std::vector<JSValue> raw(const Vec<Handle>& hs)
 {
     std::vector<JSValue> v;
     for (const Handle& h : hs)
@@ -551,7 +551,7 @@ NATIVE(reflectApply)
     UNUSED();
     if (!isFunction(arg(args, argc, 0)))
         return typeError(vm, describe(vm, arg(args, argc, 0)) + " is not a function");
-    std::vector<Handle> list;
+    Vec<Handle> list;
     if (!listFromArrayLike(vm, arg(args, argc, 2), list))
         return JSValue::exception();
     std::vector<JSValue> values = raw(list);
@@ -574,7 +574,7 @@ NATIVE(reflectConstruct)
         return typeError(vm, describe(vm, arg(args, argc, 0)) + " is not a constructor");
     if (argc > 2 && !constructible(target))
         return typeError(vm, describe(vm, target) + " is not a constructor");
-    std::vector<Handle> list;
+    Vec<Handle> list;
     if (!listFromArrayLike(vm, arg(args, argc, 1), list))
         return JSValue::exception();
     std::vector<JSValue> values = raw(list);
@@ -628,7 +628,7 @@ NATIVE(reflectOwnKeys)
     JSObject* o = objectArg(vm, arg(args, argc, 0), "Reflect.ownKeys");
     if (!o)
         return JSValue::exception();
-    std::vector<Handle> keys;
+    Vec<Handle> keys;
     ownKeys(vm, o, true, true, false, keys);
     return keysArray(vm, keys);
 }

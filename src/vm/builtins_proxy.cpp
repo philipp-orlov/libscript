@@ -143,7 +143,7 @@ int proxyDelete(VM& vm, JSObject* proxy, Key key, bool strict)
 
 namespace bi {
 
-bool proxyOwnKeys(VM& vm, JSObject* proxy, std::vector<Handle>& out)
+bool proxyOwnKeys(VM& vm, JSObject* proxy, Vec<Handle>& out)
 {
     ProxyState* ps = proxyOf(proxy);
     JSValue trap = trapOf(vm, ps, "ownKeys");

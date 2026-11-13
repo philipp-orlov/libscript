@@ -130,15 +130,39 @@ void render(VM& vm, JSValue v, int depth, std::string& out)
     out += first ? "}" : " }";
 }
 
-std::vector<JSValue> argsOf(VM& vm, const std::vector<Value>& args, std::vector<Handle>& keep)
+/// The arguments of a host call as engine values, kept alive for as long as this lives. Up to eight sit inline, so a
+/// call with few arguments makes no heap call.
+class ArgList
 {
-    std::vector<JSValue> out;
-    for (const Value& a : args) {
-        keep.push_back(Handle::adopt(fromValue(vm, a)));
-        out.push_back(keep.back().get());
+public:
+    ArgList(VM& vm, const std::vector<Value>& args) : count_(std::uint32_t(args.size()))
+    {
+        JSValue* values = inlineValues_;
+        Handle* held = inlineKeep_;
+        if (args.size() > kInline) {
+            heldMore_.resize(args.size());
+            valuesMore_.resize(args.size());
+            values = valuesMore_.data();
+            held = heldMore_.data();
+        }
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            held[i] = Handle::adopt(fromValue(vm, args[i]));
+            values[i] = held[i].get();
+        }
+        data_ = values;
     }
-    return out;
-}
+    const JSValue* data() const { return data_; }
+    std::uint32_t size() const { return count_; }
+
+private:
+    static constexpr std::size_t kInline = 8;
+    std::uint32_t count_;
+    const JSValue* data_ = nullptr;
+    JSValue inlineValues_[kInline];
+    Handle inlineKeep_[kInline];
+    std::vector<JSValue> valuesMore_;
+    Vec<Handle> heldMore_;
+};
 
 }  // namespace
 
@@ -450,9 +474,8 @@ Value call(const Value& fn, const Value& thisValue, const std::vector<Value>& ar
     ContextImpl::ActiveEngine active(vm.ctx, EngineKind::Vm);
     Handle callee = Handle::adopt(fromValue(vm, fn));
     Handle self = Handle::adopt(fromValue(vm, thisValue));
-    std::vector<Handle> keep;
-    std::vector<JSValue> argv = argsOf(vm, args, keep);
-    return finish(vm, vm.call(callee.get(), self.get(), argv.data(), std::uint32_t(argv.size())));
+    ArgList argv(vm, args);
+    return finish(vm, vm.call(callee.get(), self.get(), argv.data(), argv.size()));
 }
 
 Value invoke(const Value& v, std::string_view method, const std::vector<Value>& args)
@@ -467,9 +490,8 @@ Value invoke(const Value& v, std::string_view method, const std::vector<Value>& 
     if (fn.isException())
         raisePending(vm);
     Handle callee = Handle::adopt(fn);
-    std::vector<Handle> keep;
-    std::vector<JSValue> argv = argsOf(vm, args, keep);
-    return finish(vm, vm.call(callee.get(), self.get(), argv.data(), std::uint32_t(argv.size())));
+    ArgList argv(vm, args);
+    return finish(vm, vm.call(callee.get(), self.get(), argv.data(), argv.size()));
 }
 
 Value construct(const Value& fn, const std::vector<Value>& args)
@@ -478,9 +500,8 @@ Value construct(const Value& fn, const std::vector<Value>& args)
     Locked lock(vm.ctx);
     ContextImpl::ActiveEngine active(vm.ctx, EngineKind::Vm);
     Handle callee = Handle::adopt(fromValue(vm, fn));
-    std::vector<Handle> keep;
-    std::vector<JSValue> argv = argsOf(vm, args, keep);
-    return finish(vm, vm.construct(callee.get(), argv.data(), std::uint32_t(argv.size())));
+    ArgList argv(vm, args);
+    return finish(vm, vm.construct(callee.get(), argv.data(), argv.size()));
 }
 
 void raisePending(VM& vm)

@@ -62,14 +62,17 @@ struct Entry_
 
 struct TableState : NativeState
 {
-    std::vector<Entry_> entries;
-    std::unordered_map<KeyBox, std::uint32_t, KeyHash, KeyEq> index;
+    Vec<Entry_> entries;
+    std::unordered_map<KeyBox, std::uint32_t, KeyHash, KeyEq, PoolAlloc<std::pair<const KeyBox, std::uint32_t>>> index;
     std::uint64_t nextSeq = 1;
     std::uint32_t dead = 0;
     bool isMap;
     bool weak;
 
     TableState(bool map, bool w) : isMap(map), weak(w) {}
+    // Made and dropped by the payload pool, so a table that comes and goes makes no call to the general allocator.
+    static void* operator new(std::size_t n) { return PoolAlloc<char>().allocate(n); }
+    static void operator delete(void* p, std::size_t n) noexcept { PoolAlloc<char>().deallocate(static_cast<char*>(p), n); }
     ~TableState() override { clear_(); }
     void clear(VM&) noexcept override { clear_(); }
     void clear_() noexcept

@@ -4,6 +4,7 @@
 // Helpers the built-in installers share.
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -11,6 +12,49 @@
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
+
+namespace script::internal::vm {
+/// A stable sort that takes its scratch space from the payload pool; `std::stable_sort` asks the general allocator.
+template <class T, class Less>
+void mergeSort(T* first, T* last, Less less)
+{
+    const std::size_t n = std::size_t(last - first);
+    if (n < 2)
+        return;
+    for (T* run = first; run < last; run += 8) {  // insertion sort on short runs
+        T* end = std::min(run + 8, last);
+        for (T* i = run + 1; i < end; ++i) {
+            T v = *i;
+            T* j = i;
+            while (j > run && less(v, *(j - 1))) {
+                *j = *(j - 1);
+                --j;
+            }
+            *j = v;
+        }
+    }
+    if (n <= 8)
+        return;
+    Vec<T> scratch(n);
+    T* from = first;
+    T* to = scratch.data();
+    for (std::size_t width = 8; width < n; width *= 2) {
+        for (std::size_t lo = 0; lo < n; lo += 2 * width) {
+            const std::size_t mid = std::min(lo + width, n), hi = std::min(lo + 2 * width, n);
+            std::size_t a = lo, b = mid, o = lo;
+            while (a < mid && b < hi)
+                to[o++] = less(from[b], from[a]) ? from[b++] : from[a++];
+            while (a < mid)
+                to[o++] = from[a++];
+            while (b < hi)
+                to[o++] = from[b++];
+        }
+        std::swap(from, to);
+    }
+    if (from != first)
+        std::copy(from, from + n, first);
+}
+}  // namespace script::internal::vm
 
 namespace script {
 namespace internal {
@@ -139,9 +183,9 @@ bool forEachIterated(VM& vm, JSValue src, F&& fn)
 /// `base[i]`, owned; the exception sentinel when a getter throws.
 JSValue getIndex(VM& vm, JSValue base, std::uint32_t i);
 /// Own property keys of `o` in the order the language gives them, each an owned string or symbol value.
-void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, std::vector<Handle>& out);
+void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, Vec<Handle>& out);
 /// The elements of an array-like, each counted by its handle; false with an exception pending.
-bool listFromArrayLike(VM& vm, JSValue list, std::vector<Handle>& out);
+bool listFromArrayLike(VM& vm, JSValue list, Vec<Handle>& out);
 /// `Object.defineProperty` on a key: undefined, or the exception sentinel.
 JSValue definePropertyFromDescriptor(VM& vm, JSObject* o, Key key, JSObject* descriptor);
 /// The remaining built-ins: Object, Reflect, Array, String, Number and Math beyond the first set.
@@ -201,7 +245,7 @@ void installExtras(VM& vm);
 void installIteratorHelpers(VM& vm);
 void installAtomics(VM& vm);
 /// The keys a proxy's `ownKeys` trap (or its target) gives.
-bool proxyOwnKeys(VM& vm, JSObject* proxy, std::vector<Handle>& out);
+bool proxyOwnKeys(VM& vm, JSObject* proxy, Vec<Handle>& out);
 /// `getOwnPropertyDescriptor` through the proxy: a descriptor object, undefined, or the exception sentinel.
 JSValue proxyOwnDescriptor(VM& vm, JSObject* proxy, Key key);
 JSValue proxyDefine(VM& vm, JSObject* proxy, Key key, JSObject* descriptor);

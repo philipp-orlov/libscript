@@ -215,8 +215,8 @@ void collectVars(const Node& n, std::vector<String>& out)
             break;
         case NK::ForIn:
         case NK::ForOf:
-            if (n.a && n.a->kind == NK::VarDecl)
-                collectVars(*n.a, out);
+            if (n.a && n.varKind == VarKind::Var)
+                collectPatternNames(*n.a, out);
             collectVars(*n.d, out);
             break;
         case NK::While:
@@ -2831,19 +2831,19 @@ void Compiler::forInOf(const Node& n, bool isOf)
     }
     pushScope();
     const Node& left = *n.a;
-    if (left.kind == NK::VarDecl) {
-        const Node& target = *left.list[0]->a;
-        const bool lexical = left.varKind != VarKind::Var;
+    if (n.varKind != VarKind::None) {
+        // The parser keeps the declaration's kind on the loop and the target as its head.
+        const bool lexical = n.varKind != VarKind::Var;
         if (lexical) {
             std::vector<String> names;
-            collectPatternNames(target, names);
+            collectPatternNames(left, names);
             for (const String& name : names) {
-                Binding& b = declare(name, left.varKind == VarKind::Const ? BKind::Const : BKind::Let);
+                Binding& b = declare(name, n.varKind == VarKind::Const ? BKind::Const : BKind::Let);
                 if (b.boxed)
                     emit(Op::NewBox, b.reg);
             }
         }
-        bindTarget(target, v, lexical, left.varKind);
+        bindTarget(left, v, lexical, n.varKind);
     } else {
         bindTarget(left, v, false, VarKind::None);
     }

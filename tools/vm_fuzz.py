@@ -92,7 +92,7 @@ class Gen:
 
     def stmt(self, vs, ind, loop, depth):
         p = '    ' * ind
-        k = self.r.randint(0, 21)
+        k = self.r.randint(0, 36)
         e = lambda: self.expr(vs)
         if k <= 2 or depth > 3:
             v = self.name()
@@ -162,6 +162,67 @@ class Gen:
         if k == 20 and vs['a']:
             a = self.r.choice(vs['a'])
             return [f"{p}log({a}.{self.pick('map', 'filter')}(function (x) {{ return {self.pick('x', 'x * 2', '!x', 'x + 1')}; }}).join());"]
+        if k == 21:
+            v = self.name()
+            return [f"{p}class {v} {{ #p = {e()}; f = {e()}; static s = {e()}; constructor(a) {{ this.a = a; }} get g() {{ return this.#p; }} set g(x) {{ this.#p = x; }} m(t) {{ return this.a + t; }} static sm() {{ return {v}.s; }} }}",
+                    f"{p}var {v}i = new {v}({e()}); {v}i.g = {e()};",
+                    f"{p}log({v}i.g); log({v}i.f); log({v}.sm()); log({v}i.m({e()}));"]
+        if k == 22:
+            v = self.name()
+            return [f"{p}class {v}A {{ constructor(a) {{ this.a = a; }} m() {{ return 'A' + this.a; }} }}",
+                    f"{p}class {v}B extends {v}A {{ constructor(a) {{ super(a); this.b = {e()}; }} m() {{ return 'B' + super.m() + this.b; }} }}",
+                    f"{p}log(new {v}B({e()}).m()); log(new {v}B(1) instanceof {v}A);"]
+        if k == 23:
+            v = self.name()
+            return [f"{p}function* {v}(n) {{ for (var i = 0; i < n; i++) {{ var r = yield i * {e()}; if (r) log('got' + r); }} return 'done'; }}",
+                    f"{p}var {v}g = {v}({self.r.randint(0, 4)}); log({v}g.next().value); log({v}g.next({e()}).value); log([...{v}({self.r.randint(0, 4)})].join());",
+                    f"{p}log({v}g.return({e()}).done);"]
+        if k == 24:
+            v = self.name()
+            return [f"{p}function* {v}() {{ try {{ yield 1; yield 2; }} finally {{ log('cleanup'); }} }}",
+                    f"{p}for (var {v}x of {v}()) {{ log({v}x); break; }}",
+                    f"{p}var {v}i = {v}(); {v}i.next(); log({v}i.return(5).value);"]
+        if k == 25:
+            return [f"{p}var [{self.name()}a, {self.name()}b = {self.pick('7', '"d"', 'null', '[1]')}, ...{self.name()}r] = [{e()}, undefined, {e()}, {e()}];",
+                    f"{p}var {{x: dx = {self.pick('7', '"d"', 'null')}, ...drest}} = {{x: undefined, y: {e()}, z: {e()}}}; log(dx); log(Object.keys(drest).join());"]
+        if k == 26 and vs['f']:
+            f = self.r.choice(vs['f'])
+            return [f"{p}log({f}(...[{e()}, {e()}])); log([...'ab', ...[{e()}], ...new Set([1, 2, 1])].join());"]
+        if k == 27:
+            v = self.name()
+            return [f"{p}var {v} = new Map([[1, {e()}], ['a', {e()}]]); {v}.set(NaN, {e()}); {v}.delete(1);",
+                    f"{p}log({v}.size); log([...{v}.keys()].join()); log({v}.get(NaN)); log({v}.has('a'));",
+                    f"{p}var {v}s = new Set([{e()}, {e()}, 1, 1]); log({v}s.size); log([...{v}s].length);"]
+        if k == 28:
+            parsed = 'JSON.parse(\'{"u": [1, 2.5, {"v": null}], "w": "x"}\')'
+            return [f"{p}log(JSON.stringify({{a: {e()}, b: [{e()}, undefined, null], c: 'q'}}));",
+                    f"{p}log(JSON.stringify({parsed}));"]
+        if k == 29:
+            s_ = self.pick('"abc"', '"a,b,c"', '"Hello World"', '"  pad  "', '""')
+            sep = self.pick('","', '""', '/o/', r'/\s+/')
+            op = self.pick('toUpperCase()', 'trim()', 'padStart(8, "-")', 'slice(1, -1)', 'replace(/[aeiou]/g, "_")', 'indexOf("o")', 'at(-1)', 'repeat(2)')
+            return [f"{p}log({s_}.split({sep}).join('|')); log({s_}.{op});"]
+        if k == 30:
+            t = self.name()
+            kind = self.pick('Uint8Array', 'Int16Array', 'Float32Array', 'Uint8ClampedArray', 'Int32Array')
+            return [f"{p}var {t} = new {kind}([{e()}, {e()}, {e()}]); log({t}.join()); {t}[1] = {e()}; log({t}[1]); log({t}.length);"]
+        if k == 31:
+            v = self.name()
+            return [f"{p}var {v} = {{get g() {{ return {e()}; }}, set g(x) {{ this._g = x; }}, [`k${{1 + 1}}`]: {e()}, ['__proto__']: 1}}; {v}.g = {e()}; log({v}.g); log({v}._g); log({v}.k2);"]
+        if k == 32 and vs['o']:
+            o = self.r.choice(vs['o'])
+            return [f"{p}log({o}?.x); log({o}?.missing?.deeper); log({o}.m?.({e()})); log(Object.keys({o}).join()); log(Object.entries({o}).length);"]
+        if k == 33:
+            v = self.name()
+            return [f"{p}var {v} = {{ [Symbol.iterator]() {{ var i = 0; return {{ next() {{ return {{ value: i++, done: i > {self.r.randint(0, 4)} }}; }}, return() {{ log('closed'); return {{}}; }} }}; }} }};",
+                    f"{p}log([...{v}].join()); for (var {v}x of {v}) {{ log({v}x); if ({v}x > 1) break; }}"]
+        if k == 34:
+            return [f"{p}function dflt{self.n}(a, b = a + 1, ...r) {{ return [a, b, r.length, arguments.length].join(); }} log(dflt{self.n}({e()})); log(dflt{self.n}({e()}, {e()}, {e()}));"]
+        if k == 35:
+            return [f"{p}log(`${{{e()}}}-${{{e()}}}`); log([{e()}, {e()}].sort().join()); log([3, 1, 2].sort((a, b) => b - a).join());",
+                    f"{p}log(Array.from({{length: 3}}, (_, i) => i * {e()}).join()); log(Array.of({e()}, {e()}).length);"]
+        if k == 36:
+            return [f"{p}try {{ log(BigInt({self.r.randint(-50, 50)}) * 3n ** 20n); log(typeof 1n); log(10n / 3n); log(1n < 2); }} catch (err) {{ log(err.name); }}"]
         v = self.name()
         init = e()
         vs['n'].append(v)

@@ -18,7 +18,7 @@ endfunction()
 
 script_test_suites(core value languages steady_state limits)
 if(SCRIPT_VM)
-    script_test_suites(vm value)
+    script_test_suites(vm value cell shape object property array function validity convert)
 endif()
 if(SCRIPT_LANG_CSHARP)
     script_test_suites(csharp parser types language builtins binding module jit units modern gc soak)

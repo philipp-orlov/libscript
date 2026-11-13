@@ -7,22 +7,91 @@
 #include <cstdlib>
 
 #include "script/internal/vm/census.hpp"
+#include "script/internal/vm/object.hpp"
+#include "sys/vm.hpp"
 
 namespace script {
 namespace internal {
 namespace vm {
 
-VM::VM(ContextImpl& context) : ctx(context) {}
+namespace {
 
-VM::~VM() = default;
+mem::LocalHeap::Options heapOptionsFor(VM* owner)
+{
+    mem::LocalHeap::Options options = payloadHeapOptions();
+    options.owner = owner;
+    return options;
+}
 
-void VM::releaseRoots() noexcept {}
+}  // namespace
+
+VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
+{
+    // 2^20 ids, eight bytes each, reserved once so that the table never moves.
+    const sys::VmRegion region = sys::vmReserve(std::size_t(kDefaultMaxShapes) * sizeof(Shape*));
+    shapeRegionBase_ = region.base;
+    shapeRegionBytes_ = region.bytes;
+    shapeTable_ = static_cast<Shape**>(region.base);
+
+    atoms.length = internKey("length");
+    atoms.prototype = internKey("prototype");
+    atoms.constructor = internKey("constructor");
+    atoms.name = internKey("name");
+}
+
+VM::~VM()
+{
+    // `releaseRoots` ran before the context's cells went; what is left is the memory the VM itself reserved.
+    if (!tearingDown)
+        releaseRoots();
+    for (void* chunk : validityChunks_)
+        freePayload(chunk, kValidityChunkBytes);
+    if (shapeRegionBase_)
+        sys::vmUnmap(shapeRegionBase_, shapeRegionBytes_);
+}
 
 void VM::afterCollect() noexcept {}
 
 std::string VM::captureStack() const
 {
     return {};
+}
+
+Key VM::internKey(StringView text)
+{
+    StringCell* s = ctx.intern(text);
+    detail::incRef(s);
+    return s;
+}
+
+Key VM::internKey(std::string_view text)
+{
+    return internKey(ascii(text));
+}
+
+void VM::setIntrinsic(JSObject** slot, JSObject* object) noexcept
+{
+    if (object)
+        detail::incRef(reinterpret_cast<CellPtr>(object));
+    if (*slot)
+        detail::decRef(reinterpret_cast<CellPtr>(*slot));
+    *slot = object;
+}
+
+JSValue VM::throwError(ErrorCode code, std::string_view message)
+{
+    clearException();
+    exception = JSValue::cell(ctx.intern(ascii(message)));
+    retain(exception);
+    exceptionCode = code;
+    return JSValue::exception();
+}
+
+void VM::clearException() noexcept
+{
+    release(exception);
+    exception = JSValue::undefined();
+    exceptionCode = ErrorCode::Ok;
 }
 
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)

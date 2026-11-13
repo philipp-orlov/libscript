@@ -2,16 +2,77 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The new JavaScript core's runtime: what a context owns once something runs on it. The design is in ls-jsc.md; this
-// grows with each phase -- the shape table and the VM stack land here.
+// grows with each phase -- the VM stack and the code blocks land here.
 #pragma once
 
 #include <string>
+#include <string_view>
 
+#include "mem/local_heap.hpp"
 #include "script/internal/context.hpp"
+#include "script/internal/vm/cell.hpp"
+#include "script/internal/vm/shape.hpp"
+#include "script/internal/vm/value.hpp"
 
 namespace script {
 namespace internal {
 namespace vm {
+
+struct JSObject;
+struct JSArray;
+struct JSFunction;
+struct Box;
+struct GetterSetter;
+struct Rare;
+
+/// What a function runs. The bytecode compiler (phase P2) grows this; the object model needs the name, the arity and
+/// whether it constructs. Counted, intrusively and without atomics, by the functions made from it.
+struct CodeBlock
+{
+    std::uint32_t refs = 1;
+    std::uint32_t length = 0;  ///< the `length` property
+    Key name = nullptr;        ///< holds a count; null for an anonymous function
+    bool constructor = false;
+};
+
+/// One eight-byte cell of validity: a cache or a piece of code that depends on a prototype chain holds a count of one
+/// and reads `valid` before trusting what it learned. Made by `VM::validityOf`; cleared by `VM::invalidateChain`.
+struct ValidityCell
+{
+    std::uint32_t refs;
+    std::uint32_t valid;
+};
+
+/// A call into script from the runtime: the interpreter installs it; accessors and native callbacks go through it.
+/// Returns an owned value, or the exception sentinel with `VM::exception` set.
+using CallHook = JSValue (*)(struct VM&, JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc,
+                             void* user);
+
+/// A function written in C++, called without making an argument vector. Returns an owned value or the exception sentinel.
+using FastNative = JSValue (*)(struct VM&, JSValue thisValue, const JSValue* args, std::uint32_t argc, void* data);
+
+/// Names the runtime itself looks up, interned once and held for the VM's life.
+struct Atoms
+{
+    Key length = nullptr;
+    Key prototype = nullptr;
+    Key constructor = nullptr;
+    Key name = nullptr;
+};
+
+/// The prototypes of what a primitive is read through. Null until something installs them; a property read on a
+/// primitive whose prototype is null finds nothing.
+struct Intrinsics
+{
+    JSObject* object = nullptr;
+    JSObject* function = nullptr;
+    JSObject* array = nullptr;
+    JSObject* number = nullptr;
+    JSObject* string = nullptr;
+    JSObject* boolean = nullptr;
+    JSObject* symbol = nullptr;
+    JSObject* bigint = nullptr;
+};
 
 struct VM : EngineRuntime
 {
@@ -25,10 +86,123 @@ struct VM : EngineRuntime
     void releaseRoots() noexcept override;
     void afterCollect() noexcept override;
     std::string captureStack() const override;
+
+    // ---- cells ----
+    /// The cells of the new family; separate from the context's heap, which holds the old family and the strings. Every
+    /// cell is at most `kMaxSmall` bytes, so `ownerOf` finds this VM from any cell.
+    mem::LocalHeap heap;
+
+    /// A zeroed header and room after it; `rc` is 1. `bytes` includes the header and is at most `kMaxSmall`. Throws
+    /// `Error(OutOfMemory)` before taking anything when the context's limit would be passed.
+    void* allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux = 0);
+    /// Out-of-line storage: property slots, elements, tables. 16-byte aligned.
+    void* allocPayload(std::size_t bytes);
+    void freePayload(void* p, std::size_t bytes) noexcept;
+    /// Called by `detail::destroyUnreferenced` when a count reached zero.
+    void destroy(CellPtr cell) noexcept;
+    /// How many cells of the new family are alive.
+    std::uint64_t liveCells = 0;
+    bool tearingDown = false;
+
+    // ---- shapes ----
+    /// Shape ids index this table, which is reserved once so that its address never changes.
+    Shape* shapeById(std::uint32_t id) const noexcept { return shapeTable_[id]; }
+    Shape* newShape();
+    void freeShape(Shape* shape) noexcept;
+    /// The root of the tree for objects with this prototype (null for none); made on first use, and it holds a count of
+    /// the prototype.
+    Shape* rootShapeFor(JSObject* proto);
+    std::uint32_t maxShapes = kDefaultMaxShapes;
+    std::uint32_t shapesAlive() const noexcept { return shapeCount_ - freeShapeIds_.size() - 1; }
+
+    // ---- objects (object.cpp) ----
+    /// A plain object with `aux` inline slots, with the shapes of `root`.
+    JSObject* newObject(Shape* root, std::uint8_t aux = 3);
+    JSObject* newObject(JSObject* proto, std::uint8_t aux = 3);
+    JSArray* newArray(JSObject* proto, std::uint32_t length = 0, std::uint32_t capacity = 0);
+    Box* newBox(JSValue ownedValue);
+    GetterSetter* newGetterSetter(JSValue getter, JSValue setter);
+    /// A closure over `n` boxes, each of which gets a count, and a count of `code`. `length`, `name` and, for a
+    /// constructor, `prototype` appear as properties on first use.
+    JSFunction* newFunction(JSObject* proto, CodeBlock* code, Box* const* upvalues, std::uint32_t n);
+    CodeBlock* newCodeBlock(Key name, std::uint32_t length, bool constructor);
+    void releaseCode(CodeBlock* code) noexcept;
+    JSFunction* newNativeFunction(JSObject* proto, FastNative fn, void* data, Key name, std::uint32_t length);
+
+    // ---- validity (validity.cpp) ----
+    /// The cell that says whether the chain from `proto` upwards is as it was. No count is added for the caller.
+    ValidityCell* validityOf(JSObject* proto);
+    void retainValidity(ValidityCell* cell) noexcept { ++cell->refs; }
+    void releaseValidity(ValidityCell* cell) noexcept;
+    /// `proto` or something above it changed what it has: every cell that depended on it goes invalid. Does nothing for
+    /// an object that is nobody's prototype.
+    void invalidateChain(JSObject* proto);
+
+    // ---- errors ----
+    /// The value being thrown while a function returns the exception sentinel; owned.
+    JSValue exception = JSValue::undefined();
+    ErrorCode exceptionCode = ErrorCode::Ok;
+    /// Until Error objects exist (V-9) a throw is a string with the code kept beside it.
+    JSValue throwError(ErrorCode code, std::string_view message);
+    void clearException() noexcept;
+
+    CallHook callHook = nullptr;
+    void* callHookData = nullptr;
+
+    // ---- shared names and prototypes ----
+    Atoms atoms;
+    /// The property names of the first thousand non-negative integers, made when first asked for; each holds a count.
+    static constexpr std::size_t kSmallIndexKeys = 1024;
+    Key smallIndexKeys[kSmallIndexKeys] = {};
+    Intrinsics protos;
+    /// Install a prototype into one of `protos`'s fields, counting it and letting go of the one it replaces.
+    void setIntrinsic(JSObject** slot, JSObject* object) noexcept;
+    /// `intern` for the text of a name; the cell is the table's and the caller's (a count is added).
+    Key internKey(std::string_view ascii);
+    Key internKey(StringView text);
+
+private:
+    friend struct JSObject;
+    Shape** shapeTable_ = nullptr;
+    std::uint32_t shapeCount_ = 1;  ///< id 0 is "no shape"
+    std::uint32_t shapeCommitted_ = 0;
+    Vec<std::uint32_t> freeShapeIds_;
+    Shape* nullRoot_ = nullptr;
+    void* shapeRegionBase_ = nullptr;
+    std::size_t shapeRegionBytes_ = 0;
+    void destroyShape(Shape* shape) noexcept;
+
+    Vec<CellPtr> pending_;
+    bool destroying_ = false;
+
+public:
+    static constexpr std::size_t kValidityChunkBytes = std::size_t(64) << 10;
+
+private:
+    Vec<void*> validityChunks_;
+    ValidityCell* validityFree_ = nullptr;
+    ValidityCell* allocValidity();
+    void freeValidity(ValidityCell* cell) noexcept;
+
+    void destroyNow(CellPtr cell) noexcept;
+    friend struct Shape;
 };
 
 /// The language registration of JavaScript on this core.
 const LanguageInfo& javascriptLanguage() noexcept;
+
+/// The VM a cell of the new family belongs to.
+inline VM& vmOf(const void* cell) noexcept
+{
+    return *static_cast<VM*>(mem::LocalHeap::ownerOf(cell));
+}
+
+/// The bytes a cell of the new family occupies, as it was allocated.
+std::size_t cellBytesOf(const detail::GCObject* cell) noexcept;
+/// Every cell the cell holds a count of, appended to `out`.
+void children(const detail::GCObject* cell, detail::GcList& out);
+/// Bytes the cell and its out-of-line storage hold.
+std::size_t heapSizeOf(const detail::GCObject* cell) noexcept;
 
 }  // namespace vm
 }  // namespace internal

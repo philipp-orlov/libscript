@@ -64,6 +64,13 @@ void GCObject::reserveGrowth(std::size_t bytes)
 /// worklist threaded through `pendingNext` and the outer loop drains it.
 void destroyUnreferenced(GCObject* cell) noexcept
 {
+#if SCRIPT_VM
+    // A cell of the new core: its heap is found from the block it sits in, and it has no virtual functions.
+    if (internal::vm::isVmCell(cell)) [[unlikely]] {
+        internal::vm::vmOf(cell).destroy(cell);
+        return;
+    }
+#endif
     // A pinned cell stays until its context ends, which frees it with everything else. Not every holder of one keeps a
     // count of it -- native code writes it into the objects it makes without one -- so its count says nothing.
     if (cell->pinned) {

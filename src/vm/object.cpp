@@ -144,6 +144,10 @@ void VM::releaseCode(CodeBlock* code) noexcept
             releaseValidity(c.validity);
     for (CodeBlock* child : code->children)
         releaseCode(child);
+    if (code->tier2) {
+        releaseTier2(code->tier2, this);
+        code->tier2 = nullptr;
+    }
     if (code->tier1) {
         releaseTier1(code->tier1, this);
         code->tier1 = nullptr;

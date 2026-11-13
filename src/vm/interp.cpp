@@ -502,6 +502,19 @@ JSValue runImpl(VM& vm, const Ins* stepFall)
             LOOP_TICK();          \
     } while (0)
 #define SET(r, v) setReg(R[r], v)
+/// SET and COPY that also note what kind of value the instruction made (the baseline compiler's type feedback).
+#define SETP(r, v)                                                         \
+    do {                                                                    \
+        const JSValue pv_ = (v);                                            \
+        code->prof[std::size_t(ins - codeStart)] |= profBit(pv_);           \
+        setReg(R[r], pv_);                                                  \
+    } while (0)
+#define COPYP(r, v)                                                         \
+    do {                                                                    \
+        const JSValue pv_ = (v);                                            \
+        code->prof[std::size_t(ins - codeStart)] |= profBit(pv_);           \
+        copyReg(R[r], pv_);                                                 \
+    } while (0)
 #define COPY(r, v) copyReg(R[r], v)
 #define FAIL()  \
     do {         \
@@ -511,6 +524,8 @@ JSValue runImpl(VM& vm, const Ins* stepFall)
 #define STRICT() ((code->flags & CodeBlock::kStrict) != 0)
 
     LOAD_FRAME();
+    if (code->prof.empty()) [[unlikely]]
+        code->prof.assign(code->code.size() + code->nparams + 2, 0);
     vm.stackTop = R + code->nregs;
     if (vm.resumeThrow) [[unlikely]] {
         vm.resumeThrow = false;
@@ -564,7 +579,7 @@ L_GetGlobalOrUndef: {
     InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
     JSObject* g = vm.global;
     if (g->h.shape == ic.shape) [[likely]] {
-        COPY(ins->a, *g->slotAt(ic.index));
+        COPYP(ins->a, *g->slotAt(ic.index));
         ++pc;
         NEXT();
     }
@@ -575,13 +590,13 @@ L_GetGlobalOrUndef: {
             ic.shape = g->h.shape;
             ic.index = std::uint32_t(g->shapeOf(vm)->indexOf(key));
         }
-        COPY(ins->a, *slot);
+        COPYP(ins->a, *slot);
         ++pc;
         NEXT();
     }
     if (!hasProperty(vm, toJSValue(g), key)) {
         if (ins->opcode() == Op::GetGlobalOrUndef) {
-            SET(ins->a, JSValue::undefined());
+            SETP(ins->a, JSValue::undefined());
             ++pc;
             NEXT();
         }
@@ -592,7 +607,7 @@ L_GetGlobalOrUndef: {
     JSValue v = getProperty(vm, toJSValue(g), key);
     if (v.isException())
         FAIL();
-    SET(ins->a, v);
+    SETP(ins->a, v);
     ++pc;
     NEXT();
 }
@@ -656,7 +671,7 @@ L_NewBox: {
     NEXT();
 }
 L_GetBox:
-    COPY(ins->a, reinterpret_cast<Box*>(R[ins->b].asCell())->value);
+    COPYP(ins->a, reinterpret_cast<Box*>(R[ins->b].asCell())->value);
     NEXT();
 L_PutBox: {
     Box* box = reinterpret_cast<Box*>(R[ins->a].asCell());
@@ -674,7 +689,7 @@ L_CopyBox: {
     NEXT();
 }
 L_GetUpval:
-    COPY(ins->a, fn->upvals()[ins->b]->value);
+    COPYP(ins->a, fn->upvals()[ins->b]->value);
     NEXT();
 L_PutUpval: {
     Box* box = fn->upvals()[ins->a];
@@ -694,13 +709,13 @@ L_Add: {
     if (a.isInt32() && b.isInt32()) {
         std::int32_t r;
         if (!__builtin_add_overflow(a.asInt32(), b.asInt32(), &r)) {
-            SET(ins->a, JSValue::int32(r));
+            SETP(ins->a, JSValue::int32(r));
             NEXT();
         }
     }
     if (a.isNumber() && b.isNumber()) {
         // A double stays a double: narrowing it back to an int32 costs more than it saves.
-        SET(ins->a, JSValue::boxDouble(a.asNumber() + b.asNumber()));
+        SETP(ins->a, JSValue::boxDouble(a.asNumber() + b.asNumber()));
         NEXT();
     }
     if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b))
@@ -709,7 +724,7 @@ L_Add: {
     const JSValue r = add(vm, a, b);
     if (r.isException())
         FAIL();
-    SET(ins->a, r);
+    SETP(ins->a, r);
     NEXT();
 }
 L_AddI: {
@@ -717,7 +732,7 @@ L_AddI: {
     if (a.isInt32()) {
         std::int32_t r;
         if (!__builtin_add_overflow(a.asInt32(), std::int32_t(std::int16_t(ins->c)), &r)) {
-            SET(ins->a, JSValue::int32(r));
+            SETP(ins->a, JSValue::int32(r));
             NEXT();
         }
     }
@@ -725,7 +740,7 @@ L_AddI: {
     const JSValue r = add(vm, a, JSValue::int32(std::int16_t(ins->c)));
     if (r.isException())
         FAIL();
-    SET(ins->a, r);
+    SETP(ins->a, r);
     NEXT();
 }
 L_SubI: {
@@ -733,7 +748,7 @@ L_SubI: {
     if (a.isInt32()) {
         std::int32_t r;
         if (!__builtin_sub_overflow(a.asInt32(), std::int32_t(std::int16_t(ins->c)), &r)) {
-            SET(ins->a, JSValue::int32(r));
+            SETP(ins->a, JSValue::int32(r));
             NEXT();
         }
     }
@@ -741,7 +756,7 @@ L_SubI: {
     const JSValue r = arithmetic(vm, Op::Sub, a, JSValue::int32(std::int16_t(ins->c)));
     if (r.isException())
         FAIL();
-    SET(ins->a, r);
+    SETP(ins->a, r);
     NEXT();
 }
 #define ARITH(NAME, FAST, DOUBLE)                                                         \
@@ -758,54 +773,54 @@ L_SubI: {
         const JSValue r = arithmetic(vm, Op::NAME, a, b);                         \
         if (r.isException())                                                      \
             FAIL();                                                               \
-        SET(ins->a, r);                                                           \
+        SETP(ins->a, r);                                                           \
         NEXT();                                                                   \
     }
 ARITH(Sub, {
     std::int32_t r;
     if (!__builtin_sub_overflow(x, y, &r)) {
-        SET(ins->a, JSValue::int32(r));
+        SETP(ins->a, JSValue::int32(r));
         NEXT();
     }
-}, { SET(ins->a, JSValue::boxDouble(a.asNumber() - b.asNumber())); NEXT(); })
+}, { SETP(ins->a, JSValue::boxDouble(a.asNumber() - b.asNumber())); NEXT(); })
 ARITH(Mul, {
     std::int32_t r;
     if (!__builtin_mul_overflow(x, y, &r) && (r != 0 || (x >= 0 && y >= 0))) {
-        SET(ins->a, JSValue::int32(r));
+        SETP(ins->a, JSValue::int32(r));
         NEXT();
     }
-}, { SET(ins->a, JSValue::boxDouble(a.asNumber() * b.asNumber())); NEXT(); })
+}, { SETP(ins->a, JSValue::boxDouble(a.asNumber() * b.asNumber())); NEXT(); })
 ARITH(Div, {}, {
     const double q = a.asNumber() / b.asNumber();
     // Two integers may divide evenly: that is an int32 again.
-    SET(ins->a, a.isInt32() && b.isInt32() ? JSValue::boxNumber(q) : JSValue::boxDouble(q));
+    SETP(ins->a, a.isInt32() && b.isInt32() ? JSValue::boxNumber(q) : JSValue::boxDouble(q));
     NEXT();
 })
 ARITH(Mod, {
     if (x >= 0 && y > 0) {
-        SET(ins->a, JSValue::int32(x % y));
+        SETP(ins->a, JSValue::int32(x % y));
         NEXT();
     }
 }, { })
 ARITH(Exp, {}, { })
 ARITH(BitAnd, {
-    SET(ins->a, JSValue::int32(x & y));
+    SETP(ins->a, JSValue::int32(x & y));
     NEXT();
 }, { })
 ARITH(BitOr, {
-    SET(ins->a, JSValue::int32(x | y));
+    SETP(ins->a, JSValue::int32(x | y));
     NEXT();
 }, { })
 ARITH(BitXor, {
-    SET(ins->a, JSValue::int32(x ^ y));
+    SETP(ins->a, JSValue::int32(x ^ y));
     NEXT();
 }, { })
 ARITH(Shl, {
-    SET(ins->a, JSValue::int32(std::int32_t(std::uint32_t(x) << (y & 31))));
+    SETP(ins->a, JSValue::int32(std::int32_t(std::uint32_t(x) << (y & 31))));
     NEXT();
 }, { })
 ARITH(Shr, {
-    SET(ins->a, JSValue::int32(x >> (y & 31)));
+    SETP(ins->a, JSValue::int32(x >> (y & 31)));
     NEXT();
 }, { })
 ARITH(UShr, {}, { })
@@ -873,7 +888,7 @@ L_InstanceOf: {
 L_Neg: {
     const JSValue a = R[ins->b];
     if (a.isInt32() && a.asInt32() != 0 && a.asInt32() != INT32_MIN) {
-        SET(ins->a, JSValue::int32(-a.asInt32()));
+        SETP(ins->a, JSValue::int32(-a.asInt32()));
         NEXT();
     }
     fr->pc = pc;
@@ -885,10 +900,10 @@ L_Neg: {
         release(n);
         if (r.isException())
             FAIL();
-        SET(ins->a, r);
+        SETP(ins->a, r);
         NEXT();
     }
-    SET(ins->a, JSValue::boxNumber(-n.asNumber()));
+    SETP(ins->a, JSValue::boxNumber(-n.asNumber()));
     NEXT();
 }
 L_ToNumber: {
@@ -961,7 +976,7 @@ L_Dec: {
     if (a.isInt32()) {
         std::int32_t r;
         if (!__builtin_add_overflow(a.asInt32(), delta, &r)) {
-            SET(ins->a, JSValue::int32(r));
+            SETP(ins->a, JSValue::int32(r));
             NEXT();
         }
     }
@@ -974,10 +989,10 @@ L_Dec: {
         release(n);
         if (r.isException())
             FAIL();
-        SET(ins->a, r);
+        SETP(ins->a, r);
         NEXT();
     }
-    SET(ins->a, JSValue::boxNumber(n.asNumber() + delta));
+    SETP(ins->a, JSValue::boxNumber(n.asNumber() + delta));
     NEXT();
 }
 
@@ -1115,25 +1130,25 @@ L_UShrI: {
         switch (op) {
             case Op::MulI:
                 if (!__builtin_mul_overflow(x, y, &r) && (r != 0 || (x >= 0 && y >= 0))) {
-                    SET(ins->a, JSValue::int32(r));
+                    SETP(ins->a, JSValue::int32(r));
                     NEXT();
                 }
                 break;
             case Op::ModI:
                 if (x >= 0 && y > 0) {
-                    SET(ins->a, JSValue::int32(x % y));
+                    SETP(ins->a, JSValue::int32(x % y));
                     NEXT();
                 }
                 break;
-            case Op::BitAndI: SET(ins->a, JSValue::int32(x & y)); NEXT();
-            case Op::BitOrI: SET(ins->a, JSValue::int32(x | y)); NEXT();
-            case Op::BitXorI: SET(ins->a, JSValue::int32(x ^ y)); NEXT();
-            case Op::ShlI: SET(ins->a, JSValue::int32(std::int32_t(std::uint32_t(x) << (y & 31)))); NEXT();
-            case Op::ShrI: SET(ins->a, JSValue::int32(x >> (y & 31))); NEXT();
-            default: SET(ins->a, JSValue::boxNumber(double(std::uint32_t(x) >> (y & 31)))); NEXT();
+            case Op::BitAndI: SETP(ins->a, JSValue::int32(x & y)); NEXT();
+            case Op::BitOrI: SETP(ins->a, JSValue::int32(x | y)); NEXT();
+            case Op::BitXorI: SETP(ins->a, JSValue::int32(x ^ y)); NEXT();
+            case Op::ShlI: SETP(ins->a, JSValue::int32(std::int32_t(std::uint32_t(x) << (y & 31)))); NEXT();
+            case Op::ShrI: SETP(ins->a, JSValue::int32(x >> (y & 31))); NEXT();
+            default: SETP(ins->a, JSValue::boxNumber(double(std::uint32_t(x) >> (y & 31)))); NEXT();
         }
     } else if (op == Op::MulI && a.isDouble()) {
-        SET(ins->a, JSValue::boxDouble(a.asDouble() * double(y)));
+        SETP(ins->a, JSValue::boxDouble(a.asDouble() * double(y)));
         NEXT();
     }
     fr->pc = pc;
@@ -1142,7 +1157,7 @@ L_UShrI: {
     const JSValue r = arithmetic(vm, generic, a, JSValue::int32(y));
     if (r.isException())
         FAIL();
-    SET(ins->a, r);
+    SETP(ins->a, r);
     NEXT();
 }
 L_JLtI:
@@ -1204,25 +1219,25 @@ L_GetProp: {
         JSObject* o = asObject(base);
         if (o->h.shape == ic.shape) [[likely]] {
             if (!ic.holder) {
-                COPY(ins->a, *o->slotAt(ic.index));
+                COPYP(ins->a, *o->slotAt(ic.index));
                 ++pc;
                 NEXT();
             }
             if (ic.validity->valid) {
-                COPY(ins->a, *ic.holder->slotAt(ic.index));
+                COPYP(ins->a, *ic.holder->slotAt(ic.index));
                 ++pc;
                 NEXT();
             }
         }
         if (key == vm.atoms.length && o->cls() == ObjClass::Array) {
             const std::uint32_t n = static_cast<JSArray*>(o)->length;
-            SET(ins->a, n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            SETP(ins->a, n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             ++pc;
             NEXT();
         }
         if (key == vm.atoms.length && o->cls() == ObjClass::TypedArray) {
             const std::uint32_t n = static_cast<JSTypedArray*>(o)->length;
-            SET(ins->a, n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            SETP(ins->a, n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             ++pc;
             NEXT();
         }
@@ -1230,13 +1245,13 @@ L_GetProp: {
         if (cacheId != kNoCache) {
             if (learnRead(vm, ic, o, key)) {
                 SCRIPT_VM_CENSUS(IcMiss);
-                COPY(ins->a, ic.holder ? *ic.holder->slotAt(ic.index) : *o->slotAt(ic.index));
+                COPYP(ins->a, ic.holder ? *ic.holder->slotAt(ic.index) : *o->slotAt(ic.index));
                 ++pc;
                 NEXT();
             }
         }
     } else if (isString(base) && key == vm.atoms.length) {
-        SET(ins->a, JSValue::int32(std::int32_t(asString(base)->length)));
+        SETP(ins->a, JSValue::int32(std::int32_t(asString(base)->length)));
         ++pc;
         NEXT();
     }
@@ -1244,7 +1259,7 @@ L_GetProp: {
     const JSValue v = getProperty(vm, base, key);
     if (v.isException())
         FAIL();
-    SET(ins->a, v);
+    SETP(ins->a, v);
     ++pc;
     NEXT();
 }
@@ -1313,14 +1328,14 @@ L_GetElem: {
             auto* a = static_cast<JSArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < a->length && !a->elems[i].isHole()) {
-                COPY(ins->a, a->elems[i]);
+                COPYP(ins->a, a->elems[i]);
                 NEXT();
             }
         } else if (isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
             auto* t = static_cast<JSTypedArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < t->length && !isBigKind(t->kind)) {
-                SET(ins->a, loadNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)]));
+                SETP(ins->a, loadNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)]));
                 NEXT();
             }
         } else if (isString(base)) {
@@ -1329,7 +1344,7 @@ L_GetElem: {
             if (i < s->length) {
                 fr->pc = pc;
                 const JSValue ch = makeString(vm, s->text().substr(i, 1));
-                SET(ins->a, ch);
+                SETP(ins->a, ch);
                 NEXT();
             }
         }
@@ -1343,7 +1358,7 @@ L_GetElem: {
         const JSValue v = privateGet(vm, base, k);
         if (v.isException())
             FAIL();
-        SET(ins->a, v);
+        SETP(ins->a, v);
         NEXT();
     }
     JSValue prim = toPrimitive(vm, k, true);
@@ -1357,7 +1372,7 @@ L_GetElem: {
     release(JSValue::cell(key));
     if (v.isException())
         FAIL();
-    SET(ins->a, v);
+    SETP(ins->a, v);
     NEXT();
 }
 L_PutElem: {
@@ -1853,7 +1868,7 @@ do_call: {
             // A built-in that makes its own object: it gets the prototype of the class being constructed.
             asObject(res)->setProto(vm, asObject(R[base + 1])->proto(vm));
         }
-        SET(ins->a, res);
+        SETP(ins->a, res);
         NEXT();
     }
     TICK();
@@ -1872,7 +1887,15 @@ do_call: {
     }
     if (!c->tier1 && !c->tier1Failed && vm.tier1Threshold && ++c->hotness >= vm.tier1Threshold)
         compileTier1(vm, c);
-    JSValue* newR = R + base + 1;
+    JSValue* newR = R + base + 1;    if (c->prof.empty()) [[unlikely]]
+        c->prof.assign(c->code.size() + c->nparams + 2, 0);
+    if (!c->tier1) {
+        // What the arguments are, for the compiler of this function.
+        const std::size_t at = c->code.size();
+        for (std::uint32_t k = 0; k < c->nparams; ++k)
+            c->prof[at + k] |= k < argc ? profBit(R[base + 2 + k]) : std::uint8_t(8);
+    }
+
     if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd || (c->tier1 && nativeStackLow())) [[unlikely]] {
         vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
         FAIL();
@@ -1916,7 +1939,7 @@ do_call: {
         vm.stackTop = R + code->nregs;
         if (res.isException())
             FAIL();
-        SET(ins->a, res);
+        SETP(ins->a, res);
         NEXT();
     }
     fr = &vm.frameBase[vm.frameCount - 1];
@@ -1945,6 +1968,8 @@ L_Ret: {
     fr = &vm.frameBase[vm.frameCount - 1];
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
+    if (!code->prof.empty())
+        code->prof[std::size_t(pc - codeStart) - 1] |= profBit(result);
     SET(dst, result);
     NEXT();
 }
@@ -2326,6 +2351,8 @@ throw_: {
 #undef LOOP_TICK
 #undef TAKE16
 #undef SET
+#undef SETP
+#undef COPYP
 #undef COPY
 #undef FAIL
 #undef STRICT

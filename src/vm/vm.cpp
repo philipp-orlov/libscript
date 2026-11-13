@@ -55,6 +55,8 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_TIER1"))
         tier1Threshold = std::uint32_t(std::atoi(t));
+    if (const char* t = std::getenv("SCRIPT_VM_TIER2"))
+        tier2Threshold = std::atoi(t);
 #endif
 
     atoms.length = internKey("length");

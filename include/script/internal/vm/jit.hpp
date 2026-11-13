@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "script/internal/vm/vm.hpp"
@@ -41,6 +42,25 @@ struct Tier1Code
 /// The native behind `Math.floor`, `Math.sqrt` and the other one-argument functions of `Math`: a function whose `data` is
 /// a `double (*)(double)`, which compiled code calls directly.
 FastNative mathUnaryNative() noexcept;
+
+/// What the optimizing compiler makes. Owned by its code block.
+struct Tier2Code
+{
+    std::uint8_t* rx = nullptr;
+    std::size_t bytes = 0;
+    void* entry = nullptr;                                        ///< the function's entry, as the baseline code's
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> osr;     ///< (loop header, offset from `rx` of the way in)
+    std::vector<ValidityCell*> validities;
+    Tier2Code* older = nullptr;                                   ///< a version it replaced, kept while frames may be in it
+    void* osrAddress(std::uint32_t header) const noexcept
+    {
+        for (const auto& e : osr)
+            if (e.first == header)
+                return rx + e.second;
+        return nullptr;
+    }
+};
+void releaseTier2(Tier2Code* code, VM* vm) noexcept;
 
 /// Whether this build and host can run compiled code at all.
 bool tier1Available() noexcept;

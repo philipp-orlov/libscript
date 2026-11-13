@@ -29,6 +29,7 @@
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
+#include "opt_analysis.hpp"
 
 #if defined(__x86_64__) && defined(__linux__)
 #include "asm_x64.hpp"
@@ -168,6 +169,99 @@ extern "C" std::uint64_t scriptVmJitThrow(VM* vm, std::uint32_t index)
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
+    }
+}
+
+/// A back edge in optimized code: the interpreter's interrupt check, without the jump. 1 when it threw.
+extern "C" int scriptVmJitTick(VM* vm)
+{
+    vm->ticks = 4096;
+    if (vm->ctx.interruptAsked()) {
+        vm->throwError(ErrorCode::Interrupted, "execution was interrupted");
+        return 1;
+    }
+    return 0;
+}
+
+/// Take optimized code out of use for new calls and entries: what it was told is no longer true. Frames already in it
+/// finish there.
+void retireTier2(VM& vm, CodeBlock* code) noexcept
+{
+    if (code->tier1 && code->tier2 && code->tier1->entry == code->tier2->entry)
+        code->tier1->entry = code->tier1->rx;
+    code->tier2Counter = vm.tier2Threshold > 0 ? vm.tier2Threshold : 0x40000000;
+    if (code->tier2Tries < 255)
+        ++code->tier2Tries;
+}
+
+/// A guard of optimized code failed at instruction `index` (kind 0: it has not run, kind 1: it has). Records that, so that
+/// the next compile does not guess there, and (kind 0) runs it in the interpreter.
+extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
+{
+    try {
+        Frame* fr = vm->frameBase + vm->frameCount - 1;
+        CodeBlock* code = fr->code;
+        if (index < code->prof.size())
+            code->prof[index] |= opt::kProfFailed;
+        SCRIPT_VM_CENSUS(Tier2Exit);
+        if (++code->optExits > 40)
+            retireTier2(*vm, code);
+        else if (code->tier2Counter > 300)
+            code->tier2Counter = 300;  // a loop that left optimized code goes back in soon
+        if (kind == 1)
+            return kStepFall;
+        return stepInstruction(*vm, index);
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
+Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code);
+
+/// The baseline code's counter ran out at the function's entry (`header` is ~0u) or a loop's back edge: compile the
+/// optimizing tier if it is not there, and return the way into it from the loop, if there is one.
+extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
+{
+    try {
+        Frame* fr = vm->frameBase + vm->frameCount - 1;
+        CodeBlock* code = fr->code;
+        if (!code->tier1 || code->tier2Tries >= 3) {
+            code->tier2Counter = 0x40000000;
+            return nullptr;
+        }
+        const bool active = code->tier2 && code->tier1->entry == code->tier2->entry;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        static int compiles = 0;
+        if (!active && std::getenv("T2MAX") && compiles >= std::atoi(std::getenv("T2MAX"))) {
+            code->tier2Counter = 0x40000000;
+            return nullptr;
+        }
+        if (!active && std::getenv("T2ONLY")) {
+            const std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");
+            if (nm != std::getenv("T2ONLY")) {
+                code->tier2Counter = 0x40000000;
+                return nullptr;
+            }
+        }
+#endif
+        if (!active) {
+            Tier2Code* t = compileOptimizedCode(*vm, code);
+            if (!t) {
+                code->tier2Counter = 0x40000000;
+                code->tier2Tries = 3;
+                return nullptr;
+            }
+            t->older = code->tier2;
+            code->tier2 = t;
+            code->tier1->entry = t->entry;
+            code->optExits = 0;
+            SCRIPT_VM_CENSUS(Tier2Compiled);
+        }
+        code->tier2Counter = 0x40000000;
+        return header == 0xFFFFFFFFu ? nullptr : code->tier2->osrAddress(header);
+    } catch (...) {
+        return nullptr;
     }
 }
 
@@ -350,9 +444,19 @@ public:
     {
     }
 
+    /// The optimizing tier for the function this was made for, given the analysis of it; null when there is no room.
+    Tier2Code* optimize(const opt::Plan& plan, Tier1Code* base)
+    {
+        plan_ = &plan;
+        base_ = base;
+        return compileOptimized();
+    }
+
     Tier1Code* compile()
     {
         emitPrologue(a_);
+        if (vm_.tier2Threshold > 0)
+            emitCounter(0, -1);
         for (std::uint32_t i = 0; i < n_;) {
             a_.bind(at_[i]);
             offsets_[i] = std::uint32_t(a_.here());
@@ -392,15 +496,79 @@ private:
         vm_.retainValidity(cell);
         validities_.push_back(cell);
     }
-    Label step_, tail_, dispatch_, exit_, free_, call_, throw_;
+    Label step_, tail_, dispatch_, exit_, free_, call_, throw_, tier2_, tick_;
     std::deque<std::pair<std::uint32_t, Label>> throws_;
     struct Slow
     {
         std::uint32_t index;
         Label label;
         HelperFn helper;
+        bool saved;  ///< the template has already saved the variables (and a C call since has clobbered the registers)
     };
     std::deque<Slow> slows_;
+
+    // ---- the optimizing compiler's side (opt_emit.inc); `plan_` is null when this is the baseline compiler ----
+    const opt::Plan* plan_ = nullptr;
+    Tier1Code* base_ = nullptr;        ///< the baseline code a failed guard goes back to
+    std::int32_t spill_ = 0;           ///< bytes of stack for the typed variables, above the baseline frame
+    std::vector<std::uint8_t> dirty_;  ///< per typed web: the frame's register is behind the variable
+    bool delivered_ = false;           ///< the template just emitted put a typed destination in its variable
+    struct ExitReq
+    {
+        std::uint32_t index;
+        int kind;  ///< 0: run the instruction in the interpreter; 1: go on after it (it has run)
+        Label label;
+    };
+    std::deque<ExitReq> exits_;
+    std::map<std::uint64_t, Label*> exitIndex_;
+    std::deque<std::pair<std::uint32_t, Label>> osrEntries_;
+    std::deque<std::pair<std::uint32_t, Label>> tickStubs_;
+    std::deque<Label> tickBack_;
+    Label tailBase_, exitBase_, dispBase_, freeAll_, entryFail_;
+    struct CounterStub
+    {
+        std::uint32_t index;
+        std::int64_t target;  ///< a loop header (the way into optimized code), or -1 for the function's entry
+        Label stub;
+        Label back;
+    };
+    std::deque<CounterStub> counterStubs_;
+    bool optimizing() const noexcept { return plan_ != nullptr; }
+    Tier2Code* compileOptimized();
+    void emitOpt(std::uint32_t i);
+    bool emitTyped(std::uint32_t i);
+    void emitExits();
+    void emitOptTails();
+    // variables
+    const opt::Web& web(std::int32_t w) const { return plan_->webs[std::size_t(w)]; }
+    Mem home(std::int32_t w) const { return mem(RSP, 8 + 8 * web(w).slot); }
+    bool inReg(std::int32_t w) const { return web(w).loc.kind == opt::Loc::Reg; }
+    Reg gpr(std::int32_t w) const { return Reg(web(w).loc.reg); }
+    int xmmOf(std::int32_t w) const { return web(w).loc.reg; }
+    bool isI32(std::int32_t w) const { return web(w).rep == opt::Rep::I32; }
+    Reg useI32(std::int32_t w, Reg tmp);
+    void defI32(std::int32_t w, Reg src);
+    int operandF64(std::int32_t w, int xtmp, Reg gtmp);
+    void defF64(std::int32_t w, int x);
+    void setConstI32(std::int32_t w, std::int32_t v);
+    void spillToFrame(unsigned reg, std::int32_t w);
+    void materializeReads(std::uint32_t i);
+    void materializeLive(std::uint32_t i);
+    void loadFromFrame(unsigned reg, std::int32_t w, Label& fail);
+    void unboxRax(std::int32_t w, Label& fail);
+    void loadTypedAfter(std::uint32_t i);
+    void savePool(std::uint32_t i);
+    void restorePool(std::uint32_t i);
+    Label& exitLabel(std::uint32_t i, int kind);
+    Label& exitBefore(std::uint32_t i) { return exitLabel(i, 0); }
+    Label& exitAfter(std::uint32_t i) { return exitLabel(i, 1); }
+    void deliver(std::uint32_t i, unsigned dst);
+    void deliverInt(std::uint32_t i, unsigned dst);
+    void deliverDouble(std::uint32_t i, unsigned dst);
+    void afterGeneric(std::uint32_t i);
+    void int32OfWeb(std::int32_t w, Reg dst, std::uint32_t exitAt);
+    void typedJump(std::uint32_t i, const Ins& in);
+    void emitCounter(std::uint32_t i, std::int64_t target);
 
     std::uint32_t length(std::uint32_t i) const noexcept
     {
@@ -408,9 +576,9 @@ private:
     }
     static Mem R(unsigned r) { return mem(RBX, std::int32_t(r) * 8); }
     /// A label that runs instruction `i` in the interpreter and then goes on after it.
-    Label& slow(std::uint32_t i, HelperFn helper = nullptr)
+    Label& slow(std::uint32_t i, HelperFn helper = nullptr, bool saved = false)
     {
-        slows_.push_back(Slow{i, Label{}, helper});
+        slows_.push_back(Slow{i, Label{}, helper, saved});
         return slows_.back().label;
     }
     Label& exception(std::uint32_t i)
@@ -421,12 +589,15 @@ private:
     /// Run the instruction's helper from here; no template.
     void helperOp(std::uint32_t i, HelperFn fn)
     {
+        savePool(i);
         a_.mov(RDI, R12);
         a_.movImm(RSI, i);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(fn));
         a_.callReg(RAX);
         a_.aluI32(7, RAX, 1);
         a_.jcc(CNE, exception(i));
+        restorePool(i);
+        afterGeneric(i);
     }
 
     // ---- counting ----
@@ -591,23 +762,40 @@ private:
     }
     void emitStep(std::uint32_t i)
     {
+        savePool(i);
         callStep(i);
         a_.cmpI(RAX, std::int32_t(kStepFall));
         a_.jcc(CNE, tail_);
+        restorePool(i);
+        afterGeneric(i);
     }
     /// For a taken backward jump: count down to the next look at the interrupt flag, in the interpreter when it is time.
     void tick(std::uint32_t i)
     {
         a_.mov32(RDX, mem(R12, kVmTicks));
         a_.aluI32(5, RDX, 1);
+        if (optimizing()) {
+            // The optimizing code may not leave for the interpreter here (its variables are in registers): a stub makes the
+            // call that looks at the flag and comes back.
+            tickStubs_.emplace_back(i, Label{});
+            Label& stub = tickStubs_.back().second;
+            a_.jcc(CE, stub);
+            a_.mov32(mem(R12, kVmTicks), RDX);
+            tickBack_.emplace_back(Label{});
+            a_.bind(tickBack_.back());
+            return;
+        }
         a_.jcc(CE, slow(i));
         a_.mov32(mem(R12, kVmTicks), RDX);
     }
     /// Go to instruction `target` from the jump at `i`.
     void go(std::uint32_t i, std::uint32_t target)
     {
-        if (target <= i)
+        if (target <= i) {
             tick(i);
+            if (!optimizing() && vm_.tier2Threshold > 0)
+                emitCounter(i, target);
+        }
         a_.jmp(at_[target]);
     }
     /// Jump to `target` if `cond` holds.
@@ -654,6 +842,8 @@ void Baseline::emitTails()
     for (std::size_t k = 0; k < slows_.size(); ++k) {
         Slow& s = slows_[k];
         a_.bind(s.label);
+        if (!s.saved)
+            savePool(s.index);
         if (s.helper) {
             a_.mov(RDI, R12);
             a_.movImm(RSI, s.index);
@@ -666,14 +856,31 @@ void Baseline::emitTails()
             a_.cmpI(RAX, std::int32_t(kStepFall));
             a_.jcc(CNE, tail_);
         }
+        restorePool(s.index);
+        afterGeneric(s.index);
         a_.jmp(at_[s.index + length(s.index)]);
     }
+    if (optimizing())
+        emitOptTails();
     for (auto& t : throws_) {
         a_.bind(t.second);
         a_.mov(RDI, R12);
         a_.movImm(RSI, t.first);
         a_.call(throw_);
         a_.jmp(tail_);
+    }
+    for (CounterStub& c : counterStubs_) {
+        a_.bind(c.stub);
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, c.target >= 0 ? std::uint64_t(c.target) : std::uint64_t(0xFFFFFFFFu));
+        a_.call(tier2_);
+        if (c.target >= 0) {
+            a_.test(RAX, RAX);
+            a_.jcc(CE, c.back);
+            a_.jmp(RAX);
+        } else {
+            a_.jmp(c.back);
+        }
     }
     a_.bind(step_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitStep));
@@ -684,6 +891,54 @@ void Baseline::emitTails()
     a_.bind(throw_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitThrow));
     a_.jmp(RAX);
+    a_.bind(tier2_);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitTier2));
+    a_.jmp(RAX);
+    a_.bind(tick_);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitTick));
+    a_.jmp(RAX);
+    if (optimizing()) {
+        // A cell let go of in optimized code: the variables in caller-saved registers survive the call.
+        a_.bind(free_);
+        a_.push(R8);
+        a_.push(R9);
+        a_.push(R10);
+        a_.push(R11);
+        a_.aluI(5, RSP, 120);
+        for (int k = 0; k < 14; ++k)
+            a_.movsdStore(mem(RSP, 8 * k), 2 + k);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFree));
+        a_.callReg(RAX);
+        for (int k = 0; k < 14; ++k)
+            a_.movsdLoad(2 + k, mem(RSP, 8 * k));
+        a_.aluI(0, RSP, 120);
+        a_.pop(R11);
+        a_.pop(R10);
+        a_.pop(R9);
+        a_.pop(R8);
+        a_.ret();
+        // Leaving for the interpreter or the caller: back to the baseline frame first.
+        a_.bind(tail_);
+        a_.aluI(0, RSP, spill_);
+        a_.bind(tailBase_);
+        a_.cmpI(RAX, std::int32_t(kStepJump));
+        a_.jcc(CE, dispBase_);
+        a_.bind(exitBase_);
+        a_.aluI(0, RSP, 8);
+        a_.pop(R13);
+        a_.pop(RBX);
+        a_.ret();
+        a_.bind(dispBase_);
+        a_.mov(RDI, R12);
+        a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitTarget));
+        a_.jmp(RAX);
+        a_.bind(exit_);
+        a_.aluI(0, RSP, 8 + spill_);
+        a_.pop(R13);
+        a_.pop(RBX);
+        a_.ret();
+        return;
+    }
     a_.bind(free_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFree));
     a_.jmp(RAX);
@@ -765,8 +1020,7 @@ void Baseline::emit(std::uint32_t i)
     case Op::GetBox:
         a_.mov(RAX, R(in.b));
         a_.mov(RAX, mem(RAX, kBoxValue));
-        retain(RAX);
-        write(in.a, RAX);
+        deliver(i, in.a);
         return;
     case Op::PutBox:
         a_.mov(RAX, R(in.a));
@@ -780,8 +1034,7 @@ void Baseline::emit(std::uint32_t i)
         a_.mov(RAX, mem(R13, kFrameFn));
         a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * in.b)));
         a_.mov(RAX, mem(RAX, kBoxValue));
-        retain(RAX);
-        write(in.a, RAX);
+        deliver(i, in.a);
         return;
     case Op::PutUpval:
         a_.mov(RAX, mem(R13, kFrameFn));
@@ -1271,8 +1524,7 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
             slotAddress(ic->index);
         }
         a_.mov(RAX, mem(RDX, 0));
-        retain(RAX);
-        write(in.a, RAX);
+        deliver(i, in.a);
         if (isLength)
             a_.jmp(done);
     }
@@ -1283,8 +1535,7 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         a_.mov32(RAX, mem(RAX, kArrayLength));
         a_.test32(RAX, RAX);
         a_.jcc(CS, bad);
-        a_.or_(RAX, R14);
-        write(in.a, RAX);
+        deliverInt(i, in.a);
     }
     a_.bind(done);
 }
@@ -1345,8 +1596,7 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.mov(RAX, mem(RDX, RCX, 8));
     a_.cmpI(RAX, std::int32_t(kHole));
     a_.jcc(CE, bad);
-    retain(RAX);
-    write(in.a, RAX);
+    deliver(i, in.a);
     a_.jmp(done);
 
     a_.bind(typed);
@@ -1384,8 +1634,7 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.movssLoad(0, mem(RSI, RCX, 4));
     a_.cvtss2sd(0, 0);
     a_.bind(box);
-    boxDouble0();
-    write(in.a, RAX);
+    deliverDouble(i, in.a);
     a_.jmp(done);
     a_.bind(i32);
     a_.mov32(RAX, mem(RSI, RCX, 4));
@@ -1402,8 +1651,7 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.bind(u16);
     a_.movzx16(RAX, mem(RSI, RCX, 2));
     a_.bind(intResult);
-    a_.or_(RAX, R14);
-    write(in.a, RAX);
+    deliverInt(i, in.a);
     a_.bind(done);
 }
 
@@ -1442,8 +1690,8 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.bind(typed);
     a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
     a_.jcc(CNE, bad);
-    a_.mov(R8, R(in.c));
-    a_.test(R8, R14);
+    a_.mov(RDI, R(in.c));
+    a_.test(RDI, R14);
     a_.jcc(CE, bad);
     a_.mov32(RCX, RCX);
     a_.alu32(7, RCX, mem(RAX, kTypedLength));
@@ -1469,24 +1717,24 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.jcc(CE, f32);
     a_.jmp(bad);
     a_.bind(f64);
-    loadNumber(0, R8, RDX);
+    loadNumber(0, RDI, RDX);
     a_.movsdStore(mem(RSI, RCX, 8), 0);
     a_.jmp(done);
     a_.bind(f32);
-    loadNumber(0, R8, RDX);
+    loadNumber(0, RDI, RDX);
     a_.cvtsd2ss(0, 0);
     a_.movssStore(mem(RSI, RCX, 4), 0);
     a_.jmp(done);
     a_.bind(i32);
-    int32From(RAX, R8, bad);
+    int32From(RAX, RDI, bad);
     a_.mov32(mem(RSI, RCX, 4), RAX);
     a_.jmp(done);
     a_.bind(i8);
-    int32From(RAX, R8, bad);
+    int32From(RAX, RDI, bad);
     a_.mov8(mem(RSI, RCX, 1), RAX);
     a_.jmp(done);
     a_.bind(i16);
-    int32From(RAX, R8, bad);
+    int32From(RAX, RDI, bad);
     a_.mov16(mem(RSI, RCX, 2), RAX);
     a_.bind(done);
 }
@@ -1532,16 +1780,16 @@ void Baseline::getGlobal(std::uint32_t i, const Ins& in)
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(g));
     slotAddress(index);
     a_.mov(RAX, mem(RDX, 0));
-    retain(RAX);
-    write(in.a, RAX);
+    deliver(i, in.a);
 }
 
 void Baseline::call(std::uint32_t i, const Ins& in)
 {
-    Label& bad = slow(i);
+    Label& bad = slow(i, nullptr, true);
     throws_.emplace_back(i, Label{});
     Label& exc = throws_.back().second;
     Label helper, enter, native, afterCall;
+    savePool(i);
     const unsigned base = in.b, argc = in.c;
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     const bool fast = in.opcode() == Op::Call && window <= 1 + argc + 6;
@@ -1667,6 +1915,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     a_.jcc(CE, exc);
     write(in.a, RAX);
     a_.bind(afterCall);
+    restorePool(i);
 }
 
 void Baseline::ret(std::uint32_t i, const Ins& in)
@@ -1715,7 +1964,63 @@ void Baseline::ret(std::uint32_t i, const Ins& in)
     a_.jmp(exit_);
 }
 
+#include "opt_emit.inc"
+
+Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
+{
+    if (!code->tier1)
+        return nullptr;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* f = std::getenv("T2FAIL")) {
+        // Testing: treat these instructions as having failed a guard.
+        for (const char* q = f; *q;) {
+            const unsigned long v = std::strtoul(q, nullptr, 10);
+            if (v < code->code.size())
+                code->prof[v] |= opt::kProfFailed;
+            while (*q && *q != ',')
+                ++q;
+            if (*q == ',')
+                ++q;
+        }
+    }
+#endif
+    opt::Plan plan = opt::analyse(*code);
+    if (!plan.ok)
+        return nullptr;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2DBG")) {
+        std::fprintf(stderr, "tier2 compile: %s n=%u tries=%d webs=%zu prof:", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
+                     plan.n, int(code->tier2Tries), plan.webs.size());
+        for (std::uint32_t i = 0; i < plan.n && i < 60; ++i)
+            std::fprintf(stderr, " %u", unsigned(code->prof[i]));
+        std::fprintf(stderr, "\n");
+        for (std::size_t w = 0; w < plan.webs.size(); ++w)
+            std::fprintf(stderr, "  web %zu reg %u rep %d loc %s%d [%u,%u]\n", w, plan.webs[w].reg, int(plan.webs[w].rep),
+                         plan.webs[w].loc.kind == opt::Loc::Reg ? "r" : "s", int(plan.webs[w].loc.reg), plan.webs[w].first, plan.webs[w].last);
+        std::fprintf(stderr, "%s\n", dump(*code).c_str());
+    }
+#endif
+    Baseline compiler(vm, code);
+    return compiler.optimize(plan, code->tier1);
+}
+
 }  // namespace
+
+void releaseTier2(Tier2Code* code, VM* vm) noexcept
+{
+    while (code) {
+        if (vm)
+            for (ValidityCell* v : code->validities)
+                vm->releaseValidity(v);
+        CodeSpan span;
+        span.rx = code->rx;
+        span.bytes = code->bytes;
+        releaseCode(span);
+        Tier2Code* older = code->older;
+        delete code;
+        code = older;
+    }
+}
 
 bool tier1Available() noexcept
 {
@@ -1736,6 +2041,7 @@ void compileTier1(VM& vm, CodeBlock* code)
         return;
     code->tier1 = t;
     code->tier1Failed = false;
+    code->tier2Counter = vm.tier2Threshold > 0 ? vm.tier2Threshold : 0x40000000;
     SCRIPT_VM_CENSUS(Tier1Compiled);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     // SCRIPT_VM_PERFMAP=1: name the code for `perf report` in /tmp/perf-<pid>.map.
@@ -1790,12 +2096,15 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
 bool tier1Available() noexcept { return false; }
 void compileTier1(VM&, CodeBlock* code) { code->tier1Failed = true; }
 void releaseTier1(Tier1Code*, VM*) noexcept {}
+void releaseTier2(Tier2Code*, VM*) noexcept {}
 JSValue enterTier1(VM&, Tier1Code*, std::uint32_t) { return JSValue::exception(); }
 
 #endif
 
 CodeBlock::~CodeBlock()
 {
+    if (tier2)
+        releaseTier2(tier2, nullptr);
     if (tier1)
         releaseTier1(tier1, nullptr);
 }

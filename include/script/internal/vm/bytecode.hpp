@@ -58,6 +58,11 @@ struct Ins
 static_assert(sizeof(Ins) == 8, "an instruction is eight bytes");
 
 const char* opName(Op op) noexcept;
+
+inline std::uint8_t profBit(JSValue v) noexcept
+{
+    return v.isInt32() ? 1 : v.isDouble() ? 2 : 8;
+}
 /// The operand kinds of `op`, three characters (see opcodes.def).
 const char* opKinds(Op op) noexcept;
 
@@ -128,6 +133,14 @@ struct CodeBlock
     Vec<Handler> handlers;
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
     Vec<InlineCache> caches;
+    /// What the instructions have made so far (profBit: 1 int32, 2 double, 8 anything else), one byte per instruction, then
+    /// one per parameter for what calls passed: the optimizing compiler's type feedback. Empty until the code first runs.
+    Vec<std::uint8_t> prof;
+    /// The optimizing compiler's code for this function (jit.hpp), once the baseline code has run hot; owned.
+    struct Tier2Code* tier2 = nullptr;
+    std::int32_t tier2Counter = 0;  ///< entries and back edges of the baseline code left before the optimizing compiler is asked
+    std::uint32_t optExits = 0;     ///< guards of the optimizing code that failed
+    std::uint8_t tier2Tries = 0;
     /// Baseline machine code for this function, once it has run hot enough (jit.hpp); owned.
     struct Tier1Code* tier1 = nullptr;
     std::uint32_t hotness = 0;

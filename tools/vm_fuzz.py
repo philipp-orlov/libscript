@@ -239,7 +239,7 @@ class Gen:
                 "if (typeof x === 'function') return 'fn'; if (typeof x === 'number' && x === 0 && 1 / x < 0) return '-0'; return String(x); }\n"
                 "function log(x) { out.push(show(x)); }\n"
                 "function run() {\n" + "\n".join(body) + "\n}\n"
-                "try { run(); } catch (e) { out.push('THROW ' + (e && e.name)); }\n"
+                "try { for (var rep = 0; rep < " + os.environ.get('FUZZ_REPS', '1') + "; rep++) run(); } catch (e) { out.push('THROW ' + (e && e.name)); }\n"
                 "for (var i = 0; i < fs.length; i++) out.push(fs[i]());\n"
                 "console.log(out.join('|'));\n")
 
@@ -260,7 +260,7 @@ def one(args):
     with open(path, 'w') as f:
         f.write(Gen(seed).program())
     base = run(tool, {'SCRIPT_CORE': 'dyn', 'SCRIPT_JIT': 'off'}, path)
-    got = run(tool, {'SCRIPT_CORE': 'vm', 'SCRIPT_VM_TIER1': os.environ.get('FUZZ_TIER1', '0')}, path)
+    got = run(tool, {'SCRIPT_CORE': 'vm', 'SCRIPT_VM_TIER1': os.environ.get('FUZZ_TIER1', '0'), 'SCRIPT_VM_TIER2': os.environ.get('FUZZ_TIER2', '0')}, path)
     if base[0] != 0 and got[0] != 0:
         # Both refuse the program: the text of the message differs.
         os.unlink(path)

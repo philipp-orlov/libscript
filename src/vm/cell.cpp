@@ -550,6 +550,8 @@ void VM::releaseRoots() noexcept
     release(regexpExec);
     release(promiseCtor);
     release(arrayConstructor);
+    release(legacyInput);
+    legacyInput = JSValue::undefined();
     for (JSValue& c : typedCtors) {
         release(c);
         c = JSValue::undefined();

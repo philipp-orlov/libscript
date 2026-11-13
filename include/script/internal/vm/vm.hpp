@@ -314,6 +314,11 @@ struct VM : EngineRuntime
     JSValue regexpExec = JSValue::undefined();
     JSValue promiseCtor = JSValue::undefined();  ///< the Promise constructor as made
     JSValue arrayConstructor = JSValue::undefined();    ///< the Array constructor as made
+    /// What `RegExp.$1`, `RegExp.lastMatch` and the like read: the last successful match of a RegExp made by the constructor.
+    JSValue legacyInput = JSValue::undefined();  ///< counted
+    std::int32_t legacyBounds[20] = {};
+    std::uint8_t legacyGroups = 0;
+    bool legacyInvalid = false;                  ///< a subclass instance matched since: the accessors throw
     bool overflowing = false;                    ///< raising a stack overflow right now
     std::string ambient;                         ///< TypeScript declarations the embedder added with `Context::declare`
     JSValue typedCtors[16] = {};                 ///< the typed array constructors as made, by ElemKind

@@ -7,6 +7,8 @@
 #include <mutex>
 
 #include "script/internal/dyn/regexp.hpp"
+#include <cstring>
+
 #include "builtins_util.hpp"
 
 namespace script {
@@ -190,10 +192,46 @@ JSValue matchArray(VM& vm, RegExpData* d, JSValue input, StringView s, const Mat
             pair->append(vm, JSValue::int32(m.bounds[2 * g + 1]));
             idx->append(vm, toJSValue(pair));
         }
+        const auto& names = regex::namedGroups(*d->program);
+        JSValue groupsValue = JSValue::undefined();
+        if (!names.empty()) {
+            JSObject* g = vm.newObject(static_cast<JSObject*>(nullptr));
+            groupsValue = toJSValue(g);
+            for (const regex::NamedGroup& ng : names) {
+                JSValue v = JSValue::undefined();
+                for (std::uint32_t group : ng.groups)
+                    if (m.bounds[2 * group] >= 0) {
+                        v = idx->at(group);
+                        break;
+                    }
+                retain(v);
+                Key k = vm.internKey(StringView(ng.name));
+                g->putOwn(vm, k, v, attr::kDefault);
+                detail::decRef(k);
+            }
+        }
+        idx->putOwn(vm, vm.atoms.groups, groupsValue, attr::kDefault);
         retain(idxKeep.get());
         a->putOwn(vm, vm.atoms.indices, idxKeep.get(), attr::kDefault);
     }
     return keep.take();
+}
+
+/// What `RegExp.lastMatch` and its kin report: a match of a RegExp made by the constructor itself replaces them, and one of a
+/// subclass instance makes them throw.
+void noteLegacyMatch(VM& vm, const RegExpData* d, JSValue text, const Match& m)
+{
+    if (!d->legacy) {
+        vm.legacyInvalid = true;
+        return;
+    }
+    retain(text);
+    release(vm.legacyInput);
+    vm.legacyInput = text;
+    vm.legacyInvalid = false;
+    vm.legacyGroups = std::uint8_t(std::min<std::size_t>(m.groups(), 10));
+    for (std::size_t i = 0; i < 2u * vm.legacyGroups; ++i)
+        vm.legacyBounds[i] = m.bounds[i];
 }
 
 /// RegExpBuiltinExec: a match array, null, or the exception sentinel.
@@ -224,6 +262,7 @@ JSValue builtinExec(VM& vm, JSValue re, JSValue input)
     }
     if (useIndex && !writeLastIndex(vm, o, m.end()))
         return JSValue::exception();
+    noteLegacyMatch(vm, d, text.get(), m);
     return matchArray(vm, d, text.get(), s, m);
 }
 
@@ -765,6 +804,8 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
         }
         at = me == ms ? advance(s, me, unicode) : me;
     }
+    if (!found.empty())
+        noteLegacyMatch(vm, d, textValue, found.back());
     String out;
     std::size_t copied = 0;
     for (const Match& m : found) {
@@ -1359,9 +1400,148 @@ void installRegExp(VM& vm)
     method(vm, sp, "matchAll", stringMatchOrSearch, 1, reinterpret_cast<void*>(2));
 }
 
+/// The getters of `RegExp.$1` to `RegExp.$9` (data 1 to 9), `input` (0), `lastMatch` (10), `lastParen` (11), `leftContext` (12) and
+/// `rightContext` (13).
+NATIVE(regexpLegacyGet)
+{
+    UNUSED();
+    if (self.bits != vm.regexpCtor.bits)
+        return typeError(vm, "RegExp legacy static accessors require the RegExp constructor as the receiver");
+    if (vm.legacyInvalid)
+        return typeError(vm, "RegExp legacy static properties are not available after a subclass match");
+    const int which = int(reinterpret_cast<std::intptr_t>(data));
+    if (which == 0) {
+        if (isString(vm.legacyInput)) {
+            retain(vm.legacyInput);
+            return vm.legacyInput;
+        }
+        return makeString(vm, StringView());
+    }
+    if (!isString(vm.legacyInput))
+        return makeString(vm, StringView());
+    const StringView text = asString(vm.legacyInput)->text();
+    auto slice = [&](std::int32_t from, std::int32_t to) {
+        return makeString(vm, text.substr(std::size_t(from), std::size_t(to - from)));
+    };
+    auto group = [&](std::size_t g) {
+        if (g >= vm.legacyGroups || vm.legacyBounds[2 * g] < 0)
+            return makeString(vm, StringView());
+        return slice(vm.legacyBounds[2 * g], vm.legacyBounds[2 * g + 1]);
+    };
+    if (which <= 9)
+        return group(std::size_t(which));
+    switch (which) {
+        case 10: return group(0);
+        case 11: return vm.legacyGroups > 1 ? group(vm.legacyGroups - 1u) : makeString(vm, StringView());
+        case 12: return slice(0, vm.legacyBounds[0]);
+        default: return slice(vm.legacyBounds[1], std::int32_t(text.size()));
+    }
+}
+
+NATIVE(regexpLegacyInputSet)
+{
+    UNUSED();
+    if (self.bits != vm.regexpCtor.bits)
+        return typeError(vm, "RegExp legacy static accessors require the RegExp constructor as the receiver");
+    JSValue text = toStringValue(vm, arg(args, argc, 0));
+    if (text.isException())
+        return text;
+    release(vm.legacyInput);
+    vm.legacyInput = text;
+    return JSValue::undefined();
+}
+
+/// `RegExp.escape(string)`: the text as a pattern that matches just it.
+NATIVE(regexpEscape)
+{
+    UNUSED();
+    const JSValue v = arg(args, argc, 0);
+    if (!isString(v))
+        return typeError(vm, "RegExp.escape requires a string");
+    const StringView text = asString(v)->text();
+    String out;
+    auto hex = [&](std::uint32_t value, int digits) {
+        static const char16_t kDigits[] = u"0123456789abcdef";
+        for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
+            out.push_back(kDigits[(value >> shift) & 15]);
+    };
+    for (std::size_t i = 0; i < text.size();) {
+        std::uint32_t cp = text[i];
+        std::size_t width = 1;
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < text.size() && text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (text[i + 1] - 0xDC00);
+            width = 2;
+        }
+        const bool alnum = (cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z');
+        if (i == 0 && alnum) {
+            out += u"\\x";
+            hex(cp, 2);
+        } else if (cp < 128 && std::strchr("^$\\.*+?()[]{}|/", int(cp)) && cp != 0) {
+            out.push_back(u'\\');
+            out.push_back(char16_t(cp));
+        } else if (cp == '\t' || cp == '\n' || cp == 0x0B || cp == '\f' || cp == '\r') {
+            out.push_back(u'\\');
+            out.push_back(cp == '\t' ? u't' : cp == '\n' ? u'n' : cp == 0x0B ? u'v' : cp == '\f' ? u'f' : u'r');
+        } else if ((cp < 128 && cp != 0 && std::strchr(",-=<>#&!%:;@~'`\"", int(cp))) || cp == ' ' || cp == 0xA0 || cp == 0xFEFF ||
+                   cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x202F || cp == 0x205F || cp == 0x3000 ||
+                   cp == 0x2028 || cp == 0x2029 || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            if (cp <= 0xFF) {
+                out += u"\\x";
+                hex(cp, 2);
+            } else {
+                out += u"\\u";
+                hex(cp, 4);
+            }
+        } else {
+            out += text.substr(i, width);
+        }
+        i += width;
+    }
+    return makeString(vm, StringView(out));
+}
+
+void installRegExpLegacy(VM& vm)
+{
+    JSObject* ctor = asObject(vm.regexpCtor);
+    method(vm, ctor, "escape", regexpEscape, 1);
+    struct Spec
+    {
+        const char* name;
+        const char* alias;
+        int which;
+    };
+    static const Spec specs[] = {{"input", "$_", 0}, {"$1", nullptr, 1}, {"$2", nullptr, 2}, {"$3", nullptr, 3},
+                                 {"$4", nullptr, 4}, {"$5", nullptr, 5}, {"$6", nullptr, 6}, {"$7", nullptr, 7},
+                                 {"$8", nullptr, 8}, {"$9", nullptr, 9}, {"lastMatch", "$&", 10}, {"lastParen", "$+", 11},
+                                 {"leftContext", "$`", 12}, {"rightContext", "$'", 13}};
+    for (const Spec& spec : specs) {
+        for (const char* name : {spec.name, spec.alias}) {
+            if (!name)
+                continue;
+            Key key = vm.internKey(std::string_view(name));
+            Key getName = vm.internKey(std::string_view(std::string("get ") + name));
+            JSFunction* getter = vm.newNativeFunction(vm.protos.function, regexpLegacyGet, reinterpret_cast<void*>(std::intptr_t(spec.which)), getName, 0);
+            Handle getKeep = Handle::adopt(toJSValue(getter));
+            JSValue setter = JSValue::undefined();
+            Handle setKeep;
+            if (spec.which == 0) {
+                Key setName = vm.internKey(std::string_view(std::string("set ") + name));
+                JSFunction* fn = vm.newNativeFunction(vm.protos.function, regexpLegacyInputSet, nullptr, setName, 1);
+                setKeep = Handle::adopt(toJSValue(fn));
+                setter = setKeep.get();
+                detail::decRef(setName);
+            }
+            defineAccessor(vm, ctor, key, toJSValue(getter), setter, attr::kConfigurable);
+            detail::decRef(key);
+            detail::decRef(getName);
+        }
+    }
+}
+
 /// What a plain RegExp counts on staying as it is, taken once everything that goes on the prototype and the constructor is there.
 void recordRegExpOriginals(VM& vm)
 {
+    installRegExpLegacy(vm);
     JSObject* proto = vm.protos.regexp;
     JSObject* ctor = asObject(vm.regexpCtor);
     const char* const names[] = {"exec", "constructor", "flags", "global", "ignoreCase", "multiline", "dotAll", "unicode",

@@ -195,6 +195,25 @@ void VM::destroyShape(Shape* shape) noexcept
     PoolAlloc<Shape>().deallocate(shape, 1);
 }
 
+void VM::retireShapeTree(Shape* root) noexcept
+{
+    std::vector<Shape*> pending{root};
+    while (!pending.empty()) {
+        Shape* s = pending.back();
+        pending.pop_back();
+        try {
+            for (const Transition& t : s->transitions)
+                pending.push_back(t.next);
+        } catch (...) {
+            // What cannot be listed stays, as it did.
+        }
+        shapeTable_[s->id] = nullptr;
+        ++retiredShapes_;
+        s->proto = nullptr;
+        destroyShape(s);
+    }
+}
+
 void VM::freeShape(Shape* shape) noexcept
 {
     shapeTable_[shape->id] = nullptr;

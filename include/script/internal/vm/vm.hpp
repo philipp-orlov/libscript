@@ -178,7 +178,10 @@ struct VM : EngineRuntime
     /// the prototype.
     Shape* rootShapeFor(JSObject* proto);
     std::uint32_t maxShapes = kDefaultMaxShapes;
-    std::uint32_t shapesAlive() const noexcept { return shapeCount_ - freeShapeIds_.size() - 1; }
+    std::uint32_t shapesAlive() const noexcept { return shapeCount_ - std::uint32_t(freeShapeIds_.size()) - retiredShapes_ - 1; }
+    /// Free the shapes of a prototype that is gone and of everything inherited from it. Their ids stay taken: native code and
+    /// inline caches may still name one, and must never meet another shape under it.
+    void retireShapeTree(Shape* root) noexcept;
 
     // ---- objects (object.cpp) ----
     /// A plain object with `aux` inline slots, with the shapes of `root`.
@@ -343,6 +346,7 @@ private:
     friend struct JSObject;
     Shape** shapeTable_ = nullptr;
     std::uint32_t shapeCount_ = 1;  ///< id 0 is "no shape"
+    std::uint32_t retiredShapes_ = 0;
     std::uint32_t shapeCommitted_ = 0;
     Vec<std::uint32_t> freeShapeIds_;
     Shape* nullRoot_ = nullptr;

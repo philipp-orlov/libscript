@@ -495,7 +495,8 @@ void VM::collectCycles(bool minor) noexcept
     ctx.gcFreed += garbage.size();
     for (CellPtr cell : garbage)
         clearReferences(*this, cell);
-    // A dead prototype lets go of its root's count; the shapes stay (their ids are never reused), without it.
+    // A dead prototype lets go of its root's count; its shapes are freed once what had them is gone.
+    std::vector<Shape*> deadRoots;
     for (CellPtr cell : garbage) {
         if (kindOf(cell) != Kind::Object || !(headerOf(cell)->flags & cellflags::kIsProto))
             continue;
@@ -505,10 +506,17 @@ void VM::collectCycles(bool minor) noexcept
         if (r && r->childRoot && r->childRoot->proto == o) {
             r->childRoot->proto = nullptr;
             detail::decRef(cell);
+            try {
+                deadRoots.push_back(r->childRoot);
+                r->childRoot = nullptr;
+            } catch (...) {
+            }
         }
     }
     for (CellPtr cell : garbage)
         detail::decRef(cell);
+    for (Shape* root : deadRoots)
+        retireShapeTree(root);
 }
 
 void VM::releaseRoots() noexcept

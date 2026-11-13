@@ -945,20 +945,38 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
                 bind(done);
                 emit(Op::LoadUndef, d);
             } else if (n.prefix) {
-                // `yield*` hands out what the inner iterator does; what it sends back and its return value are not passed on.
+                // `yield*`: each resumption goes to the inner iterator's next, throw or return, whose result is given out as
+                // it is; when it says it is done its value is the value of the expression (or, for a return, the return).
                 const std::uint16_t src = exprAny(*n.a);
                 const std::uint16_t it = temps(2);
+                const std::uint16_t recv = temps(2);
+                const std::uint16_t res = temp();
+                const std::uint16_t flag = temp();
                 const std::uint16_t v = temp();
-                const std::uint16_t sent = temp();
-                Label top, done;
-                emit(Op::IterInit, it, src);
+                Label top, finished, noReturn, end;
+                emit(Op::GetIteratorObj, it, src);
+                emit(Op::LoadUndef, recv);
+                loadNumber(std::uint16_t(recv + 1), 0);
                 bind(top);
-                emit(Op::IterNext, v, it, 0);
-                emitJump(Op::JHole, v, done);
-                emit(Op::Yield, sent, v);
+                emit(Op::DelegateCall, res, it, recv);
+                emitJump(Op::JHole, res, noReturn);
+                emit(Op::DelegateDone, flag, res);
+                emitJump(Op::JTrue, flag, finished);
+                emit(Op::YieldDelegate, recv, res);
                 jump(top);
-                bind(done);
-                emit(Op::LoadUndef, d);
+                bind(finished);
+                emitCached(Op::GetProp, v, res, atom(String(u"value")));
+                loadNumber(flag, 2);
+                emit(Op::StrictEq, flag, std::uint16_t(recv + 1), flag);
+                emitJump(Op::JFalse, flag, end);
+                emitFinallyFor(0);
+                emitReturn(v);
+                bind(noReturn);
+                emit(Op::Mov, v, recv);
+                emitFinallyFor(0);
+                emitReturn(v);
+                bind(end);
+                emit(Op::Mov, d, v);
             } else {
                 std::uint16_t v;
                 if (n.a) {
@@ -2127,12 +2145,19 @@ std::uint16_t Compiler::chainRoot(const Node& n, int dst, bool isNew)
 std::uint16_t Compiler::member(const Node& n, int dst)
 {
     if (n.a->kind == NK::SuperExpr) {
-        if (n.computed)
-            unsupported(n, "this use of super");
-        const std::uint16_t d = dest(dst);
         const std::uint16_t at = fn_->top;
+        if (n.computed) {
+            const std::uint16_t self = thisRegister();
+            const std::uint16_t key = exprAny(*n.b);
+            fn_->top = at;
+            const std::uint16_t d = dest(dst);
+            emit(Op::GetSuperElem, d, key, self);
+            return d;
+        }
+        const std::uint16_t d = dest(dst);
+        const std::uint16_t inner = fn_->top;
         emit(Op::GetSuperProp, d, atom(n.text), thisRegister());
-        fn_->top = at;
+        fn_->top = inner;
         return d;
     }
     const std::uint16_t mark = fn_->top;
@@ -2168,11 +2193,14 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
                                               : !(fn_->block->flags & CodeBlock::kClassConstructor))))
         unsupported(n, "super() here");
     if (!isNew && callee.kind == NK::Member && callee.a->kind == NK::SuperExpr) {
-        if (callee.computed)
-            unsupported(n, "this use of super");
         const std::uint16_t at = fn_->top;
         const std::uint16_t self = thisRegister();
-        emit(Op::GetSuperProp, base, atom(callee.text), self);
+        if (callee.computed) {
+            const std::uint16_t key = exprAny(*callee.b);
+            emit(Op::GetSuperElem, base, key, self);
+        } else {
+            emit(Op::GetSuperProp, base, atom(callee.text), self);
+        }
         emit(Op::Mov, base + 1, self);
         fn_->top = at;
     } else if (superCall && fn_->isArrow) {

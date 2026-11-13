@@ -105,6 +105,9 @@ struct Intrinsics
     JSObject* arguments = nullptr;       ///< what the `arguments` of a call inherits from
     JSObject* arrayBuffer = nullptr;
     JSObject* sharedArrayBuffer = nullptr;
+    JSObject* generatorFunction = nullptr;       ///< %GeneratorFunction.prototype%: what generator functions inherit from
+    JSObject* asyncFunction = nullptr;
+    JSObject* asyncGeneratorFunction = nullptr;
     JSObject* iteratorHelper = nullptr;         ///< %IteratorHelperPrototype%
     JSObject* wrapForValidIterator = nullptr;   ///< %WrapForValidIteratorPrototype%
     JSObject* typedArrays[16] = {};  ///< by ElemKind
@@ -211,6 +214,8 @@ struct VM : EngineRuntime
     ErrorCode exceptionCode = ErrorCode::Ok;
     /// An error object of the class `code` names, with `message`; owned.
     JSValue makeError(ErrorCode code, std::string_view message);
+    /// Give an error object its `stack`: its name and message, then the calls that lead here.
+    void attachStack(JSObject* error);
     /// Make an error and leave it pending; returns the exception sentinel, so `return vm.throwError(...)` reads well.
     JSValue throwError(ErrorCode code, std::string_view message);
     void clearException() noexcept;
@@ -313,7 +318,8 @@ struct VM : EngineRuntime
     /// Run queued jobs, and those they queue, until none are left; how many ran.
     std::size_t runJobs();
     /// `resumeGenerator` without the result object: `*out` is the value (owned), `*done` whether it returned.
-    bool resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool* done);
+    /// `rawResult`, when given, receives the iterator result a `yield*` passes on as it is (owned), and `*out` is then unset.
+    bool resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool* done, JSValue* rawResult = nullptr);
     /// What a generator'"'"'s `return(v)` throws at the `yield` it waits in, so that `finally` blocks run and `catch` blocks do
     /// not; `returnValue` is `v`. Both owned.
     JSValue returnMarker = JSValue::undefined();

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -173,6 +174,16 @@ NATIVE(parseIntImpl)
     } else {
         double n = 0;
         bool any = false;
+        if (radix == 10) {
+            // Exactly the nearest double of the digits, however many there are.
+            std::string digits;
+            for (; i < text.size() && text[i] >= u'0' && text[i] <= u'9'; ++i)
+                digits.push_back(char(text[i]));
+            any = !digits.empty();
+            if (any)
+                n = std::strtod(digits.c_str(), nullptr);
+            i = text.size();
+        }
         for (; i < text.size(); ++i) {
             const char16_t c = text[i];
             int digit;
@@ -591,6 +602,7 @@ JSValue definePropertyImpl(VM& vm, JSObject* o, Key key, JSObject* d)
     PropDesc desc;
     if (!readPropDesc(vm, d, &desc))
         return JSValue::exception();
+    o->materialize(vm);
     const JSValue vv = desc.hasValue ? desc.value.get() : JSValue::undefined();
     auto reject = [&]() { return typeError(vm, "Cannot redefine property: " + keyText(key)); };
 
@@ -1025,32 +1037,7 @@ JSValue fillError(VM& vm, JSObject* o, JSValue message, JSValue options = JSValu
         }
         detail::decRef(causeKey);
     }
-    return JSValue::undefined();
-}
-
-/// `error.stack`: the error's text and a place to put the frames; made when asked for.
-NATIVE(errorStackGetter)
-{
-    UNUSED();
-    if (!isObject(self))
-        return JSValue::undefined();
-    JSValue text = errorToString(vm, self, nullptr, 0, nullptr);
-    if (text.isException())
-        return text;
-    Handle keep = Handle::adopt(text);
-    return makeString(vm, StringView(String(asString(text)->text()) + u"\n    at <anonymous>"));
-}
-
-NATIVE(errorStackSetter)
-{
-    UNUSED();
-    if (isObject(self)) {
-        Key k = vm.internKey(std::string_view("stack"));
-        JSValue v = arg(args, argc, 0);
-        retain(v);
-        asObject(self)->putOwn(vm, k, v, attr::kWritable | attr::kConfigurable);
-        detail::decRef(k);
-    }
+    vm.attachStack(o);
     return JSValue::undefined();
 }
 
@@ -3119,6 +3106,22 @@ JSObject* VM::errorProto(ErrorCode code) const noexcept
     return errorProtos[std::size_t(ErrorCode::Exception)];
 }
 
+void VM::attachStack(JSObject* o)
+{
+    JSValue text = toStringValue(*this, toJSValue(o));
+    std::string header;
+    if (text.isException()) {
+        clearException();
+        header = "Error";
+    } else {
+        header = toUtf8(static_cast<StringCell*>(text.asCell())->text());
+        release(text);
+    }
+    Key k = internKey(std::string_view("stack"));
+    o->putOwn(*this, k, makeString(*this, std::string_view(header + captureStack())), attr::kWritable | attr::kConfigurable);
+    detail::decRef(k);
+}
+
 JSValue VM::makeError(ErrorCode code, std::string_view message)
 {
     JSObject* o = newObject(errorProto(code));
@@ -3126,6 +3129,7 @@ JSValue VM::makeError(ErrorCode code, std::string_view message)
     JSValue text = makeString(*this, message);
     value(*this, o, "message", text);
     o->h.cls = std::uint8_t(ObjClass::Error);
+    attachStack(o);
     return keep.take();
 }
 
@@ -3237,18 +3241,6 @@ void VM::installBuiltins()
     value(*this, errorProtoObject, "name", str(*this, "Error"));
     value(*this, errorProtoObject, "message", str(*this, ""));
     method(*this, errorProtoObject, "toString", errorToString, 0);
-    {
-        Key key = internKey(std::string_view("stack"));
-        Key gname = internKey(std::string_view("get stack")), sname = internKey(std::string_view("set stack"));
-        JSFunction* g = newNativeFunction(functionProto, errorStackGetter, nullptr, gname, 0);
-        Handle gk = Handle::adopt(toJSValue(g));
-        JSFunction* st = newNativeFunction(functionProto, errorStackSetter, nullptr, sname, 1);
-        Handle sk = Handle::adopt(toJSValue(st));
-        defineAccessor(*this, errorProtoObject, key, toJSValue(g), toJSValue(st), attr::kConfigurable);
-        detail::decRef(key);
-        detail::decRef(gname);
-        detail::decRef(sname);
-    }
     {
         JSFunction* base = constructor(*this, "Error", errorCtor, 1, errorProtoObject);
         (void)base;

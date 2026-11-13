@@ -526,6 +526,37 @@ NATIVE(mathF16round)
     return JSValue::boxNumber(halfToDouble(doubleToHalf(d)));
 }
 
+/// The constructors of generator, async and async generator functions: Function with another head. Data 1 `function*`,
+/// 2 `async function`, 3 `async function*`.
+NATIVE(functionKindCtor)
+{
+    UNUSED();
+    if (!vm.ctx.options.runtimeCode)
+        return vm.throwError(ErrorCode::EvalError, "the Function constructor is disabled: the engine runs only the source its host gives it");
+    static const char* const heads[] = {"", "function*", "async function", "async function*"};
+    String params;
+    for (std::uint32_t i = 0; i + 1 < argc; ++i) {
+        JSValue p = toStringValue(vm, args[i]);
+        if (p.isException())
+            return p;
+        if (i)
+            params += u",";
+        params += asString(p)->text();
+        release(p);
+    }
+    String body;
+    if (argc) {
+        JSValue b = toStringValue(vm, args[argc - 1]);
+        if (b.isException())
+            return b;
+        body = String(asString(b)->text());
+        release(b);
+    }
+    const String head = fromUtf8(heads[reinterpret_cast<std::intptr_t>(data)]);
+    const String text = u"(" + head + u" anonymous(" + params + u"\n) {\n" + body + u"\n})";
+    return vm.evalSource(toUtf8(text), "<function>");
+}
+
 NATIVE(returnThis)
 {
     UNUSED();
@@ -543,6 +574,43 @@ void installExtras(VM& vm)
         detail::decRef(k);
         if (slot && isObject(*slot))
             method(vm, asObject(*slot), "f16round", mathF16round, 1);
+    }
+    // GeneratorFunction, AsyncFunction and AsyncGeneratorFunction: not globals, but what such functions inherit from.
+    {
+        Key fk = vm.internKey(std::string_view("Function"));
+        JSValue* functionCtor = vm.global->findOwn(vm, fk);
+        detail::decRef(fk);
+        struct Kind
+        {
+            const char* name;
+            JSObject** slot;
+            std::intptr_t code;
+            JSObject* prototypeOf;  ///< what the `prototype` property of the function proto is, if any
+        };
+        for (const Kind& kind : {Kind{"GeneratorFunction", &vm.protos.generatorFunction, 1, vm.protos.generator},
+                                 Kind{"AsyncFunction", &vm.protos.asyncFunction, 2, nullptr},
+                                 Kind{"AsyncGeneratorFunction", &vm.protos.asyncGeneratorFunction, 3, vm.protos.asyncGenerator}}) {
+            JSObject* proto = vm.newObject(vm.protos.function);
+            vm.setIntrinsic(kind.slot, proto);
+            release(toJSValue(proto));
+            Key name = vm.internKey(std::string_view(kind.name));
+            JSFunction* ctor = vm.newNativeFunction(vm.protos.function, functionKindCtor, reinterpret_cast<void*>(kind.code), name, 1);
+            detail::decRef(name);
+            ctor->flags |= JSFunction::kConstructor;
+            ctor->materialize(vm);
+            if (functionCtor && isObject(*functionCtor))
+                ctor->setProto(vm, asObject(*functionCtor));
+            retain(toJSValue(proto));
+            ctor->putOwn(vm, vm.atoms.prototype, toJSValue(proto), 0);
+            proto->putOwn(vm, vm.atoms.constructor, toJSValue(ctor), attr::kConfigurable);
+            proto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view(kind.name)), attr::kConfigurable);
+            if (kind.prototypeOf) {
+                retain(toJSValue(kind.prototypeOf));
+                proto->putOwn(vm, vm.atoms.prototype, toJSValue(kind.prototypeOf), attr::kConfigurable);
+                retain(toJSValue(proto));
+                kind.prototypeOf->putOwn(vm, vm.atoms.constructor, toJSValue(proto), attr::kConfigurable);
+            }
+        }
     }
     // The tags of the namespace objects, and `Symbol.species` of the constructors that have one.
     for (const char* name : {"JSON", "Reflect"}) {

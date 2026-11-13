@@ -742,12 +742,14 @@ int relational(VM& vm, Op op, JSValue a, JSValue b)
     return result;
 }
 
-int instanceOf(VM& vm, JSValue a, JSValue b)
+/// OrdinaryHasInstance(b, a).
+static int ordinaryHasInstance(VM& vm, JSValue b, JSValue a)
 {
-    if (!isFunction(b)) {
-        vm.throwError(ErrorCode::TypeError, "Right-hand side of 'instanceof' is not callable");
-        return -1;
-    }
+    if (!isFunction(b))
+        return 0;
+    // A bound function asks about what it is bound to.
+    if (Rare* r = asObject(b)->rare(); r && isFunction(r->boundTarget))
+        return instanceOf(vm, a, r->boundTarget);
     if (!isObject(a))
         return 0;
     JSValue proto = getProperty(vm, b, vm.atoms.prototype);
@@ -760,6 +762,9 @@ int instanceOf(VM& vm, JSValue a, JSValue b)
     }
     int found = 0;
     for (JSObject* p = asObject(a)->proto(vm); p; p = p->proto(vm)) {
+        if (proxyOf(p)) {
+            break;
+        }
         if (toJSValue(p) == proto) {
             found = 1;
             break;
@@ -767,6 +772,37 @@ int instanceOf(VM& vm, JSValue a, JSValue b)
     }
     release(proto);
     return found;
+}
+
+int instanceOf(VM& vm, JSValue a, JSValue b)
+{
+    if (!isObject(b)) {
+        vm.throwError(ErrorCode::TypeError, "Right-hand side of 'instanceof' is not an object");
+        return -1;
+    }
+    JSValue handler = getProperty(vm, b, vm.atoms.symHasInstance);
+    if (handler.isException())
+        return -1;
+    if (!handler.isNullish()) {
+        if (!isFunction(handler)) {
+            release(handler);
+            vm.throwError(ErrorCode::TypeError, "Symbol.hasInstance is not a function");
+            return -1;
+        }
+        JSValue r = vm.call(handler, b, &a, 1);
+        release(handler);
+        if (r.isException())
+            return -1;
+        const bool result = toBoolean(r);
+        release(r);
+        return result;
+    }
+    release(handler);
+    if (!isFunction(b)) {
+        vm.throwError(ErrorCode::TypeError, "Right-hand side of 'instanceof' is not callable");
+        return -1;
+    }
+    return ordinaryHasInstance(vm, b, a);
 }
 
 int inOperator(VM& vm, JSValue a, JSValue b)

@@ -126,7 +126,24 @@ void VM::removeCodeRoot(CodeBlock** slot) noexcept
 
 std::string VM::captureStack() const
 {
-    return {};
+    std::string out;
+    int shown = 0;
+    for (std::size_t i = frameCount; i-- > 0 && shown < 10; ++shown) {
+        const Frame& f = frameBase[i];
+        const CodeBlock* c = f.code;
+        std::string name = c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string();
+        if (name.empty())
+            name = (c->flags & CodeBlock::kProgram) ? "<program>" : "<anonymous>";
+        std::uint32_t line = 0;
+        if (f.pc && c->code.size()) {
+            const std::size_t at = std::size_t(f.pc - c->code.data());
+            const std::size_t idx = at ? at - 1 : 0;
+            if (idx < c->lines.size())
+                line = c->lines[idx];
+        }
+        out += "\n    at " + name + " (" + toUtf8(c->file) + ":" + std::to_string(line) + ")";
+    }
+    return out;
 }
 
 JSValue VM::newSymbol(StringView description, bool hasDescription)

@@ -536,7 +536,8 @@ void VM::releaseRoots() noexcept
     for (JSObject** p : {&protos.object, &protos.function, &protos.array, &protos.number, &protos.string, &protos.boolean,
                          &protos.symbol, &protos.bigint, &protos.generator, &protos.iterator,
                           &protos.nativeIterator, &protos.map, &protos.set, &protos.weakMap, &protos.weakSet, &protos.regexp, &protos.promise, &protos.arrayBuffer, &protos.asyncGenerator, &protos.sharedArrayBuffer, &protos.iteratorHelper,
-                         &protos.wrapForValidIterator, &protos.arguments}) {
+                         &protos.wrapForValidIterator, &protos.arguments, &protos.generatorFunction, &protos.asyncFunction,
+                         &protos.asyncGeneratorFunction}) {
         if (*p)
             detail::decRef(reinterpret_cast<CellPtr>(*p));
         *p = nullptr;

@@ -32,10 +32,26 @@ JSTypedArray* asTyped(JSValue v)
     return isObject(v) && asObject(v)->cls() == ObjClass::TypedArray ? static_cast<JSTypedArray*>(asObject(v)) : nullptr;
 }
 
+/// Whether the typed array no longer fits its buffer, or the buffer is gone.
+bool outOfBounds(const JSTypedArray* t)
+{
+    const BufferState* b = bufferOf(t->buffer);
+    if (!b || b->detached)
+        return true;
+    if (t->tracking)
+        return t->byteOffset > b->size;
+    return std::size_t(t->byteOffset) + std::size_t(t->fixedLength) * kElemSize[std::size_t(t->kind)] > b->size;
+}
+
 JSTypedArray* thisTyped(VM& vm, JSValue self)
 {
-    if (JSTypedArray* t = asTyped(self))
+    if (JSTypedArray* t = asTyped(self)) {
+        if (outOfBounds(t)) {
+            typeError(vm, "the typed array is out of bounds");
+            return nullptr;
+        }
         return t;
+    }
     typeError(vm, "not a typed array");
     return nullptr;
 }
@@ -366,7 +382,7 @@ NATIVE(typedGetter)
     switch (which) {
         case 0: return JSValue::boxNumber(double(t->length));
         case 1: return JSValue::boxNumber(double(t->length) * kElemSize[std::size_t(t->kind)]);
-        case 2: return JSValue::boxNumber(double(t->byteOffset));
+        case 2: return JSValue::boxNumber(outOfBounds(t) ? 0.0 : double(t->byteOffset));
         default: retain(t->buffer); return t->buffer;
     }
 }

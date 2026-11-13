@@ -198,6 +198,14 @@ JSFunction* VM::newFunction(JSObject* proto, CodeBlock* code, Box* const* upvalu
     const std::size_t bytes = JSFunction::bytesFor(n);
     if (bytes > mem::LocalHeap::kMaxSmall)
         throw Error(ErrorCode::RangeError, "a closure captures too many variables");
+    // Generator and async functions inherit from prototypes of their own kind.
+    if (code->flags & CodeBlock::kGenerator) {
+        JSObject* kind = (code->flags & CodeBlock::kAsync)
+                             ? ((code->flags & CodeBlock::kAsyncGen) ? protos.asyncGeneratorFunction : protos.asyncFunction)
+                             : protos.generatorFunction;
+        if (kind)
+            proto = kind;
+    }
     Shape* root = rootShapeFor(proto);
     auto* f = static_cast<JSFunction*>(allocCell(bytes, Kind::Object, ObjClass::Function, 0));
     f->h.shape = root->id;

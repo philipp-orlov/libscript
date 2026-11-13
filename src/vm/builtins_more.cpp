@@ -560,13 +560,23 @@ NATIVE(reflectApply)
 NATIVE(reflectConstruct)
 {
     UNUSED();
+    const JSValue target = argc > 2 ? args[2] : JSValue::undefined();
+    auto constructible = [&](JSValue f) {
+        if (!isFunction(f))
+            return false;
+        auto* fn = static_cast<JSFunction*>(asObject(f));
+        if (fn->flags & JSFunction::kNative)
+            return (fn->flags & JSFunction::kConstructor) != 0 || proxyOf(fn) != nullptr;
+        return fn->code->constructor;
+    };
+    if (!constructible(arg(args, argc, 0)))
+        return typeError(vm, describe(vm, arg(args, argc, 0)) + " is not a constructor");
+    if (argc > 2 && !constructible(target))
+        return typeError(vm, describe(vm, target) + " is not a constructor");
     std::vector<Handle> list;
     if (!listFromArrayLike(vm, arg(args, argc, 1), list))
         return JSValue::exception();
     std::vector<JSValue> values = raw(list);
-    const JSValue target = argc > 2 ? args[2] : JSValue::undefined();
-    if (argc > 2 && !isFunction(target))
-        return typeError(vm, describe(vm, target) + " is not a constructor");
     return vm.construct(arg(args, argc, 0), values.data(), std::uint32_t(values.size()), target);
 }
 

@@ -803,6 +803,11 @@ DynObject* Runtime::hostPrototypeFor(const void* typeKey)
 
 std::string Runtime::hostDeclarations() const
 {
+    return hostDeclarationsOf(ctx);
+}
+
+std::string hostDeclarationsOf(const ContextImpl& ctx)
+{
     std::string out;
     for (const auto& owned : ctx.hostClasses) {
         const HostClassInfo& info = *owned;

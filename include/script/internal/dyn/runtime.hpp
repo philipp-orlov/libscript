@@ -344,6 +344,9 @@ struct Runtime : EngineRuntime
     DynFunction* makeConstructor(const char* name, NativeFunction fn, int arity, DynObject* proto);
 };
 
+/// The ambient TypeScript declarations for every host class `ctx` has, whichever core runs them.
+std::string hostDeclarationsOf(const ContextImpl& ctx);
+
 /// Give `obj` the wrapper state of a C++ instance.
 void attachNativeSlot(DynObject& obj, const void* typeKey, void* instance,
                       Context::Finalizer finalizer, void* owner);

@@ -7,6 +7,13 @@
 #include <cstdlib>
 
 #include "script/internal/dyn/parser.hpp"
+#include "script/config.hpp"
+#if SCRIPT_VM_LANG_TYPESCRIPT
+#include "script/internal/dyn/checker.hpp"
+#include "script/internal/dyn/erase.hpp"
+#include "script/internal/dyn/runtime.hpp"
+#endif
+#include "../vm/builtins_util.hpp"
 #include "script/internal/vm/compiler.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/host.hpp"
@@ -121,6 +128,75 @@ JSValue VM::evalDirect(JSValue sourceValue)
     Handle keep = Handle::adopt(toJSValue(f));
     return call(keep.get(), JSValue::undefined(), nullptr, 0);
 }
+
+#if SCRIPT_VM_LANG_TYPESCRIPT
+namespace {
+
+/// What the embedder installed on the global object is visible to a script, so the checker has to know it is there.
+std::vector<String> hostGlobals(VM& vm)
+{
+    std::vector<Handle> keys;
+    bi::ownKeys(vm, vm.global, true, false, false, keys);
+    std::vector<String> names;
+    for (const Handle& k : keys)
+        if (isString(k.get()))
+            names.emplace_back(asString(k.get())->text());
+    return names;
+}
+
+std::shared_ptr<CompiledUnit> compileTypeScript(ContextImpl& ctx, std::string_view source, std::string_view name,
+                                                std::vector<Diagnostic>& diagnostics)
+{
+    VM& vm = ctx.vm();
+    host::syncHostClasses(ctx);
+    dyn::Parser parser(source, std::string(name), /*typescript=*/true);
+    dyn::NodePtr tree = parser.parseProgram();
+    if (ctx.options.check.enabled) {
+        diagnostics = dyn::checkProgram(*tree, std::string(name), ctx.options.check, hostGlobals(vm),
+                                        dyn::hostDeclarationsOf(ctx) + vm.ambient);
+        if (!diagnostics.empty())
+            return nullptr;
+    }
+    dyn::erase(*tree);
+    auto unit = std::make_shared<Program>();
+    unit->language = Language::TypeScript;
+    unit->name = std::string(name);
+    unit->context = &ctx;
+    unit->alive = ctx.alive;
+    unit->vm = &vm;
+    unit->code = compileProgram(vm, *tree, name, std::make_shared<const std::string>(source));
+    vm.addCodeRoot(&unit->code);
+    return unit;
+}
+
+void declareTypeScript(ContextImpl& ctx, std::string_view declarations)
+{
+    // Parsed here so a malformed declaration is reported where it was added.
+    dyn::Parser parser(declarations, "<declare>", /*typescript=*/true);
+    parser.parseProgram();
+    ctx.vm().ambient += std::string(declarations);
+    ctx.vm().ambient += '\n';
+}
+
+}  // namespace
+
+const LanguageInfo& typescriptLanguage() noexcept
+{
+    static const char* const extensions[] = {".ts", ".mts", nullptr};
+    static const LanguageInfo info = [] {
+        LanguageInfo l;
+        l.id = Language::TypeScript;
+        l.name = "typescript";
+        l.extensions = extensions;
+        l.engine = EngineKind::Vm;
+        l.compile = &compileTypeScript;
+        l.run = &runProgram;
+        l.declare = &declareTypeScript;
+        return l;
+    }();
+    return info;
+}
+#endif
 
 const LanguageInfo& javascriptLanguage() noexcept
 {

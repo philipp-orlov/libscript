@@ -76,6 +76,11 @@ namespace vm {
 const LanguageInfo& javascriptLanguage() noexcept;
 }
 #endif
+#if SCRIPT_VM && SCRIPT_VM_LANG_TYPESCRIPT
+namespace vm {
+const LanguageInfo& typescriptLanguage() noexcept;
+}
+#endif
 
 const LanguageInfo* languageInfoFor(const ContextImpl& rt, Language id) noexcept
 {
@@ -83,6 +88,10 @@ const LanguageInfo* languageInfoFor(const ContextImpl& rt, Language id) noexcept
 #if SCRIPT_VM && SCRIPT_VM_LANG_JAVASCRIPT
         if (id == Language::JavaScript)
             return &vm::javascriptLanguage();
+#endif
+#if SCRIPT_VM && SCRIPT_VM_LANG_TYPESCRIPT
+        if (id == Language::TypeScript)
+            return &vm::typescriptLanguage();
 #endif
         // Asked for the new core, and this language is not on it: a refusal, never a silent run on the other core.
         return languageInfo(id) && languageInfo(id)->engine == EngineKind::Dynamic ? nullptr : languageInfo(id);

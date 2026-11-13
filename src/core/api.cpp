@@ -1592,8 +1592,10 @@ void Context::declare(std::string_view declarations)
 {
     Lock lock(*this);
     bool accepted = false;
-    for (const LanguageInfo* info : languageTable()) {
-        if (info->declare) {
+    for (const LanguageInfo* listed : languageTable()) {
+        // The core this context runs gives the language its hook.
+        const LanguageInfo* info = languageInfoFor(*impl_, listed->id);
+        if (info && info->declare) {
             info->declare(*impl_, declarations);
             accepted = true;
         }

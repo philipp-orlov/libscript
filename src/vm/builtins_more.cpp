@@ -16,38 +16,10 @@ namespace internal {
 namespace vm {
 namespace bi {
 
-void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, Vec<Handle>& out)
+bool ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, Vec<Handle>& out)
 {
-    if (proxyOf(o)) {
-        Vec<Handle> all;
-        if (!proxyOwnKeys(vm, o, all))
-            return;
-        for (Handle& k : all) {
-            const bool isSym = isSymbol(k.get());
-            if (isSym ? !symbols : !strings)
-                continue;
-            if (onlyEnumerable) {
-                JSValue d = proxyOwnDescriptor(vm, o, static_cast<Key>(k.get().asCell()));
-                if (d.isException()) {
-                    vm.clearException();
-                    continue;
-                }
-                Handle dk = Handle::adopt(d);
-                if (!isObject(d))
-                    continue;
-                Key enumKey = vm.internKey(std::string_view("enumerable"));
-                JSValue e = getProperty(vm, d, enumKey);
-                detail::decRef(enumKey);
-                const bool en = !e.isException() && toBoolean(e);
-                if (!e.isException())
-                    release(e);
-                if (!en)
-                    continue;
-            }
-            out.push_back(std::move(k));
-        }
-        return;
-    }
+    if (proxyOf(o))
+        return objOwnKeysFiltered(vm, o, strings, symbols, onlyEnumerable, out);
     o->materialize(vm);
     Vec<std::pair<std::uint32_t, Key>> indexed;
     Vec<Key> named, syms;
@@ -91,12 +63,13 @@ void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
             out.push_back(Handle::adopt(JSValue::cell(made)));
         }
     }
-    if (strings && !onlyEnumerable && hasElems(o))
+    if (strings && !onlyEnumerable && (hasElems(o) || (o->cls() == ObjClass::String && isString(unwrapped(toJSValue(o), ObjClass::String)))))
         out.push_back(Handle::retained(JSValue::cell(vm.atoms.length)));
     for (Key k : named)
         out.push_back(Handle::retained(JSValue::cell(k)));
     for (Key k : syms)
         out.push_back(Handle::retained(JSValue::cell(k)));
+    return true;
 }
 
 JSValue getIndex(VM& vm, JSValue base, std::uint32_t i)
@@ -218,9 +191,7 @@ JSValue descriptorObjectOf(VM& vm, JSObject* o, Key key)
 
 JSValue descriptorObject(VM& vm, JSObject* o, Key key)
 {
-    if (proxyOf(o))
-        return proxyOwnDescriptor(vm, o, key);
-    return descriptorObjectOf(vm, o, key);
+    return objOwnDescriptorObject(vm, o, key);
 }
 
 JSObject* objectArg(VM& vm, JSValue v, const char* who)
@@ -266,30 +237,26 @@ NATIVE(objectGetOwnPropertyNames)
 {
     UNUSED();
     const JSValue v = arg(args, argc, 0);
-    if (v.isNullish())
-        return typeError(vm, "Cannot convert undefined or null to object");
+    Handle obj = Handle::adopt(toObject(vm, v));
+    if (obj.get().isException())
+        return obj.get();
     Vec<Handle> keys;
     const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 names, 1 symbols
-    if (isObject(v)) {
-        ownKeys(vm, asObject(v), mode == 0, mode == 1, false, keys);
-    } else if (isString(v) && mode == 0) {
-        for (std::uint32_t i = 0; i < asString(v)->length; ++i)
-            keys.push_back(Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(i)))));
-        keys.push_back(Handle::retained(JSValue::cell(vm.atoms.length)));
-    }
+    if (!objOwnKeysFiltered(vm, asObject(obj.get()), mode == 0, mode == 1, false, keys))
+        return JSValue::exception();
     return keysArray(vm, keys);
 }
 
 NATIVE(objectGetOwnPropertyDescriptor)
 {
     UNUSED();
-    JSObject* o = objectArg(vm, arg(args, argc, 0), "Object.getOwnPropertyDescriptor");
-    if (!o)
-        return JSValue::exception();
+    Handle obj = Handle::adopt(toObject(vm, arg(args, argc, 0)));
+    if (obj.get().isException())
+        return obj.get();
     Key k = keyArg(vm, arg(args, argc, 1));
     if (!k)
         return JSValue::exception();
-    JSValue d = descriptorObject(vm, o, k);
+    JSValue d = descriptorObject(vm, asObject(obj.get()), k);
     detail::decRef(k);
     return d;
 }
@@ -297,20 +264,27 @@ NATIVE(objectGetOwnPropertyDescriptor)
 NATIVE(objectGetOwnPropertyDescriptors)
 {
     UNUSED();
-    JSObject* o = objectArg(vm, arg(args, argc, 0), "Object.getOwnPropertyDescriptors");
-    if (!o)
+    Handle obj = Handle::adopt(toObject(vm, arg(args, argc, 0)));
+    if (obj.get().isException())
+        return obj.get();
+    JSObject* o = asObject(obj.get());
+    Vec<Handle> keys;
+    if (!objOwnKeys(vm, o, keys))
         return JSValue::exception();
     JSObject* out = vm.newObject(vm.protos.object);
     Handle keep = Handle::adopt(toJSValue(out));
-    Vec<Handle> keys;
-    ownKeys(vm, o, true, true, false, keys);
     for (Handle& k : keys) {
         Key key = static_cast<Key>(k.get().asCell());
         JSValue d = descriptorObject(vm, o, key);
+        if (d.isException())
+            return d;
         if (!d.isUndefined()) {
-            retain(JSValue::cell(key));
-            out->putOwn(vm, key, d, attr::kDefault);
-            detail::decRef(key);
+            PropDesc fresh;
+            fresh.hasValue = fresh.hasWritable = fresh.hasEnumerable = fresh.hasConfigurable = true;
+            fresh.writable = fresh.enumerable = fresh.configurable = true;
+            fresh.value = Handle::adopt(d);
+            if (objDefineOwnProperty(vm, out, key, fresh) < 0)
+                return JSValue::exception();
         }
     }
     return keep.take();
@@ -322,22 +296,44 @@ NATIVE(objectDefineProperties)
     JSObject* o = objectArg(vm, arg(args, argc, 0), "Object.defineProperties");
     if (!o)
         return JSValue::exception();
-    const JSValue props = arg(args, argc, 1);
-    if (!isObject(props))
-        return typeError(vm, "Property description must be an object");
+    Handle props = Handle::adopt(toObject(vm, arg(args, argc, 1)));
+    if (props.get().isException())
+        return props.get();
+    JSObject* source = asObject(props.get());
     Vec<Handle> keys;
-    ownKeys(vm, asObject(props), true, true, true, keys);
+    if (!objOwnKeys(vm, source, keys))
+        return JSValue::exception();
+    struct Pending
+    {
+        Key key;
+        PropDesc desc;
+    };
+    std::vector<Pending> pending;
     for (Handle& k : keys) {
         Key key = static_cast<Key>(k.get().asCell());
-        JSValue d = getProperty(vm, props, key);
-        if (d.isException())
-            return d;
-        Handle dk = Handle::adopt(d);
-        if (!isObject(d))
+        PropDesc own;
+        const int has = objGetOwnProperty(vm, source, key, &own);
+        if (has < 0)
+            return JSValue::exception();
+        if (!has || !own.enumerable)
+            continue;
+        Handle d = Handle::adopt(getProperty(vm, props.get(), key));
+        if (d.get().isException())
+            return d.get();
+        if (!isObject(d.get()))
             return typeError(vm, "Property description must be an object");
-        JSValue r = definePropertyFromDescriptor(vm, o, key, asObject(d));
-        if (r.isException())
-            return r;
+        Pending item;
+        item.key = key;
+        if (!readPropertyDescriptor(vm, asObject(d.get()), &item.desc))
+            return JSValue::exception();
+        pending.push_back(std::move(item));
+    }
+    for (Pending& item : pending) {
+        const int ok = objDefineOwnProperty(vm, o, item.key, item.desc);
+        if (ok < 0)
+            return JSValue::exception();
+        if (!ok)
+            return typeError(vm, "Cannot redefine property");
     }
     retain(arg(args, argc, 0));
     return arg(args, argc, 0);
@@ -383,61 +379,68 @@ NATIVE(objectIs)
 NATIVE(objectExtensibility)
 {
     UNUSED();
-    const int mode = int(reinterpret_cast<std::intptr_t>(data));  // 0 isExtensible, 1 preventExtensions, 2 seal, 3 isSealed
+    // 0 isExtensible, 1 preventExtensions, 2 seal, 3 isSealed, 4 Reflect.isExtensible, 5 Reflect.preventExtensions
+    const int mode = int(reinterpret_cast<std::intptr_t>(data));
     const JSValue v = arg(args, argc, 0);
+    if (mode >= 4 && !isObject(v))
+        return typeError(vm, std::string("Reflect.") + (mode == 4 ? "isExtensible" : "preventExtensions") + " called on non-object");
     if (!isObject(v))
         return mode == 0 ? JSValue::boolean(false) : mode == 3 ? JSValue::boolean(true) : (retain(v), v);
     JSObject* o = asObject(v);
-    if (mode == 0)
-        return JSValue::boolean(!(o->h.flags & cellflags::kNotExtensible));
-    if (mode == 1) {
-        o->h.flags |= cellflags::kNotExtensible;
+    if (mode == 0 || mode == 4) {
+        const int r = objIsExtensible(vm, o);
+        return r < 0 ? JSValue::exception() : JSValue::boolean(r == 1);
+    }
+    if (mode == 1 || mode == 5) {
+        const int r = objPreventExtensions(vm, o);
+        if (r < 0)
+            return JSValue::exception();
+        if (mode == 5)
+            return JSValue::boolean(r == 1);
+        if (!r)
+            return typeError(vm, "Cannot prevent extensions");
+        retain(v);
+        return v;
+    }
+    if (mode == 3) {
+        const int r = testIntegrity(vm, o, false);
+        return r < 0 ? JSValue::exception() : JSValue::boolean(r == 1);
+    }
+    if (proxyOf(o) || o->cls() == ObjClass::TypedArray) {
+        const int r = setIntegrity(vm, o, false);
+        if (r < 0)
+            return JSValue::exception();
+        if (!r)
+            return typeError(vm, "Cannot seal");
         retain(v);
         return v;
     }
     o->materialize(vm);
     std::vector<Key> keys;
     o->forEachOwn(vm, [&](Key k, std::uint8_t, JSValue) { keys.push_back(k); });
-    if (mode == 2) {
-        o->h.flags |= cellflags::kNotExtensible;
-        for (Key k : keys) {
-            std::uint8_t attrs = 0;
-            o->findOwn(vm, k, &attrs);
-            o->setAttrs(vm, k, std::uint8_t(attrs & ~attr::kConfigurable));
-        }
-        retain(v);
-        return v;
-    }
-    bool sealed = (o->h.flags & cellflags::kNotExtensible) != 0;
+    o->h.flags |= cellflags::kNotExtensible;
     for (Key k : keys) {
         std::uint8_t attrs = 0;
         o->findOwn(vm, k, &attrs);
-        sealed = sealed && !(attrs & attr::kConfigurable);
+        o->setAttrs(vm, k, std::uint8_t(attrs & ~attr::kConfigurable));
     }
-    if (hasElems(o) && static_cast<JSArray*>(o)->length && !(o->h.flags & cellflags::kFrozen))
-        sealed = false;
-    return JSValue::boolean(sealed);
+    retain(v);
+    return v;
 }
 
 NATIVE(objectHasOwn)
 {
     UNUSED();
-    const JSValue v = arg(args, argc, 0);
-    if (v.isNullish())
-        return typeError(vm, "Cannot convert undefined or null to object");
+    Handle obj = Handle::adopt(toObject(vm, arg(args, argc, 0)));
+    if (obj.get().isException())
+        return obj.get();
     Key k = keyArg(vm, arg(args, argc, 1));
     if (!k)
         return JSValue::exception();
-    bool has = false;
-    if (isObject(v)) {
-        OwnDesc d;
-        has = ownDescriptor(vm, asObject(v), k, d);
-    } else if (isString(v)) {
-        std::uint32_t index;
-        has = k == vm.atoms.length || (arrayIndexOf(k, &index) && index < asString(v)->length);
-    }
+    PropDesc d;
+    const int has = objGetOwnProperty(vm, asObject(obj.get()), k, &d);
     detail::decRef(k);
-    return JSValue::boolean(has);
+    return has < 0 ? JSValue::exception() : JSValue::boolean(has == 1);
 }
 
 NATIVE(objectPropertyIsEnumerable)
@@ -446,13 +449,15 @@ NATIVE(objectPropertyIsEnumerable)
     Key k = keyArg(vm, arg(args, argc, 0));
     if (!k)
         return JSValue::exception();
-    bool result = false;
-    if (isObject(self)) {
-        OwnDesc d;
-        result = ownDescriptor(vm, asObject(self), k, d) && (d.attrs & attr::kEnumerable);
+    Handle obj = Handle::adopt(toObject(vm, self));
+    if (obj.get().isException()) {
+        detail::decRef(k);
+        return obj.get();
     }
+    PropDesc d;
+    const int has = objGetOwnProperty(vm, asObject(obj.get()), k, &d);
     detail::decRef(k);
-    return JSValue::boolean(result);
+    return has < 0 ? JSValue::exception() : JSValue::boolean(has == 1 && d.enumerable);
 }
 
 NATIVE(objectToLocaleString)
@@ -470,42 +475,54 @@ NATIVE(objectToLocaleString)
 NATIVE(protoGetter)
 {
     UNUSED();
-    if (self.isNullish())
-        return typeError(vm, "Cannot convert undefined or null to object");
-    JSObject* p = nullptr;
-    if (isObject(self))
-        p = asObject(self)->proto(vm);
-    else if (self.isNumber())
-        p = vm.protos.number;
-    else if (isString(self))
-        p = vm.protos.string;
-    else if (self.isBool())
-        p = vm.protos.boolean;
-    if (!p)
-        return JSValue::null();
-    retain(toJSValue(p));
-    return toJSValue(p);
+    Handle obj = Handle::adopt(toObject(vm, self));
+    if (obj.get().isException())
+        return obj.get();
+    Handle p;
+    if (objGetPrototypeOf(vm, asObject(obj.get()), &p) < 0)
+        return JSValue::exception();
+    return p.take();
 }
 
 NATIVE(protoSetter)
 {
     UNUSED();
+    if (self.isNullish())
+        return typeError(vm, "Object.prototype.__proto__ called on null or undefined");
     const JSValue p = arg(args, argc, 0);
     if (!isObject(self) || !(isObject(p) || p.isNull()))
         return JSValue::undefined();
-    if (p.isNull()) {
-        asObject(self)->setProto(vm, nullptr);
-    } else {
-        if (asObject(self)->wouldCycle(vm, asObject(p)))
-            return typeError(vm, "cyclic prototype chain");
-        asObject(self)->setProto(vm, asObject(p));
-    }
+    const int r = objSetPrototypeOf(vm, asObject(self), p);
+    if (r < 0)
+        return JSValue::exception();
+    if (!r)
+        return typeError(vm, prototypeRefusal(vm, asObject(self)));
     return JSValue::undefined();
 }
 
 // ------------------------------------------------------------------ Reflect ---
 
 }  // namespace
+
+int ordinaryOwnProperty(VM& vm, JSObject* o, Key key, PropDesc* out)
+{
+    OwnDesc d;
+    if (!ownDescriptor(vm, o, key, d))
+        return 0;
+    out->hasEnumerable = out->hasConfigurable = true;
+    out->enumerable = (d.attrs & attr::kEnumerable) != 0;
+    out->configurable = (d.attrs & attr::kConfigurable) != 0;
+    if (d.accessor) {
+        out->hasGet = out->hasSet = true;
+        out->get = d.getter;
+        out->set = d.setter;
+    } else {
+        out->hasValue = out->hasWritable = true;
+        out->writable = (d.attrs & attr::kWritable) != 0;
+        out->value = d.value;
+    }
+    return 1;
+}
 
 bool listFromArrayLike(VM& vm, JSValue list, Vec<Handle>& out)
 {
@@ -567,7 +584,7 @@ NATIVE(reflectConstruct)
             return false;
         auto* fn = static_cast<JSFunction*>(asObject(f));
         if (fn->flags & JSFunction::kNative)
-            return (fn->flags & JSFunction::kConstructor) != 0 || proxyOf(fn) != nullptr;
+            return (fn->flags & JSFunction::kConstructor) != 0;
         return fn->code->constructor;
     };
     if (!constructible(arg(args, argc, 0)))
@@ -593,27 +610,33 @@ NATIVE(reflectOp)
     if (!k)
         return JSValue::exception();
     JSValue result;
+    int status = 0;
     switch (mode) {
-        case 0: {
-            const JSValue receiver = argc > 2 ? args[2] : args[0];
-            result = getPropertyFrom(vm, o, receiver, k);
+        case 0: result = getPropertyFrom(vm, o, argc > 2 ? args[2] : args[0], k); break;
+        case 1:
+            status = objSet(vm, o, k, arg(args, argc, 2), argc > 3 ? args[3] : args[0]);
+            result = status < 0 ? JSValue::exception() : JSValue::boolean(status == 1);
             break;
-        }
-        case 1: result = JSValue::boolean(setProperty(vm, args[0], k, arg(args, argc, 2), false)); break;
-        case 2: result = JSValue::boolean(hasProperty(vm, args[0], k)); break;
-        case 3: result = JSValue::boolean(deleteProperty(vm, args[0], k, false)); break;
+        case 2:
+            status = objHasProperty(vm, o, k);
+            result = status < 0 ? JSValue::exception() : JSValue::boolean(status == 1);
+            break;
+        case 3:
+            status = objDelete(vm, o, k);
+            result = status < 0 ? JSValue::exception() : JSValue::boolean(status == 1);
+            break;
         case 4: {
+            PropDesc desc;
             if (!isObject(arg(args, argc, 2))) {
                 result = typeError(vm, "Property description must be an object");
                 break;
             }
-            JSValue r = definePropertyFromDescriptor(vm, o, k, asObject(args[2]));
-            if (r.isException()) {
-                vm.clearException();
-                result = JSValue::boolean(false);
-            } else {
-                result = JSValue::boolean(true);
+            if (!readPropertyDescriptor(vm, asObject(args[2]), &desc)) {
+                result = JSValue::exception();
+                break;
             }
+            status = objDefineOwnProperty(vm, o, k, desc);
+            result = status < 0 ? JSValue::exception() : JSValue::boolean(status == 1);
             break;
         }
         default: result = descriptorObject(vm, o, k); break;
@@ -629,34 +652,28 @@ NATIVE(reflectOwnKeys)
     if (!o)
         return JSValue::exception();
     Vec<Handle> keys;
-    ownKeys(vm, o, true, true, false, keys);
+    if (!objOwnKeys(vm, o, keys))
+        return JSValue::exception();
     return keysArray(vm, keys);
 }
 
 NATIVE(reflectProto)
 {
     UNUSED();
-    JSObject* o = objectArg(vm, arg(args, argc, 0), "Reflect.getPrototypeOf");
+    JSObject* o = objectArg(vm, arg(args, argc, 0), data ? "Reflect.setPrototypeOf" : "Reflect.getPrototypeOf");
     if (!o)
         return JSValue::exception();
     if (!data) {
-        JSObject* p = o->proto(vm);
-        if (!p)
-            return JSValue::null();
-        retain(toJSValue(p));
-        return toJSValue(p);
+        Handle p;
+        if (objGetPrototypeOf(vm, o, &p) < 0)
+            return JSValue::exception();
+        return p.take();
     }
     const JSValue p = arg(args, argc, 1);
     if (!(isObject(p) || p.isNull()))
         return typeError(vm, "Object prototype may only be an Object or null");
-    if (p.isNull()) {
-        o->setProto(vm, nullptr);
-        return JSValue::boolean(true);
-    }
-    if (o->wouldCycle(vm, asObject(p)) || (o->h.flags & cellflags::kNotExtensible))
-        return JSValue::boolean(false);
-    o->setProto(vm, asObject(p));
-    return JSValue::boolean(true);
+    const int r = objSetPrototypeOf(vm, o, p);
+    return r < 0 ? JSValue::exception() : JSValue::boolean(r == 1);
 }
 
 // -------------------------------------------------------------------- Array ---
@@ -935,8 +952,8 @@ void installMore(VM& vm)
     method(vm, reflect, "ownKeys", reflectOwnKeys, 1);
     method(vm, reflect, "getPrototypeOf", reflectProto, 1, nullptr);
     method(vm, reflect, "setPrototypeOf", reflectProto, 2, reinterpret_cast<void*>(1));
-    method(vm, reflect, "isExtensible", objectExtensibility, 1, reinterpret_cast<void*>(0));
-    method(vm, reflect, "preventExtensions", objectExtensibility, 1, reinterpret_cast<void*>(1));
+    method(vm, reflect, "isExtensible", objectExtensibility, 1, reinterpret_cast<void*>(4));
+    method(vm, reflect, "preventExtensions", objectExtensibility, 1, reinterpret_cast<void*>(5));
 
     // Array.
     Key arrayKey = vm.internKey(std::string_view("Array"));

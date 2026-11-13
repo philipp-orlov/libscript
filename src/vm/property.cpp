@@ -260,6 +260,24 @@ bool setArrayLength(VM& vm, JSArray* a, JSValue value, bool strict)
 
 }  // namespace
 
+namespace {
+
+/// Whether an element an array does not have yet could be met by something on its prototype chain: a proxy, a setter or a
+/// read-only property. The usual chain, Array.prototype then Object.prototype, is taken to have no such element.
+bool chainIntercepts(VM& vm, JSObject* receiver, Key key)
+{
+    JSObject* p = receiver->proto(vm);
+    if (p == vm.protos.array && p && p->proto(vm) == vm.protos.object)
+        return false;
+    for (; p; p = p->proto(vm)) {
+        if (proxyOf(p) || p->findOwn(vm, key))
+            return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
 {
     if (base.isNullish()) {
@@ -293,7 +311,8 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
                 return refuse(vm, strict, "Cannot assign to read only property of a frozen array");
             // A hole may stand for an index property with attributes of its own, kept by name.
             const bool named = index < a->length && a->elems[index].isHole() && receiver->findOwn(vm, key);
-            if (!named) {
+            const bool absent = index >= a->length || a->elems[index].isHole();
+            if (!named && !(absent && chainIntercepts(vm, receiver, key))) {
                 if (index >= a->length && (receiver->h.flags & cellflags::kNotExtensible))
                     return refuse(vm, strict, "Cannot add property, object is not extensible");
                 retain(value);
@@ -334,6 +353,13 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
     if (receiver->h.flags & cellflags::kNotExtensible)
         return refuse(vm, strict, "Cannot add property, object is not extensible");
     retain(value);
+    std::uint32_t at;
+    if (hasElems(receiver) && arrayIndexOf(key, &at)) {
+        if (static_cast<JSArray*>(receiver)->setAt(vm, at, value))
+            return true;
+        release(value);
+        return refuse(vm, strict, "Cannot create a sparse array element");
+    }
     receiver->putOwn(vm, key, value, attr::kDefault);
     return true;
 }

@@ -183,7 +183,7 @@ bool forEachIterated(VM& vm, JSValue src, F&& fn)
 /// `base[i]`, owned; the exception sentinel when a getter throws.
 JSValue getIndex(VM& vm, JSValue base, std::uint32_t i);
 /// Own property keys of `o` in the order the language gives them, each an owned string or symbol value.
-void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, Vec<Handle>& out);
+bool ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, Vec<Handle>& out);
 /// The elements of an array-like, each counted by its handle; false with an exception pending.
 bool listFromArrayLike(VM& vm, JSValue list, Vec<Handle>& out);
 /// `Object.defineProperty` on a key: undefined, or the exception sentinel.
@@ -244,11 +244,52 @@ void installExtras(VM& vm);
 /// The global Iterator and the iterator helpers.
 void installIteratorHelpers(VM& vm);
 void installAtomics(VM& vm);
-/// The keys a proxy's `ownKeys` trap (or its target) gives.
-bool proxyOwnKeys(VM& vm, JSObject* proxy, Vec<Handle>& out);
-/// `getOwnPropertyDescriptor` through the proxy: a descriptor object, undefined, or the exception sentinel.
-JSValue proxyOwnDescriptor(VM& vm, JSObject* proxy, Key key);
-JSValue proxyDefine(VM& vm, JSObject* proxy, Key key, JSObject* descriptor);
+/// The trap `name` of a proxy's handler: a function, undefined for none, or the exception sentinel.
+JSValue proxyTrap(VM& vm, ProxyState* ps, const char* name);
+/// A property descriptor, with the fields it names marked.
+struct PropDesc
+{
+    bool hasValue = false, hasWritable = false, hasGet = false, hasSet = false, hasEnumerable = false, hasConfigurable = false;
+    bool writable = false, enumerable = false, configurable = false;
+    Handle value, get, set;
+    bool isAccessor() const { return hasGet || hasSet; }
+    bool isData() const { return hasValue || hasWritable; }
+};
+/// ToPropertyDescriptor of an object, in the order the language reads its fields; false with an exception pending.
+bool readPropertyDescriptor(VM& vm, JSObject* d, PropDesc* out);
+/// ValidateAndApplyPropertyDescriptor on an object that is not a proxy. A refusal is a TypeError with `*rejected` set.
+/// Undefined, or the exception sentinel.
+JSValue defineOrdinary(VM& vm, JSObject* o, Key key, const PropDesc& desc, bool* rejected);
+
+// The internal methods of an object, proxies included, with the checks the language makes of a proxy's traps. Each gives
+// 1 or 0 for the answer, or -1 with an exception pending.
+int objGetOwnProperty(VM& vm, JSObject* o, Key key, PropDesc* out);
+int objDefineOwnProperty(VM& vm, JSObject* o, Key key, const PropDesc& desc);
+int objHasProperty(VM& vm, JSObject* o, Key key);
+int objSet(VM& vm, JSObject* o, Key key, JSValue value, JSValue receiver);
+int objDelete(VM& vm, JSObject* o, Key key);
+/// The prototype as an owned value, an object or null.
+int objGetPrototypeOf(VM& vm, JSObject* o, Handle* out);
+int objSetPrototypeOf(VM& vm, JSObject* o, JSValue proto);
+/// IsArray: 1, 0, or -1 for a revoked proxy (with the TypeError pending); a proxy is an array when its target is.
+int isArrayValue(VM& vm, JSValue v);
+/// Why a prototype was refused, as an error message.
+std::string prototypeRefusal(VM& vm, JSObject* o);
+int objIsExtensible(VM& vm, JSObject* o);
+int objPreventExtensions(VM& vm, JSObject* o);
+/// Every own key, strings then symbols, in the order the language gives them.
+bool objOwnKeys(VM& vm, JSObject* o, Vec<Handle>& out);
+/// A fresh descriptor object for `d` (FromPropertyDescriptor), owned.
+JSValue descriptorToObject(VM& vm, const PropDesc& d);
+/// The same as `getOwnPropertyDescriptor`: a descriptor object, undefined, or the exception sentinel.
+JSValue objOwnDescriptorObject(VM& vm, JSObject* o, Key key);
+/// SetIntegrityLevel and TestIntegrityLevel; `frozen` for the stronger level.
+int setIntegrity(VM& vm, JSObject* o, bool frozen);
+int testIntegrity(VM& vm, JSObject* o, bool frozen);
+/// What `Object.keys` and the like want of the keys: `strings`, `symbols`, and only the enumerable ones when asked.
+bool objOwnKeysFiltered(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, Vec<Handle>& out);
+/// The own property `key` of an ordinary object as a complete descriptor, if there is one.
+int ordinaryOwnProperty(VM& vm, JSObject* o, Key key, PropDesc* out);
 /// A descriptor object for an own property of an ordinary object, or undefined.
 JSValue ownDescriptorObject(VM& vm, JSObject* o, Key key);
 /// A global property, taking the count of `v`.

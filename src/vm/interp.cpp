@@ -252,8 +252,23 @@ JSValue forInKeys(VM& vm, JSValue value)
             add(k);
     };
     if (isObject(value)) {
-        for (JSObject* o = asObject(value); o; o = o->proto(vm))
-            visit(o);
+        Handle cur = Handle::retained(value);
+        while (isObject(cur.get())) {
+            JSObject* o = asObject(cur.get());
+            if (proxyOf(o)) {
+                Vec<Handle> names;
+                if (!bi::objOwnKeysFiltered(vm, o, true, false, true, names))
+                    return JSValue::exception();
+                for (Handle& name : names)
+                    add(static_cast<Key>(name.get().asCell()));
+            } else {
+                visit(o);
+            }
+            Handle next;
+            if (bi::objGetPrototypeOf(vm, o, &next) < 0)
+                return JSValue::exception();
+            cur = std::move(next);
+        }
     } else if (isString(value)) {
         const std::uint32_t n = asString(value)->length;
         for (std::uint32_t i = 0; i < n; ++i)
@@ -269,7 +284,8 @@ JSValue forInKeys(VM& vm, JSValue value)
 /// made yet.
 inline bool cacheable(VM& vm, JSObject* o) noexcept
 {
-    return !o->isDictionary(vm) && !(o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps));
+    return !o->isDictionary(vm) && !(o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)) &&
+           !proxyOf(o);
 }
 
 void clearValidity(VM& vm, InlineCache& ic) noexcept
@@ -2343,7 +2359,10 @@ L_ThrowError: {
 // ---- iteration ----
 L_KeysOf: {
     fr->pc = pc;
-    SET(ins->a, forInKeys(vm, R[ins->b]));
+    const JSValue keys = forInKeys(vm, R[ins->b]);
+    if (keys.isException())
+        FAIL();
+    SET(ins->a, keys);
     NEXT();
 }
 L_IterInit: {

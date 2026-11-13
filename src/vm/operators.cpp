@@ -3,6 +3,7 @@
 
 #include "script/internal/dyn/bigint.hpp"
 #include "script/internal/dyn/object.hpp"
+#include "builtins_util.hpp"
 #include "script/internal/vm/operators.hpp"
 
 #include <cmath>
@@ -772,14 +773,20 @@ static int ordinaryHasInstance(VM& vm, JSValue b, JSValue a)
         return -1;
     }
     int found = 0;
-    for (JSObject* p = asObject(a)->proto(vm); p; p = p->proto(vm)) {
-        if (proxyOf(p)) {
+    Handle cur = Handle::retained(a);
+    for (;;) {
+        Handle next;
+        if (bi::objGetPrototypeOf(vm, asObject(cur.get()), &next) < 0) {
+            found = -1;
             break;
         }
-        if (toJSValue(p) == proto) {
+        if (!isObject(next.get()))
+            break;
+        if (next.get() == proto) {
             found = 1;
             break;
         }
+        cur = std::move(next);
     }
     release(proto);
     return found;
@@ -833,6 +840,8 @@ int inOperator(VM& vm, JSValue a, JSValue b)
         return -1;
     const bool has = hasProperty(vm, b, key);
     release(JSValue::cell(key));
+    if (!has && !vm.exception.isUndefined())
+        return -1;
     return has;
 }
 

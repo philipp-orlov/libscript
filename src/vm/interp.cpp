@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
@@ -74,6 +75,67 @@ bool initAccessor(VM& vm, JSObject* object, Key key, JSValue fn, bool isGetter,
     release(getter);
     release(setter);
     return ok;
+}
+
+bool isPrivateKey(JSValue v) noexcept
+{
+    return isSymbol(v) && static_cast<dyn::SymbolCell*>(v.asCell())->isPrivate;
+}
+
+std::string privateName(JSValue symbol)
+{
+    return toUtf8(static_cast<dyn::SymbolCell*>(symbol.asCell())->description);
+}
+
+/// `base.#name`: the property must be the object's own.
+JSValue privateGet(VM& vm, JSValue base, JSValue symbol)
+{
+    std::uint8_t attrs = 0;
+    JSValue* slot = isObject(base) ? asObject(base)->findOwn(vm, symbol.asCell(), &attrs) : nullptr;
+    if (!slot)
+        return vm.throwError(ErrorCode::TypeError, "Cannot read private member " + privateName(symbol) +
+                                                        " from an object whose class did not declare it");
+    if (attrs & attr::kAccessor) {
+        const auto* gs = reinterpret_cast<const GetterSetter*>(slot->asCell());
+        if (!isFunction(gs->getter))
+            return vm.throwError(ErrorCode::TypeError, "'" + privateName(symbol) + "' was defined without a getter");
+        return vm.call(gs->getter, base, nullptr, 0);
+    }
+    retain(*slot);
+    return *slot;
+}
+
+/// `base.#name = value`: false with an exception pending.
+bool privatePut(VM& vm, JSValue base, JSValue symbol, JSValue value)
+{
+    std::uint8_t attrs = 0;
+    JSValue* slot = isObject(base) ? asObject(base)->findOwn(vm, symbol.asCell(), &attrs) : nullptr;
+    if (!slot) {
+        vm.throwError(ErrorCode::TypeError, "Cannot write private member " + privateName(symbol) +
+                                                 " to an object whose class did not declare it");
+        return false;
+    }
+    if (attrs & attr::kAccessor) {
+        const auto* gs = reinterpret_cast<const GetterSetter*>(slot->asCell());
+        if (!isFunction(gs->setter)) {
+            vm.throwError(ErrorCode::TypeError, "'" + privateName(symbol) + "' was defined without a setter");
+            return false;
+        }
+        JSValue r = vm.call(gs->setter, base, &value, 1);
+        if (r.isException())
+            return false;
+        release(r);
+        return true;
+    }
+    if (!(attrs & attr::kWritable)) {
+        vm.throwError(ErrorCode::TypeError, "Private method '" + privateName(symbol) + "' is not writable");
+        return false;
+    }
+    const JSValue old = *slot;
+    *slot = value;
+    retain(value);
+    release(old);
+    return true;
 }
 
 /// The enumerable string keys `for (k in value)` visits: integer-like names in ascending order, then the others in
@@ -1060,6 +1122,13 @@ L_GetElem: {
         vm.throwError(ErrorCode::TypeError, "Cannot read properties of " + std::string(base.isNull() ? "null" : "undefined"));
         FAIL();
     }
+    if (isPrivateKey(k)) [[unlikely]] {
+        const JSValue v = privateGet(vm, base, k);
+        if (v.isException())
+            FAIL();
+        SET(ins->a, v);
+        NEXT();
+    }
     JSValue prim = toPrimitive(vm, k, true);
     if (prim.isException())
         FAIL();
@@ -1099,6 +1168,11 @@ L_PutElem: {
     if (base.isNullish()) {
         vm.throwError(ErrorCode::TypeError, "Cannot set properties of " + std::string(base.isNull() ? "null" : "undefined"));
         FAIL();
+    }
+    if (isPrivateKey(k)) [[unlikely]] {
+        if (!privatePut(vm, base, k, R[ins->c]))
+            FAIL();
+        NEXT();
     }
     JSValue prim = toPrimitive(vm, k, true);
     if (prim.isException())
@@ -1311,7 +1385,13 @@ L_NewClass: {
             release(pp);
         }
     }
-    JSFunction* f = vm.newFunction(parent ? parent : vm.protos.function, ctor, nullptr, 0);
+    const std::uint32_t nUp = std::uint32_t(ctor->upvals.size());
+    std::vector<Box*> upBoxes(nUp);
+    for (std::uint32_t i = 0; i < nUp; ++i) {
+        const UpvalDesc& d = ctor->upvals[i];
+        upBoxes[i] = d.fromParentLocal ? reinterpret_cast<Box*>(R[d.index].asCell()) : fn->upvals()[d.index];
+    }
+    JSFunction* f = vm.newFunction(parent ? parent : vm.protos.function, ctor, upBoxes.data(), nUp);
     Handle fKeep = Handle::adopt(toJSValue(f));
     f->materialize(vm);  // length and name now, so that they come before `prototype`
     f->flags |= JSFunction::kConstructor;
@@ -1410,7 +1490,7 @@ L_GetSuperProp: {
     if (rr && isObject(rr->home))
         start = asObject(rr->home)->proto(vm);
     fr->pc = pc;
-    JSValue v = getPropertyFrom(vm, start, R[0], atoms[ins->b]);
+    JSValue v = getPropertyFrom(vm, start, R[ins->c], atoms[ins->b]);
     if (v.isException())
         FAIL();
     SET(ins->a, v);
@@ -1707,6 +1787,55 @@ L_IterNext: {
     NEXT();
 }
 
+L_NewPrivateName: {
+    JSValue sym = vm.newSymbol(static_cast<StringCell*>(atoms[ins->b])->text(), true);
+    static_cast<dyn::SymbolCell*>(sym.asCell())->isPrivate = true;
+    SET(ins->a, sym);
+    NEXT();
+}
+L_DefPrivate: {
+    fr->pc = pc;
+    JSObject* target = asObject(R[ins->a]);
+    if (target->findOwn(vm, R[ins->b].asCell())) {
+        vm.throwError(ErrorCode::TypeError, "Cannot initialize " + privateName(R[ins->b]) + " twice on the same object");
+        FAIL();
+    }
+    retain(R[ins->c]);
+    target->putOwn(vm, R[ins->b].asCell(), R[ins->c], attr::kWritable);
+    NEXT();
+}
+L_DefPrivMethod:
+L_DefPrivGetter:
+L_DefPrivSetter: {
+    fr->pc = pc;
+    JSObject* target = asObject(R[ins->a]);
+    const Op which = ins->opcode();
+    std::uint8_t existing = 0;
+    if (target->findOwn(vm, R[ins->b].asCell(), &existing) && (which == Op::DefPrivMethod || !(existing & attr::kAccessor))) {
+        vm.throwError(ErrorCode::TypeError, "Cannot initialize private methods of class twice on the same object");
+        FAIL();
+    }
+    if (which == Op::DefPrivMethod) {
+        retain(R[ins->c]);
+        target->putOwn(vm, R[ins->b].asCell(), R[ins->c], 0);
+    } else {
+        initAccessor(vm, target, R[ins->b].asCell(), R[ins->c], which == Op::DefPrivGetter, attr::kConfigurable);
+    }
+    NEXT();
+}
+L_GetHome: {
+    Rare* rr = fn->rare();
+    COPY(ins->a, rr && isObject(rr->home) ? rr->home : JSValue::undefined());
+    NEXT();
+}
+L_SetHome: {
+    auto* f = static_cast<JSFunction*>(asObject(R[ins->a]));
+    Rare& rr = f->rareOf(vm);
+    release(rr.home);
+    rr.home = R[ins->b];
+    retain(rr.home);
+    NEXT();
+}
 L_NewRegExp: {
     fr->pc = pc;
     JSValue r = bi::newRegExp(vm, asString(K[ins->b])->text(), asString(K[ins->c])->text());

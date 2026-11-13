@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/operators.hpp"
 
 #include <cmath>
@@ -495,6 +496,8 @@ int inOperator(VM& vm, JSValue a, JSValue b)
         vm.throwError(ErrorCode::TypeError, "Cannot use 'in' operator to search for a key in a non-object");
         return -1;
     }
+    if (isSymbol(a) && static_cast<dyn::SymbolCell*>(a.asCell())->isPrivate)
+        return asObject(b)->findOwn(vm, a.asCell()) != nullptr;
     JSValue prim = toPrimitive(vm, a, true);
     if (prim.isException())
         return -1;

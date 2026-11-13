@@ -383,3 +383,16 @@ S("/^\\s*$/.test('  ') + ':' + /[a-z]+/i.exec('12Ab')[0] + ':' + 'x-y_z'.split(/
 S("var re = /a/g; re.lastIndex = 5; re.test('aaa') + ':' + re.lastIndex")
 S("'abc'.replace(/(?:)/g, '-')")
 S("'aaa'.lastIndexOf('a') + ':' + ' x '.replace(/^\\s+|\\s+$/g, '').length")
+
+S("class A { #x = 1; static #c = 10; #m() { return this.#x * 2; } get #g() { return this.#x + 100; } set #g(v) { this.#x = v; } static #sm() { return A.#c; } inc() { this.#x++; return this.#x; } call() { return this.#m(); } viaG() { this.#g = 7; return this.#g; } static has(o) { return #x in o; } static sm() { return A.#sm(); } } var a = new A(); [a.inc(), a.call(), a.viaG(), A.has(a), A.has({}), A.sm()].join()")
+S("class A { #x = 1; inc() { return this.#x; } } var r; try { A.prototype.inc.call({}); } catch (e) { r = e.name; } r")
+S("class A { #x = 1; y = 2; } var a = new A(); JSON.stringify(a) + Object.keys(a).length + Object.getOwnPropertyNames(a).length")
+S("class A { #x = 1; inc() { return ++this.#x; } } class B extends A { #y = 5; y() { return this.#y + this.inc(); } } new B().y()")
+S("class C { #v = 1; static make() { return new C(); } eq(o) { return this.#v === o.#v; } } C.make().eq(new C())")
+S("class A { m() { return 'A'; } get g() { return 5; } } class B extends A { m() { var f = () => super.m() + 'B'; return f(); } get g() { return (() => super.g + 1)(); } set(v) { super.x = v; return this.x; } } var b = new B(); b.m() + b.g + b.set(9)")
+S("var o = { __proto__: { hi() { return 'hi'; } }, hi() { return (() => super.hi())() + '!'; } }; o.hi()")
+S("class A { static #count = 0; static next() { return ++A.#count; } } A.next() + A.next()")
+S("class A { #a = 1; #b = this.#a + 1; get() { return this.#a + this.#b; } } new A().get()")
+
+S("function mk(x) { class K { constructor() { this.v = x; } get() { return x + 1; } } return new K(); } var k = mk(5); k.v + ':' + k.get()")
+S("function mk(x) { return class extends Object { constructor() { super(); this.v = x; } }; } new (mk(3))().v")

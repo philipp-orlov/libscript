@@ -11,6 +11,7 @@
 #include <limits>
 
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
@@ -437,7 +438,10 @@ NATIVE(objectFreeze)
         JSObject* o = asObject(v);
         o->h.flags |= cellflags::kFrozen | cellflags::kNotExtensible;
         std::vector<Key> keys;
-        o->forEachOwn(vm, [&](Key k, std::uint8_t, JSValue) { keys.push_back(k); });
+        o->forEachOwn(vm, [&](Key k, std::uint8_t, JSValue) {
+            if (k->kind != detail::CellKind::Symbol || !static_cast<dyn::SymbolCell*>(k)->isPrivate)
+                keys.push_back(k);
+        });
         for (Key k : keys) {
             std::uint8_t attrs = 0;
             o->findOwn(vm, k, &attrs);

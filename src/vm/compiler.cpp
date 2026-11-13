@@ -123,7 +123,7 @@ void collectCaptured(const Node& n, std::set<String>& out, bool nested, bool arr
 {
     if (n.kind == NK::Identifier && nested)
         out.insert(n.text);
-    if (n.kind == NK::ThisExpr && nested && arrowChain)
+    if ((n.kind == NK::ThisExpr || n.kind == NK::SuperExpr) && nested && arrowChain)
         out.insert(String(u"this"));
     bool childNested = nested, childArrow = arrowChain;
     if (isFunctionNode(n)) {
@@ -272,6 +272,21 @@ bool usesArguments(const Node& n)
             return true;
     for (const dyn::NodePtr& child : n.list)
         if (child && usesArguments(*child))
+            return true;
+    return false;
+}
+
+bool usesSuper(const Node& n)
+{
+    if (n.kind == NK::SuperExpr)
+        return true;
+    if (n.kind == NK::FunctionExpr)
+        return false;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child && usesSuper(**child))
+            return true;
+    for (const dyn::NodePtr& child : n.list)
+        if (child && usesSuper(*child))
             return true;
     return false;
 }
@@ -700,6 +715,21 @@ private:
     CodeBlock* compileInitFunction(const std::vector<const Node*>& items, bool isStatic);
     CodeBlock* compileInitOnce(const std::vector<const Node*>& items, bool isStatic);
     void storeThis(std::uint16_t src);
+    /// A method of an object literal that mentions `super` looks the prototype up from the literal.
+    void homeFor(const Node& value, std::uint16_t fnReg, std::uint16_t object)
+    {
+        if (value.kind == NK::FunctionExpr && value.isMethod && value.d && usesSuper(*value.d))
+            emit(Op::SetHome, fnReg, object);
+    }
+    /// A register holding `this`: register 0, or a copy of the captured one inside an arrow.
+    std::uint16_t thisRegister()
+    {
+        if (!fn_->isArrow && !findInScopes(*fn_, String(u"this")))
+            return 0;
+        const std::uint16_t t = temp();
+        loadVar(String(u"this"), t, Node(NK::ThisExpr));
+        return t;
+    }
     CodeBlock* programOnce(const Node& program);
     void functionBody(const Node& n, CodeBlock* block);
 };
@@ -781,7 +811,15 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             }
             return expr(*n.list.back(), dst);
         }
-        case NK::SuperExpr: unsupported(n, "super");
+        case NK::SuperExpr: {
+            // Only as the object of `super.x = v` and the like, which store on `this`.
+            const std::uint16_t d = dest(dst);
+            if (fn_->isArrow || findInScopes(*fn_, String(u"this")))
+                loadVar(String(u"this"), d, n);
+            else
+                emit(Op::Mov, d, 0);
+            return d;
+        }
         case NK::Spread: unsupported(n, "spread");
         case NK::Yield: {
             if (!(fn_->block->flags & CodeBlock::kGenerator))
@@ -934,6 +972,7 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
             if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter) {
                 const std::uint16_t f = temp();
                 function(*p->b, String(), f);
+                homeFor(*p->b, f, t);
                 emit(p->propKind == PropKind::Getter ? Op::InitGetterElem : Op::InitSetterElem, t, k, f);
             } else {
                 const std::uint16_t v = temp();
@@ -941,6 +980,7 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
                     function(*p->b, String(), v);
                 else
                     expr(*p->b, v);
+                homeFor(*p->b, v, t);
                 emit(Op::InitElem, t, k, v);
             }
         } else {
@@ -948,10 +988,12 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
             if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter) {
                 const std::uint16_t f = temp();
                 function(*p->b, name, f);
+                homeFor(*p->b, f, t);
                 emit(p->propKind == PropKind::Getter ? Op::InitGetter : Op::InitSetter, t, atom(name), f);
             } else {
                 const std::uint16_t v = temp();
                 exprNamed(*p->b, v, name);
+                homeFor(*p->b, v, t);
                 emitCached(Op::InitProp, t, atom(name), v);
             }
         }
@@ -975,6 +1017,13 @@ std::uint16_t Compiler::function(const Node& n, const String& inferredName, int 
     fn_->block->children.push_back(child);
     const std::uint16_t d = dest(dst);
     emit(Op::Closure, d, std::uint32_t(index));
+    if (n.kind == NK::ArrowExpr && usesSuper(*n.d)) {
+        // `super.x` inside the arrow means what it means in the method around it.
+        const std::uint16_t h = temp();
+        emit(Op::GetHome, h);
+        emit(Op::SetHome, d, h);
+        fn_->top = h;
+    }
     return d;
 }
 
@@ -999,8 +1048,6 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         if (m->kind == NK::MethodDef && m->propKind == PropKind::Constructor && !m->declared)
             ctor = m.get();
     for (const dyn::NodePtr& m : cls.list) {
-        if (m->isPrivate)
-            unsupported(*m, "private class members");
         if (m->computed && m->kind == NK::FieldDef && !m->declared)
             unsupported(*m, "computed field names");
         if ((m->kind == NK::MethodDef || m->kind == NK::FieldDef) && !m->computed && m->a && m->a->kind != NK::Identifier &&
@@ -1012,11 +1059,27 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
     const std::uint16_t d = dest(dst);
     const std::uint16_t inner = fn_->top;
     const bool scoped = innerBinding && !cls.text.empty();
-    if (scoped) {
+    // The class's private names, each a binding of the scope the class's functions see; the fields and the methods
+    // that use them are other functions, so each is captured.
+    std::vector<String> privateNames;
+    for (const dyn::NodePtr& m : cls.list)
+        if (m->isPrivate && !m->declared && m->a && std::find(privateNames.begin(), privateNames.end(), m->a->text) == privateNames.end())
+            privateNames.push_back(m->a->text);
+    const bool anyScope = scoped || !privateNames.empty();
+    if (anyScope)
         pushScope();
+    if (scoped) {
         Binding& b = declare(cls.text, BKind::Const);
         b.initialized = true;
         emit(Op::LoadUndef, b.reg);
+        if (b.boxed)
+            emit(Op::NewBox, b.reg);
+    }
+    for (const String& pn : privateNames) {
+        fn_->captured.insert(pn);
+        Binding& b = declare(pn, BKind::Const);
+        b.initialized = true;
+        emit(Op::NewPrivateName, b.reg, atom(pn));
         if (b.boxed)
             emit(Op::NewBox, b.reg);
     }
@@ -1086,6 +1149,24 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         if (m->kind != NK::MethodDef || m->propKind == PropKind::Constructor)
             continue;
         const std::uint16_t target = m->isStatic ? f : proto;
+        if (m->isPrivate) {
+            // Made once here; each instance (or the class, if static) gets it where its fields are set up.
+            const String& pn = m->a->text;
+            const String holder = pn + (m->propKind == PropKind::Getter ? u" get" : m->propKind == PropKind::Setter ? u" set" : u" method");
+            fn_->captured.insert(holder);
+            Binding& hb = declare(holder, BKind::Const);
+            hb.initialized = true;
+            const std::uint16_t at = fn_->top;
+            const std::uint16_t t = temp();
+            function(*m->b, pn, t);
+            emit(Op::SetHome, t, target);
+            emit(Op::Mov, hb.reg, t);
+            if (hb.boxed)
+                emit(Op::NewBox, hb.reg);
+            fn_->top = at;
+            (m->isStatic ? staticItems : instanceFields).push_back(m.get());
+            continue;
+        }
         const std::uint16_t at = fn_->top;
         const Op plain = m->propKind == PropKind::Getter ? (m->computed ? Op::DefGetterElem : Op::DefGetter)
                          : m->propKind == PropKind::Setter ? (m->computed ? Op::DefSetterElem : Op::DefSetter)
@@ -1126,7 +1207,7 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
         fn_->top = at;
     }
     emit(Op::Mov, d, f);
-    if (scoped)
+    if (anyScope)
         popScope();
     fn_->top = inner;
     return d;
@@ -1168,7 +1249,7 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
         if (item->kind == NK::FieldDef) {
             if (item->b)
                 collectCaptured(*item->b, child.captured, false, true);
-        } else {
+        } else if (item->kind == NK::StaticBlock) {
             collectCaptured(*item->d, child.captured, false, true);
         }
     }
@@ -1200,11 +1281,37 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
                     emit(Op::NewBox, b.reg);
             }
         }
-        for (const Node* item : items) {
+        // Private methods go on first, then fields and blocks in the order they were written.
+        std::vector<const Node*> ordered;
+        for (const Node* item : items)
+            if (item->kind == NK::MethodDef)
+                ordered.push_back(item);
+        for (const Node* item : items)
+            if (item->kind != NK::MethodDef)
+                ordered.push_back(item);
+        for (const Node* item : ordered) {
             line_ = item->line;
             const std::uint16_t mark = fn_->top;
-            if (item->kind == NK::StaticBlock) {
+            if (item->kind == NK::MethodDef) {
+                const String& pn = item->a->text;
+                const String holder = pn + (item->propKind == PropKind::Getter ? u" get" : item->propKind == PropKind::Setter ? u" set" : u" method");
+                const std::uint16_t sym = temp();
+                loadVar(pn, sym, *item);
+                const std::uint16_t fnReg = temp();
+                loadVar(holder, fnReg, *item);
+                emit(item->propKind == PropKind::Getter ? Op::DefPrivGetter : item->propKind == PropKind::Setter ? Op::DefPrivSetter : Op::DefPrivMethod,
+                     0, sym, fnReg);
+            } else if (item->kind == NK::StaticBlock) {
                 statement(*item->d);
+            } else if (item->isPrivate) {
+                const std::uint16_t sym = temp();
+                loadVar(item->a->text, sym, *item);
+                const std::uint16_t v = temp();
+                if (item->b)
+                    exprNamed(*item->b, v, item->a->text);
+                else
+                    emit(Op::LoadUndef, v);
+                emit(Op::DefPrivate, 0, sym, v);
             } else {
                 const String key = item->a->text;
                 const std::uint16_t v = temp();
@@ -1364,8 +1471,6 @@ bool smallInt(const Node& n) noexcept
 
 std::uint16_t Compiler::binary(const Node& n, int dst)
 {
-    if (n.op == Tok::In && n.a->isPrivate)
-        unsupported(n, "private names");
     bool ok;
     const Op op = binaryOp(n.op, &ok);
     if (!ok)
@@ -1716,10 +1821,12 @@ std::uint16_t Compiler::chainRoot(const Node& n, int dst, bool isNew)
 std::uint16_t Compiler::member(const Node& n, int dst)
 {
     if (n.a->kind == NK::SuperExpr) {
-        if (fn_->isArrow || n.computed)
+        if (n.computed)
             unsupported(n, "this use of super");
         const std::uint16_t d = dest(dst);
-        emit(Op::GetSuperProp, d, atom(n.text));
+        const std::uint16_t at = fn_->top;
+        emit(Op::GetSuperProp, d, atom(n.text), thisRegister());
+        fn_->top = at;
         return d;
     }
     const std::uint16_t mark = fn_->top;
@@ -1754,10 +1861,13 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     if (superCall && (isNew || fn_->isArrow || !(fn_->block->flags & CodeBlock::kClassConstructor)))
         unsupported(n, "super() here");
     if (!isNew && callee.kind == NK::Member && callee.a->kind == NK::SuperExpr) {
-        if (fn_->isArrow || callee.computed)
+        if (callee.computed)
             unsupported(n, "this use of super");
-        emit(Op::GetSuperProp, base, atom(callee.text));
-        emit(Op::Mov, base + 1, 0);
+        const std::uint16_t at = fn_->top;
+        const std::uint16_t self = thisRegister();
+        emit(Op::GetSuperProp, base, atom(callee.text), self);
+        emit(Op::Mov, base + 1, self);
+        fn_->top = at;
     } else if (superCall) {
         emit(Op::GetSuperCtor, base);
         emit(Op::Mov, base + 1, 0);

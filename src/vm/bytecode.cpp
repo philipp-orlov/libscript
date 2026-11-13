@@ -51,10 +51,12 @@ std::string dump(const CodeBlock& block)
                 case 'A': n += std::snprintf(line + n, sizeof line - n, " @%u", operands[i]); break;
                 case 'N': n += std::snprintf(line + n, sizeof line - n, " #%u", operands[i]); break;
                 case 'I': n += std::snprintf(line + n, sizeof line - n, " %d", int(std::int16_t(operands[i]))); break;
-                case 'J':
-                    n += std::snprintf(line + n, sizeof line - n, " ->%lld", static_cast<long long>(pc) + 1 + ins.jump());
+                case 'J': {
+                    const long long offset = kinds[1] == 'R' ? ins.jump16() : ins.jump();
+                    n += std::snprintf(line + n, sizeof line - n, " ->%lld", static_cast<long long>(pc) + 1 + offset);
                     i = 3;
                     break;
+                }
                 default: break;
             }
         }

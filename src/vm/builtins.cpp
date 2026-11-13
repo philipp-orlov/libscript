@@ -6,6 +6,7 @@
 // src/dyn/builtins (ls-jsc.md, 9.4) one file at a time.
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
@@ -1681,6 +1682,20 @@ NATIVE(mathImul)
     return JSValue::int32(std::int32_t(std::uint32_t(toInt32(a)) * std::uint32_t(toInt32(b))));
 }
 
+NATIVE(dateNow)
+{
+    UNUSED();
+    const auto since = std::chrono::system_clock::now().time_since_epoch();
+    return JSValue::boxNumber(double(std::chrono::duration_cast<std::chrono::milliseconds>(since).count()));
+}
+
+NATIVE(performanceNow)
+{
+    UNUSED();
+    const auto since = std::chrono::steady_clock::now().time_since_epoch();
+    return JSValue::boxNumber(double(std::chrono::duration_cast<std::chrono::nanoseconds>(since).count()) / 1e6);
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------ install ---
@@ -1945,6 +1960,20 @@ void VM::installBuiltins()
     method(*this, console, "warn", consoleLog, 0, reinterpret_cast<void*>(1));
     release(toJSValue(console));
     method(*this, globalObject, "print", consoleLog, 0);
+    {
+        // Only what a benchmark needs of `Date` and `performance`: the clock.
+        JSObject* dateProto = newObject(objectProto);
+        JSFunction* dateCtor = constructor(*this, "Date", [](VM& vm, JSValue, const JSValue*, std::uint32_t, void*) -> JSValue {
+            return vm.throwError(ErrorCode::NotSupported, "Date objects are not supported by the vm core yet");
+        }, 7, dateProto);
+        release(toJSValue(dateProto));
+        method(*this, dateCtor, "now", dateNow, 0);
+        JSObject* performance = newObject(objectProto);
+        method(*this, performance, "now", performanceNow, 0);
+        Key key = internKey(std::string_view("performance"));
+        globalObject->putOwn(*this, key, toJSValue(performance), attr::kWritable | attr::kConfigurable);
+        detail::decRef(key);
+    }
     JSFunction* pi = method(*this, globalObject, "parseInt", parseIntImpl, 2);
     JSFunction* pf = method(*this, globalObject, "parseFloat", parseFloatImpl, 1);
     method(*this, globalObject, "isNaN", isNaNImpl, 1);

@@ -39,6 +39,8 @@ struct Ins
     Op opcode() const noexcept { return Op(op); }
     /// A jump's offset, in instructions from the one after this.
     std::int32_t jump() const noexcept { return std::int32_t(std::uint32_t(b) | (std::uint32_t(c) << 16)); }
+    /// The offset of a fused compare-and-jump, which has two registers and so only 16 bits for the distance.
+    std::int16_t jump16() const noexcept { return std::int16_t(c); }
     std::int16_t imm() const noexcept { return std::int16_t(b); }
     static Ins make(Op op, std::uint16_t a = 0, std::uint16_t b = 0, std::uint16_t c = 0) noexcept
     {
@@ -73,12 +75,22 @@ struct Handler
     std::uint16_t reg;
 };
 
-/// What a property read or write at one instruction learned: the shape of the object and the slot the property is in.
+/// What a property instruction learned, kept as data beside the code (ls-jsc.md, 4.6). `shape` is the receiver's shape id
+/// (never 0, so an empty cache never hits). Four kinds, told apart by the other fields:
+///   own property:        holder and validity null; the value is in slot `index` of the receiver
+///   prototype property:  `holder` is the object that has it, `validity` says the chain is as it was
+///   add a property:      `next` is the shape after the store (an object literal or a store that creates a property)
 struct InlineCache
 {
     std::uint32_t shape = 0;
     std::uint32_t index = 0;
+    std::uint32_t next = 0;
+    std::uint32_t pad = 0;
+    JSObject* holder = nullptr;
+    ValidityCell* validity = nullptr;  ///< holds a count
 };
+/// The id a property instruction carries in the word after it when it has no cache (too many in one function).
+inline constexpr std::uint16_t kNoCache = 0xFFFF;
 
 struct CodeBlock
 {
@@ -105,7 +117,7 @@ struct CodeBlock
     Vec<UpvalDesc> upvals;
     Vec<Handler> handlers;
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
-    Vec<InlineCache> caches;   ///< one per property instruction, indexed by its `c` or `b` operand
+    Vec<InlineCache> caches;   
     String file;
 
     CodeBlock() = default;

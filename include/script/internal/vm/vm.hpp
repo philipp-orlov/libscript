@@ -165,7 +165,17 @@ struct VM : EngineRuntime
     /// First register nobody uses: what a call from C++ puts its frame at.
     JSValue* stackTop = nullptr;
     std::uint32_t depth = 0;
-    Vec<Frame> frames;
+    /// The live frames, innermost last, in an array that never moves; `frameCapacity` is the call depth the context allows.
+    Frame* frameBase = nullptr;
+    std::uint32_t frameCount = 0;
+    std::uint32_t frameCapacity = 0;
+    /// Registers below this hold a value (undefined unless a frame wrote another): the stack is filled as it is first used.
+    JSValue* stackInit = nullptr;
+    void fillStack(JSValue* upTo) noexcept
+    {
+        for (; stackInit < upTo; ++stackInit)
+            *stackInit = JSValue::undefined();
+    }
     /// `callee(this, ...args)`. An owned result, or the exception sentinel with `exception` set. Runs script or native
     /// code; may be called from native code that script called.
     JSValue call(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc);

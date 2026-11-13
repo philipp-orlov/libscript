@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Differential fuzzing of native code for JavaScript: random programs, interpreted and compiled, must print the same.
 
-usage: js_jit_fuzz.py <libscript tool> [count] [seed]. Prints each disagreement and keeps the program.
+usage: js_jit_fuzz.py [--cores] <libscript tool> [count] [seed]. Prints each disagreement and keeps the program.
+--cores compares the dynamic engine's interpreter with the vm core (the tool needs SCRIPT_JIT_ENV_OVERRIDE).
 """
 import os, random, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -321,14 +322,38 @@ def one(args):
         os.unlink(path)
     return bad if bad else 'ok'
 
+def one_cores(args):
+    """The dynamic engine with its interpreter, against the vm core (and what it can run of the other tiers)."""
+    tool, seed, dirname = args
+    source = Gen(seed).program()
+    path = os.path.join(dirname, f"f{seed}.js")
+    with open(path, 'w') as f:
+        f.write(source)
+    base = run(tool, {'X_INTERP': '1', 'SCRIPT_CORE': 'dyn', 'SCRIPT_JIT': 'off'}, path)
+    if base[0] != 0 and 'exception' not in base[1][:200].lower():
+        os.unlink(path)
+        return None
+    got = run(tool, {'SCRIPT_CORE': 'vm'}, path)
+    if 'not supported' in got[1].lower() or 'is not supported' in got[1]:
+        os.unlink(path)
+        return None  # a feature the new core does not have yet, not a disagreement
+    if got != base:
+        return (seed, {'SCRIPT_CORE': 'vm'}, path, base, got)
+    os.unlink(path)
+    return 'ok'
+
 def main():
+    cores = '--cores' in sys.argv
+    if cores:
+        sys.argv.remove('--cores')
     tool = sys.argv[1]
     count = int(sys.argv[2]) if len(sys.argv) > 2 else 500
     start = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    job = one_cores if cores else one
     dirname = tempfile.mkdtemp(prefix='jsjit')
     ran = bad = 0
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-        for result in pool.map(one, [(tool, s, dirname) for s in range(start, start + count)]):
+        for result in pool.map(job, [(tool, s, dirname) for s in range(start, start + count)]):
             if result is None:
                 continue
             ran += 1

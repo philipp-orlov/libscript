@@ -66,3 +66,14 @@ TEST(everySnippetAgreesWithTheDynamicEngine)
     std::fprintf(stderr, "%d snippets, %d differ\n", checked, failed);
     CHECK_EQ(failed, 0);
 }
+
+// What the language says where the dynamic engine does not: a read-only property on a prototype stops a store from
+// creating an own property of the same name.
+TEST(readOnlyOnThePrototypeBlocksTheStoreEvenWhenTheSiteLearnedToAdd)
+{
+    const Outcome got = runOn(script::Context::Options::Core::Vm,
+                              "var P = {}; function mk() { var o = Object.create(P); o.x = 1; return o; } mk(); mk(); "
+                              "Object.defineProperty(P, 'x', {value: 7, writable: false}); var o = mk(); String(o.x)");
+    CHECK(!got.threw);
+    CHECK_EQ(got.text, std::string("7"));
+}

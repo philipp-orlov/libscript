@@ -43,7 +43,9 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     stackBase = stackTop = static_cast<JSValue*>(stack.base);
     stackEnd = stackBase + stack.bytes / sizeof(JSValue);
     // A frame is pushed without ever growing the vector, so pointers into it stay good.
-    frames.reserve(std::size_t(ctx.options.stackLimit) + 16);
+    frameCapacity = std::uint32_t(ctx.options.stackLimit) + 16;
+    frameBase = static_cast<Frame*>(allocPayload(sizeof(Frame) * frameCapacity));
+    stackInit = stackBase;
 
     atoms.length = internKey("length");
     atoms.prototype = internKey("prototype");
@@ -66,6 +68,8 @@ VM::~VM()
         sys::vmUnmap(shapeRegionBase_, shapeRegionBytes_);
     if (stackRegionBase_)
         sys::vmUnmap(stackRegionBase_, stackRegionBytes_);
+    if (frameBase)
+        freePayload(frameBase, sizeof(Frame) * frameCapacity);
 }
 
 void VM::afterCollect() noexcept {}

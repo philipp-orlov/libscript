@@ -91,6 +91,9 @@ void VM::releaseCode(CodeBlock* code) noexcept
         release(v);
     for (Key k : code->atoms)
         detail::decRef(k);
+    for (const InlineCache& c : code->caches)
+        if (c.validity)
+            releaseValidity(c.validity);
     for (CodeBlock* child : code->children)
         releaseCode(child);
     code->~CodeBlock();

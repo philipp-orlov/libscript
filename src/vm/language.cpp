@@ -3,6 +3,9 @@
 
 // JavaScript's registration on the new core: the shared ECMAScript parser, the bytecode compiler, and the VM that runs the
 // result in the global scope.
+#include <cstdio>
+#include <cstdlib>
+
 #include "script/internal/dyn/parser.hpp"
 #include "script/internal/vm/compiler.hpp"
 #include "script/internal/vm/convert.hpp"
@@ -45,6 +48,10 @@ std::shared_ptr<CompiledUnit> compileJavaScript(ContextImpl& ctx, std::string_vi
     unit->alive = ctx.alive;
     unit->vm = &vm;
     unit->code = compileProgram(vm, *tree, name);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SCRIPT_VM_DUMP"))
+        std::fputs(dump(*unit->code).c_str(), stderr);
+#endif
     vm.addCodeRoot(&unit->code);
     return unit;
 }

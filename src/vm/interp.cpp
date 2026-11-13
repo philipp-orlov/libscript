@@ -125,6 +125,102 @@ JSValue forInKeys(VM& vm, JSValue value)
     return keep.take();
 }
 
+
+// -------------------------------------------------------------- the caches ---
+
+/// Whether `o` may hand out the position of a property: in the shape tree, and not a function whose properties are not
+/// made yet.
+inline bool cacheable(VM& vm, JSObject* o) noexcept
+{
+    return !o->isDictionary(vm) && !(o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps));
+}
+
+void clearValidity(VM& vm, InlineCache& ic) noexcept
+{
+    if (ic.validity)
+        vm.releaseValidity(ic.validity);
+    ic.validity = nullptr;
+    ic.holder = nullptr;
+}
+
+/// A read found `key` as an own data property of `o`, or on a prototype: remember where.
+bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
+{
+    if (!cacheable(vm, o))
+        return false;
+    std::uint8_t attrs = 0;
+    std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
+    if (index >= 0) {
+        if (attrs & attr::kAccessor)
+            return false;
+        clearValidity(vm, ic);
+        ic.shape = o->h.shape;
+        ic.index = std::uint32_t(index);
+        ic.next = 0;
+        return true;
+    }
+    // A property of a prototype: the cache holds the holder and a cell that says the chain has not changed.
+    for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
+        if (!cacheable(vm, p))
+            return false;
+        index = p->shapeOf(vm)->indexOf(key, &attrs);
+        if (index < 0)
+            continue;
+        if (attrs & attr::kAccessor)
+            return false;
+        ValidityCell* cell = vm.validityOf(o->proto(vm));
+        vm.retainValidity(cell);
+        clearValidity(vm, ic);
+        ic.shape = o->h.shape;
+        ic.holder = p;
+        ic.index = std::uint32_t(index);
+        ic.validity = cell;
+        ic.next = 0;
+        return true;
+    }
+    return false;
+}
+
+/// A store to an own writable data property.
+void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key)
+{
+    if (!cacheable(vm, o) || o->cls() == ObjClass::Array)
+        return;
+    std::uint8_t attrs = 0;
+    const std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
+    if (index < 0 || !(attrs & attr::kWritable) || (attrs & attr::kAccessor))
+        return;
+    clearValidity(vm, ic);
+    ic.shape = o->h.shape;
+    ic.index = std::uint32_t(index);
+    ic.next = 0;
+}
+
+/// A store (or a literal's property) that added `key` to an object whose shape was `before`: remember the shape after.
+/// A store that goes through the prototypes also holds the validity of the chain, since a setter or a read-only property
+/// added to one of them would change what the store does.
+void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key key, bool throughChain)
+{
+    if (o->h.shape == before || !cacheable(vm, o) || o->cls() == ObjClass::Array || o->isProto())
+        return;
+    Shape* now = o->shapeOf(vm);
+    Shape* was = vm.shapeById(before);
+    if (!was || now->parent != was || now->key != key || now->attrs != attr::kDefault || was->count >= o->h.aux)
+        return;
+    clearValidity(vm, ic);
+    if (throughChain) {
+        if (JSObject* p = o->proto(vm)) {
+            ValidityCell* cell = vm.validityOf(p);
+            vm.retainValidity(cell);
+            ic.validity = cell;
+        }
+    }
+    ic.shape = before;
+    ic.next = o->h.shape;
+    ic.index = was->count;
+    ic.holder = nullptr;
+}
+
 }  // namespace
 
 // --------------------------------------------------------------- the loop ---
@@ -139,7 +235,7 @@ JSValue run(VM& vm)
 #undef OP
     };
 
-    Frame* fr = &vm.frames.back();
+    Frame* fr = vm.frameBase + vm.frameCount - 1;
     CodeBlock* code;
     const Ins* codeStart;
     const JSValue* K;
@@ -217,47 +313,82 @@ L_CheckInit:
 L_GetGlobal:
 L_GetGlobalOrUndef: {
     Key key = atoms[ins->b];
-    std::uint8_t attrs = 0;
-    JSValue* slot = vm.global->findOwn(vm, key, &attrs);
-    if (slot && !(attrs & attr::kAccessor)) {
-        COPY(ins->a, *slot);
+    InlineCache scratch;
+    const std::uint16_t cacheId = pc->a;
+    InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
+    JSObject* g = vm.global;
+    if (g->h.shape == ic.shape) [[likely]] {
+        COPY(ins->a, *g->slotAt(ic.index));
+        ++pc;
         NEXT();
     }
-    if (!hasProperty(vm, toJSValue(vm.global), key)) {
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm, key, &attrs);
+    if (slot && !(attrs & attr::kAccessor)) {
+        if (cacheId != kNoCache && cacheable(vm, g)) {
+            ic.shape = g->h.shape;
+            ic.index = std::uint32_t(g->shapeOf(vm)->indexOf(key));
+        }
+        COPY(ins->a, *slot);
+        ++pc;
+        NEXT();
+    }
+    if (!hasProperty(vm, toJSValue(g), key)) {
         if (ins->opcode() == Op::GetGlobalOrUndef) {
             SET(ins->a, JSValue::undefined());
+            ++pc;
             NEXT();
         }
         vm.throwError(ErrorCode::ReferenceError, toUtf8(static_cast<StringCell*>(key)->text()) + " is not defined");
         FAIL();
     }
     fr->pc = pc;
-    JSValue v = getProperty(vm, toJSValue(vm.global), key);
+    JSValue v = getProperty(vm, toJSValue(g), key);
     if (v.isException())
         FAIL();
     SET(ins->a, v);
+    ++pc;
     NEXT();
 }
 L_PutGlobal: {
     Key key = atoms[ins->a];
-    std::uint8_t attrs = 0;
-    JSValue* slot = vm.global->findOwn(vm, key, &attrs);
-    if (slot && (attrs & attr::kWritable) && !(attrs & attr::kAccessor)) {
+    InlineCache scratch;
+    const std::uint16_t cacheId = pc->a;
+    InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
+    JSObject* g = vm.global;
+    if (g->h.shape == ic.shape) [[likely]] {
+        JSValue* slot = g->slotAt(ic.index);
         const JSValue old = *slot;
         *slot = R[ins->b];
         retain(*slot);
         release(old);
+        ++pc;
         NEXT();
     }
-    if (!slot && STRICT() && !hasProperty(vm, toJSValue(vm.global), key)) {
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm, key, &attrs);
+    if (slot && (attrs & attr::kWritable) && !(attrs & attr::kAccessor)) {
+        if (cacheId != kNoCache && cacheable(vm, g)) {
+            ic.shape = g->h.shape;
+            ic.index = std::uint32_t(g->shapeOf(vm)->indexOf(key));
+        }
+        const JSValue old = *slot;
+        *slot = R[ins->b];
+        retain(*slot);
+        release(old);
+        ++pc;
+        NEXT();
+    }
+    if (!slot && STRICT() && !hasProperty(vm, toJSValue(g), key)) {
         vm.throwError(ErrorCode::ReferenceError, toUtf8(static_cast<StringCell*>(key)->text()) + " is not defined");
         FAIL();
     }
     fr->pc = pc;
-    if (!setProperty(vm, toJSValue(vm.global), key, R[ins->b], STRICT())) {
+    if (!setProperty(vm, toJSValue(g), key, R[ins->b], STRICT())) {
         if (!vm.exception.isUndefined())
             FAIL();
     }
+    ++pc;
     NEXT();
 }
 L_DefGlobal: {
@@ -321,6 +452,12 @@ L_Add: {
             NEXT();
         }
     }
+    if (a.isNumber() && b.isNumber()) {
+        SET(ins->a, JSValue::boxNumber(a.asNumber() + b.asNumber()));
+        NEXT();
+    }
+    if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b))
+        NEXT();
     fr->pc = pc;
     const JSValue r = add(vm, a, b);
     if (r.isException())
@@ -360,12 +497,15 @@ L_SubI: {
     SET(ins->a, r);
     NEXT();
 }
-#define ARITH(NAME, FAST)                                                         \
+#define ARITH(NAME, FAST, DOUBLE)                                                         \
     L_##NAME : {                                                                  \
         const JSValue a = R[ins->b], b = R[ins->c];                               \
         if (a.isInt32() && b.isInt32()) {                                         \
             const std::int32_t x = a.asInt32(), y = b.asInt32();                  \
             FAST                                                                  \
+        }                                                                         \
+        if (a.isNumber() && b.isNumber()) {                                       \
+            DOUBLE                                                                \
         }                                                                         \
         fr->pc = pc;                                                              \
         const JSValue r = arithmetic(vm, Op::NAME, a, b);                         \
@@ -380,49 +520,53 @@ ARITH(Sub, {
         SET(ins->a, JSValue::int32(r));
         NEXT();
     }
-})
+}, { SET(ins->a, JSValue::boxNumber(a.asNumber() - b.asNumber())); NEXT(); })
 ARITH(Mul, {
     std::int32_t r;
     if (!__builtin_mul_overflow(x, y, &r) && (r != 0 || (x >= 0 && y >= 0))) {
         SET(ins->a, JSValue::int32(r));
         NEXT();
     }
-})
-ARITH(Div, {})
+}, { SET(ins->a, JSValue::boxNumber(a.asNumber() * b.asNumber())); NEXT(); })
+ARITH(Div, {}, { SET(ins->a, JSValue::boxNumber(a.asNumber() / b.asNumber())); NEXT(); })
 ARITH(Mod, {
     if (x >= 0 && y > 0) {
         SET(ins->a, JSValue::int32(x % y));
         NEXT();
     }
-})
-ARITH(Exp, {})
+}, { })
+ARITH(Exp, {}, { })
 ARITH(BitAnd, {
     SET(ins->a, JSValue::int32(x & y));
     NEXT();
-})
+}, { })
 ARITH(BitOr, {
     SET(ins->a, JSValue::int32(x | y));
     NEXT();
-})
+}, { })
 ARITH(BitXor, {
     SET(ins->a, JSValue::int32(x ^ y));
     NEXT();
-})
+}, { })
 ARITH(Shl, {
     SET(ins->a, JSValue::int32(std::int32_t(std::uint32_t(x) << (y & 31))));
     NEXT();
-})
+}, { })
 ARITH(Shr, {
     SET(ins->a, JSValue::int32(x >> (y & 31)));
     NEXT();
-})
-ARITH(UShr, {})
+}, { })
+ARITH(UShr, {}, { })
 
 #define COMPARE(NAME, OPERATOR)                                       \
     L_##NAME : {                                                      \
         const JSValue a = R[ins->b], b = R[ins->c];                   \
         if (a.isInt32() && b.isInt32()) {                             \
             SET(ins->a, JSValue::boolean(a.asInt32() OPERATOR b.asInt32())); \
+            NEXT();                                                   \
+        }                                                             \
+        if (a.isNumber() && b.isNumber()) {                           \
+            SET(ins->a, JSValue::boolean(a.asNumber() OPERATOR b.asNumber())); \
             NEXT();                                                   \
         }                                                             \
         fr->pc = pc;                                                  \
@@ -583,38 +727,124 @@ L_JHole:
     if (R[ins->a].isHole())
         pc += ins->jump();
     NEXT();
+L_JLt:
+L_JLe:
+L_JGt:
+L_JGe: {
+    const JSValue a = R[ins->a], b = R[ins->b];
+    bool holds;
+    if (a.isInt32() && b.isInt32()) {
+        const std::int32_t x = a.asInt32(), y = b.asInt32();
+        switch (ins->opcode()) {
+            case Op::JLt: holds = x < y; break;
+            case Op::JLe: holds = x <= y; break;
+            case Op::JGt: holds = x > y; break;
+            default: holds = x >= y; break;
+        }
+    } else if (a.isNumber() && b.isNumber()) {
+        const double x = a.asNumber(), y = b.asNumber();
+        switch (ins->opcode()) {
+            case Op::JLt: holds = x < y; break;
+            case Op::JLe: holds = x <= y; break;
+            case Op::JGt: holds = x > y; break;
+            default: holds = x >= y; break;
+        }
+    } else {
+        fr->pc = pc;
+        const Op rel = ins->opcode() == Op::JLt ? Op::Lt : ins->opcode() == Op::JLe ? Op::Le : ins->opcode() == Op::JGt ? Op::Gt : Op::Ge;
+        const int r = relational(vm, rel, a, b);
+        if (r < 0)
+            FAIL();
+        holds = r != 0;
+    }
+    if (holds)
+        pc += ins->jump16();
+    NEXT();
+}
+L_JNotLt:
+L_JNotLe:
+L_JNotGt:
+L_JNotGe: {
+    const JSValue a = R[ins->a], b = R[ins->b];
+    bool holds;
+    if (a.isInt32() && b.isInt32()) {
+        const std::int32_t x = a.asInt32(), y = b.asInt32();
+        switch (ins->opcode()) {
+            case Op::JNotLt: holds = x < y; break;
+            case Op::JNotLe: holds = x <= y; break;
+            case Op::JNotGt: holds = x > y; break;
+            default: holds = x >= y; break;
+        }
+    } else if (a.isNumber() && b.isNumber()) {
+        const double x = a.asNumber(), y = b.asNumber();
+        switch (ins->opcode()) {
+            case Op::JNotLt: holds = x < y; break;
+            case Op::JNotLe: holds = x <= y; break;
+            case Op::JNotGt: holds = x > y; break;
+            default: holds = x >= y; break;
+        }
+    } else {
+        fr->pc = pc;
+        const Op rel = ins->opcode() == Op::JNotLt ? Op::Lt : ins->opcode() == Op::JNotLe ? Op::Le : ins->opcode() == Op::JNotGt ? Op::Gt : Op::Ge;
+        const int r = relational(vm, rel, a, b);
+        if (r < 0)
+            FAIL();
+        holds = r != 0;
+    }
+    if (!holds)
+        pc += ins->jump16();
+    NEXT();
+}
+L_JStrictNe:
+L_JStrictEq: {
+    const bool eq = strictEquals(R[ins->a], R[ins->b]);
+    if (eq == (ins->opcode() == Op::JStrictEq))
+        pc += ins->jump16();
+    NEXT();
+}
+L_Cache:
+    // Never executed: the word after a property instruction, skipped by it.
+    goto throw_;
 
 // ---- properties ----
 L_GetProp: {
     const JSValue base = R[ins->b];
     Key key = atoms[ins->c];
+    InlineCache scratch;
+    const std::uint16_t cacheId = pc->a;
+    InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
     if (isObject(base)) {
         JSObject* o = asObject(base);
-        InlineCache* ic = &code->caches[std::size_t(ins - codeStart)];
-        if (o->h.shape == ic->shape && ic->shape != 0) [[likely]] {
-            COPY(ins->a, *o->slotAt(ic->index));
-            NEXT();
+        if (o->h.shape == ic.shape) [[likely]] {
+            if (!ic.holder) {
+                COPY(ins->a, *o->slotAt(ic.index));
+                ++pc;
+                NEXT();
+            }
+            if (ic.validity->valid) {
+                COPY(ins->a, *ic.holder->slotAt(ic.index));
+                ++pc;
+                NEXT();
+            }
         }
         if (key == vm.atoms.length && o->cls() == ObjClass::Array) {
             const std::uint32_t n = static_cast<JSArray*>(o)->length;
             SET(ins->a, n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            ++pc;
             NEXT();
         }
         SCRIPT_VM_CENSUS(SlowGetProp);
-        // An own data property of an object in the shape tree is what a cache remembers.
-        if (!o->isDictionary(vm)) {
-            std::uint8_t attrs = 0;
-            const std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
-            if (index >= 0 && !(attrs & attr::kAccessor) && !(o->cls() == ObjClass::Function && static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)) {
+        if (cacheId != kNoCache) {
+            if (learnRead(vm, ic, o, key)) {
                 SCRIPT_VM_CENSUS(IcMiss);
-                ic->shape = o->h.shape;
-                ic->index = std::uint32_t(index);
-                COPY(ins->a, *o->slotAt(std::uint32_t(index)));
+                COPY(ins->a, ic.holder ? *ic.holder->slotAt(ic.index) : *o->slotAt(ic.index));
+                ++pc;
                 NEXT();
             }
         }
     } else if (isString(base) && key == vm.atoms.length) {
         SET(ins->a, JSValue::int32(std::int32_t(asString(base)->length)));
+        ++pc;
         NEXT();
     }
     fr->pc = pc;
@@ -622,42 +852,59 @@ L_GetProp: {
     if (v.isException())
         FAIL();
     SET(ins->a, v);
+    ++pc;
     NEXT();
 }
 L_PutProp: {
     const JSValue base = R[ins->a];
     Key key = atoms[ins->b];
+    InlineCache scratch;
+    const std::uint16_t cacheId = pc->a;
+    InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
     if (isObject(base)) {
         JSObject* o = asObject(base);
-        InlineCache* ic = &code->caches[std::size_t(ins - codeStart)];
-        if (o->h.shape == ic->shape && ic->shape != 0) [[likely]] {
-            JSValue* slot = o->slotAt(ic->index);
-            const JSValue old = *slot;
-            *slot = R[ins->c];
-            retain(*slot);
-            release(old);
-            NEXT();
-        }
-        SCRIPT_VM_CENSUS(SlowPutProp);
-        if (!o->isDictionary(vm) && o->cls() != ObjClass::Array) {
-            std::uint8_t attrs = 0;
-            const std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
-            if (index >= 0 && (attrs & attr::kWritable) && !(attrs & attr::kAccessor) &&
-                !(o->cls() == ObjClass::Function && static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)) {
-                ic->shape = o->h.shape;
-                ic->index = std::uint32_t(index);
-                JSValue* slot = o->slotAt(std::uint32_t(index));
+        if (o->h.shape == ic.shape) [[likely]] {
+            if (ic.next == 0) {
+                JSValue* slot = o->slotAt(ic.index);
                 const JSValue old = *slot;
                 *slot = R[ins->c];
                 retain(*slot);
                 release(old);
+                ++pc;
+                NEXT();
+            }
+            // A store that adds the property, where the prototypes still have nothing to say about it.
+            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
+                JSValue* slot = &o->inl()[ic.index];
+                *slot = R[ins->c];
+                retain(*slot);
+                o->h.shape = ic.next;
+                ++pc;
                 NEXT();
             }
         }
+        SCRIPT_VM_CENSUS(SlowPutProp);
+        const std::uint32_t before = o->h.shape;
+        fr->pc = pc;
+        if (!setProperty(vm, base, key, R[ins->c], STRICT())) {
+            if (!vm.exception.isUndefined())
+                FAIL();
+            ++pc;
+            NEXT();
+        }
+        if (cacheId != kNoCache) {
+            if (o->h.shape == before)
+                learnOwnWrite(vm, ic, o, key);
+            else
+                learnAdd(vm, ic, o, before, key, true);
+        }
+        ++pc;
+        NEXT();
     }
     fr->pc = pc;
     if (!setProperty(vm, base, key, R[ins->c], STRICT()) && !vm.exception.isUndefined())
         FAIL();
+    ++pc;
     NEXT();
 }
 L_GetElem: {
@@ -766,7 +1013,7 @@ L_DelElem: {
 
 // ---- literals ----
 L_NewObject: {
-    JSObject* o = vm.newObject(vm.protos.object);
+    JSObject* o = vm.newObject(vm.protos.object, std::uint8_t(ins->b));
     SET(ins->a, toJSValue(o));
     // `SET` released the previous value; the new object's creation count is the register's.
     NEXT();
@@ -784,8 +1031,24 @@ L_ArrayPush: {
 }
 L_InitProp: {
     JSObject* o = asObject(R[ins->a]);
+    InlineCache scratch;
+    const std::uint16_t cacheId = pc->a;
+    InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
+    if (o->h.shape == ic.shape) [[likely]] {
+        // The literal's next property: the shape it had and the shape it gets.
+        JSValue* slot = &o->inl()[ic.index];
+        *slot = R[ins->c];
+        retain(*slot);
+        o->h.shape = ic.next;
+        ++pc;
+        NEXT();
+    }
+    const std::uint32_t before = o->h.shape;
     retain(R[ins->c]);
     o->putOwn(vm, atoms[ins->b], R[ins->c], attr::kDefault);
+    if (cacheId != kNoCache)
+        learnAdd(vm, ic, o, before, atoms[ins->b], false);
+    ++pc;
     NEXT();
 }
 L_InitElem: {
@@ -900,7 +1163,7 @@ L_New: {
     }
     CodeBlock* c = f->code;
     JSValue* newR = R + base + 1;
-    if (vm.frames.size() + 2 >= vm.frames.capacity() || newR + c->nregs + 8 > vm.stackEnd) [[unlikely]] {
+    if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd) [[unlikely]] {
         vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
         FAIL();
     }
@@ -908,13 +1171,27 @@ L_New: {
         copyReg(newR[0], toJSValue(vm.global));
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
-    for (std::uint32_t i = keep; i < c->nregs; ++i) {
-        const JSValue v = newR[i];
-        newR[i] = JSValue::undefined();
-        release(v);
+    // Past what is initialised the registers are fresh; below it, what this frame sits on top of may be the caller's dead
+    // temporaries or arguments the callee has no parameter for, which let go of their values now.
+    if (newR + c->nregs > vm.stackInit) [[unlikely]]
+        vm.fillStack(newR + c->nregs);
+    {
+        JSValue* callerEnd = R + code->nregs;
+        const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(std::min<std::ptrdiff_t>(callerEnd - newR, c->nregs)) : 0;
+        for (std::uint32_t i = keep; i < overlap; ++i) {
+            const JSValue v = newR[i];
+            newR[i] = JSValue::undefined();
+            release(v);
+        }
+        // Arguments past the parameters, if they sit beyond the caller's own registers.
+        for (std::uint32_t i = std::max(keep, overlap); i < 1 + argc && i < c->nregs; ++i) {
+            const JSValue v = newR[i];
+            newR[i] = JSValue::undefined();
+            release(v);
+        }
     }
-    vm.frames.push_back(Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, false});
-    fr = &vm.frames.back();
+    vm.frameBase[vm.frameCount++] = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, false};
+    fr = &vm.frameBase[vm.frameCount - 1];
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
     NEXT();
@@ -932,12 +1209,12 @@ L_Ret: {
     const bool entry = fr->entry;
     const std::uint16_t dst = fr->retDst;
     JSValue* calleeR = R;
-    vm.frames.pop_back();
+    --vm.frameCount;
     if (entry) {
         (void)calleeR;
         return result;
     }
-    fr = &vm.frames.back();
+    fr = &vm.frameBase[vm.frameCount - 1];
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
     SET(dst, result);
@@ -1031,10 +1308,10 @@ throw_: {
         const std::uint32_t keep = 1 + (fr->argc < code->nparams ? fr->argc : code->nparams);
         clearRegs(R, keep, code->nregs);
         const bool entry = fr->entry;
-        vm.frames.pop_back();
+        --vm.frameCount;
         if (entry)
             return JSValue::exception();
-        fr = &vm.frames.back();
+        fr = &vm.frameBase[vm.frameCount - 1];
         code = fr->code;
         codeStart = code->code.data();
         R = fr->R;
@@ -1072,9 +1349,10 @@ JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::ui
     }
     CodeBlock* c = f->code;
     JSValue* R = stackTop;
-    if (frames.size() + 2 >= frames.capacity() || R + std::max<std::size_t>(c->nregs, argc + 1) + 8 > stackEnd)
+    if (frameCount + 2 >= frameCapacity || R + std::max<std::size_t>(c->nregs, argc + 1) + 8 > stackEnd)
         return throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
     // `this` and the arguments become the first registers of the new frame, each with a count of its own.
+    fillStack(R + std::max<std::size_t>(c->nregs, argc + 1) + 1);
     JSValue self = thisValue;
     if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self.isNullish())
         self = toJSValue(global);
@@ -1091,7 +1369,7 @@ JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::ui
         release(v);
     }
     JSValue* savedTop = stackTop;
-    frames.push_back(Frame{c, f, nullptr, R, 0, argc, false, true});
+    frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, false, true};
     const JSValue result = run(*this);
     stackTop = savedTop;
     // The frame let go of its own registers; `this` and the arguments are ours.

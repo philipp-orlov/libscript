@@ -66,9 +66,14 @@ struct Scope
     std::uint16_t baseTop = 0;
 };
 
+struct FusionOverflow
+{
+};
+
 struct Label
 {
     std::vector<std::uint32_t> patches;
+    std::vector<std::uint32_t> patches16;  ///< fused compare-and-jumps
     std::int64_t target = -1;
 };
 
@@ -235,6 +240,22 @@ bool needsTdz(const std::vector<dyn::NodePtr>& statements, std::size_t declIndex
     return false;
 }
 
+/// Whether evaluating a node can assign to a variable of this function.
+bool hasAssignment(const Node& n)
+{
+    if (n.kind == NK::Assign || n.kind == NK::Update)
+        return true;
+    if (isFunctionNode(n))
+        return false;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child && hasAssignment(**child))
+            return true;
+    for (const dyn::NodePtr& child : n.list)
+        if (child && hasAssignment(*child))
+            return true;
+    return false;
+}
+
 bool hasUseStrict(const Node& body)
 {
     for (const dyn::NodePtr& s : body.list) {
@@ -277,6 +298,8 @@ private:
     std::uint32_t line_ = 0;
     Label* chain_ = nullptr;
     bool chainUsed_ = false;
+    bool noFuse_ = false;
+    bool discard_ = false;  ///< the expression about to be compiled has its value thrown away
 
     // ---------------------------------------------------------------- emit ---
     std::uint32_t pc() const noexcept { return std::uint32_t(fn_->block->code.size()); }
@@ -287,6 +310,37 @@ private:
             throw Error(ErrorCode::NotSupported, "vm core: function too large (operand over 65535)");
         fn_->block->code.push_back(Ins::make(op, std::uint16_t(a), std::uint16_t(b), std::uint16_t(c)));
         fn_->block->lines.push_back(line_);
+    }
+
+    /// A property instruction and the word after it that names its cache.
+    void emitCached(Op op, std::uint32_t a, std::uint32_t b, std::uint32_t c)
+    {
+        emit(op, a, b, c);
+        std::uint32_t id = kNoCache;
+        if (fn_->block->caches.size() < kNoCache) {
+            id = std::uint32_t(fn_->block->caches.size());
+            fn_->block->caches.emplace_back();
+        }
+        emit(Op::Cache, id);
+    }
+
+    /// `op a, b` and a jump to `label`, in one instruction: the distance has 16 bits, and a function with a jump that
+    /// is longer is compiled again without these.
+    void emitFusedJump(Op op, std::uint32_t a, std::uint32_t b, Label& label)
+    {
+        const std::uint32_t at = pc();
+        emit(op, a, b, 0);
+        if (label.target >= 0)
+            patch16(at, label.target);
+        else
+            label.patches16.push_back(at);
+    }
+    void patch16(std::uint32_t at, std::int64_t target)
+    {
+        const std::int64_t offset = target - (at + 1);
+        if (offset < -32768 || offset > 32767)
+            throw FusionOverflow();
+        fn_->block->code[at].c = std::uint16_t(std::int16_t(offset));
     }
 
     std::uint32_t emitJump(Op op, std::uint32_t reg, Label& label)
@@ -306,6 +360,9 @@ private:
         for (std::uint32_t at : label.patches)
             fn_->block->code[at].setJump(std::int32_t(label.target - (at + 1)));
         label.patches.clear();
+        for (std::uint32_t at : label.patches16)
+            patch16(at, label.target);
+        label.patches16.clear();
     }
 
     std::uint16_t temp()
@@ -494,7 +551,7 @@ private:
             if (name == u"undefined") {
                 emit(Op::LoadUndef, d);
             } else {
-                emit(forTypeof ? Op::GetGlobalOrUndef : Op::GetGlobal, d, atom(name));
+                emitCached(forTypeof ? Op::GetGlobalOrUndef : Op::GetGlobal, d, atom(name), 0);
             }
         }
         (void)at;
@@ -536,7 +593,10 @@ private:
             }
             emit(Op::PutUpval, r.upval, src);
         } else {
-            emit(init ? Op::DefGlobal : Op::PutGlobal, atom(name), src);
+            if (init)
+                emit(Op::DefGlobal, atom(name), src);
+            else
+                emitCached(Op::PutGlobal, atom(name), src, 0);
         }
         (void)at;
     }
@@ -560,7 +620,7 @@ private:
     std::uint16_t call(const Node& n, int dst, bool isNew);
     std::uint16_t chainRoot(const Node& n, int dst, bool isNew);
     std::uint16_t unary(const Node& n, int dst);
-    std::uint16_t update(const Node& n, int dst);
+    std::uint16_t update(const Node& n, int dst, bool discard);
     std::uint16_t binary(const Node& n, int dst);
     std::uint16_t logical(const Node& n, int dst);
     std::uint16_t assign(const Node& n, int dst);
@@ -570,6 +630,7 @@ private:
     std::uint16_t templateLit(const Node& n, int dst);
     std::uint16_t function(const Node& n, const String& inferredName, int dst);
     void condJump(const Node& cond, Label& whenFalse);
+    void condJumpTrue(const Node& cond, Label& whenTrue);
     bool isAnonymousFunction(const Node& n) const
     {
         return isFunctionNode(n) && n.text.empty() && !n.isMethod;
@@ -607,6 +668,8 @@ private:
     std::vector<String> pendingLabels_;
 
     CodeBlock* compileFunction(const Node& n, const String& name);
+    CodeBlock* compileFunctionOnce(const Node& n, const String& name);
+    CodeBlock* programOnce(const Node& program);
     void functionBody(const Node& n, CodeBlock* block);
 };
 
@@ -622,6 +685,8 @@ void Compiler::exprVia(const Node& n, int dst, std::uint16_t result)
 
 std::uint16_t Compiler::expr(const Node& n, int dst)
 {
+    const bool discard = discard_;
+    discard_ = false;
     const std::uint32_t savedLine = line_;
     if (n.line)
         line_ = n.line;
@@ -669,7 +734,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         case NK::FunctionExpr:
         case NK::ArrowExpr: return function(n, n.text, dst);
         case NK::Unary: return unary(n, dst);
-        case NK::Update: return update(n, dst);
+        case NK::Update: return update(n, dst, discard);
         case NK::Binary: return binary(n, dst);
         case NK::Logical: return logical(n, dst);
         case NK::Assign: return assign(n, dst);
@@ -768,7 +833,10 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
 {
     const std::uint16_t mark = fn_->top;
     const std::uint16_t t = temp();
-    emit(Op::NewObject, t);
+    // Room for the literal's properties, an odd count so that the cell is a multiple of 16 bytes (4.4).
+    std::uint32_t inlineSlots = std::max<std::size_t>(3, n.list.size());
+    inlineSlots = std::min<std::uint32_t>(inlineSlots | 1u, 15);
+    emit(Op::NewObject, t, inlineSlots);
     for (const dyn::NodePtr& p : n.list) {
         const std::uint16_t inner = fn_->top;
         line_ = p->line ? p->line : line_;
@@ -803,7 +871,7 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
             } else {
                 const std::uint16_t v = temp();
                 exprNamed(*p->b, v, name);
-                emit(Op::InitProp, t, atom(name), v);
+                emitCached(Op::InitProp, t, atom(name), v);
             }
         }
         fn_->top = inner;
@@ -1018,6 +1086,34 @@ std::uint16_t Compiler::conditional(const Node& n, int dst)
     return t;
 }
 
+void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
+{
+    if (cond.kind == NK::Binary && !noFuse_) {
+        Op fused = Op::Nop;
+        switch (cond.op) {
+            case Tok::Lt: fused = Op::JLt; break;
+            case Tok::Le: fused = Op::JLe; break;
+            case Tok::Gt: fused = Op::JGt; break;
+            case Tok::Ge: fused = Op::JGe; break;
+            case Tok::EqEqEq: fused = Op::JStrictEq; break;
+            case Tok::NotEqEq: fused = Op::JStrictNe; break;
+            default: break;
+        }
+        if (fused != Op::Nop) {
+            const std::uint16_t mark = fn_->top;
+            const std::uint16_t a = isPure(*cond.b) ? exprAny(*cond.a) : exprTemp(*cond.a);
+            const std::uint16_t b = exprAny(*cond.b);
+            emitFusedJump(fused, a, b, whenTrue);
+            fn_->top = mark;
+            return;
+        }
+    }
+    const std::uint16_t mark = fn_->top;
+    const std::uint16_t r = exprAny(cond);
+    emitJump(Op::JTrue, r, whenTrue);
+    fn_->top = mark;
+}
+
 void Compiler::condJump(const Node& cond, Label& whenFalse)
 {
     if (cond.kind == NK::Logical && cond.op == Tok::AndAnd) {
@@ -1025,13 +1121,33 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
         condJump(*cond.b, whenFalse);
         return;
     }
+    if (cond.kind == NK::Binary && !noFuse_) {
+        Op fused = Op::Nop;
+        switch (cond.op) {
+            case Tok::Lt: fused = Op::JNotLt; break;
+            case Tok::Le: fused = Op::JNotLe; break;
+            case Tok::Gt: fused = Op::JNotGt; break;
+            case Tok::Ge: fused = Op::JNotGe; break;
+            case Tok::EqEqEq: fused = Op::JStrictNe; break;
+            case Tok::NotEqEq: fused = Op::JStrictEq; break;
+            default: break;
+        }
+        if (fused != Op::Nop) {
+            const std::uint16_t mark = fn_->top;
+            const std::uint16_t a = isPure(*cond.b) ? exprAny(*cond.a) : exprTemp(*cond.a);
+            const std::uint16_t b = exprAny(*cond.b);
+            emitFusedJump(fused, a, b, whenFalse);
+            fn_->top = mark;
+            return;
+        }
+    }
     const std::uint16_t mark = fn_->top;
     const std::uint16_t r = exprAny(cond);
     emitJump(Op::JFalse, r, whenFalse);
     fn_->top = mark;
 }
 
-std::uint16_t Compiler::update(const Node& n, int dst)
+std::uint16_t Compiler::update(const Node& n, int dst, bool discard)
 {
     const std::uint16_t mark = fn_->top;
     const Node& target = *n.a;
@@ -1040,7 +1156,7 @@ std::uint16_t Compiler::update(const Node& n, int dst)
         Ref r = resolve(target.text);
         if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst) {
             const std::uint16_t reg = r.binding->reg;
-            if (n.prefix) {
+            if (n.prefix || discard) {
                 emit(step, reg, reg);
                 if (dst >= 0 && dst != reg) {
                     emit(Op::Mov, std::uint16_t(dst), reg);
@@ -1073,14 +1189,14 @@ std::uint16_t Compiler::update(const Node& n, int dst)
         if (target.computed)
             emit(Op::GetElem, old, o, k);
         else
-            emit(Op::GetProp, old, o, atom(target.text));
+            emitCached(Op::GetProp, old, o, atom(target.text));
         emit(Op::ToNumeric, old, old);
         const std::uint16_t fresh = temp();
         emit(step, fresh, old);
         if (target.computed)
             emit(Op::PutElem, o, k, fresh);
         else
-            emit(Op::PutProp, o, atom(target.text), fresh);
+            emitCached(Op::PutProp, o, atom(target.text), fresh);
         fn_->top = mark;
         const std::uint16_t d = dest(dst);
         emit(Op::Mov, d, n.prefix ? fresh : old);
@@ -1152,6 +1268,20 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
         }
         if (!isCompound)
             unsupported(n, "this assignment operator");
+        {
+            // A local no other function can see, updated in place: no copy out and back.
+            Ref r = resolve(target.text);
+            if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && !r.isConst && !hasAssignment(*n.b)) {
+                const std::uint16_t reg = r.binding->reg;
+                if ((op == Op::Add || op == Op::Sub) && smallInt(*n.b))
+                    emit(op == Op::Add ? Op::AddI : Op::SubI, reg, reg, std::uint16_t(std::int16_t(n.b->number)));
+                else {
+                    const std::uint16_t v = exprAny(*n.b);
+                    emit(op, reg, reg, v);
+                }
+                return finish(reg);
+            }
+        }
         const std::uint16_t old = temp();
         loadVar(target.text, old, target);
         const std::uint16_t v = exprAny(*n.b);
@@ -1171,13 +1301,13 @@ std::uint16_t Compiler::assign(const Node& n, int dst)
             if (computed)
                 emit(Op::PutElem, o, k, value);
             else
-                emit(Op::PutProp, o, nameAtom, value);
+                emitCached(Op::PutProp, o, nameAtom, value);
         };
         auto get = [&](std::uint16_t into) {
             if (computed)
                 emit(Op::GetElem, into, o, k);
             else
-                emit(Op::GetProp, into, o, nameAtom);
+                emitCached(Op::GetProp, into, o, nameAtom);
         };
         if (n.op == Tok::Assign) {
             const std::uint16_t v = temp();
@@ -1267,7 +1397,7 @@ std::uint16_t Compiler::member(const Node& n, int dst)
     }
     fn_->top = mark;
     const std::uint16_t d = dest(dst);
-    emit(Op::GetProp, d, o, atom(constantKey ? n.b->text : n.text));
+    emitCached(Op::GetProp, d, o, atom(constantKey ? n.b->text : n.text));
     return d;
 }
 
@@ -1292,7 +1422,7 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
             emit(Op::GetElem, base, base + 1, k);
             fn_->top = base + 2;
         } else {
-            emit(Op::GetProp, base, base + 1, atom(callee.text));
+            emitCached(Op::GetProp, base, base + 1, atom(callee.text));
         }
     } else {
         Label* savedChain = chain_;
@@ -1404,10 +1534,13 @@ void Compiler::statement(const Node& n)
         case NK::Empty:
         case NK::FunctionDecl: break;
         case NK::ExprStatement:
-            if (fn_->isProgram)
+            if (fn_->isProgram) {
                 expr(*n.a, fn_->resultReg);
-            else
+            } else {
+                discard_ = true;
                 expr(*n.a, -1);
+                discard_ = false;
+            }
             break;
         case NK::VarDecl: varDecl(n); break;
         case NK::Block: blockScoped(n.list, true); break;
@@ -1474,7 +1607,7 @@ void Compiler::bindTarget(const Node& target, std::uint16_t value, bool init, Va
             const std::uint16_t k = exprAny(*target.b);
             emit(Op::PutElem, o, k, value);
         } else {
-            emit(Op::PutProp, o, atom(target.text), value);
+            emitCached(Op::PutProp, o, atom(target.text), value);
         }
         fn_->top = mark;
     } else {
@@ -1496,7 +1629,7 @@ void Compiler::bindPattern(const Node& target, std::uint16_t value, bool init, V
                 const std::uint16_t k = exprAny(*p->a);
                 emit(Op::GetElem, v, value, k);
             } else {
-                emit(Op::GetProp, v, value, atom(p->text));
+                emitCached(Op::GetProp, v, value, atom(p->text));
             }
             const Node* t = p->b.get();
             if (t->kind == NK::AssignPattern) {
@@ -1571,11 +1704,13 @@ void Compiler::whileStatement(const Node& n)
 {
     std::vector<String> labels;
     labels.swap(pendingLabels_);
-    Label top, end;
-    bind(top);
+    // The test is made once before the loop and once at the bottom of each pass, so a pass has one jump, not two.
+    Label body, cont, end;
     condJump(*n.a, end);
-    loopBody(*n.d, end, top, std::move(labels));
-    jump(top);
+    bind(body);
+    loopBody(*n.d, end, cont, std::move(labels));
+    bind(cont);
+    condJumpTrue(*n.a, body);
     bind(end);
 }
 
@@ -1587,10 +1722,7 @@ void Compiler::doWhile(const Node& n)
     bind(top);
     loopBody(*n.d, end, cont, std::move(labels));
     bind(cont);
-    const std::uint16_t mark = fn_->top;
-    const std::uint16_t r = exprAny(*n.a);
-    emitJump(Op::JTrue, r, top);
-    fn_->top = mark;
+    condJumpTrue(*n.a, top);
     bind(end);
 }
 
@@ -1623,9 +1755,9 @@ void Compiler::forStatement(const Node& n)
         }
     }
     Label top, cont, end;
-    bind(top);
     if (n.b)
         condJump(*n.b, end);
+    bind(top);
     loopBody(*n.d, end, cont, std::move(labels));
     bind(cont);
     // A closure made in one iteration keeps that iteration's variable: the next one starts from a copy.
@@ -1635,10 +1767,15 @@ void Compiler::forStatement(const Node& n)
                 emit(Op::CopyBox, b.reg);
     if (n.c) {
         const std::uint16_t mark = fn_->top;
+        discard_ = true;
         expr(*n.c, -1);
+        discard_ = false;
         fn_->top = mark;
     }
-    jump(top);
+    if (n.b)
+        condJumpTrue(*n.b, top);
+    else
+        jump(top);
     bind(end);
     popScope();
 }
@@ -1947,6 +2084,27 @@ void Compiler::tryStatement(const Node& n)
 
 CodeBlock* Compiler::compileFunction(const Node& n, const String& name)
 {
+    const bool saved = noFuse_;
+    for (;;) {
+        try {
+            CodeBlock* block = compileFunctionOnce(n, name);
+            noFuse_ = saved;
+            return block;
+        } catch (const FusionOverflow&) {
+            if (noFuse_) {
+                noFuse_ = saved;
+                throw;
+            }
+            noFuse_ = true;
+        } catch (...) {
+            noFuse_ = saved;
+            throw;
+        }
+    }
+}
+
+CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name)
+{
     const bool arrow = n.kind == NK::ArrowExpr;
     Key nameKey = name.empty() ? nullptr : vm_.internKey(StringView(name));
     CodeBlock* block = vm_.newCodeBlock(nameKey, 0, !arrow && !n.isMethod);
@@ -1993,7 +2151,6 @@ CodeBlock* Compiler::compileFunction(const Node& n, const String& name)
     line_ = savedLine;
     chain_ = savedChain;
     pendingLabels_.swap(savedLabels);
-    block->caches.assign(block->code.size(), InlineCache());
     return block;
 }
 
@@ -2101,6 +2258,20 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
 
 CodeBlock* Compiler::program(const Node& program)
 {
+    noFuse_ = false;
+    for (;;) {
+        try {
+            return programOnce(program);
+        } catch (const FusionOverflow&) {
+            if (noFuse_)
+                throw;
+            noFuse_ = true;
+        }
+    }
+}
+
+CodeBlock* Compiler::programOnce(const Node& program)
+{
     CodeBlock* block = vm_.newCodeBlock(nullptr, 0, false);
     block->file = file_;
     block->flags |= CodeBlock::kProgram;
@@ -2146,7 +2317,6 @@ CodeBlock* Compiler::program(const Node& program)
         throw;
     }
     fn_ = nullptr;
-    block->caches.assign(block->code.size(), InlineCache());
     return block;
 }
 

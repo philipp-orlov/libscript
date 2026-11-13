@@ -4,6 +4,7 @@
 #include "script/internal/vm/operators.hpp"
 
 #include <cmath>
+#include <cstring>
 
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/vm/convert.hpp"
@@ -326,6 +327,42 @@ JSValue add(VM& vm, JSValue a, JSValue b)
     release(pa);
     release(pb);
     return result;
+}
+
+bool appendInPlace(VM& vm, JSValue& slot, JSValue y)
+{
+    if (slot == y)
+        return false;
+    StringCell* s = asString(slot);
+    String digits;
+    StringView tail;
+    if (isString(y)) {
+        tail = asString(y)->text();
+    } else if (y.isNumber()) {
+        digits = numberToString(y.asNumber());
+        tail = digits;
+    } else {
+        return false;
+    }
+    const std::size_t length = std::size_t(s->length) + tail.size();
+    if (length > 0xFFFFFFF0u || (s->bits & StringCell::kOutOfLine))
+        return false;
+    // Only this register holds the cell, so nothing sees the old text.
+    if (!s->interned && s->rc == 1 && s->capacity() >= length) {
+        std::memmove(s->mutableChars() + s->length, tail.data(), tail.size() * sizeof(Char));
+        s->length = std::uint32_t(length);
+        s->hash_ = 0;
+        return true;
+    }
+    if (length >= 32) {
+        vm.ctx.reserve(length * 2 * sizeof(Char));
+        StringCell* grown = vm.ctx.newStringRoom(s->text(), tail, length * 2);
+        const JSValue old = slot;
+        slot = JSValue::cell(grown);
+        release(old);
+        return true;
+    }
+    return false;
 }
 
 namespace {

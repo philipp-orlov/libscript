@@ -41,6 +41,10 @@ bool looseEquals(VM& vm, JSValue a, JSValue b, bool* ok);
 
 /// `a + b`.
 JSValue add(VM& vm, JSValue a, JSValue b);
+/// `slot += y` where `slot` holds a string that nothing else refers to: the characters go on the end of the same cell
+/// when it has room, and a longer cell with room to spare replaces it otherwise, so that a loop that appends takes linear
+/// time. False when it does not apply and the general `add` must do it.
+bool appendInPlace(VM& vm, JSValue& slot, JSValue y);
 /// The arithmetic and bitwise operators: `op` is one of Sub..UShr (and Exp).
 JSValue arithmetic(VM& vm, Op op, JSValue a, JSValue b);
 /// `a < b` and friends: `op` is Lt, Le, Gt or Ge. 0 or 1, or -1 with an exception pending.

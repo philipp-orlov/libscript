@@ -161,6 +161,15 @@ enum class ElemKind : std::uint8_t
 };
 inline constexpr std::uint32_t kElemSize[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
 
+struct ProxyState;
+/// The proxy state of an object that is a proxy, else null.
+ProxyState* proxyOf(JSObject* o) noexcept;
+JSValue proxyGet(VM& vm, JSObject* proxy, Key key, JSValue receiver);
+bool proxySet(VM& vm, JSObject* proxy, Key key, JSValue value, JSValue receiver, bool strict);
+/// 1 yes, 0 no, -1 an exception is pending.
+int proxyHas(VM& vm, JSObject* proxy, Key key);
+int proxyDelete(VM& vm, JSObject* proxy, Key key, bool strict);
+
 /// A typed array: a window on an ArrayBuffer. `data` points into the buffer, which this holds a count of; the buffer
 /// does not move (the buffers of this core do not resize), so the pointer stays good.
 struct JSTypedArray : JSObject
@@ -170,6 +179,29 @@ struct JSTypedArray : JSObject
     ElemKind kind;
     JSValue buffer;        ///< the ArrayBuffer object, counted
     std::uint32_t byteOffset;
+};
+
+/// What a proxy's object keeps: where its operations go when its handler has no trap, and the handler (null once revoked).
+struct ProxyState : NativeState
+{
+    JSValue target = JSValue::undefined();
+    JSValue handler = JSValue::undefined();
+    ~ProxyState() override
+    {
+        release(target);
+        release(handler);
+    }
+    void clear(VM&) noexcept override
+    {
+        release(target);
+        release(handler);
+        target = handler = JSValue::undefined();
+    }
+    void values(std::vector<JSValue>& out) const override
+    {
+        out.push_back(target);
+        out.push_back(handler);
+    }
 };
 
 /// What an ArrayBuffer's object keeps (in its `Rare::ext`).

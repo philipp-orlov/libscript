@@ -299,6 +299,33 @@ NATIVE(objectKeys)
     if (!isObject(target))
         return keep.take();
     JSObject* o = asObject(target);
+    if (proxyOf(o)) {
+        std::vector<Handle> names;
+        ownKeys(vm, o, true, false, true, names);
+        if (!vm.exception.isUndefined())
+            return JSValue::exception();
+        for (Handle& name : names) {
+            if (mode == 0) {
+                retain(name.get());
+                out->append(vm, name.get());
+                continue;
+            }
+            Key k = static_cast<Key>(name.get().asCell());
+            JSValue v = getProperty(vm, target, k);
+            if (v.isException())
+                return v;
+            if (mode == 1) {
+                out->append(vm, v);
+            } else {
+                JSArray* pair = vm.newArray(vm.protos.array);
+                retain(name.get());
+                pair->append(vm, name.get());
+                pair->append(vm, v);
+                out->append(vm, toJSValue(pair));
+            }
+        }
+        return keep.take();
+    }
     if (o->cls() == ObjClass::TypedArray) {
         auto* ta = static_cast<JSTypedArray*>(o);
         for (std::uint32_t i = 0; i < ta->length; ++i) {
@@ -436,6 +463,8 @@ bool descriptorField(VM& vm, JSObject* d, const char* name, JSValue* out)
 /// Define `key` on `o` as the descriptor object `d` says. Undefined, or the exception sentinel.
 JSValue definePropertyImpl(VM& vm, JSObject* o, Key key, JSObject* d)
 {
+    if (proxyOf(o))
+        return proxyDefine(vm, o, key, d);
     JSValue v = JSValue::undefined(), g = JSValue::undefined(), s = JSValue::undefined(), flag;
     const bool hasValue = descriptorField(vm, d, "value", &v);
     const bool hasGet = descriptorField(vm, d, "get", &g);
@@ -2809,6 +2838,7 @@ void VM::installBuiltins()
     installPromise(*this);
     installDate(*this);
     installTypedArrays(*this);
+    installProxy(*this);
     returnMarker = toJSValue(newObject(static_cast<JSObject*>(nullptr)));
 }
 

@@ -155,6 +155,14 @@ JSValue asyncStart(VM& vm, JSValue generator);
 void installPromise(VM& vm);
 void installDate(VM& vm);
 void installTypedArrays(VM& vm);
+void installProxy(VM& vm);
+/// The keys a proxy's `ownKeys` trap (or its target) gives.
+bool proxyOwnKeys(VM& vm, JSObject* proxy, std::vector<Handle>& out);
+/// `getOwnPropertyDescriptor` through the proxy: a descriptor object, undefined, or the exception sentinel.
+JSValue proxyOwnDescriptor(VM& vm, JSObject* proxy, Key key);
+JSValue proxyDefine(VM& vm, JSObject* proxy, Key key, JSObject* descriptor);
+/// A descriptor object for an own property of an ordinary object, or undefined.
+JSValue ownDescriptorObject(VM& vm, JSObject* o, Key key);
 /// A global property, taking the count of `v`.
 inline void defineGlobal(VM& vm, const char* name, JSValue v)
 {

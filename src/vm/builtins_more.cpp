@@ -18,6 +18,36 @@ namespace bi {
 
 void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, std::vector<Handle>& out)
 {
+    if (proxyOf(o)) {
+        std::vector<Handle> all;
+        if (!proxyOwnKeys(vm, o, all))
+            return;
+        for (Handle& k : all) {
+            const bool isSym = isSymbol(k.get());
+            if (isSym ? !symbols : !strings)
+                continue;
+            if (onlyEnumerable) {
+                JSValue d = proxyOwnDescriptor(vm, o, static_cast<Key>(k.get().asCell()));
+                if (d.isException()) {
+                    vm.clearException();
+                    continue;
+                }
+                Handle dk = Handle::adopt(d);
+                if (!isObject(d))
+                    continue;
+                Key enumKey = vm.internKey(std::string_view("enumerable"));
+                JSValue e = getProperty(vm, d, enumKey);
+                detail::decRef(enumKey);
+                const bool en = !e.isException() && toBoolean(e);
+                if (!e.isException())
+                    release(e);
+                if (!en)
+                    continue;
+            }
+            out.push_back(std::move(k));
+        }
+        return;
+    }
     o->materialize(vm);
     std::vector<std::pair<std::uint32_t, Key>> indexed;
     std::vector<Key> named, syms;
@@ -138,7 +168,7 @@ bool ownDescriptor(VM& vm, JSObject* o, Key key, OwnDesc& out)
     return true;
 }
 
-JSValue descriptorObject(VM& vm, JSObject* o, Key key)
+JSValue descriptorObjectOf(VM& vm, JSObject* o, Key key)
 {
     OwnDesc d;
     if (!ownDescriptor(vm, o, key, d))
@@ -161,6 +191,13 @@ JSValue descriptorObject(VM& vm, JSObject* o, Key key)
     put("enumerable", JSValue::boolean((d.attrs & attr::kEnumerable) != 0));
     put("configurable", JSValue::boolean((d.attrs & attr::kConfigurable) != 0));
     return keep.take();
+}
+
+JSValue descriptorObject(VM& vm, JSObject* o, Key key)
+{
+    if (proxyOf(o))
+        return proxyOwnDescriptor(vm, o, key);
+    return descriptorObjectOf(vm, o, key);
 }
 
 JSObject* objectArg(VM& vm, JSValue v, const char* who)
@@ -958,6 +995,8 @@ NATIVE(bigintValueOfFn)
 }
 
 }  // namespace
+
+JSValue ownDescriptorObject(VM& vm, JSObject* o, Key key) { return descriptorObjectOf(vm, o, key); }
 
 void installMore(VM& vm)
 {

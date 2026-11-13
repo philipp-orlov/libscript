@@ -92,6 +92,29 @@ bool arrayIndexOf(Key key, std::uint32_t* index) noexcept
 JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key)
 {
     for (JSObject* o = start; o; o = o->proto(vm)) {
+        if (proxyOf(o))
+            return proxyGet(vm, o, key, receiver);
+        if (o->cls() == ObjClass::TypedArray) {
+            auto* t = static_cast<JSTypedArray*>(o);
+            if (key == vm.atoms.length)
+                return number(t->length);
+            std::uint32_t index;
+            if (arrayIndexOf(key, &index))
+                return index < t->length ? typedGet(vm, t, index) : JSValue::undefined();
+        }
+        if (o->cls() == ObjClass::Array) {
+            auto* a = static_cast<JSArray*>(o);
+            if (key == vm.atoms.length)
+                return number(a->length);
+            std::uint32_t index;
+            if (arrayIndexOf(key, &index)) {
+                const JSValue v = a->at(index);
+                if (!v.isHole()) {
+                    retain(v);
+                    return v;
+                }
+            }
+        }
         std::uint8_t attrs;
         JSValue* slot = o->findOwn(vm, key, &attrs);
         if (!slot)
@@ -123,42 +146,7 @@ JSValue getProperty(VM& vm, JSValue base, Key key)
     if (!o && !isObject(base) && base.isCell() && !isVmCell(base.asCell()) &&
         base.asCell()->kind == detail::CellKind::Object)
         return vm.throwError(ErrorCode::TypeError, "an object of the dynamic engine is not readable by the vm core");
-    for (; o; o = o->proto(vm)) {
-        if (o->cls() == ObjClass::TypedArray) {
-            auto* t = static_cast<JSTypedArray*>(o);
-            if (key == vm.atoms.length)
-                return number(t->length);
-            std::uint32_t index;
-            if (arrayIndexOf(key, &index))
-                return index < t->length ? typedGet(vm, t, index) : JSValue::undefined();
-        }
-        if (o->cls() == ObjClass::Array) {
-            auto* a = static_cast<JSArray*>(o);
-            if (key == vm.atoms.length)
-                return number(a->length);
-            std::uint32_t index;
-            if (arrayIndexOf(key, &index)) {
-                const JSValue v = a->at(index);
-                if (!v.isHole()) {
-                    retain(v);
-                    return v;
-                }
-            }
-        }
-        std::uint8_t attrs;
-        JSValue* slot = o->findOwn(vm, key, &attrs);
-        if (!slot)
-            continue;
-        if (attrs & attr::kAccessor) {
-            const auto* gs = reinterpret_cast<const GetterSetter*>(slot->asCell());
-            if (gs->getter.isUndefined())
-                return JSValue::undefined();
-            return callAccessor(vm, gs->getter, base, nullptr, 0);
-        }
-        retain(*slot);
-        return *slot;
-    }
-    return JSValue::undefined();
+    return getPropertyFrom(vm, o, base, key);
 }
 
 bool hasProperty(VM& vm, JSValue base, Key key)
@@ -172,6 +160,8 @@ bool hasProperty(VM& vm, JSValue base, Key key)
     }
     (void)direct;
     for (o = asObject(base); o; o = o->proto(vm)) {
+        if (proxyOf(o))
+            return proxyHas(vm, o, key) > 0;
         if (o->cls() == ObjClass::TypedArray) {
             std::uint32_t index;
             if (arrayIndexOf(key, &index))
@@ -221,6 +211,8 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
     if (!isObject(base))
         return refuse(vm, strict, "Cannot create property on a primitive value");
     JSObject* receiver = asObject(base);
+    if (proxyOf(receiver))
+        return proxySet(vm, receiver, key, value, base, strict);
     if (receiver->cls() == ObjClass::TypedArray) {
         std::uint32_t index;
         if (arrayIndexOf(key, &index))
@@ -243,6 +235,8 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
         }
     }
     for (JSObject* p = receiver; p; p = p->proto(vm)) {
+        if (p != receiver && proxyOf(p))
+            return proxySet(vm, p, key, value, base, strict);
         std::uint8_t attrs;
         JSValue* slot = p->findOwn(vm, key, &attrs);
         if (!slot)
@@ -284,6 +278,8 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
     if (!isObject(base))
         return true;
     JSObject* o = asObject(base);
+    if (proxyOf(o))
+        return proxyDelete(vm, o, key, strict) > 0;
     if (o->cls() == ObjClass::TypedArray) {
         std::uint32_t index;
         if (arrayIndexOf(key, &index))

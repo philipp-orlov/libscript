@@ -76,7 +76,8 @@ std::size_t cellBytesOf(const detail::GCObject* cell) noexcept
         case Kind::Object: {
             const auto* o = reinterpret_cast<const JSObject*>(cell);
             switch (o->cls()) {
-                case ObjClass::Array: return sizeof(JSArray);
+                case ObjClass::Array:
+                case ObjClass::Arguments: return sizeof(JSArray);
                 case ObjClass::TypedArray: return sizeof(JSTypedArray);
                 case ObjClass::Function: return JSFunction::bytesFor(static_cast<const JSFunction*>(o)->nUpvals);
                 default: return JSObject::bytesFor(o->h.aux);
@@ -98,7 +99,7 @@ std::size_t heapSizeOf(const detail::GCObject* cell) noexcept
         bytes += sizeof(SlotsHeader) + 8u * o->slotCapacity();
     if (Rare* r = o->rare())
         bytes += sizeof(Rare) + (r->dict ? sizeof(Dictionary) + r->dict->entries.capacity() * sizeof(Entry) : 0);
-    if (o->cls() == ObjClass::Array)
+    if (hasElems(o))
         bytes += 8u * static_cast<JSArray*>(o)->capacity;
     return bytes;
 }
@@ -131,7 +132,7 @@ void children(const detail::GCObject* cell, detail::GcList& out)
             const std::uint32_t n = usedSlots(vm, o);
             for (std::uint32_t i = 0; i < n; ++i)
                 appendIfCell(out, *o->slotAt(i));
-            if (o->cls() == ObjClass::Array) {
+            if (hasElems(o)) {
                 auto* a = static_cast<JSArray*>(o);
                 for (std::uint32_t i = 0; i < a->length; ++i)
                     appendIfCell(out, a->elems[i]);
@@ -180,7 +181,8 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
             release(*o->slotAt(i));
     }
     switch (o->cls()) {
-        case ObjClass::Array: {
+        case ObjClass::Array:
+        case ObjClass::Arguments: {
             auto* a = static_cast<JSArray*>(o);
             if (!vm.tearingDown)
                 for (std::uint32_t i = 0; i < a->length; ++i)
@@ -303,7 +305,7 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
                 t->buffer = JSValue::undefined();
                 t->length = 0;
             }
-            if (o->cls() == ObjClass::Array) {
+            if (hasElems(o)) {
                 auto* a = static_cast<JSArray*>(o);
                 for (std::uint32_t i = 0; i < a->length; ++i) {
                     release(a->elems[i]);

@@ -1675,6 +1675,9 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.jcc(CAE, bad);  // an append goes the long way
     a_.mov(RDX, mem(RAX, kArrayElems));
     a_.lea(RDX, mem(RDX, RCX, 8));
+    a_.mov(RDI, mem(RDX, 0));
+    a_.cmpI(RDI, std::int32_t(kHole));
+    a_.jcc(CE, bad);  // a hole may stand for a property of the array's own
     a_.mov(RSI, R(in.c));
     retain(RSI);
     a_.test(RSI, R14);

@@ -26,6 +26,53 @@ namespace vm {
 
 namespace {
 
+/// SetFunctionName for a function made under a computed key: the key's text, a symbol's description in brackets, an
+/// accessor's after `get ` or `set `. A function that already has a name keeps it.
+void setFunctionName(VM& vm, JSValue fnv, Key key, const char* prefix)
+{
+    if (!isFunction(fnv))
+        return;
+    auto* f = static_cast<JSFunction*>(asObject(fnv));
+    if (f->flags & JSFunction::kNative)
+        return;
+    const bool hasName = f->code->name && !static_cast<StringCell*>(f->code->name)->text().empty();
+    if (hasName)
+        return;
+    String text;
+    if (key->kind == detail::CellKind::Symbol) {
+        const auto* sym = static_cast<const dyn::SymbolCell*>(key);
+        if (sym->hasDescription)
+            text = u"[" + sym->description + u"]";
+    } else {
+        text = String(static_cast<StringCell*>(key)->text());
+    }
+    if (*prefix)
+        text = fromUtf8(prefix) + text;
+    Key name = vm.internKey(StringView(text));
+    if (f->flags & JSFunction::kLazyProps) {
+        Rare& r = f->rareOf(vm);
+        if (r.fnName)
+            detail::decRef(r.fnName);
+        r.fnName = name;
+        return;
+    }
+    std::uint8_t attrs = 0;
+    JSValue* slot = f->findOwn(vm, vm.atoms.name, &attrs);
+    if (slot && !(attrs & (attr::kAccessor | attr::kWritable)) && isString(*slot) && asString(*slot)->length == 0) {
+        const JSValue old = *slot;
+        *slot = JSValue::cell(name);
+        release(old);
+        return;
+    }
+    detail::decRef(name);
+}
+
+inline bool isConstructorFn(const JSFunction* f)
+{
+    return (f->flags & JSFunction::kNative) ? (f->flags & JSFunction::kConstructor) != 0 : f->code->constructor;
+}
+
+
 constexpr std::uint32_t kInterruptInterval = 4096;
 /// Calls and back edges a function has had when the interpreter moves a loop that keeps going into compiled code.
 constexpr std::uint32_t kOsrAfter = 1000;
@@ -176,7 +223,7 @@ JSValue forInKeys(VM& vm, JSValue value)
     auto visit = [&](JSObject* o) {
         std::vector<std::uint32_t> indexes;
         std::vector<Key> named;
-        if (o->cls() == ObjClass::Array) {
+        if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             for (std::uint32_t i = 0; i < a->length; ++i)
                 if (!a->elems[i].isHole())
@@ -274,7 +321,7 @@ bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
 /// A store to an own writable data property.
 void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key)
 {
-    if (!cacheable(vm, o) || o->cls() == ObjClass::Array)
+    if (!cacheable(vm, o) || hasElems(o))
         return;
     std::uint8_t attrs = 0;
     const std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
@@ -291,7 +338,7 @@ void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key)
 /// added to one of them would change what the store does.
 void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key key, bool throughChain)
 {
-    if (o->h.shape == before || !cacheable(vm, o) || o->cls() == ObjClass::Array || o->isProto())
+    if (o->h.shape == before || !cacheable(vm, o) || hasElems(o) || o->isProto())
         return;
     Shape* now = o->shapeOf(vm);
     Shape* was = vm.shapeById(before);
@@ -315,7 +362,8 @@ void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key ke
 /// The call's arguments, copied into an array for `arguments` and rest parameters.
 JSArray* captureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
 {
-    JSArray* all = vm.newArray(vm.protos.array, 0, argc);
+    JSArray* all = vm.newArray(vm.protos.arguments, 0, argc);
+    all->h.cls = std::uint8_t(ObjClass::Arguments);
     all->appendAll(vm, args, argc);
     return all;
 }
@@ -339,7 +387,7 @@ void copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
     };
     if (isObject(source)) {
         JSObject* o = asObject(source);
-        if (o->cls() == ObjClass::Array) {
+        if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             for (std::uint32_t i = 0; i < a->length; ++i) {
                 if (a->elems[i].isHole())
@@ -1229,7 +1277,7 @@ L_GetProp: {
                 NEXT();
             }
         }
-        if (key == vm.atoms.length && o->cls() == ObjClass::Array) {
+        if (key == vm.atoms.length && hasElems(o)) {
             const std::uint32_t n = static_cast<JSArray*>(o)->length;
             SETP(ins->a, n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             ++pc;
@@ -1396,7 +1444,7 @@ L_PutElem: {
         !(asObject(base)->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
         auto* a = static_cast<JSArray*>(asObject(base));
         const std::uint32_t i = std::uint32_t(k.asInt32());
-        if (i < a->length) {
+        if (i < a->length && !a->elems[i].isHole()) {
             const JSValue old = a->elems[i];
             a->elems[i] = R[ins->c];
             retain(a->elems[i]);
@@ -1528,6 +1576,7 @@ L_InitSetterElem: {
     release(prim);
     if (!key)
         FAIL();
+    setFunctionName(vm, R[ins->c], key, ins->opcode() == Op::InitGetterElem ? "get " : "set ");
     initAccessor(vm, asObject(R[ins->a]), key, R[ins->c], ins->opcode() == Op::InitGetterElem);
     release(JSValue::cell(key));
     NEXT();
@@ -1704,6 +1753,7 @@ L_DefSetterElem: {
         FAIL();
     JSValue fnv = R[ins->c];
     auto* fn = static_cast<JSFunction*>(asObject(fnv));
+    setFunctionName(vm, fnv, key, ins->opcode() == Op::DefMethodElem ? "" : ins->opcode() == Op::DefGetterElem ? "get " : "set ");
     Rare& rr = fn->rareOf(vm);
     release(rr.home);
     rr.home = R[ins->a];
@@ -1738,9 +1788,9 @@ L_InitFields: {
 }
 L_GetSuperCtor: {
     JSObject* p = fn->proto(vm);
-    if (!p || !isFunction(toJSValue(p))) {
+    if (!p || !isFunction(toJSValue(p)) || !isConstructorFn(static_cast<JSFunction*>(p))) {
         fr->pc = pc;
-        vm.throwError(ErrorCode::TypeError, "Super constructor is not a constructor");
+        vm.throwError(ErrorCode::TypeError, "the super class is not a constructor");
         FAIL();
     }
     COPY(ins->a, toJSValue(p));
@@ -1761,6 +1811,76 @@ L_GetSuperProp: {
 }
 L_NewTarget:
     COPY(ins->a, fr->newTarget);
+    NEXT();
+L_SetFnName: {
+    // The value just stored under a computed key, when it is an anonymous function or class.
+    JSValue prim = toPrimitive(vm, R[ins->b], true);
+    if (prim.isException())
+        FAIL();
+    Key key = toPropertyKey(vm, prim);
+    release(prim);
+    if (!key)
+        FAIL();
+    setFunctionName(vm, R[ins->a], key, "");
+    release(JSValue::cell(key));
+    NEXT();
+}
+L_SetEvalScope:
+    vm.evalCode = code;
+    vm.evalIndex = ins->a;
+    vm.evalFrames = vm.frameCount;
+    NEXT();
+L_SetNewTarget:
+    // An arrow function that calls `super()` runs it with the new.target of the constructor around it.
+    fr->newTarget = R[ins->a];
+    NEXT();
+L_GetSuperCtorOf: {
+    JSObject* p = asObject(R[ins->b])->proto(vm);
+    if (!p || !isFunction(toJSValue(p)) || !isConstructorFn(static_cast<JSFunction*>(p))) {
+        fr->pc = pc;
+        vm.throwError(ErrorCode::TypeError, "the super class is not a constructor");
+        FAIL();
+    }
+    COPY(ins->a, toJSValue(p));
+    NEXT();
+}
+L_InitFieldsOf: {
+    Rare* rr = asObject(R[ins->a])->rare();
+    if (rr && isFunction(rr->fieldInit)) {
+        fr->pc = pc;
+        JSValue r = vm.call(rr->fieldInit, R[ins->b], nullptr, 0);
+        if (r.isException())
+            FAIL();
+        release(r);
+    }
+    NEXT();
+}
+L_CheckBound:
+    if (R[ins->a] != JSValue::boolean(true)) [[unlikely]] {
+        fr->pc = pc;
+        vm.throwError(ErrorCode::ReferenceError, "'this' is not there until super() has been called");
+        FAIL();
+    }
+    NEXT();
+L_CheckUnbound:
+    if (R[ins->a] == JSValue::boolean(true)) [[unlikely]] {
+        fr->pc = pc;
+        vm.throwError(ErrorCode::ReferenceError, "super() has already been called");
+        FAIL();
+    }
+    NEXT();
+L_CheckDerivedRet:
+    if (!isObject(R[ins->a])) {
+        fr->pc = pc;
+        if (!R[ins->a].isUndefined()) {
+            vm.throwError(ErrorCode::TypeError, "a derived constructor can only return an object or undefined");
+            FAIL();
+        }
+        if (R[ins->b] != JSValue::boolean(true)) {
+            vm.throwError(ErrorCode::ReferenceError, "a derived constructor did not call super()");
+            FAIL();
+        }
+    }
     NEXT();
 L_Closure: {
     CodeBlock* child = code->children[ins->b];
@@ -2457,7 +2577,7 @@ int jitGetProp(VM& vm, std::uint32_t index)
                 return 1;
             }
         }
-        if (key == vm.atoms.length && o->cls() == ObjClass::Array) {
+        if (key == vm.atoms.length && hasElems(o)) {
             const std::uint32_t n = static_cast<JSArray*>(o)->length;
             setReg(R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             return 1;
@@ -2729,7 +2849,7 @@ int jitPutElem(VM& vm, std::uint32_t index)
         !(asObject(base)->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
         auto* a = static_cast<JSArray*>(asObject(base));
         const std::uint32_t i = std::uint32_t(k.asInt32());
-        if (i < a->length) {
+        if (i < a->length && !a->elems[i].isHole()) {
             const JSValue old = a->elems[i];
             a->elems[i] = R[ins->c];
             retain(a->elems[i]);
@@ -2811,7 +2931,7 @@ JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::ui
     return callInternal(callee, thisValue, args, argc, false);
 }
 
-JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct)
+JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct, JSValue target)
 {
     if (!isFunction(callee))
         return notCallable(*this, callee);
@@ -2854,7 +2974,8 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     if (argsArray)
         setReg(R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;
-    frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, construct, true, construct ? callee : JSValue::undefined()};
+    frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, construct, true,
+                                          construct ? (target.isUndefined() ? callee : target) : JSValue::undefined()};
     if (!c->tier1 && !c->tier1Failed && tier1Threshold && ++c->hotness >= tier1Threshold)
         compileTier1(*this, c);
     const JSValue result = c->tier1 ? enterTier1(*this, c->tier1, 0) : run(*this);
@@ -3005,7 +3126,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     return true;
 }
 
-JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc)
+JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc, JSValue target)
 {
     if (!isFunction(callee))
         return throwError(ErrorCode::TypeError, describe(*this, callee) + " is not a constructor");
@@ -3013,7 +3134,7 @@ JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc)
     const bool canConstruct = (f->flags & JSFunction::kNative) ? (f->flags & JSFunction::kConstructor) != 0 : f->code->constructor;
     if (!canConstruct)
         return throwError(ErrorCode::TypeError, describe(*this, callee) + " is not a constructor");
-    JSValue protoValue = getProperty(*this, callee, atoms.prototype);
+    JSValue protoValue = getProperty(*this, target.isUndefined() ? callee : target, atoms.prototype);
     if (protoValue.isException())
         return protoValue;
     JSObject* proto = isObject(protoValue) ? asObject(protoValue) : protos.object;
@@ -3023,11 +3144,11 @@ JSValue VM::construct(JSValue callee, const JSValue* args, std::uint32_t argc)
     if (f->flags & JSFunction::kNative) {
         Rare* r = f->rare();
         const JSValue saved = newTarget;
-        newTarget = callee;
+        newTarget = target.isUndefined() ? callee : target;
         result = r->native(*this, made.get(), args, argc, r->nativeData);
         newTarget = saved;
     } else {
-        result = callInternal(callee, made.get(), args, argc, true);
+        result = callInternal(callee, made.get(), args, argc, true, target);
     }
     if (result.isException() || isObject(result))
         return result;

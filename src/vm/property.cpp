@@ -102,7 +102,7 @@ JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key)
             if (arrayIndexOf(key, &index))
                 return index < t->length ? typedGet(vm, t, index) : JSValue::undefined();
         }
-        if (o->cls() == ObjClass::Array) {
+        if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             if (key == vm.atoms.length)
                 return number(a->length);
@@ -167,7 +167,7 @@ bool hasProperty(VM& vm, JSValue base, Key key)
             if (arrayIndexOf(key, &index))
                 return index < static_cast<JSTypedArray*>(o)->length;
         }
-        if (o->cls() == ObjClass::Array) {
+        if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             std::uint32_t index;
             if (key == vm.atoms.length || (arrayIndexOf(key, &index) && !a->at(index).isHole()))
@@ -195,7 +195,17 @@ bool setArrayLength(VM& vm, JSArray* a, JSValue value, bool strict)
             vm.throwError(ErrorCode::RangeError, "Invalid array length");
         return false;
     }
-    a->resize(vm, std::uint32_t(value.asNumber()));
+    const std::uint32_t wanted = std::uint32_t(value.asNumber());
+    if (a->h.flags & cellflags::kFrozen) {
+        if (wanted == a->length)
+            return true;
+        return refuse(vm, strict, "Cannot assign to read only property 'length' of a frozen array");
+    }
+    if (wanted > a->length && (wanted - a->length) > (1u << 26)) {
+        vm.throwError(ErrorCode::RangeError, "arrays are dense; this length is too large");
+        return false;
+    }
+    a->resize(vm, wanted);
     return true;
 }
 
@@ -218,7 +228,7 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
         if (arrayIndexOf(key, &index))
             return typedSet(vm, static_cast<JSTypedArray*>(receiver), double(index), value);
     }
-    if (receiver->cls() == ObjClass::Array) {
+    if (hasElems(receiver)) {
         auto* a = static_cast<JSArray*>(receiver);
         std::uint32_t index;
         if (key == vm.atoms.length)
@@ -226,12 +236,16 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
         if (arrayIndexOf(key, &index)) {
             if (receiver->h.flags & cellflags::kFrozen)
                 return refuse(vm, strict, "Cannot assign to read only property of a frozen array");
-            if (index >= a->length && (receiver->h.flags & cellflags::kNotExtensible))
-                return refuse(vm, strict, "Cannot add property, object is not extensible");
-            retain(value);
-            if (a->setAt(vm, index, value))
-                return true;
-            return refuse(vm, strict, "Cannot create a sparse array element");
+            // A hole may stand for an index property with attributes of its own, kept by name.
+            const bool named = index < a->length && a->elems[index].isHole() && receiver->findOwn(vm, key);
+            if (!named) {
+                if (index >= a->length && (receiver->h.flags & cellflags::kNotExtensible))
+                    return refuse(vm, strict, "Cannot add property, object is not extensible");
+                retain(value);
+                if (a->setAt(vm, index, value))
+                    return true;
+                return refuse(vm, strict, "Cannot create a sparse array element");
+            }
         }
     }
     for (JSObject* p = receiver; p; p = p->proto(vm)) {
@@ -285,7 +299,7 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
         if (arrayIndexOf(key, &index))
             return index >= static_cast<JSTypedArray*>(o)->length || refuse(vm, strict, "Cannot delete property of a typed array");
     }
-    if (o->cls() == ObjClass::Array) {
+    if (hasElems(o)) {
         auto* a = static_cast<JSArray*>(o);
         std::uint32_t index;
         if (key == vm.atoms.length)
@@ -299,14 +313,43 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
                 a->elems[index] = JSValue::hole();
                 a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
                 release(old);
+                return true;
             }
-            return true;
         }
     }
     if (o->deleteOwn(vm, key))
         return true;
     return refuse(vm, strict, "Cannot delete a non-configurable property");
 }
+
+namespace {
+
+/// Make room for an index property with attributes of its own: the element is a hole and the property lives by name.
+bool makeIndexHole(VM& vm, JSArray* a, std::uint32_t index, Key key)
+{
+    if (index < a->length && !a->elems[index].isHole()) {
+        if (a->h.flags & cellflags::kFrozen)
+            return false;
+        const JSValue old = a->elems[index];
+        a->elems[index] = JSValue::hole();
+        a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
+        release(old);
+        return true;
+    }
+    std::uint8_t existing;
+    if (index < a->length && a->findOwn(vm, key, &existing) && !(existing & attr::kConfigurable))
+        return false;
+    if (index >= a->length) {
+        if (a->h.flags & cellflags::kNotExtensible)
+            return false;
+        if (index - a->length > JSArray::kMaxDenseGap)
+            return false;
+        a->resize(vm, index + 1);
+    }
+    return true;
+}
+
+}  // namespace
 
 bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t attrs)
 {
@@ -319,7 +362,7 @@ bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t at
             return ok;
         }
     }
-    if (object->cls() == ObjClass::Array) {
+    if (hasElems(object)) {
         auto* a = static_cast<JSArray*>(object);
         std::uint32_t index;
         if (key == vm.atoms.length) {
@@ -330,12 +373,23 @@ bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t at
             return true;
         }
         if (arrayIndexOf(key, &index)) {
-            // Dense elements always have the default attributes; anything else would need a sparse array.
+            // Dense elements have the default attributes; any other index property is kept by name behind a hole.
             if (attrs != attr::kDefault) {
-                release(value);
-                return false;
+                if (!makeIndexHole(vm, a, index, key)) {
+                    release(value);
+                    return false;
+                }
+            } else {
+                std::uint8_t named;
+                if (index < a->length && a->elems[index].isHole() && object->findOwn(vm, key, &named)) {
+                    if (!(named & attr::kConfigurable)) {
+                        release(value);
+                        return false;
+                    }
+                    object->deleteOwn(vm, key);
+                }
+                return a->setAt(vm, index, value);
             }
-            return a->setAt(vm, index, value);
         }
     }
     std::uint8_t old = 0;
@@ -355,6 +409,11 @@ bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t at
 
 bool defineAccessor(VM& vm, JSObject* object, Key key, JSValue getter, JSValue setter, std::uint8_t attrs)
 {
+    if (hasElems(object)) {
+        std::uint32_t index;
+        if (arrayIndexOf(key, &index) && !makeIndexHole(vm, static_cast<JSArray*>(object), index, key))
+            return false;
+    }
     std::uint8_t old = 0;
     if (object->findOwn(vm, key, &old)) {
         if (!(old & attr::kConfigurable))

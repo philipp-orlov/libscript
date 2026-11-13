@@ -74,6 +74,15 @@ struct UpvalDesc
     bool fromParentLocal;
 };
 
+/// A variable a direct `eval` can see: `atom` names it; its box is a register of the calling function (`local`) or one of
+/// the function's upvalues.
+struct EvalVar
+{
+    std::uint32_t atom;
+    bool local;
+    std::uint16_t index;
+};
+
 /// A protected range of instructions [start, end) and where an exception in it goes: `reg` receives the thrown value.
 struct Handler
 {
@@ -130,6 +139,7 @@ struct CodeBlock
     Vec<Key> atoms;       ///< property and global names; each holds a count
     Vec<CodeBlock*> children;  ///< each holds a count
     Vec<UpvalDesc> upvals;
+    Vec<Vec<EvalVar>> evalScopes;  ///< what each direct `eval` call in the function sees
     Vec<Handler> handlers;
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
     Vec<InlineCache> caches;

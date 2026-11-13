@@ -496,7 +496,8 @@ void JSObject::materialize(VM& vm)
         name = r ? r->fnName : nullptr;
     } else {
         length = f->code->length;
-        name = f->code->name;
+        Rare* r = rare();
+        name = r && r->fnName ? r->fnName : f->code->name;
     }
     constexpr std::uint8_t kReadOnlyConfigurable = attr::kConfigurable;
     putOwn(vm, vm.atoms.length, JSValue::int32(std::int32_t(length)), kReadOnlyConfigurable);

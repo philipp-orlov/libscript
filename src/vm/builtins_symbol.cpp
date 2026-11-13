@@ -357,6 +357,13 @@ void installSymbolAndIterators(VM& vm)
     method(vm, ap, "entries", arrayIterator, 0, reinterpret_cast<void*>(2));
     retain(toJSValue(values));
     ap->putOwn(vm, vm.atoms.symIterator, toJSValue(values), attr::kWritable | attr::kConfigurable);
+    {
+        JSObject* argumentsProto = vm.newObject(vm.protos.object);
+        vm.setIntrinsic(&vm.protos.arguments, argumentsProto);
+        release(toJSValue(argumentsProto));
+        retain(toJSValue(values));
+        argumentsProto->putOwn(vm, vm.atoms.symIterator, toJSValue(values), attr::kWritable | attr::kConfigurable);
+    }
     symbolMethod(vm, vm.protos.string, vm.atoms.symIterator, "[Symbol.iterator]", stringIterator, 0);
 
     // Symbol.

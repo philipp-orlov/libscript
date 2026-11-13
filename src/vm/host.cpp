@@ -392,7 +392,7 @@ void setPrototype(const Value& v, const Value& proto)
     JSObject* o = asObject(JSValue::cell(detail::Access::ptr(v)));
     JSObject* p = owns(proto) ? asObject(JSValue::cell(detail::Access::ptr(proto))) : nullptr;
     if (p && o->wouldCycle(vm, p))
-        throw Error(ErrorCode::TypeError, "Cyclic __proto__ value");
+        throw Error(ErrorCode::TypeError, "cyclic prototype chain");
     o->setProto(vm, p);
 }
 

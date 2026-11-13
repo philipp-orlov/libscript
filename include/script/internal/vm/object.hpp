@@ -253,6 +253,17 @@ inline bool isObject(JSValue v) noexcept
 {
     return v.isCell() && isVmCell(v.asCell()) && kindOf(v.asCell()) == Kind::Object;
 }
+/// An object with the elements of a `JSArray`: an array, or the `arguments` of a call.
+inline bool hasElems(const JSObject* o) noexcept
+{
+    return o->cls() == ObjClass::Array || o->cls() == ObjClass::Arguments;
+}
+
+inline bool hasElems(JSValue v) noexcept
+{
+    return isObject(v) && hasElems(asObject(v));
+}
+
 inline bool isArray(JSValue v) noexcept
 {
     return isObject(v) && asObject(v)->cls() == ObjClass::Array;

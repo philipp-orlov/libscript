@@ -137,6 +137,8 @@ bool forEachIterated(VM& vm, JSValue src, F&& fn)
 JSValue getIndex(VM& vm, JSValue base, std::uint32_t i);
 /// Own property keys of `o` in the order the language gives them, each an owned string or symbol value.
 void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerable, std::vector<Handle>& out);
+/// The elements of an array-like, each counted by its handle; false with an exception pending.
+bool listFromArrayLike(VM& vm, JSValue list, std::vector<Handle>& out);
 /// `Object.defineProperty` on a key: undefined, or the exception sentinel.
 JSValue definePropertyFromDescriptor(VM& vm, JSObject* o, Key key, JSObject* descriptor);
 /// The remaining built-ins: Object, Reflect, Array, String, Number and Math beyond the first set.

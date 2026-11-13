@@ -91,6 +91,36 @@ JSValue VM::evalSource(std::string_view source, std::string_view name)
     return call(keep.get(), toJSValue(global), nullptr, 0);
 }
 
+JSValue VM::evalDirect(JSValue sourceValue)
+{
+    Frame* fr = frameBase + frameCount - 1;
+    const CodeBlock* caller = fr->code;
+    const Vec<EvalVar>& vars = caller->evalScopes[evalIndex];
+    std::vector<String> names;
+    for (const EvalVar& v : vars)
+        names.push_back(String(static_cast<StringCell*>(caller->atoms[v.atom])->text()));
+    const std::string text = toUtf8(asString(sourceValue)->text());
+    CodeBlock* code = nullptr;
+    try {
+        dyn::Parser parser(text, "<eval>", /*typescript=*/false);
+        dyn::NodePtr tree = parser.parseProgram();
+        code = compileEval(*this, *tree, "<eval>", std::make_shared<const std::string>(text), names,
+                           (caller->flags & CodeBlock::kStrict) != 0);
+    } catch (const Error& e) {
+        return throwError(e.code() == ErrorCode::CompileError ? ErrorCode::SyntaxError : e.code(), e.what());
+    }
+    const std::uint32_t n = std::uint32_t(code->upvals.size());
+    std::vector<Box*> boxes(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const EvalVar& v = vars[code->upvals[i].index];
+        boxes[i] = v.local ? reinterpret_cast<Box*>(fr->R[v.index].asCell()) : fr->fn->upvals()[v.index];
+    }
+    JSFunction* f = newFunction(protos.function, code, boxes.data(), n);
+    releaseCode(code);  // the function has its own count
+    Handle keep = Handle::adopt(toJSValue(f));
+    return call(keep.get(), JSValue::undefined(), nullptr, 0);
+}
+
 const LanguageInfo& javascriptLanguage() noexcept
 {
     static const char* const extensions[] = {".js", ".mjs", ".cjs", nullptr};

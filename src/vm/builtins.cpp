@@ -29,7 +29,7 @@ using namespace bi;
 
 JSArray* thisArray(VM& vm, JSValue self)
 {
-    if (!isArray(self)) {
+    if (!isObject(self) || !hasElems(asObject(self))) {
         typeError(vm, "this is not an array");
         return nullptr;
     }
@@ -45,7 +45,7 @@ struct ArrayView
 
     ArrayView(VM& vm, JSValue self)
     {
-        if (isArray(self)) {
+        if (hasElems(self)) {
             a = static_cast<JSArray*>(asObject(self));
             return;
         }
@@ -349,7 +349,7 @@ NATIVE(objectKeys)
     }
     std::vector<std::pair<std::uint32_t, Key>> indexed;
     std::vector<std::pair<Key, JSValue>> named;
-    if (o->cls() == ObjClass::Array) {
+    if (hasElems(o)) {
         auto* a = static_cast<JSArray*>(o);
         for (std::uint32_t i = 0; i < a->length; ++i)
             if (!a->elems[i].isHole())
@@ -388,7 +388,7 @@ NATIVE(objectKeys)
     };
     for (auto& [index, key] : indexed) {
         Key k = key ? key : toPropertyKey(vm, JSValue::boxNumber(double(index)));
-        JSValue v = o->cls() == ObjClass::Array && !key ? static_cast<JSArray*>(o)->at(index) : JSValue::undefined();
+        JSValue v = hasElems(o) && !key ? static_cast<JSArray*>(o)->at(index) : JSValue::undefined();
         if (key) {
             JSValue* slot = o->findOwn(vm, key);
             v = slot ? *slot : JSValue::undefined();
@@ -434,7 +434,7 @@ NATIVE(objectSetPrototypeOf)
     if (!isObject(p) && !p.isNull())
         return typeError(vm, "Object prototype may only be an Object or null");
     if (isObject(p) && asObject(o)->wouldCycle(vm, asObject(p)))
-        return typeError(vm, "Cyclic __proto__ value");
+        return typeError(vm, "cyclic prototype chain");
     asObject(o)->setProto(vm, isObject(p) ? asObject(p) : nullptr);
     retain(o);
     return o;
@@ -471,7 +471,16 @@ JSValue definePropertyImpl(VM& vm, JSObject* o, Key key, JSObject* d)
     const bool hasSet = descriptorField(vm, d, "set", &s);
     std::uint8_t attrs = 0;
     std::uint8_t existing = 0;
-    const bool exists = o->findOwn(vm, key, &existing) != nullptr || (o->cls() == ObjClass::Array && key == vm.atoms.length);
+    bool exists = o->findOwn(vm, key, &existing) != nullptr;
+    if (!exists && hasElems(o)) {
+        std::uint32_t index;
+        if (key == vm.atoms.length) {
+            exists = true;
+        } else if (arrayIndexOf(key, &index) && !static_cast<JSArray*>(o)->at(index).isHole()) {
+            exists = true;
+            existing = attr::kDefault;
+        }
+    }
     auto bit = [&](const char* name, std::uint8_t mask) {
         if (descriptorField(vm, d, name, &flag)) {
             if (toBoolean(flag))
@@ -602,7 +611,7 @@ NATIVE(hasOwnProperty)
     if (isObject(self)) {
         JSObject* o = asObject(self);
         std::uint32_t index;
-        if (o->cls() == ObjClass::Array) {
+        if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             if (key == vm.atoms.length || (arrayIndexOf(key, &index) && !a->at(index).isHole()))
                 has = true;
@@ -626,6 +635,8 @@ NATIVE(objectToString)
         tag = "[object Null]";
     else if (isArray(self))
         tag = "[object Array]";
+    else if (isObject(self) && asObject(self)->cls() == ObjClass::Arguments)
+        tag = "[object Arguments]";
     else if (isFunction(self))
         tag = "[object Function]";
     else if (isObject(self) && asObject(self)->cls() == ObjClass::Error)
@@ -679,14 +690,12 @@ NATIVE(functionApply)
 {
     UNUSED();
     JSValue list = arg(args, argc, 1);
+    std::vector<Handle> held;
+    if (!list.isNullish() && !listFromArrayLike(vm, list, held))
+        return JSValue::exception();
     std::vector<JSValue> values;
-    if (isArray(list)) {
-        auto* a = static_cast<JSArray*>(asObject(list));
-        for (std::uint32_t i = 0; i < a->length; ++i)
-            values.push_back(a->elems[i].isHole() ? JSValue::undefined() : a->elems[i]);
-    } else if (!list.isNullish()) {
-        return typeError(vm, "CreateListFromArrayLike called on non-object");
-    }
+    for (const Handle& h : held)
+        values.push_back(h.get());
     return vm.call(self, arg(args, argc, 0), values.data(), std::uint32_t(values.size()));
 }
 
@@ -869,7 +878,7 @@ NATIVE(arrayCtor)
         if (d < 0 || d != std::floor(d) || d > 4294967295.0)
             return vm.throwError(ErrorCode::RangeError, "Invalid array length");
         if (d > double(JSArray::kMaxDenseGap))
-            return vm.throwError(ErrorCode::RangeError, "Array too large for the vm core");
+            return vm.throwError(ErrorCode::RangeError, "arrays are dense; this length is too large");
         a->resize(vm, std::uint32_t(d));
     } else {
         a->appendAll(vm, args, argc);
@@ -883,13 +892,24 @@ NATIVE(arrayIsArray)
     return JSValue::boolean(isArray(arg(args, argc, 0)));
 }
 
+/// The array a mutating method works on: frozen arrays refuse.
+static JSArray* thisMutableArray(VM& vm, JSValue self)
+{
+    JSArray* a = thisArray(vm, self);
+    if (a && (a->h.flags & cellflags::kFrozen)) {
+        vm.throwError(ErrorCode::TypeError, "Cannot modify a frozen array");
+        return nullptr;
+    }
+    return a;
+}
+
 NATIVE(arrayPush)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
-    if (a->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))
+    if (a->h.flags & cellflags::kNotExtensible)
         return typeError(vm, "Cannot add property, object is not extensible");
     a->appendAll(vm, args, argc);
     return JSValue::boxNumber(double(a->length));
@@ -898,11 +918,9 @@ NATIVE(arrayPush)
 NATIVE(arrayPop)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
-    if (a->h.flags & cellflags::kFrozen)
-        return typeError(vm, "Cannot delete property of a frozen array");
     JSValue v = a->pop(vm);
     return v.isHole() ? JSValue::undefined() : v;
 }
@@ -910,7 +928,7 @@ NATIVE(arrayPop)
 NATIVE(arrayShift)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
     if (!a->length)
@@ -924,7 +942,7 @@ NATIVE(arrayShift)
 NATIVE(arrayUnshift)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
     a->insertGap(vm, 0, argc);
@@ -1007,7 +1025,7 @@ NATIVE(arraySlice)
 NATIVE(arraySplice)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
     std::int64_t start, count;
@@ -1060,7 +1078,7 @@ NATIVE(arrayConcat)
 NATIVE(arrayReverse)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
     std::reverse(a->elems, a->elems + a->length);
@@ -1223,7 +1241,7 @@ NATIVE(arrayReduce)
 NATIVE(arrayFill)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
     std::int64_t from, to;
@@ -1238,7 +1256,7 @@ NATIVE(arrayFill)
 NATIVE(arraySort)
 {
     UNUSED();
-    JSArray* a = thisArray(vm, self);
+    JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
     const JSValue compare = arg(args, argc, 0);
@@ -2546,7 +2564,10 @@ void VM::installBuiltins()
     JSObject* objectProto = newObject(static_cast<JSObject*>(nullptr), 7);
     setIntrinsic(&protos.object, objectProto);
     release(toJSValue(objectProto));
-    JSObject* functionProto = newObject(objectProto);
+    // `Function.prototype` is itself a function: it can be called and does nothing.
+    JSObject* functionProto = newNativeFunction(
+        objectProto, [](VM&, JSValue, const JSValue*, std::uint32_t, void*) -> JSValue { return JSValue::undefined(); }, nullptr,
+        nullptr, 0);
     setIntrinsic(&protos.function, functionProto);
     release(toJSValue(functionProto));
     JSObject* globalObject = newObject(objectProto, 15);
@@ -2615,6 +2636,9 @@ void VM::installBuiltins()
         globalObject->putOwn(*this, key, toJSValue(f), attr::kWritable | attr::kConfigurable);
         detail::decRef(key);
         method(*this, globalObject, "eval", [](VM& vm, JSValue, const JSValue* args, std::uint32_t argc, void*) -> JSValue {
+            // `SetEvalScope` marks a call that is a direct `eval` of the function running.
+            const bool direct = vm.evalCode && vm.frameCount == vm.evalFrames && vm.frameBase[vm.frameCount - 1].code == vm.evalCode;
+            vm.evalCode = nullptr;
             if (!vm.ctx.options.runtimeCode)
                 return vm.throwError(ErrorCode::EvalError, "eval is disabled: the engine runs only the source its host gives it");
             const JSValue x = arg(args, argc, 0);
@@ -2622,6 +2646,8 @@ void VM::installBuiltins()
                 retain(x);
                 return x;
             }
+            if (direct)
+                return vm.evalDirect(x);
             return vm.evalSource(toUtf8(asString(x)->text()), "<eval>");
         }, 1);
     }

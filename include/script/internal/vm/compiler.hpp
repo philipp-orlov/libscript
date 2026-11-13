@@ -16,6 +16,11 @@ namespace vm {
 CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file,
                           std::shared_ptr<const std::string> source = nullptr);
 
+/// Compile the text of a direct `eval` as a function that reads the caller's variables `names` through upvalues: upvalue `i`
+/// is the box of `names[i]`, and it keeps the caller's `this`. Its result is the program's completion value.
+CodeBlock* compileEval(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source,
+                       const std::vector<String>& names, bool strict);
+
 }  // namespace vm
 }  // namespace internal
 }  // namespace script

@@ -99,6 +99,7 @@ struct Intrinsics
     JSObject* regexp = nullptr;
     JSObject* promise = nullptr;
     JSObject* asyncGenerator = nullptr;
+    JSObject* arguments = nullptr;       ///< what the `arguments` of a call inherits from
     JSObject* arrayBuffer = nullptr;
     JSObject* typedArrays[16] = {};  ///< by ElemKind
 };
@@ -236,9 +237,11 @@ struct VM : EngineRuntime
     /// `callee(this, ...args)`. An owned result, or the exception sentinel with `exception` set. Runs script or native
     /// code; may be called from native code that script called.
     JSValue call(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc);
-    JSValue callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct);
+    JSValue callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct,
+                         JSValue target = JSValue::undefined());
     /// `new callee(...args)`.
-    JSValue construct(JSValue callee, const JSValue* args, std::uint32_t argc);
+    /// `new callee(...args)`; `target` is the new.target when it is not the callee (Reflect.construct).
+    JSValue construct(JSValue callee, const JSValue* args, std::uint32_t argc, JSValue target = JSValue::undefined());
     /// Set while a native function runs as a constructor: the function itself; otherwise undefined. A native that
     /// constructs is handed a fresh `this` made from the function's `prototype`.
     JSValue newTarget = JSValue::undefined();
@@ -278,6 +281,12 @@ struct VM : EngineRuntime
     /// Compile `source` as a program and run it on the global object: `eval` and `new Function`. An owned result, or the
     /// exception sentinel (a syntax error is a pending SyntaxError).
     JSValue evalSource(std::string_view source, std::string_view name);
+    /// A direct `eval` of `source` from the function running now, which sees that function's variables.
+    JSValue evalDirect(JSValue source);
+    /// Set by `SetEvalScope` just before a call that may be a direct `eval`.
+    const CodeBlock* evalCode = nullptr;
+    std::uint32_t evalIndex = 0;
+    std::uint32_t evalFrames = 0;
     /// Room for the boxes a closure with many captures gathers; the interpreter cannot hold a vector across its jumps.
     std::vector<Box*> boxScratch;
     // ---- promises (builtins_promise.cpp) ----

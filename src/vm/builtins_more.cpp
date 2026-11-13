@@ -54,7 +54,7 @@ void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
     if (strings && o->cls() == ObjClass::TypedArray)
         for (std::uint32_t i = 0; i < static_cast<JSTypedArray*>(o)->length; ++i)
             indexed.push_back({i, nullptr});
-    if (strings && o->cls() == ObjClass::Array) {
+    if (strings && hasElems(o)) {
         auto* a = static_cast<JSArray*>(o);
         for (std::uint32_t i = 0; i < a->length; ++i)
             if (!a->elems[i].isHole())
@@ -85,7 +85,7 @@ void ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
             out.push_back(Handle::adopt(JSValue::cell(made)));
         }
     }
-    if (strings && !onlyEnumerable && o->cls() == ObjClass::Array)
+    if (strings && !onlyEnumerable && hasElems(o))
         out.push_back(Handle::retained(JSValue::cell(vm.atoms.length)));
     for (Key k : named)
         out.push_back(Handle::retained(JSValue::cell(k)));
@@ -135,7 +135,7 @@ bool ownDescriptor(VM& vm, JSObject* o, Key key, OwnDesc& out)
             return true;
         }
     }
-    if (o->cls() == ObjClass::Array) {
+    if (hasElems(o)) {
         auto* a = static_cast<JSArray*>(o);
         if (key == vm.atoms.length) {
             out.attrs = frozen ? 0 : attr::kWritable;
@@ -391,7 +391,7 @@ NATIVE(objectExtensibility)
         o->findOwn(vm, k, &attrs);
         sealed = sealed && !(attrs & attr::kConfigurable);
     }
-    if (o->cls() == ObjClass::Array && static_cast<JSArray*>(o)->length && !(o->h.flags & cellflags::kFrozen))
+    if (hasElems(o) && static_cast<JSArray*>(o)->length && !(o->h.flags & cellflags::kFrozen))
         sealed = false;
     return JSValue::boolean(sealed);
 }
@@ -474,13 +474,15 @@ NATIVE(protoSetter)
         asObject(self)->setProto(vm, nullptr);
     } else {
         if (asObject(self)->wouldCycle(vm, asObject(p)))
-            return typeError(vm, "Cyclic __proto__ value");
+            return typeError(vm, "cyclic prototype chain");
         asObject(self)->setProto(vm, asObject(p));
     }
     return JSValue::undefined();
 }
 
 // ------------------------------------------------------------------ Reflect ---
+
+}  // namespace
 
 bool listFromArrayLike(VM& vm, JSValue list, std::vector<Handle>& out)
 {
@@ -511,6 +513,8 @@ bool listFromArrayLike(VM& vm, JSValue list, std::vector<Handle>& out)
     return true;
 }
 
+namespace {
+
 std::vector<JSValue> raw(const std::vector<Handle>& hs)
 {
     std::vector<JSValue> v;
@@ -538,7 +542,10 @@ NATIVE(reflectConstruct)
     if (!listFromArrayLike(vm, arg(args, argc, 1), list))
         return JSValue::exception();
     std::vector<JSValue> values = raw(list);
-    return vm.construct(arg(args, argc, 0), values.data(), std::uint32_t(values.size()));
+    const JSValue target = argc > 2 ? args[2] : JSValue::undefined();
+    if (argc > 2 && !isFunction(target))
+        return typeError(vm, describe(vm, target) + " is not a constructor");
+    return vm.construct(arg(args, argc, 0), values.data(), std::uint32_t(values.size()), target);
 }
 
 NATIVE(reflectOp)
@@ -698,7 +705,7 @@ NATIVE(arrayOf)
 NATIVE(arrayAt)
 {
     UNUSED();
-    if (!isArray(self))
+    if (!hasElems(self))
         return typeError(vm, "this is not an array");
     auto* a = static_cast<JSArray*>(asObject(self));
     bool ok;
@@ -742,7 +749,7 @@ bool flattenInto(VM& vm, JSArray* out, JSValue source, double depth, JSValue map
 NATIVE(arrayFlat)
 {
     UNUSED();
-    if (!isArray(self))
+    if (!hasElems(self))
         return typeError(vm, "this is not an array");
     const bool map = data != nullptr;
     JSValue mapFn = JSValue::undefined();
@@ -767,7 +774,7 @@ NATIVE(arrayFlat)
 NATIVE(arrayFindLast)
 {
     UNUSED();
-    if (!isArray(self))
+    if (!hasElems(self))
         return typeError(vm, "this is not an array");
     const JSValue callback = arg(args, argc, 0);
     if (!isFunction(callback))

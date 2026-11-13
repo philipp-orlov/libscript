@@ -106,6 +106,8 @@ struct Fn
     std::uint16_t top = 1;
     bool isArrow = false;
     bool isProgram = false;
+    bool isEval = false;       ///< the text of a direct `eval`: arrow-like, with a completion value
+    bool completion = false;   ///< expression statements leave their value in `resultReg`
     bool strict = false;
     std::uint16_t resultReg = 0;
     std::vector<JumpCtx> jumps;
@@ -126,8 +128,20 @@ void collectCaptured(const Node& n, std::set<String>& out, bool nested, bool arr
 {
     if (n.kind == NK::Identifier && nested)
         out.insert(n.text);
-    if ((n.kind == NK::ThisExpr || n.kind == NK::SuperExpr) && nested && arrowChain)
+    if ((n.kind == NK::ThisExpr || n.kind == NK::SuperExpr) && nested && arrowChain) {
         out.insert(String(u"this"));
+        out.insert(String(u"%bound"));
+    }
+    if (n.kind == NK::NewTarget && nested && arrowChain)
+        out.insert(String(u"%newtarget"));
+    // A direct `eval` can name any variable around it, so none of them may live in a bare register.
+    if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval")
+        out.insert(String(u"%all"));
+    // `super()` in an arrow function needs the constructor around it and its new.target.
+    if (n.kind == NK::Call && n.a && n.a->kind == NK::SuperExpr && nested && arrowChain) {
+        out.insert(String(u"%callee"));
+        out.insert(String(u"%newtarget"));
+    }
     bool childNested = nested, childArrow = arrowChain;
     if (isFunctionNode(n)) {
         childNested = true;
@@ -342,6 +356,10 @@ public:
     }
 
     CodeBlock* program(const Node& program);
+    CodeBlock* evalProgram(const Node& program, const std::vector<String>& names, bool strict)
+    {
+        return evalOnce(program, names, strict);
+    }
 
 private:
     VM& vm_;
@@ -499,6 +517,11 @@ private:
         fn_->scopes.pop_back();
     }
 
+    bool isCaptured(const String& name) const
+    {
+        return fn_->captured.count(name) != 0 || fn_->captured.count(String(u"%all")) != 0;
+    }
+
     Binding& declare(const String& name, BKind kind)
     {
         Scope& scope = fn_->scopes.back();
@@ -511,7 +534,7 @@ private:
         b.name = name;
         b.kind = kind;
         b.reg = temp();
-        b.boxed = fn_->captured.count(name) != 0;
+        b.boxed = isCaptured(name);
         scope.bindings.push_back(b);
         return scope.bindings.back();
     }
@@ -752,13 +775,47 @@ private:
     /// A register holding `this`: register 0, or a copy of the captured one inside an arrow.
     std::uint16_t thisRegister()
     {
+        checkThisBound(Node(NK::ThisExpr));
         if (!fn_->isArrow && !findInScopes(*fn_, String(u"this")))
             return 0;
         const std::uint16_t t = temp();
         loadVar(String(u"this"), t, Node(NK::ThisExpr));
         return t;
     }
+    /// In a derived constructor, and the arrows inside it, `this` is not there until `super()` has returned.
+    bool thisBindsLate() const
+    {
+        const Fn* f = fn_;
+        while (f->isArrow && f->parent)
+            f = f->parent;
+        return !f->isArrow && !f->isProgram && (f->block->flags & CodeBlock::kDerived);
+    }
+    void checkThisBound(const Node& at)
+    {
+        if (!thisBindsLate())
+            return;
+        const std::uint16_t mark = fn_->top;
+        const std::uint16_t flag = loadVar(String(u"%bound"), -1, at);
+        emit(Op::CheckBound, flag);
+        fn_->top = mark;
+    }
+    /// Return `r`; a derived constructor checks what it returns first.
+    void emitReturn(std::uint16_t r)
+    {
+        if (!fn_->isArrow && (fn_->block->flags & CodeBlock::kDerived)) {
+            const std::uint16_t mark = fn_->top;
+            const std::uint16_t flag = loadVar(String(u"%bound"), -1, Node(NK::ThisExpr));
+            emit(Op::CheckDerivedRet, r, flag);
+            fn_->top = mark;
+            // An arrow function may have made `this`, which lives in its box.
+            if (Binding* b = findInScopes(*fn_, String(u"this")))
+                emit(Op::GetBox, 0, b->reg);
+        }
+        emit(Op::Ret, r);
+    }
     CodeBlock* programOnce(const Node& program);
+    CodeBlock* evalOnce(const Node& program, const std::vector<String>& names, bool strict);
+    void emitEvalScope();
     void functionBody(const Node& n, CodeBlock* block);
 };
 
@@ -809,6 +866,9 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         }
         case NK::Identifier: return loadVar(n.text, dst, n);
         case NK::ThisExpr: {
+            checkThisBound(n);
+            if (fn_->isEval && resolve(String(u"this")).kind == Ref::Global)
+                return loadVar(String(u"globalThis"), dst, n);
             if (fn_->isArrow || findInScopes(*fn_, String(u"this")))
                 return loadVar(String(u"this"), dst, n);
             if (dst >= 0 && dst != 0) {
@@ -841,6 +901,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         }
         case NK::SuperExpr: {
             // Only as the object of `super.x = v` and the like, which store on `this`.
+            checkThisBound(n);
             const std::uint16_t d = dest(dst);
             if (fn_->isArrow || findInScopes(*fn_, String(u"this")))
                 loadVar(String(u"this"), d, n);
@@ -936,8 +997,13 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             return d;
         }
         case NK::NewTarget: {
-            if (fn_->isArrow || fn_->isProgram)
+            if (fn_->isProgram)
                 unsupported(n, "new.target here");
+            if (fn_->isArrow) {
+                if (resolve(String(u"%newtarget")).kind == Ref::Global)
+                    unsupported(n, "new.target here");
+                return loadVar(String(u"%newtarget"), dst, n);
+            }
             const std::uint16_t d = dest(dst);
             emit(Op::NewTarget, d);
             return d;
@@ -1071,6 +1137,8 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
                     expr(*p->b, v);
                 homeFor(*p->b, v, t);
                 emit(Op::InitElem, t, k, v);
+                if ((isFunctionNode(*p->b) || p->b->kind == NK::ClassExpr) && p->b->text.empty())
+                    emit(Op::SetFnName, v, k);
             }
         } else {
             const String name = p->text;
@@ -1116,6 +1184,10 @@ std::uint16_t Compiler::function(const Node& n, const String& inferredName, int 
 
 void Compiler::storeThis(std::uint16_t src)
 {
+    if (fn_->isArrow) {
+        storeVar(String(u"this"), src, true, Node(NK::ThisExpr));
+        return;
+    }
     if (src != 0)
         emit(Op::Mov, 0, src);
     if (Binding* b = findInScopes(*fn_, String(u"this"))) {
@@ -1364,7 +1436,7 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
         fn_->top = 1;
         block->nregs = 1;
         pushScope();
-        if (fn_->captured.count(String(u"this"))) {
+        if (isCaptured(String(u"this"))) {
             Binding& b = declare(String(u"this"), BKind::Var);
             emit(Op::Mov, b.reg, 0);
             if (b.boxed)
@@ -1421,6 +1493,8 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
                 else
                     emit(Op::LoadUndef, v);
                 emit(Op::InitElem, 0, key, v);
+                if (item->b && (isFunctionNode(*item->b) || item->b->kind == NK::ClassExpr) && item->b->text.empty())
+                    emit(Op::SetFnName, v, key);
             } else {
                 const String key = item->a->text;
                 const std::uint16_t v = temp();
@@ -2035,7 +2109,8 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     const std::uint16_t base = temps(2);
     const Node& callee = *n.a;
     const bool superCall = callee.kind == NK::SuperExpr;
-    if (superCall && (isNew || fn_->isArrow || !(fn_->block->flags & CodeBlock::kClassConstructor)))
+    if (superCall && (isNew || (fn_->isArrow ? resolve(String(u"%callee")).kind == Ref::Global
+                                              : !(fn_->block->flags & CodeBlock::kClassConstructor))))
         unsupported(n, "super() here");
     if (!isNew && callee.kind == NK::Member && callee.a->kind == NK::SuperExpr) {
         if (callee.computed)
@@ -2044,6 +2119,15 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
         const std::uint16_t self = thisRegister();
         emit(Op::GetSuperProp, base, atom(callee.text), self);
         emit(Op::Mov, base + 1, self);
+        fn_->top = at;
+    } else if (superCall && fn_->isArrow) {
+        const std::uint16_t at = fn_->top;
+        const std::uint16_t callee = loadVar(String(u"%callee"), -1, n);
+        emit(Op::GetSuperCtorOf, base, callee);
+        fn_->top = at;
+        loadVar(String(u"this"), base + 1, n);
+        const std::uint16_t target = loadVar(String(u"%newtarget"), -1, n);
+        emit(Op::SetNewTarget, target);
         fn_->top = at;
     } else if (superCall) {
         emit(Op::GetSuperCtor, base);
@@ -2116,13 +2200,36 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     }
     chain_ = savedChain;
     const std::uint16_t d = dst >= 0 ? std::uint16_t(dst) : base;
+    if (!isNew && callee.kind == NK::Identifier && callee.text == u"eval" && resolve(String(u"eval")).kind == Ref::Global)
+        emitEvalScope();
+    if (superCall && thisBindsLate()) {
+        // A second `super()` is an error once its arguments are evaluated, before another object is made.
+        const std::uint16_t at = fn_->top;
+        const std::uint16_t flag = loadVar(String(u"%bound"), -1, n);
+        emit(Op::CheckUnbound, flag);
+        fn_->top = at;
+    }
     emit(spread ? (superCall ? Op::SuperSpread : isNew ? Op::NewSpread : Op::CallSpread)
                 : (superCall ? Op::SuperCall : isNew ? Op::New : Op::Call),
          d, base, argc);
     if (superCall) {
         // The constructor's `this` is what the parent made; the fields of this class are initialised now.
+        const std::uint16_t at = fn_->top;
         storeThis(d);
-        emit(Op::InitFields);
+        if (thisBindsLate()) {
+            const std::uint16_t t = temp();
+            emit(Op::LoadTrue, t);
+            storeVar(String(u"%bound"), t, true, n);
+            fn_->top = at;
+        }
+        if (fn_->isArrow) {
+            const std::uint16_t callee = loadVar(String(u"%callee"), -1, n);
+            const std::uint16_t self = loadVar(String(u"this"), -1, n);
+            emit(Op::InitFieldsOf, callee, self);
+            fn_->top = at;
+        } else {
+            emit(Op::InitFields);
+        }
     }
     fn_->top = mark;
     if (dst < 0) {
@@ -2216,7 +2323,7 @@ void Compiler::statement(const Node& n)
         case NK::Empty:
         case NK::FunctionDecl: break;
         case NK::ExprStatement:
-            if (fn_->isProgram) {
+            if (fn_->isProgram || fn_->completion) {
                 expr(*n.a, fn_->resultReg);
             } else {
                 discard_ = true;
@@ -2616,7 +2723,7 @@ void Compiler::emitFinallyFor(std::size_t fromDepth)
 
 void Compiler::returnStatement(const Node& n)
 {
-    if (fn_->isProgram)
+    if (fn_->isProgram || fn_->isEval)
         syntaxError(n, "Illegal return statement");
     const std::uint16_t mark = fn_->top;
     std::uint16_t r;
@@ -2629,7 +2736,7 @@ void Compiler::returnStatement(const Node& n)
     if (fn_->block->flags & CodeBlock::kAsyncGen)
         emit(Op::Await, r, r);
     emitFinallyFor(0);
-    emit(Op::Ret, r);
+    emitReturn(r);
     fn_->top = mark;
 }
 
@@ -2950,7 +3057,7 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     const std::size_t nparams = n.list.size();
     const std::size_t fixed = block->nparams;
     const bool hasRest = fixed < nparams;
-    const bool needsArgs = hasRest || (!arrow && usesArguments(*n.d));
+    const bool needsArgs = hasRest || (!arrow && (usesArguments(*n.d) || fn_->captured.count(String(u"%all"))));
     // `this`, the fixed parameters, then (if any) the arguments array.
     fn_->top = std::uint16_t(1 + fixed + (needsArgs ? 1 : 0));
     block->nregs = fn_->top;
@@ -2976,15 +3083,34 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
         b.name = String(u"arguments");
         b.kind = BKind::Var;
         b.reg = std::uint16_t(1 + fixed);
-        b.boxed = fn_->captured.count(b.name) != 0;
+        b.boxed = isCaptured(b.name);
         scope.bindings.push_back(b);
         if (b.boxed)
             emit(Op::NewBox, b.reg);
     }
     // `this` for the arrows inside.
-    if (!arrow && fn_->captured.count(String(u"this"))) {
+    if (!arrow && isCaptured(String(u"this"))) {
         Binding& b = declare(String(u"this"), BKind::Var);
         emit(Op::Mov, b.reg, 0);
+        if (b.boxed)
+            emit(Op::NewBox, b.reg);
+    }
+    if (!arrow && fn_->captured.count(String(u"%newtarget"))) {
+        Binding& b = declare(String(u"%newtarget"), BKind::Var);
+        emit(Op::NewTarget, b.reg);
+        if (b.boxed)
+            emit(Op::NewBox, b.reg);
+    }
+    if (!arrow && fn_->captured.count(String(u"%callee"))) {
+        Binding& b = declare(String(u"%callee"), BKind::Var);
+        emit(Op::LoadCallee, b.reg);
+        if (b.boxed)
+            emit(Op::NewBox, b.reg);
+    }
+    if (block->flags & CodeBlock::kDerived) {
+        // Whether `super()` has returned.
+        Binding& b = declare(String(u"%bound"), BKind::Var);
+        emit(Op::LoadUndef, b.reg);
         if (b.boxed)
             emit(Op::NewBox, b.reg);
     }
@@ -3001,7 +3127,7 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
             b.name = target->text;
             b.kind = BKind::Param;
             b.reg = std::uint16_t(i + 1);
-            b.boxed = fn_->captured.count(b.name) != 0;
+            b.boxed = isCaptured(b.name);
             bool duplicate = false;
             for (Binding& e : scope.bindings)
                 if (e.name == b.name) {
@@ -3078,10 +3204,93 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     statements(n.d->list);
     const std::uint16_t r = temp();
     emit(Op::LoadUndef, r);
-    emit(Op::Ret, r);
+    emitReturn(r);
     if (n.kind == NK::FunctionExpr && n.namedExpr && !n.text.empty())
         fn_->scopes.pop_back();
     fn_->scopes.pop_back();
+}
+
+/// Tell a direct `eval` call about the variables around it: what `SetEvalScope` names is a table in the code block.
+void Compiler::emitEvalScope()
+{
+    std::vector<String> names;
+    for (Fn* f = fn_; f; f = f->parent)
+        for (const Scope& scope : f->scopes)
+            for (const Binding& b : scope.bindings)
+                if (std::find(names.begin(), names.end(), b.name) == names.end())
+                    names.push_back(b.name);
+    Vec<EvalVar> vars;
+    for (const String& name : names) {
+        const Ref r = resolve(name);
+        if (r.kind == Ref::Global || (r.kind == Ref::Local && !r.binding->boxed))
+            continue;
+        EvalVar v;
+        v.atom = atom(name);
+        v.local = r.kind == Ref::Local;
+        v.index = v.local ? r.binding->reg : r.upval;
+        vars.push_back(v);
+    }
+    fn_->block->evalScopes.push_back(std::move(vars));
+    emit(Op::SetEvalScope, std::uint16_t(fn_->block->evalScopes.size() - 1));
+}
+
+CodeBlock* Compiler::evalOnce(const Node& program, const std::vector<String>& names, bool strict)
+{
+    CodeBlock* block = vm_.newCodeBlock(nullptr, 0, false);
+    block->file = file_;
+    block->source = source_;
+    block->flags |= CodeBlock::kArrow;
+    // The caller's variables, each a box the eval code reaches as an upvalue.
+    Fn outer;
+    outer.isProgram = true;
+    outer.scopes.emplace_back();
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        Binding b;
+        b.name = names[i];
+        b.reg = std::uint16_t(i);
+        b.boxed = true;
+        outer.scopes.back().bindings.push_back(b);
+    }
+    Fn top;
+    top.parent = &outer;
+    top.block = block;
+    top.isArrow = true;
+    top.isEval = true;
+    top.completion = true;
+    top.strict = strict || hasUseStrict(program);
+    if (top.strict)
+        block->flags |= CodeBlock::kStrict;
+    collectCaptured(program, top.captured, false, true);
+    fn_ = &top;
+    try {
+        top.top = 1;
+        block->nregs = 1;
+        pushScope();
+        top.resultReg = temp();
+        emit(Op::LoadUndef, top.resultReg);
+        std::vector<String> vars;
+        collectVars(program, vars);
+        for (const String& v : vars) {
+            // `var x` of a name the caller has is that variable.
+            if (std::find(names.begin(), names.end(), v) != names.end() ||
+                (findInScopes(*fn_, v) && fn_->scopes.back().bindings.end() != std::find_if(fn_->scopes.back().bindings.begin(), fn_->scopes.back().bindings.end(), [&](const Binding& b) { return b.name == v; })))
+                continue;
+            Binding& b = declare(v, BKind::Var);
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+        }
+        declareLexical(program.list);
+        hoistFunctions(program.list);
+        statements(program.list);
+        emit(Op::Ret, top.resultReg);
+        popScope();
+    } catch (...) {
+        fn_ = nullptr;
+        vm_.releaseCode(block);
+        throw;
+    }
+    fn_ = nullptr;
+    return block;
 }
 
 CodeBlock* Compiler::program(const Node& program)
@@ -3118,7 +3327,7 @@ CodeBlock* Compiler::programOnce(const Node& program)
         top.resultReg = temp();
         emit(Op::LoadUndef, top.resultReg);
         // `this` for arrows at the top of a program.
-        if (top.captured.count(String(u"this"))) {
+        if (isCaptured(String(u"this"))) {
             Binding& b = declare(String(u"this"), BKind::Var);
             emit(Op::Mov, b.reg, 0);
             if (b.boxed)
@@ -3147,6 +3356,13 @@ CodeBlock* Compiler::programOnce(const Node& program)
 }
 
 }  // namespace
+
+CodeBlock* compileEval(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source,
+                       const std::vector<String>& names, bool strict)
+{
+    Compiler compiler(vm, file, std::move(source));
+    return compiler.evalProgram(program, names, strict);
+}
 
 CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source)
 {

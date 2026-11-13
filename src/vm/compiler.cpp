@@ -2377,6 +2377,12 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     const std::uint16_t d = dst >= 0 ? std::uint16_t(dst) : base;
     if (!isNew && callee.kind == NK::Identifier && callee.text == u"eval" && resolve(String(u"eval")).kind == Ref::Global)
         emitEvalScope();
+    if (superCall && thisBindsLate()) {
+        const std::uint16_t at = fn_->top;
+        const std::uint16_t flag = loadVar(String(u"%bound"), -1, n);
+        emit(Op::FreshThisIfBound, std::uint16_t(base + 1), flag);
+        fn_->top = at;
+    }
     emit(spread ? (superCall ? Op::SuperSpread : isNew ? Op::NewSpread : Op::CallSpread)
                 : (superCall ? Op::SuperCall : isNew ? Op::New : Op::Call),
          d, base, argc);

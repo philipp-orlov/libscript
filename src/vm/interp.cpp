@@ -2059,6 +2059,11 @@ L_CheckUnbound:
         FAIL();
     }
     NEXT();
+L_FreshThisIfBound:
+    // A second `super()` still runs the parent constructor, on an object of its own, before it fails.
+    if (R[ins->b] == JSValue::boolean(true)) [[unlikely]]
+        setReg(R[ins->a], toJSValue(vm.newObject(vm.protos.object)));
+    NEXT();
 L_CheckDerivedRet:
     if (!isObject(R[ins->a])) {
         fr->pc = pc;

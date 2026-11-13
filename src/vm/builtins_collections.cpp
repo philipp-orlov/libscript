@@ -87,7 +87,7 @@ struct TableState : NativeState
         index.clear();
         dead = 0;
     }
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         for (const Entry_& e : entries)
             if (e.live) {
@@ -195,7 +195,7 @@ struct TableIter : IteratorState
 
     TableIter(JSValue t, int k) : table(t), kind(k) { retain(table); }
     ~TableIter() override { release(table); }
-    void values(std::vector<JSValue>& out) const override { out.push_back(table); }
+    void values(Vec<JSValue>& out) const override { out.push_back(table); }
     void clear(VM&) noexcept override
     {
         release(table);
@@ -423,7 +423,7 @@ struct RefState : NativeState
         release(target);
         target = JSValue::undefined();
     }
-    void values(std::vector<JSValue>& out) const override { out.push_back(target); }
+    void values(Vec<JSValue>& out) const override { out.push_back(target); }
 };
 
 NATIVE(weakRefCtor)

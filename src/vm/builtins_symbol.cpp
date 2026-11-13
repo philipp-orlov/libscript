@@ -115,7 +115,7 @@ struct ArrayIter : IteratorState
 
     ArrayIter(JSValue t, int k) : target(t), kind(k) { retain(target); }
     ~ArrayIter() override { release(target); }
-    void values(std::vector<JSValue>& out) const override { out.push_back(target); }
+    void values(Vec<JSValue>& out) const override { out.push_back(target); }
     void clear(VM&) noexcept override
     {
         release(target);
@@ -189,7 +189,7 @@ struct StringIter : IteratorState
 
     explicit StringIter(JSValue t) : text(t) { retain(text); }
     ~StringIter() override { release(text); }
-    void values(std::vector<JSValue>& out) const override { out.push_back(text); }
+    void values(Vec<JSValue>& out) const override { out.push_back(text); }
     void clear(VM&) noexcept override
     {
         release(text);

@@ -483,7 +483,7 @@ struct GenState : NativeState
     bool raw = false;         ///< what it yielded is an inner iterator result, to be given out as it is
 
     ~GenState() override { clear_(); }
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         out.push_back(callee);
         out.insert(out.end(), regs.begin(), regs.end());
@@ -758,6 +758,59 @@ L_DeclGlobal: {
     Key key = atoms[ins->a];
     if (!vm.global->findOwn(vm, key))
         vm.global->putOwn(vm, key, JSValue::undefined(), attr::kDefault);
+    NEXT();
+}
+L_DelGlobal: {
+    fr->pc = pc;
+    const bool ok = deleteProperty(vm, toJSValue(vm.global), atoms[ins->b], false);
+    if (!vm.exception.isUndefined())
+        FAIL();
+    SET(ins->a, JSValue::boolean(ok));
+    NEXT();
+}
+// The variables a sloppy direct `eval` declares in a function live on an object of the function's own (made at its entry).
+L_NewEnv: {
+    JSObject* o = vm.newObject(static_cast<JSObject*>(nullptr));
+    SET(ins->a, toJSValue(o));
+    NEXT();
+}
+L_EnvHas: {
+    const JSValue env = R[ins->b];
+    SET(ins->a, JSValue::boolean(isObject(env) && asObject(env)->findOwn(vm, atoms[ins->c]) != nullptr));
+    NEXT();
+}
+L_EnvGet: {
+    JSValue* slot = asObject(R[ins->b])->findOwn(vm, atoms[ins->c]);
+    COPY(ins->a, slot ? *slot : JSValue::undefined());
+    NEXT();
+}
+L_EnvSet: {
+    JSValue* slot = asObject(R[ins->a])->findOwn(vm, atoms[ins->b]);
+    if (slot) {
+        const JSValue old = *slot;
+        *slot = R[ins->c];
+        retain(*slot);
+        release(old);
+    }
+    NEXT();
+}
+L_DeclEnv: {
+    JSObject* env = asObject(R[ins->a]);
+    if (!env->findOwn(vm, atoms[ins->b]))
+        env->putOwn(vm, atoms[ins->b], JSValue::undefined(), attr::kDefault);
+    NEXT();
+}
+L_DefEnv: {
+    JSObject* env = asObject(R[ins->a]);
+    JSValue* slot = env->findOwn(vm, atoms[ins->b]);
+    retain(R[ins->c]);
+    if (slot) {
+        const JSValue old = *slot;
+        *slot = R[ins->c];
+        release(old);
+    } else {
+        env->putOwn(vm, atoms[ins->b], R[ins->c], attr::kDefault);
+    }
     NEXT();
 }
 

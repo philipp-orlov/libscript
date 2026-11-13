@@ -417,7 +417,7 @@ struct ViewState : NativeState
         buffer = JSValue::undefined();
         length = 0;
     }
-    void values(std::vector<JSValue>& out) const override { out.push_back(buffer); }
+    void values(Vec<JSValue>& out) const override { out.push_back(buffer); }
 };
 
 /// The view as the buffer is now: false when it no longer fits (or the buffer is gone).

@@ -43,7 +43,7 @@ struct PromiseData : NativeState
         onFulfilled.clear();
         onRejected.clear();
     }
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         out.push_back(result);
         for (const auto* list : {&onFulfilled, &onRejected})
@@ -799,7 +799,7 @@ struct AsyncGenState : NativeState
         generator = Handle();
         queue.clear();
     }
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         out.push_back(generator.get());
         for (const AsyncGenRequest& r : queue) {
@@ -903,7 +903,7 @@ struct SyncWrap : NativeState
         iterator = Handle();
         next = Handle();
     }
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         out.push_back(iterator.get());
         out.push_back(next.get());

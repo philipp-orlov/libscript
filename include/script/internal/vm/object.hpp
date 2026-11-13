@@ -27,7 +27,7 @@ struct NativeState
 {
     virtual ~NativeState() = default;
     /// The values it holds, for the walk that finds cycles at teardown.
-    virtual void values(std::vector<JSValue>& out) const { (void)out; }
+    virtual void values(Vec<JSValue>& out) const { (void)out; }
     /// Let go of every value it holds, now; safe to call twice.
     virtual void clear(VM& vm) noexcept { (void)vm; }
     /// A weak table: `values` lists its entries as key, value pairs, and a value lives as long as its key does.
@@ -193,7 +193,7 @@ struct PrimitiveBox : NativeState
 {
     JSValue value = JSValue::undefined();
     ~PrimitiveBox() override { release(value); }
-    void values(std::vector<JSValue>& out) const override { out.push_back(value); }
+    void values(Vec<JSValue>& out) const override { out.push_back(value); }
     void clear(VM&) noexcept override
     {
         release(value);
@@ -217,7 +217,7 @@ struct ProxyState : NativeState
         release(handler);
         target = handler = JSValue::undefined();
     }
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         out.push_back(target);
         out.push_back(handler);

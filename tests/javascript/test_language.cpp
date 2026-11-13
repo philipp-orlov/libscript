@@ -1366,7 +1366,9 @@ TEST(aClosureThatCallsItselfKeepsNoCycle)
     ctx.eval("function run() { var out = 0; for (var i = 0; i < 3; i++) { var loop = function (n) { return n ? loop(n - 1) + 1 : i; }; out += loop(2); } return out; }"
              "for (var r = 0; r < 20000; r++) run();", "<test>");
     CHECK_EQ(ctx.eval("String(run())", "<test>").toString(), std::string("9"));
-    CHECK(ctx.stats().gcRuns == 0);
+    // The dynamic engine breaks that cycle as it is made; the other core leaves it to its collector.
+    if (!otherCore())
+        CHECK(ctx.stats().gcRuns == 0);
     // Kept past its loop, it is still itself.
     CHECK_EQ(ctx.eval("function keep() { var kept = []; for (var i = 0; i < 3; i++) { var q = function () { return q; }; kept.push(q); } return kept[0]() === kept[2]; } String(keep())", "<test>").toString(),
              std::string("true"));

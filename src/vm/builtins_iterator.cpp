@@ -33,7 +33,7 @@ struct Helper : NativeState
     Vec<Handle> iterables, methods;              ///< concat's
     std::size_t at = 0;
 
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         for (const Handle* h : {&iterator, &next, &fn, &innerIterator, &innerNext})
             out.push_back(h->get());

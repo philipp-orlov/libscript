@@ -108,6 +108,9 @@ struct Fn
     bool isArrow = false;
     bool isProgram = false;
     bool isEval = false;       ///< the text of a direct `eval`: arrow-like, with a completion value
+    String evalEnvName;        ///< a sloppy function with a direct `eval` in it: the hidden variable that holds its eval object
+    bool evalOuter = false;    ///< the stand-in for the variables around a direct `eval`
+    bool dynamicVars = false;  ///< sloppy eval code: its `var`s and functions go to the caller's eval object or the global
     bool completion = false;   ///< expression statements leave their value in `resultReg`
     bool strict = false;
     std::size_t varScope = 0;  ///< the scope `var` and the function's own names live in
@@ -403,6 +406,25 @@ bool hasAssignment(const Node& n)
             return true;
     return false;
 }
+
+/// Whether a direct `eval` call is in this function's own code: its parameters and body, not a function inside them.
+bool containsDirectEval(const Node& n)
+{
+    checkNativeStack();
+    if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval")
+        return true;
+    if (isFunctionNode(n) || n.kind == NK::FieldDef || n.kind == NK::StaticBlock)
+        return false;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child && containsDirectEval(**child))
+            return true;
+    for (const dyn::NodePtr& child : n.list)
+        if (child && containsDirectEval(*child))
+            return true;
+    return false;
+}
+
+bool isEvalEnvName(const String& name) { return name.size() > 9 && name.compare(0, 9, u"%evalenv#") == 0; }
 
 /// Whether `arguments` is read in a function's body or in an arrow inside it (not in another function, which has its own).
 bool usesArguments(const Node& n)
@@ -729,6 +751,30 @@ private:
         return r;
     }
 
+    // ------------------------------------------------------ eval variables ---
+    /// The eval objects a name that is not declared anywhere may live on, innermost first: one for each sloppy function around
+    /// this code that has a direct `eval` in it, and the ones of the code a direct `eval` runs in.
+    std::vector<Ref> evalEnvRefs()
+    {
+        std::vector<Ref> refs;
+        for (Fn* f = fn_; f; f = f->parent) {
+            if (!f->evalEnvName.empty())
+                refs.push_back(resolve(f->evalEnvName));
+            if (f->evalOuter)
+                for (const Binding& b : f->scopes.back().bindings)
+                    if (isEvalEnvName(b.name))
+                        refs.push_back(resolve(b.name));
+        }
+        return refs;
+    }
+    /// The eval object of `e` in a register of its own.
+    std::uint16_t loadEnv(const Ref& e)
+    {
+        const std::uint16_t t = temp();
+        emit(e.kind == Ref::Local ? Op::GetBox : Op::GetUpval, t, e.kind == Ref::Local ? e.binding->reg : e.upval);
+        return t;
+    }
+
     // -------------------------------------------------------------- variables ---
     /// Read `name` into `dst` (or a register of its own, when `dst` is negative and the variable lives in one).
     std::uint16_t loadVar(const String& name, int dst, const Node& at, bool forTypeof = false)
@@ -761,7 +807,21 @@ private:
             if (name == u"undefined") {
                 emit(Op::LoadUndef, d);
             } else {
+                const std::vector<Ref> envs = evalEnvRefs();
+                Label done;
+                const std::uint16_t mark = fn_->top;
+                for (const Ref& e : envs) {
+                    const std::uint16_t env = loadEnv(e), flag = temp();
+                    emit(Op::EnvHas, flag, env, atom(name));
+                    Label next;
+                    emitJump(Op::JFalse, flag, next);
+                    emit(Op::EnvGet, d, env, atom(name));
+                    jump(done);
+                    bind(next);
+                    fn_->top = mark;
+                }
                 emitCached(forTypeof ? Op::GetGlobalOrUndef : Op::GetGlobal, d, atom(name), 0);
+                bind(done);
             }
         }
         (void)at;
@@ -808,10 +868,30 @@ private:
             }
             emit(Op::PutUpval, r.upval, src);
         } else {
-            if (init)
+            const std::vector<Ref> envs = evalEnvRefs();
+            const std::uint16_t mark = fn_->top;
+            if (init && fn_->dynamicVars && !envs.empty()) {
+                // A function or `var` of sloppy eval code goes to the eval object of the function that called it.
+                const std::uint16_t env = loadEnv(envs.front());
+                emit(Op::DefEnv, env, atom(name), src);
+                fn_->top = mark;
+            } else if (init) {
                 emit(Op::DefGlobal, atom(name), src);
-            else
+            } else {
+                Label done;
+                for (const Ref& e : envs) {
+                    const std::uint16_t env = loadEnv(e), flag = temp();
+                    emit(Op::EnvHas, flag, env, atom(name));
+                    Label next;
+                    emitJump(Op::JFalse, flag, next);
+                    emit(Op::EnvSet, env, atom(name), src);
+                    jump(done);
+                    bind(next);
+                    fn_->top = mark;
+                }
                 emitCached(Op::PutGlobal, atom(name), src, 0);
+                bind(done);
+            }
         }
         (void)at;
     }
@@ -1867,6 +1947,27 @@ std::uint16_t Compiler::unary(const Node& n, int dst)
                 emit(Op::DelProp, d, o, atom(target.text));
                 return d;
             }
+            if (target.kind == NK::Identifier && resolve(target.text).kind == Ref::Global) {
+                // An eval-declared variable can be deleted; so can a configurable property of the global object.
+                const std::vector<Ref> envs = evalEnvRefs();
+                const std::uint16_t d = dst >= 0 ? std::uint16_t(dst) : temp();
+                const std::uint16_t inner = fn_->top;
+                Label done;
+                for (const Ref& e : envs) {
+                    const std::uint16_t env = loadEnv(e), flag = temp();
+                    emit(Op::EnvHas, flag, env, atom(target.text));
+                    Label next;
+                    emitJump(Op::JFalse, flag, next);
+                    emit(Op::DelProp, d, env, atom(target.text));
+                    jump(done);
+                    bind(next);
+                    fn_->top = inner;
+                }
+                emit(Op::DelGlobal, d, atom(target.text));
+                bind(done);
+                fn_->top = dst >= 0 ? mark : std::uint16_t(d + 1);
+                return d;
+            }
             if (target.kind != NK::Identifier)
                 exprAny(target);
             fn_->top = mark;
@@ -2625,7 +2726,7 @@ void Compiler::declareLexical(const std::vector<dyn::NodePtr>& list)
 /// Function declarations are made when their scope is entered.
 void Compiler::hoistFunctions(const std::vector<dyn::NodePtr>& list)
 {
-    const bool global = fn_->isProgram && fn_->scopes.size() == 1;
+    const bool global = (fn_->isProgram && fn_->scopes.size() == 1) || (fn_->dynamicVars && fn_->scopes.size() == 1);
     // Declare every name first, so that a function can see its siblings; then make each closure.
     if (!global) {
         for (const dyn::NodePtr& s : list)
@@ -3594,6 +3695,20 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
         if (b.boxed)
             emit(Op::NewBox, b.reg);
     }
+    if (!fn_->strict) {
+        bool hasEval = containsDirectEval(*n.d);
+        for (const dyn::NodePtr& p : n.list)
+            hasEval = hasEval || containsDirectEval(*p);
+        if (hasEval) {
+            // The variables a direct `eval` in here declares go to this object, which the code inside reaches by name.
+            fn_->evalEnvName = u"%evalenv#" + fromUtf8(std::to_string(++vm_.evalEnvSerial));
+            fn_->captured.insert(fn_->evalEnvName);
+            Binding& b = declare(fn_->evalEnvName, BKind::Var);
+            emit(Op::NewEnv, b.reg);
+            if (b.boxed)
+                emit(Op::NewBox, b.reg);
+        }
+    }
     if (block->flags & CodeBlock::kDerived) {
         // Whether `super()` has returned.
         Binding& b = declare(String(u"%bound"), BKind::Var);
@@ -3760,6 +3875,7 @@ CodeBlock* Compiler::evalOnce(const Node& program, const std::vector<String>& na
     // The caller's variables, each a box the eval code reaches as an upvalue.
     Fn outer;
     outer.isProgram = true;
+    outer.evalOuter = true;
     outer.scopes.emplace_back();
     for (std::size_t i = 0; i < names.size(); ++i) {
         Binding b;
@@ -3793,11 +3909,26 @@ CodeBlock* Compiler::evalOnce(const Node& program, const std::vector<String>& na
             annexBNames(program.list, blockFunctions);
             vars.insert(vars.end(), blockFunctions.begin(), blockFunctions.end());
         }
+        // Sloppy eval code declares its `var`s and functions where its caller does: on the eval object of the function that
+        // called it, or on the global object when it was called from global code.
+        top.dynamicVars = !top.strict;
+        const std::vector<Ref> callerEnvs = top.dynamicVars ? evalEnvRefs() : std::vector<Ref>();
         for (const String& v : vars) {
             // `var x` of a name the caller has is that variable.
             if (std::find(names.begin(), names.end(), v) != names.end() ||
                 (findInScopes(*fn_, v) && fn_->scopes.back().bindings.end() != std::find_if(fn_->scopes.back().bindings.begin(), fn_->scopes.back().bindings.end(), [&](const Binding& b) { return b.name == v; })))
                 continue;
+            if (top.dynamicVars) {
+                if (!callerEnvs.empty()) {
+                    const std::uint16_t mark = fn_->top;
+                    const std::uint16_t env = loadEnv(callerEnvs.front());
+                    emit(Op::DeclEnv, env, atom(v));
+                    fn_->top = mark;
+                } else {
+                    emit(Op::DeclGlobal, atom(v));
+                }
+                continue;
+            }
             Binding& b = declare(v, BKind::Var);
             if (b.boxed)
                 emit(Op::NewBox, b.reg);

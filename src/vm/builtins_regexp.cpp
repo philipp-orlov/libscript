@@ -1200,7 +1200,7 @@ struct MatchAllIter : IteratorState
         release(text);
         re = text = JSValue::undefined();
     }
-    void values(std::vector<JSValue>& out) const override
+    void values(Vec<JSValue>& out) const override
     {
         out.push_back(re);
         out.push_back(text);

@@ -34,6 +34,16 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
     if (bytes > mem::LocalHeap::kMaxSmall) [[unlikely]]
         throw Error(ErrorCode::OutOfMemory, "a cell of the vm core is larger than the heap's small limit");
     ctx.maybeCollect();
+    // The context's budget counts heap bytes, which the buffers of arrays and strings do not add to: a program that makes
+    // little garbage of cells with large buffers would hold on to a lot of memory. Cells are counted as well.
+    if (liveCells >= cellBudget_ && !ctx.tearingDown && !ctx.destroying) [[unlikely]] {
+        // A minor collection frees young cycles only; once the cells have more than doubled since a whole look, take one.
+        const bool full = liveCells > cellsAfterFull_ * 2 + kMinCellBudget;
+        ctx.collectCycles(!full);
+        if (full)
+            cellsAfterFull_ = liveCells;
+        cellBudget_ = liveCells + std::max<std::uint64_t>(kMinCellBudget, cellsAfterFull_);
+    }
     ctx.reserve(bytes);
     void* memory = heap.allocate(bytes);
     if (reinterpret_cast<std::uintptr_t>(memory) + bytes > kAddressLimit) [[unlikely]]
@@ -143,7 +153,7 @@ void children(const detail::GCObject* cell, detail::GcList& out, bool tracing)
                 appendIfCell(out, static_cast<JSTypedArray*>(o)->buffer);
             }
             if (Rare* r = o->rare(); r && r->ext && !(tracing && r->ext->ephemeron())) {
-                std::vector<JSValue> held;
+                Vec<JSValue> held;
                 r->ext->values(held);
                 for (JSValue v : held)
                     appendIfCell(out, v);
@@ -365,17 +375,17 @@ void VM::collectCycles(bool minor) noexcept
 {
     if (destroying_ || tearingDown)
         return;
-    std::vector<CellPtr> everything;
+    Vec<CellPtr> everything;
     try {
-        heap.forEachSlot([](void* list, void* slot) { static_cast<std::vector<CellPtr>*>(list)->push_back(static_cast<CellPtr>(slot)); },
+        heap.forEachSlot([](void* list, void* slot) { static_cast<Vec<CellPtr>*>(list)->push_back(static_cast<CellPtr>(slot)); },
                          &everything);
     } catch (...) {
         return;
     }
     // The world: the young cells of a minor collection, every cell otherwise. What lies outside it, and a cell that is never
     // freed, counts as a reference from outside.
-    std::vector<CellPtr> set;
-    std::vector<CellPtr> work;
+    Vec<CellPtr> set;
+    Vec<CellPtr> work;
     for (CellPtr cell : everything) {
         CellHeader* h = headerOf(cell);
         if (h->flags & cellflags::kImmortal) {
@@ -390,7 +400,7 @@ void VM::collectCycles(bool minor) noexcept
         h->gc = (h->rc & kCountMask) | kInSet;
         set.push_back(cell);
     }
-    std::vector<CellPtr>().swap(everything);
+    Vec<CellPtr>().swap(everything);
 
     // A prototype is counted once by the root of the shapes of what inherits from it. That count is not a reference from
     // outside, but a collection that sees the whole heap can tell: whatever inherits from it reaches it below.
@@ -424,7 +434,7 @@ void VM::collectCycles(bool minor) noexcept
             work.push_back(cell);
         }
     };
-    std::vector<CellPtr> seeds;
+    Vec<CellPtr> seeds;
     seeds.swap(work);
     for (CellPtr cell : seeds)
         reach(cell);
@@ -433,7 +443,7 @@ void VM::collectCycles(bool minor) noexcept
         if (h->gc & kCountMask)
             reach(cell);
     }
-    std::vector<JSObject*> tables;
+    Vec<JSObject*> tables;
     while (!work.empty()) {
         CellPtr cell = work.back();
         work.pop_back();
@@ -452,7 +462,7 @@ void VM::collectCycles(bool minor) noexcept
         if (work.empty() && !tables.empty()) {
             // A weak table keeps a value while its key is reached; a key outside the world counts as reached.
             for (JSObject* t : tables) {
-                std::vector<JSValue> held;
+                Vec<JSValue> held;
                 t->rare()->ext->values(held);
                 for (std::size_t i = 0; i + 1 < held.size(); i += 2) {
                     const JSValue key = held[i], value = held[i + 1];
@@ -469,7 +479,7 @@ void VM::collectCycles(bool minor) noexcept
             }
         }
     }
-    std::vector<CellPtr> garbage;
+    Vec<CellPtr> garbage;
     for (CellPtr cell : set) {
         CellHeader* h = headerOf(cell);
         if (!(h->gc & kReached)) {
@@ -496,7 +506,7 @@ void VM::collectCycles(bool minor) noexcept
     for (CellPtr cell : garbage)
         clearReferences(*this, cell);
     // A dead prototype lets go of its root's count; its shapes are freed once what had them is gone.
-    std::vector<Shape*> deadRoots;
+    Vec<Shape*> deadRoots;
     for (CellPtr cell : garbage) {
         if (kindOf(cell) != Kind::Object || !(headerOf(cell)->flags & cellflags::kIsProto))
             continue;

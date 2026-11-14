@@ -107,8 +107,7 @@ drives; a generator's `return(v)` throws a marker that `finally` blocks see and 
 
 ## test262
 
-`tools/run_test262.py` with `SCRIPT_CORE=vm`: 38,456 of 48,795 pass on x86-64 (the old core: 36,984), after the work above
-more. What fails on both cores is mostly `$262.createRealm` and `$262.agent` (cross-realm and threads), Intl-adjacent
+`tools/run_test262.py` with `SCRIPT_CORE=vm`: 38,718 of 48,795 pass on x86-64 (the old core: 36,984; 91 tests the old core passes fail here, 1,825 the other way). What fails on both cores is mostly `$262.createRealm` and `$262.agent` (cross-realm and threads), Intl-adjacent
 Unicode property tables and a few features the shared front end does not parse. What the old core passes and this one does
 not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 

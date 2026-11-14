@@ -1615,6 +1615,15 @@ L_PutElem: {
             a->append(vm, R[ins->c]);
             NEXT();
         }
+        // A hole of a plain array (no properties of its own, the usual prototype chain): nothing can intercept the store.
+        if (i < a->length && a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 &&
+            vm.protos.array->proto(vm) == vm.protos.object) {
+            retain(R[ins->c]);
+            a->elems[i] = R[ins->c];
+            if (!R[ins->c].isNumber())
+                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
+            NEXT();
+        }
     }
     fr->pc = pc;
     if (base.isNullish()) {
@@ -3202,6 +3211,14 @@ int jitPutElem(VM& vm, std::uint32_t index)
         if (i == a->length) {
             retain(R[ins->c]);
             a->append(vm, R[ins->c]);
+            return 1;
+        }
+        if (i < a->length && a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 &&
+            vm.protos.array->proto(vm) == vm.protos.object) {
+            retain(R[ins->c]);
+            a->elems[i] = R[ins->c];
+            if (!R[ins->c].isNumber())
+                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
             return 1;
         }
     }

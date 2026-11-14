@@ -74,7 +74,9 @@ bool createData(VM& vm, JSValue a, double i, JSValue v)
     if (isArray(a) && !(asObject(a)->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
         auto* arr = static_cast<JSArray*>(asObject(a));
         // Appending, or replacing an element that is there: nothing kept by name can be in the way.
-        if (i < double(arr->length) ? !arr->at(std::uint32_t(i)).isHole() : i == double(arr->length)) {
+        const bool plain = arr->proto(vm) == vm.protos.array && !arr->isDictionary(vm) && arr->shapeOf(vm)->count == 0 &&
+                           vm.protos.array->proto(vm) == vm.protos.object;
+        if (i < double(arr->length) ? (plain || !arr->at(std::uint32_t(i)).isHole()) : i == double(arr->length)) {
             retain(v);
             if (arr->setAt(vm, std::uint32_t(i), v))
                 return true;

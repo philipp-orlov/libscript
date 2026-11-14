@@ -40,9 +40,8 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
         // A minor collection frees young cycles only; once the cells have more than doubled since a whole look, take one.
         const bool full = liveCells > cellsAfterFull_ * 2 + kMinCellBudget;
         ctx.collectCycles(!full);
-        if (full)
-            cellsAfterFull_ = liveCells;
-        cellBudget_ = liveCells + std::max<std::uint64_t>(kMinCellBudget, cellsAfterFull_);
+        if (liveCells >= cellBudget_)  // the collection did not run its engine's part
+            cellBudget_ = liveCells * 2;
     }
     ctx.reserve(bytes);
     void* memory = heap.allocate(bytes);
@@ -527,6 +526,10 @@ void VM::collectCycles(bool minor) noexcept
         detail::decRef(cell);
     for (Shape* root : deadRoots)
         retireShapeTree(root);
+    // Re-arm the budget of cells from what is alive now, whoever asked for the collection.
+    if (!minor)
+        cellsAfterFull_ = liveCells;
+    cellBudget_ = liveCells + std::max<std::uint64_t>(kMinCellBudget, cellsAfterFull_);
 }
 
 void VM::releaseRoots() noexcept

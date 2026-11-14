@@ -7,6 +7,7 @@
 // gradually shreds.
 
 #include <cstdio>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -210,7 +211,8 @@ TEST(burstsReturnTheirMemory)
     ctx.collectGarbage();
     const js::Context::Stats quiet = ctx.stats();
 
-    ctx.eval("hold = []; for (let i = 0; i < " + std::to_string(scaled(200000)) +
+    // Even scaled down the burst must be larger than the few idle blocks a heap keeps, or there is nothing to give back.
+    ctx.eval("hold = []; for (let i = 0; i < " + std::to_string(std::max(scaled(200000), 60000)) +
              "; i++) hold.push({ i, s: 'v' + i });");
     const js::Context::Stats loaded = ctx.stats();
     CHECK(loaded.heapBytes > quiet.heapBytes * 4);

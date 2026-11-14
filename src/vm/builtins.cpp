@@ -987,12 +987,25 @@ NATIVE(functionBind)
     Key nameKey = vm.internKey(StringView(fromUtf8(name)));
     const std::uint32_t bound = argc > 1 ? argc - 1 : 0;
     std::uint32_t length = 0;
-    if (JSValue len = getProperty(vm, self, vm.atoms.length); len.isNumber()) {
-        const double d = len.asNumber() - bound;
-        length = d > 0 ? std::uint32_t(d) : 0;
-    } else if (len.isException()) {
+    // Only an own `length` counts; what the target inherits does not.
+    PropDesc ownLength;
+    const int hasLength = objGetOwnProperty(vm, asObject(self), vm.atoms.length, &ownLength);
+    if (hasLength < 0) {
         detail::decRef(nameKey);
-        return len;
+        return JSValue::exception();
+    }
+    if (hasLength) {
+        JSValue len = getProperty(vm, self, vm.atoms.length);
+        if (len.isException()) {
+            detail::decRef(nameKey);
+            return len;
+        }
+        if (len.isNumber()) {
+            const double raw = len.asNumber();
+            const double d = std::isinf(raw) ? raw : (raw != raw ? 0 : std::trunc(raw)) - bound;
+            length = d > 0 ? (d > 4294967295.0 ? 4294967295u : std::uint32_t(d)) : 0;
+        }
+        release(len);
     }
     JSFunction* f = vm.newNativeFunction(vm.protos.function, boundCall, nullptr, nameKey, length);
     detail::decRef(nameKey);
@@ -1027,7 +1040,12 @@ JSValue fillError(VM& vm, JSObject* o, JSValue message, JSValue options = JSValu
     }
     if (isObject(options)) {
         Key causeKey = vm.internKey(std::string_view("cause"));
-        if (hasProperty(vm, options, causeKey)) {
+        const bool hasCause = hasProperty(vm, options, causeKey);
+        if (!hasCause && !vm.exception.isUndefined()) {
+            detail::decRef(causeKey);
+            return JSValue::exception();
+        }
+        if (hasCause) {
             JSValue cause = getProperty(vm, options, causeKey);
             if (cause.isException()) {
                 detail::decRef(causeKey);
@@ -1100,9 +1118,22 @@ NATIVE(errorToString)
         release(name.isException() ? JSValue::undefined() : name);
         return JSValue::exception();
     }
-    std::string n = name.isUndefined() ? "Error" : describe(vm, name), m = message.isUndefined() ? "" : describe(vm, message);
-    release(name);
-    release(message);
+    Handle nameKeep = Handle::adopt(name), messageKeep = Handle::adopt(message);
+    std::string n = "Error", m;
+    if (!name.isUndefined()) {
+        JSValue text = toStringValue(vm, name);
+        if (text.isException())
+            return text;
+        n = toUtf8(asString(text)->text());
+        release(text);
+    }
+    if (!message.isUndefined()) {
+        JSValue text = toStringValue(vm, message);
+        if (text.isException())
+            return text;
+        m = toUtf8(asString(text)->text());
+        release(text);
+    }
     if (n.empty())
         return str(vm, m);
     if (m.empty())

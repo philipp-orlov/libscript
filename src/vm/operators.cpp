@@ -665,6 +665,11 @@ JSValue arithmetic(VM& vm, Op op, JSValue a, JSValue b)
         JSValue pa = toPrimitive(vm, a, false);
         if (pa.isException())
             return pa;
+        // ToNumeric of the left operand comes before anything is done with the right one.
+        if (isSymbol(pa)) {
+            release(pa);
+            return vm.throwError(ErrorCode::TypeError, "Cannot convert a Symbol value to a number");
+        }
         JSValue pb = toPrimitive(vm, b, false);
         if (pb.isException()) {
             release(pa);

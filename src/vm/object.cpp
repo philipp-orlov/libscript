@@ -550,7 +550,9 @@ void JSObject::materialize(VM& vm)
     if (name)
         detail::incRef(text);
     putOwn(vm, vm.atoms.name, JSValue::cell(text), kReadOnlyConfigurable);
-    if (!(f->flags & JSFunction::kNative) && (f->code->flags & CodeBlock::kGenerator)) {
+    const bool script = !(f->flags & JSFunction::kNative);
+    const bool plainAsync = script && (f->code->flags & CodeBlock::kAsync) && !(f->code->flags & CodeBlock::kAsyncGen);
+    if (script && (f->code->flags & CodeBlock::kGenerator) && !plainAsync) {
         // A generator function's `prototype` is what its generators inherit from; it has no `constructor`.
         JSObject* prototype = vm.newObject((f->code->flags & CodeBlock::kAsyncGen) ? vm.protos.asyncGenerator : vm.protos.generator);
         putOwn(vm, vm.atoms.prototype, toJSValue(prototype), attr::kWritable);

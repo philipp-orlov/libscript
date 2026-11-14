@@ -380,6 +380,7 @@ void installDate(VM& vm)
     }
     method(vm, proto, "toJSON", dateToJSON, 1);
     symbolMethod(vm, proto, vm.atoms.symToPrimitive, "[Symbol.toPrimitive]", dateToPrimitive, 1);
+    proto->setAttrs(vm, vm.atoms.symToPrimitive, attr::kConfigurable);
     release(toJSValue(proto));
 }
 

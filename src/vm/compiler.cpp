@@ -1422,6 +1422,8 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
         }
         if (p->computed) {
             const std::uint16_t k = exprTemp(*p->a);
+            // The key becomes a property key before the value is worked out.
+            emit(Op::ToKey, k, k);
             if (p->propKind == PropKind::Getter || p->propKind == PropKind::Setter) {
                 const std::uint16_t f = temp();
                 function(*p->b, String(), f);

@@ -918,6 +918,21 @@ NATIVE(wrapUnwrap)
     return iterResult(vm, arg(args, argc, 0), r.fnState != 0);
 }
 
+/// What a rejected value of `next()` or `return()` does: closes the sync iterator (boundTarget), then rejects with the same
+/// reason (AsyncFromSyncIteratorContinuation with closeOnRejection).
+NATIVE(wrapCloseOnReject)
+{
+    UNUSED();
+    Rare& r = carried(data);
+    const JSValue reason = arg(args, argc, 0);
+    iteratorClose(vm, r.boundTarget, true);
+    release(vm.exception);
+    vm.exception = reason;
+    retain(vm.exception);
+    vm.exceptionCode = ErrorCode::Exception;
+    return JSValue::exception();
+}
+
 NATIVE(syncWrapStep)
 {
     UNUSED();
@@ -946,11 +961,12 @@ NATIVE(syncWrapStep)
         } else if (f.isNullish()) {
             release(f);
             if (mode == 1) {
-                release(vm.exception);
-                vm.exception = arg(args, argc, 0);
-                retain(vm.exception);
-                vm.exceptionCode = ErrorCode::Exception;
-                r = JSValue::exception();
+                // No `throw`: the iterator is closed to give it a chance to clean up, and that is a protocol violation.
+                if (!iteratorClose(vm, w->iterator.get(), false)) {
+                    r = JSValue::exception();
+                } else {
+                    r = vm.throwError(ErrorCode::TypeError, "The iterator does not provide a 'throw' method");
+                }
             } else {
                 retain(arg(args, argc, 0));
                 r = iterResult(vm, arg(args, argc, 0), true);
@@ -991,9 +1007,20 @@ NATIVE(syncWrapStep)
     }
     Handle vKeep = Handle::adopt(v);
     JSValue wrapped = promiseResolve(vm, v);
+    if (wrapped.isException()) {
+        if (!done && mode != 1)
+            iteratorClose(vm, w->iterator.get(), true);
+        JSValue e = takeException(vm);
+        rejectPromise(vm, derived, e);
+        release(e);
+        return derivedKeep.take();
+    }
     Handle wrappedKeep = Handle::adopt(wrapped);
     Handle unwrap = Handle::adopt(toJSValue(closureFn(vm, wrapUnwrap, JSValue::undefined(), JSValue::undefined(), done ? 1 : 0)));
-    performThen(vm, wrapped, unwrap.get(), JSValue::undefined(), derived);
+    Handle onRejected;
+    if (!done && mode != 1)
+        onRejected = Handle::adopt(toJSValue(closureFn(vm, wrapCloseOnReject, w->iterator.get(), JSValue::undefined(), 0)));
+    performThen(vm, wrapped, unwrap.get(), onRejected.get(), derived);
     return derivedKeep.take();
 }
 
@@ -1039,17 +1066,20 @@ JSValue asyncFromSyncIterator(VM& vm, JSValue iterator, JSValue next)
 void installPromise(VM& vm)
 {
     {
-        JSObject* agProto = vm.newObject(vm.protos.object);
+        // %AsyncIteratorPrototype%, which `Symbol.asyncIterator` lives on, is what an async generator's prototype inherits from.
+        JSObject* asyncIteratorProto = vm.newObject(vm.protos.object);
+        symbolMethod(vm, asyncIteratorProto, vm.atoms.symAsyncIterator, "[Symbol.asyncIterator]",
+                     [](VM&, JSValue self, const JSValue*, std::uint32_t, void*) -> JSValue {
+                         retain(self);
+                         return self;
+                     }, 0);
+        JSObject* agProto = vm.newObject(asyncIteratorProto);
+        release(toJSValue(asyncIteratorProto));
         vm.setIntrinsic(&vm.protos.asyncGenerator, agProto);
         release(toJSValue(agProto));
         method(vm, agProto, "next", asyncGenEnqueue, 1, reinterpret_cast<void*>(0));
         method(vm, agProto, "throw", asyncGenEnqueue, 1, reinterpret_cast<void*>(1));
         method(vm, agProto, "return", asyncGenEnqueue, 1, reinterpret_cast<void*>(2));
-        symbolMethod(vm, agProto, vm.atoms.symAsyncIterator, "[Symbol.asyncIterator]",
-                     [](VM&, JSValue self, const JSValue*, std::uint32_t, void*) -> JSValue {
-                         retain(self);
-                         return self;
-                     }, 0);
         agProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("AsyncGenerator")), attr::kConfigurable);
     }
     JSObject* proto = vm.newObject(vm.protos.object);

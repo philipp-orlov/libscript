@@ -2262,6 +2262,44 @@ struct JsonWriter
     String out;
     Vec<JSObject*> stack;
     Key toJson = nullptr;  ///< held for the length of the call
+    /// Whether Array.prototype and Object.prototype have no `toJSON`, as of `protoCell` (held while it is valid).
+    ValidityCell* protoCell = nullptr;
+    bool protosClean = false;
+    std::uint32_t cleanShape = 0;  ///< the last shape of a plain object found to have no `toJSON` of its own
+    ~JsonWriter()
+    {
+        if (protoCell)
+            vm.releaseValidity(protoCell);
+    }
+    /// Whether `o`, a plain object or an array with the usual prototype, has no `toJSON` anywhere: no lookup needed.
+    bool noToJson(JSObject* o)
+    {
+        JSObject* ap = vm.protos.array;
+        if (!ap || !vm.protos.object)
+            return false;
+        if (!protoCell || !protoCell->valid) {
+            if (protoCell)
+                vm.releaseValidity(protoCell);
+            protoCell = vm.validityOf(ap);
+            vm.retainValidity(protoCell);
+            protosClean = ap->proto(vm) == vm.protos.object && !ap->findOwn(vm, toJson) &&
+                          !vm.protos.object->findOwn(vm, toJson);
+            cleanShape = 0;
+        }
+        if (!protosClean || o->isDictionary(vm))
+            return false;
+        const ObjClass cls = o->cls();
+        if (cls == ObjClass::Array && o->proto(vm) == ap)
+            return o->h.shape == cleanShape || o->shapeOf(vm)->indexOf(toJson) < 0;
+        if (cls != ObjClass::Plain || o->proto(vm) != vm.protos.object)
+            return false;
+        if (o->h.shape == cleanShape)
+            return true;
+        if (o->shapeOf(vm)->indexOf(toJson) >= 0)
+            return false;
+        cleanShape = o->h.shape;
+        return true;
+    }
 };
 
 void jsonQuote(String& out, StringView s)
@@ -2269,6 +2307,16 @@ void jsonQuote(String& out, StringView s)
     static const char16_t hex[] = u"0123456789abcdef";
     out.push_back(u'"');
     for (std::size_t i = 0; i < s.size(); ++i) {
+        // A run of characters that stand as they are, in one go.
+        std::size_t run = i;
+        while (run < s.size() && s[run] >= 0x20 && s[run] != u'"' && s[run] != u'\\' && (s[run] < 0xd800 || s[run] > 0xdfff))
+            ++run;
+        if (run > i) {
+            out.append(s.data() + i, run - i);
+            i = run;
+            if (i >= s.size())
+                break;
+        }
         const char16_t c = s[i];
         switch (c) {
             case u'"': out += u"\\\""; break;
@@ -2314,7 +2362,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         return 0;
     }
     Handle value = Handle::retained(input);
-    if (isObject(value.get()) || isBigInt(value.get())) {
+    if ((isObject(value.get()) && !j.noToJson(asObject(value.get()))) || isBigInt(value.get())) {
         JSValue fn = getProperty(vm, value.get(), j.toJson);
         if (fn.isException())
             return 0;
@@ -2379,6 +2427,13 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         jsonQuote(j.out, asString(v)->text());
         return 1;
     }
+    if (v.isInt32()) {
+        char digits[16];
+        const int n = std::snprintf(digits, sizeof digits, "%d", v.asInt32());
+        for (int k = 0; k < n; ++k)
+            j.out.push_back(char16_t(digits[k]));
+        return 1;
+    }
     if (v.isNumber()) {
         const double d = v.asNumber();
         j.out += std::isfinite(d) ? script::internal::numberToString(d) : String(u"null");
@@ -2402,8 +2457,9 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         return 0;
     }
     j.stack.push_back(o);
-    const String stepback = j.indent;
-    j.indent += j.gap;
+    const String stepback = j.gap.empty() ? String() : j.indent;
+    if (!j.gap.empty())
+        j.indent += j.gap;
     const bool array = isArray(v);
     Vec<Handle> keys;
     // A plain object made of data properties with names that are not indexes: its keys are read off the shape, and each value
@@ -2547,7 +2603,8 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
             }
         }
     }
-    j.indent = stepback;
+    if (!j.gap.empty())
+        j.indent = stepback;
     j.stack.pop_back();
     if (wroteAny && !j.gap.empty()) {
         j.out.push_back(u'\n');
@@ -2640,6 +2697,54 @@ struct JsonReader
         i += n;
         return true;
     }
+    /// A string's text: a piece of the source when it has no escapes, else built in `scratch`. False on a syntax error (thrown).
+    bool text(StringView* view, String& scratch)
+    {
+        const std::size_t start = i + 1;
+        std::size_t k = start;
+        while (k < s.size()) {
+            const char16_t c = s[k];
+            if (c == u'"') {
+                *view = StringView(s.data() + start, k - start);
+                i = k + 1;
+                return true;
+            }
+            if (c == u'\\' || c < 0x20)
+                break;
+            ++k;
+        }
+        scratch.clear();
+        if (string(&scratch).isException())
+            return false;
+        *view = StringView(scratch);
+        return true;
+    }
+    /// The key for a property name, from a few names this parse has seen (most objects of one document share theirs).
+    Key key(StringView name)
+    {
+        const std::size_t slot = (name.size() * 31 + (name.empty() ? 0 : name[0] + name.back() * 7)) & 31;
+        Key& cached = keys[slot];
+        if (cached && cached->kind == detail::CellKind::String) {
+            const StringView have = static_cast<StringCell*>(cached)->text();
+            if (have == name) {
+                detail::incRef(cached);
+                return cached;
+            }
+        }
+        Key k = vm.internKey(name);
+        if (cached)
+            detail::decRef(cached);
+        cached = k;
+        detail::incRef(k);
+        return k;
+    }
+    Key keys[32] = {};
+    ~JsonReader()
+    {
+        for (Key k : keys)
+            if (k)
+                detail::decRef(k);
+    }
     // Owned; the exception sentinel on a syntax error.
     JSValue string(String* text)
     {
@@ -2727,10 +2832,30 @@ struct JsonReader
             while (i < s.size() && s[i] >= u'0' && s[i] <= u'9')
                 ++i;
         }
-        std::string text;
-        for (std::size_t k = start; k < i; ++k)
-            text.push_back(char(s[k]));
-        return JSValue::boxNumber(std::strtod(text.c_str(), nullptr));
+        // A short integer is read here; the rest by the library, from a copy in ASCII.
+        const std::size_t len = i - start;
+        const bool negative = s[start] == u'-';
+        if (len - negative <= 9) {
+            bool digits = true;
+            std::int32_t n = 0;
+            for (std::size_t k = start + negative; k < i && digits; ++k) {
+                digits = s[k] >= u'0' && s[k] <= u'9';
+                n = n * 10 + std::int32_t(s[k] - u'0');
+            }
+            if (digits && !(negative && n == 0))
+                return JSValue::int32(negative ? -n : n);
+        }
+        char small[64];
+        std::string big;
+        char* text = small;
+        if (len >= sizeof small) {
+            big.resize(len + 1);
+            text = big.data();
+        }
+        for (std::size_t k = 0; k < len; ++k)
+            text[k] = char(s[start + k]);
+        text[len] = 0;
+        return JSValue::boxNumber(std::strtod(text, nullptr));
     }
     JSValue value()
     {
@@ -2739,11 +2864,11 @@ struct JsonReader
             return fail("unexpected end of input");
         const char16_t c = s[i];
         if (c == u'"') {
-            String text;
-            JSValue r = string(&text);
-            if (r.isException())
-                return r;
-            return makeString(vm, StringView(text));
+            String scratch;
+            StringView view;
+            if (!text(&view, scratch))
+                return JSValue::exception();
+            return makeString(vm, view);
         }
         if (c == u'-' || (c >= u'0' && c <= u'9'))
             return number();
@@ -2799,10 +2924,10 @@ struct JsonReader
                 skip();
                 if (i >= s.size() || s[i] != u'"')
                     return fail("expected a property name");
-                String name;
-                JSValue r = string(&name);
-                if (r.isException())
-                    return r;
+                String scratch;
+                StringView name;
+                if (!text(&name, scratch))
+                    return JSValue::exception();
                 skip();
                 if (i >= s.size() || s[i] != u':')
                     return fail("expected ':'");
@@ -2811,10 +2936,10 @@ struct JsonReader
                 if (item.isException())
                     return item;
                 Handle itemKeep = Handle::adopt(item);
-                Key key = vm.internKey(StringView(name));
+                Key k = key(name);
                 retain(item);
-                defineOwn(vm, o, key, item, attr::kDefault);
-                detail::decRef(key);
+                defineOwn(vm, o, k, item, attr::kDefault);
+                detail::decRef(k);
                 skip();
                 if (i < s.size() && s[i] == u',') {
                     ++i;

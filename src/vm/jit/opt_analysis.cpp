@@ -92,6 +92,9 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
     case Op::KeysOf: case Op::ToKey:
         rd(in.b); wr(in.a);
         break;
+    case Op::GetSuperProp:
+        rd(in.c); wr(in.a);
+        break;
     case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined:
     case Op::JHole: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI:
     case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI: case Op::Ret: case Op::Throw:

@@ -136,6 +136,14 @@ struct PolyCache
     std::uint8_t n = 0;
     std::uint8_t next = 0;  ///< the entry replaced when all four are taken
 };
+/// What a `super.name` read found: the slot of a data property on the chain above `home`, good while `validity` (of
+/// `home`'s chain) is valid. `home` is compared, not counted: a dead home object was a prototype, so its cell is cleared.
+struct SuperCache
+{
+    const void* home = nullptr;
+    JSValue* slot = nullptr;
+    ValidityCell* validity = nullptr;
+};
 /// The id a property instruction carries in the word after it when it has no cache (too many in one function).
 inline constexpr std::uint16_t kNoCache = 0xFFFF;
 
@@ -174,6 +182,7 @@ struct CodeBlock
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
     Vec<InlineCache> caches;
     Vec<PolyCache> poly;
+    Vec<SuperCache> superCaches;  ///< one per instruction, made with the baseline code of a function that reads `super.x`
     /// What the instructions have made so far (profBit: 1 int32, 2 double, 8 anything else), one byte per instruction, then
     /// one per parameter for what calls passed: the optimizing compiler's type feedback. Empty until the code first runs.
     Vec<std::uint8_t> prof;

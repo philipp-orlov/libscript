@@ -183,6 +183,9 @@ void VM::releaseCode(CodeBlock* code) noexcept
         for (std::uint8_t i = 0; i < p.n; ++i)
             if (p.e[i].validity)
                 releaseValidity(p.e[i].validity);
+    for (const SuperCache& s : code->superCaches)
+        if (s.validity)
+            releaseValidity(s.validity);
     for (CodeBlock* child : code->children)
         releaseCode(child);
     if (code->tier2) {

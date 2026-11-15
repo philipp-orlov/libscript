@@ -445,6 +445,11 @@ constexpr std::int32_t kTypedLength = std::int32_t(offsetof(JSTypedArray, length
 constexpr std::int32_t kTypedKind = std::int32_t(offsetof(JSTypedArray, kind));
 constexpr std::int32_t kRareNative = std::int32_t(offsetof(Rare, native));
 constexpr std::int32_t kRareData = std::int32_t(offsetof(Rare, nativeData));
+constexpr std::int32_t kRareHome = std::int32_t(offsetof(Rare, home));
+constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
+constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
+constexpr std::int32_t kSuperSlot = std::int32_t(offsetof(SuperCache, slot));
+constexpr std::int32_t kSuperValidity = std::int32_t(offsetof(SuperCache, validity));
 constexpr std::int32_t kObjSlots = 16;
 constexpr std::int32_t kObjInline = 24;
 constexpr std::int32_t kBoxValue = 16;
@@ -979,6 +984,8 @@ private:
     void getProp(std::uint32_t i, const Ins& in);
     void putProp(std::uint32_t i, const Ins& in);
     void getElem(std::uint32_t i, const Ins& in);
+    void getSuperProp(std::uint32_t i, const Ins& in);
+    void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
     void putElem(std::uint32_t i, const Ins& in);
     void ret(std::uint32_t i, const Ins& in);
     void call(std::uint32_t i, const Ins& in);
@@ -1204,6 +1211,9 @@ void Baseline::emit(std::uint32_t i)
         return;
     case Op::GetElem:
         getElem(i, in);
+        return;
+    case Op::GetSuperProp:
+        getSuperProp(i, in);
         return;
     case Op::PutElem:
         putElem(i, in);
@@ -1676,6 +1686,14 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
                 seen[count++] = Seen{e.shape, e.index, e.holder, e.validity};
         }
     }
+    if (count == 0 && !isLength && ic && ic->shape == 0 && ic->pad && ic->pad <= code_->poly.size()) {
+        // A getter the site always finds in the same place: called like a script function, without the runtime.
+        const PolyCache& pc = code_->poly[ic->pad - 1];
+        if (pc.n == 1 && (pc.e[0].kind == PolyEntry::OwnAccessor || (pc.e[0].kind == PolyEntry::ProtoAccessor && pc.e[0].validity))) {
+            getterCall(i, in, pc.e[0]);
+            return;
+        }
+    }
     if (count == 0 && !isLength) {
         helperOp(i, &helperThunk<jitGetProp>);
         return;
@@ -1717,6 +1735,86 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     a_.bind(done);
 }
 
+void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
+{
+    // The getter's frame goes above this function's registers: `this` (not counted: the receiver register holds it until
+    // the result is written) and nothing else, the rest of the stack there being undefined already.
+    Label& bad = slow(i, &helperThunk<jitGetProp>, true);
+    throws_.emplace_back(i, Label{});
+    Label& exc = throws_.back().second;
+    const std::int32_t thisAt = std::int32_t(8 * code_->nregs);
+    savePool(i);
+    a_.mov(RAX, R(in.b));
+    needObject(RAX, bad);
+    a_.cmpI32(mem(RAX, 0), std::int32_t(e.shape));
+    a_.jcc(CNE, bad);
+    if (e.holder) {
+        hold(e.validity);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(e.validity));
+        a_.cmpI32(mem(RCX, kValidityValid), 0);
+        a_.jcc(CE, bad);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(e.holder));
+    }
+    slotAddress(e.index);
+    a_.mov(RAX, mem(RDX, 0));
+    a_.mov(RAX, mem(RAX, kGsGetter));
+    needObject(RAX, bad);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+    a_.jcc(CNE, bad);
+    a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+    a_.jcc(CNE, bad);
+    a_.mov(RCX, mem(RAX, kFnCode));
+    a_.mov(RDX, mem(RCX, kCbTier1));
+    a_.test(RDX, RDX);
+    a_.jcc(CE, bad);
+    a_.testI32(mem(RCX, kCbFlags), CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync |
+                                       CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs);
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RCX, kCbNregs));
+    a_.lea(R9, mem(RBX, thisAt));
+    a_.lea(R10, mem(R9, RSI, 8, 64));
+    a_.alu(7, R10, mem(R12, kVmStackEnd));
+    a_.jcc(CA, bad);
+    a_.lea(R10, mem(R9, RSI, 8));
+    a_.alu(7, R10, mem(R12, kVmStackInit));
+    a_.jcc(CA, bad);
+    a_.mov32(R10, mem(R12, kVmFrameCount));
+    a_.aluI32(0, R10, 2);
+    a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+    a_.jcc(CAE, bad);
+    a_.cmpI32(mem(R12, kVmTicks), 1);
+    a_.jcc(CBE, bad);
+    a_.alu(7, RSP, mem(R12, kVmStackFloor));
+    a_.jcc(CB, bad);
+    a_.mov(RDI, R(in.b));
+    a_.mov(mem(R9, 0), RDI);
+    a_.dec32(mem(R12, kVmTicks));
+    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + length(i)]));
+    a_.mov(mem(R13, kFramePc), RDI);
+    a_.mov32(R10, mem(R12, kVmFrameCount));
+    a_.mov(R11, mem(R12, kVmFrameBase));
+    a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
+    a_.add(R11, RDI);
+    a_.inc32(mem(R12, kVmFrameCount));
+    a_.mov(mem(R11, kFrameCode), RCX);
+    a_.mov(mem(R11, kFrameFn), RAX);
+    a_.mov(mem(R11, kFramePc), 0);
+    a_.mov(mem(R11, kFrameR), R9);
+    a_.movImm(RDI, in.a);
+    a_.mov(mem(R11, kFrameRetDst), RDI);
+    a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
+    a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+    a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+    a_.mov(RSI, R11);
+    a_.mov(RDX, mem(RDX, kTierEntry));
+    a_.callReg(RDX);
+    a_.mov(mem(RBX, thisAt), std::int32_t(kUndefined));
+    a_.test(RAX, RAX);
+    a_.jcc(CE, exc);
+    write(in.a, RAX);
+    restorePool(i);
+}
+
 void Baseline::putProp(std::uint32_t i, const Ins& in)
 {
     const std::uint16_t cacheId = code_->code[i + 1].a;
@@ -1751,6 +1849,32 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
     retain(RCX);
     a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic->index)), RCX);
     a_.mov32(mem(RAX, 0), std::int32_t(ic->next));
+}
+
+void Baseline::getSuperProp(std::uint32_t i, const Ins& in)
+{
+    // The slot the helper found last time, while the function's home object is the same and its chain unchanged.
+    if (code_->superCaches.empty())
+        code_->superCaches.assign(code_->code.size(), SuperCache{});
+    const SuperCache* sc = &code_->superCaches[i];
+    Label& bad = slow(i, &helperThunk<jitGetSuperProp>);
+    a_.mov(RAX, mem(R13, kFrameFn));
+    a_.test(RAX, RAX);
+    a_.jcc(CE, bad);
+    a_.testI8(mem(RAX, kHdrFlags), cellflags::kHasRare);
+    a_.jcc(CE, bad);
+    a_.mov(RAX, mem(RAX, kObjSlots));
+    a_.mov(RAX, mem(RAX, -16));
+    a_.mov(RAX, mem(RAX, kRareHome));
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(sc));
+    a_.cmp(RAX, mem(RCX, kSuperHome));
+    a_.jcc(CNE, bad);
+    a_.mov(RDX, mem(RCX, kSuperValidity));
+    a_.cmpI32(mem(RDX, kValidityValid), 0);
+    a_.jcc(CE, bad);
+    a_.mov(RDX, mem(RCX, kSuperSlot));
+    a_.mov(RAX, mem(RDX, 0));
+    deliver(i, in.a);
 }
 
 void Baseline::getElem(std::uint32_t i, const Ins& in)

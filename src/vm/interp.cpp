@@ -3049,6 +3049,48 @@ int jitGetGlobal(VM& vm, std::uint32_t index)
     return 1;
 }
 
+int jitGetSuperProp(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    Rare* rr = c.fr->fn ? c.fr->fn->rare() : nullptr;
+    JSObject* const home = rr && isObject(rr->home) ? asObject(rr->home) : nullptr;
+    JSObject* const start = home ? home->proto(vm) : nullptr;
+    if (!start) {
+        vm.throwError(ErrorCode::TypeError, "Cannot read properties of null (reading a property through 'super')");
+        return 0;
+    }
+    const Key key = c.atoms[ins->b];
+    // A data property of an ordinary object on the chain: remembered for the compiled code, by slot.
+    if (index < c.code->superCaches.size()) {
+        // The cell first: making it may move the slots of the objects on the chain.
+        ValidityCell* cell = vm.validityOf(home);
+        for (JSObject* p = start; p; p = p->proto(vm)) {
+            if (p->cls() != ObjClass::Plain && p->cls() != ObjClass::Function)
+                break;
+            std::uint8_t attrs = 0;
+            JSValue* slot = p->findOwn(vm, key, &attrs);
+            if (!slot)
+                continue;
+            if (!(attrs & attr::kAccessor) && cell->valid) {
+                SuperCache& sc = c.code->superCaches[index];
+                vm.retainValidity(cell);
+                if (sc.validity)
+                    vm.releaseValidity(sc.validity);
+                sc = SuperCache{home, slot, cell};
+                copyReg(c.R[ins->a], *slot);
+                return 1;
+            }
+            break;
+        }
+    }
+    JSValue v = getPropertyFrom(vm, start, c.R[ins->c], key);
+    if (v.isException())
+        return 0;
+    setReg(c.R[ins->a], v);
+    return 1;
+}
+
 int jitGetProp(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, true);

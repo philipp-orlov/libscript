@@ -1,8 +1,8 @@
 # The vm core
 
-A second execution core for JavaScript, built beside the dynamic engine (`src/dyn`), which stays the default and the
-oracle until the new one runs every JavaScript suite. The design is in `ls-jsc.md` (outside this repository); this page
-says what is here.
+The execution core for JavaScript, TypeScript and Python (`src/vm`). It is the default: a `Context` runs on it unless told to
+use the dynamic engine (`src/dyn`), which stays in the tree as the oracle (`Options::core = Dyn`, and `SCRIPT_CORE=dyn` in builds
+with `SCRIPT_JIT_ENV_OVERRIDE`). The design is in `ls-jsc.md` (outside this repository); this page says what is here.
 
 ## Using it
 
@@ -12,9 +12,10 @@ SCRIPT_CORE=vm build/vm-dev/tools/libscript program.js      # run on the new cor
 SCRIPT_CORE=vm SCRIPT_VM_DUMP=1 build/vm-dev/tools/libscript program.js   # print the bytecode first
 ```
 
-`SCRIPT_JS_CORE` is `dyn` (default), `vm` or `both`. `vm` builds the new core but keeps the old one as the default context
-until the switch-over (`SCRIPT_VM_DEFAULT`, off). In code, `Context::Options::core = Context::Options::Core::Vm` picks it per
-context; builds with `SCRIPT_JIT_ENV_OVERRIDE` also read `SCRIPT_CORE=dyn|vm`. `-DSCRIPT_VM_LANGS="javascript;typescript;python"`
+`SCRIPT_JS_CORE` is `vm` (default: builds the new core and makes it the default), `both` (the same; the name says that the old core
+is built too, which it is in every setting but `dyn`) or `dyn` (the old core only). In code, `Context::Options::core` picks a core
+per context; `Auto` is the new core when it is built (`SCRIPT_VM_DEFAULT`).
+`-DSCRIPT_VM_LANGS="javascript;typescript;python"`
 (a cache variable: reconfigure to change it) says which languages the new core runs: TypeScript goes through the shared
 parser, checker and type eraser and then the vm compiler (`src/vm/language.cpp`); Python runs the shared prelude on the vm
 core's natives (`src/vm/python.cpp`). `Context::core()` says which core a context has.
@@ -63,6 +64,13 @@ includes what it calls), and an exception handler is entered by looking its labe
   interpreter, `=2` adds the sites.
 - Tests: `everySnippetAgreesInCompiledCode` runs every snippet and `snippets_jit.inc` Eager and Tiered; `FUZZ_TIER1=1
   tools/vm_fuzz.py` fuzzes compiled code; the suites run with `SCRIPT_VM_TIER1=1`.
+
+## Property read caches
+
+A read site has one inline cache (own property, prototype property with a validity cell, in the word after the instruction) and,
+when it sees more, a `PolyCache` of four entries reached through `InlineCache::pad`: own and inherited data properties and
+getters. The interpreter and the helper `jitGetProp` probe it; tier 1 compiles a guard chain over the entries it has at compile
+time (data entries only). Getters are not inline-cached in compiled code: they go to the helper, which calls them.
 
 ## Rules the code keeps
 
@@ -113,8 +121,12 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 
 ## Known limits
 
-- Tier 1 (the baseline compiler) is the default; tier 2 (the first optimizing form) is off unless `SCRIPT_VM_TIER2=<calls>` (a threshold; 0 is off) is set in a
-  build with `SCRIPT_JIT_ENV_OVERRIDE`. aarch64 has no compiler yet and interprets (no aarch64 hardware was available).
+- Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in
+  registers) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in builds with
+  `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). aarch64 has no compiler yet and interprets (no aarch64 hardware was available).
+- Speed: ahead of JavaScriptCore without its JITs on most kernels and level with the old core on `map_dict`; the old core's JIT is
+  still 2x to 5x faster on call-heavy, allocation-heavy and callback-heavy code (`fib_calls`, `closure`, `alloc_small`, `tree_gc`,
+  `sort_cmp`, `array_push_hof`), which needs inlining and cheaper native-to-script calls.
 - Not compiled by tier 1: generators and async functions (they stay in the interpreter), functions of more than 20,000
   instructions.
 - Arrays are dense: a length past what a gap of `JSArray::kMaxDenseGap` allows (`a.length = 2**32 - 1`) ends in

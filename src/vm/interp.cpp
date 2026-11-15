@@ -339,6 +339,11 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
 {
     if (!cacheable(vm, o))
         return false;
+    // A typed array answers a canonical numeric name itself, whatever its prototypes have.
+    double numeric;
+    const bool numericKey = canonicalNumericIndex(key, &numeric);
+    if (numericKey && o->cls() == ObjClass::TypedArray)
+        return false;
     PolyEntry entry;
     std::uint8_t attrs = 0;
     std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
@@ -346,7 +351,7 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
     JSObject* holder = nullptr;
     if (index < 0) {
         for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
-            if (!cacheable(vm, p))
+            if (!cacheable(vm, p) || (numericKey && p->cls() == ObjClass::TypedArray))
                 return false;
             index = p->shapeOf(vm)->indexOf(key, &attrs);
             if (index >= 0) {

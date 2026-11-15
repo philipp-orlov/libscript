@@ -848,11 +848,22 @@ private:
         CodeBlock* code;
         std::uint32_t globalIndex;  ///< the global's slot index
         bool thisSkipped;
+        std::uint32_t read;  ///< the `GetGlobal` of the callee
+        bool thisNull;       ///< the skipped `this` is null (else undefined)
     };
+    std::vector<std::int32_t> exitRedirect_;  ///< an exit at an instruction runs from here instead (nothing between has effects)
     std::map<std::uint32_t, DirectCall> directCalls_;
     std::vector<std::uint8_t> skipDef_;  ///< instructions whose result a direct call keeps out of the frame
     std::map<std::uint32_t, std::vector<std::pair<unsigned, JSValue>>> pendingAt_;  ///< what an exit there writes first
     void planDirectCalls();
+    // read chains (opt_inline.inc)
+    std::vector<std::uint8_t> chainRole_;  ///< 1: the result goes to the chain slot; 2: the receiver comes from it
+    std::vector<std::int32_t> chainHead_;  ///< for an instruction inside a chain: where a failed guard restarts
+    std::int32_t chainSlot_ = -1;          ///< rsp-relative
+    void planChains();
+    bool regDeadAfter(std::uint32_t i, unsigned r);
+    bool chainable(std::uint32_t i, bool asConsumer);
+    void emitChain(std::uint32_t i);
     void emitDirectCall(std::uint32_t i);
     void writePending(std::uint32_t point);
     bool inlineDeliver(InlineCtx& cx, const IVal& v, unsigned dst);

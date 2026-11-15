@@ -164,6 +164,15 @@ void Baseline::restorePool(std::uint32_t i)
 
 Label& Baseline::exitLabel(std::uint32_t i, int kind)
 {
+    // Inside a read chain every exit runs the chain again from its start: nothing in it has an effect.
+    if (optimizing() && i < chainHead_.size() && chainHead_[i] >= 0 && std::uint32_t(chainHead_[i]) != i) {
+        i = std::uint32_t(chainHead_[i]);
+        kind = 0;
+    }
+    if (optimizing() && i < exitRedirect_.size() && exitRedirect_[i] >= 0) {
+        i = std::uint32_t(exitRedirect_[i]);
+        kind = 0;
+    }
     const std::uint64_t key = (std::uint64_t(i) << 1) | std::uint64_t(kind);
     auto it = exitIndex_.find(key);
     if (it != exitIndex_.end())
@@ -938,6 +947,11 @@ void Baseline::emitOpt(std::uint32_t i)
         emitDirectCall(i);
         return;
     }
+    if (i < chainRole_.size() && chainRole_[i]) {
+        forgetFacts();
+        emitChain(i);
+        return;
+    }
     if (emitTyped(i)) {
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
             if (r < factShape_.size()) {
@@ -1037,10 +1051,12 @@ Tier2Code* Baseline::compileOptimized()
     for (std::uint32_t j = 0; j < n_; j += length(j))
         calls = calls || code_->code[j].opcode() == Op::Call;
     inlineBase_ = calls ? std::int32_t(8 + 8 * W) : -1;
-    spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 15) & ~15u);
+    chainSlot_ = std::int32_t(8 + 8 * W + (calls ? 8 * kInlineSlots : 0));
+    spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 8 + 15) & ~15u);
     dirty_.assign(W, 1);
     findPlainRegs();
     planDirectCalls();
+    planChains();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);
     a_.push(RBX);

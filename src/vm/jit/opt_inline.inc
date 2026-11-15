@@ -784,6 +784,7 @@ void Baseline::planDirectCalls()
     directCalls_.clear();
     pendingAt_.clear();
     skipDef_.assign(n_ + 1, 0);
+    exitRedirect_.assign(n_ + 1, -1);
     if (!code_->handlers.empty())
         return;
     std::vector<std::uint32_t> starts;
@@ -822,22 +823,7 @@ void Baseline::planDirectCalls()
             return false;
         }
     };
-    // Whether `r` is read after instruction `k` before it is written again (a jump ends the search: assume it is).
-    auto deadAfter = [&](std::size_t k, unsigned r) {
-        for (std::size_t m = k + 1; m < starts.size(); ++m) {
-            const std::uint32_t j = starts[m];
-            if (reads(j, r))
-                return false;
-            if (writes(j, r))
-                return true;
-            const Op op = code_->code[j].opcode();
-            if (op == Op::Ret || op == Op::Throw)
-                return true;
-            if (opt::jumpTarget(*code_, j) >= 0)
-                return false;
-        }
-        return false;
-    };
+    auto deadAfter = [&](std::size_t k, unsigned r) { return regDeadAfter(starts[k], r); };
     for (std::size_t k = 0; k < starts.size(); ++k) {
         const std::uint32_t i = starts[k];
         const Ins& in = code_->code[i];
@@ -898,19 +884,16 @@ void Baseline::planDirectCalls()
             thisSkipped = !readBetween;
         }
         holdValue(f);
-        directCalls_[i] = DirectCall{f, C, index, thisSkipped};
+        directCalls_[i] = DirectCall{f, C, index, thisSkipped, std::uint32_t(d),
+                                     t >= 0 && code_->code[std::size_t(t)].opcode() == Op::LoadNull};
         skipDef_[std::size_t(d)] = 1;
         if (thisSkipped)
             skipDef_[std::size_t(t)] = 1;
-        // An exit at a point after the skipped instruction and up to the call writes what it skipped.
-        for (std::size_t m = 0; m <= k; ++m) {
-            const std::uint32_t p = starts[m];
-            if (p > std::uint32_t(d))
-                pendingAt_[p].emplace_back(base, f);
-            if (thisSkipped && p > std::uint32_t(t))
-                pendingAt_[p].emplace_back(base + 1, code_->code[std::size_t(t)].opcode() == Op::LoadNull ? JSValue::null()
-                                                                                                           : JSValue::undefined());
-        }
+        // An exit between the read of the global and the call runs again from the read: the global may have changed
+        // since this code was made, and what lies between has no effects.
+        for (std::size_t m = 0; m < k; ++m)
+            if (starts[m] > std::uint32_t(d))
+                exitRedirect_[starts[m]] = std::int32_t(d);
     }
 }
 
@@ -1010,12 +993,307 @@ void Baseline::emitDirectCall(std::uint32_t i)
     write(in.a, RAX);
     restorePool(i);
     a_.jmp(done);
-    // The long way: the registers written as the instructions would have, then the baseline call sequence.
+    // The long way: the registers written as the instructions would have (the global read now), then the baseline call
+    // sequence.
     a_.bind(slowPath);
     restorePool(i);
-    writePending(i);
+    savePool(i);
+    a_.mov(RDI, R12);
+    a_.movImm(RSI, dc.read);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
+    a_.callReg(RAX);
+    a_.aluI32(7, RAX, 1);
+    a_.jcc(CNE, exception(i));
+    restorePool(i);
+    if (dc.thisSkipped) {
+        a_.movImm(RAX, dc.thisNull ? kNull : kUndefined);
+        write(base + 1, RAX);
+    }
     call(i, in);
     a_.bind(done);
     if (plan_->defWeb[i] >= 0)
         loadTypedAfter(i);
+}
+
+// ---- read chains ----
+//
+// `os[i & 3].x`, `a.b.c`: reads whose intermediate objects are used once, by the next read, and then dead. The objects pass
+// through a slot of the optimized frame, never written to their registers nor counted; every read in the chain is free of
+// effects, so a failed guard anywhere in it runs the whole chain again in the interpreter from its start.
+
+bool Baseline::chainable(std::uint32_t i, bool asConsumer)
+{
+    const Ins& in = code_->code[i];
+    if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
+        return false;
+    switch (in.opcode()) {
+    case Op::GetGlobal: {
+        if (asConsumer)
+            return false;
+        std::uint8_t attrs = 0;
+        JSValue* slot = vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs);
+        return slot && !(attrs & attr::kAccessor);
+    }
+    case Op::GetElem: {
+        const auto& uw = plan_->useWebs[i];
+        if (uw.size() < 2 || (asConsumer ? false : uw[0] >= 0))
+            return false;
+        if (uw[1] >= 0 && !isI32(uw[1]))
+            return false;
+        const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+        return ep == elemprof::kArray && in.b != in.c;
+    }
+    case Op::GetProp: {
+        const std::uint16_t cacheId = code_->code[i + 1].a;
+        if (cacheId == kNoCache)
+            return false;
+        const InlineCache& ic = code_->caches[cacheId];
+        if (ic.shape == 0 || ic.next != 0 || (ic.holder && !ic.validity))
+            return false;
+        if (ic.pad && ic.pad <= code_->poly.size()) {
+            const PolyCache& pc = code_->poly[ic.pad - 1];
+            for (std::uint8_t k = 0; k < pc.n; ++k)
+                if (pc.e[k].kind != PolyEntry::OwnData && !(pc.e[k].kind == PolyEntry::ProtoData && pc.e[k].validity))
+                    return false;
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+void Baseline::planChains()
+{
+    chainRole_.assign(n_ + 1, 0);
+    chainHead_.assign(n_ + 1, -1);
+    if (!code_->handlers.empty())
+        return;
+    std::vector<std::uint32_t> starts;
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        starts.push_back(j);
+    auto reads = [&](std::uint32_t j, unsigned r) {
+        for (std::uint16_t x : opt::effectsOf(*code_, j).rd)
+            if (x == r)
+                return true;
+        return false;
+    };
+    auto writes = [&](std::uint32_t j, unsigned r) {
+        for (std::uint16_t x : opt::effectsOf(*code_, j).wr)
+            if (x == r)
+                return true;
+        return false;
+    };
+    auto deadAfter = [&](std::size_t k, unsigned r) { return regDeadAfter(starts[k], r); };
+    // Between two reads of a chain: typed arithmetic whose result nothing at the chain's start holds.
+    auto quiet = [&](std::uint32_t j, std::uint32_t head) {
+        const Op op = code_->code[j].opcode();
+        if (plan_->isLeader[j] || opt::jumpTarget(*code_, j) >= 0)
+            return false;
+        if (op != Op::LoadInt) {
+            if (plan_->defWeb[j] < 0)
+                return false;
+            for (std::int32_t w : plan_->useWebs[j])
+                if (w < 0)
+                    return false;
+        }
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        if (e.wr.size() != 1)
+            return false;
+        for (const opt::LiveWeb& lw : plan_->liveBefore[head])
+            if (lw.reg == e.wr[0])
+                return false;
+        return true;
+    };
+    std::vector<std::int32_t> headOf(n_ + 1, -1);
+    for (std::size_t k = 0; k < starts.size(); ++k) {
+        const std::uint32_t i = starts[k];
+        if (plan_->defWeb[i] >= 0 || !chainable(i, false))
+            continue;
+        const Ins& in = code_->code[i];
+        const unsigned r = in.a;
+        const std::uint32_t head = headOf[i] >= 0 ? std::uint32_t(headOf[i]) : i;
+        // The one reader of `r`: the next read of the chain.
+        std::size_t m = k + 1;
+        for (; m < starts.size(); ++m) {
+            const std::uint32_t j = starts[m];
+            if (reads(j, r) || writes(j, r))
+                break;
+            if (!quiet(j, head))
+                break;
+        }
+        if (m >= starts.size())
+            continue;
+        const std::uint32_t c = starts[m];
+        const Ins& cn = code_->code[c];
+        const Op cop = cn.opcode();
+        if ((cop != Op::GetProp && cop != Op::GetElem) || cn.b != r || plan_->isLeader[c] || !chainable(c, true))
+            continue;
+        if (cop == Op::GetElem && cn.c == r)
+            continue;
+        if (!(cn.a == r || deadAfter(m, r)))
+            continue;
+        chainRole_[i] |= 1;
+        chainRole_[c] |= 2;
+        headOf[c] = std::int32_t(head);
+        for (std::size_t q = 0; q < starts.size(); ++q)
+            if (starts[q] >= head && starts[q] <= c)
+                chainHead_[starts[q]] = std::int32_t(head);
+    }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2CHAIN"))
+        for (std::uint32_t j = 0; j < n_; ++j)
+            if (chainRole_[j] || chainHead_[j] >= 0)
+                std::fprintf(stderr, "chain %s @%u role %d head %d\n", codeName(code_).c_str(), j, chainRole_[j], chainHead_[j]);
+#endif
+    // A chain is only worth it when it ends in a read: a producer whose consumer was not taken writes normally.
+    for (std::uint32_t j = 0; j < n_; ++j)
+        if ((chainRole_[j] & 1) && !std::any_of(chainRole_.begin() + j + 1, chainRole_.end(), [](std::uint8_t x) { return x & 2; }))
+            chainRole_[j] &= std::uint8_t(~1);
+}
+
+void Baseline::emitChain(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const std::uint8_t role = chainRole_[i];
+    Label& bad = exitBefore(std::uint32_t(chainHead_[i] >= 0 ? chainHead_[i] : std::int32_t(i)));
+    auto receiver = [&](unsigned reg) {
+        if (role & 2)
+            a_.mov(RAX, mem(RSP, chainSlot_));
+        else
+            a_.mov(RAX, R(reg));
+    };
+    switch (in.opcode()) {
+    case Op::GetGlobal: {
+        JSObject* g = vm_.global;
+        std::uint8_t attrs = 0;
+        JSValue* slot = g->findOwn(vm_, code_->atoms[in.b], &attrs);
+        JSValue* inl = g->inl();
+        const std::uint32_t index = slot >= inl && slot < inl + g->h.aux ? std::uint32_t(slot - inl)
+                                                                          : std::uint32_t(slot - g->slots) + g->h.aux;
+        a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+        a_.jcc(CNE, bad);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(g));
+        slotAddress(index);
+        a_.mov(RAX, mem(RDX, 0));
+        break;
+    }
+    case Op::GetElem: {
+        const auto& uw = plan_->useWebs[i];
+        receiver(in.b);
+        needObject(RAX, bad);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, bad);
+        if (uw[1] >= 0) {
+            a_.mov32(RCX, useI32(uw[1], RCX));
+        } else {
+            a_.mov(RCX, R(in.c));
+            needInt(RCX, bad);
+            a_.mov32(RCX, RCX);
+        }
+        a_.test32(RCX, RCX);
+        a_.jcc(CS, bad);
+        a_.alu32(7, RCX, mem(RAX, kArrayLength));
+        a_.jcc(CAE, bad);
+        a_.mov(RDX, mem(RAX, kArrayElems));
+        a_.mov(RAX, mem(RDX, RCX, 8));
+        a_.cmpI(RAX, std::int32_t(kHole));
+        a_.jcc(CE, bad);
+        break;
+    }
+    case Op::GetProp: {
+        const InlineCache& ic = code_->caches[code_->code[i + 1].a];
+        struct Seen
+        {
+            std::uint32_t shape, index;
+            JSObject* holder;
+            ValidityCell* validity;
+        };
+        Seen seen[5];
+        int count = 0;
+        seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+        if (ic.pad && ic.pad <= code_->poly.size()) {
+            const PolyCache& pc = code_->poly[ic.pad - 1];
+            for (std::uint8_t k = 0; k < pc.n; ++k)
+                seen[count++] = Seen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity};
+        }
+        receiver(in.b);
+        needObject(RAX, bad);
+        Label got;
+        for (int k = 0; k < count; ++k) {
+            Label next;
+            a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
+            a_.jcc(CNE, k + 1 < count ? next : bad);
+            if (seen[k].holder) {
+                hold(seen[k].validity);
+                a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
+                a_.cmpI32(mem(RCX, kValidityValid), 0);
+                a_.jcc(CE, bad);
+                a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
+            }
+            slotAddress(seen[k].index);
+            a_.jmp(got);
+            if (k + 1 < count)
+                a_.bind(next);
+        }
+        a_.bind(got);
+        a_.mov(RAX, mem(RDX, 0));
+        break;
+    }
+    default:
+        break;
+    }
+    if (role & 1) {
+        a_.mov(mem(RSP, chainSlot_), RAX);
+        return;
+    }
+    const std::int32_t dw = plan_->defWeb[i];
+    if (dw >= 0) {
+        unboxRax(dw, bad);
+    } else {
+        retain(RAX);
+        write(in.a, RAX);
+    }
+}
+
+/// Whether register `r` is never read after instruction `i` before something writes it again, on every path.
+bool Baseline::regDeadAfter(std::uint32_t i, unsigned r)
+{
+    std::vector<std::uint8_t> seen(n_ + 1, 0);
+    std::vector<std::uint32_t> work;
+    auto successors = [&](std::uint32_t j) {
+        const Op op = code_->code[j].opcode();
+        const std::uint32_t nx = j + length(j);
+        const std::int64_t t = opt::jumpTarget(*code_, j);
+        if (t >= 0) {
+            work.push_back(std::uint32_t(t));
+            if (op != Op::Jmp)
+                work.push_back(nx);
+        } else if (op != Op::Ret && op != Op::Throw && op != Op::ThrowError) {
+            work.push_back(nx);
+        }
+    };
+    successors(i);
+    while (!work.empty()) {
+        const std::uint32_t j = work.back();
+        work.pop_back();
+        if (j >= n_)
+            return false;
+        if (seen[j])
+            continue;
+        seen[j] = 1;
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        if (!e.ok)
+            return false;
+        bool read = false, written = false;
+        for (std::uint16_t x : e.rd)
+            read = read || x == r;
+        for (std::uint16_t x : e.wr)
+            written = written || x == r;
+        if (read)
+            return false;
+        if (!written)
+            successors(j);
+    }
+    return true;
 }

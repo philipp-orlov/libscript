@@ -2971,6 +2971,9 @@ TEST(callsOfGlobalFunctionsFromOptimizedCode)
         "function self(){ return this === undefined ? 1 : 2; }"
         "function k5(n){ var s=0; for (var i=0;i<n;i++) s+=self(); return s; }"
         "out.push(k5(3000));"
+        "function one(x){ return 1; } var fn = one;"
+        "function k6(n){ var s=0, b=2147482000; for (var i=0;i<n;i++){ if (i===1000) fn=function(x){return 2;}; s+=fn(b+i); } return s; }"
+        "out.push(k6(3000));"
         "out.join(\" \")";
     for (int mode = 0; mode < 3; ++mode) {
         script::Context::Options options;
@@ -2981,7 +2984,7 @@ TEST(callsOfGlobalFunctionsFromOptimizedCode)
         else
             options.jit.mode = script::JitOptions::Mode::Eager;
         js::Context ctx(options);
-        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("42000 e777 true 400 6442453498500 202000 6000"));
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("42000 e777 true 400 6442453498500 202000 6000 5000"));
     }
 }
 
@@ -3050,6 +3053,38 @@ TEST(stringLengthsMethodsAndCharacterCodesFromCompiledCode)
         js::Context ctx(options);
         CHECK_EQ(ctx.eval(program, "<test>").toString(),
                  std::string("-634317659 1473919994 -362063818 -798229026 0 NaN NaN 121 98 9731 42 5 3 9 2 Z 6"));
+    }
+}
+
+TEST(chainsOfReadsFromOptimizedCode)
+{
+    // `os[i & 3].x` and `a.b.c.d` pass their objects along without registers; a new shape, a missing element, a getter
+    // for the global or an overflow beside the chain sends it back to the interpreter from its start.
+    const char* program =
+        "var out=[];"
+        "var os=[{x:1},{y:0,x:2},{z:0,y:0,x:3},{w:0,z:0,y:0,x:4}];"
+        "function k1(n){var s=0;for(var i=0;i<n;i++){s+=os[i&3].x;}return s;}"
+        "out.push(k1(5000));"
+        "os[2]={q:1,x:30}; out.push(k1(8));"
+        "os[1]=undefined; try { k1(8); } catch(e){ out.push(e.constructor.name); }"
+        "os=[{x:5}]; out.push(k1(1));"
+        "var arr=[1,,3]; os=[{x:1},{x:2},{x:3},{x:4}];"
+        "Object.defineProperty(globalThis, \"os2\", { get(){ return [{x:7},{x:7},{x:7},{x:7}]; }, configurable:true });"
+        "function k2(n){var s=0;for(var i=0;i<n;i++){s+=os2[i&3].x;}return s;} out.push(k2(3000));"
+        "var deep={a:{b:{c:{d:5}}}}; function k3(n){var s=0;for(var i=0;i<n;i++) s+=deep.a.b.c.d; return s;} out.push(k3(5000)); deep.a.b={c:{d:1}}; out.push(k3(3)); deep.a.b.c.d=\"z\"; out.push(k3(2));"
+        "var big=[{x:2147483647}]; function k4(n){var s=0; for (var i=0;i<n;i++){ var j=(i+2147483640)|0; s+=big[0].x; } return s;} out.push(k4(5000));"
+        "function k5(n,o){var s=0;for(var i=0;i<n;i++){ var t=i+2147483000; s+=o[0].x; } return s;} out.push(k5(3000,[{x:1}]));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("12500 74 TypeError 5 21000 25000 3 0zz 10737418235000 3000"));
     }
 }
 

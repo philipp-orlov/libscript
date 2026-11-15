@@ -465,6 +465,8 @@ constexpr std::int32_t kTypedKind = std::int32_t(offsetof(JSTypedArray, kind));
 constexpr std::int32_t kRareNative = std::int32_t(offsetof(Rare, native));
 constexpr std::int32_t kRareData = std::int32_t(offsetof(Rare, nativeData));
 constexpr std::int32_t kRareHome = std::int32_t(offsetof(Rare, home));
+constexpr std::int32_t kRareChildRoot = std::int32_t(offsetof(Rare, childRoot));
+constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
 constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
 constexpr std::int32_t kSuperSlot = std::int32_t(offsetof(SuperCache, slot));
@@ -638,7 +640,7 @@ private:
     /// A plain object of shape `shape` with `aux` inline slots, made here (as `VM::newObject` does, counters and all) when
     /// the heap's current block has room and no collection is due; else `slow`. The object, owned, in rax; clobbers rcx,
     /// rdx, rsi. False when it cannot be done here at all.
-    bool allocObject(std::uint32_t shape, std::uint8_t aux, Label& slow)
+    bool allocObject(std::uint32_t shape, std::uint8_t aux, Label& slow, bool shapeInR8 = false)
     {
         const std::size_t bytes = JSObject::bytesFor(aux);
         if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit || bytes > 256)
@@ -690,6 +692,8 @@ private:
         std::uint64_t word;
         std::memcpy(&word, &h, sizeof word);
         a_.movImm(RSI, word);
+        if (shapeInR8)
+            a_.or_(RSI, R8);
         a_.mov(mem(RAX, 0), RSI);
         a_.mov(mem(RAX, 8), 1);
         a_.mov(mem(RAX, kObjSlots), 0);
@@ -2414,12 +2418,34 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         }
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
         a_.mov(mem(R13, kFramePc), RDI);
-        a_.mov(RDI, R12);
-        a_.mov(RSI, RAX);
-        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitNewThis));
-        a_.callReg(RAX);
-        a_.test(RAX, RAX);
-        a_.jcc(CE, exc);
+        {
+            // `this` made here when `f.prototype` is an object that is already some shape tree's prototype.
+            Label viaRuntime, made;
+            a_.mov(RSI, mem(RAX, kObjSlots));
+            a_.test(RSI, RSI);
+            a_.jcc(CE, viaRuntime);
+            a_.mov(RSI, mem(RSI, 16));
+            needObject(RSI, viaRuntime);
+            a_.testI8(mem(RSI, kHdrFlags), cellflags::kHasRare);
+            a_.jcc(CE, viaRuntime);
+            a_.mov(RSI, mem(RSI, kObjSlots));
+            a_.mov(RSI, mem(RSI, -16));
+            a_.mov(RSI, mem(RSI, kRareChildRoot));
+            a_.test(RSI, RSI);
+            a_.jcc(CE, viaRuntime);
+            a_.mov32(R8, mem(RSI, kShapeId));
+            if (allocObject(0, 3, viaRuntime, true))
+                a_.jmp(made);
+            a_.bind(viaRuntime);
+            a_.mov(RAX, R(base));
+            a_.mov(RDI, R12);
+            a_.mov(RSI, RAX);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitNewThis));
+            a_.callReg(RAX);
+            a_.test(RAX, RAX);
+            a_.jcc(CE, exc);
+            a_.bind(made);
+        }
         a_.mov(RDI, R(base + 1));
         a_.mov(R(base + 1), RAX);
         release(RDI);

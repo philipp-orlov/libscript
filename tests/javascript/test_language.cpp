@@ -2915,6 +2915,38 @@ TEST(gettersAndSuperReadsFromCompiledCode)
     }
 }
 
+TEST(methodsGettersAndSuperCallsInlineInsideEachOther)
+{
+    // A method that calls `super.add` and a getter run inside their caller, the one inside the other; replacing the getter,
+    // the method on the prototype or the prototype itself is noticed.
+    const char* program =
+        "var out=[];"
+        "class V{constructor(x,y){this.x=x;this.y=y;}add(o){return this.x*o.x+this.y*o.y;}get m(){return this.x;}}"
+        "class W extends V{add(o){return super.add(o)+1;}}"
+        "function kernel(n,a,b){var s=0;for(var i=0;i<n;i++){s+=a.add(b);s+=b.add(a);s+=a.m;}return s;}"
+        "var a=new V(1,2), b=new W(3,4);"
+        "out.push(kernel(5000,a,b));"
+        "Object.defineProperty(V.prototype,\"m\",{get(){return 1000;},configurable:true}); out.push(kernel(2,a,b));"
+        "V.prototype.add=function(o){return -1;}; out.push(kernel(2,a,b));"
+        "Object.setPrototypeOf(W.prototype,{add(o){return 50;}}); out.push(kernel(2,a,b));"
+        "class X{ get p(){ return this.q * 2; } constructor(){ this.q = 1; } }"
+        "function kx(n,o){ var s=0; for (var i=0;i<n;i++) s+=o.p; return s; }"
+        "var xo=new X(); out.push(kx(5000,xo)); xo.q=1.5; out.push(kx(3,xo)); xo.q=\"s\"; out.push(kx(2,xo));"
+        "var yo=Object.create(xo); yo.q=7; out.push(kx(3,yo));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("120000 2046 1998 2100 10000 9 NaN 42"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

@@ -526,6 +526,8 @@ bool Baseline::emitTyped(std::uint32_t i)
         return true;
     }
     case Op::GetProp: {
+        if (inlineGetter(i))
+            return true;
         // A number read from a property the site has always found in the same place: straight into the variable.
         if (dw < 0 || uw.empty() || uw[0] >= 0)
             return false;
@@ -535,6 +537,50 @@ bool Baseline::emitTyped(std::uint32_t i)
         const InlineCache& ic = code_->caches[cacheId];
         if (ic.shape == 0 || ic.next != 0 || (ic.holder && !ic.validity))
             return false;
+        if (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n) {
+            // Several shapes: a test for each, the slot found at run time.
+            const PolyCache& pc = code_->poly[ic.pad - 1];
+            struct Seen
+            {
+                std::uint32_t shape, index;
+                JSObject* holder;
+                ValidityCell* validity;
+            };
+            Seen seen[5];
+            int count = 0;
+            seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+            for (std::uint8_t k = 0; k < pc.n; ++k) {
+                const PolyEntry& e = pc.e[k];
+                if (e.kind == PolyEntry::OwnData || (e.kind == PolyEntry::ProtoData && e.validity))
+                    seen[count++] = Seen{e.shape, e.index, e.holder, e.validity};
+                else
+                    return false;
+            }
+            Label& bad = exitBefore(i);
+            Label got;
+            a_.mov(RAX, R(in.b));
+            needObject(RAX, bad);
+            for (int k = 0; k < count; ++k) {
+                Label next;
+                a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
+                a_.jcc(CNE, k + 1 < count ? next : bad);
+                if (seen[k].holder) {
+                    hold(seen[k].validity);
+                    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
+                    a_.cmpI32(mem(RCX, kValidityValid), 0);
+                    a_.jcc(CE, bad);
+                    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
+                }
+                slotAddress(seen[k].index);
+                a_.jmp(got);
+                if (k + 1 < count)
+                    a_.bind(next);
+            }
+            a_.bind(got);
+            a_.mov(RAX, mem(RDX, 0));
+            unboxRax(dw, bad);
+            return true;
+        }
         Label& bad = exitBefore(i);
         if (ic.holder) {
             provenShape(in.b, ic.shape, bad);

@@ -461,6 +461,21 @@ constexpr std::uint8_t kObjectKind = 0x80 | std::uint8_t(Kind::Object);
 constexpr std::int32_t kHdrCls = 4, kHdrFlags = 5, kHdrAux = 6, kHdrKind = 7, kHdrRc = 8;
 constexpr std::int32_t kValidityValid = 4;
 
+/// A value of an inlined function (opt_inline.inc): a typed variable of the caller, a register of the caller's frame, a
+/// slot of the inline area, or a constant.
+struct IVal
+{
+    enum Kind : std::uint8_t { I32, F64, Box, Const };
+    Kind kind = Const;
+    std::int32_t web = -1;
+    std::int32_t frameReg = -1;
+    std::int32_t slot = -1;
+    JSValue c = JSValue::undefined();
+    JSValue known = JSValue::undefined();  ///< Box: the function it was when compiled, when it is one
+    std::uint8_t hint = 0;                 ///< Box: profBit bits of what it has held
+    std::uint32_t epoch = 0;               ///< Box: side effects before it was read (a later one may have let it go)
+};
+
 class Baseline
 {
 public:
@@ -691,9 +706,31 @@ private:
     Tier2Code* compileOptimized();
     void emitOpt(std::uint32_t i);
     bool emitTyped(std::uint32_t i);
+    // inlining (opt_inline.inc)
+    struct InlineCtx
+    {
+        std::uint32_t at = 0;  ///< the caller's instruction: where a failed guard sends it
+        bool emit = false;     ///< the second pass; the first only decides
+        bool sideEffect = false;
+        std::uint32_t epoch = 0;
+        std::int32_t nextSlot = 0;
+        Label dummy;
+        Label* fail(Baseline* b);
+    };
     Mem inlineSlot(std::int32_t s) const;
+    bool inlinable(const CodeBlock* C) const;
+    IVal callerValue(std::uint32_t i, unsigned reg, std::size_t k, std::uint8_t hint) const;
+    void inlineBits(const IVal& v, Reg dst);
+    void inlineI32(const IVal& v, Reg dst, Label* bad);
+    void inlineF64(const IVal& v, int x, Reg tmp, Label* bad);
+    void inlineBoxed(const IVal& v);
     bool inlineCall(std::uint32_t i);
-    bool inlineBody(std::uint32_t i, CodeBlock* C, JSValue known, bool sloppyThis, bool emit);
+    bool inlineGetter(std::uint32_t i);
+    bool inlineTop(std::uint32_t i, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
+                   unsigned dst);
+    bool inlineDeliver(InlineCtx& cx, const IVal& v, unsigned dst);
+    bool inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
+                    IVal& result, int depth);
     std::int32_t inlineBase_ = -1;  ///< where the slots of inlined calls start in the optimized frame (rsp-relative)
     void emitExits();
     void emitOptTails();

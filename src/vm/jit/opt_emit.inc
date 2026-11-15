@@ -342,8 +342,14 @@ bool Baseline::emitTyped(std::uint32_t i)
             case Op::Shr: a_.shiftCl32(7, RAX); break;
             case Op::UShr: a_.shiftCl32(5, RAX); break;
             case Op::BitAndI: a_.aluI32(4, RAX, k); break;
-            case Op::BitOrI: a_.aluI32(1, RAX, k); break;
-            case Op::BitXorI: a_.aluI32(6, RAX, k); break;
+            case Op::BitOrI:
+                if (k != 0)
+                    a_.aluI32(1, RAX, k);
+                break;
+            case Op::BitXorI:
+                if (k != 0)
+                    a_.aluI32(6, RAX, k);
+                break;
             case Op::ShlI: a_.shiftI32(4, RAX, k & 31); break;
             case Op::ShrI: a_.shiftI32(7, RAX, k & 31); break;
             default: a_.shiftI32(5, RAX, k & 31); break;
@@ -370,13 +376,32 @@ bool Baseline::emitTyped(std::uint32_t i)
             if (op == Op::Mod || op == Op::ModI) {
                 if (op == Op::ModI && k <= 0)
                     return false;
-                if (op == Op::Mod) {
-                    a_.mov32(RCX, useI32(uw[1], RCX));
-                    a_.test32(RCX, RCX);
-                    a_.jcc(CLE, bad);
-                } else {
-                    a_.movImm(RCX, std::uint32_t(k));
+                if (op == Op::ModI) {
+                    // A non-negative dividend and a constant divisor: a mask, or a multiply by the reciprocal.
+                    a_.mov32(RAX, useI32(uw[0], RAX));
+                    a_.test32(RAX, RAX);
+                    a_.jcc(CS, bad);
+                    const std::uint32_t d = std::uint32_t(k);
+                    if ((d & (d - 1)) == 0) {
+                        a_.aluI32(4, RAX, std::int32_t(d - 1));
+                        defI32(dw, RAX);
+                        return true;
+                    }
+                    int l = 0;
+                    while ((std::uint64_t(1) << l) < d)
+                        ++l;
+                    const std::uint64_t m = (std::uint64_t(1) << (32 + l)) / d + 1;
+                    a_.movImm(RCX, m);
+                    a_.imul64(RCX, RAX);
+                    a_.shiftI(5, RCX, 32 + l);
+                    a_.imulI32(RCX, RCX, std::int32_t(d));
+                    a_.alu32(5, RAX, RCX);
+                    defI32(dw, RAX);
+                    return true;
                 }
+                a_.mov32(RCX, useI32(uw[1], RCX));
+                a_.test32(RCX, RCX);
+                a_.jcc(CLE, bad);
                 a_.mov32(RAX, useI32(uw[0], RAX));
                 a_.test32(RAX, RAX);
                 a_.jcc(CS, bad);
@@ -410,12 +435,12 @@ bool Baseline::emitTyped(std::uint32_t i)
             const Reg a = useI32(uw[0], RAX);
             a_.mov32(RAX, a);
             switch (op) {
-            case Op::Add: a_.alu32(0, RAX, useI32(uw[1], RCX)); a_.jcc(CO, bad); break;
-            case Op::Sub: a_.alu32(5, RAX, useI32(uw[1], RCX)); a_.jcc(CO, bad); break;
-            case Op::AddI: a_.aluI32(0, RAX, k); a_.jcc(CO, bad); break;
-            case Op::SubI: a_.aluI32(5, RAX, k); a_.jcc(CO, bad); break;
-            case Op::Inc: a_.aluI32(0, RAX, 1); a_.jcc(CO, bad); break;
-            case Op::Dec: a_.aluI32(0, RAX, -1); a_.jcc(CO, bad); break;
+            case Op::Add: a_.alu32(0, RAX, useI32(uw[1], RCX)); break;
+            case Op::Sub: a_.alu32(5, RAX, useI32(uw[1], RCX)); break;
+            case Op::AddI: a_.aluI32(0, RAX, k); break;
+            case Op::SubI: a_.aluI32(5, RAX, k); break;
+            case Op::Inc: a_.aluI32(0, RAX, 1); break;
+            case Op::Dec: a_.aluI32(0, RAX, -1); break;
             case Op::Neg:
                 a_.test32(RAX, RAX);
                 a_.jcc(CE, bad);  // -0
@@ -452,6 +477,9 @@ bool Baseline::emitTyped(std::uint32_t i)
             default:
                 return false;
             }
+            if ((op == Op::Add || op == Op::Sub || op == Op::AddI || op == Op::SubI || op == Op::Inc || op == Op::Dec) &&
+                !plan_->wraps[i])
+                a_.jcc(CO, bad);
             defI32(dw, RAX);
             return true;
         }

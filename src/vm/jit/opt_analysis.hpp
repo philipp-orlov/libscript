@@ -81,6 +81,8 @@ struct Plan
     std::vector<std::vector<LiveWeb>> liveBefore;
     /// Whether each instruction starts a basic block, and the ones that are loop headers (a backward jump goes there).
     std::vector<std::uint8_t> isLeader, isLoopHeader;
+    /// Per instruction: an int32 add or subtract whose result only ever reaches ToInt32 (`(a + b) | 0`), so it may wrap.
+    std::vector<std::uint8_t> wraps;
     std::vector<std::uint32_t> loopHeaders;
     /// Typed webs that a function entry loads from the frame (parameters) with a guard.
     std::vector<std::uint32_t> entryWebs;

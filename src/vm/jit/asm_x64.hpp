@@ -308,6 +308,7 @@ public:
         d32(std::uint32_t(imm));
     }
     void imul32(Reg d, Reg s) { opReg(false, 0x0F, d, s, 0xAF); }
+    void imul64(Reg d, Reg s) { opReg(true, 0x0F, d, s, 0xAF); }
     void neg32(Reg r) { opReg(false, 0xF7, 3, r); }
     void not32(Reg r) { opReg(false, 0xF7, 2, r); }
     void inc32(const Mem& m) { opMem(false, 0xFF, 0, m); }

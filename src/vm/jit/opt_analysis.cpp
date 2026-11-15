@@ -426,6 +426,49 @@ Plan analyse(const CodeBlock& code)
     for (std::uint16_t r = 0; r < nregs; ++r)
         raise(entryDef[r], argRep(r));
 
+    // ---- int32 truncation ----
+    // A web whose every use converts it with ToInt32 (a bitwise operator), or is an add or subtract whose own result is such a
+    // web, may be computed modulo 2^32: the exact sum of int32s is far below 2^53, so wrapping changes nothing ToInt32 sees.
+    auto truncating = [](Op op) {
+        switch (op) {
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr: case Op::UShr: case Op::BitAndI:
+        case Op::BitOrI: case Op::BitXorI: case Op::ShlI: case Op::ShrI: case Op::UShrI: case Op::BitNot:
+            return true;
+        default:
+            return false;
+        }
+    };
+    auto additive = [](Op op) {
+        return op == Op::Add || op == Op::Sub || op == Op::AddI || op == Op::SubI || op == Op::Inc || op == Op::Dec;
+    };
+    std::vector<std::uint8_t> truncOnly(D, 0), used(D, 0);
+    for (std::uint32_t i = 0; i < n; i = nextOf(code, i))
+        for (std::uint32_t d : useDef[i])
+            used[webOf(d)] = 1;
+    for (std::uint32_t id = 0; id < D; ++id)
+        truncOnly[id] = used[id];
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::uint32_t i = 0; i < n; i = nextOf(code, i)) {
+            const Op op = code.code[i].opcode();
+            for (std::uint32_t d : useDef[i]) {
+                const std::uint32_t w = webOf(d);
+                if (!truncOnly[w])
+                    continue;
+                bool ok = truncating(op);
+                if (!ok && additive(op) && !insDefs[i].empty())
+                    ok = truncOnly[webOf(insDefs[i][0])] != 0;
+                if (!ok) {
+                    truncOnly[w] = 0;
+                    changed = true;
+                }
+            }
+        }
+    }
+    auto wrapping = [&](std::uint32_t i) {
+        return additive(code.code[i].opcode()) && !insDefs[i].empty() && truncOnly[webOf(insDefs[i][0])];
+    };
+
     auto useRep = [&](std::uint32_t i, std::size_t k) { return rep[webOf(useDef[i][k])]; };
     auto profOf = [&](std::uint32_t i) { return i < code.prof.size() ? code.prof[i] : std::uint8_t(0); };
     auto fromProfile = [&](std::uint32_t i) -> Rep {
@@ -454,6 +497,16 @@ Plan analyse(const CodeBlock& code)
             const Rep a = useRep(i, 0);
             return a;
         };
+        if (wrapping(i)) {
+            // Overflow does not matter here: the result is int32 whenever the operands are.
+            const Op op = ins.opcode();
+            const bool binary = op == Op::Add || op == Op::Sub;
+            const Rep a = useRep(i, 0), b = binary ? useRep(i, 1) : Rep::I32;
+            if (a == Rep::None || b == Rep::None)
+                return Rep::None;
+            if (a == Rep::I32 && b == Rep::I32)
+                return Rep::I32;
+        }
         if (p & kProfFailed) {
             // A guard failed here. Where what it made can be said by what the interpreter then saw (arithmetic that
             // overflowed made a double), the profile has it; elsewhere the instruction goes back to the frame.
@@ -557,6 +610,15 @@ Plan analyse(const CodeBlock& code)
     }
     auto typedWeb = [&](std::uint32_t def) -> std::int32_t { return webIndex[webOf(def)]; };
     plan.defWeb.assign(n, -1);
+    plan.wraps.assign(n, 0);
+    for (std::uint32_t i = 0; i < n; i = nextOf(code, i)) {
+        if (!wrapping(i) || rep[webOf(insDefs[i][0])] != Rep::I32)
+            continue;
+        bool allInt = true;
+        for (std::uint32_t d : useDef[i])
+            allInt = allInt && rep[webOf(d)] == Rep::I32;
+        plan.wraps[i] = allInt;
+    }
     plan.useWebs.assign(n, {});
     plan.liveBefore.assign(n, {});
     // Loop depth, for weights.

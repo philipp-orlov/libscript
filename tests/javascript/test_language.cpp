@@ -3021,6 +3021,38 @@ TEST(constructorCallsFromCompiledCode)
     }
 }
 
+TEST(stringLengthsMethodsAndCharacterCodesFromCompiledCode)
+{
+    // Compiled code reads a string's length, the methods of String.prototype and `charCodeAt` itself: ropes, slices, wrong
+    // indices, String objects and replaced or added methods behave.
+    const char* program =
+        "var out=[];"
+        "function h(s){ var x=0; for (var i=0;i<s.length;i++) x=(x*31+s.charCodeAt(i))|0; return x; }"
+        "var base=\"abcdefghij\"; var rope=\"\"; for (var i=0;i<50;i++) rope+=base;"
+        "for (var k=0;k<200;k++) h(base);"
+        "out.push(h(base), h(rope), h(rope.slice(3,40)), h(rope.substring(7)), h(\"\"));"
+        "function at(s,i){ return s.charCodeAt(i); }"
+        "for (var k=0;k<3000;k++) at(\"xyz\",1);"
+        "out.push(at(\"xyz\",5), at(\"xyz\",-1), at(\"xyz\",1.5), at(new String(\"abc\"),1), at(\"é☃\",1));"
+        "var sp=String.prototype.charCodeAt; String.prototype.charCodeAt=function(){ return 42; }; out.push(at(\"abc\",0)); String.prototype.charCodeAt=sp;"
+        "function len(s){ return s.length; } for (var k=0;k<3000;k++) len(\"abcd\"); out.push(len(\"hello\"), len([1,2,3]), len({length:9}), len(new String(\"ab\")));"
+        "function up(s){ return s.toUpperCase(); } for (var k=0;k<3000;k++) up(\"a\"); String.prototype.toUpperCase=function(){return \"Z\";}; out.push(up(\"q\"));"
+        "String.prototype.newm = function(){ return this.length*2; }; function nm(s){ return s.newm(); } for (var k=0;k<3000;k++) nm(\"ab\"); out.push(nm(\"abc\"));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("-634317659 1473919994 -362063818 -798229026 0 NaN NaN 121 98 9731 42 5 3 9 2 Z 6"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

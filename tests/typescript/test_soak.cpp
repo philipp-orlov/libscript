@@ -166,7 +166,8 @@ TEST(dynamicPropertyNamesAreReclaimed)
         "  for (let i = 0; i < n; i++) o['field_' + i] = i;"
         "  return Object.keys(o).length;"
         "}");
-    ctx.eval("build(200)");
+    // Warmed up at the size it runs at: what the compilers keep for `build` once it is hot is not garbage.
+    ctx.eval("build(2000)");
     ctx.collectGarbage();
     const ts::Context::Stats base = ctx.stats();
 

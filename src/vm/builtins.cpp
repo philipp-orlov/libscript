@@ -3416,6 +3416,11 @@ FastNative mathUnaryNative() noexcept
     return mathUnary;
 }
 
+FastNative stringCharNative() noexcept
+{
+    return stringCharAt;
+}
+
 }  // namespace vm
 }  // namespace internal
 }  // namespace script

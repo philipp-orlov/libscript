@@ -465,6 +465,10 @@ constexpr std::int32_t kTypedKind = std::int32_t(offsetof(JSTypedArray, kind));
 constexpr std::int32_t kRareNative = std::int32_t(offsetof(Rare, native));
 constexpr std::int32_t kRareData = std::int32_t(offsetof(Rare, nativeData));
 constexpr std::int32_t kRareHome = std::int32_t(offsetof(Rare, home));
+constexpr std::int32_t kGcKind = std::int32_t(offsetof(detail::GCObject, kind));
+constexpr std::int32_t kStrBits = std::int32_t(offsetof(StringCell, bits));
+constexpr std::int32_t kStrLength = std::int32_t(offsetof(StringCell, length));
+constexpr std::int32_t kStrChars = std::int32_t(sizeof(StringCell));
 constexpr std::int32_t kRareChildRoot = std::int32_t(offsetof(Rare, childRoot));
 constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
@@ -703,6 +707,30 @@ private:
         a_.aluI(0, mem(R12, atVm(&vm_.ownedBytes_)), std::int32_t(bytes));
         a_.aluI(0, mem(R12, atVm(&vm_.liveCells)), 1);
         return true;
+    }
+    /// The value in `v` is a string (a cell of the core's own kind String), else `bad`.
+    void needString(Reg v, Label& bad)
+    {
+        a_.test(v, R15);
+        a_.jcc(CNE, bad);
+        a_.testI8(mem(v, 7), 0x80);
+        a_.jcc(CNE, bad);
+        a_.cmpI8(mem(v, kGcKind), std::uint8_t(detail::CellKind::String));
+        a_.jcc(CNE, bad);
+    }
+    /// The characters of the string in `s`, into `dst`; a rope not yet joined goes to `bad`.
+    void stringChars(Reg s, Reg dst, Label& bad)
+    {
+        Label outOfLine, done;
+        a_.testI8(mem(s, kStrBits), StringCell::kOutOfLine);
+        a_.jcc(CNE, outOfLine);
+        a_.lea(dst, mem(s, kStrChars));
+        a_.jmp(done);
+        a_.bind(outOfLine);
+        a_.testI8(mem(s, kStrBits), StringCell::kRope);
+        a_.jcc(CNE, bad);
+        a_.mov(dst, mem(s, kStrChars));
+        a_.bind(done);
     }
     /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
     void hold(ValidityCell* cell)
@@ -1851,14 +1879,34 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
             return;
         }
     }
-    if (count == 0 && !isLength) {
+    // A string receiver: its length, or a data property of String.prototype while that chain is as it was.
+    JSValue* protoSlot = nullptr;
+    ValidityCell* protoCell = nullptr;
+    double numeric;
+    if (!isLength && vm_.protos.string && !canonicalNumericIndex(key, &numeric)) {
+        std::uint8_t attrs = 0;
+        JSObject* sp = vm_.protos.string;
+        protoCell = vm_.validityOf(sp);
+        JSValue* slot = sp->findOwn(vm_, key, &attrs);
+        if (slot && !(attrs & attr::kAccessor) && protoCell->valid)
+            protoSlot = slot;
+    }
+    const bool stringPath = isLength || protoSlot;
+    if (count == 0 && !stringPath) {
         helperOp(i, &helperThunk<jitGetProp>);
         return;
     }
     Label& bad = slow(i, &helperThunk<jitGetProp>);
-    Label done, lengthPath;
+    Label done, lengthPath, stringRecv;
     a_.mov(RAX, R(in.b));
-    needObject(RAX, bad);
+    if (count == 0) {
+        a_.jmp(stringRecv);
+    } else {
+        a_.test(RAX, R15);
+        a_.jcc(CNE, bad);
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CNE, stringPath ? stringRecv : bad);
+    }
     for (int k = 0; k < count; ++k) {
         Label next;
         const bool last = k == count - 1;
@@ -1888,6 +1936,25 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         a_.test32(RAX, RAX);
         a_.jcc(CS, bad);
         deliverInt(i, in.a);
+    }
+    if (stringPath) {
+        a_.jmp(done);
+        a_.bind(stringRecv);
+        needString(RAX, bad);
+        if (isLength) {
+            a_.mov32(RAX, mem(RAX, kStrLength));
+            a_.test32(RAX, RAX);
+            a_.jcc(CS, bad);
+            deliverInt(i, in.a);
+        } else {
+            hold(protoCell);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(protoCell));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(protoSlot));
+            a_.mov(RAX, mem(RDX, 0));
+            deliver(i, in.a);
+        }
     }
     a_.bind(done);
 }
@@ -2473,6 +2540,36 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jmp(enter);
     }
     a_.bind(helper);
+    if (in.opcode() == Op::Call && argc == 1) {
+        // `s.charCodeAt(i)`: the character read here.
+        Label generic;
+        a_.mov(RAX, R(base));
+        needObject(RAX, generic);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, generic);
+        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+        a_.jcc(CE, generic);
+        a_.mov(RCX, mem(RAX, kObjSlots));
+        a_.mov(RCX, mem(RCX, -16));
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(stringCharNative()));
+        a_.cmp(RDX, mem(RCX, kRareNative));
+        a_.jcc(CNE, generic);
+        a_.cmpI(mem(RCX, kRareData), 1);
+        a_.jcc(CNE, generic);
+        a_.mov(RSI, R(base + 1));
+        needString(RSI, generic);
+        a_.mov(RDX, R(base + 2));
+        needInt(RDX, generic);
+        a_.mov32(RDX, RDX);
+        a_.alu32(7, RDX, mem(RSI, kStrLength));
+        a_.jcc(CAE, generic);  // also a negative index
+        stringChars(RSI, RCX, generic);
+        a_.movzx16(RAX, mem(RCX, RDX, 2));
+        a_.or_(RAX, R14);
+        write(in.a, RAX, false);
+        a_.jmp(afterCall);
+        a_.bind(generic);
+    }
     if (in.opcode() == Op::Call && argc == 1) {
         // `Math.floor(x)` and its kind: a native whose data is a function of one double, called without the interpreter.
         Label generic, notInt;

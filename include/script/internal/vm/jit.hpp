@@ -42,6 +42,8 @@ struct Tier1Code
 /// The native behind `Math.floor`, `Math.sqrt` and the other one-argument functions of `Math`: a function whose `data` is
 /// a `double (*)(double)`, which compiled code calls directly.
 FastNative mathUnaryNative() noexcept;
+/// `String.prototype.charAt`, and with data 1 `charCodeAt`: compiled code reads a character itself.
+FastNative stringCharNative() noexcept;
 /// Whether a `Math` native's data is `Math.sqrt`'s, which compiled code does with one instruction.
 bool mathUnaryIsSqrt(const void* data) noexcept;
 

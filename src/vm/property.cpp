@@ -267,7 +267,7 @@ namespace {
 bool chainIntercepts(VM& vm, JSObject* receiver, Key key)
 {
     JSObject* p = receiver->proto(vm);
-    if (p == vm.protos.array && p && p->proto(vm) == vm.protos.object)
+    if (p && p == vm.protos.array && vm.plainHoleStores())
         return false;
     for (; p; p = p->proto(vm)) {
         if (proxyOf(p) || p->findOwn(vm, key))

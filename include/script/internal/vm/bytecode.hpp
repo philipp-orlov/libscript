@@ -59,6 +59,15 @@ static_assert(sizeof(Ins) == 8, "an instruction is eight bytes");
 
 const char* opName(Op op) noexcept;
 
+namespace elemprof {
+inline constexpr std::uint8_t kArray = 1;
+inline constexpr std::uint8_t kFloat64 = 2;
+inline constexpr std::uint8_t kInt32 = 4;
+inline constexpr std::uint8_t kUint8 = 8;
+inline constexpr std::uint8_t kOtherTyped = 16;
+inline constexpr std::uint8_t kOther = 32;
+}  // namespace elemprof
+
 inline std::uint8_t profBit(JSValue v) noexcept
 {
     return v.isInt32() ? 1 : v.isDouble() ? 2 : 8;
@@ -168,6 +177,8 @@ struct CodeBlock
     /// What the instructions have made so far (profBit: 1 int32, 2 double, 8 anything else), one byte per instruction, then
     /// one per parameter for what calls passed: the optimizing compiler's type feedback. Empty until the code first runs.
     Vec<std::uint8_t> prof;
+    /// What `GetElem` and `PutElem` have indexed (`elemprof` bits), one byte per instruction; made with the baseline code.
+    Vec<std::uint8_t> elemProf;
     /// The optimizing compiler's code for this function (jit.hpp), once the baseline code has run hot; owned.
     struct Tier2Code* tier2 = nullptr;
     std::int32_t tier2Counter = 0;  ///< entries and back edges of the baseline code left before the optimizing compiler is asked

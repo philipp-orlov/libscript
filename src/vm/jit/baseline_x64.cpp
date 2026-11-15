@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <exception>
 #include <utility>
+#include <initializer_list>
+#include <tuple>
 
 #include "script/internal/stack_guard.hpp"
 #include "script/internal/vm/bytecode.hpp"
@@ -547,6 +549,52 @@ private:
             return JSValue::undefined();
         }
         return JSValue::undefined();
+    }
+    /// Records in the element profile of instruction `i` that it has seen `bit` (elemprof), with `tmp` as scratch.
+    void noteElem(std::uint32_t i, std::uint8_t bit, Reg tmp)
+    {
+        if (code_->elemProf.empty())
+            code_->elemProf.assign(code_->code.size(), 0);
+        a_.movImm(tmp, reinterpret_cast<std::uint64_t>(&code_->elemProf[i]));
+        a_.orI8(mem(tmp, 0), bit);
+    }
+    /// For each element kind `kinds[k]`, a jump (on RDX equal to it) to a stub that notes `bits[k]` and goes on to `to[k]`.
+    void kindDispatch(std::uint32_t i, std::initializer_list<std::tuple<ElemKind, std::uint8_t, Label*>> kinds, Label& none)
+    {
+        std::vector<Label> stubs(kinds.size());
+        std::size_t k = 0;
+        for (const auto& [kind, bit, to] : kinds) {
+            a_.aluI32(7, RDX, int(kind));
+            a_.jcc(CE, stubs[k++]);
+        }
+        a_.jmp(none);
+        k = 0;
+        for (const auto& [kind, bit, to] : kinds) {
+            a_.bind(stubs[k++]);
+            noteElem(i, bit, RDX);
+            a_.jmp(*to);
+        }
+    }
+    /// Guards (RAX the array) that a store into a hole of it cannot be intercepted (VM::holeStoreCell), with `tmp` as
+    /// scratch; false, emitting nothing, when it can be now.
+    bool plainHoleGuard(Reg tmp, Label& fail)
+    {
+        JSObject* const ap = vm_.protos.array;
+        ValidityCell* const cell = vm_.holeStoreCell();
+        if (!cell)
+            return false;
+        hold(cell);
+        a_.cmpI32(mem(RAX, 0), std::int32_t(vm_.rootShapeFor(ap)->id));
+        a_.jcc(CNE, fail);
+        a_.movImm(tmp, reinterpret_cast<std::uint64_t>(cell));
+        a_.cmpI32(mem(tmp, kValidityValid), 0);
+        a_.jcc(CE, fail);
+        if (ap->cls() == ObjClass::Array) {
+            a_.movImm(tmp, reinterpret_cast<std::uint64_t>(ap));
+            a_.cmpI32(mem(tmp, kArrayLength), 0);
+            a_.jcc(CNE, fail);
+        }
+        return true;
     }
     /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
     void hold(ValidityCell* cell)
@@ -1725,6 +1773,7 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.mov(RAX, mem(RDX, RCX, 8));
     a_.cmpI(RAX, std::int32_t(kHole));
     a_.jcc(CE, bad);
+    noteElem(i, elemprof::kArray, RDX);
     deliver(i, in.a);
     a_.jmp(done);
 
@@ -1737,23 +1786,10 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.movzx8(RDX, mem(RAX, kTypedKind));
     a_.mov(RSI, mem(RAX, kTypedData));
     Label f64, i32, u8, s8, i16, u16, f32;
-    a_.aluI32(7, RDX, int(E::Float64));
-    a_.jcc(CE, f64);
-    a_.aluI32(7, RDX, int(E::Int32));
-    a_.jcc(CE, i32);
-    a_.aluI32(7, RDX, int(E::Uint8));
-    a_.jcc(CE, u8);
-    a_.aluI32(7, RDX, int(E::Uint8Clamped));
-    a_.jcc(CE, u8);
-    a_.aluI32(7, RDX, int(E::Int8));
-    a_.jcc(CE, s8);
-    a_.aluI32(7, RDX, int(E::Int16));
-    a_.jcc(CE, i16);
-    a_.aluI32(7, RDX, int(E::Uint16));
-    a_.jcc(CE, u16);
-    a_.aluI32(7, RDX, int(E::Float32));
-    a_.jcc(CE, f32);
-    a_.jmp(bad);
+    using namespace elemprof;
+    kindDispatch(i, {{E::Float64, kFloat64, &f64}, {E::Int32, kInt32, &i32}, {E::Uint8, kUint8, &u8},
+                     {E::Uint8Clamped, kOtherTyped, &u8}, {E::Int8, kOtherTyped, &s8}, {E::Int16, kOtherTyped, &i16},
+                     {E::Uint16, kOtherTyped, &u16}, {E::Float32, kOtherTyped, &f32}}, bad);
     Label intResult;
     a_.bind(f64);
     a_.movsdLoad(0, mem(RSI, RCX, 8));
@@ -1806,7 +1842,9 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.lea(RDX, mem(RDX, RCX, 8));
     a_.mov(RDI, mem(RDX, 0));
     a_.cmpI(RDI, std::int32_t(kHole));
-    a_.jcc(CE, bad);  // a hole may stand for a property of the array's own
+    Label hole;
+    a_.jcc(CE, hole);
+    noteElem(i, elemprof::kArray, RSI);
     a_.mov(RSI, R(in.c));
     retain(RSI);
     a_.test(RSI, R14);
@@ -1817,6 +1855,26 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.mov(mem(RDX, 0), RSI);
     release(RDI);
     a_.jmp(done);
+
+    // A hole of a plain array (no properties of its own, the usual prototype chain, which has not changed since): nothing
+    // can intercept the store.
+    a_.bind(hole);
+    {
+        if (!plainHoleGuard(RDI, bad)) {
+            a_.jmp(bad);
+        } else {
+            noteElem(i, elemprof::kArray, RSI);
+            Label holeNumber;
+            a_.mov(RSI, R(in.c));
+            retain(RSI);
+            a_.test(RSI, R14);
+            a_.jcc(CNE, holeNumber);
+            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+            a_.bind(holeNumber);
+            a_.mov(mem(RDX, 0), RSI);
+            a_.jmp(done);
+        }
+    }
 
     // A typed array takes a number; one past its end is ignored.
     a_.bind(typed);
@@ -1831,23 +1889,10 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.movzx8(RDX, mem(RAX, kTypedKind));
     a_.mov(RSI, mem(RAX, kTypedData));
     Label f64, i32, i8, i16, f32;
-    a_.aluI32(7, RDX, int(E::Float64));
-    a_.jcc(CE, f64);
-    a_.aluI32(7, RDX, int(E::Int32));
-    a_.jcc(CE, i32);
-    a_.aluI32(7, RDX, int(E::Uint32));
-    a_.jcc(CE, i32);
-    a_.aluI32(7, RDX, int(E::Uint8));
-    a_.jcc(CE, i8);
-    a_.aluI32(7, RDX, int(E::Int8));
-    a_.jcc(CE, i8);
-    a_.aluI32(7, RDX, int(E::Int16));
-    a_.jcc(CE, i16);
-    a_.aluI32(7, RDX, int(E::Uint16));
-    a_.jcc(CE, i16);
-    a_.aluI32(7, RDX, int(E::Float32));
-    a_.jcc(CE, f32);
-    a_.jmp(bad);
+    using namespace elemprof;
+    kindDispatch(i, {{E::Float64, kFloat64, &f64}, {E::Int32, kInt32, &i32}, {E::Uint32, kOtherTyped, &i32},
+                     {E::Uint8, kUint8, &i8}, {E::Int8, kOtherTyped, &i8}, {E::Int16, kOtherTyped, &i16},
+                     {E::Uint16, kOtherTyped, &i16}, {E::Float32, kOtherTyped, &f32}}, bad);
     a_.bind(f64);
     loadNumber(0, RDI, RDX);
     a_.movsdStore(mem(RSI, RCX, 8), 0);

@@ -86,6 +86,36 @@ ValidityCell* VM::validityOf(JSObject* proto)
     return cell;
 }
 
+ValidityCell* VM::holeStoreCell()
+{
+    JSObject* const ap = protos.array;
+    if (!ap || ap->proto(*this) != protos.object)
+        return nullptr;
+    if (!holeCell_ || !holeCell_->valid) {
+        if (holeCell_)
+            releaseValidity(holeCell_);
+        holeCell_ = validityOf(ap);
+        retainValidity(holeCell_);
+        bool plain = true;
+        for (JSObject* o = ap; o && plain; o = o->proto(*this))
+            o->forEachOwn(*this, [&](Key key, std::uint8_t, JSValue) {
+                std::uint32_t index;
+                if (arrayIndexOf(key, &index))
+                    plain = false;
+            });
+        holePlain_ = plain;
+    }
+    return holePlain_ ? holeCell_ : nullptr;
+}
+
+bool VM::plainHoleStores()
+{
+    if (!holeStoreCell())
+        return false;
+    JSObject* const ap = protos.array;
+    return ap->cls() != ObjClass::Array || static_cast<JSArray*>(ap)->length == 0;
+}
+
 void VM::invalidateChain(JSObject* proto)
 {
     if (!(proto->h.flags & cellflags::kIsProto))

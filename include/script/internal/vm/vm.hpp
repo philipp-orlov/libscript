@@ -206,6 +206,12 @@ struct VM : EngineRuntime
     // ---- validity (validity.cpp) ----
     /// The cell that says whether the chain from `proto` upwards is as it was. No count is added for the caller.
     ValidityCell* validityOf(JSObject* proto);
+    /// A valid cell while a store into a hole of a plain array (the usual prototype chain, no properties of its own)
+    /// cannot be intercepted: neither `Array.prototype` nor `Object.prototype` has a property named by an index. Null when
+    /// one has. `Array.prototype`'s own elements do not move the cell: the caller also checks that its length is 0.
+    ValidityCell* holeStoreCell();
+    /// `holeStoreCell` and an `Array.prototype` with no elements: whether a hole store into a plain array is plain now.
+    bool plainHoleStores();
     void retainValidity(ValidityCell* cell) noexcept { ++cell->refs; }
     void releaseValidity(ValidityCell* cell) noexcept;
     /// `proto` or something above it changed what it has: every cell that depended on it goes invalid. Does nothing for
@@ -388,6 +394,8 @@ public:
 private:
     Vec<void*> validityChunks_;
     ValidityCell* validityFree_ = nullptr;
+    ValidityCell* holeCell_ = nullptr;
+    bool holePlain_ = false;
     ValidityCell* allocValidity();
     void freeValidity(ValidityCell* cell) noexcept;
 

@@ -1741,7 +1741,7 @@ L_PutElem: {
         }
         // A hole of a plain array (no properties of its own, the usual prototype chain): nothing can intercept the store.
         if (i < a->length && a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 &&
-            vm.protos.array->proto(vm) == vm.protos.object) {
+            vm.plainHoleStores()) {
             retain(R[ins->c]);
             a->elems[i] = R[ins->c];
             if (!R[ins->c].isNumber())
@@ -2986,6 +2986,25 @@ struct JitCtx
     InlineCache* ic(InlineCache& scratch) const { return cacheId == kNoCache ? &scratch : &code->caches[cacheId]; }
 };
 
+/// What an element access the baseline code did not finish found as its base, for the optimizing compiler.
+void noteElem(CodeBlock* code, std::uint32_t index, JSValue base)
+{
+    if (index >= code->elemProf.size())
+        return;
+    std::uint8_t bit = elemprof::kOther;
+    if (isObject(base)) {
+        JSObject* o = asObject(base);
+        if (o->cls() == ObjClass::Array) {
+            bit = elemprof::kArray;
+        } else if (o->cls() == ObjClass::TypedArray) {
+            const ElemKind k = static_cast<JSTypedArray*>(o)->kind;
+            bit = k == ElemKind::Float64 ? elemprof::kFloat64 : k == ElemKind::Int32 ? elemprof::kInt32
+                : k == ElemKind::Uint8 ? elemprof::kUint8 : elemprof::kOtherTyped;
+        }
+    }
+    code->elemProf[index] |= bit;
+}
+
 inline JitCtx jitCtx(VM& vm, std::uint32_t index, bool hasCache)
 {
     Frame* fr = vm.frameBase + vm.frameCount - 1;
@@ -3248,6 +3267,7 @@ int jitGetElem(VM& vm, std::uint32_t index)
     JSValue* R = c.R;
     const JSValue base = R[ins->b];
     JSValue k = R[ins->c];
+    noteElem(c.code, index, base);
     if (k.isDouble()) {
         const double d = k.asDouble();
         if (d >= 0 && d < 2147483648.0 && double(std::int32_t(d)) == d)
@@ -3311,6 +3331,7 @@ int jitPutElem(VM& vm, std::uint32_t index)
     JSValue* R = c.R;
     const JSValue base = R[ins->a];
     JSValue k = R[ins->b];
+    noteElem(c.code, index, base);
     if (k.isDouble()) {
         const double d = k.asDouble();
         if (d >= 0 && d < 2147483648.0 && double(std::int32_t(d)) == d)
@@ -3344,7 +3365,7 @@ int jitPutElem(VM& vm, std::uint32_t index)
             return 1;
         }
         if (i < a->length && a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 &&
-            vm.protos.array->proto(vm) == vm.protos.object) {
+            vm.plainHoleStores()) {
             retain(R[ins->c]);
             a->elems[i] = R[ins->c];
             if (!R[ins->c].isNumber())

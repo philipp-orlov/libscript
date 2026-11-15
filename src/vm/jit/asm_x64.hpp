@@ -297,6 +297,11 @@ public:
         opMem(false, 0xF6, 0, m);
         b(imm);
     }
+    void orI8(const Mem& m, std::uint8_t imm)
+    {
+        opMem(false, 0x80, 1, m);
+        b(imm);
+    }
     void andI8(const Mem& m, std::uint8_t imm)
     {
         opMem(false, 0x80, 4, m);

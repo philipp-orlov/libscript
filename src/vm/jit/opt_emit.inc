@@ -548,6 +548,125 @@ bool Baseline::emitTyped(std::uint32_t i)
         unboxRax(dw, bad);
         return true;
     }
+    case Op::GetElem: case Op::PutElem: {
+        // An element of the one kind of indexed object the site has seen, at an int32 index: no boxing of the index, one
+        // class test, the kind's own load or store.
+        const bool put = op == Op::PutElem;
+        if (uw.size() < (put ? 3u : 2u) || uw[0] >= 0 || uw[1] < 0 || !isI32(uw[1]))
+            return false;
+        if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
+            return false;
+        const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+        using namespace elemprof;
+        if (ep != kArray && ep != kFloat64 && ep != kInt32 && ep != kUint8)
+            return false;
+        const std::int32_t vw = put ? uw[2] : -1;
+        if (put && ep != kArray && vw < 0)
+            return false;
+        Label& bad = exitBefore(i);
+        Label done;
+        a_.mov32(RCX, useI32(uw[1], RCX));
+        a_.mov(RAX, R(put ? in.a : in.b));
+        needObject(RAX, bad);
+        if (ep == kArray) {
+            a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+            a_.jcc(CNE, bad);
+            if (put) {
+                a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
+                a_.jcc(CNE, bad);
+            }
+            a_.test32(RCX, RCX);
+            a_.jcc(CS, bad);
+            a_.alu32(7, RCX, mem(RAX, kArrayLength));
+            a_.jcc(CAE, bad);
+            a_.mov(RDX, mem(RAX, kArrayElems));
+            if (!put) {
+                a_.mov(RAX, mem(RDX, RCX, 8));
+                a_.cmpI(RAX, std::int32_t(kHole));
+                a_.jcc(CE, bad);
+                deliver(i, in.a);
+                return true;
+            }
+            a_.lea(RDX, mem(RDX, RCX, 8));
+            // The value, boxed and counted, in RSI; a number leaves the array's all-numbers flag as it is.
+            if (vw >= 0) {
+                if (isI32(vw)) {
+                    a_.mov32(RSI, useI32(vw, RSI));
+                    a_.or_(RSI, R14);
+                } else {
+                    a_.mov(RDI, RAX);
+                    const int x = operandF64(vw, 0, RSI);
+                    if (x != 0)
+                        a_.movaps(0, x);
+                    boxDouble0();
+                    a_.mov(RSI, RAX);
+                    a_.mov(RAX, RDI);
+                }
+            } else {
+                Label number;
+                a_.mov(RSI, R(in.c));
+                retain(RSI);
+                a_.test(RSI, R14);
+                a_.jcc(CNE, number);
+                a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+                a_.bind(number);
+            }
+            Label hole;
+            a_.mov(RDI, mem(RDX, 0));
+            a_.cmpI(RDI, std::int32_t(kHole));
+            a_.jcc(CE, hole);
+            a_.mov(mem(RDX, 0), RSI);
+            release(RDI);
+            a_.jmp(done);
+            // A hole of a plain array whose prototype chain is as it was: nothing can intercept the store. Otherwise the
+            // value's count is given back and the instruction runs again in the interpreter.
+            a_.bind(hole);
+            Label undo;
+            if (plainHoleGuard(RDI, undo)) {
+                a_.mov(mem(RDX, 0), RSI);
+                a_.jmp(done);
+            }
+            a_.bind(undo);
+            if (vw < 0)
+                release(RSI);
+            a_.jmp(bad);
+            a_.bind(done);
+            return true;
+        }
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
+        a_.jcc(CNE, bad);
+        const ElemKind kind = ep == kFloat64 ? ElemKind::Float64 : ep == kInt32 ? ElemKind::Int32 : ElemKind::Uint8;
+        a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
+        a_.jcc(CNE, bad);
+        a_.alu32(7, RCX, mem(RAX, kTypedLength));
+        a_.jcc(CAE, put ? done : bad);  // a store to no element (past the end, or a negative index) does nothing
+        a_.mov(RSI, mem(RAX, kTypedData));
+        if (!put) {
+            if (kind == ElemKind::Float64) {
+                a_.movsdLoad(0, mem(RSI, RCX, 8));
+                deliverDouble(i, in.a);
+            } else {
+                if (kind == ElemKind::Int32)
+                    a_.mov32(RAX, mem(RSI, RCX, 4));
+                else
+                    a_.movzx8(RAX, mem(RSI, RCX, 1));
+                deliverInt(i, in.a);
+            }
+            return true;
+        }
+        if (kind == ElemKind::Float64) {
+            const int x = operandF64(vw, 0, RAX);
+            a_.movsdStore(mem(RSI, RCX, 8), x);
+        } else {
+            int32OfWeb(vw, RAX, i);
+            if (kind == ElemKind::Int32)
+                a_.mov32(mem(RSI, RCX, 4), RAX);
+            else
+                a_.mov8(mem(RSI, RCX, 1), RAX);
+        }
+        a_.bind(done);
+        return true;
+    }
     case Op::PutProp: {
         // A number stored to an existing own data property: boxed in place, no trip through the frame.
         if (uw.size() < 2 || uw[0] >= 0 || uw[1] < 0)

@@ -556,8 +556,10 @@ bool Baseline::emitTyped(std::uint32_t i)
             return false;
         if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
             return false;
-        const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
         using namespace elemprof;
+        std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+        if (ep == 0)
+            ep = kArray;  // not run yet: the usual case, and a guard that fails says so
         if (ep != kArray && ep != kFloat64 && ep != kInt32 && ep != kUint8)
             return false;
         const std::int32_t vw = put ? uw[2] : -1;
@@ -754,6 +756,31 @@ bool Baseline::emitTyped(std::uint32_t i)
     case Op::JNotGt: case Op::JNotGe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
     case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictEq: case Op::JStrictNe: case Op::JStrictEqI:
     case Op::JStrictNeI:
+        if ((op == Op::JTrue || op == Op::JFalse) && !uw.empty() && uw[0] < 0) {
+            // A value in the frame: booleans, int32s, undefined and null here; anything else in the interpreter, so the
+            // variables need not be written back on the way.
+            const std::uint32_t target = i + 1 + std::uint32_t(in.jump());
+            Label& bad = exitBefore(i);
+            Label taken, notTaken;
+            const bool jt = op == Op::JTrue;
+            a_.mov(RAX, R(in.a));
+            a_.cmpI(RAX, std::int32_t(kTrue));
+            a_.jcc(CE, jt ? taken : notTaken);
+            a_.cmpI(RAX, std::int32_t(kFalse));
+            a_.jcc(CE, jt ? notTaken : taken);
+            a_.cmpI(RAX, std::int32_t(kUndefined));
+            a_.jcc(CE, jt ? notTaken : taken);
+            a_.cmpI(RAX, std::int32_t(kNull));
+            a_.jcc(CE, jt ? notTaken : taken);
+            needInt(RAX, bad);
+            a_.test32(RAX, RAX);
+            a_.jcc(jt ? CNE : CE, taken);
+            a_.jmp(notTaken);
+            a_.bind(taken);
+            go(i, target);
+            a_.bind(notTaken);
+            return true;
+        }
         if (!allTyped())
             return false;
         typedJump(i, in);

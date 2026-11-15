@@ -2985,6 +2985,42 @@ TEST(callsOfGlobalFunctionsFromOptimizedCode)
     }
 }
 
+TEST(constructorCallsFromCompiledCode)
+{
+    // `new` of a compiled function pushes its frame from compiled code: results that are objects or not, derived classes,
+    // `new.target`, a prototype that is not an object, a throw, an arrow and `arguments` all behave.
+    const char* program =
+        "var out=[];"
+        "function P(x){ this.x=x; }"
+        "function R(x){ this.x=x; return {y:x}; }"
+        "function Q(x){ this.x=x; return 5; }"
+        "function NT(){ this.t = new.target === NT; }"
+        "class A{ constructor(v){ this.v=v; } }"
+        "class B extends A{ constructor(v){ super(v*2); this.w=1; } }"
+        "function T(x){ if (x===99999) throw new Error(\"bad\"+x); this.x=x; }"
+        "function k(n){ var s=0; for (var i=0;i<n;i++){ s+=new P(i).x + new R(i).y + new Q(i).x + (new NT().t?1:0) + new A(i).v + new B(i).v + new T(i).x; } return s; }"
+        "out.push(k(3000));"
+        "P.prototype = 7; out.push(Object.getPrototypeOf(new P(1)) === Object.prototype);"
+        "P.prototype = {z:3}; out.push(new P(1).z);"
+        "try { k(1000); for (var i=0;i<1000;i++) new T(i===500?99999:i); } catch(e){ out.push(e.message); }"
+        "function Sloppy(){ this.g = (this instanceof Sloppy); }"
+        "var c=0; for (var i=0;i<3000;i++) if (new Sloppy().g) c++; out.push(c);"
+        "var arrow = () => 1; try { for (var i=0;i<3000;i++) new arrow(); } catch(e){ out.push(e instanceof TypeError); }"
+        "function Args(){ this.n = arguments.length; } var an=0; for (var i=0;i<3000;i++) an+=new Args(1,2).n; out.push(an);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("31492500 true 3 bad99999 3000 true 6000"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

@@ -384,6 +384,19 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
             reinterpret_cast<std::uint64_t>(c->tier1->entry)};
 }
 
+/// `this` for `new f(...)` from compiled code: an object inheriting from `f.prototype` (an ordinary function: the property
+/// is its third slot). Owned; 0 with the exception parked.
+extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
+{
+    try {
+        const JSValue pv = *f->slotAt(2);
+        return toJSValue(vm->newObject(isObject(pv) ? asObject(pv) : vm->protos.object)).bits;
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
 extern "C" CallResult scriptVmJitCall(VM* vm, std::uint32_t index)
 {
     try {
@@ -432,12 +445,15 @@ constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
 constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
 constexpr std::int32_t kCbTier1 = std::int32_t(offsetof(CodeBlock, tier1));
 constexpr std::int32_t kCbUid = std::int32_t(offsetof(CodeBlock, uid));
+constexpr std::int32_t kCbConstructor = std::int32_t(offsetof(CodeBlock, constructor));
+constexpr std::int32_t kVmFnProtoShape = std::int32_t(offsetof(VM, fnProtoShape));
 constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
 constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
 constexpr std::int32_t kCbNregs = std::int32_t(offsetof(CodeBlock, nregs));
 constexpr std::int32_t kTierEntry = std::int32_t(offsetof(Tier1Code, entry));
 constexpr std::int32_t kFrameArgc = std::int32_t(offsetof(Frame, argc));
 constexpr std::int32_t kFrameConstruct = std::int32_t(offsetof(Frame, construct));
+static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "a frame push writes both flags in one store");
 constexpr std::int32_t kVmTicks = std::int32_t(offsetof(VM, ticks));
 constexpr std::int32_t kVmFrameCount = std::int32_t(offsetof(VM, frameCount));
 constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, elems));
@@ -2271,6 +2287,89 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(mem(R11, kFrameRetDst), RDI);
         a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
         a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+        a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+        a_.mov(RSI, R11);
+        a_.mov(RDX, mem(RDX, kTierEntry));
+        a_.jmp(enter);
+    }
+    if (in.opcode() == Op::New && window <= 1 + argc + 6) {
+        // `new f(...)` of an ordinary compiled function: `this` made by a call into the runtime, the frame pushed here.
+        a_.mov(RAX, R(base));
+        needObject(RAX, helper);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, helper);
+        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+        a_.jcc(CNE, helper);
+        a_.mov32(RSI, mem(R12, kVmFnProtoShape));
+        a_.alu32(7, RSI, mem(RAX, 0));
+        a_.jcc(CNE, helper);
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.cmpI8(mem(RCX, kCbConstructor), 0);
+        a_.jcc(CE, helper);
+        a_.mov(RDX, mem(RCX, kCbTier1));
+        a_.test(RDX, RDX);
+        a_.jcc(CE, helper);
+        a_.testI32(mem(RCX, kCbFlags), CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
+                                           CodeBlock::kNeedsArgs);
+        a_.jcc(CNE, helper);
+        a_.movzx16(RSI, mem(RCX, kCbNparams));
+        a_.aluI32(7, RSI, std::int32_t(argc));
+        a_.jcc(CB, helper);
+        a_.mov32(RSI, mem(RCX, kCbNregs));
+        a_.lea(R9, R(base + 1));
+        a_.lea(R10, mem(R9, RSI, 8, 64));
+        a_.alu(7, R10, mem(R12, kVmStackEnd));
+        a_.jcc(CA, helper);
+        a_.lea(R10, mem(R9, RSI, 8));
+        a_.alu(7, R10, mem(R12, kVmStackInit));
+        a_.jcc(CA, helper);
+        a_.mov32(R10, mem(R12, kVmFrameCount));
+        a_.aluI32(0, R10, 2);
+        a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+        a_.jcc(CAE, helper);
+        a_.cmpI32(mem(R12, kVmTicks), 1);
+        a_.jcc(CBE, helper);
+        a_.alu(7, RSP, mem(R12, kVmStackFloor));
+        a_.jcc(CB, helper);
+        for (unsigned r = 1 + argc; r < window; ++r) {
+            Label skip;
+            a_.aluI32(7, RSI, std::int32_t(r));
+            a_.jcc(CBE, skip);
+            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
+            a_.test(RDI, R15);
+            a_.jcc(CE, helper);
+            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+            a_.bind(skip);
+        }
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+        a_.mov(mem(R13, kFramePc), RDI);
+        a_.mov(RDI, R12);
+        a_.mov(RSI, RAX);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitNewThis));
+        a_.callReg(RAX);
+        a_.test(RAX, RAX);
+        a_.jcc(CE, exc);
+        a_.mov(RDI, R(base + 1));
+        a_.mov(R(base + 1), RAX);
+        release(RDI);
+        a_.mov(RAX, R(base));
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.mov(RDX, mem(RCX, kCbTier1));
+        a_.lea(R9, R(base + 1));
+        a_.dec32(mem(R12, kVmTicks));
+        a_.mov32(R10, mem(R12, kVmFrameCount));
+        a_.mov(R11, mem(R12, kVmFrameBase));
+        a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
+        a_.add(R11, RDI);
+        a_.inc32(mem(R12, kVmFrameCount));
+        a_.mov(mem(R11, kFrameCode), RCX);
+        a_.mov(mem(R11, kFrameFn), RAX);
+        a_.mov(mem(R11, kFramePc), 0);
+        a_.mov(mem(R11, kFrameR), R9);
+        a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
+        a_.mov(mem(R11, kFrameRetDst), RDI);
+        a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x101));
+        a_.mov(mem(R11, kFrameNewTarget), RAX);
         a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
         a_.mov(RSI, R11);
         a_.mov(RDX, mem(RDX, kTierEntry));

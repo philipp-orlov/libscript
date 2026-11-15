@@ -929,6 +929,15 @@ void Baseline::emitOpt(std::uint32_t i)
         forgetFacts();
     }
     delivered_ = false;
+    if (skipDef_.size() > i && skipDef_[i]) {
+        forgetFacts();
+        return;
+    }
+    if (directCalls_.count(i)) {
+        forgetFacts();
+        emitDirectCall(i);
+        return;
+    }
     if (emitTyped(i)) {
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
             if (r < factShape_.size()) {
@@ -957,6 +966,7 @@ void Baseline::emitExits()
             for (const opt::LiveWeb& lw : plan_->liveBefore[at])
                 if (std::int32_t(lw.web) != skip)
                     spillToFrame(lw.reg, std::int32_t(lw.web));
+        writePending(at);
         a_.aluI(0, RSP, spill_);
         a_.mov(RDI, R12);
         a_.movImm(RSI, e.index);
@@ -993,6 +1003,33 @@ void Baseline::emitOptTails()
     a_.jmp(RAX);
 }
 
+void Baseline::findPlainRegs()
+{
+    plainRegs_.assign(code_->nregs, 1);
+    if (!plainRegs_.empty())
+        plainRegs_[0] = 0;
+    if (!code_->handlers.empty() || (code_->flags & (CodeBlock::kGenerator | CodeBlock::kAsync))) {
+        plainRegs_.assign(code_->nregs, 0);
+        return;
+    }
+    for (std::uint32_t i = 0; i < n_; i += length(i)) {
+        const Ins& in = code_->code[i];
+        const Op op = in.opcode();
+        const opt::Effects e = opt::effectsOf(*code_, i);
+        const bool constant = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue || op == Op::LoadFalse ||
+                              op == Op::LoadInt || op == Op::LoadHole || op == Op::LoadUninit ||
+                              (op == Op::LoadK && !code_->consts[in.b].isCell());
+        for (std::size_t k = 0; k < e.wr.size(); ++k) {
+            const bool typed = k == 0 && plan_->defWeb[i] >= 0;
+            if (!typed && !constant && e.wr[k] < plainRegs_.size())
+                plainRegs_[e.wr[k]] = 0;
+        }
+        if (op == Op::Call || op == Op::New)
+            for (unsigned r = in.b + 1u; r <= in.b + 1u + in.c && r < plainRegs_.size(); ++r)
+                plainRegs_[r] = 0;
+    }
+}
+
 Tier2Code* Baseline::compileOptimized()
 {
     const std::uint32_t W = plan_->typedWebs;
@@ -1002,6 +1039,8 @@ Tier2Code* Baseline::compileOptimized()
     inlineBase_ = calls ? std::int32_t(8 + 8 * W) : -1;
     spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 15) & ~15u);
     dirty_.assign(W, 1);
+    findPlainRegs();
+    planDirectCalls();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);
     a_.push(RBX);
@@ -1024,6 +1063,14 @@ Tier2Code* Baseline::compileOptimized()
         osr.emplace_back(h, std::uint32_t(a_.here()));
         Label fail;
         a_.aluI(5, RSP, spill_);
+        // The baseline code may have left a cell where this code keeps only plain values: then it goes on there.
+        for (unsigned r = 1; r < plainRegs_.size(); ++r) {
+            if (!plainRegs_[r])
+                continue;
+            a_.mov(RAX, R(r));
+            a_.test(RAX, R15);
+            a_.jcc(CE, fail);
+        }
         for (const opt::LiveWeb& lw : plan_->liveBefore[h])
             loadFromFrame(lw.reg, std::int32_t(lw.web), fail);
         a_.jmp(at_[h]);

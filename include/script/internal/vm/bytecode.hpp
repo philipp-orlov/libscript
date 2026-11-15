@@ -161,6 +161,7 @@ struct CodeBlock
         kAsync = 256,            ///< an async function: a generator that a promise drives
         kGenerator = 128,        ///< a call makes a generator object instead of running
         kNeedsArgs = 16,  ///< the call keeps every argument in an array, in the register after the parameters
+        kNoThis = 1024,   ///< never reads `this` (found when the baseline code is made): a call need not make one
     };
 
     std::uint32_t refs = 1;

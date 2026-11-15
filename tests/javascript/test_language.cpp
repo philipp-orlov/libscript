@@ -2947,6 +2947,44 @@ TEST(methodsGettersAndSuperCallsInlineInsideEachOther)
     }
 }
 
+TEST(callsOfGlobalFunctionsFromOptimizedCode)
+{
+    // A global function called from optimized code is checked at the call and its frame pushed from constants; replacing
+    // the function, a throw, running out of stack and an exit between the read of the global and the call all behave.
+    const char* program =
+        "var out=[];"
+        "function sq(x){ return x*x; }"
+        "function k1(n){ var s=0; for (var i=0;i<n;i++){ s=(s+sq(i&7))|0; if (i===3000) sq=function(x){return -x;}; } return s; }"
+        "out.push(k1(6000));"
+        "function thr(x){ if (x===777) throw new Error(\"e\"+x); return x; }"
+        "function k2(n){ var s=0; for (var i=0;i<n;i++) s+=thr(i); return s; }"
+        "try { k2(1000); } catch(e){ out.push(e.message); }"
+        "function rec(n){ return n===0?0:1+rec(n-1); }"
+        "try { out.push(rec(1e6)); } catch(e){ out.push(e instanceof RangeError); }"
+        "out.push(rec(400));"
+        "function ov(x){ return x; }"
+        "function k3(n){ var s=0, b=2147483000; for (var i=0;i<n;i++){ s+=ov(b+i); } return s; }"
+        "out.push(k3(3000));"
+        "var cnt=0; function g(){ cnt++; if (cnt===2000) { globalThis.g = function(){ return 100; }; } return 1; }"
+        "function k4(n){ var s=0; for (var i=0;i<n;i++) s+=g(); return s; }"
+        "out.push(k4(4000));"
+        "function self(){ return this === undefined ? 1 : 2; }"
+        "function k5(n){ var s=0; for (var i=0;i<n;i++) s+=self(); return s; }"
+        "out.push(k5(3000));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("42000 e777 true 400 6442453498500 202000 6000"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

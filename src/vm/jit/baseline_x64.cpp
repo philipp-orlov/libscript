@@ -264,7 +264,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
                 static int serial2 = 0;
                 const std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");
-                const std::string path = std::string(dir) + "/t2-" + std::to_string(++serial2) + "-" + nm + ".bin";
+                char at[32]; std::snprintf(at, sizeof at, "%p", static_cast<void*>(t->rx)); const std::string path = std::string(dir) + "/t2-" + std::to_string(++serial2) + "-" + nm + "@" + at + ".bin";
                 if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
                     std::fwrite(t->rx, 1, t->bytes, f);
                     std::fclose(f);
@@ -353,7 +353,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         R[base + 1] = toJSValue(made);
         release(old);
     }
-    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && newR[0].isNullish()) {
+    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && newR[0].isNullish()) {
         const JSValue old = newR[0];
         newR[0] = toJSValue(vm.global);
         retain(newR[0]);
@@ -724,14 +724,32 @@ private:
     void inlineI32(const IVal& v, Reg dst, Label* bad);
     void inlineF64(const IVal& v, int x, Reg tmp, Label* bad);
     void inlineBoxed(const IVal& v);
-    bool inlineCall(std::uint32_t i);
+    bool inlineCall(std::uint32_t i, bool decideOnly = false);
     bool inlineGetter(std::uint32_t i);
     bool inlineTop(std::uint32_t i, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
-                   unsigned dst);
+                   unsigned dst, bool decideOnly);
+    // direct calls (opt_inline.inc)
+    struct DirectCall
+    {
+        JSValue fn;
+        CodeBlock* code;
+        std::uint32_t globalIndex;  ///< the global's slot index
+        bool thisSkipped;
+    };
+    std::map<std::uint32_t, DirectCall> directCalls_;
+    std::vector<std::uint8_t> skipDef_;  ///< instructions whose result a direct call keeps out of the frame
+    std::map<std::uint32_t, std::vector<std::pair<unsigned, JSValue>>> pendingAt_;  ///< what an exit there writes first
+    void planDirectCalls();
+    void emitDirectCall(std::uint32_t i);
+    void writePending(std::uint32_t point);
     bool inlineDeliver(InlineCtx& cx, const IVal& v, unsigned dst);
     bool inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
                     IVal& result, int depth);
-    std::int32_t inlineBase_ = -1;  ///< where the slots of inlined calls start in the optimized frame (rsp-relative)
+    std::int32_t inlineBase_ = -1;
+    /// Optimized code: registers that only ever hold numbers and other plain values while it runs, so clearing one is a
+    /// store. Not those a call passes arguments in (the callee may assign its parameters) nor with exception handlers.
+    std::vector<std::uint8_t> plainRegs_;
+    void findPlainRegs();  ///< where the slots of inlined calls start in the optimized frame (rsp-relative)
     void emitExits();
     void emitOptTails();
     // variables
@@ -1011,6 +1029,10 @@ private:
     }
     void clearReg(unsigned r)
     {
+        if (r < plainRegs_.size() && plainRegs_[r]) {
+            a_.mov(R(r), std::int32_t(kUndefined));  // never a cell here (`plainRegs_`)
+            return;
+        }
         a_.mov(RDX, R(r));
         a_.mov(R(r), std::int32_t(kUndefined));
         release(RDX);
@@ -2222,7 +2244,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         {
             // A sloppy function called with no `this` gets the global object.
             Label thisOk;
-            a_.testI32(mem(RCX, kCbFlags), CodeBlock::kStrict | CodeBlock::kArrow);
+            a_.testI32(mem(RCX, kCbFlags), CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis);
             a_.jcc(CNE, thisOk);
             a_.mov(RDI, R(base + 1));
             a_.aluI(4, RDI, -9);
@@ -2424,6 +2446,17 @@ void compileTier1(VM& vm, CodeBlock* code)
     if (!t)
         return;
     code->tier1 = t;
+    {
+        bool reads = false;
+        for (std::uint32_t j = 0; j < code->code.size() && !reads; j = opt::nextOf(*code, j)) {
+            const opt::Effects e = opt::effectsOf(*code, j);
+            reads = !e.ok;
+            for (std::uint16_t r : e.rd)
+                reads = reads || r == 0;
+        }
+        if (!reads)
+            code->flags |= CodeBlock::kNoThis;
+    }
     code->tier1Failed = false;
     code->tier2Counter = vm.tier2Threshold > 0 ? vm.tier2Threshold : 0x40000000;
     SCRIPT_VM_CENSUS(Tier1Compiled);

@@ -151,7 +151,7 @@ IVal Baseline::callerValue(std::uint32_t i, unsigned reg, std::size_t k, std::ui
     return v;
 }
 
-bool Baseline::inlineCall(std::uint32_t i)
+bool Baseline::inlineCall(std::uint32_t i, bool decideOnly)
 {
     const Ins& in = code_->code[i];
     if (in.opcode() != Op::Call || inlineBase_ < 0)
@@ -183,7 +183,7 @@ bool Baseline::inlineCall(std::uint32_t i)
     args.push_back(callerValue(i, base + 1, 1, 8));
     for (unsigned k = 0; k < argc; ++k)
         args.push_back(callerValue(i, base + 2 + k, 2 + k, k < C->nparams ? C->prof[C->code.size() + k] : 8));
-    return inlineTop(i, C, callee, known, args, in.a);
+    return inlineTop(i, C, callee, known, args, in.a, decideOnly);
 }
 
 bool Baseline::inlineGetter(std::uint32_t i)
@@ -263,10 +263,10 @@ bool Baseline::inlineGetter(std::uint32_t i)
 }
 
 bool Baseline::inlineTop(std::uint32_t i, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
-                         unsigned dst)
+                         unsigned dst, bool decideOnly)
 {
     // The first pass decides everything and emits nothing; the second follows it.
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < (decideOnly ? 1 : 2); ++pass) {
         InlineCtx cx;
         cx.at = i;
         cx.emit = pass == 1;
@@ -771,4 +771,251 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
         }
     }
     return false;
+}
+
+// ---- direct calls ----
+//
+// `f(x)` where `f` is a global function: the `GetGlobal` that reads it and the `LoadUndef` of `this` (when the callee never
+// reads it) write nothing; the call checks that the global still holds the function and pushes its frame from constants.
+// A slow path, or an exit between those instructions and the call, writes the registers first.
+
+void Baseline::planDirectCalls()
+{
+    directCalls_.clear();
+    pendingAt_.clear();
+    skipDef_.assign(n_ + 1, 0);
+    if (!code_->handlers.empty())
+        return;
+    std::vector<std::uint32_t> starts;
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        starts.push_back(j);
+    auto reads = [&](std::uint32_t j, unsigned r) {
+        for (std::uint16_t x : opt::effectsOf(*code_, j).rd)
+            if (x == r)
+                return true;
+        return false;
+    };
+    auto writes = [&](std::uint32_t j, unsigned r) {
+        for (std::uint16_t x : opt::effectsOf(*code_, j).wr)
+            if (x == r)
+                return true;
+        return false;
+    };
+    // Instructions that may sit between the read of the global and the call: nothing that runs script or writes globals.
+    auto quiet = [&](std::uint32_t j) {
+        const Op op = code_->code[j].opcode();
+        switch (op) {
+        case Op::LoadUndef: case Op::LoadNull: case Op::LoadInt: case Op::LoadK: case Op::LoadTrue: case Op::LoadFalse:
+        case Op::Mov:
+            return true;
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl:
+        case Op::Shr: case Op::AddI: case Op::SubI: case Op::MulI: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
+        case Op::ShlI: case Op::ShrI: case Op::Inc: case Op::Dec: {
+            if (plan_->defWeb[j] < 0)
+                return false;
+            for (std::int32_t w : plan_->useWebs[j])
+                if (w < 0)
+                    return false;
+            return true;
+        }
+        default:
+            return false;
+        }
+    };
+    // Whether `r` is read after instruction `k` before it is written again (a jump ends the search: assume it is).
+    auto deadAfter = [&](std::size_t k, unsigned r) {
+        for (std::size_t m = k + 1; m < starts.size(); ++m) {
+            const std::uint32_t j = starts[m];
+            if (reads(j, r))
+                return false;
+            if (writes(j, r))
+                return true;
+            const Op op = code_->code[j].opcode();
+            if (op == Op::Ret || op == Op::Throw)
+                return true;
+            if (opt::jumpTarget(*code_, j) >= 0)
+                return false;
+        }
+        return false;
+    };
+    for (std::size_t k = 0; k < starts.size(); ++k) {
+        const std::uint32_t i = starts[k];
+        const Ins& in = code_->code[i];
+        if (in.opcode() != Op::Call || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+            continue;
+        const unsigned base = in.b, argc = in.c;
+        const JSValue f = constantBefore(i, base);
+        if (!isFunction(f))
+            continue;
+        auto* fn = static_cast<JSFunction*>(asObject(f));
+        if (fn->flags & JSFunction::kNative)
+            continue;
+        CodeBlock* C = fn->code;
+        if (!C || argc > C->nparams ||
+            (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+                         CodeBlock::kClassConstructor)))
+            continue;
+        if (inlineCall(i, true))
+            continue;
+        // The read of the callee, in this block, with only quiet instructions after it.
+        std::int64_t d = -1, t = -1;
+        bool ok = true;
+        for (std::size_t m = k; m-- > 0;) {
+            const std::uint32_t j = starts[m];
+            if (writes(j, base)) {
+                if (code_->code[j].opcode() == Op::GetGlobal && plan_->defWeb[j] < 0)
+                    d = j;
+                break;
+            }
+            if (reads(j, base) || !quiet(j) || plan_->isLeader[j]) {
+                ok = false;
+                break;
+            }
+            if (t < 0 && writes(j, base + 1)) {
+                const Op op = code_->code[j].opcode();
+                if (op == Op::LoadUndef || op == Op::LoadNull)
+                    t = j;
+            }
+        }
+        if (!ok || d < 0 || !deadAfter(k, base))
+            continue;
+        // The global's slot.
+        JSObject* g = vm_.global;
+        std::uint8_t attrs = 0;
+        JSValue* slot = g->findOwn(vm_, code_->atoms[code_->code[std::size_t(d)].b], &attrs);
+        if (!slot || (attrs & attr::kAccessor) || *slot != f)
+            continue;
+        JSValue* inl = g->inl();
+        const std::uint32_t index = slot >= inl && slot < inl + g->h.aux ? std::uint32_t(slot - inl)
+                                                                          : std::uint32_t(slot - g->slots) + g->h.aux;
+        bool thisSkipped = false;
+        if (t >= 0 && (C->flags & CodeBlock::kNoThis) && deadAfter(k, base + 1)) {
+            // Nothing else between the `this` and the call reads it.
+            bool readBetween = false;
+            for (std::size_t m = 0; m < k; ++m)
+                if (starts[m] > std::uint32_t(t) && reads(starts[m], base + 1))
+                    readBetween = true;
+            thisSkipped = !readBetween;
+        }
+        holdValue(f);
+        directCalls_[i] = DirectCall{f, C, index, thisSkipped};
+        skipDef_[std::size_t(d)] = 1;
+        if (thisSkipped)
+            skipDef_[std::size_t(t)] = 1;
+        // An exit at a point after the skipped instruction and up to the call writes what it skipped.
+        for (std::size_t m = 0; m <= k; ++m) {
+            const std::uint32_t p = starts[m];
+            if (p > std::uint32_t(d))
+                pendingAt_[p].emplace_back(base, f);
+            if (thisSkipped && p > std::uint32_t(t))
+                pendingAt_[p].emplace_back(base + 1, code_->code[std::size_t(t)].opcode() == Op::LoadNull ? JSValue::null()
+                                                                                                           : JSValue::undefined());
+        }
+    }
+}
+
+void Baseline::writePending(std::uint32_t point)
+{
+    auto it = pendingAt_.find(point);
+    if (it == pendingAt_.end())
+        return;
+    for (const auto& [reg, v] : it->second) {
+        a_.movImm(RAX, v.bits);
+        if (v.isCell())
+            a_.inc32(mem(RAX, kHdrRc));
+        write(reg, RAX);
+    }
+}
+
+void Baseline::emitDirectCall(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const DirectCall& dc = directCalls_.at(i);
+    CodeBlock* C = dc.code;
+    const unsigned base = in.b, argc = in.c;
+    materializeReads(i);
+    savePool(i);
+    Label slowPath, done;
+    throws_.emplace_back(i, Label{});
+    Label& exc = throws_.back().second;
+    // The global still holds the function.
+    a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+    a_.jcc(CNE, slowPath);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(vm_.global));
+    slotAddress(dc.globalIndex);
+    a_.movImm(RAX, dc.fn.bits);
+    a_.cmp(RAX, mem(RDX, 0));
+    a_.jcc(CNE, slowPath);
+    // Its baseline code, room for its frame.
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(C));
+    a_.mov(RDX, mem(RCX, kCbTier1));
+    a_.test(RDX, RDX);
+    a_.jcc(CE, slowPath);
+    a_.lea(R9, R(base + 1));
+    a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 64)));
+    a_.alu(7, R10, mem(R12, kVmStackEnd));
+    a_.jcc(CA, slowPath);
+    a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs)));
+    a_.alu(7, R10, mem(R12, kVmStackInit));
+    a_.jcc(CA, slowPath);
+    a_.mov32(R10, mem(R12, kVmFrameCount));
+    a_.aluI32(0, R10, 2);
+    a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+    a_.jcc(CAE, slowPath);
+    a_.cmpI32(mem(R12, kVmTicks), 1);
+    a_.jcc(CBE, slowPath);
+    a_.alu(7, RSP, mem(R12, kVmStackFloor));
+    a_.jcc(CB, slowPath);
+    // Caller registers the callee's frame covers past the arguments: plain values are overwritten, a cell goes the long way.
+    const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
+    for (unsigned r = 1 + argc; r < window && r < C->nregs; ++r) {
+        a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
+        a_.test(RDI, R15);
+        a_.jcc(CE, slowPath);
+        a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+    }
+    if (!dc.thisSkipped && !(C->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) {
+        Label thisOk;
+        a_.mov(RDI, R(base + 1));
+        a_.aluI(4, RDI, -9);
+        a_.cmpI(RDI, std::int32_t(kNull));
+        a_.jcc(CNE, thisOk);
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
+        a_.inc32(mem(RDI, kHdrRc));
+        a_.mov(R(base + 1), RDI);
+        a_.bind(thisOk);
+    }
+    a_.dec32(mem(R12, kVmTicks));
+    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+    a_.mov(mem(R13, kFramePc), RDI);
+    a_.mov32(R10, mem(R12, kVmFrameCount));
+    a_.mov(R11, mem(R12, kVmFrameBase));
+    a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
+    a_.add(R11, RDI);
+    a_.inc32(mem(R12, kVmFrameCount));
+    a_.mov(mem(R11, kFrameCode), RCX);
+    a_.mov(mem(R11, kFrameFn), RAX);
+    a_.mov(mem(R11, kFramePc), 0);
+    a_.mov(mem(R11, kFrameR), R9);
+    a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
+    a_.mov(mem(R11, kFrameRetDst), RDI);
+    a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
+    a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+    a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+    a_.mov(RSI, R11);
+    a_.mov(RDX, mem(RDX, kTierEntry));
+    a_.callReg(RDX);
+    a_.test(RAX, RAX);
+    a_.jcc(CE, exc);
+    write(in.a, RAX);
+    restorePool(i);
+    a_.jmp(done);
+    // The long way: the registers written as the instructions would have, then the baseline call sequence.
+    a_.bind(slowPath);
+    restorePool(i);
+    writePending(i);
+    call(i, in);
+    a_.bind(done);
+    if (plan_->defWeb[i] >= 0)
+        loadTypedAfter(i);
 }

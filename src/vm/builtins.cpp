@@ -2306,7 +2306,7 @@ void jsonQuote(String& out, StringView s)
 }
 
 // 0 for an exception, 1 for text written, 2 for nothing to write (undefined, a function, a symbol).
-int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
+int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std::int64_t keyIndex = -1)
 {
     VM& vm = j.vm;
     if (nativeStackLow()) {
@@ -2320,6 +2320,12 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
             return 0;
         Handle fnKeep = Handle::adopt(fn);
         if (isFunction(fn)) {
+            // An array element's key is only made when something asks for it.
+            Handle made;
+            if (keyIndex >= 0) {
+                made = Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(keyIndex))));
+                key = made.get();
+            }
             JSValue r = vm.call(fn, value.get(), &key, 1);
             if (r.isException())
                 return 0;
@@ -2327,6 +2333,11 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
         }
     }
     if (j.replacerFn.get() != JSValue::undefined()) {
+        Handle made;
+        if (keyIndex >= 0) {
+            made = Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(keyIndex))));
+            key = made.get();
+        }
         JSValue callArgs[2] = {key, value.get()};
         JSValue r = vm.call(j.replacerFn.get(), holder, callArgs, 2);
         if (r.isException())
@@ -2395,7 +2406,48 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
     j.indent += j.gap;
     const bool array = isArray(v);
     Vec<Handle> keys;
-    if (array) {
+    // A plain object made of data properties with names that are not indexes: its keys are read off the shape, and each value
+    // is read from its slot as long as the shape is the one the keys came from (a toJSON that changes the object gets `Get`).
+    struct KeyList
+    {
+        Vec<Key> names;
+        Vec<std::uint32_t> slots;  ///< where each name's value is while the shape is unchanged
+        ~KeyList()
+        {
+            for (Key k : names)
+                detail::decRef(k);
+        }
+    } fastKeys;
+    bool fast = false;
+    Shape* shape0 = nullptr;
+    if (!array && !j.hasAllow && o->cls() == ObjClass::Plain && !proxyOf(o) && !o->isDictionary(vm)) {
+        fast = true;
+        shape0 = o->shapeOf(vm);
+        for (std::uint32_t i = 0; i < shape0->count && fast; ++i) {
+            const Entry e = shape0->entryAt(i);
+            if (e.attrs & attr::kAccessor) {
+                fast = false;
+            } else if (e.key->kind == detail::CellKind::Symbol) {
+                continue;
+            } else {
+                std::uint32_t index;
+                if (arrayIndexOf(e.key, &index)) {
+                    fast = false;
+                } else if (e.attrs & attr::kEnumerable) {
+                    detail::incRef(e.key);
+                    fastKeys.names.push_back(e.key);
+                    fastKeys.slots.push_back(i);
+                }
+            }
+        }
+        if (!fast) {
+            for (Key k : fastKeys.names)
+                detail::decRef(k);
+            fastKeys.names.clear();
+            fastKeys.slots.clear();
+        }
+    }
+    if (array || fast) {
         // Elements are read through `length`, as the spec says.
     } else if (j.hasAllow) {
         keys = j.allow;
@@ -2418,24 +2470,56 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input)
         if (lenValue.isException())
             return 0;
         const std::uint32_t length = std::uint32_t(lenValue.asNumber());
+        const bool plainArray = asObject(v)->cls() == ObjClass::Array;
         for (std::uint32_t i = 0; i < length; ++i) {
-            Handle idx = Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(i))));
-            Key k = toPropertyKey(vm, idx.get());
-            if (!k)
-                return 0;
-            JSValue element = getProperty(vm, v, k);
-            detail::decRef(k);
-            if (element.isException())
-                return 0;
-            Handle elementKeep = Handle::adopt(element);
+            Handle elementKeep;
+            auto* arr = static_cast<JSArray*>(asObject(v));
+            if (plainArray && i < arr->length && !arr->at(i).isHole()) {
+                elementKeep = Handle::retained(arr->at(i));
+            } else {
+                Handle idx = Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(i))));
+                Key k = toPropertyKey(vm, idx.get());
+                if (!k)
+                    return 0;
+                JSValue element = getProperty(vm, v, k);
+                detail::decRef(k);
+                if (element.isException())
+                    return 0;
+                elementKeep = Handle::adopt(element);
+            }
             separator();
-            const std::size_t mark = j.out.size();
-            const int r = jsonSerialize(j, v, idx.get(), element);
+            const int r = jsonSerialize(j, v, JSValue::undefined(), elementKeep.get(), std::int64_t(i));
             if (r == 0)
                 return 0;
             if (r == 2)
                 j.out += u"null";
-            (void)mark;
+        }
+    } else if (fast) {
+        for (std::size_t n = 0; n < fastKeys.names.size(); ++n) {
+            const Key name = fastKeys.names[n];
+            Handle propKeep;
+            if (o->h.shape == shape0->id) {
+                propKeep = Handle::retained(*o->slotAt(fastKeys.slots[n]));
+            } else {
+                JSValue prop = getProperty(vm, v, name);
+                if (prop.isException())
+                    return 0;
+                propKeep = Handle::adopt(prop);
+            }
+            const std::size_t before = j.out.size();
+            const bool hadAny = wroteAny;
+            separator();
+            jsonQuote(j.out, static_cast<StringCell*>(name)->text());
+            j.out.push_back(u':');
+            if (!j.gap.empty())
+                j.out.push_back(u' ');
+            const int r = jsonSerialize(j, v, JSValue::cell(name), propKeep.get());
+            if (r == 0)
+                return 0;
+            if (r == 2) {
+                j.out.resize(before);
+                wroteAny = hadAny;
+            }
         }
     } else {
         for (const Handle& name : keys) {

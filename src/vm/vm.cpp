@@ -52,6 +52,9 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     case JitOptions::Mode::Eager: tier1Threshold = 1; break;
     default: tier1Threshold = ctx.options.jit.threshold ? ctx.options.jit.threshold : 1; break;
     }
+    // The optimizing form takes over a function or loop that has been hot in the baseline code for this many calls or
+    // iterations; with the JIT off there is nothing to take over from.
+    tier2Threshold = tier1Threshold ? 2000 : 0;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_TIER1"))
         tier1Threshold = std::uint32_t(std::atoi(t));

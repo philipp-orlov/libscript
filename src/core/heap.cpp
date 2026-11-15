@@ -297,6 +297,10 @@ ContextImpl::~ContextImpl()
 
 /// Let go of what `count` values refer to, as a dying cell does: nothing is destroyed from here, so a long chain of them
 /// takes no stack.
+// A value may name a cell of the vm core, which has the header of a `GCObject` but no vtable: the dynamic-type check stands aside.
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((no_sanitize("vptr")))
+#endif
 void ContextImpl::releaseAll(const Value* values, std::size_t count) noexcept
 {
     // A dying tree is far from the cache: ask for every child before the first one is needed.

@@ -26,7 +26,7 @@ option(SCRIPT_ENABLE_JIT "Compile the arm64 and x86-64 code generators for the t
 #   dyn   (default) the dynamic engine only
 #   vm    the new core is the default of every context; the dynamic engine is still built for the languages not yet ported
 #   both  both are built; Context::Options::core, or SCRIPT_CORE with SCRIPT_JIT_ENV_OVERRIDE, picks one per context
-set(SCRIPT_JS_CORE "dyn" CACHE STRING "dyn, vm or both")
+set(SCRIPT_JS_CORE "vm" CACHE STRING "dyn, vm or both: the core that runs the dynamic languages by default; both builds the two and picks vm")
 set_property(CACHE SCRIPT_JS_CORE PROPERTY STRINGS dyn vm both)
 if(NOT SCRIPT_JS_CORE MATCHES "^(dyn|vm|both)$")
     message(FATAL_ERROR "SCRIPT_JS_CORE must be dyn, vm or both, not '${SCRIPT_JS_CORE}'")
@@ -253,18 +253,14 @@ if(SCRIPT_ENABLE_JIT AND NOT SCRIPT_ENGINE_TYPED)
     set(SCRIPT_ENABLE_JIT OFF)
 endif()
 
-# The new core needs the dynamic engine's front end and shared cells, so it exists only where that does. Until it runs
-# every JavaScript suite (milestone M0) it is never the default: `vm` then builds it and keeps `dyn` as the default.
+# The new core needs the dynamic engine's front end and shared cells, so it exists only where that does. It is the default
+# for JavaScript, TypeScript and Python wherever it is built (`vm` and `both`); `dyn` builds only the old core, which stays in
+# the tree as the oracle and for `Options::core = Dyn` (and `SCRIPT_CORE=dyn` in builds with SCRIPT_JIT_ENV_OVERRIDE).
 set(SCRIPT_VM OFF)
 set(SCRIPT_VM_DEFAULT OFF)
 if(NOT SCRIPT_JS_CORE STREQUAL "dyn" AND SCRIPT_ENGINE_DYNAMIC)
     set(SCRIPT_VM ON)
-    set(SCRIPT_VM_CORE_COMPLETE OFF)
-    if(SCRIPT_JS_CORE STREQUAL "vm" AND SCRIPT_VM_CORE_COMPLETE)
-        set(SCRIPT_VM_DEFAULT ON)
-    elseif(SCRIPT_JS_CORE STREQUAL "vm")
-        message(WARNING "libscript: the new core is not complete; SCRIPT_JS_CORE=vm builds it but contexts default to the dynamic engine")
-    endif()
+    set(SCRIPT_VM_DEFAULT ON)
 endif()
 if(SCRIPT_VM)
     set(SCRIPT_VM_TIER_MAX ${SCRIPT_VM_TIERS})

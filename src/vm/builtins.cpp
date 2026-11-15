@@ -3406,6 +3406,11 @@ bool readPropertyDescriptor(VM& vm, JSObject* d, PropDesc* out)
 }
 }  // namespace bi
 
+bool mathUnaryIsSqrt(const void* data) noexcept
+{
+    return data == reinterpret_cast<const void*>(mathSqrt);
+}
+
 FastNative mathUnaryNative() noexcept
 {
     return mathUnary;

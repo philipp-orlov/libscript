@@ -103,7 +103,9 @@ struct InlineCache
     std::uint32_t shape = 0;
     std::uint32_t index = 0;
     std::uint32_t next = 0;
-    std::uint32_t pad = 0;
+    std::uint16_t pad = 0;     ///< index + 1 of the site's `PolyCache`, 0 for none
+    std::uint8_t aux = 0;      ///< the inline slot count of the receiver it learned on, + 1 (0: not known)
+    std::uint8_t spare = 0;
     JSObject* holder = nullptr;
     ValidityCell* validity = nullptr;  ///< holds a count
 };

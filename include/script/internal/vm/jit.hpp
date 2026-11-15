@@ -42,6 +42,8 @@ struct Tier1Code
 /// The native behind `Math.floor`, `Math.sqrt` and the other one-argument functions of `Math`: a function whose `data` is
 /// a `double (*)(double)`, which compiled code calls directly.
 FastNative mathUnaryNative() noexcept;
+/// Whether a `Math` native's data is `Math.sqrt`'s, which compiled code does with one instruction.
+bool mathUnaryIsSqrt(const void* data) noexcept;
 
 /// What the optimizing compiler makes. Owned by its code block.
 struct Tier2Code
@@ -51,6 +53,7 @@ struct Tier2Code
     void* entry = nullptr;                                        ///< the function's entry, as the baseline code's
     std::vector<std::pair<std::uint32_t, std::uint32_t>> osr;     ///< (loop header, offset from `rx` of the way in)
     std::vector<ValidityCell*> validities;
+    std::vector<JSValue> held;                                    ///< values the code compares against, each counted
     Tier2Code* older = nullptr;                                   ///< a version it replaced, kept while frames may be in it
     void* osrAddress(std::uint32_t header) const noexcept
     {

@@ -203,6 +203,10 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
         CodeBlock* code = fr->code;
         if (index < code->prof.size())
             code->prof[index] |= opt::kProfFailed;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2EXITS"))
+            std::fprintf(stderr, "tier2 exit %s @%u kind %d\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind);
+#endif
         SCRIPT_VM_CENSUS(Tier2Exit);
         if (++code->optExits > 40)
             retireTier2(*vm, code);
@@ -254,6 +258,17 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             }
             t->older = code->tier2;
             code->tier2 = t;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
+                static int serial2 = 0;
+                const std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");
+                const std::string path = std::string(dir) + "/t2-" + std::to_string(++serial2) + "-" + nm + ".bin";
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(t->rx, 1, t->bytes, f);
+                    std::fclose(f);
+                }
+            }
+#endif
             code->tier1->entry = t->entry;
             code->optExits = 0;
             SCRIPT_VM_CENSUS(Tier2Compiled);
@@ -490,6 +505,49 @@ private:
     std::vector<Label> at_;
     std::vector<std::uint32_t> offsets_;
     std::vector<ValidityCell*> validities_;
+    std::vector<JSValue> held_;  ///< values optimized code compares against, each counted (moved into its Tier2Code)
+    /// Keep `v` alive for as long as the optimized code is: its address is in the code.
+    void holdValue(JSValue v)
+    {
+        vm::retain(v);
+        held_.push_back(v);
+    }
+    /// The value frame register `reg` will hold when instruction `i` runs, if straight-line code before it in the same block
+    /// loads it from a global and (optionally) one property of that: read now, to be guarded at run time. Undefined if not.
+    JSValue constantBefore(std::uint32_t i, unsigned reg, int depth = 0)
+    {
+        if (depth > 2)
+            return JSValue::undefined();
+        for (std::uint32_t j = i; j-- > 0;) {
+            if (code_->code[j].opcode() == Op::Cache)
+                continue;
+            const Ins& in = code_->code[j];
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            bool writes = false;
+            for (std::uint16_t w : e.wr)
+                writes = writes || w == reg;
+            if (!writes) {
+                if (!e.ok || plan_->isLeader[j] || in.opcode() == Op::Call || in.opcode() == Op::New)
+                    return JSValue::undefined();
+                continue;
+            }
+            if (in.opcode() == Op::GetGlobal && in.a == reg) {
+                std::uint8_t attrs = 0;
+                JSValue* slot = vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs);
+                return slot && !(attrs & attr::kAccessor) ? *slot : JSValue::undefined();
+            }
+            if (in.opcode() == Op::GetProp && in.a == reg && in.b != reg) {
+                const JSValue base = constantBefore(j, in.b, depth + 1);
+                if (!isObject(base))
+                    return JSValue::undefined();
+                std::uint8_t attrs = 0;
+                JSValue* slot = asObject(base)->findOwn(vm_, code_->atoms[in.c], &attrs);
+                return slot && !(attrs & attr::kAccessor) ? *slot : JSValue::undefined();
+            }
+            return JSValue::undefined();
+        }
+        return JSValue::undefined();
+    }
     /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
     void hold(ValidityCell* cell)
     {
@@ -512,6 +570,46 @@ private:
     Tier1Code* base_ = nullptr;        ///< the baseline code a failed guard goes back to
     std::int32_t spill_ = 0;           ///< bytes of stack for the typed variables, above the baseline frame
     std::vector<std::uint8_t> dirty_;  ///< per typed web: the frame's register is behind the variable
+    /// What straight-line optimized code has already proven about a frame register: it holds an object of this shape
+    /// (0: nothing known) with this many inline slots (-1: not known). Forgotten at block heads, when the register is written,
+    /// and at any instruction the optimizing compiler does not do itself.
+    std::vector<std::uint32_t> factShape_;
+    std::vector<std::int32_t> factAux_;
+    void forgetFacts() { std::fill(factShape_.begin(), factShape_.end(), 0u); std::fill(factAux_.begin(), factAux_.end(), -1); }
+    /// Make the object in frame register `reg` (left in RAX) be of shape `shape`, else `bad`. Proved for the code after it.
+    void provenShape(unsigned reg, std::uint32_t shape, Label& bad)
+    {
+        a_.mov(RAX, R(reg));
+        if (factShape_[reg] == shape)
+            return;
+        needObject(RAX, bad);
+        a_.cmpI32(mem(RAX, 0), std::int32_t(shape));
+        a_.jcc(CNE, bad);
+        factShape_[reg] = shape;
+        factAux_[reg] = -1;
+    }
+    /// The address of slot `index` of the object of shape `shape` in frame register `reg`, in RDX (the object in RAX), `bad`
+    /// when it is another. `aux` is the inline slot count the cache saw, plus one (0: unknown): with it the address is fixed.
+    void provenSlot(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
+    {
+        provenShape(reg, shape, bad);
+        if (aux == 0) {
+            slotAddress(index);
+            return;
+        }
+        const std::int32_t inl = std::int32_t(aux) - 1;
+        if (factAux_[reg] != inl) {
+            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
+            a_.jcc(CNE, bad);
+            factAux_[reg] = inl;
+        }
+        if (std::int32_t(index) < inl) {
+            a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
+        } else {
+            a_.mov(RDX, mem(RAX, kObjSlots));
+            a_.lea(RDX, mem(RDX, std::int32_t(8 * (std::int32_t(index) - inl))));
+        }
+    }
     bool delivered_ = false;           ///< the template just emitted put a typed destination in its variable
     struct ExitReq
     {
@@ -2072,9 +2170,13 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
 void releaseTier2(Tier2Code* code, VM* vm) noexcept
 {
     while (code) {
-        if (vm)
+        if (vm) {
             for (ValidityCell* v : code->validities)
                 vm->releaseValidity(v);
+            if (!vm->tearingDown)
+                for (JSValue v : code->held)
+                    release(v);
+        }
         CodeSpan span;
         span.rx = code->rx;
         span.bytes = code->bytes;
@@ -2111,6 +2213,16 @@ void compileTier1(VM& vm, CodeBlock* code)
     static std::FILE* map = std::getenv("SCRIPT_VM_PERFMAP")
                                 ? std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "w")
                                 : nullptr;
+    if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
+        // Raw code for `objdump -D -b binary -mi386:x86-64 --adjust-vma=<rx>`.
+        static int serial = 0;
+        const std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");
+        const std::string path = std::string(dir) + "/t1-" + std::to_string(++serial) + "-" + nm + ".bin";
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(t->rx, 1, t->bytes, f);
+            std::fclose(f);
+        }
+    }
     if (map) {
         std::fprintf(map, "%llx %zx js:%s:%u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(t->rx)),
                      t->bytes, code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",

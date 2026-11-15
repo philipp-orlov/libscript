@@ -310,6 +310,7 @@ bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
         ic.shape = o->h.shape;
         ic.index = std::uint32_t(index);
         ic.next = 0;
+        ic.aux = std::uint8_t(o->h.aux + 1u);
         return true;
     }
     // A property of a prototype: the cache holds the holder and a cell that says the chain has not changed.
@@ -375,7 +376,7 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
     }
     if (!ic.pad) {
         code->poly.emplace_back();
-        ic.pad = std::uint32_t(code->poly.size());
+        ic.pad = std::uint16_t(code->poly.size());
     }
     PolyCache& pc = code->poly[ic.pad - 1];
     std::uint8_t at = pc.n;
@@ -464,6 +465,7 @@ void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key)
     ic.shape = o->h.shape;
     ic.index = std::uint32_t(index);
     ic.next = 0;
+    ic.aux = std::uint8_t(o->h.aux + 1u);
 }
 
 /// A store (or a literal's property) that added `key` to an object whose shape was `before`: remember the shape after.

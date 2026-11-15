@@ -494,6 +494,115 @@ bool Baseline::emitTyped(std::uint32_t i)
         defF64(dw, 0);
         return true;
     }
+    case Op::GetProp: {
+        // A number read from a property the site has always found in the same place: straight into the variable.
+        if (dw < 0 || uw.empty() || uw[0] >= 0)
+            return false;
+        const std::uint16_t cacheId = code_->code[i + 1].a;
+        if (cacheId == kNoCache)
+            return false;
+        const InlineCache& ic = code_->caches[cacheId];
+        if (ic.shape == 0 || ic.next != 0 || (ic.holder && !ic.validity))
+            return false;
+        Label& bad = exitBefore(i);
+        if (ic.holder) {
+            provenShape(in.b, ic.shape, bad);
+            hold(ic.validity);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic.validity));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(ic.holder));
+            slotAddress(ic.index);
+        } else {
+            provenSlot(in.b, ic.shape, ic.index, ic.aux, bad);
+        }
+        a_.mov(RAX, mem(RDX, 0));
+        unboxRax(dw, bad);
+        return true;
+    }
+    case Op::PutProp: {
+        // A number stored to an existing own data property: boxed in place, no trip through the frame.
+        if (uw.size() < 2 || uw[0] >= 0 || uw[1] < 0)
+            return false;
+        const std::uint16_t cacheId = code_->code[i + 1].a;
+        if (cacheId == kNoCache)
+            return false;
+        const InlineCache& ic = code_->caches[cacheId];
+        if (ic.shape == 0 || ic.holder || ic.next != 0)
+            return false;
+        Label& bad = exitBefore(i);
+        provenSlot(in.a, ic.shape, ic.index, ic.aux, bad);
+        const std::int32_t vw = uw[1];
+        if (isI32(vw)) {
+            const Reg r = useI32(vw, RCX);
+            a_.mov32(RCX, r);
+            a_.or_(RCX, R14);
+        } else {
+            const int x = operandF64(vw, 0, RCX);
+            if (x != 0)
+                a_.movaps(0, x);
+            boxDouble0();
+            a_.mov(RCX, RAX);
+        }
+        a_.mov(RSI, mem(RDX, 0));
+        a_.mov(mem(RDX, 0), RCX);
+        release(RSI);
+        return true;
+    }
+    case Op::Call: {
+        // `Math.sqrt(x)` and the other one-argument `Math` functions on a number: the callee is guarded to be the function it
+        // was when compiled, and the double function is run directly (`sqrt` as one instruction).
+        if (in.c != 1 || dw < 0 || uw.size() < 3 || uw[2] < 0)
+            return false;
+        const JSValue callee = constantBefore(i, in.b);
+        if (!isFunction(callee))
+            return false;
+        auto* fn = static_cast<JSFunction*>(asObject(callee));
+        if (!(fn->flags & JSFunction::kNative) || !fn->rare() || fn->rare()->native != mathUnaryNative())
+            return false;
+        void* const target = fn->rare()->nativeData;
+        holdValue(callee);
+        Label& bad = exitBefore(i);
+        a_.movImm(RCX, callee.bits);
+        a_.cmp(RCX, R(in.b));
+        a_.jcc(CNE, bad);
+        const int x = operandF64(uw[2], 0, RAX);
+        if (x != 0)
+            a_.movaps(0, x);
+        if (mathUnaryIsSqrt(target)) {
+            a_.sqrtsd(0, 0);
+        } else {
+            savePool(i);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(target));
+            a_.callReg(RAX);
+            restorePool(i);
+        }
+        if (isI32(dw)) {
+            // An int32 web for the result: only if it is one; otherwise the number goes to the frame and the code leaves.
+            Label ok, notInt, done;
+            a_.cvttsd2si32(RAX, 0);
+            a_.cvtsi2sd32(1, RAX);
+            a_.ucomisd(0, 1);
+            a_.jcc(CNE, notInt);
+            a_.jcc(CP, notInt);
+            a_.test32(RAX, RAX);
+            a_.jcc(CNE, ok);
+            a_.movqFromX(RDX, 0);
+            a_.test(RDX, RDX);
+            a_.jcc(CS, notInt);
+            a_.bind(ok);
+            defI32(dw, RAX);
+            a_.jmp(done);
+            a_.bind(notInt);
+            boxDouble0();
+            write(in.a, RAX);
+            a_.jmp(exitAfter(i));
+            a_.bind(done);
+        } else {
+            defF64(dw, 0);
+        }
+        return true;
+    }
     case Op::JTrue: case Op::JFalse: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe:
     case Op::JNotGt: case Op::JNotGe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
     case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictEq: case Op::JStrictNe: case Op::JStrictEqI:
@@ -590,11 +699,20 @@ void Baseline::typedJump(std::uint32_t i, const Ins& in)
 
 void Baseline::emitOpt(std::uint32_t i)
 {
-    if (plan_->isLeader[i])
+    if (plan_->isLeader[i]) {
         std::fill(dirty_.begin(), dirty_.end(), 1);
+        forgetFacts();
+    }
     delivered_ = false;
-    if (emitTyped(i))
+    if (emitTyped(i)) {
+        for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
+            if (r < factShape_.size()) {
+                factShape_[r] = 0;
+                factAux_[r] = -1;
+            }
         return;
+    }
+    forgetFacts();
     materializeReads(i);
     if (opt::jumpTarget(*code_, i) >= 0)
         materializeLive(i);
@@ -655,6 +773,8 @@ Tier2Code* Baseline::compileOptimized()
     const std::uint32_t W = plan_->typedWebs;
     spill_ = std::int32_t((8 * W + 15) & ~15u);
     dirty_.assign(W, 1);
+    factShape_.assign(code_->nregs + 1, 0u);
+    factAux_.assign(code_->nregs + 1, -1);
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
@@ -688,6 +808,8 @@ Tier2Code* Baseline::compileOptimized()
     if (!span) {
         for (ValidityCell* v : validities_)
             vm_.releaseValidity(v);
+        for (JSValue v : held_)
+            vm::release(v);
         return nullptr;
     }
     std::memcpy(span.rw, a_.buf.data(), a_.buf.size());
@@ -705,6 +827,7 @@ Tier2Code* Baseline::compileOptimized()
     t->entry = t->rx;
     t->osr = std::move(osr);
     t->validities = std::move(validities_);
+    t->held = std::move(held_);
     return t;
 }
 

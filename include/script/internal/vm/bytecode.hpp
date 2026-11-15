@@ -107,6 +107,24 @@ struct InlineCache
     JSObject* holder = nullptr;
     ValidityCell* validity = nullptr;  ///< holds a count
 };
+/// What a property read remembers beyond its one inline cache: up to four more shapes (a read site that sees several), and
+/// accessors. An entry is an own or inherited data property, or an own or inherited accessor; the inherited ones hold a count of
+/// the validity cell of the chain. A site reaches its `PolyCache` by `InlineCache::pad` (index plus one; 0 for none).
+struct PolyEntry
+{
+    enum Kind : std::uint8_t { OwnData, ProtoData, OwnAccessor, ProtoAccessor };
+    std::uint32_t shape = 0;
+    std::uint32_t index = 0;
+    JSObject* holder = nullptr;
+    ValidityCell* validity = nullptr;  ///< holds a count (inherited kinds)
+    Kind kind = OwnData;
+};
+struct PolyCache
+{
+    PolyEntry e[4];
+    std::uint8_t n = 0;
+    std::uint8_t next = 0;  ///< the entry replaced when all four are taken
+};
 /// The id a property instruction carries in the word after it when it has no cache (too many in one function).
 inline constexpr std::uint16_t kNoCache = 0xFFFF;
 
@@ -144,6 +162,7 @@ struct CodeBlock
     Vec<Handler> handlers;
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
     Vec<InlineCache> caches;
+    Vec<PolyCache> poly;
     /// What the instructions have made so far (profBit: 1 int32, 2 double, 8 anything else), one byte per instruction, then
     /// one per parameter for what calls passed: the optimizing compiler's type feedback. Empty until the code first runs.
     Vec<std::uint8_t> prof;

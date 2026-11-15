@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <cstring>
 #include <unordered_map>
 
 #include "script/internal/dyn/object.hpp"
@@ -33,10 +34,17 @@ struct KeyHash
                 d = 0;  // -0 and +0 are one key
             if (d != d)
                 return 0x9e3779b9u;
-            return std::hash<double>()(d);
+            // A whole number (the usual key) is mixed as an integer; the rest by their bits.
+            std::uint64_t bits;
+            if (d > -9.0e18 && d < 9.0e18 && d == double(std::int64_t(d)))
+                bits = std::uint64_t(std::int64_t(d));
+            else
+                std::memcpy(&bits, &d, sizeof bits);
+            bits *= 0x9e3779b97f4a7c15ull;
+            return std::size_t(bits ^ (bits >> 32));
         }
         if (isString(v))
-            return std::hash<StringView>()(asString(v)->text());
+            return const_cast<StringCell*>(asString(v))->hash();  // kept by the string
         if (isBigInt(v)) {
             const auto* big = static_cast<const dyn::BigIntCell*>(v.asCell());
             std::size_t h = big->negative ? 0x51ed27u : 0x2545f491u;
@@ -49,7 +57,7 @@ struct KeyHash
 };
 struct KeyEq
 {
-    bool operator()(const KeyBox& a, const KeyBox& b) const noexcept { return sameValueZero(a.v, b.v); }
+    bool operator()(const KeyBox& a, const KeyBox& b) const noexcept { return a.v.bits == b.v.bits || sameValueZero(a.v, b.v); }
 };
 
 struct Entry_
@@ -60,10 +68,81 @@ struct Entry_
     bool live = false;
 };
 
+/// Where the entries of a table are, by key: open addressing over the entries' positions (0 empty, else position + 1). An entry
+/// that was deleted stays in its slot until the table is rebuilt, so a probe goes past it.
+struct KeyIndex
+{
+    /// Pointers and small integers differ in few bits, and the low ones are what a mask keeps: mixed first.
+    static std::size_t spread(JSValue key) noexcept
+    {
+        std::uint64_t h = KeyHash()(KeyBox{key});
+        h *= 0x9e3779b97f4a7c15ull;
+        return std::size_t(h ^ (h >> 29));
+    }
+    Vec<std::uint32_t> slots;
+    std::size_t used = 0;  ///< slots that are not empty
+
+    template <class Entries>
+    int find(const Entries& entries, JSValue key) const noexcept
+    {
+        if (slots.empty())
+            return -1;
+        const std::size_t mask = slots.size() - 1;
+        for (std::size_t at = spread(key) & mask;; at = (at + 1) & mask) {
+            const std::uint32_t s = slots[at];
+            if (!s)
+                return -1;
+            const auto& e = entries[s - 1];
+            if (e.live && KeyEq()(KeyBox{e.key}, KeyBox{key}))
+                return int(s - 1);
+        }
+    }
+    /// The entry at `position` has just been added.
+    template <class Entries>
+    void add(const Entries& entries, std::uint32_t position)
+    {
+        if ((used + 1) * 2 > slots.size())
+            rebuild(entries);
+        else
+            place(entries[position].key, position);
+    }
+    template <class Entries>
+    void rebuild(const Entries& entries)
+    {
+        std::size_t live = 0;
+        for (const auto& e : entries)
+            live += e.live;
+        std::size_t cap = 8;
+        while (cap < (live + 1) * 4)
+            cap *= 2;
+        slots.assign(cap, 0);
+        used = 0;
+        for (std::uint32_t i = 0; i < entries.size(); ++i)
+            if (entries[i].live)
+                place(entries[i].key, i);
+    }
+    void clear() noexcept
+    {
+        slots.clear();
+        used = 0;
+    }
+
+private:
+    void place(JSValue key, std::uint32_t position) noexcept
+    {
+        const std::size_t mask = slots.size() - 1;
+        std::size_t at = spread(key) & mask;
+        while (slots[at])
+            at = (at + 1) & mask;
+        slots[at] = position + 1;
+        ++used;
+    }
+};
+
 struct TableState : NativeState
 {
     Vec<Entry_> entries;
-    std::unordered_map<KeyBox, std::uint32_t, KeyHash, KeyEq, PoolAlloc<std::pair<const KeyBox, std::uint32_t>>> index;
+    KeyIndex index;
     std::uint64_t nextSeq = 1;
     std::uint32_t dead = 0;
     bool isMap;
@@ -101,7 +180,6 @@ struct TableState : NativeState
         for (Entry_& e : entries) {
             if (!e.live || !isDead(context, e.key))
                 continue;
-            index.erase(KeyBox{e.key});
             const JSValue k = e.key, v = e.value;
             e.live = false;
             e.key = e.value = JSValue::undefined();
@@ -114,8 +192,8 @@ struct TableState : NativeState
 
     Entry_* find(JSValue key)
     {
-        auto it = index.find(KeyBox{key});
-        return it == index.end() ? nullptr : &entries[it->second];
+        const int at = index.find(entries, key);
+        return at < 0 ? nullptr : &entries[std::size_t(at)];
     }
     /// Take counts of its own on both.
     void set(JSValue key, JSValue value)
@@ -131,15 +209,14 @@ struct TableState : NativeState
         retain(key);
         retain(value);
         entries.push_back(Entry_{key, value, nextSeq++, true});
-        index[KeyBox{key}] = std::uint32_t(entries.size() - 1);
+        index.add(entries, std::uint32_t(entries.size() - 1));
     }
     bool remove(JSValue key)
     {
-        auto it = index.find(KeyBox{key});
-        if (it == index.end())
+        const int at = index.find(entries, key);
+        if (at < 0)
             return false;
-        Entry_& e = entries[it->second];
-        index.erase(it);
+        Entry_& e = entries[std::size_t(at)];
         const JSValue k = e.key, v = e.value;
         e.live = false;
         e.key = e.value = JSValue::undefined();
@@ -172,9 +249,7 @@ struct TableState : NativeState
                 entries[to++] = entries[i];
         entries.resize(to);
         dead = 0;
-        index.clear();
-        for (std::uint32_t i = 0; i < entries.size(); ++i)
-            index[KeyBox{entries[i].key}] = i;
+        index.rebuild(entries);
     }
     /// The first live entry after sequence `after`.
     const Entry_* after(std::uint64_t seq) const

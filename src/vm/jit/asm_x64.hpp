@@ -371,6 +371,7 @@ public:
     void ucomisd(int x, int y) { opReg(false, 0x0F, x, y, 0x2E, 0x66); }
     void cvtsi2sd32(int x, Reg r) { opReg(false, 0x0F, x, r, 0x2A, 0xF2); }
     void cvttsd2si32(Reg r, int x) { opReg(false, 0x0F, r, x, 0x2C, 0xF2); }
+    void cvttsd2si64(Reg r, int x) { opReg(true, 0x0F, r, x, 0x2C, 0xF2); }
     void xorps(int x, int y) { opReg(false, 0x0F, x, y, 0x57); }
     void movaps(int x, int y) { opReg(false, 0x0F, x, y, 0x28); }
     void cvtsi2sd64(int x, Reg r) { opReg(true, 0x0F, x, r, 0x2A, 0xF2); }

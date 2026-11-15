@@ -715,9 +715,13 @@ private:
         a_.mov(RDX, src);
         a_.sub(RDX, RBP);
         a_.movqToX(0, RDX);
-        a_.cvttsd2si32(dst, 0);
-        a_.aluI32(7, dst, INT32_MIN);
+        // ToInt32 of a double that fits 64 bits is the low half of its truncation; NaN, infinities and what does not fit give
+        // the "indefinite" value and are left to the helper.
+        a_.cvttsd2si64(dst, 0);
+        a_.movImm(RDX, std::uint64_t(1) << 63);
+        a_.cmp(dst, RDX);
         a_.jcc(CE, bad);
+        a_.mov32(dst, dst);
         a_.bind(done);
     }
     /// xmm0 as the number `JSValue::boxNumber` makes of it, in rax: an int32 when it is one, else a double.
@@ -833,6 +837,7 @@ private:
     void ret(std::uint32_t i, const Ins& in);
     void call(std::uint32_t i, const Ins& in);
     void getGlobal(std::uint32_t i, const Ins& in);
+    void putGlobal(std::uint32_t i, const Ins& in);
     void initProp(std::uint32_t i, const Ins& in);
 };
 
@@ -1068,6 +1073,9 @@ void Baseline::emit(std::uint32_t i)
     case Op::GetGlobalOrUndef:
         getGlobal(i, in);
         return;
+    case Op::PutGlobal:
+        putGlobal(i, in);
+        return;
     case Op::InitProp:
         initProp(i, in);
         return;
@@ -1199,10 +1207,12 @@ void Baseline::arithImm(std::uint32_t i, const Ins& in)
     case Op::AddI: case Op::Inc: case Op::Dec: a_.aluI32(0, RAX, imm); a_.jcc(CO, bad); break;
     case Op::SubI: a_.aluI32(5, RAX, imm); a_.jcc(CO, bad); break;
     case Op::MulI:
-        a_.imulI32(RAX, RAX, imm);
-        a_.jcc(CO, bad);
-        a_.test32(RAX, RAX);
-        a_.jcc(CE, bad);
+        // An overflow, or a zero that may be a negative zero, is the double path's: RAX still holds the operand.
+        a_.imulI32(RDX, RAX, imm);
+        a_.jcc(CO, dbl);
+        a_.test32(RDX, RDX);
+        a_.jcc(CE, dbl);
+        a_.mov32(RAX, RDX);
         break;
     case Op::ModI:
         a_.test32(RAX, RAX);
@@ -1500,9 +1510,27 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     const Key key = code_->atoms[in.c];
     const std::uint16_t cacheId = code_->code[i + 1].a;
     const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
-    const bool known = ic && ic->shape != 0 && (!ic->holder || ic->validity);
     const bool isLength = key == vm_.atoms.length;
-    if (!known && !isLength) {
+    // The shapes the site has seen: its inline cache, then the data entries of its `PolyCache` (accessors go to the helper).
+    struct Seen
+    {
+        std::uint32_t shape, index;
+        JSObject* holder;
+        ValidityCell* validity;
+    };
+    Seen seen[5];
+    int count = 0;
+    if (ic && ic->shape != 0 && (!ic->holder || ic->validity))
+        seen[count++] = Seen{ic->shape, ic->index, ic->holder, ic->validity};
+    if (ic && ic->pad && ic->pad <= code_->poly.size()) {
+        const PolyCache& pc = code_->poly[ic->pad - 1];
+        for (std::uint8_t k = 0; k < pc.n; ++k) {
+            const PolyEntry& e = pc.e[k];
+            if (e.kind == PolyEntry::OwnData || (e.kind == PolyEntry::ProtoData && e.validity))
+                seen[count++] = Seen{e.shape, e.index, e.holder, e.validity};
+        }
+    }
+    if (count == 0 && !isLength) {
         helperOp(i, &helperThunk<jitGetProp>);
         return;
     }
@@ -1510,23 +1538,26 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     Label done, lengthPath;
     a_.mov(RAX, R(in.b));
     needObject(RAX, bad);
-    if (known) {
-        a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
-        a_.jcc(CNE, isLength ? lengthPath : bad);
-        if (ic->holder) {
-            hold(ic->validity);
-            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic->validity));
+    for (int k = 0; k < count; ++k) {
+        Label next;
+        const bool last = k == count - 1;
+        // The last entry that does not match goes where a miss goes; a hit falls through to the end.
+        a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
+        a_.jcc(CNE, last ? (isLength ? lengthPath : bad) : next);
+        if (seen[k].holder) {
+            hold(seen[k].validity);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
-            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(ic->holder));
-            slotAddress(ic->index);
-        } else {
-            slotAddress(ic->index);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
         }
+        slotAddress(seen[k].index);
         a_.mov(RAX, mem(RDX, 0));
         deliver(i, in.a);
-        if (isLength)
+        if (!last || isLength)
             a_.jmp(done);
+        if (!last)
+            a_.bind(next);
     }
     if (isLength) {
         a_.bind(lengthPath);
@@ -1784,6 +1815,35 @@ void Baseline::getGlobal(std::uint32_t i, const Ins& in)
     slotAddress(index);
     a_.mov(RAX, mem(RDX, 0));
     deliver(i, in.a);
+}
+
+void Baseline::putGlobal(std::uint32_t i, const Ins& in)
+{
+    // As for a read: a writable data property of the global object stays where it is until the epoch moves. A name the global
+    // object does not have yet, or one that cannot be written, is left to the interpreter.
+    JSObject* g = vm_.global;
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm_, code_->atoms[in.a], &attrs);
+    if (!slot || (attrs & attr::kAccessor) || !(attrs & attr::kWritable)) {
+        emitStep(i);
+        return;
+    }
+    std::uint32_t index;
+    JSValue* inlineBase = g->inl();
+    if (slot >= inlineBase && slot < inlineBase + g->h.aux)
+        index = std::uint32_t(slot - inlineBase);
+    else
+        index = std::uint32_t(slot - g->slots) + g->h.aux;
+    Label& bad = slow(i);
+    a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+    a_.jcc(CNE, bad);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(g));
+    slotAddress(index);
+    a_.mov(RCX, R(in.b));
+    retain(RCX);
+    a_.mov(RSI, mem(RDX, 0));
+    a_.mov(mem(RDX, 0), RCX);
+    release(RSI);
 }
 
 void Baseline::call(std::uint32_t i, const Ins& in)

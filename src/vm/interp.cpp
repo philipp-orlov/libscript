@@ -334,6 +334,118 @@ bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
     return false;
 }
 
+/// Remember where a read of `key` on `o` finds it in the site's `PolyCache`: a data property or an accessor, own or inherited.
+bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
+{
+    if (!cacheable(vm, o))
+        return false;
+    PolyEntry entry;
+    std::uint8_t attrs = 0;
+    std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
+    bool inherited = false;
+    JSObject* holder = nullptr;
+    if (index < 0) {
+        for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
+            if (!cacheable(vm, p))
+                return false;
+            index = p->shapeOf(vm)->indexOf(key, &attrs);
+            if (index >= 0) {
+                holder = p;
+                inherited = true;
+                break;
+            }
+        }
+        if (!inherited)
+            return false;
+    }
+    entry.shape = o->h.shape;
+    entry.index = std::uint32_t(index);
+    entry.holder = holder;
+    const bool accessor = (attrs & attr::kAccessor) != 0;
+    entry.kind = inherited ? (accessor ? PolyEntry::ProtoAccessor : PolyEntry::ProtoData)
+                           : (accessor ? PolyEntry::OwnAccessor : PolyEntry::OwnData);
+    if (inherited) {
+        entry.validity = vm.validityOf(o->proto(vm));
+        vm.retainValidity(entry.validity);
+    }
+    if (!ic.pad) {
+        code->poly.emplace_back();
+        ic.pad = std::uint32_t(code->poly.size());
+    }
+    PolyCache& pc = code->poly[ic.pad - 1];
+    std::uint8_t at = pc.n;
+    for (std::uint8_t i = 0; i < pc.n; ++i)
+        if (pc.e[i].shape == entry.shape)
+            at = i;
+    if (at == pc.n) {
+        if (pc.n < 4) {
+            ++pc.n;
+        } else {
+            at = pc.next;
+            pc.next = std::uint8_t((pc.next + 1) & 3);
+        }
+    }
+    if (pc.e[at].validity)
+        vm.releaseValidity(pc.e[at].validity);
+    pc.e[at] = entry;
+    return true;
+}
+
+/// A read through the site's `PolyCache`: 1 with the value owned in `*out`, 0 when no entry applies, -1 on an exception (a getter
+/// threw).
+int readPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValue base, JSValue* out)
+{
+    if (!ic.pad)
+        return 0;
+    PolyCache& pc = code->poly[ic.pad - 1];
+    for (std::uint8_t i = 0; i < pc.n; ++i) {
+        const PolyEntry& e = pc.e[i];
+        if (e.shape != o->h.shape)
+            continue;
+        if ((e.kind == PolyEntry::ProtoData || e.kind == PolyEntry::ProtoAccessor) && !e.validity->valid)
+            continue;
+        const JSValue slot = (e.holder ? e.holder : o)->slotAt(e.index)[0];
+        if (e.kind == PolyEntry::OwnData || e.kind == PolyEntry::ProtoData) {
+            retain(slot);
+            *out = slot;
+            return 1;
+        }
+        const auto* gs = reinterpret_cast<const GetterSetter*>(slot.asCell());
+        if (gs->getter.isUndefined()) {
+            *out = JSValue::undefined();
+            return 1;
+        }
+        // The getter may replace the property that holds it.
+        const JSValue getter = gs->getter;
+        retain(getter);
+        const JSValue r = vm.callHook(vm, getter, base, nullptr, 0, vm.callHookData);
+        release(getter);
+        if (r.isException())
+            return -1;
+        *out = r;
+        return 1;
+    }
+    return 0;
+}
+
+/// The slow part of a cached property read once the site's one entry did not apply: the `PolyCache`, then learning (the first
+/// shape goes into the inline cache itself, the others and accessors into the `PolyCache`). Same results as `readPoly`.
+int readCachedSlow(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValue base, Key key, JSValue* out)
+{
+    int r = readPoly(vm, code, ic, o, base, out);
+    if (r)
+        return r;
+    if ((ic.shape == 0 || ic.shape == o->h.shape) && learnRead(vm, ic, o, key)) {
+        const JSValue v = ic.holder ? *ic.holder->slotAt(ic.index) : *o->slotAt(ic.index);
+        retain(v);
+        *out = v;
+        return 1;
+    }
+    if (learnPoly(vm, code, ic, o, key))
+        return readPoly(vm, code, ic, o, base, out);
+    return 0;
+}
+
 /// A store to an own writable data property.
 void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key)
 {
@@ -1409,9 +1521,14 @@ L_GetProp: {
         }
         SCRIPT_VM_CENSUS(SlowGetProp);
         if (cacheId != kNoCache) {
-            if (learnRead(vm, ic, o, key)) {
+            fr->pc = pc;
+            JSValue got;
+            const int r = readCachedSlow(vm, code, ic, o, base, key, &got);
+            if (r < 0)
+                FAIL();
+            if (r > 0) {
                 SCRIPT_VM_CENSUS(IcMiss);
-                COPYP(ins->a, ic.holder ? *ic.holder->slotAt(ic.index) : *o->slotAt(ic.index));
+                SETP(ins->a, got);
                 ++pc;
                 NEXT();
             }
@@ -2937,9 +3054,15 @@ int jitGetProp(VM& vm, std::uint32_t index)
             setReg(R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             return 1;
         }
-        if (c.cacheId != kNoCache && learnRead(vm, ic, o, key)) {
-            copyReg(R[ins->a], ic.holder ? *ic.holder->slotAt(ic.index) : *o->slotAt(ic.index));
-            return 1;
+        if (c.cacheId != kNoCache) {
+            JSValue got;
+            const int r = readCachedSlow(vm, c.code, ic, o, base, key, &got);
+            if (r < 0)
+                return 0;
+            if (r > 0) {
+                setReg(R[ins->a], got);
+                return 1;
+            }
         }
     } else if (isString(base) && key == vm.atoms.length) {
         setReg(R[ins->a], JSValue::int32(std::int32_t(asString(base)->length)));
@@ -3331,7 +3454,9 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
     JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArguments(*this, R + 1, argc) : nullptr;
-    for (std::uint32_t i = keep; i < c->nregs; ++i) {
+    // Above `this` and the arguments the stack holds undefined (a frame lets go of its registers when it ends); an argument
+    // past the parameters is the one thing in the window that is not a register of the callee.
+    for (std::uint32_t i = keep, end = std::min<std::uint32_t>(c->nregs, 1 + argc); i < end; ++i) {
         const JSValue v = R[i];
         R[i] = JSValue::undefined();
         release(v);

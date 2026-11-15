@@ -259,6 +259,55 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
 
 void VM::destroyNow(CellPtr cell) noexcept
 {
+    CellHeader* const hd = headerOf(cell);
+    if (kindOf(cell) == Kind::Object && !(hd->flags & cellflags::kHasRare) && !tearingDown) {
+        auto* o = reinterpret_cast<JSObject*>(cell);
+        const ObjClass cls = o->cls();
+        if (cls == ObjClass::Plain || cls == ObjClass::Array) {
+            // An object with nothing on the side (no `Rare`, so no dictionary): its values, its buffers, its memory. What its
+            // values free waits in the list `destroy` drains.
+            auto drop = [this](JSValue v) {
+                if (!v.isCell())
+                    return;
+                CellPtr c = v.asCell();
+                if (--detail::cellCount(c) != 0)
+                    return;
+                if (destroying_ && isVmCell(c)) {
+                    try {
+                        pending_.push_back(c);
+                        return;
+                    } catch (...) {
+                    }
+                }
+                detail::destroyUnreferenced(c);
+            };
+            const std::uint32_t n = shapeById(hd->shape)->count;
+            const std::uint32_t inl = n < hd->aux ? n : hd->aux;
+            for (std::uint32_t i = 0; i < inl; ++i)
+                drop(o->inl()[i]);
+            for (std::uint32_t i = inl; i < n; ++i)
+                drop(o->slots[i - hd->aux]);
+            std::size_t bytes;
+            if (cls == ObjClass::Array) {
+                auto* a = static_cast<JSArray*>(o);
+                for (std::uint32_t i = 0; i < a->length; ++i)
+                    drop(a->elems[i]);
+                if (a->elems)
+                    freePayload(a->elems, 8u * a->capacity);
+                bytes = sizeof(JSArray);
+            } else {
+                bytes = JSObject::bytesFor(hd->aux);
+            }
+            if (o->slots)
+                freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
+            heap.deallocate(cell, bytes);
+            ctx.heapBytes -= bytes;
+            ownedBytes_ -= bytes;
+            --ctx.liveObjects;
+            --liveCells;
+            return;
+        }
+    }
     const std::size_t bytes = cellBytesOf(cell);
     switch (kindOf(cell)) {
         case Kind::Object: destroyObjectStorage(*this, reinterpret_cast<JSObject*>(cell)); break;

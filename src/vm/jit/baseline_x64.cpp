@@ -635,6 +635,71 @@ private:
         }
         return true;
     }
+    /// A plain object of shape `shape` with `aux` inline slots, made here (as `VM::newObject` does, counters and all) when
+    /// the heap's current block has room and no collection is due; else `slow`. The object, owned, in rax; clobbers rcx,
+    /// rdx, rsi. False when it cannot be done here at all.
+    bool allocObject(std::uint32_t shape, std::uint8_t aux, Label& slow)
+    {
+        const std::size_t bytes = JSObject::bytesFor(aux);
+        if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit || bytes > 256)
+            return false;
+        auto& ctx = vm_.ctx;
+        auto at = [&](const void* field) {
+            return std::int32_t(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&ctx));
+        };
+        auto atVm = [&](const void* field) {
+            return std::int32_t(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&vm_));
+        };
+        // A collection due: the runtime's way.
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(&ctx));
+        a_.mov(RAX, mem(RCX, at(&ctx.heapBytes)));
+        a_.cmp(RAX, mem(RCX, at(&ctx.nextGcBytes)));
+        a_.jcc(CAE, slow);
+        a_.mov(RAX, mem(RCX, at(&ctx.liveObjects)));
+        a_.alu(0, RAX, mem(RCX, at(&ctx.liveStrings)));
+        a_.cmp(RAX, mem(RCX, at(&ctx.nextGcCells)));
+        a_.jcc(CAE, slow);
+        a_.mov(RAX, mem(R12, atVm(&vm_.liveCells)));
+        a_.cmp(RAX, mem(R12, atVm(&vm_.cellBudget_)));
+        a_.jcc(CAE, slow);
+        // A slot of the current block: a free one, or one not carved yet.
+        Label carve, got;
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.heap.currentBlockOf(bytes)));
+        a_.mov(RDX, mem(RDX, 0));
+        a_.mov(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockFreeOffset)));
+        a_.test(RAX, RAX);
+        a_.jcc(CE, carve);
+        a_.mov(RSI, mem(RAX, 0));
+        a_.mov(mem(RDX, std::int32_t(mem::LocalHeap::kBlockFreeOffset)), RSI);
+        a_.jmp(got);
+        a_.bind(carve);
+        a_.mov(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockBumpOffset)));
+        a_.cmp(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockEndOffset)));
+        a_.jcc(CE, slow);
+        a_.mov32(RSI, mem(RDX, std::int32_t(mem::LocalHeap::kBlockSlotBytesOffset)));
+        a_.alu(0, mem(RDX, std::int32_t(mem::LocalHeap::kBlockBumpOffset)), RSI);
+        a_.bind(got);
+        a_.inc32(mem(RDX, std::int32_t(mem::LocalHeap::kBlockLiveOffset)));
+        // The header: shape, class, flags, inline slots, kind; a count of one; no slots outside.
+        CellHeader h{};
+        h.shape = shape;
+        h.cls = std::uint8_t(ObjClass::Plain);
+        h.flags = cellflags::kYoung;
+        h.aux = aux;
+        h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
+        std::uint64_t word;
+        std::memcpy(&word, &h, sizeof word);
+        a_.movImm(RSI, word);
+        a_.mov(mem(RAX, 0), RSI);
+        a_.mov(mem(RAX, 8), 1);
+        a_.mov(mem(RAX, kObjSlots), 0);
+        a_.aluI(0, mem(RCX, at(&ctx.heapBytes)), std::int32_t(bytes));
+        a_.aluI(0, mem(RCX, at(&ctx.totalAllocated)), std::int32_t(bytes));
+        a_.aluI(0, mem(RCX, at(&ctx.liveObjects)), 1);
+        a_.aluI(0, mem(R12, atVm(&vm_.ownedBytes_)), std::int32_t(bytes));
+        a_.aluI(0, mem(R12, atVm(&vm_.liveCells)), 1);
+        return true;
+    }
     /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
     void hold(ValidityCell* cell)
     {
@@ -1323,9 +1388,15 @@ void Baseline::emit(std::uint32_t i)
     case Op::NewBox:
         helperOp(i, &helperThunk<jitNewBox>);
         return;
-    case Op::NewObject:
-        helperOp(i, &helperThunk<jitNewObject>);
+    case Op::NewObject: {
+        Label& bad = slow(i, &helperThunk<jitNewObject>);
+        if (!allocObject(vm_.rootShapeFor(vm_.protos.object)->id, std::uint8_t(in.b), bad)) {
+            a_.jmp(bad);
+            return;
+        }
+        write(in.a, RAX);
         return;
+    }
     case Op::NewArray:
         helperOp(i, &helperThunk<jitNewArray>);
         return;

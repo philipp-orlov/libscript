@@ -2428,10 +2428,19 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         return 1;
     }
     if (v.isInt32()) {
-        char digits[16];
-        const int n = std::snprintf(digits, sizeof digits, "%d", v.asInt32());
-        for (int k = 0; k < n; ++k)
-            j.out.push_back(char16_t(digits[k]));
+        char16_t digits[12];
+        std::int64_t n = v.asInt32();
+        const bool negative = n < 0;
+        if (negative)
+            n = -n;
+        int at = 12;
+        do {
+            digits[--at] = char16_t(u'0' + n % 10);
+            n /= 10;
+        } while (n);
+        if (negative)
+            digits[--at] = u'-';
+        j.out.append(digits + at, std::size_t(12 - at));
         return 1;
     }
     if (v.isNumber()) {
@@ -2479,6 +2488,8 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
     if (!array && !j.hasAllow && o->cls() == ObjClass::Plain && !proxyOf(o) && !o->isDictionary(vm)) {
         fast = true;
         shape0 = o->shapeOf(vm);
+        fastKeys.names.reserve(shape0->count);
+        fastKeys.slots.reserve(shape0->count);
         for (std::uint32_t i = 0; i < shape0->count && fast; ++i) {
             const Entry e = shape0->entryAt(i);
             if (e.attrs & attr::kAccessor) {

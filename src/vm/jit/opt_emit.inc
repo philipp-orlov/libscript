@@ -249,6 +249,9 @@ void Baseline::int32OfWeb(std::int32_t w, Reg dst, std::uint32_t exitAt)
 
 namespace {
 
+/// Slots of the optimized frame for the values of inlined calls.
+constexpr std::uint32_t kInlineSlots = 32;
+
 std::uint64_t doubleBits(double d)
 {
     std::uint64_t b;
@@ -699,6 +702,8 @@ bool Baseline::emitTyped(std::uint32_t i)
         return true;
     }
     case Op::Call: {
+        if (inlineCall(i))
+            return true;
         // `Math.sqrt(x)` and the other one-argument `Math` functions on a number: the callee is guarded to be the function it
         // was when compiled, and the double function is run directly (`sqrt` as one instruction).
         if (in.c != 1 || dw < 0 || uw.size() < 3 || uw[2] < 0)
@@ -945,7 +950,11 @@ void Baseline::emitOptTails()
 Tier2Code* Baseline::compileOptimized()
 {
     const std::uint32_t W = plan_->typedWebs;
-    spill_ = std::int32_t((8 * W + 15) & ~15u);
+    bool calls = false;
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        calls = calls || code_->code[j].opcode() == Op::Call;
+    inlineBase_ = calls ? std::int32_t(8 + 8 * W) : -1;
+    spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 15) & ~15u);
     dirty_.assign(W, 1);
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);

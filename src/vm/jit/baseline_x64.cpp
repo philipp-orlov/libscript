@@ -318,6 +318,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     auto* f = static_cast<JSFunction*>(asObject(callee));
     if (isNew && ((f->flags & JSFunction::kNative) || !f->code->constructor || f->h.shape != vm.fnProtoShape))
         return {0, 0};
+    if (!(f->flags & JSFunction::kNative) && index < code->callProf.size())
+        code->callProf[index] = f->code->uid;
     if (f->flags & JSFunction::kNative) {
         fr->pc = ins + 1;
         Rare* r = f->rare();
@@ -429,6 +431,7 @@ constexpr std::int32_t kVmStackFloor = std::int32_t(offsetof(VM, jitStackFloor))
 constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
 constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
 constexpr std::int32_t kCbTier1 = std::int32_t(offsetof(CodeBlock, tier1));
+constexpr std::int32_t kCbUid = std::int32_t(offsetof(CodeBlock, uid));
 constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
 constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
 constexpr std::int32_t kCbNregs = std::int32_t(offsetof(CodeBlock, nregs));
@@ -688,6 +691,10 @@ private:
     Tier2Code* compileOptimized();
     void emitOpt(std::uint32_t i);
     bool emitTyped(std::uint32_t i);
+    Mem inlineSlot(std::int32_t s) const;
+    bool inlineCall(std::uint32_t i);
+    bool inlineBody(std::uint32_t i, CodeBlock* C, JSValue known, bool sloppyThis, bool emit);
+    std::int32_t inlineBase_ = -1;  ///< where the slots of inlined calls start in the optimized frame (rsp-relative)
     void emitExits();
     void emitOptTails();
     // variables
@@ -2133,6 +2140,11 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
         a_.jcc(CNE, helper);
         a_.mov(RCX, mem(RAX, kFnCode));
+        if (code_->callProf.empty())
+            code_->callProf.assign(code_->code.size(), 0);
+        a_.mov(RDI, mem(RCX, kCbUid));
+        a_.movImm(RSI, reinterpret_cast<std::uint64_t>(&code_->callProf[i]));
+        a_.mov(mem(RSI, 0), RDI);
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.test(RDX, RDX);
         a_.jcc(CE, helper);
@@ -2295,6 +2307,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in)
 }
 
 #include "opt_emit.inc"
+#include "opt_inline.inc"
 
 Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
 {

@@ -182,7 +182,11 @@ struct CodeBlock
     Vec<std::uint32_t> lines;  ///< the source line of each instruction
     Vec<InlineCache> caches;
     Vec<PolyCache> poly;
-    Vec<SuperCache> superCaches;  ///< one per instruction, made with the baseline code of a function that reads `super.x`
+    Vec<SuperCache> superCaches;
+    /// The `uid` of the function the baseline code last called from each `Call` (0 for none): the optimizing compiler's hint
+    /// for what to inline. One per instruction once the baseline code is made.
+    Vec<std::uint64_t> callProf;
+    std::uint64_t uid = 0;  ///< never reused; `VM::codeByUid` finds the block while it lives  ///< one per instruction, made with the baseline code of a function that reads `super.x`
     /// What the instructions have made so far (profBit: 1 int32, 2 double, 8 anything else), one byte per instruction, then
     /// one per parameter for what calls passed: the optimizing compiler's type feedback. Empty until the code first runs.
     Vec<std::uint8_t> prof;

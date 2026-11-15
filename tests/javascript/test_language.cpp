@@ -2829,6 +2829,124 @@ TEST(aLoopChecksItsTypedArraysOnceAndStillSeesThemReplaced)
     }
 }
 
+TEST(smallFunctionsRunInPlaceAndGiveWayWhenTheirGuessesFail)
+{
+    // Small callees run inside their caller's optimized code; another callee, an overflow, a string or a missing argument
+    // sends the call back to the interpreter, with the caller as it was.
+    const char* program =
+        "var out=[];"
+        "function mk(){var c=0;return function(d){c+=d;return c;};}"
+        "function k1(n,f){var s=0;for(var i=0;i<n;i++){s=f(i&1);}return s;}"
+        "var f=mk(); out.push(k1(5000,f));"
+        "out.push(k1(10, function(d){ return \"x\"+d; }));"
+        "var g=mk(); out.push(k1(5000,g));"
+        "var h=mk(); h(2147483000); out.push(k1(3000,h));"
+        "var s=mk(); s(\"str\"); out.push(k1(5,s));"
+        "class P{constructor(x){this.x=x;} get2(o){return this.x*o.x;} }"
+        "function k2(n,a,b){var t=0;for(var i=0;i<n;i++) t+=a.get2(b); return t;}"
+        "var a=new P(3), b=new P(4); out.push(k2(5000,a,b));"
+        "out.push(k2(3,a,{x:0.5})); out.push(k2(3,a,{y:1,x:\"7\"})); out.push(k2(2,a,{x:-0}).toString());"
+        "out.push(1/k2(1,new P(0),new P(-5)));"
+        "var big=new P(1<<20); out.push(k2(2,big,big));"
+        "function sl(){ return this === undefined ? \"u\" : typeof this; }"
+        "function k3(n){ var r; for (var i=0;i<n;i++) r=sl(); return r; }"
+        "out.push(k3(5000));"
+        "function add3(a,b,c){ return a+b+(c===undefined?100:c); }"
+        "function k4(n){ var t=0; for (var i=0;i<n;i++) t+=add3(i,1); return t; }"
+        "out.push(k4(5000));"
+        "function id(x){ return x; }"
+        "function k5(n,v){ var r; for (var i=0;i<n;i++) r=id(v); return r; }"
+        "out.push(k5(5000,{q:1}).q, k5(10,\"s\"), k5(10,1.5));"
+        "var o2={v:1, inc(){ this.v = this.v + 1; return this.v; }};"
+        "function k6(n){ var t=0; for (var i=0;i<n;i++) t+=o2.inc(); return t; }"
+        "out.push(k6(5000), o2.v);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2500 x1 2500 2147484500 0str01010 60000 4.5 63 0 Infinity 2199023255552 object 13002500 1 s 1.5 12507500 5001"));
+    }
+}
+
+TEST(gettersAndSuperReadsFromCompiledCode)
+{
+    // Getters are called straight from compiled code and `super.x` reads are cached by slot: throwing getters, getters that
+    // replace themselves, changed prototypes and deep recursion behave as in the interpreter.
+    const char* program =
+        "var out=[];"
+        "class A{constructor(v){this.v=v;} get g(){ if (this.v===7) throw new Error(\"seven\"); return this.v*2; }}"
+        "function run(o){ var s=0; for (var i=0;i<20;i++) s+=o.g; return s; }"
+        "var a=new A(3); for (var k=0;k<300;k++) run(a);"
+        "out.push(run(a));"
+        "try { run(new A(7)); } catch(e){ out.push(e.message); }"
+        "Object.defineProperty(A.prototype, \"g\", {get(){ return 100; }, configurable:true});"
+        "out.push(run(a));"
+        "var deep = { get d(){ return this.d + 1; } };"
+        "function rd(o){ return o.d; }"
+        "try { rd(deep); } catch(e) { out.push(e instanceof RangeError); }"
+        "class B{ get h(){ var x = 1; Object.defineProperty(B.prototype, \"h\", {value: 5}); return x; } }"
+        "function rh(o){ var s=0; for (var i=0;i<3;i++) s+=o.h; return s; }"
+        "for (var k=0;k<200;k++) rh(new B());"
+        "out.push(rh(new B()));"
+        "class P{ m(){ return 1; } } class Q extends P{ m(){ return super.m()+10; } }"
+        "var q=new Q(); var t=0; for (var k=0;k<5000;k++) t+=q.m();"
+        "P.prototype.m = function(){ return 2; }; t += q.m();"
+        "Object.setPrototypeOf(Q.prototype, { m(){ return 3; } }); t += q.m();"
+        "out.push(t);"
+        "var obj = { __proto__: { x: 1 }, f(){ return super.x; } }; var u=0; for (var k=0;k<3000;k++) u+=obj.f();"
+        "Object.getPrototypeOf(obj).x = 5; u+=obj.f(); out.push(u);"
+        "out.join()";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("120,seven,2000,true,15,55025,3005"));
+    }
+}
+
+TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
+{
+    // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed
+    // array stores convert, wrap and ignore what is out of range.
+    const char* program =
+        "var log = [];"
+        "var b = new Array(5); function fill(a) { for (var i = 0; i < a.length; i++) a[i] = i; return a; }"
+        "for (var k = 0; k < 3000; k++) fill(new Array(8));"
+        "Object.defineProperty(Object.prototype, 2, { set(v) { log.push(\"o\" + v); }, configurable: true });"
+        "var r1 = fill(new Array(5)).join();"
+        "delete Object.prototype[2];"
+        "Object.defineProperty(Array.prototype, 3, { set(v) { log.push(\"a\" + v); }, configurable: true });"
+        "var r2 = fill(new Array(5)).join();"
+        "delete Array.prototype[3]; Array.prototype.length = 0;"
+        "var r3 = fill(new Array(5)).join();"
+        "var e = new Float64Array(4), u = new Uint8Array(4), q = new Int32Array(4);"
+        "function put(t, v) { for (var i = -1; i <= t.length; i++) t[i] = v; var s = 0; for (var i = 0; i < t.length; i++) s += t[i]; return s; }"
+        "for (var k = 0; k < 3000; k++) { put(e, 1.5); put(u, 300); put(q, 7); }"
+        "[r1, r2, r3, log.join(), put(e, 0.25), put(u, 257), put(q, 2.5e9), put(q, -3)].join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("0,1,,3,4 0,1,2,,4 0,1,2,3,4 o2,a3 1 4 -7179869184 -12"));
+    }
+}
+
 TEST(aLocalGivenOnlyNumbersStaysANumberAndFindsOutOtherwise)
 {
     // A local the interpreter has only ever given numbers is a number in native code even where what is stored has no

@@ -200,6 +200,12 @@ struct VM : EngineRuntime
     /// constructor, `prototype` appear as properties on first use.
     JSFunction* newFunction(JSObject* proto, CodeBlock* code, Box* const* upvalues, std::uint32_t n);
     CodeBlock* newCodeBlock(Key name, std::uint32_t length, bool constructor);
+    /// The live code block with this `uid`, or null.
+    CodeBlock* codeByUid(std::uint64_t uid) const noexcept
+    {
+        auto it = codeByUid_.find(uid);
+        return it == codeByUid_.end() ? nullptr : it->second;
+    }
     void releaseCode(CodeBlock* code) noexcept;
     JSFunction* newNativeFunction(JSObject* proto, FastNative fn, void* data, Key name, std::uint32_t length);
 
@@ -385,6 +391,8 @@ private:
     void* stackRegionBase_ = nullptr;
     std::size_t stackRegionBytes_ = 0;
     Vec<CodeBlock**> codeRoots_;
+    std::unordered_map<std::uint64_t, CodeBlock*> codeByUid_;
+    std::uint64_t nextCodeUid_ = 1;
 
 public:
     /// A program's code block, which the VM lets go of when it ends if the program has not.

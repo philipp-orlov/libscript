@@ -163,6 +163,8 @@ CodeBlock* VM::newCodeBlock(Key name, std::uint32_t length, bool constructor)
     code->name = name;
     if (name)
         detail::incRef(name);
+    code->uid = nextCodeUid_++;
+    codeByUid_.emplace(code->uid, code);
     return code;
 }
 
@@ -196,6 +198,7 @@ void VM::releaseCode(CodeBlock* code) noexcept
         releaseTier1(code->tier1, this);
         code->tier1 = nullptr;
     }
+    codeByUid_.erase(code->uid);
     code->~CodeBlock();
     PoolAlloc<CodeBlock>().deallocate(code, 1);
 }

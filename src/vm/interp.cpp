@@ -3503,6 +3503,32 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
         return result;
     }
     CodeBlock* c = f->code;
+    if (!construct && c->tier1 &&
+        !(c->flags & (CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
+                      CodeBlock::kNeedsArgs))) {
+        // A compiled ordinary function, the usual callback: `this` and the arguments it has parameters for go in, the rest
+        // of the window being undefined already.
+        JSValue* R = stackTop;
+        if (frameCount + 2 < frameCapacity && R + c->nregs + 8 <= stackEnd) {
+            if (R + c->nregs + 1 > stackInit) [[unlikely]]
+                fillStack(R + c->nregs + 1);
+            JSValue self = thisValue;
+            if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && self.isNullish())
+                self = toJSValue(global);
+            retain(self);
+            R[0] = self;
+            const std::uint32_t n = argc < c->nparams ? argc : c->nparams;
+            for (std::uint32_t i = 0; i < n; ++i) {
+                retain(args[i]);
+                R[1 + i] = args[i];
+            }
+            frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, n, false, true, JSValue::undefined()};
+            const JSValue result = enterTier1(*this, c->tier1, 0);
+            stackTop = R;
+            clearRegs(R, 0, 1 + n);
+            return result;
+        }
+    }
     if ((c->flags & CodeBlock::kClassConstructor) && !construct)
         return throwError(ErrorCode::TypeError, "class constructor " + (c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string()) +
                                                     " must be called with 'new'");

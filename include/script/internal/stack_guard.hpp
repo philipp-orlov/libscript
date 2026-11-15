@@ -22,7 +22,14 @@ inline constexpr std::size_t kStackReserve = 96 * 1024;
 
 /// The lowest address of the calling thread's stack that may be used, or 0 when this platform cannot say. Cached per
 /// thread; zero means "not looked up yet", and `nativeStackFloorLookup` stores 1 for "cannot be determined".
-extern thread_local std::uintptr_t nativeStackFloorCache;
+/// GCC and Clang's `__thread`: a plain integer never needs a thread's initialisation, and other translation units then read
+/// it directly instead of through a wrapper call.
+#if defined(__GNUC__)
+#define SCRIPT_THREAD_LOCAL_POD __thread
+#else
+#define SCRIPT_THREAD_LOCAL_POD thread_local
+#endif
+extern SCRIPT_THREAD_LOCAL_POD std::uintptr_t nativeStackFloorCache;
 std::uintptr_t nativeStackFloorLookup() noexcept;
 /// The highest address of this thread's stack, or 0 when it cannot be determined.
 std::uintptr_t nativeStackCeiling() noexcept;

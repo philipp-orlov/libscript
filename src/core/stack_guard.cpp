@@ -17,7 +17,7 @@
 
 namespace script::internal {
 
-thread_local std::uintptr_t nativeStackFloorCache = 0;
+SCRIPT_THREAD_LOCAL_POD std::uintptr_t nativeStackFloorCache = 0;
 
 namespace {
 

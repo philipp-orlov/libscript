@@ -1163,11 +1163,13 @@ private:
         a_.bind(done);
     }
     /// xmm0 as a boxed double in rax; every NaN becomes the canonical one.
-    void boxDouble0()
+    void boxDouble0() { boxDouble(0); }
+    /// xmm`x` as a boxed double in rax; every NaN becomes the canonical one.
+    void boxDouble(int x)
     {
         Label ok;
-        a_.movqFromX(RAX, 0);
-        a_.ucomisd(0, 0);
+        a_.movqFromX(RAX, x);
+        a_.ucomisd(x, x);
         a_.jcc(CNP, ok);
         a_.movImm(RAX, kCanonicalNaN);
         a_.bind(ok);

@@ -69,10 +69,7 @@ void Baseline::spillToFrame(unsigned reg, std::int32_t w)
         a_.mov32(RAX, r);
         a_.or_(RAX, R14);
     } else {
-        const int x = operandF64(w, 0, RAX);
-        if (x != 0)
-            a_.movaps(0, x);
-        boxDouble0();
+        boxDouble(operandF64(w, 0, RAX));
     }
     write(reg, RAX);
     dirty_[std::size_t(w)] = 0;
@@ -100,6 +97,10 @@ void Baseline::unboxRax(std::int32_t w, Label& fail)
     if (isI32(w)) {
         needInt(RAX, fail);
         defI32(w, RAX);
+    } else if (inReg(w)) {
+        needNumber(RAX, fail);
+        loadNumber(xmmOf(w), RAX, RDX);
+        dirty_[std::size_t(w)] = 1;
     } else {
         needNumber(RAX, fail);
         loadNumber(0, RAX, RDX);
@@ -501,8 +502,10 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (op == Op::Mod || op == Op::ModI)
             return false;
         const int x0 = operandF64(uw[0], 0, RAX);
-        if (x0 != 0)
-            a_.movaps(0, x0);
+        if (op == Op::Neg || unary) {
+            if (x0 != 0)
+                a_.movaps(0, x0);
+        }
         if (op == Op::Neg) {
             a_.movImm(RAX, 0x8000000000000000ull);
             a_.movqToX(1, RAX);
@@ -526,13 +529,36 @@ bool Baseline::emitTyped(std::uint32_t i)
         } else {
             x1 = operandF64(uw[1], 1, RCX);
         }
-        switch (op) {
-        case Op::Add: case Op::AddI: a_.addsd(0, x1); break;
-        case Op::Sub: case Op::SubI: a_.subsd(0, x1); break;
-        case Op::Mul: case Op::MulI: a_.mulsd(0, x1); break;
-        case Op::Div: a_.divsd(0, x1); break;
-        default: return false;
+        auto apply = [&](int d, int src) {
+            switch (op) {
+            case Op::Add: case Op::AddI: a_.addsd(d, src); break;
+            case Op::Sub: case Op::SubI: a_.subsd(d, src); break;
+            case Op::Mul: case Op::MulI: a_.mulsd(d, src); break;
+            case Op::Div: a_.divsd(d, src); break;
+            default: break;
+            }
+        };
+        if (op != Op::Add && op != Op::AddI && op != Op::Sub && op != Op::SubI && op != Op::Mul && op != Op::MulI &&
+            op != Op::Div)
+            return false;
+        // Straight into the variable's own register when it has one: `d = a op b` as `d = a; d op= b`.
+        if (inReg(dw) && xmmOf(dw) != x1) {
+            const int d = xmmOf(dw);
+            const int a = x0 != 0 ? x0 : 0;
+            if (d != a)
+                a_.movaps(d, a);
+            apply(d, x1);
+            dirty_[std::size_t(dw)] = 1;
+            return true;
         }
+        if (inReg(dw) && xmmOf(dw) == x1 && (op == Op::Add || op == Op::AddI || op == Op::Mul || op == Op::MulI)) {
+            apply(x1, x0 != 0 ? x0 : 0);
+            dirty_[std::size_t(dw)] = 1;
+            return true;
+        }
+        if (x0 != 0)
+            a_.movaps(0, x0);
+        apply(0, x1);
         defF64(dw, 0);
         return true;
     }
@@ -751,10 +777,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.mov32(RCX, r);
             a_.or_(RCX, R14);
         } else {
-            const int x = operandF64(vw, 0, RCX);
-            if (x != 0)
-                a_.movaps(0, x);
-            boxDouble0();
+            boxDouble(operandF64(vw, 0, RCX));
             a_.mov(RCX, RAX);
         }
         a_.mov(RSI, mem(RDX, 0));

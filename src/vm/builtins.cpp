@@ -3428,7 +3428,7 @@ void VM::installBuiltins()
         detail::decRef(key);
         method(*this, globalObject, "eval", [](VM& vm, JSValue, const JSValue* args, std::uint32_t argc, void*) -> JSValue {
             // `SetEvalScope` marks a call that is a direct `eval` of the function running.
-            const bool direct = vm.evalCode && vm.frameCount == vm.evalFrames && vm.frameBase[vm.frameCount - 1].code == vm.evalCode;
+            const bool direct = vm.evalCode && vm.frameCount() == vm.evalFrames && (vm.frameTop - 1)->code == vm.evalCode;
             vm.evalCode = nullptr;
             if (!vm.ctx.options.runtimeCode)
                 return vm.throwError(ErrorCode::EvalError, "eval is disabled: the engine runs only the source its host gives it");

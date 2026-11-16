@@ -118,7 +118,7 @@ Stub entryStub()
 /// Where compiled code goes on after a handler or a jump the interpreter took: the top frame's pc.
 extern "C" void* scriptVmJitTarget(VM* vm)
 {
-    Frame* fr = vm->frameBase + vm->frameCount - 1;
+    Frame* fr = vm->frameTop - 1;
     return fr->code->tier1->addressFor(std::uint32_t(fr->pc - fr->code->code.data()));
 }
 
@@ -152,7 +152,7 @@ extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
 {
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (stepCensus) {
-        Frame* fr = vm->frameBase + vm->frameCount - 1;
+        Frame* fr = vm->frameTop - 1;
         ++stepCounts[fr->code->code[index].op];
         if (std::getenv("SCRIPT_VM_STEPS")[0] == '2')
             ++stepSites[{fr->code, index}];
@@ -206,7 +206,7 @@ void retireTier2(VM& vm, CodeBlock* code) noexcept
 extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
 {
     try {
-        Frame* fr = vm->frameBase + vm->frameCount - 1;
+        Frame* fr = vm->frameTop - 1;
         CodeBlock* code = fr->code;
         if (kind == 2) {
             // Sites this code knew nothing of have run long enough: a new compile will know them (not a failure: no try
@@ -251,7 +251,7 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code);
 extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
 {
     try {
-        Frame* fr = vm->frameBase + vm->frameCount - 1;
+        Frame* fr = vm->frameTop - 1;
         CodeBlock* code = fr->code;
         if (!code->tier1 || code->tier2Tries >= 5) {
             code->tier2Counter = 0x40000000;
@@ -332,7 +332,7 @@ struct CallResult
 /// its frame pushed and ready; enter `code` with it.
 CallResult callPrepare(VM& vm, std::uint32_t index)
 {
-    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    Frame* fr = vm.frameTop - 1;
     CodeBlock* code = fr->code;
     const Ins* ins = code->code.data() + index;
     JSValue* R = fr->R;
@@ -368,7 +368,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
             return {0, 0};
     }
     JSValue* newR = R + base + 1;
-    if (vm.ticks <= 1 || vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd || nativeStackLow())
+    if (vm.ticks <= 1 || vm.frameTop >= vm.frameLimit || newR + c->nregs + 8 > vm.stackEnd || nativeStackLow())
         return {0, 0};
     fr->pc = ins + 1;
     --vm.ticks;
@@ -404,9 +404,9 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
             release(v);
         }
     }
-    vm.frameBase[vm.frameCount++] =
+    *vm.frameTop++ =
         Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, true, isNew ? callee : JSValue::undefined()};
-    return {reinterpret_cast<std::uint64_t>(&vm.frameBase[vm.frameCount - 1]),
+    return {reinterpret_cast<std::uint64_t>(vm.frameTop - 1),
             reinterpret_cast<std::uint64_t>(c->tier1->entry)};
 }
 
@@ -528,7 +528,8 @@ constexpr std::int32_t kFrameArgc = std::int32_t(offsetof(Frame, argc));
 constexpr std::int32_t kFrameConstruct = std::int32_t(offsetof(Frame, construct));
 static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "a frame push writes both flags in one store");
 constexpr std::int32_t kVmTicks = std::int32_t(offsetof(VM, ticks));
-constexpr std::int32_t kVmFrameCount = std::int32_t(offsetof(VM, frameCount));
+constexpr std::int32_t kVmFrameTop = std::int32_t(offsetof(VM, frameTop));
+constexpr std::int32_t kVmFrameLimit = std::int32_t(offsetof(VM, frameLimit));
 constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, elems));
 constexpr std::int32_t kArrayCapacity = std::int32_t(offsetof(JSArray, capacity));
 constexpr std::int32_t kArrayLength = std::int32_t(offsetof(JSArray, length));
@@ -1705,15 +1706,8 @@ private:
     void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
     void putElem(std::uint32_t i, const Ins& in);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false);
-    // R11 = the frame after the top one (R13), R10 = its index; read from the address so that nothing waits on the
-    // last store of the count.
-    void topFrameIndex()
-    {
-        a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame))));
-        a_.mov(R10, R11);
-        a_.alu(5, R10, mem(R12, kVmFrameBase));
-        a_.shiftI(5, R10, 6);
-    }
+    /// R11 = the frame after the top one (R13): from the address, so that nothing waits on the top's last store.
+    void topFrame() { a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame)))); }
     void call(std::uint32_t i, const Ins& in);
     void getGlobal(std::uint32_t i, const Ins& in);
     void putGlobal(std::uint32_t i, const Ins& in);
@@ -2614,9 +2608,8 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
     a_.lea(R10, mem(R9, RSI, 8, 8));
     a_.alu(7, R10, mem(R12, kVmStackInit));
     a_.jcc(CA, bad);
-    topFrameIndex();
-    a_.aluI32(0, R10, 2);
-    a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+    topFrame();
+    a_.alu(7, R11, mem(R12, kVmFrameLimit));
     a_.jcc(CAE, bad);
     a_.cmpI32(mem(R12, kVmTicks), 1);
     a_.jcc(CBE, bad);
@@ -2627,9 +2620,9 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
     a_.dec32(mem(R12, kVmTicks));
     a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + length(i)]));
     a_.mov(mem(R13, kFramePc), RDI);
-    topFrameIndex();
-    a_.lea(RDI, mem(R10, 1));
-    a_.mov32(mem(R12, kVmFrameCount), RDI);
+    topFrame();
+    a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
+    a_.mov(mem(R12, kVmFrameTop), RDI);
     a_.mov(mem(R11, kFrameCode), RCX);
     a_.mov(mem(R11, kFrameFn), RAX);
     a_.mov(mem(R11, kFramePc), 0);
@@ -2989,9 +2982,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.lea(R10, mem(R9, RSI, 8, 8));
         a_.alu(7, R10, mem(R12, kVmStackInit));
         a_.jcc(CA, helper);
-        topFrameIndex();
-        a_.aluI32(0, R10, 2);
-        a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+        topFrame();
+        a_.alu(7, R11, mem(R12, kVmFrameLimit));
         a_.jcc(CAE, helper);
         a_.cmpI32(mem(R12, kVmTicks), 1);
         a_.jcc(CBE, helper);
@@ -3026,9 +3018,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.dec32(mem(R12, kVmTicks));
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
         a_.mov(mem(R13, kFramePc), RDI);
-        topFrameIndex();
-        a_.lea(RDI, mem(R10, 1));
-        a_.mov32(mem(R12, kVmFrameCount), RDI);
+        topFrame();
+        a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
+        a_.mov(mem(R12, kVmFrameTop), RDI);
         a_.mov(mem(R11, kFrameCode), RCX);
         a_.mov(mem(R11, kFrameFn), RAX);
         a_.mov(mem(R11, kFramePc), 0);
@@ -3072,9 +3064,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.lea(R10, mem(R9, RSI, 8, 8));
         a_.alu(7, R10, mem(R12, kVmStackInit));
         a_.jcc(CA, helper);
-        topFrameIndex();
-        a_.aluI32(0, R10, 2);
-        a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+        topFrame();
+        a_.alu(7, R11, mem(R12, kVmFrameLimit));
         a_.jcc(CAE, helper);
         a_.cmpI32(mem(R12, kVmTicks), 1);
         a_.jcc(CBE, helper);
@@ -3136,9 +3127,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.lea(R9, R(base + 1));
         a_.dec32(mem(R12, kVmTicks));
-        topFrameIndex();
-        a_.lea(RDI, mem(R10, 1));
-        a_.mov32(mem(R12, kVmFrameCount), RDI);
+        topFrame();
+        a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
+        a_.mov(mem(R12, kVmFrameTop), RDI);
         a_.mov(mem(R11, kFrameCode), RCX);
         a_.mov(mem(R11, kFrameFn), RAX);
         a_.mov(mem(R11, kFramePc), 0);
@@ -3389,11 +3380,8 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
             a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitClear));
         }
     }
-    // This frame's index is the count once it is gone (from its address: nothing waits on the count's last store).
-    a_.mov(RDX, R13);
-    a_.alu(5, RDX, mem(R12, kVmFrameBase));
-    a_.shiftI(5, RDX, 6);
-    a_.mov32(mem(R12, kVmFrameCount), RDX);
+    // This frame is one past the top once it is gone.
+    a_.mov(mem(R12, kVmFrameTop), R13);
     if (!plain)
         a_.mov(RAX, mem(RSP, 0));
     a_.jmp(exit_);
@@ -3548,7 +3536,7 @@ void releaseTier1(Tier1Code* code, VM* vm) noexcept
 
 JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
 {
-    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    Frame* fr = vm.frameTop - 1;
     {
         std::uintptr_t floor = nativeStackFloorCache;
         if (floor == 0)

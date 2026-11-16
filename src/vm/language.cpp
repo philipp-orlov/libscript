@@ -101,7 +101,7 @@ JSValue VM::evalSource(std::string_view source, std::string_view name)
 
 JSValue VM::evalDirect(JSValue sourceValue)
 {
-    Frame* fr = frameBase + frameCount - 1;
+    Frame* fr = frameTop - 1;
     const CodeBlock* caller = fr->code;
     const Vec<EvalVar>& vars = caller->evalScopes[evalIndex];
     std::vector<String> names;

@@ -48,6 +48,8 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     // A frame is pushed without ever growing the vector, so pointers into it stay good.
     frameCapacity = std::uint32_t(ctx.options.stackLimit) + 16;
     frameBase = static_cast<Frame*>(allocPayload(sizeof(Frame) * frameCapacity));
+    frameTop = frameBase;
+    frameLimit = frameBase + frameCapacity - 2;
     stackInit = stackBase;
     switch (ctx.options.jit.mode) {
     case JitOptions::Mode::Off: tier1Threshold = 0; break;
@@ -133,7 +135,7 @@ std::string VM::captureStack() const
 {
     std::string out;
     int shown = 0;
-    std::size_t top = frameCount;
+    std::size_t top = frameCount();
     // The constructors of the error classes being built are not where the error was made.
     while (top > 1 && (frameBase[top - 1].code->flags & CodeBlock::kClassConstructor))
         --top;

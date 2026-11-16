@@ -636,7 +636,7 @@ JSValue runImpl(VM& vm, const Ins* stepFall)
 #undef OP
     };
 
-    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    Frame* fr = vm.frameTop - 1;
     [[maybe_unused]] Frame* const home = fr;
     CodeBlock* code;
     const Ins* codeStart;
@@ -701,7 +701,7 @@ JSValue runImpl(VM& vm, const Ins* stepFall)
                     const JSValue res_ = enterTier1(vm, code->tier1, std::uint32_t(pc - codeStart)); \
                     if (wasEntry_)                                                       \
                         return res_;                                                     \
-                    fr = &vm.frameBase[vm.frameCount - 1];                               \
+                    fr = vm.frameTop - 1;                               \
                     LOAD_FRAME();                                                        \
                     vm.stackTop = R + code->nregs;                                       \
                     if (res_.isException())                                              \
@@ -2155,7 +2155,7 @@ L_SetFnName: {
 L_SetEvalScope:
     vm.evalCode = code;
     vm.evalIndex = ins->a;
-    vm.evalFrames = vm.frameCount;
+    vm.evalFrames = vm.frameCount();
     NEXT();
 L_GetIteratorObj: {
     const JSValue src = R[ins->b];
@@ -2288,7 +2288,7 @@ L_GenStart: {
         g->regs[i] = R[i];
         R[i] = JSValue::undefined();
     }
-    --vm.frameCount;
+    --vm.frameTop;
     return JSValue::undefined();
 }
 L_SetNewTarget:
@@ -2483,7 +2483,7 @@ do_call: {
             c->prof[at + k] |= k < argc ? profBit(R[base + 2 + k]) : std::uint8_t(8);
     }
 
-    if (vm.frameCount + 2 >= vm.frameCapacity || newR + c->nregs + 8 > vm.stackEnd || (c->tier1 && nativeStackLow())) [[unlikely]] {
+    if (vm.frameTop >= vm.frameLimit || newR + c->nregs + 8 > vm.stackEnd || (c->tier1 && nativeStackLow())) [[unlikely]] {
         vm.throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
         FAIL();
     }
@@ -2517,11 +2517,11 @@ do_call: {
             vm.fillStack(newR + 2 + c->nparams);
         setReg(newR[1 + c->nparams], toJSValue(argsArray));
     }
-    vm.frameBase[vm.frameCount++] = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew || isSuper, false,
+    *vm.frameTop++ = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew || isSuper, false,
                                           isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
     if (c->tier1) {
         // Compiled code runs on the machine stack: the frame is its own entry, and the result comes back here.
-        vm.frameBase[vm.frameCount - 1].entry = true;
+        (vm.frameTop - 1)->entry = true;
         const JSValue res = enterTier1(vm, c->tier1, 0);
         vm.stackTop = R + code->nregs;
         if (res.isException())
@@ -2529,7 +2529,7 @@ do_call: {
         SETP(ins->a, res);
         NEXT();
     }
-    fr = &vm.frameBase[vm.frameCount - 1];
+    fr = vm.frameTop - 1;
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
     NEXT();
@@ -2547,12 +2547,12 @@ L_Ret: {
     const bool entry = fr->entry;
     const std::uint16_t dst = fr->retDst;
     JSValue* calleeR = R;
-    --vm.frameCount;
+    --vm.frameTop;
     if (entry) {
         (void)calleeR;
         return result;
     }
-    fr = &vm.frameBase[vm.frameCount - 1];
+    fr = vm.frameTop - 1;
     LOAD_FRAME();
     vm.stackTop = R + code->nregs;
     if (!code->prof.empty())
@@ -2904,7 +2904,7 @@ L_Yield: {
         g->regs[i] = R[i];
         R[i] = JSValue::undefined();
     }
-    --vm.frameCount;
+    --vm.frameTop;
     return out;
 }
 
@@ -2929,10 +2929,10 @@ throw_: {
         const std::uint32_t keep = 1 + (fr->argc < code->nparams ? fr->argc : code->nparams);
         clearRegs(R, keep, code->nregs);
         const bool entry = fr->entry;
-        --vm.frameCount;
+        --vm.frameTop;
         if (entry)
             return JSValue::exception();
-        fr = &vm.frameBase[vm.frameCount - 1];
+        fr = vm.frameTop - 1;
         code = fr->code;
         codeStart = code->code.data();
         R = fr->R;
@@ -2966,7 +2966,7 @@ JSValue run(VM& vm)
 
 std::uint64_t stepInstruction(VM& vm, std::uint32_t index)
 {
-    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    Frame* fr = vm.frameTop - 1;
     const Ins* at = fr->code->code.data() + index;
     const Ins* fall = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
     fr->pc = at;
@@ -3012,7 +3012,7 @@ void noteElem(CodeBlock* code, std::uint32_t index, JSValue base)
 
 inline JitCtx jitCtx(VM& vm, std::uint32_t index, bool hasCache)
 {
-    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    Frame* fr = vm.frameTop - 1;
     CodeBlock* code = fr->code;
     const Ins* ins = code->code.data() + index;
     fr->pc = ins + (hasCache ? 2 : 1);
@@ -3473,7 +3473,7 @@ int jitNewBox(VM& vm, std::uint32_t index)
 
 std::uint64_t stepThrow(VM& vm, std::uint32_t index)
 {
-    Frame* fr = vm.frameBase + vm.frameCount - 1;
+    Frame* fr = vm.frameTop - 1;
     const Ins* at = fr->code->code.data() + index;
     fr->pc = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
     vm.resumeThrow = true;
@@ -3514,7 +3514,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
         // A compiled ordinary function, the usual callback: `this` and the arguments it has parameters for go in, the rest
         // of the window being undefined already.
         JSValue* R = stackTop;
-        if (frameCount + 2 < frameCapacity && R + c->nregs + 8 <= stackEnd) {
+        if (frameTop < frameLimit && R + c->nregs + 8 <= stackEnd) {
             if (R + c->nregs + 1 > stackInit) [[unlikely]]
                 fillStack(R + c->nregs + 1);
             JSValue self = thisValue;
@@ -3527,7 +3527,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
                 retain(args[i]);
                 R[1 + i] = args[i];
             }
-            frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, n, false, true, JSValue::undefined()};
+            *frameTop++ = Frame{c, f, nullptr, R, 0, n, false, true, JSValue::undefined()};
             const JSValue result = enterTier1(*this, c->tier1, 0);
             stackTop = R;
             clearRegs(R, 0, 1 + n);
@@ -3540,7 +3540,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     if (c->flags & CodeBlock::kGenerator)
         return makeGenerator(f, thisValue, args, argc);
     JSValue* R = stackTop;
-    if (frameCount + 2 >= frameCapacity || R + std::max<std::size_t>(c->nregs, argc + 1) + 8 > stackEnd)
+    if (frameTop >= frameLimit || R + std::max<std::size_t>(c->nregs, argc + 1) + 8 > stackEnd)
         return throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
     // `this` and the arguments become the first registers of the new frame, each with a count of its own.
     fillStack(R + std::max<std::size_t>(c->nregs, argc + 1) + 1);
@@ -3565,7 +3565,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     if (argsArray)
         setReg(R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;
-    frameBase[frameCount++] = Frame{c, f, nullptr, R, 0, argc, construct, true,
+    *frameTop++ = Frame{c, f, nullptr, R, 0, argc, construct, true,
                                           construct ? (target.isUndefined() ? callee : target) : JSValue::undefined()};
     if (!c->tier1 && !c->tier1Failed && tier1Threshold && ++c->hotness >= tier1Threshold)
         compileTier1(*this, c);
@@ -3670,7 +3670,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     auto* f = static_cast<JSFunction*>(asObject(g->callee));
     CodeBlock* c = f->code;
     JSValue* R = stackTop;
-    if (frameCount + 2 >= frameCapacity || R + c->nregs + 8 > stackEnd) {
+    if (frameTop >= frameLimit || R + c->nregs + 8 > stackEnd) {
         throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
         return false;
     }
@@ -3710,7 +3710,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     }
     g->state = GenState::Running;
     JSValue* savedTop = stackTop;
-    frameBase[frameCount++] = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, false, true, JSValue::undefined(), generator};
+    *frameTop++ = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, false, true, JSValue::undefined(), generator};
     const JSValue result = run(*this);
     stackTop = savedTop;
     const bool finished = g->state == GenState::Running;

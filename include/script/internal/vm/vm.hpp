@@ -256,8 +256,10 @@ struct VM : EngineRuntime
     /// The lowest machine stack address compiled code may reach before a call is made the slow way (0: no limit).
     std::uintptr_t jitStackFloor = 0;
     Frame* frameBase = nullptr;
-    std::uint32_t frameCount = 0;
+    Frame* frameTop = nullptr;    ///< one past the top frame
+    Frame* frameLimit = nullptr;  ///< a frame pushed at or past this is one too many (`frameBase + frameCapacity - 2`)
     std::uint32_t frameCapacity = 0;
+    std::uint32_t frameCount() const noexcept { return std::uint32_t(frameTop - frameBase); }
     /// Registers below this hold a value (undefined unless a frame wrote another): the stack is filled as it is first used.
     /// Every filler has made sure of 8 registers past what it fills, so this stays 8 short of `stackEnd`, and compiled
     /// code that finds a frame (and one more) below it needs no other test of the stack's end.

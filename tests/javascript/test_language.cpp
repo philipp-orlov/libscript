@@ -3791,3 +3791,32 @@ TEST(aMethodALoopCallsIsReadOnceBeforeItWhileNothingStoresThere)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("true 30000 505"));
     }
 }
+
+TEST(aSlotSeenHoldingAnInt32IsReadWithoutALookUntilADoubleMayGoThere)
+{
+    // Int32 slots read without a check after an int32 store or read; a double stored to the same object under another name,
+    // inside and outside loops, and a double there when the loop begins.
+    const char* program =
+        "var out=[]; "
+        "function P(){this.a=1;this.b=2;} "
+        "function k1(o,p,n){var s=0;for(var i=0;i<n;i++){ o.a=o.b+1; s+=o.a; p.a=(i==n-5)?1.5:i; s+=o.a; o.b=o.a|0; }return s;} "
+        "for (var r=0;r<20;r++) k1(new P(),new P(),100); "
+        "var x=new P(); out.push(k1(x,x,1000), x.a, x.b); var y=new P(); out.push(k1(y,new P(),1000), y.a); "
+        "function k2(o,p){ var s=o.a; o.a=s+1; p.a=0.25; return o.a+s; } "
+        "for (var r=0;r<200;r++) k2(new P(), new P()); "
+        "var z=new P(); out.push(k2(z,z), k2(new P(), new P())); "
+        "function k3(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.a; o.a=s&7; }return s;} "
+        "for (var r=0;r<20;r++) k3(new P(),100); var w=new P(); w.a=2.5; out.push(k3(w,1000)); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("997015.5 999 999 1005000 1002 1.25 3 8.5"));
+    }
+}

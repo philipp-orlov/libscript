@@ -704,8 +704,12 @@ bool Baseline::emitTyped(std::uint32_t i)
             // worked out each time.
             const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
             a_.mov(RAX, provenSlotMem(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad));
-            unboxRax(dw, bad);
-            factNum_.insert({in.b, ic.index});
+            std::uint8_t& known = factNum_[{in.b, ic.index}];
+            if (known == 2 && isI32(dw))
+                defI32(dw, RAX);  // an int32 there, seen or stored
+            else
+                unboxRax(dw, bad);
+            known = isI32(dw) ? std::uint8_t(2) : std::max<std::uint8_t>(known, 1);
             return true;
         }
     }
@@ -854,7 +858,11 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.mov(mem(RDX, 0), RCX);
             release(RSI);
         }
-        factNum_.insert({in.a, ic.index});
+        if (!isI32(vw))
+            for (auto& [slot, kind] : factNum_)
+                if (slot.second == ic.index && kind == 2)
+                    kind = 1;  // the same object may be under another name
+        factNum_[{in.a, ic.index}] = isI32(vw) ? 2 : 1;
         return true;
     }
     case Op::New:

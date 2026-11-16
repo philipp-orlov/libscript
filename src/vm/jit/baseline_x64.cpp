@@ -895,12 +895,14 @@ private:
     std::set<const ValidityCell*> factValid_;
     /// Slots (register, property index) seen holding a number: only a typed store (a number) writes a slot without the
     /// facts being forgotten, so a store over one has nothing to let go of.
-    std::set<std::pair<unsigned, std::uint32_t>> factNum_;
+    /// What it holds: 1 a number, 2 an int32.
+    std::map<std::pair<unsigned, std::uint32_t>, std::uint8_t> factNum_;
     struct LoopNum
     {
         std::uint32_t from, to;
         unsigned reg;
         std::uint32_t index;
+        bool int32;  ///< every store of the loop to such a slot stores an int32
     };
     std::vector<LoopNum> loopNums_;
     /// A frame register's object is an array (1), and one that may be stored to: neither frozen nor closed to growth (2).
@@ -1039,7 +1041,7 @@ private:
         factNum_.clear();
         for (const LoopNum& ln : loopNums_)
             if (ln.from <= factAt_ && factAt_ <= ln.to)
-                factNum_.insert({ln.reg, ln.index});
+                factNum_[{ln.reg, ln.index}] = ln.int32 ? 2 : 1;
         std::fill(factArr_.begin(), factArr_.end(), std::uint8_t(0));
         for (const LoopArr& la : loopArrs_)
             if (la.from <= factAt_ && factAt_ <= la.to && la.reg < factArr_.size())
@@ -1065,7 +1067,7 @@ private:
             factSet_[r] = {};
             factCode_[r] = nullptr;
             factArr_[r] = 0;
-            for (auto it = factNum_.lower_bound({r, 0}); it != factNum_.end() && it->first == r;)
+            for (auto it = factNum_.lower_bound({r, 0}); it != factNum_.end() && it->first.first == r;)
                 it = factNum_.erase(it);
         }
     }

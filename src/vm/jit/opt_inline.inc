@@ -1844,8 +1844,18 @@ void Baseline::planLoopFacts()
                 continue;
             nums.insert({r, ic.index});
         }
+        // Int32 all through when every typed store of the loop to that index stores one (any object: it may be the same).
+        std::set<std::uint32_t> notInt;
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            const Ins& in = code_->code[j];
+            if (in.opcode() != Op::PutProp || j + 1 >= n_ || code_->code[j + 1].a == kNoCache)
+                continue;
+            const auto& uw = plan_->useWebs[j];
+            if (uw.size() < 2 || uw[1] < 0 || !isI32(uw[1]))
+                notInt.insert(code_->caches[code_->code[j + 1].a].index);
+        }
         for (const auto& [r, k] : nums)
-            loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k});
+            loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k, !notInt.count(k)});
         // Number reads of those objects' own slots that no store of the loop writes (to an object of that shape, which may
         // be the same one): read once before it.
         std::set<std::pair<std::uint32_t, std::uint32_t>> stored;
@@ -2055,8 +2065,13 @@ void Baseline::emitLoopGuards(std::uint32_t h)
             a_.mov(RDX, mem(RAX, kObjSlots));
             a_.mov(RAX, mem(RDX, std::int32_t(8 * (std::int32_t(ln.index) - aux))));
         }
-        a_.test(RAX, R14);
-        a_.jcc(CE, bad);
+        if (ln.int32) {
+            a_.cmp(RAX, R14);
+            a_.jcc(CB, bad);
+        } else {
+            a_.test(RAX, R14);
+            a_.jcc(CE, bad);
+        }
     }
     for (const LoopValid& lv : loopValids_) {
         if (lv.from != h)

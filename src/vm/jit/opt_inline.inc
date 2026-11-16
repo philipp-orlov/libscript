@@ -1144,6 +1144,7 @@ void Baseline::planFnBorrows()
     if (!gated_)
         return;  // no call of itself: nothing to gain
     planCalleeReads();
+    gated_ = false;  // decided below: worth it only when something is held without a count, or read ahead
     for (std::uint32_t j = 0; j < n_; j += length(j)) {
         const Ins& in = code_->code[j];
         const Op op = in.opcode();
@@ -1198,6 +1199,7 @@ void Baseline::planFnBorrows()
     for (unsigned r = first; r < code_->nregs; ++r)
         if (cand[r] && !bad[r])
             fnBorrow_.insert(r);
+    gated_ = !fnBorrow_.empty() || !calleeReads_.empty();
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("T2HOIST"))
         for (unsigned r : fnBorrow_)
@@ -1478,6 +1480,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     for (unsigned r = 1 + argc; r < window && r < C->nregs; ++r) {
         const unsigned reg = base + 1 + r;
+        if (!dirtyIn_.empty() && !(dirtyIn_[i][reg / 64] >> (reg % 64) & 1))
+            continue;  // no way here wrote it: undefined still
         if (!windowPlain(i, reg)) {
             a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
             a_.test(RDI, R15);

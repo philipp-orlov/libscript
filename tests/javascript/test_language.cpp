@@ -4414,3 +4414,31 @@ TEST(newOfAGlobalConstructorReadBeforeItsArgumentsKeepsWhatWasRead)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("93000 true true true 15 2 63 true"));
     }
 }
+
+TEST(aDoubleReadFromAFieldTellsAnInt32AndWhatIsNoNumber)
+{
+    // Fields read as doubles in a loop: then an int32 in one (converted out of line), the largest int32, NaN, a string, undefined.
+    const char* program =
+        "function P(x,y){this.x=x;this.y=y;}"
+        "function k(ps,n){var s=0.5;for(var i=0;i<n;i++){var p=ps[i&3];s+=p.x*0.5+p.y;}return s;}"
+        "var ps=[new P(1.5,2.25),new P(3.5,0.125),new P(5.25,1.5),new P(7.5,2.5)];"
+        "var r=0; for (var m=0;m<300;m++) r=k(ps,400);"
+        "var out=[r];"
+        "ps[1].x=3; out.push(k(ps,40));"
+        "ps[2].y=-7; ps[3].x=2147483647; out.push(k(ps,40));"
+        "ps[0].x=NaN; out.push(String(k(ps,8)));"
+        "ps[0].x='s'; out.push(String(k(ps,8)));"
+        "ps[0].x=undefined; out.push(String(k(ps,8)));"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1525.5 150.5 10737418263 NaN NaN NaN"));
+    }
+}

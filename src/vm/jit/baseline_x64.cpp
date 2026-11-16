@@ -1901,6 +1901,22 @@ private:
         Label* bad;
     };
     std::deque<ColdUndo> coldUndos_;
+    /// As `unboxDouble`, with `v` itself clobbered: an int32 is told from its bits first (the cold way converts them), then
+    /// the offset taken off in place.
+    void unboxDoubleInPlace(int x, Reg v, Label* bad)
+    {
+        a_.cmp(v, R14);
+        coldInts_.emplace_back();
+        ColdInt& c = coldInts_.back();
+        c.x = x;
+        c.v = v;
+        a_.jcc(CAE, c.entry);
+        a_.sub(v, RBP);
+        if (bad)
+            a_.jcc(CB, *bad);  // below the first double: not a number
+        a_.movqToX(x, v);
+        a_.bind(c.back);
+    }
     void unboxDouble(int x, Reg v, Reg tmp, Label* bad)
     {
         a_.mov(tmp, v);

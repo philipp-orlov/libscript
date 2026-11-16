@@ -776,7 +776,7 @@ bool Baseline::emitTyped(std::uint32_t i)
                 // A double through rcx: rax keeps the object for the next read or store of it.
                 a_.mov(RCX, m);
                 const int x = inReg(dw) ? xmmOf(dw) : 0;
-                unboxDouble(x, RCX, RDX, known ? nullptr : &bad);
+                unboxDoubleInPlace(x, RCX, known ? nullptr : &bad);
                 if (inReg(dw))
                     dirty_[std::size_t(dw)] = 1;
                 else
@@ -939,6 +939,7 @@ bool Baseline::emitTyped(std::uint32_t i)
         const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
         // The value boxed in rdi first (finding the slot uses rax, rcx, rdx and rsi), then stored into the slot.
         const std::int32_t vw = uw[1];
+        const std::int32_t boxAt = a_.here();
         if (isI32(vw)) {
             const Reg r = useI32(vw, RDI);
             a_.mov32(RDI, r);
@@ -946,6 +947,7 @@ bool Baseline::emitTyped(std::uint32_t i)
         } else {
             boxDoubleTo(RDI, operandF64(vw, 0, RDI), tame(vw));
         }
+        passRax(boxAt);  // boxing goes through rdi only
         const Mem slot = provenSlotMem(in.a, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
         if (factNum_.count({in.a, ic.index})) {
             a_.mov(slot, RDI);  // over a number
@@ -998,7 +1000,11 @@ bool Baseline::emitTyped(std::uint32_t i)
         const int x = operandF64(uw[2], 0, RAX);
         if (mathUnaryIsSqrt(target) && !isI32(dw) && inReg(dw)) {
             // One instruction, from the argument's register into the result's.
-            a_.sqrtsd(xmmOf(dw), x);
+            // VEX with the argument as the merged operand: no false wait on what the result register held before.
+            if (hasAvx())
+                a_.vsd(0x51, xmmOf(dw), x, x);
+            else
+                a_.sqrtsd(xmmOf(dw), x);
             dirty_[std::size_t(dw)] = 1;
             return true;
         }

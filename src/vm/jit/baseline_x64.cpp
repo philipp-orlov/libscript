@@ -919,6 +919,7 @@ private:
         std::uint32_t from, to, read;
         std::int32_t slot;  ///< rsp-relative
         bool array;
+        std::uint32_t taker;  ///< the chain's link that reads it
     };
     std::vector<LoopGlobal> loopGlobals_;
     struct LoopMath

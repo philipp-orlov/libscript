@@ -1221,7 +1221,7 @@ void Baseline::emitChain(std::uint32_t i)
         receiver(in.b);
         bool known = false;
         for (const LoopGlobal& lg : loopGlobals_)
-            known = known || (lg.array && lg.read + length(lg.read) == i && lg.from <= factAt_ && factAt_ <= lg.to);
+            known = known || (lg.array && lg.taker == i && lg.from <= factAt_ && factAt_ <= lg.to);
         if (known) {
             // A global checked to be an array before the loop.
         } else if (role & 2) {
@@ -1930,12 +1930,15 @@ void Baseline::planLoopFacts()
                 std::uint8_t attrs = 0;
                 if (!vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs) || (attrs & attr::kAccessor))
                     continue;
-                const std::uint32_t next = j + length(j);
+                // The link that takes it: the next one of the chain, reading the register it was read into.
+                std::uint32_t next = j + length(j);
+                while (next < n_ && std::int64_t(next) <= end && !(next < chainRole_.size() && (chainRole_[next] & 2)))
+                    next += length(next);
                 const std::uint8_t ep = next < code_->elemProf.size() ? code_->elemProf[next] : 0;
-                const bool array = next < n_ && code_->code[next].opcode() == Op::GetElem && code_->code[next].b == in.a &&
-                                   (chainRole_[next] & 2) && (ep == 0 || ep == elemprof::kArray);
+                const bool array = next < n_ && std::int64_t(next) <= end && code_->code[next].opcode() == Op::GetElem &&
+                                   code_->code[next].b == in.a && (ep == 0 || ep == elemprof::kArray);
                 loopGlobals_.push_back(LoopGlobal{h, std::uint32_t(end), j,
-                                                  hoistBase_ + std::int32_t(8 * loopGlobals_.size()), array});
+                                                  hoistBase_ + std::int32_t(8 * loopGlobals_.size()), array, next});
                 any = true;
             }
             for (const auto& [c, reads] : mathWin_)

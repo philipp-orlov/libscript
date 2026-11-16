@@ -3960,3 +3960,30 @@ TEST(aFunctionRunInPlaceThatReplacesItselfLeavesTheCopy)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("28500,1006,1000,7500,-96,-100"));
     }
 }
+
+TEST(aPropertyReadAgainSeesStoresThroughOtherNames)
+{
+    // A number read of a property again in the block takes the first read's value only while nothing between can have
+    // changed it: a store to the property through another name of the object, the register reassigned, a setter.
+    const char* program =
+        "function P(x, m) { this.x = x; this.m = m; }"
+        "function f(a, b, k) { var s = a.m * 2; b.m = k; s += a.m; var c = a; a = b; s += a.m * 3 + c.m; return s; }"
+        "var p = new P(1, 1.5), q = new P(2, 2.5), t = 0;"
+        "for (var i = 0; i < 20000; i++) { t += f(p, q, i * 0.5); t += f(p, p, 0.25); p.m = 1.5; }"
+        "var o = { m: 1.25 };"
+        "var w = { set m(v) { o.m = v * 2; }, get m() { return 7; } };"
+        "function g(a, b) { var s = a.m; b.m = 3; return s + a.m; }"
+        "for (var i = 0; i < 20000; i++) { t += g(o, w); o.m = 1.25; }"
+        "t;";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("300335000"));
+    }
+}

@@ -1114,9 +1114,24 @@ void Baseline::emitOpt(std::uint32_t i)
             forgetFact(r);
         return;
     }
+    if (auto ru = reuseRead_.find(i); ru != reuseRead_.end()) {
+        // The value an earlier read of the same property of the same object left in its home slot.
+        const std::int32_t from = plan_->defWeb[ru->second], dw = plan_->defWeb[i];
+        if (isI32(dw)) {
+            a_.mov32(RAX, home(from));
+            defI32(dw, RAX);
+        } else {
+            a_.movsdLoad(0, home(from));
+            defF64(dw, 0);
+        }
+        for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
+            forgetFact(r);
+        return;
+    }
     if (emitTyped(i)) {
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
             forgetFact(r);
+        saveReadValue(i);
         return;
     }
     if (code_->code[i].opcode() == Op::LoadUndef && plainAt(i, code_->code[i].a)) {
@@ -1136,6 +1151,20 @@ void Baseline::emitOpt(std::uint32_t i)
     emit(i);
     if (plan_->defWeb[i] >= 0 && !delivered_)
         loadTypedAfter(i);
+    saveReadValue(i);
+}
+
+void Baseline::saveReadValue(std::uint32_t i)
+{
+    if (!saveRead_.count(i))
+        return;
+    const std::int32_t w = plan_->defWeb[i];
+    if (!inReg(w))
+        return;  // there already
+    if (isI32(w))
+        a_.mov32(home(w), gpr(w));
+    else
+        a_.movsdStore(home(w), xmmOf(w));
 }
 
 void Baseline::emitExits()
@@ -1294,6 +1323,93 @@ bool Baseline::emitMove(std::uint32_t i)
     return true;
 }
 
+void Baseline::planReadReuse()
+{
+    reuseRead_.clear();
+    saveRead_.clear();
+    if (!code_->handlers.empty())
+        return;
+    struct Seen
+    {
+        unsigned obj;
+        std::uint16_t atom;
+        std::uint32_t at;
+    };
+    std::vector<Seen> seen;
+    auto typedUses = [&](std::uint32_t j) {
+        for (std::int32_t w : plan_->useWebs[j])
+            if (w < 0)
+                return false;
+        return true;
+    };
+    // A store of a number into a property where the site has always found it: nothing but that slot changes.
+    auto numberStore = [&](std::uint32_t j) {
+        const auto& uw = plan_->useWebs[j];
+        if (uw.size() < 2 || uw[0] >= 0 || uw[1] < 0)
+            return false;
+        const std::uint16_t cacheId = code_->code[j + 1].a;
+        if (cacheId == kNoCache)
+            return false;
+        const InlineCache& ic = code_->caches[cacheId];
+        return ic.shape != 0 && !ic.holder && ic.next == 0;
+    };
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        if (plan_->isLeader[j])
+            seen.clear();
+        const Ins& in = code_->code[j];
+        const Op op = in.opcode();
+        const bool skipped = j < skipDef_.size() && skipDef_[j];
+        if (skipped)
+            continue;
+        // A read in a chain or into a window keeps its value elsewhere: neither end of a reuse.
+        const bool elsewhere = (j < chainRole_.size() && chainRole_[j]) || windowRead_.count(j);
+        if (op == Op::GetProp && !elsewhere && plan_->defWeb[j] >= 0 && !plan_->useWebs[j].empty() &&
+            plan_->useWebs[j][0] < 0 && plainReadable(j) && !inlineGetterSite(j)) {
+            bool found = false;
+            for (const Seen& x : seen)
+                if (x.obj == in.b && x.atom == in.c &&
+                    isI32(plan_->defWeb[x.at]) == isI32(plan_->defWeb[j])) {
+                    reuseRead_[j] = x.at;
+                    saveRead_.insert(x.at);
+                    found = true;
+                    break;
+                }
+            if (!found && in.a != in.b)
+                seen.push_back(Seen{in.b, std::uint16_t(in.c), j});
+        } else if (op == Op::PutProp && numberStore(j)) {
+            seen.erase(std::remove_if(seen.begin(), seen.end(), [&](const Seen& x) { return x.atom == in.b; }),
+                       seen.end());
+        } else {
+            bool quiet = false;
+            switch (op) {
+            case Op::Nop: case Op::Jmp: case Op::LoadUndef: case Op::LoadNull: case Op::LoadInt: case Op::LoadK:
+            case Op::LoadTrue: case Op::LoadFalse: case Op::LoadHole: case Op::LoadUninit: case Op::Mov:
+                quiet = true;
+                break;
+            case Op::GetProp:
+                quiet = plan_->useWebs[j].size() >= 1 && plan_->useWebs[j][0] < 0 && plainReadable(j) &&
+                        !inlineGetterSite(j);
+                break;
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::BitAnd: case Op::BitOr: case Op::BitXor:
+            case Op::Shl: case Op::Shr: case Op::AddI: case Op::SubI: case Op::MulI: case Op::BitAndI: case Op::BitOrI:
+            case Op::BitXorI: case Op::ShlI: case Op::ShrI: case Op::Inc: case Op::Dec: case Op::Neg:
+                quiet = plan_->defWeb[j] >= 0 && typedUses(j);
+                break;
+            default:
+                quiet = opt::isConditionalJump(op) && typedUses(j);
+                break;
+            }
+            if (!quiet) {
+                seen.clear();
+                continue;
+            }
+        }
+        // A register written here is no longer the object the reads were of.
+        for (std::uint16_t r : opt::effectsOf(*code_, j).wr)
+            seen.erase(std::remove_if(seen.begin(), seen.end(), [&](const Seen& x) { return x.obj == r; }), seen.end());
+    }
+}
+
 void Baseline::findCells()
 {
     struct Dump
@@ -1411,6 +1527,7 @@ Tier2Code* Baseline::compileOptimized()
     findPlainRegs();
     findCells();
     planSelfChecked();
+    planReadReuse();
     movedOut_.clear();
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);

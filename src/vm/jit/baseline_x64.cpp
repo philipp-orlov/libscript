@@ -1227,6 +1227,22 @@ private:
     std::vector<std::uint8_t> selfChecked_;
     JSValue selfFn_ = JSValue::undefined();
     void planSelfChecked();
+    /// Number reads of a property that an earlier read in the block made of the same object, with nothing between that
+    /// may change it: the later read takes the earlier one's value from its home slot (`reuseRead_`: later -> earlier;
+    /// `saveRead_`: earlier reads whose value goes to the home slot too).
+    std::map<std::uint32_t, std::uint32_t> reuseRead_;
+    std::set<std::uint32_t> saveRead_;
+    void planReadReuse();
+    void saveReadValue(std::uint32_t i);
+    /// Whether the read at `i` is one `inlineGetter` would take (a getter's body in place).
+    bool inlineGetterSite(std::uint32_t i) const
+    {
+        const std::uint16_t cacheId = code_->code[i + 1].a;
+        if (cacheId == kNoCache || cacheId >= code_->caches.size())
+            return true;
+        const InlineCache& ic = code_->caches[cacheId];
+        return ic.shape == 0;
+    }
     void emitSelfGuard(std::uint32_t i);
     /// Whether the `Call` at `i` is the long way of a guarded call run in place, which this code never reaches.
     bool fallbackOf(std::uint32_t i) const

@@ -953,7 +953,12 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs)));
     a_.alu(7, R10, mem(R12, kVmStackInit));
     a_.jcc(CA, slowPath);
-    a_.mov32(R10, mem(R12, kVmFrameCount));
+    // The new frame follows this one (the top one): its index from the address, so nothing waits on the count's last
+    // store.
+    a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame))));
+    a_.mov(R10, R11);
+    a_.alu(5, R10, mem(R12, kVmFrameBase));
+    a_.shiftI(5, R10, 6);
     a_.lea(RDI, mem(R10, 2));
     a_.alu32(7, RDI, mem(R12, kVmFrameCapacity));
     a_.jcc(CAE, slowPath);
@@ -986,11 +991,9 @@ void Baseline::emitDirectCall(std::uint32_t i)
     }
     a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
     a_.mov(mem(R13, kFramePc), RDI);
-    a_.mov(R11, mem(R12, kVmFrameBase));
     static_assert(sizeof(Frame) == 64, "a frame is found by a shift");
-    a_.shiftI(4, R10, 6);
-    a_.add(R11, R10);
-    a_.inc32(mem(R12, kVmFrameCount));
+    a_.lea(RDI, mem(R10, 1));
+    a_.mov32(mem(R12, kVmFrameCount), RDI);
     a_.mov(mem(R11, kFrameCode), RCX);
     a_.mov(mem(R11, kFrameFn), RAX);
     a_.mov(mem(R11, kFramePc), 0);

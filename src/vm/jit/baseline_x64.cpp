@@ -2859,7 +2859,11 @@ void Baseline::ret(std::uint32_t i, const Ins& in)
             a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitClear));
         }
     }
-    a_.dec32(mem(R12, kVmFrameCount));
+    // This frame's index is the count once it is gone (from its address: nothing waits on the count's last store).
+    a_.mov(RDX, R13);
+    a_.alu(5, RDX, mem(R12, kVmFrameBase));
+    a_.shiftI(5, RDX, 6);
+    a_.mov32(mem(R12, kVmFrameCount), RDX);
     a_.mov(RAX, mem(RSP, 0));
     a_.jmp(exit_);
 }

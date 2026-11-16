@@ -648,8 +648,7 @@ bool Baseline::emitTyped(std::uint32_t i)
                 a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
                 a_.jcc(CNE, bad);
             }
-            a_.test32(RCX, RCX);
-            a_.jcc(CS, bad);
+            // Unsigned: a negative index is past any length (an array has fewer than 2^31 elements).
             a_.alu32(7, RCX, mem(RAX, kArrayLength));
             a_.jcc(CAE, bad);
             a_.mov(RDX, mem(RAX, kArrayElems));

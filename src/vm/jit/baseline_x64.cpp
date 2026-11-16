@@ -997,6 +997,7 @@ private:
     std::vector<std::uint8_t> chainRole_;  ///< 1: the result goes to the chain slot; 2: the receiver comes from it
     std::vector<std::int32_t> chainHead_;  ///< for an instruction inside a chain: where a failed guard restarts
     std::int32_t chainSlot_ = -1;          ///< rsp-relative
+    std::int32_t chainLeft_ = -1;  ///< where the code was when a chain link last left its value in rax
     void planChains();
     bool regDeadAfter(std::uint32_t i, unsigned r);
     bool chainable(std::uint32_t i, bool asConsumer);

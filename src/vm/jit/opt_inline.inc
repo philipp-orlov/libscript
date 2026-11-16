@@ -1156,10 +1156,13 @@ void Baseline::emitChain(std::uint32_t i)
     const std::uint8_t role = chainRole_[i];
     Label& bad = exitBefore(std::uint32_t(chainHead_[i] >= 0 ? chainHead_[i] : std::int32_t(i)));
     auto receiver = [&](unsigned reg) {
-        if (role & 2)
-            a_.mov(RAX, mem(RSP, chainSlot_));
-        else
+        if (role & 2) {
+            // The link before left its value in rax when nothing has been emitted since and nothing jumps in here.
+            if (!(chainLeft_ == a_.here() && !plan_->isLeader[i]))
+                a_.mov(RAX, mem(RSP, chainSlot_));
+        } else {
             a_.mov(RAX, R(reg));
+        }
     };
     switch (in.opcode()) {
     case Op::GetGlobal: {
@@ -1188,8 +1191,7 @@ void Baseline::emitChain(std::uint32_t i)
             needInt(RCX, bad);
             a_.mov32(RCX, RCX);
         }
-        a_.test32(RCX, RCX);
-        a_.jcc(CS, bad);
+        // Unsigned: a negative index is past any length (an array has fewer than 2^31 elements).
         a_.alu32(7, RCX, mem(RAX, kArrayLength));
         a_.jcc(CAE, bad);
         a_.mov(RDX, mem(RAX, kArrayElems));
@@ -1217,6 +1219,7 @@ void Baseline::emitChain(std::uint32_t i)
     }
     if (role & 1) {
         a_.mov(mem(RSP, chainSlot_), RAX);
+        chainLeft_ = a_.here();
         return;
     }
     const std::int32_t dw = plan_->defWeb[i];

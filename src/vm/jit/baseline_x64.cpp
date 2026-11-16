@@ -3519,7 +3519,11 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
     a_.mov(mem(R12, kVmFrameTop), R13);
     if (!plain)
         a_.mov(RAX, mem(RSP, 0));
-    a_.jmp(exit_);
+    // The way out in place (as at exit_).
+    a_.aluI(0, RSP, optimizing() ? 8 + spill_ : 8);
+    a_.pop(R13);
+    a_.pop(RBX);
+    a_.ret();
 }
 
 #include "opt_emit.inc"

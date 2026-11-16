@@ -3651,3 +3651,35 @@ TEST(globalsAndMathFunctionsALoopReadAreReadBeforeItWhileNothingChangesThem)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("50000 137491 124003 172685 2000 true"));
     }
 }
+
+TEST(numberReadsALoopNeverStoresOverAreReadOnceBeforeIt)
+{
+    // A property read in a loop that stores only to others, the same object under another name stored to, other kinds of
+    // number or a string on the way in, and a store through a call.
+    const char* program =
+        "var out=[]; "
+        "function B(x,v){this.x=x;this.v=v;} "
+        "function k1(a,bs,n){var s=0;for(var i=0;i<n;i++){var b=bs[i&1]; s+=a.x*b.x; b.v+=a.x;}return s;} "
+        "for (var r=0;r<20;r++){ var a=new B(1.5,0); k1(a,[new B(2.5,0),new B(3.5,0)],100); } "
+        "var a=new B(1.5,0), bs=[new B(2.5,0),a]; out.push(k1(a,bs,1000), a.v, bs[0].v); "
+        "function k2(a,bs,n){var s=0;for(var i=0;i<n;i++){var b=bs[i&1]; s+=a.x; b.x=i*0.5;}return s;} "
+        "for (var r=0;r<20;r++){ k2(new B(1.5,0),[new B(2.5,0),new B(3.5,0)],100); } "
+        "var c=new B(1.5,0); out.push(k2(c,[new B(0,0),c],1000), c.x); "
+        "function k3(a,n){var s=0;for(var i=0;i<n;i++){ s+=a.x; }return s;} "
+        "for (var r=0;r<20;r++) k3(new B(2,0),100); out.push(k3(new B(2,0),1000), k3(new B(2.5,0),1000), k3(new B('s',0),3)); "
+        "function setx(o){ o.x=100; } "
+        "function k4(a,n){var s=0;for(var i=0;i<n;i++){ s+=a.x; if(i==500) setx(a); }return s;} "
+        "for (var r=0;r<20;r++) k4(new B(1,0),100); out.push(k4(new B(1,0),1000)); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3000 750 750 249004 499.5 2000 2500 0sss 50401"));
+    }
+}

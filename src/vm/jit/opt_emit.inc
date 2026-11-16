@@ -277,7 +277,7 @@ namespace {
 constexpr std::uint32_t kInlineSlots = 32;
 /// Slots for method reads that feed an inlined call.
 constexpr std::uint32_t kWindowSlots = 4;
-constexpr std::uint32_t kHoistSlots = 4;
+constexpr std::uint32_t kHoistSlots = 8;
 
 std::uint64_t doubleBits(double d)
 {
@@ -648,6 +648,17 @@ bool Baseline::emitTyped(std::uint32_t i)
             }
             retain(RAX);
             write(in.a, RAX);
+            return true;
+        }
+        if (const LoopRead* lr = hoistedRead(i)) {
+            // Read before the loop, which stores to it nowhere: from its slot on the stack.
+            if (isI32(dw)) {
+                a_.mov32(RAX, mem(RSP, lr->slot));
+                defI32(dw, RAX);
+            } else {
+                a_.movsdLoad(0, mem(RSP, lr->slot));
+                defF64(dw, 0);
+            }
             return true;
         }
         // A number read from a property the site has always found in the same place: straight into the variable.

@@ -1690,6 +1690,7 @@ void Baseline::planLoopFacts()
     loopArrs_.clear();
     loopGlobals_.clear();
     loopMaths_.clear();
+    loopReads_.clear();
     hoistWatch_.clear();
     preLoop_.clear();
     if (!code_->handlers.empty())
@@ -1829,6 +1830,32 @@ void Baseline::planLoopFacts()
         }
         for (const auto& [r, k] : nums)
             loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k});
+        // Number reads of those objects' own slots that no store of the loop writes (to an object of that shape, which may
+        // be the same one): read once before it.
+        std::set<std::pair<std::uint32_t, std::uint32_t>> stored;
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j))
+            if (code_->code[j].opcode() == Op::PutProp && j + 1 < n_ && code_->code[j + 1].a != kNoCache) {
+                const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+                stored.insert({ic.shape, ic.index});
+                if (ic.pad && ic.pad <= code_->poly.size())
+                    for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k)
+                        stored.insert({code_->poly[ic.pad - 1].e[k].shape, code_->poly[ic.pad - 1].e[k].index});
+            }
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            const Ins& in = code_->code[j];
+            if (in.opcode() != Op::GetProp || j + 1 >= n_ || code_->code[j + 1].a == kNoCache || plan_->defWeb[j] < 0 ||
+                (j < chainRole_.size() && chainRole_[j]) || windowRead_.count(j) ||
+                loopGlobals_.size() + loopReads_.size() >= kHoistSlots)
+                continue;
+            const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+            const unsigned r = in.b;
+            if (ic.holder || (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n) || !shapes.count(r) ||
+                mixedShape.count(r) || shapes[r].first != ic.shape || shapes[r].second < 0 || stored.count({ic.shape, ic.index}))
+                continue;
+            loopReads_.push_back(LoopRead{h, std::uint32_t(end), j,
+                                          hoistBase_ + std::int32_t(8 * (loopGlobals_.size() + loopReads_.size()))});
+            any = true;
+        }
         // Arrays in registers the loop does not write, which it reads or stores elements of.
         std::map<unsigned, std::uint8_t> arrs;
         for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
@@ -1915,6 +1942,31 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         if (ls.aux >= 0) {
             a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ls.aux));
             a_.jcc(CNE, bad);
+        }
+    }
+    for (const LoopRead& lr : loopReads_) {
+        if (lr.from != h)
+            continue;
+        const Ins& in = code_->code[lr.read];
+        const InlineCache& ic = code_->caches[code_->code[lr.read + 1].a];
+        std::int32_t aux = -1;
+        for (const LoopShape& ls : loopShapes_)
+            if (ls.from == h && ls.reg == in.b)
+                aux = ls.aux;
+        a_.mov(RAX, R(in.b));
+        if (std::int32_t(ic.index) < aux) {
+            a_.mov(RAX, mem(RAX, kObjInline + std::int32_t(8 * ic.index)));
+        } else {
+            a_.mov(RDX, mem(RAX, kObjSlots));
+            a_.mov(RAX, mem(RDX, std::int32_t(8 * (std::int32_t(ic.index) - aux))));
+        }
+        if (isI32(plan_->defWeb[lr.read])) {
+            needInt(RAX, bad);
+            a_.mov32(mem(RSP, lr.slot), RAX);
+        } else {
+            needNumber(RAX, bad);
+            loadNumber(0, RAX, RDX);
+            a_.movsdStore(mem(RSP, lr.slot), 0);
         }
     }
     for (const LoopGlobal& lg : loopGlobals_) {

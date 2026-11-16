@@ -918,6 +918,21 @@ private:
         std::uint32_t from, to, call;
     };
     std::vector<LoopMath> loopMaths_;
+    /// A number read from a slot of an object of known shape that nothing in the loop stores to: read and unboxed before the
+    /// loop (as its variable's kind) into a stack slot.
+    struct LoopRead
+    {
+        std::uint32_t from, to, read;
+        std::int32_t slot;  ///< rsp-relative
+    };
+    std::vector<LoopRead> loopReads_;
+    const LoopRead* hoistedRead(std::uint32_t read) const
+    {
+        for (const LoopRead& r : loopReads_)
+            if (r.read == read && r.from <= factAt_ && factAt_ <= r.to)
+                return &r;
+        return nullptr;
+    }
     std::int32_t hoistBase_ = -1;  ///< rsp-relative: the slots of `loopGlobals_`
     const LoopGlobal* hoistedGlobal(std::uint32_t read) const
     {

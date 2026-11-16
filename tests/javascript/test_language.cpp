@@ -4223,3 +4223,39 @@ TEST(anInlinedNewTakesTheCountOfArgumentsThatDie)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("4222500"));
     }
 }
+
+TEST(loopPromotedSlotsSeeEveryOtherWayToTheObject)
+{
+    // A number slot a loop reads and stores through a register it does not write is kept in a stack slot: an element read
+    // that turns out to be the same object leaves the code (writing it back), as does an element of another shape, and a
+    // loop entered part way loads it first.
+    const char* program =
+        "function B(x, v) { this.x = x; this.v = v; this.m = 1.5; }"
+        "function step(bs, dt) { var n = bs.length; for (var i = 0; i < n; i++) { var a = bs[i]; for (var j = 0; j < n; j++) { var b = bs[j]; var d = a.x - b.x; a.v -= d * b.m * dt; b.v += d * a.m * dt; } } }"
+        "function sum(bs) { var s = 0; for (var i = 0; i < bs.length; i++) s += bs[i].v; return Math.round(s * 1e6); }"
+        "var out = [];"
+        "var bs = []; for (var k = 0; k < 6; k++) bs.push(new B(k * 1.25, 0.5 * k));"
+        "for (var r = 0; r < 3000; r++) step(bs, 0.01);"
+        "out.push(sum(bs), Math.round(bs[2].v * 1e6));"
+        "var odd = { x: 3, v: 1, m: 2, extra: 1 }; bs[3] = odd;"
+        "for (var r = 0; r < 50; r++) step(bs, 0.01);"
+        "out.push(sum(bs));"
+        "bs[3] = new B(1, 2); bs[4].v = 'str';"
+        "try { step(bs, 0.01); out.push(typeof bs[4].v, String(bs[0].v).slice(0, 6)); } catch (e) { out.push(e.name); }"
+        "var big = []; for (var k = 0; k < 400; k++) big.push(new B(k * 0.5, k));"
+        "step(big, 0.001); out.push(sum(big));"
+        "function self(bs) { for (var i = 0; i < bs.length; i++) { var a = bs[i]; for (var j = 0; j < bs.length; j++) { var b = bs[i]; a.v += b.m; } } }"
+        "var ss = [new B(1, 0), new B(2, 0)]; for (var r = 0; r < 2000; r++) self(ss); out.push(ss[0].v, ss[1].v);"
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("7500000,338500000,344500000,number,1716.4,79800000000,6000,6000"));
+    }
+}

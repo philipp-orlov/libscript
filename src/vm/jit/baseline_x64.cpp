@@ -967,6 +967,40 @@ private:
         bool dup = false;   ///< another read of the loop fills the slot
     };
     std::vector<LoopRead> loopReads_;
+    /// A number slot of an object in a register the loop does not write, read and stored by the loop through that register:
+    /// kept as a double in a stack slot (`slot`), loaded before the loop and written back on every way out of it. Other
+    /// registers that may hold the object are compared with it, once before the loop (`fixed`) or where they get a value
+    /// (`promoGuards_`).
+    struct LoopPromo
+    {
+        std::uint32_t from, to;
+        unsigned reg;
+        std::uint32_t index;
+        std::int32_t slot;
+        std::vector<unsigned> fixed;
+    };
+    std::vector<LoopPromo> loopPromos_;
+    std::int64_t emittingGuards_ = -1;  ///< the loop whose checks are being made: its promoted slots are not loaded yet
+    std::map<std::uint32_t, std::size_t> promoAccess_;               ///< read or store -> its promotion
+    std::map<std::uint32_t, std::vector<std::size_t>> promoGuards_;  ///< element read -> promotions to compare with
+    std::vector<std::size_t> promosAt(std::uint32_t at) const
+    {
+        std::vector<std::size_t> out;
+        for (std::size_t k = 0; k < loopPromos_.size(); ++k)
+            if (loopPromos_[k].from <= at && at <= loopPromos_[k].to)
+                out.push_back(k);
+        return out;
+    }
+    void writeBack(const std::vector<std::size_t>& promos)
+    {
+        for (std::size_t k : promos) {
+            const LoopPromo& lp = loopPromos_[k];
+            a_.movsdLoad(0, mem(RSP, lp.slot));
+            boxDoubleTo(RDX, 0);
+            a_.mov(RAX, R(lp.reg));
+            a_.mov(mem(RAX, kObjInline + std::int32_t(8 * lp.index)), RDX);
+        }
+    }
     /// A method read from a prototype for an inlined call, in a loop that changes neither the receiver, nor its shape, nor
     /// the chain, nor that slot: read and compared once before the loop; inside, its window slot gets the function as a
     /// constant and the call needs no look at it.
@@ -1255,6 +1289,7 @@ private:
         int kind;  ///< 0: run the instruction in the interpreter; 1: go on after it (it has run)
         Label label;
         std::vector<unsigned> own;  ///< registers held without a count where the exit is taken (`borrows_`)
+        std::vector<std::size_t> promos;  ///< promoted slots to write back first (`loopPromos_`)
     };
     std::deque<ExitReq> exits_;
     std::map<std::uint64_t, Label*> exitIndex_;

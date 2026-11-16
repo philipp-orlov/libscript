@@ -189,18 +189,26 @@ Label& Baseline::exitLabel(std::uint32_t i, int kind)
     // Exits taken where registers are held without a count are their own: the count is taken first.
     std::uint64_t ctx = 0;
     std::vector<unsigned> own;
+    std::vector<std::size_t> promos;
     if (optimizing() && !borrows_.empty()) {
         for (std::size_t k = 0; k < borrows_.size(); ++k)
             if (borrows_[k].from <= factAt_ && factAt_ <= borrows_[k].to) {
-                ctx |= std::uint64_t(1) << (k % 20);
+                ctx |= std::uint64_t(1) << (k % 10);
                 own.push_back(borrows_[k].reg);
+            }
+    }
+    if (optimizing() && !loopPromos_.empty()) {
+        for (std::size_t k : promosAt(factAt_))
+            if (std::int64_t(loopPromos_[k].from) != emittingGuards_) {
+                promos.push_back(k);
+                ctx |= std::uint64_t(1) << (10 + k % 10);
             }
     }
     const std::uint64_t key = (ctx << 40) | (std::uint64_t(i) << 2) | std::uint64_t(kind);
     auto it = exitIndex_.find(key);
     if (it != exitIndex_.end())
         return *it->second;
-    exits_.push_back(ExitReq{i, kind, Label{}, own});
+    exits_.push_back(ExitReq{i, kind, Label{}, own, promos});
     exitIndex_[key] = &exits_.back().label;
     return exits_.back().label;
 }
@@ -285,7 +293,7 @@ namespace {
 constexpr std::uint32_t kInlineSlots = 32;
 /// Slots for method reads that feed an inlined call.
 constexpr std::uint32_t kWindowSlots = 4;
-constexpr std::uint32_t kHoistSlots = 8;
+constexpr std::uint32_t kHoistSlots = 16;
 
 std::uint64_t doubleBits(double d)
 {
@@ -810,8 +818,19 @@ bool Baseline::emitTyped(std::uint32_t i)
                 a_.mov(RAX, mem(RDX, RCX, 8));
                 a_.cmpI(RAX, std::int32_t(kHole));
                 a_.jcc(CE, bad);
+                if (auto pg = promoGuards_.find(i); pg != promoGuards_.end()) {
+                    std::set<unsigned> seen;
+                    for (std::size_t k : pg->second) {
+                        // The object a promoted slot belongs to: the code leaves (writing the slot back).
+                        if (!seen.insert(loopPromos_[k].reg).second)
+                            continue;
+                        a_.cmp(RAX, R(loopPromos_[k].reg));
+                        a_.jcc(CE, bad);
+                    }
+                }
                 if (plan_->defWeb[i] < 0 && borrowed(i, in.a)) {
                     a_.mov(R(in.a), RAX);  // held by the array: no count, and the old value had none
+                    keepRax(in.a);
                     return true;
                 }
                 deliver(i, in.a);
@@ -968,6 +987,12 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.jcc(CNE, bad);
         }
         const int x = operandF64(uw[2], 0, RAX);
+        if (mathUnaryIsSqrt(target) && !isI32(dw) && inReg(dw)) {
+            // One instruction, from the argument's register into the result's.
+            a_.sqrtsd(xmmOf(dw), x);
+            dirty_[std::size_t(dw)] = 1;
+            return true;
+        }
         if (x != 0)
             a_.movaps(0, x);
         if (mathUnaryIsSqrt(target)) {
@@ -1173,16 +1198,43 @@ void Baseline::emitOpt(std::uint32_t i)
             forgetFact(r);
         return;
     }
+    if (auto pa = promoAccess_.find(i); pa != promoAccess_.end()) {
+        // A promoted slot: the double in its stack slot.
+        const LoopPromo& lp = loopPromos_[pa->second];
+        const Ins& in = code_->code[i];
+        const std::int32_t start = a_.here();
+        if (in.opcode() == Op::GetProp) {
+            const std::int32_t dw = plan_->defWeb[i];
+            const int x = inReg(dw) ? xmmOf(dw) : 0;
+            a_.movsdLoad(x, mem(RSP, lp.slot));
+            defF64(dw, x);
+        } else {
+            const std::int32_t vw = plan_->useWebs[i][1];
+            a_.movsdStore(mem(RSP, lp.slot), operandF64(vw, 0, RCX));
+        }
+        passRax(start);
+        for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
+            forgetFact(r);
+        return;
+    }
     if (auto ru = reuseRead_.find(i); ru != reuseRead_.end()) {
         // The value an earlier read of the same property of the same object left in its home slot.
+        // A read hoisted before the loop left it in its loop slot instead. Straight into the variable's register; rax stays.
         const std::int32_t from = plan_->defWeb[ru->second], dw = plan_->defWeb[i];
+        const LoopRead* lr = hoistedRead(ru->second);
+        const Mem src = lr ? mem(RSP, lr->slot) : home(from);
+        const std::int32_t start = a_.here();
         if (isI32(dw)) {
-            a_.mov32(RAX, home(from));
-            defI32(dw, RAX);
+            const Reg r = inReg(dw) ? gpr(dw) : RCX;
+            a_.mov32(r, src);
+            defI32(dw, r);
         } else {
-            a_.movsdLoad(0, home(from));
-            defF64(dw, 0);
+            const int x = inReg(dw) ? xmmOf(dw) : 0;
+            a_.movsdLoad(x, src);
+            defF64(dw, x);
         }
+        if (raxObj_ != int(code_->code[i].a))
+            passRax(start);
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
             forgetFact(r);
         return;
@@ -1350,8 +1402,8 @@ bool Baseline::emitReturnCopy(std::uint32_t i)
 
 void Baseline::saveReadValue(std::uint32_t i)
 {
-    if (!saveRead_.count(i))
-        return;
+    if (!saveRead_.count(i) || hoistedRead(i))
+        return;  // a hoisted read's value stays in its loop slot
     const std::int32_t w = plan_->defWeb[i];
     if (!inReg(w))
         return;  // there already
@@ -1365,6 +1417,7 @@ void Baseline::emitExits()
 {
     for (ExitReq& e : exits_) {
         a_.bind(e.label);
+        writeBack(e.promos);
         ownRegs(e.own);
         const bool after = e.kind == 1;
         const std::uint32_t at = after ? e.index + length(e.index) : e.index;
@@ -1395,6 +1448,7 @@ void Baseline::emitOptTails()
     for (std::size_t k = 0; k < tickStubs_.size(); ++k) {
         auto& t = tickStubs_[k];
         a_.bind(t.second);
+        writeBack(promosAt(t.first));  // what the interrupt may see; the loop's way in loads it again
         savePool(t.first);
         a_.mov(RDI, R12);
         a_.call(tick_);
@@ -1833,6 +1887,9 @@ Tier2Code* Baseline::compileOptimized()
                 a_.mov(RAX, R(b.reg));
                 retain(RAX);
             }
+        for (std::size_t k = 0; k < loopPromos_.size(); ++k)
+            if (loopPromos_[k].to == i)
+                writeBack({k});
         for (const auto& [h, w] : hoistWatch_)
             if (w.first == i && w.second != sideDoors_)
                 hoistBroken_.insert(h);
@@ -1857,6 +1914,8 @@ Tier2Code* Baseline::compileOptimized()
         bool nested = false;
         for (const Borrow& b : borrows_)
             nested = nested || (b.from < h && h <= b.to);
+        for (const LoopPromo& lp : loopPromos_)
+            nested = nested || (lp.from < h && h <= lp.to);
         if (nested)
             a_.jmp(fail);
         for (const opt::LiveWeb& lw : plan_->liveBefore[h])

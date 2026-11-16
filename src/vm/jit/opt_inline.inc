@@ -2022,6 +2022,9 @@ void Baseline::planLoopFacts()
     loopGlobals_.clear();
     loopMaths_.clear();
     loopReads_.clear();
+    loopPromos_.clear();
+    promoAccess_.clear();
+    promoGuards_.clear();
     hoistSlots_ = 0;
     loopWins_.clear();
     hoistWatch_.clear();
@@ -2210,6 +2213,118 @@ void Baseline::planLoopFacts()
             else
                 loopReads_.push_back(LoopRead{h, std::uint32_t(end), j, hoistBase_ + std::int32_t(8 * hoistSlots_++)});
             any = true;
+        }
+        // Number slots of those objects that the loop both reads and stores through the register: kept as a double in a
+        // stack slot all through the loop, written back on every way out. Another register that may hold the same
+        // object is compared with it where it gets its value (and the code leaves when it is the same).
+        if (opt::isConditionalJump(code_->code[std::size_t(end)].opcode())) {
+            bool leaves = false;
+            for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+                const std::int64_t t = opt::jumpTarget(*code_, j);
+                const Op op = code_->code[j].opcode();
+                if ((t >= 0 && (t < std::int64_t(h) || t > end)) || op == Op::Ret || op == Op::Throw || op == Op::ThrowError)
+                    leaves = true;
+            }
+            std::uint32_t before = 0;
+            for (std::uint32_t j = 0; j < h; j += length(j))
+                before = j;
+            for (const auto& [r, sa] : shapes) {
+                if (leaves || mixedShape.count(r) || sa.second < 0 || h == 0)
+                    break;
+                const std::uint32_t shape = sa.first;
+                const std::int32_t aux = sa.second;
+                std::set<std::uint32_t> idxs;
+                for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+                    const Ins& in = code_->code[j];
+                    if (in.opcode() != Op::PutProp || in.a != r || code_->code[j + 1].a == kNoCache)
+                        continue;
+                    const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+                    if (ic.shape == shape && !ic.holder && ic.next == 0 && std::int32_t(ic.index) < aux)
+                        idxs.insert(ic.index);
+                }
+                for (std::uint32_t idx : idxs) {
+                    bool ok = hoistSlots_ < kHoistSlots;
+                    std::vector<std::uint32_t> own;
+                    std::set<unsigned> others;
+                    for (std::uint32_t j = h; std::int64_t(j) <= end && ok; j += length(j)) {
+                        const Ins& in = code_->code[j];
+                        const Op op = in.opcode();
+                        if ((op != Op::GetProp && op != Op::PutProp) || code_->code[j + 1].a == kNoCache)
+                            continue;
+                        const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+                        bool touches = ic.shape == shape && ic.index == idx && !ic.holder;
+                        const bool poly = ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n;
+                        if (poly)
+                            for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k)
+                                touches = touches || (code_->poly[ic.pad - 1].e[k].shape == shape &&
+                                                      code_->poly[ic.pad - 1].e[k].index == idx);
+                        if (!touches)
+                            continue;
+                        const unsigned recv = op == Op::GetProp ? in.b : in.a;
+                        if (recv != r) {
+                            others.insert(recv);
+                            continue;
+                        }
+                        const auto& uw = plan_->useWebs[j];
+                        const bool failed = j < code_->prof.size() && (code_->prof[j] & opt::kProfFailed);
+                        if (poly || ic.holder || failed || (j < chainRole_.size() && chainRole_[j]) || windowRead_.count(j) ||
+                            (j < skipDef_.size() && skipDef_[j]))
+                            ok = false;
+                        else if (op == Op::GetProp)
+                            ok = plan_->defWeb[j] >= 0 && !isI32(plan_->defWeb[j]) && in.a != r;
+                        else
+                            ok = uw.size() >= 2 && uw[0] < 0 && uw[1] >= 0 && !isI32(uw[1]) && ic.next == 0;
+                        if (ok)
+                            own.push_back(j);
+                    }
+                    // The other registers: given their values in the loop only by element reads, dead before it; or not
+                    // written in it at all (compared once, before it).
+                    std::vector<unsigned> fixed;
+                    for (unsigned q : others) {
+                        if (!ok)
+                            break;
+                        if (q >= written.size() || !written[q]) {
+                            fixed.push_back(q);
+                            continue;
+                        }
+                        ok = regDeadAfter(before, q);
+                        for (std::uint32_t j = h; std::int64_t(j) <= end && ok; j += length(j)) {
+                            const Ins& in = code_->code[j];
+                            const opt::Effects e = opt::effectsOf(*code_, j);
+                            if (std::find(e.wr.begin(), e.wr.end(), q) == e.wr.end())
+                                continue;
+                            const auto& uw = plan_->useWebs[j];
+                            const std::uint8_t ep = j < code_->elemProf.size() ? code_->elemProf[j] : 0;
+                            const bool typedElem = in.opcode() == Op::GetElem && in.a == q && plan_->defWeb[j] < 0 &&
+                                                   uw.size() >= 2 && uw[0] < 0 && uw[1] >= 0 && isI32(uw[1]) &&
+                                                   (ep == 0 || ep == elemprof::kArray) &&
+                                                   !(j < code_->prof.size() && (code_->prof[j] & opt::kProfFailed)) &&
+                                                   !(j < chainRole_.size() && chainRole_[j]) && !(j < skipDef_.size() && skipDef_[j]);
+                            if (!typedElem)
+                                ok = false;
+                            else
+                                promoGuards_[j].push_back(loopPromos_.size());
+                        }
+                    }
+                    if (!ok || own.empty()) {
+                        for (auto& [j, ks] : promoGuards_)
+                            if (!ks.empty() && ks.back() == loopPromos_.size())
+                                ks.pop_back();
+                        continue;
+                    }
+                    for (std::uint32_t j : own)
+                        promoAccess_[j] = loopPromos_.size();
+                    loopPromos_.push_back(LoopPromo{h, std::uint32_t(end), r, idx, hoistBase_ + std::int32_t(8 * hoistSlots_++), fixed});
+                    any = true;
+                }
+            }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (std::getenv("T2HOIST"))
+                for (const LoopPromo& lp : loopPromos_)
+                    if (lp.from == h)
+                        std::fprintf(stderr, "promote %s loop @%u..%u r%u slot %u\n", codeName(code_).c_str(), lp.from, lp.to,
+                                     lp.reg, lp.index);
+#endif
         }
         // Methods read from prototypes for inlined calls on those objects.
         for (const auto& [d, sr] : windowRead_) {
@@ -2449,6 +2564,10 @@ bool Baseline::coveredArr(std::uint32_t h, const LoopArr& x) const
 }
 bool Baseline::coveredNum(std::uint32_t h, const LoopNum& x) const
 {
+    // A promoted slot is loaded, and so checked, before the loop.
+    for (const LoopPromo& lp : loopPromos_)
+        if (lp.from == h && lp.reg == x.reg && lp.index == x.index && !x.int32)
+            return true;
     for (const LoopNum& o : loopNums_)
         if (encloses(o.from, o.to, h) && o.reg == x.reg && o.index == x.index && (o.int32 || !x.int32))
             return true;
@@ -2471,6 +2590,13 @@ bool Baseline::coveredValid(std::uint32_t h, const LoopValid& x) const
 /// hoisted read checks); true: only what was left out, for a way into the loop that did not come through those checks.
 void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
 {
+    struct Mark
+    {
+        std::int64_t& v;
+        std::int64_t old;
+        ~Mark() { v = old; }
+    } mark{emittingGuards_, emittingGuards_};
+    emittingGuards_ = h;
     if (!covered)
         a_.bind(preLoop_.at(h));
     Label& bad = exitBefore(h);
@@ -2512,6 +2638,19 @@ void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
             unboxDouble(0, RAX, RDX, &bad);
             a_.movsdStore(mem(RSP, lr.slot), 0);
         }
+    }
+    for (const LoopPromo& lp : loopPromos_) {
+        if (lp.from != h || covered)
+            continue;
+        for (unsigned q : lp.fixed) {
+            a_.mov(RAX, R(q));
+            a_.cmp(RAX, R(lp.reg));
+            a_.jcc(CE, bad);
+        }
+        a_.mov(RAX, R(lp.reg));
+        a_.mov(RCX, mem(RAX, kObjInline + std::int32_t(8 * lp.index)));
+        unboxDouble(0, RCX, RDX, &bad);
+        a_.movsdStore(mem(RSP, lp.slot), 0);
     }
     for (const LoopGlobal& lg : loopGlobals_) {
         if (lg.from != h || covered)

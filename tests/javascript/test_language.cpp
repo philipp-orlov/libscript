@@ -4259,3 +4259,36 @@ TEST(loopPromotedSlotsSeeEveryOtherWayToTheObject)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("7500000,338500000,344500000,number,1716.4,79800000000,6000,6000"));
     }
 }
+
+TEST(recursionThatChangesNoGlobalChecksItOnce)
+{
+    // A function that calls itself and can change no global checks its global and its function once, at the entry: called
+    // under another name after the global changed, as one of two closures of one code, or one that does write a global.
+    const char* program =
+        "var out = [];"
+        "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }"
+        "for (var r = 0; r < 30; r++) fib(15);"
+        "var g = fib; var orig = fib; fib = function (n) { return 100; }; out.push(g(5));"
+        "fib = orig; out.push(fib(20));"
+        "function f2(n) { return n < 2 ? n : f2(n - 1) + f2(n - 2); }"
+        "var other = function (n) { return n < 2 ? n : f2(n - 1) + f2(n - 2); };"
+        "for (var r = 0; r < 30; r++) f2(15);"
+        "var mk = function () { return function self(n) { return n < 2 ? n : self(n - 1) + self(n - 2); }; };"
+        "var s1 = mk(), s2 = mk(); out.push(s1(18), s2(18));"
+        "function h(n) { if (n < 2) return n; if (n === 9) G = 1; return h(n - 1) + h(n - 2); }"
+        "var G = 0; for (var r = 0; r < 30; r++) h(14); out.push(h(16), G);"
+        "function big(n) { return n < 2 ? n : big(n - 1) + big(n - 2) + 1073741823; }"
+        "out.push(big(8));"
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("200,6765,2584,2584,987,1,35433480180"));
+    }
+}

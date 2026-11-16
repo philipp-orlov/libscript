@@ -351,7 +351,13 @@ bool Baseline::emitTyped(std::uint32_t i)
         } else {
             boxDoubleTo(RAX, operandF64(w, 0, RAX), tame(w));
         }
-        ret(i, in, true);
+        if (!dirtyIn_.empty() && i < dirtyIn_.size()) {
+            std::vector<std::uint64_t> dirty = dirtyIn_[i];
+            dirty[in.a / 64] |= std::uint64_t(1) << (in.a % 64);
+            ret(i, in, true, &dirty);
+        } else {
+            ret(i, in, true);
+        }
         return true;
     }
     case Op::LoadInt:
@@ -1159,6 +1165,19 @@ void Baseline::emitOpt(std::uint32_t i)
     delivered_ = false;
     carried_ = plan_->isLeader[i] ? -1 : raxHolds_;
     raxHolds_ = -1;
+    if (code_->code[i].opcode() == Op::Call && fallbackOf(i))
+        return;  // the long way of a call run in place: its guard leaves for the interpreter instead
+    if (code_->code[i].opcode() == Op::Jmp) {
+        // A jump over nothing that makes code (padding, the long ways of calls run in place) is no jump.
+        const std::int64_t t = opt::jumpTarget(*code_, i);
+        bool empty = t > std::int64_t(i);
+        for (std::uint32_t j = i + length(i); empty && std::int64_t(j) < t; j += length(j))
+            empty = code_->code[j].opcode() == Op::Nop || (code_->code[j].opcode() == Op::Call && fallbackOf(j));
+        if (empty) {
+            materializeReads(i);
+            return;
+        }
+    }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (code_->code[i].opcode() == Op::LoadUndef && std::getenv("T2UNDEF"))
         std::fprintf(stderr, "undef @%u r%u plain %d dead %d\n", i, unsigned(code_->code[i].a),
@@ -1311,8 +1330,7 @@ void Baseline::planTestReads()
     }
 }
 
-/// Which registers each instruction may find written since the frame began: a register only `LoadUndef` wrote counts too,
-/// as the optimized code may leave that out.
+/// Which registers each instruction may find written since the frame began (with something other than undefined).
 void Baseline::planDirty()
 {
     dirtyIn_.clear();
@@ -1327,7 +1345,50 @@ void Baseline::planDirty()
             return;
         if (quietDefs_.count(j))
             eff[j].wr.clear();  // writes nothing (`planTestReads`)
+        // Undefined, or left out and so leaving the register as it was: no new value either way.
+        if (code_->code[j].opcode() == Op::LoadUndef)
+            eff[j].wr.clear();
     }
+    // The global read before a self guard is written only on its way out to the interpreter.
+    for (const auto& [g, sg] : selfGuards_)
+        if (sg.read < n_)
+            eff[sg.read].wr.clear();
+    // A typed variable's register is written in the frame only when something reads it there (a generic instruction, a
+    // call's arguments) or a jump that may run the interpreter writes the frame back. Where neither can happen, the
+    // instructions that always make it in place write no register.
+    auto allTypedUses = [&](std::uint32_t j) {
+        for (std::int32_t w : plan_->useWebs[j])
+            if (w < 0)
+                return false;
+        return true;
+    };
+    auto inPlace = [&](std::uint32_t j) {
+        switch (code_->code[j].opcode()) {
+        case Op::Mov: case Op::Add: case Op::Sub: case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec:
+        case Op::LoadInt:
+            return plan_->defWeb[j] >= 0 && isI32(plan_->defWeb[j]) && allTypedUses(j);
+        default:
+            return false;
+        }
+    };
+    bool genericJump = false;
+    std::vector<std::uint8_t> frameRead(code_->nregs + 1, 0);
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        const Op op = code_->code[j].opcode();
+        const bool cond = opt::isConditionalJump(op) && op != Op::JNotCallee;
+        if (cond && !allTypedUses(j))
+            genericJump = true;
+        const bool typedReader = inPlace(j) || (cond && allTypedUses(j)) || (op == Op::Ret && allTypedUses(j)) ||
+                                 (op == Op::Call && fallbackOf(j));  // never reached here
+        if (!typedReader)
+            for (std::uint16_t r : eff[j].rd)
+                if (r < frameRead.size())
+                    frameRead[r] = 1;
+    }
+    if (!genericJump)
+        for (std::uint32_t j = 0; j < n_; j += length(j))
+            if (inPlace(j) && !eff[j].wr.empty() && eff[j].wr[0] < frameRead.size() && !frameRead[eff[j].wr[0]])
+                eff[j].wr.clear();
     for (bool changed = true; changed;) {
         changed = false;
         for (std::uint32_t j = 0; j < n_; j += length(j)) {
@@ -1353,6 +1414,17 @@ void Baseline::planDirty()
         }
     }
     dirtyIn_ = std::move(in);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2DIRTY"))
+        for (std::uint32_t j = 0; j < n_; j += length(j))
+            if (code_->code[j].opcode() == Op::Ret) {
+                std::fprintf(stderr, "ret @%u dirty:", j);
+                for (unsigned r = 0; r < code_->nregs; ++r)
+                    if (dirtyIn_[j][r / 64] >> (r % 64) & 1)
+                        std::fprintf(stderr, " r%u", r);
+                std::fprintf(stderr, " (genericJump %d)\n", int(genericJump));
+            }
+#endif
 }
 
 /// A forward `Jmp` to a `Ret` (or to `Mov a, b; Ret a`): the return made here, clearing only what this path wrote.
@@ -1864,6 +1936,14 @@ Tier2Code* Baseline::compileOptimized()
     a_.mov(RBX, RDI);  // the frame's registers, as every way in passes them
     for (const opt::LiveWeb& lw : plan_->liveBefore[0])
         loadFromFrame(lw.reg, std::int32_t(lw.web), entryFail_);
+    if (fnAtEntry_) {
+        // Self guards compare the global only: a frame of another function of this code takes the baseline code.
+        holdValue(selfFn_);
+        a_.movImm(RAX, selfFn_.bits);
+        a_.cmp(RAX, mem(R13, kFrameFn));
+        a_.jcc(CNE, entryFail_);
+
+    }
     for (std::uint32_t i = 0; i < n_;) {
         for (const Borrow& b : borrows_)
             if (b.from == i) {

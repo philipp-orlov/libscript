@@ -68,7 +68,10 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     selfInlining = tier2Threshold > 0 ? 2 : 0;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_SELFINLINE"))
+    {
         selfInlining = selfInlining ? std::uint8_t(std::min(std::max(std::atoi(t), 0), 4)) : 0;
+        selfInliningSet = true;
+    }
 #endif
 
     atoms.length = internKey("length");

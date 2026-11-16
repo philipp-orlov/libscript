@@ -1358,6 +1358,7 @@ private:
     /// global still holds the running function (`selfFn_`), so a guard or a direct call of it need not look again.
     std::vector<std::uint8_t> selfChecked_;
     JSValue selfFn_ = JSValue::undefined();
+    bool fnAtEntry_ = false;  ///< the frame's function is checked at the entry, not by each self guard
     void planSelfChecked();
     /// Number reads of a property that an earlier read in the block made of the same object, with nothing between that
     /// may change it: the later read takes the earlier one's value from its home slot (`reuseRead_`: later -> earlier;
@@ -2243,7 +2244,13 @@ void Baseline::emit(std::uint32_t i)
         putElem(i, in);
         return;
     case Op::Ret:
-        ret(i, in);
+        if (optimizing() && !dirtyIn_.empty() && i < dirtyIn_.size()) {
+            std::vector<std::uint64_t> dirty = dirtyIn_[i];
+            dirty[in.a / 64] |= std::uint64_t(1) << (in.a % 64);
+            ret(i, in, false, &dirty);
+        } else {
+            ret(i, in);
+        }
         return;
     case Op::Call:
     case Op::New:

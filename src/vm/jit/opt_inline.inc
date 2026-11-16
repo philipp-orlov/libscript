@@ -996,12 +996,16 @@ void Baseline::planSelfChecked()
 {
     selfChecked_.assign(n_ + 1, 0);
     selfFn_ = JSValue::undefined();
+    fnAtEntry_ = false;
     if (selfGuards_.empty())
         return;
     selfFn_ = selfGuards_.begin()->second.fn;
+    fnAtEntry_ = false;
     for (const auto& [g, sg] : selfGuards_)
         if (sg.fn != selfFn_)
             return;
+    // No way in but the entry (no loop to enter part way): the frame's function is checked there, once.
+    fnAtEntry_ = plan_->loopHeaders.empty();
     auto typedUses = [&](std::uint32_t j) {
         for (std::int32_t w : plan_->useWebs[j])
             if (w < 0)
@@ -1033,6 +1037,21 @@ void Baseline::planSelfChecked()
             return false;
         }
     };
+    // A function whose code can change no global -- typed arithmetic, reads, jumps, and calls of itself, which by the same
+    // token cannot either -- keeps its global as it was all through a call: a guard after one that looked, even across
+    // calls of itself, need not look again. Its frame's function is then looked at by those first guards, not the entry.
+    bool pure = true;
+    for (std::uint32_t j = 0; j < n_ && pure; j += length(j)) {
+        const Op op = code_->code[j].opcode();
+        if (quietHere(j) || op == Op::Ret || (op == Op::JNotCallee && selfGuards_.count(j)) ||
+            (op == Op::Call && (fallbackOf(j) || (directCalls_.count(j) && directCalls_.at(j).fn == selfFn_))))
+            continue;
+        std::uint8_t attrs = 0;
+        pure = op == Op::GetGlobal && vm_.global->findOwn(vm_, code_->atoms[code_->code[j].b], &attrs) &&
+               !(attrs & attr::kAccessor);
+    }
+    if (pure)
+        fnAtEntry_ = false;
     // Forward, meeting by "and": 2 unreached, 1 checked, 0 not.
     std::vector<std::uint8_t> in(n_ + 1, 2);
     std::vector<std::uint32_t> work{0};
@@ -1051,7 +1070,8 @@ void Baseline::planSelfChecked()
         work.pop_back();
         const Op op = code_->code[j].opcode();
         const bool guard = op == Op::JNotCallee && selfGuards_.count(j);
-        const std::uint8_t out = guard ? 1 : quietHere(j) ? in[j] : 0;
+        const bool selfCall = pure && op == Op::Call && directCalls_.count(j) && directCalls_.at(j).fn == selfFn_;
+        const std::uint8_t out = guard ? 1 : (quietHere(j) || selfCall) ? in[j] : 0;
         // The long way of a call run in place: this code leaves before it.
         if (op == Op::Call && fallbackOf(j))
             continue;
@@ -1071,28 +1091,31 @@ void Baseline::emitSelfGuard(std::uint32_t i)
         return;  // a guard before it checked the same, and nothing since may have changed it
     const SelfGuard& sg = selfGuards_.at(i);
     const unsigned base = code_->code[i].a;
-    Label cold, inPlace;
+    Label& cold = coldLabels_.emplace_back();
     a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, cold);
     globalSlot(sg.globalIndex);
     a_.movImm(RAX, sg.fn.bits);
     a_.cmp(RAX, mem(RDX, 0));
     a_.jcc(CNE, cold);
-    a_.cmp(RAX, mem(R13, kFrameFn));
-    a_.jcc(CE, inPlace);
-    // The long way leaves this code: the global read as the skipped instruction would have, the `this` it skipped, and
-    // the guard runs again in the interpreter (registers this code never writes again).
-    a_.bind(cold);
-    sideDoor();
-    forgetFacts();
-    emit(sg.read);
-    if (sg.thisAt >= 0) {
-        const Ins& t = code_->code[std::size_t(sg.thisAt)];
-        a_.movImm(RAX, t.opcode() == Op::LoadNull ? kNull : kUndefined);
-        write(base + 1, RAX);
+    if (!fnAtEntry_) {
+        a_.cmp(RAX, mem(R13, kFrameFn));
+        a_.jcc(CNE, cold);
     }
-    a_.jmp(exitBefore(i));
-    a_.bind(inPlace);
+    // The long way, out of line, leaves this code: the global read as the skipped instruction would have, the `this` it
+    // skipped, and the guard runs again in the interpreter (registers this code never writes again).
+    sideDoor();
+    deferCold(i, [this, i, base, &cold]() {
+        const SelfGuard& g = selfGuards_.at(i);
+        a_.bind(cold);
+        emit(g.read);
+        if (g.thisAt >= 0) {
+            const Ins& t = code_->code[std::size_t(g.thisAt)];
+            a_.movImm(RAX, t.opcode() == Op::LoadNull ? kNull : kUndefined);
+            write(base + 1, RAX);
+        }
+        a_.jmp(exitBefore(i));
+    });
 }
 
 void Baseline::writePending(std::uint32_t point)

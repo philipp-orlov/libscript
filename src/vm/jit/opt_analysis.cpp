@@ -4,6 +4,7 @@
 #include "opt_analysis.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <numeric>
 
 namespace script {

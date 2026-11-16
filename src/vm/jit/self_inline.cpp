@@ -113,7 +113,8 @@ std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reach
 
 CodeBlock* selfInline(VM& vm, CodeBlock* c)
 {
-    const int depth = vm.selfInlining;
+    // A very small function (`fib`) goes one level deeper: its copy stays small, and its calls are most of what it does.
+    const int depth = vm.selfInlining == 2 && !vm.selfInliningSet && c->code.size() <= 20 ? 3 : vm.selfInlining;
     if (c->selfInlined)
         return c->selfInlined;
     if (c->selfInlineTried || c->inlinedFrom)

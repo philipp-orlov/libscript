@@ -291,9 +291,11 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
 #endif
             code->tier1->entry = t->entry;
             code->optExits = 0;
-            // The first optimized code of a function may have been made before parts of it had run; later ones stay.
-            code->tier2Budget = code->tier2Matured ? 0x7fffffff : 20000;
-            code->tier2Matured = true;
+            // Optimized code may have been made before parts of the function had run: it makes way after those have run
+            // a while, a few times, each given longer.
+            code->tier2Budget = code->tier2Matured < 4 ? 20000 << (2 * code->tier2Matured) : 0x7fffffff;
+            if (code->tier2Matured < 4)
+                ++code->tier2Matured;
             SCRIPT_VM_CENSUS(Tier2Compiled);
         }
         code->tier2Counter = 0x40000000;

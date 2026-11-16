@@ -186,11 +186,21 @@ Label& Baseline::exitLabel(std::uint32_t i, int kind)
         i = std::uint32_t(exitRedirect_[i]);
         kind = 0;
     }
-    const std::uint64_t key = (std::uint64_t(i) << 2) | std::uint64_t(kind);
+    // Exits taken where registers are held without a count are their own: the count is taken first.
+    std::uint64_t ctx = 0;
+    std::vector<unsigned> own;
+    if (optimizing() && !borrows_.empty()) {
+        for (std::size_t k = 0; k < borrows_.size(); ++k)
+            if (borrows_[k].from <= factAt_ && factAt_ <= borrows_[k].to) {
+                ctx |= std::uint64_t(1) << (k % 20);
+                own.push_back(borrows_[k].reg);
+            }
+    }
+    const std::uint64_t key = (ctx << 40) | (std::uint64_t(i) << 2) | std::uint64_t(kind);
     auto it = exitIndex_.find(key);
     if (it != exitIndex_.end())
         return *it->second;
-    exits_.push_back(ExitReq{i, kind, Label{}});
+    exits_.push_back(ExitReq{i, kind, Label{}, own});
     exitIndex_[key] = &exits_.back().label;
     return exits_.back().label;
 }
@@ -313,6 +323,7 @@ bool Baseline::emitTyped(std::uint32_t i)
     const std::int32_t dw = plan_->defWeb[i];
     const auto& uw = plan_->useWebs[i];
     const Op op = in.opcode();
+    const std::int32_t start = a_.here();
     auto allTyped = [&]() {
         for (std::int32_t w : uw)
             if (w < 0)
@@ -617,6 +628,8 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (inReg(dw) && hasAvx()) {
             a_.vsd(vop, xmmOf(dw), x0, x1);
             dirty_[std::size_t(dw)] = 1;
+            if (!imm && !isI32(uw[0]) && !isI32(uw[1]))
+                passRax(start);
             return true;
         }
         // Straight into the variable's own register when it has one: `d = a op b` as `d = a; d op= b`.
@@ -688,6 +701,7 @@ bool Baseline::emitTyped(std::uint32_t i)
                 const int x = inReg(dw) ? xmmOf(dw) : 0;
                 a_.movsdLoad(x, mem(RSP, lr->slot));
                 defF64(dw, x);
+                passRax(start);
             }
             return true;
         }
@@ -731,8 +745,23 @@ bool Baseline::emitTyped(std::uint32_t i)
             // A site whose guard failed before sees objects of this shape with other inline slot counts: the address is
             // worked out each time.
             const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
-            a_.mov(RAX, provenSlotMem(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad));
+            const std::uint8_t aux = failed ? 0 : ic.aux;
+            const Mem m = provenSlotMem(in.b, ic.shape, ic.index, aux, bad);
             std::uint8_t& known = factNum_[{in.b, ic.index}];
+            if (!isI32(dw) && aux != 0 && in.a != in.b) {
+                // A double through rcx: rax keeps the object for the next read or store of it.
+                a_.mov(RCX, m);
+                const int x = inReg(dw) ? xmmOf(dw) : 0;
+                unboxDouble(x, RCX, RDX, known ? nullptr : &bad);
+                if (inReg(dw))
+                    dirty_[std::size_t(dw)] = 1;
+                else
+                    defF64(dw, 0);
+                known = std::max<std::uint8_t>(known, 1);
+                keepRax(in.b);
+                return true;
+            }
+            a_.mov(RAX, m);
             if (known == 2 && isI32(dw))
                 defI32(dw, RAX);  // an int32 there, seen or stored
             else
@@ -774,6 +803,10 @@ bool Baseline::emitTyped(std::uint32_t i)
                 a_.mov(RAX, mem(RDX, RCX, 8));
                 a_.cmpI(RAX, std::int32_t(kHole));
                 a_.jcc(CE, bad);
+                if (plan_->defWeb[i] < 0 && borrowed(i, in.a)) {
+                    a_.mov(R(in.a), RAX);  // held by the array: no count, and the old value had none
+                    return true;
+                }
                 deliver(i, in.a);
                 return true;
             }
@@ -881,6 +914,8 @@ bool Baseline::emitTyped(std::uint32_t i)
         const Mem slot = provenSlotMem(in.a, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
         if (factNum_.count({in.a, ic.index})) {
             a_.mov(slot, RDI);  // over a number
+            if (!failed && ic.aux != 0)
+                keepRax(in.a);
         } else {
             a_.mov(RSI, slot);
             a_.mov(slot, RDI);
@@ -1087,6 +1122,7 @@ void Baseline::emitOpt(std::uint32_t i)
     if (plan_->isLeader[i]) {
         std::fill(dirty_.begin(), dirty_.end(), 1);
         forgetFacts();
+        raxObj_ = -1;
     }
     delivered_ = false;
     carried_ = plan_->isLeader[i] ? -1 : raxHolds_;
@@ -1187,6 +1223,7 @@ void Baseline::emitExits()
 {
     for (ExitReq& e : exits_) {
         a_.bind(e.label);
+        ownRegs(e.own);
         const bool after = e.kind == 1;
         const std::uint32_t at = after ? e.index + length(e.index) : e.index;
         const std::int32_t skip = after ? plan_->defWeb[e.index] : -1;
@@ -1220,7 +1257,15 @@ void Baseline::emitOptTails()
         a_.mov(RDI, R12);
         a_.call(tick_);
         a_.test32(RAX, RAX);
-        a_.jcc(CNE, exception(t.first));
+        if (const std::vector<unsigned> own = borrowedAt(t.first); !own.empty()) {
+            Label ok;
+            a_.jcc(CE, ok);
+            ownRegs(own);
+            a_.jmp(exception(t.first));
+            a_.bind(ok);
+        } else {
+            a_.jcc(CNE, exception(t.first));
+        }
         restorePool(t.first);
         // What the interrupt ran may have changed what a loop takes as known: through its checks again.
         const std::int64_t target = opt::jumpTarget(*code_, t.first);
@@ -1613,6 +1658,7 @@ Tier2Code* Baseline::compileOptimized()
     for (const auto& [h, label] : preLoop_)
         if (guardsCovered(h))
             preLoopFull_[h];
+    planBorrows();
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
@@ -1621,11 +1667,25 @@ Tier2Code* Baseline::compileOptimized()
     for (const opt::LiveWeb& lw : plan_->liveBefore[0])
         loadFromFrame(lw.reg, std::int32_t(lw.web), entryFail_);
     for (std::uint32_t i = 0; i < n_;) {
+        for (const Borrow& b : borrows_)
+            if (b.from == i) {
+                // Dead here: let go of, so that inside the loop it never holds a counted value.
+                a_.mov(RAX, R(b.reg));
+                a_.movImm(RDX, kUndefined);
+                a_.mov(R(b.reg), RDX);
+                release(RAX);
+            }
         if (preLoop_.count(i))
             emitLoopGuards(i);
         a_.bind(at_[i]);
         offsets_[i] = std::uint32_t(a_.here());
         emitOpt(i);
+        for (const Borrow& b : borrows_)
+            if (b.to == i) {
+                // Out of the loop (its last instruction does not jump back): counted again.
+                a_.mov(RAX, R(b.reg));
+                retain(RAX);
+            }
         for (const auto& [h, w] : hoistWatch_)
             if (w.first == i && w.second != sideDoors_)
                 hoistBroken_.insert(h);
@@ -1646,8 +1706,21 @@ Tier2Code* Baseline::compileOptimized()
             a_.test(RAX, R15);
             a_.jcc(CE, fail);
         }
+        // Not into a loop inside one that holds registers without a count (they hold counted values here).
+        bool nested = false;
+        for (const Borrow& b : borrows_)
+            nested = nested || (b.from < h && h <= b.to);
+        if (nested)
+            a_.jmp(fail);
         for (const opt::LiveWeb& lw : plan_->liveBefore[h])
             loadFromFrame(lw.reg, std::int32_t(lw.web), fail);
+        for (const Borrow& b : borrows_)
+            if (b.from == h) {
+                a_.mov(RAX, R(b.reg));
+                a_.movImm(RDX, kUndefined);
+                a_.mov(R(b.reg), RDX);
+                release(RAX);
+            }
         if (preLoop_.count(h))
             a_.jmp(loopEntry(h));  // through the checks the loop's code relies on
         else
@@ -1659,6 +1732,7 @@ Tier2Code* Baseline::compileOptimized()
     }
     for (auto& [h, full] : preLoopFull_) {
         a_.bind(full);
+        factAt_ = h;
         emitLoopGuards(h, true);
         a_.jmp(preLoop_.at(h));
     }

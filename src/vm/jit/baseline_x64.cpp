@@ -1068,6 +1068,40 @@ private:
     /// A loop header whose checks leave out what enclosing loops check: the way in for a jump from elsewhere (an entry
     /// from the interpreter, the return from an interrupt), which makes those checks first.
     std::map<std::uint32_t, Label> preLoopFull_;
+    /// A frame register that a loop (with its checks before it, so that nothing in it runs script or changes an array) only
+    /// sets to elements of arrays it does not write, and only reads as the object of a property: it holds them without a
+    /// count, as the arrays keep them. It is let go of and set to undefined before the loop (it is dead there), and counted
+    /// again on the way out of the loop, and on every way out to the interpreter.
+    struct Borrow
+    {
+        std::uint32_t from, to;
+        unsigned reg;
+    };
+    std::vector<Borrow> borrows_;
+    void planBorrows();
+    bool borrowed(std::uint32_t at, unsigned reg) const
+    {
+        for (const Borrow& b : borrows_)
+            if (b.reg == reg && b.from <= at && at <= b.to)
+                return true;
+        return false;
+    }
+    /// The registers held without a count at instruction `at`.
+    std::vector<unsigned> borrowedAt(std::uint32_t at) const
+    {
+        std::vector<unsigned> regs;
+        for (const Borrow& b : borrows_)
+            if (b.from <= at && at <= b.to)
+                regs.push_back(b.reg);
+        return regs;
+    }
+    void ownRegs(const std::vector<unsigned>& regs)
+    {
+        for (unsigned r : regs) {
+            a_.mov(RAX, R(r));
+            retain(RAX);
+        }
+    }
     Label& loopEntry(std::uint32_t h)
     {
         if (auto f = preLoopFull_.find(h); f != preLoopFull_.end())
@@ -1116,9 +1150,26 @@ private:
         }
     }
     /// Make the object in frame register `reg` (left in RAX) be of shape `shape`, else `bad`. Proved for the code after it.
+    /// Rax holds frame register `raxObj_`'s object while nothing has been emitted since `raxObjAt_` but what is known to
+    /// leave rax and the frame alone; a jump target ends it.
+    int raxObj_ = -1;
+    std::int32_t raxObjAt_ = -1;
+    bool raxHoldsObj(unsigned reg) const { return raxObj_ == int(reg) && a_.here() == raxObjAt_; }
+    void keepRax(unsigned reg)
+    {
+        raxObj_ = int(reg);
+        raxObjAt_ = a_.here();
+    }
+    /// Code emitted from `start` left rax and the frame as they were.
+    void passRax(std::int32_t start)
+    {
+        if (raxObjAt_ == start)
+            raxObjAt_ = a_.here();
+    }
     void provenShape(unsigned reg, std::uint32_t shape, Label& bad)
     {
-        a_.mov(RAX, R(reg));
+        if (!raxHoldsObj(reg))
+            a_.mov(RAX, R(reg));
         if (factShape_[reg] == shape)
             return;
         needObject(RAX, bad);
@@ -1177,6 +1228,7 @@ private:
         std::uint32_t index;
         int kind;  ///< 0: run the instruction in the interpreter; 1: go on after it (it has run)
         Label label;
+        std::vector<unsigned> own;  ///< registers held without a count where the exit is taken (`borrows_`)
     };
     std::deque<ExitReq> exits_;
     std::map<std::uint64_t, Label*> exitIndex_;

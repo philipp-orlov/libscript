@@ -2197,6 +2197,103 @@ void Baseline::planLoopFacts()
     }
 }
 
+void Baseline::planBorrows()
+{
+    borrows_.clear();
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2NOBORROW"))
+        return;
+#endif
+    for (const auto& [h, watch] : hoistWatch_) {
+        const std::uint32_t end = watch.first;
+        if (h == 0 || noHoist_.count(h) || !opt::isConditionalJump(code_->code[end].opcode()) ||
+            opt::jumpTarget(*code_, end) != std::int64_t(h))
+            continue;
+        // Nothing in the loop leaves it but its last jump, and every instruction is one the optimizing code does itself
+        // without a call: the checks before the loop (`hoistWatch_`) see to the rest.
+        bool ok = true;
+        std::uint32_t prev = h;
+        for (std::uint32_t j = h; j <= end && ok; j += length(j)) {
+            const Ins& in = code_->code[j];
+            const std::int64_t t = opt::jumpTarget(*code_, j);
+            if (t >= 0 && (t < std::int64_t(h) || t > std::int64_t(end)))
+                ok = false;
+            switch (in.opcode()) {
+            case Op::Nop: case Op::Mov: case Op::LoadK: case Op::LoadInt: case Op::LoadUndef: case Op::LoadNull:
+            case Op::LoadTrue: case Op::LoadFalse: case Op::GetProp: case Op::PutProp: case Op::GetElem: case Op::GetGlobal:
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod: case Op::Neg: case Op::Inc: case Op::Dec:
+            case Op::AddI: case Op::SubI: case Op::MulI: case Op::ModI: case Op::BitAnd: case Op::BitOr: case Op::BitXor:
+            case Op::Shl: case Op::Shr: case Op::UShr: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI: case Op::ShlI:
+            case Op::ShrI: case Op::UShrI: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::StrictEq:
+            case Op::StrictNe: case Op::Jmp:
+                break;
+            case Op::Call:
+                ok = mathWin_.count(j) != 0;
+                break;
+            default:
+                ok = ok && opt::isConditionalJump(in.opcode());
+                break;
+            }
+            prev = j;
+        }
+        (void)prev;
+        if (!ok)
+            continue;
+        std::uint32_t before = 0;
+        for (std::uint32_t j = 0; j < h; j += length(j))
+            before = j;
+        // Candidates: the destinations of element reads of arrays the loop does not write.
+        std::set<unsigned> cands, bad;
+        for (std::uint32_t j = h; j <= end; j += length(j)) {
+            const Ins& in = code_->code[j];
+            if (in.opcode() != Op::GetElem)
+                continue;
+            const auto& uw = plan_->useWebs[j];
+            const std::uint8_t ep = j < code_->elemProf.size() ? code_->elemProf[j] : 0;
+            bool arr = false;
+            for (const LoopArr& la : loopArrs_)
+                if (la.reg == in.b && la.from <= h && end <= la.to)
+                    arr = true;
+            const bool chained = (j < chainRole_.size() && chainRole_[j]) || (j < skipDef_.size() && skipDef_[j]);
+            if (!arr || chained || plan_->defWeb[j] >= 0 || uw.size() < 2 || uw[0] >= 0 || uw[1] < 0 || !isI32(uw[1]) ||
+                (ep != 0 && ep != elemprof::kArray) || (j < code_->prof.size() && (code_->prof[j] & opt::kProfFailed)) ||
+                in.a == in.b)
+                bad.insert(in.a);
+            else
+                cands.insert(in.a);
+        }
+        for (unsigned r : cands) {
+            if (bad.count(r) || borrowed(h, r))
+                continue;
+            bool fine = regDeadAfter(before, r);
+            for (std::uint32_t j = h; j <= end && fine; j += length(j)) {
+                const Ins& in = code_->code[j];
+                const opt::Effects e = opt::effectsOf(*code_, j);
+                const bool writes = std::find(e.wr.begin(), e.wr.end(), r) != e.wr.end();
+                const bool reads = std::find(e.rd.begin(), e.rd.end(), r) != e.rd.end();
+                if (writes && in.opcode() != Op::GetElem)
+                    fine = false;
+                if (!reads)
+                    continue;
+                // Read only as the object of a property, never as the value stored or the result's register.
+                if (in.opcode() == Op::GetProp)
+                    fine = fine && in.b == r && in.a != r && !(j < chainRole_.size() && chainRole_[j]) && !windowRead_.count(j);
+                else if (in.opcode() == Op::PutProp)
+                    fine = fine && in.a == r && in.c != r;
+                else
+                    fine = false;
+            }
+            if (fine)
+                borrows_.push_back(Borrow{h, end, r});
+        }
+    }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2HOIST"))
+        for (const Borrow& b : borrows_)
+            std::fprintf(stderr, "borrow %s loop @%u..%u r%u\n", codeName(code_).c_str(), b.from, b.to, b.reg);
+#endif
+}
+
 /// Whether loop `h` leaves out checks an enclosing loop makes (a way in that does not come through them needs its own).
 bool Baseline::guardsCovered(std::uint32_t h) const
 {

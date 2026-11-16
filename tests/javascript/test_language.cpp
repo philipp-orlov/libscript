@@ -4049,3 +4049,45 @@ TEST(optimizedNumbersNaNsCountersAndNestedLoopChecks)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("number,true,true,1,2,true,NaN,50700,187.08284521,653197101,NaN,176000"));
     }
 }
+
+TEST(loopElementsHeldWithoutACount)
+{
+    // A loop that only reads elements of arrays it does not change, and only uses them as objects of properties, holds them
+    // without a count: counted again on the way out of the loop (the last one outlives the array), on a way out to the
+    // interpreter (a getter that throws, an element of another shape), in nested loops and in a loop entered part way.
+    const char* program =
+        "function B(x) { this.x = x; this.y = x * 0.5; }"
+        "var out = [];"
+        "function scan(arr, n) { var s = 0, b; for (var j = 0; j < n; j++) { b = arr[j]; s += b.x * b.y; b.y = s * 0.001; } return b; }"
+        "var arr = []; for (var k = 0; k < 64; k++) arr.push(new B(k + 0.5));"
+        "var last; for (var r = 0; r < 400; r++) last = scan(arr, 64);"
+        "arr.length = 0; arr = null;"
+        "out.push(Math.round(last.x * 1000), Math.round(last.y * 1000));"
+        "var arr2 = []; for (var k = 0; k < 64; k++) arr2.push(new B(k + 0.25));"
+        "arr2[40] = { x: 2, get y() { if (this.t++ > 3) throw new Error('stop'); return 1.5; }, t: 0 };"
+        "var caught = 0;"
+        "for (var r = 0; r < 20; r++) { try { scan(arr2, 64); } catch (e) { caught++; } }"
+        "out.push(caught);"
+        "arr2[40] = new B(3);"
+        "arr2[50] = { y: 2.5, x: 'str' };"
+        "out.push(String(scan(arr2, 64).y).slice(0, 10));"
+        "function nest(bs, m) { var t = 0; for (var i = 0; i < bs.length; i++) { var a = bs[i]; for (var j = i + 1; j < bs.length; j++) { var b = bs[j]; t += a.x * b.x; b.y += m; } } return t; }"
+        "var bs = []; for (var k = 0; k < 8; k++) bs.push(new B(k));"
+        "var tt = 0; for (var r = 0; r < 3000; r++) tt += nest(bs, 0.5);"
+        "out.push(tt, Math.round(bs[7].y));"
+        "function longRun(arr, n) { var s = 0; for (var j = 0; j < n; j++) { var b = arr[j & 63]; s += b.x; } return s; }"
+        "var arr3 = []; for (var k = 0; k < 64; k++) arr3.push(new B(k));"
+        "out.push(longRun(arr3, 3000000));"
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("63500,0,16,NaN,966000,10504,94500000"));
+    }
+}

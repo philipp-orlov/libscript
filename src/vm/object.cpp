@@ -278,6 +278,9 @@ void JSObject::growSlots(VM& vm, std::uint32_t capacity)
     if (slots)
         vm.freePayload(slotsHeader(), sizeof(SlotsHeader) + 8u * old);
     slots = fresh;
+    // Compiled code holds the addresses of the global object's slots while the epoch stays.
+    if (this == vm.global)
+        ++vm.globalEpoch;
 }
 
 void JSObject::reserveSlot(VM& vm, std::uint32_t index)

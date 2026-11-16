@@ -302,7 +302,8 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             SCRIPT_VM_CENSUS(Tier2Compiled);
         }
         code->tier2Counter = 0x40000000;
-        return header == 0xFFFFFFFFu ? nullptr : code->tier2->osrAddress(header);
+        // Optimized code is made for calls: a frame `new` made stays in the baseline code.
+        return header == 0xFFFFFFFFu || fr->construct ? nullptr : code->tier2->osrAddress(header);
     } catch (...) {
         return nullptr;
     }
@@ -408,8 +409,9 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     }
     *vm.frameTop++ =
         Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, true, isNew ? callee : JSValue::undefined()};
+    // `new` runs the baseline code: optimized code is made for calls only.
     return {reinterpret_cast<std::uint64_t>(vm.frameTop - 1),
-            reinterpret_cast<std::uint64_t>(c->tier1->entry)};
+            reinterpret_cast<std::uint64_t>(isNew ? static_cast<void*>(c->tier1->rx) : c->tier1->entry)};
 }
 
 /// `this` for `new f(...)` from compiled code: an object inheriting from `f.prototype` (an ordinary function: the property
@@ -526,6 +528,7 @@ constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
 constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
 constexpr std::int32_t kCbNregs = std::int32_t(offsetof(CodeBlock, nregs));
 constexpr std::int32_t kTierEntry = std::int32_t(offsetof(Tier1Code, entry));
+constexpr std::int32_t kTierRx = std::int32_t(offsetof(Tier1Code, rx));  // the baseline code's own entry
 constexpr std::int32_t kFrameArgc = std::int32_t(offsetof(Frame, argc));
 constexpr std::int32_t kFrameConstruct = std::int32_t(offsetof(Frame, construct));
 static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "a frame push writes both flags in one store");
@@ -870,9 +873,8 @@ private:
         if (index < g->h.aux) {
             a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->inl()[index]));
         } else {
-            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->slots));
-            a_.mov(RDX, mem(RDX, 0));
-            a_.lea(RDX, mem(RDX, std::int32_t(8 * (index - g->h.aux))));
+            // The slots move only with the epoch (`JSObject::growSlots`), which every user checks first.
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->slots[index - g->h.aux]));
         }
     }
     /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
@@ -1078,6 +1080,7 @@ private:
         unsigned reg;
     };
     std::vector<Borrow> borrows_;
+    std::set<std::uint32_t> slowNext_;  ///< instructions a slow path comes back to
     void planBorrows();
     bool borrowed(std::uint32_t at, unsigned reg) const
     {
@@ -1430,6 +1433,7 @@ private:
     {
         sideDoor();
         slows_.push_back(Slow{i, Label{}, helper, saved});
+        slowNext_.insert(i + length(i));
         return slows_.back().label;
     }
     Label& exception(std::uint32_t i)
@@ -1928,7 +1932,13 @@ private:
     void getSuperProp(std::uint32_t i, const Ins& in);
     void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
     void putElem(std::uint32_t i, const Ins& in);
-    void ret(std::uint32_t i, const Ins& in, bool numberInRax = false);
+    void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
+    /// Per instruction: the registers that may have been written since the frame began (one bit each), or empty when
+    /// that is not known (`planDirty`). Those that were not are undefined still, and a return leaves them be.
+    std::vector<std::vector<std::uint64_t>> dirtyIn_;
+    void planDirty();
+    bool emitReturnCopy(std::uint32_t i);
+    std::vector<std::uint8_t> paramWritten_;  ///< per parameter register: some instruction writes it
     /// R11 = the frame after the top one (R13): from the address, so that nothing waits on the top's last store.
     void topFrame() { a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame)))); }
     void call(std::uint32_t i, const Ins& in);
@@ -3369,7 +3379,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
         a_.mov(RSI, R11);
         a_.mov(RDI, R9);
-        a_.mov(RDX, mem(RDX, kTierEntry));
+        a_.mov(RDX, mem(RDX, kTierRx));  // `new` runs the baseline code: optimized code is made for calls only
         a_.jmp(enter);
     }
     a_.bind(helper);
@@ -3550,16 +3560,20 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     restorePool(i);
 }
 
-void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
+void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::vector<std::uint64_t>* dirty)
 {
+    // Registers no path to here has written are undefined still: nothing to clear.
+    auto needs = [&](unsigned r) { return !dirty || (r / 64 < dirty->size() && ((*dirty)[r / 64] >> (r % 64) & 1)); };
     // `numberInRax`: the result is a number the optimized code has boxed in rax already, which needs no count.
     const unsigned first = 1 + code_->nparams;
     // A result in a register this frame clears on its way out goes with that register's count (optimized code).
     const bool taken = optimizing() && !numberInRax && in.a >= first && in.a < code_->nregs;
+    // Optimized code runs no frame `new` made (it enters the baseline code), so its result is what it returns.
+    const bool constructs = !optimizing() && (code_->constructor || (code_->flags & CodeBlock::kClassConstructor));
     Label have;
     if (!numberInRax)
         a_.mov(RAX, R(in.a));
-    if (taken && (code_->constructor || (code_->flags & CodeBlock::kClassConstructor))) {
+    if (taken && constructs) {
         // A constructor's result that is not an object is `this`; the register's value is then let go.
         Label useThis, counted;
         a_.cmpI8(mem(R13, kFrameConstruct), 0);
@@ -3576,7 +3590,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
         retain(RAX);
         a_.bind(counted);
     } else if (taken) {
-    } else if (code_->constructor || (code_->flags & CodeBlock::kClassConstructor)) {
+    } else if (constructs) {
         // A constructor's result that is not an object is `this`.
         Label useThis;
         a_.cmpI8(mem(R13, kFrameConstruct), 0);
@@ -3608,16 +3622,31 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
     };
     unsigned cells = 0;
     for (unsigned r = first; r < code_->nregs; ++r)
-        cells += isPlain(r) ? 0 : 1;
+        cells += isPlain(r) || !needs(r) ? 0 : 1;
     // Inline: a dozen registers, or a few more when most need no look (two at a time).
     const bool inlineClear = code_->nregs <= first || code_->nregs - first <= 12 ||
                              (code_->nregs - first <= 40 && cells <= 8);
     bool plain = inlineClear;
     for (unsigned r = 1; r < code_->nregs && plain; ++r)
-        plain = isPlain(r);
+        plain = isPlain(r) || !needs(r);
     if (!plain)
         a_.mov(mem(RSP, 0), RAX);
+    // A parameter the caller gave no argument for is this frame's, but undefined still unless the function writes it.
+    if (paramWritten_.empty()) {
+        paramWritten_.assign(code_->nparams + 1u, 0);
+        for (std::uint32_t j = 0; j < n_; j += length(j)) {
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            if (!e.ok || (code_->flags & CodeBlock::kNeedsArgs))
+                std::fill(paramWritten_.begin(), paramWritten_.end(), std::uint8_t(1));
+            for (std::uint16_t r : e.wr)
+                if (r < paramWritten_.size())
+                    paramWritten_[r] = 1;
+        }
+        paramWritten_[0] = 1;
+    }
     for (unsigned p = 1; p <= code_->nparams; ++p) {
+        if (!paramWritten_[p] || !needs(p))
+            continue;
         Label skip;
         a_.cmpI32(mem(R13, kFrameArgc), std::int32_t(p));
         a_.jcc(CAE, skip);
@@ -3630,7 +3659,11 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
             // Two registers that never hold a cell at a time, from xmm0 (two undefineds); a release calls out (xmm0 goes).
             bool pair = false;
             for (unsigned r = first; r < code_->nregs;) {
-                if (r + 1 < code_->nregs && isPlain(r) && isPlain(r + 1)) {
+                if (!needs(r)) {
+                    r += 1;
+                    continue;
+                }
+                if (r + 1 < code_->nregs && isPlain(r) && isPlain(r + 1) && needs(r + 1)) {
                     if (!pair) {
                         a_.movImm(RDX, kUndefined);
                         a_.movqToX(0, RDX);
@@ -3824,7 +3857,8 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
         vm.jitStackFloor = floor == 1 ? 0 : floor + kStackReserve;
     }
     const Stubs& st = stubs();
-    const std::uint64_t bits = index == 0 ? st.run(&vm, fr, nullptr, code->entry)
+    // `new` runs the baseline code: optimized code is made for calls only.
+    const std::uint64_t bits = index == 0 ? st.run(&vm, fr, nullptr, fr->construct ? static_cast<void*>(code->rx) : code->entry)
                                           : st.run(&vm, fr, code->addressFor(index), st.osrEnter);
     if (bits == 0 && pendingException) [[unlikely]] {
         std::exception_ptr e = std::move(pendingException);

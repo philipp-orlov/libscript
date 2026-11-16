@@ -93,6 +93,14 @@ public:
     }
 
     // ---- labels ----
+    /// A label only the code before it falls into: what the peephole knows of that code still holds.
+    void bindFallthrough(Label& l)
+    {
+        const std::size_t stored = stored_, zeroed = zeroed_;
+        bind(l);
+        stored_ = stored;
+        zeroed_ = zeroed;
+    }
     void bind(Label& l)
     {
         stored_ = ~std::size_t(0);

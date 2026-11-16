@@ -715,11 +715,36 @@ Plan analyse(const CodeBlock& code)
     plan.stackSlots = std::uint32_t(plan.webs.size());
     plan.typedWebs = std::uint32_t(plan.webs.size());
 
+    // ---- moves: a Mov whose source ends there and whose destination begins there joins the two, which then share a
+    // place, and the Mov moves nothing ----
+    std::vector<std::uint32_t> group(plan.webs.size());
+    std::iota(group.begin(), group.end(), 0u);
+    auto root = [&](std::uint32_t w) {
+        while (group[w] != w)
+            w = group[w] = group[group[w]];
+        return w;
+    };
+    std::vector<Web> span = plan.webs;  // per group root: its interval and weight
+    for (std::uint32_t i = 0; i < n; i = nextOf(code, i)) {
+        if (code.code[i].opcode() != Op::Mov || plan.defWeb[i] < 0 || plan.useWebs[i].empty() || plan.useWebs[i][0] < 0)
+            continue;
+        const std::uint32_t s = root(std::uint32_t(plan.useWebs[i][0])), d = root(std::uint32_t(plan.defWeb[i]));
+        if (s == d || plan.webs[s].rep != plan.webs[d].rep || span[s].last != i || span[d].first != i)
+            continue;
+        group[d] = s;
+        span[s].last = std::max(span[s].last, span[d].last);
+        span[s].weight += span[d].weight;
+    }
+    for (std::uint32_t k = 0; k < plan.webs.size(); ++k)
+        plan.webs[k].slot = std::int32_t(root(k));
+
     // ---- registers: the heaviest webs first, a register whose other webs do not overlap ----
-    std::vector<std::uint32_t> order(plan.webs.size());
-    std::iota(order.begin(), order.end(), 0u);
+    std::vector<std::uint32_t> order;
+    for (std::uint32_t k = 0; k < plan.webs.size(); ++k)
+        if (root(k) == k)
+            order.push_back(k);
     std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
-        return plan.webs[a].weight > plan.webs[b].weight;
+        return span[a].weight > span[b].weight;
     });
     struct Interval
     {
@@ -728,7 +753,7 @@ Plan analyse(const CodeBlock& code)
     std::vector<Interval> gpr[16], xmm[16];
     constexpr std::uint8_t kGprPool[] = {8, 9, 10, 11};
     for (std::uint32_t wi : order) {
-        Web& w = plan.webs[wi];
+        Web& w = span[wi];
         std::vector<Interval>* regs = w.rep == Rep::I32 ? gpr : xmm;
         auto fits = [&](std::uint8_t r) {
             for (const Interval& iv : regs[r])
@@ -757,6 +782,8 @@ Plan analyse(const CodeBlock& code)
         if (!placed)
             w.loc = {Loc::Stack, 0};
     }
+    for (std::uint32_t k = 0; k < plan.webs.size(); ++k)
+        plan.webs[k].loc = span[root(k)].loc;
     plan.ok = true;
     return plan;
 }

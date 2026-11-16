@@ -377,6 +377,13 @@ bool Baseline::emitTyped(std::uint32_t i)
     case Op::Mov:
         if (dw < 0 || !allTyped())
             return false;
+        if (web(uw[0]).slot == web(dw).slot && isI32(uw[0]) == isI32(dw)) {
+            // Joined by the allocator: one place for both.
+            dirty_[std::size_t(dw)] = 1;
+            if (carried_ == uw[0])
+                raxHolds_ = dw;
+            return true;
+        }
         if (isI32(uw[0])) {
             const Reg r = useI32(uw[0], RAX);
             if (isI32(dw)) {
@@ -1193,6 +1200,8 @@ void Baseline::emitOpt(std::uint32_t i)
     }
     if (emitMove(i))
         return;
+    if (emitReturnCopy(i))
+        return;
     forgetFacts();
     materializeReads(i);
     // A jump that may run the interpreter (a test of an object, a tick) leaves the frame as the interpreter wants it. A
@@ -1204,6 +1213,93 @@ void Baseline::emitOpt(std::uint32_t i)
     if (plan_->defWeb[i] >= 0 && !delivered_)
         loadTypedAfter(i);
     saveReadValue(i);
+}
+
+/// Which registers each instruction may find written since the frame began: a register only `LoadUndef` wrote counts too,
+/// as the optimized code may leave that out.
+void Baseline::planDirty()
+{
+    dirtyIn_.clear();
+    if (!code_->handlers.empty())
+        return;
+    const std::size_t words = (code_->nregs + 63) / 64;
+    std::vector<std::vector<std::uint64_t>> in(n_ + 1, std::vector<std::uint64_t>(words, 0));
+    std::vector<opt::Effects> eff(n_);
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        eff[j] = opt::effectsOf(*code_, j);
+        if (!eff[j].ok)
+            return;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::uint32_t j = 0; j < n_; j += length(j)) {
+            std::vector<std::uint64_t> out = in[j];
+            for (std::uint16_t r : eff[j].wr)
+                if (r < code_->nregs)
+                    out[r / 64] |= std::uint64_t(1) << (r % 64);
+            auto flow = [&](std::uint32_t to) {
+                if (to > n_)
+                    return;
+                for (std::size_t w = 0; w < words; ++w)
+                    if (out[w] & ~in[to][w]) {
+                        in[to][w] |= out[w];
+                        changed = true;
+                    }
+            };
+            const Op op = code_->code[j].opcode();
+            const std::int64_t t = opt::jumpTarget(*code_, j);
+            if (t >= 0)
+                flow(std::uint32_t(t));
+            if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+                flow(j + length(j));
+        }
+    }
+    dirtyIn_ = std::move(in);
+}
+
+/// A forward `Jmp` to a `Ret` (or to `Mov a, b; Ret a`): the return made here, clearing only what this path wrote.
+bool Baseline::emitReturnCopy(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    if (in.opcode() != Op::Jmp || dirtyIn_.empty())
+        return false;
+    const std::int64_t t = opt::jumpTarget(*code_, i);
+    if (t <= std::int64_t(i) || std::uint32_t(t) + 1 >= n_)
+        return false;
+    const std::uint32_t at = std::uint32_t(t);
+    const Ins& ti = code_->code[at];
+    unsigned src;
+    std::int32_t w;
+    if (ti.opcode() == Op::Ret) {
+        src = ti.a;
+        w = plan_->useWebs[at].empty() ? -1 : plan_->useWebs[at][0];
+    } else if (ti.opcode() == Op::Mov && code_->code[at + 1].opcode() == Op::Ret && code_->code[at + 1].a == ti.a &&
+               !plan_->isLeader[at + 1]) {
+        src = ti.b;
+        w = plan_->useWebs[at].empty() ? -1 : plan_->useWebs[at][0];
+    } else {
+        return false;
+    }
+    if (src == 0 || (w < 0 && plan_->defWeb[at] >= 0))
+        return false;
+    std::vector<std::uint64_t> dirty = dirtyIn_[i];
+    dirty[src / 64] |= std::uint64_t(1) << (src % 64);
+    Ins r = code_->code[at + (ti.opcode() == Op::Ret ? 0 : 1)];
+    r.a = std::uint16_t(src);
+    materializeReads(i);
+    if (w >= 0) {
+        if (isI32(w)) {
+            const Reg v = useI32(w, RAX);
+            a_.mov32(RAX, v);
+            a_.or_(RAX, R14);
+        } else {
+            boxDoubleTo(RAX, operandF64(w, 0, RAX), tame(w));
+        }
+        ret(i, r, true, &dirty);
+    } else {
+        ret(i, r, false, &dirty);
+    }
+    return true;
 }
 
 void Baseline::saveReadValue(std::uint32_t i)
@@ -1659,6 +1755,7 @@ Tier2Code* Baseline::compileOptimized()
         if (guardsCovered(h))
             preLoopFull_[h];
     planBorrows();
+    planDirty();
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
@@ -1677,7 +1774,10 @@ Tier2Code* Baseline::compileOptimized()
             }
         if (preLoop_.count(i))
             emitLoopGuards(i);
-        a_.bind(at_[i]);
+        if (!plan_->isLeader[i] && !slowNext_.count(i) && !preLoop_.count(i))
+            a_.bindFallthrough(at_[i]);  // nothing jumps here
+        else
+            a_.bind(at_[i]);
         offsets_[i] = std::uint32_t(a_.here());
         emitOpt(i);
         for (const Borrow& b : borrows_)

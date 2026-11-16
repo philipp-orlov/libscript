@@ -4091,3 +4091,47 @@ TEST(loopElementsHeldWithoutACount)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("63500,0,16,NaN,966000,10504,94500000"));
     }
 }
+
+TEST(callsNewAndReturnsInOptimizedCode)
+{
+    // Optimized code runs calls only (`new` and its loops stay in the baseline code), a return reached by a jump clears only what its
+    // path wrote (a parameter given no argument is undefined in the next call), and globals added after the code was made move
+    // the slots it reads.
+    const char* program =
+        "var out = [];"
+        "function P(x) { this.v = x; return x * 2; }"
+        "var s = 0, objs = 0;"
+        "for (var i = 0; i < 30000; i++) { s += P(i & 7); var o = new P(i & 3); objs += o.v; }"
+        "out.push(s, objs);"
+        "function L(n) { var t = 0; for (var k = 0; k < n; k++) t += k; this.t = t; return t; }"
+        "var lt = 0; for (var i = 0; i < 300; i++) lt += L(10) + new L(5000).t;"
+        "out.push(lt);"
+        "function f(a, b) { if (a < 3) return a; var c = a - 1; if (b === undefined) { b = c; return b; } return a + b; }"
+        "var fs = 0; for (var i = 0; i < 30000; i++) fs += f(i & 7) + f(i & 7, 1) + f(1);"
+        "out.push(fs);"
+        "function g(n, m) { m = n * 2; if (n < 1) return m; return g(n - 1) + m; }"
+        "var gs = 0; for (var i = 0; i < 3000; i++) gs += g(i & 15);"
+        "out.push(gs);"
+        "function h(a, b, c) { return typeof b + typeof c; }"
+        "var hs = ''; for (var i = 0; i < 3000; i++) { h(1, 2, 3); hs = h(1); } out.push(hs);"
+        "var G0 = 1; function readG() { return G0 + (typeof G150 === 'number' ? G150 : 0); }"
+        "var rs = 0; for (var i = 0; i < 20000; i++) rs += readG();"
+        "for (var k = 1; k < 300; k++) this['G' + k] = k;"
+        "for (var i = 0; i < 20000; i++) rs += readG();"
+        "G0 = 5; for (var i = 0; i < 2000; i++) rs += readG();"
+        "out.push(rs);"
+        "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }"
+        "var fb = fib(24); var keep = fib; fib = function (n) { return 1; }; out.push(fb, keep(10)); fib = keep; out.push(fib(20));"
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("210000,45000,3749263500,240000,254488,undefinedundefined,3350000,46368,2,6765"));
+    }
+}

@@ -96,6 +96,15 @@ struct EvalVar
 };
 
 /// A protected range of instructions [start, end) and where an exception in it goes: `reg` receives the thrown value.
+/// A call a block runs in place (`selfInline`): instructions [start, end) are the body of the function the `Call` at `site`
+/// calls, which is the block's own function.
+struct InlineSite
+{
+    std::uint32_t start;
+    std::uint32_t end;
+    std::uint32_t site;
+};
+
 struct Handler
 {
     std::uint32_t start;
@@ -216,6 +225,12 @@ struct CodeBlock
     /// The program text, shared by every function of it, and where this function's own text lies in it (bytes).
     std::shared_ptr<const std::string> source;
     std::uint32_t srcStart = 0, srcEnd = 0;
+    /// The block this one was made from by `selfInline`, which runs the function's calls of itself in place one level deep;
+    /// holds a count. Null for a block the compiler made.
+    CodeBlock* inlinedFrom = nullptr;
+    CodeBlock* selfInlined = nullptr;  ///< the block `selfInline` made from this one, while it lives
+    bool selfInlineTried = false;
+    Vec<InlineSite> inlineSites;
 
     CodeBlock() = default;
     ~CodeBlock();

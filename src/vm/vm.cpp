@@ -65,6 +65,11 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     if (const char* t = std::getenv("SCRIPT_VM_TIER2"))
         tier2Threshold = std::atoi(t);
 #endif
+    selfInlining = tier2Threshold > 0;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* t = std::getenv("SCRIPT_VM_SELFINLINE"))
+        selfInlining = selfInlining && std::atoi(t) != 0;
+#endif
 
     atoms.length = internKey("length");
     atoms.prototype = internKey("prototype");
@@ -151,6 +156,14 @@ std::string VM::captureStack() const
             const std::size_t idx = at ? at - 1 : 0;
             if (idx < c->lines.size())
                 line = c->lines[idx];
+            // A call the function made of itself, run in place: its own line, then the call's.
+            for (const InlineSite& s : c->inlineSites)
+                if (idx >= s.start && idx < s.end && shown + 1 < 16) {
+                    out += "\n    at " + name + " (" + toUtf8(c->file) + ":" + std::to_string(line) + ")";
+                    ++shown;
+                    line = s.site < c->lines.size() ? c->lines[s.site] : 0;
+                    break;
+                }
         }
         out += "\n    at " + name + " (" + toUtf8(c->file) + ":" + std::to_string(line) + ")";
     }

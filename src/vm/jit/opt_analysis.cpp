@@ -20,7 +20,7 @@ bool isConditionalJump(Op op)
 {
     switch (op) {
     case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined:
-    case Op::JHole: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
+    case Op::JHole: case Op::JNotCallee: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
     case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI:
     case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI:
         return true;
@@ -34,7 +34,7 @@ std::int64_t jumpTarget(const CodeBlock& code, std::uint32_t i)
     const Ins& in = code.code[i];
     switch (in.opcode()) {
     case Op::Jmp: case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined:
-    case Op::JNotUndefined: case Op::JHole:
+    case Op::JNotUndefined: case Op::JHole: case Op::JNotCallee:
         return std::int64_t(i) + 1 + in.jump();
     case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt: case Op::JNotGe:
     case Op::JStrictNe: case Op::JStrictEq: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
@@ -96,7 +96,7 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
         rd(in.c); wr(in.a);
         break;
     case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined:
-    case Op::JHole: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI:
+    case Op::JHole: case Op::JNotCallee: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI:
     case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI: case Op::Ret: case Op::Throw:
         rd(in.a);
         break;
@@ -579,8 +579,11 @@ Plan analyse(const CodeBlock& code)
                 return t;
             return (p & 2) ? Rep::F64 : Rep::I32;
         }
-        case Op::GetProp: case Op::GetElem: case Op::GetBox: case Op::GetUpval: case Op::GetGlobal: case Op::GetGlobalOrUndef:
         case Op::Call:
+            // A call that has never run (the long way of a call run in place) says nothing yet: a result of another kind
+            // leaves the code after it.
+            return p == 0 ? Rep::None : fromProfile(i);
+        case Op::GetProp: case Op::GetElem: case Op::GetBox: case Op::GetUpval: case Op::GetGlobal: case Op::GetGlobalOrUndef:
             return fromProfile(i);
         default:
             return Rep::Mem;

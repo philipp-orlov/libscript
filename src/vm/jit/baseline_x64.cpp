@@ -363,6 +363,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     if (!c->tier1) {
         if (c->tier1Failed || !vm.tier1Threshold || ++c->hotness < vm.tier1Threshold)
             return {0, 0};
+        if (tierUpBlock(vm, f, c) != c)
+            return {0, 0};
         compileTier1(vm, c);
         if (!c->tier1)
             return {0, 0};
@@ -1186,6 +1188,26 @@ private:
         std::uint32_t read;  ///< the `GetGlobal` of the callee
         bool thisNull;       ///< the skipped `this` is null (else undefined)
     };
+    /// A `JNotCallee` of a block `selfInline` made, whose callee is the global read before the jump to it: the read is
+    /// skipped (and the `this` after it), the guard checks the global's slot and the frame's function, and the call the
+    /// long way reads the global then.
+    struct SelfGuard
+    {
+        JSValue fn;
+        std::uint32_t globalIndex;
+        std::uint32_t read;    ///< the `GetGlobal`
+        std::int64_t thisAt;   ///< the skipped `LoadUndef`/`LoadNull` of `this` (-1: not skipped)
+    };
+    std::map<std::uint32_t, SelfGuard> selfGuards_;
+    void emitSelfGuard(std::uint32_t i);
+    /// Whether the `Call` at `i` is the long way of a guarded call run in place, which this code never reaches.
+    bool fallbackOf(std::uint32_t i) const
+    {
+        for (const auto& [g, sg] : selfGuards_)
+            if (opt::jumpTarget(*code_, g) == std::int64_t(i))
+                return true;
+        return false;
+    }
     std::vector<std::int32_t> exitRedirect_;  ///< an exit at an instruction runs from here instead (nothing between has effects)
     /// Inlined calls whose window registers are not written: what the inlined body reads for each (by call, then operand).
     std::map<std::uint32_t, std::map<std::size_t, IVal>> windowVal_;
@@ -1219,6 +1241,16 @@ private:
     /// Optimized code: registers that only ever hold numbers and other plain values while it runs, so clearing one is a
     /// store. Not those a call passes arguments in (the callee may assign its parameters) nor with exception handlers.
     std::vector<std::uint8_t> plainRegs_;
+    /// For each instruction, the frame registers that may hold a cell as it begins (flow-sensitive; empty: never reached).
+    std::vector<std::vector<bool>> cellAt_;
+    void findCells();
+    /// Whether register `reg` cannot hold a cell as instruction `i` begins.
+    bool plainAt(std::uint32_t i, unsigned reg) const
+    {
+        if (!optimizing() || i >= cellAt_.size() || cellAt_[i].empty() || reg >= cellAt_[i].size())
+            return false;
+        return !cellAt_[i][reg];
+    }
     std::map<std::uint32_t, std::vector<unsigned>> windowCleanup_;  ///< a direct call's slow path lets these go after it
     void findPlainRegs();  ///< where the slots of inlined calls start in the optimized frame (rsp-relative)
     void emitExits();
@@ -1679,6 +1711,30 @@ private:
         go(i, target);
         a_.bind(skip);
     }
+    bool windowPlain(std::uint32_t i, unsigned reg) const
+    {
+        return optimizing() && ((reg < plainRegs_.size() && plainRegs_[reg]) || plainAt(i, reg));
+    }
+    /// The caller registers past a call's arguments, `r9` the callee's registers and `rsi` its register count: those it
+    /// covers made undefined, a cell in one taking the long way. A plain one (dead, never a cell) is written whether
+    /// covered or not.
+    void clearWindow(std::uint32_t i, unsigned base, unsigned argc, unsigned window, Label& helper)
+    {
+        for (unsigned r = 1 + argc; r < window; ++r) {
+            if (windowPlain(i, base + 1 + r)) {
+                a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+                continue;
+            }
+            Label skip;
+            a_.aluI32(7, RSI, std::int32_t(r));
+            a_.jcc(CBE, skip);
+            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
+            a_.test(RDI, R15);
+            a_.jcc(CE, helper);
+            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+            a_.bind(skip);
+        }
+    }
     void clearReg(unsigned r)
     {
         if (r < plainRegs_.size() && plainRegs_[r]) {
@@ -1888,7 +1944,7 @@ void Baseline::emit(std::uint32_t i)
         compare(i, in);
         return;
     case Op::Jmp: case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined:
-    case Op::JNotUndefined: case Op::JHole:
+    case Op::JNotUndefined: case Op::JHole: case Op::JNotCallee:
     case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
     case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq:
     case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI:
@@ -2387,6 +2443,13 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
         }
         const bool wantEqual = op == Op::JNullish || op == Op::JUndefined || op == Op::JHole;
         goIf(wantEqual ? CE : CNE, i, target);
+        return;
+    }
+    case Op::JNotCallee: {
+        const std::uint32_t target = i + 1 + std::uint32_t(in.jump());
+        a_.mov(RAX, R(in.a));
+        a_.cmp(RAX, mem(R13, kFrameFn));
+        goIf(CNE, i, target);
         return;
     }
     case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI:
@@ -2951,7 +3014,13 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     savePool(i);
     const unsigned base = in.b, argc = in.c;
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
-    const bool fast = in.opcode() == Op::Call && window <= 1 + argc + 6;
+    // Caller registers past the arguments the callee's frame may cover: dead here (temporaries above a call's operands),
+    // a plain one overwritten without a look, one that may hold a cell looked at.
+    unsigned looked = 0;
+    for (unsigned r = 1 + argc; r < window; ++r)
+        looked += windowPlain(i, base + 1 + r) ? 0 : 1;
+    const bool roomy = window <= 1 + argc + 6 || (looked <= 6 && window <= 1 + argc + 40);
+    const bool fast = in.opcode() == Op::Call && roomy;
     if (fast) {
         // A script function that is compiled, takes at least as many parameters as there are arguments and needs nothing
         // the interpreter's call sequence does on the side: its frame is pushed here.
@@ -2991,16 +3060,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CB, helper);
         // What the frame sits on: caller registers above the arguments hold stale values; the call sequence of the
         // interpreter lets them go. Plain values are overwritten here; a cell takes the long way.
-        for (unsigned r = 1 + argc; r < window; ++r) {
-            Label skip;
-            a_.aluI32(7, RSI, std::int32_t(r));
-            a_.jcc(CBE, skip);
-            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
-            a_.test(RDI, R15);
-            a_.jcc(CE, helper);
-            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
-            a_.bind(skip);
-        }
+        clearWindow(i, base, argc, window, helper);
         {
             // A sloppy function called with no `this` gets the global object.
             Label thisOk;
@@ -3035,7 +3095,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RDX, mem(RDX, kTierEntry));
         a_.jmp(enter);
     }
-    if (in.opcode() == Op::New && window <= 1 + argc + 6) {
+    if (in.opcode() == Op::New && roomy) {
         // `new f(...)` of an ordinary compiled function: `this` made by a call into the runtime, the frame pushed here.
         a_.mov(RAX, R(base));
         needObject(RAX, helper);
@@ -3071,16 +3131,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CBE, helper);
         a_.alu(7, RSP, mem(R12, kVmStackFloor));
         a_.jcc(CB, helper);
-        for (unsigned r = 1 + argc; r < window; ++r) {
-            Label skip;
-            a_.aluI32(7, RSI, std::int32_t(r));
-            a_.jcc(CBE, skip);
-            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
-            a_.test(RDI, R15);
-            a_.jcc(CE, helper);
-            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
-            a_.bind(skip);
-        }
+        clearWindow(i, base, argc, window, helper);
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
         a_.mov(mem(R13, kFramePc), RDI);
         {
@@ -3324,7 +3375,6 @@ void Baseline::call(std::uint32_t i, const Ins& in)
 
 void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
 {
-    (void)i;
     // `numberInRax`: the result is a number the optimized code has boxed in rax already, which needs no count.
     Label have;
     if (!numberInRax)
@@ -3357,9 +3407,16 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
     // Registers a call put its arguments in belong to the caller; those the call did not fill and everything above the
     // parameters are this frame's to clear. When none can hold a cell, nothing here calls out and rax stays.
     const unsigned first = 1 + code_->nparams;
-    bool plain = code_->nregs <= first || code_->nregs - first <= 12;
+    auto isPlain = [&](unsigned r) { return (r < plainRegs_.size() && plainRegs_[r]) || plainAt(i, r); };
+    unsigned cells = 0;
+    for (unsigned r = first; r < code_->nregs; ++r)
+        cells += isPlain(r) ? 0 : 1;
+    // Inline: a dozen registers, or a few more when most need no look (two at a time).
+    const bool inlineClear = code_->nregs <= first || code_->nregs - first <= 12 ||
+                             (code_->nregs - first <= 40 && cells <= 8);
+    bool plain = inlineClear;
     for (unsigned r = 1; r < code_->nregs && plain; ++r)
-        plain = r < plainRegs_.size() && plainRegs_[r];
+        plain = isPlain(r);
     if (!plain)
         a_.mov(mem(RSP, 0), RAX);
     for (unsigned p = 1; p <= code_->nparams; ++p) {
@@ -3371,9 +3428,8 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
     }
     if (code_->nregs > first) {
         const unsigned count = code_->nregs - first;
-        if (count <= 12) {
+        if (inlineClear) {
             // Two registers that never hold a cell at a time, from xmm0 (two undefineds); a release calls out (xmm0 goes).
-            auto isPlain = [&](unsigned r) { return r < plainRegs_.size() && plainRegs_[r]; };
             bool pair = false;
             for (unsigned r = first; r < code_->nregs;) {
                 if (r + 1 < code_->nregs && isPlain(r) && isPlain(r + 1)) {

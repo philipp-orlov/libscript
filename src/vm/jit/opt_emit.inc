@@ -1063,6 +1063,16 @@ void Baseline::emitOpt(std::uint32_t i)
     delivered_ = false;
     carried_ = plan_->isLeader[i] ? -1 : raxHolds_;
     raxHolds_ = -1;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (code_->code[i].opcode() == Op::LoadUndef && std::getenv("T2UNDEF"))
+        std::fprintf(stderr, "undef @%u r%u plain %d dead %d\n", i, unsigned(code_->code[i].a),
+                     int(plainAt(i, code_->code[i].a)), int(regDeadAfter(i, code_->code[i].a)));
+#endif
+    if (code_->code[i].opcode() == Op::LoadUndef && plainAt(i, code_->code[i].a) && regDeadAfter(i, code_->code[i].a)) {
+        // Over no cell, and nothing reads it: the frame's way out writes it anyway.
+        forgetFact(code_->code[i].a);
+        return;
+    }
     if (skipDef_.size() > i && skipDef_[i]) {
         // Nothing runs; the register it would have written no longer holds what was proven about it.
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
@@ -1072,6 +1082,10 @@ void Baseline::emitOpt(std::uint32_t i)
     if (directCalls_.count(i)) {
         forgetFacts();
         emitDirectCall(i);
+        return;
+    }
+    if (selfGuards_.count(i)) {
+        emitSelfGuard(i);
         return;
     }
     if (i < chainRole_.size() && chainRole_[i]) {
@@ -1093,7 +1107,10 @@ void Baseline::emitOpt(std::uint32_t i)
     }
     forgetFacts();
     materializeReads(i);
-    if (opt::jumpTarget(*code_, i) >= 0)
+    // A jump that may run the interpreter (a test of an object, a tick) leaves the frame as the interpreter wants it. A
+    // forward `Jmp` runs nothing, and where it goes every variable's frame copy counts as stale.
+    if (const std::int64_t t = opt::jumpTarget(*code_, i);
+        t >= 0 && !(code_->code[i].opcode() == Op::Jmp && t > std::int64_t(i)))
         materializeLive(i);
     emit(i);
     if (plan_->defWeb[i] >= 0 && !delivered_)
@@ -1173,6 +1190,8 @@ void Baseline::findPlainRegs()
         // direct call's long way lets it go after the call).
         if (i < skipDef_.size() && skipDef_[i])
             continue;
+        if (op == Op::Call && i > 0 && fallbackOf(i))
+            continue;  // the long way of a call run in place: this code leaves before it
         const bool constant = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue || op == Op::LoadFalse ||
                               op == Op::LoadInt || op == Op::LoadHole || op == Op::LoadUninit ||
                               (op == Op::LoadK && !code_->consts[in.b].isCell());
@@ -1210,6 +1229,105 @@ void Baseline::findPlainRegs()
     }
 }
 
+void Baseline::findCells()
+{
+    struct Dump
+    {
+        Baseline* b;
+        ~Dump()
+        {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (!std::getenv("T2CELLS"))
+                return;
+            for (std::uint32_t i = 0; i < b->n_; ++i) {
+                if (b->cellAt_[i].empty())
+                    continue;
+                std::fprintf(stderr, "cells @%u:", i);
+                for (unsigned r = 0; r < b->cellAt_[i].size(); ++r)
+                    if (b->cellAt_[i][r])
+                        std::fprintf(stderr, " r%u", r);
+                std::fprintf(stderr, "\n");
+            }
+#endif
+        }
+    } dump{this};
+    const unsigned R = code_->nregs;
+    cellAt_.assign(n_ + 1, {});
+    if (!code_->handlers.empty() || (code_->flags & (CodeBlock::kGenerator | CodeBlock::kAsync)))
+        return;
+    std::vector<bool> all(R, true);
+    std::vector<std::uint32_t> work;
+    auto flow = [&](std::uint32_t to, const std::vector<bool>& s) {
+        if (to >= n_)
+            return;
+        std::vector<bool>& at = cellAt_[to];
+        if (at.empty()) {
+            at = s;
+            work.push_back(to);
+            return;
+        }
+        bool changed = false;
+        for (unsigned r = 0; r < R; ++r)
+            if (s[r] && !at[r]) {
+                at[r] = true;
+                changed = true;
+            }
+        if (changed)
+            work.push_back(to);
+    };
+    {
+        std::vector<bool> entry(R, false);
+        for (unsigned r = 0; r <= code_->nparams && r < R; ++r)
+            entry[r] = true;
+        flow(0, entry);
+    }
+    while (!work.empty()) {
+        const std::uint32_t i = work.back();
+        work.pop_back();
+        std::vector<bool> s = cellAt_[i];
+        const Ins& in = code_->code[i];
+        const Op op = in.opcode();
+        if (!(i < skipDef_.size() && skipDef_[i])) {
+            const opt::Effects e = opt::effectsOf(*code_, i);
+            if (!e.ok) {
+                s = all;
+            } else {
+                const bool constant = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue ||
+                                      op == Op::LoadFalse || op == Op::LoadInt || op == Op::LoadHole ||
+                                      op == Op::LoadUninit || (op == Op::LoadK && !code_->consts[in.b].isCell());
+                const bool fromPlain = op == Op::Mov && in.b < R && !s[in.b];
+                // A typed result stays in its variable: the frame register keeps what it held.
+                for (std::size_t k = 0; k < e.wr.size(); ++k)
+                    if (e.wr[k] < R && !(k == 0 && plan_->defWeb[i] >= 0))
+                        s[e.wr[k]] = !(constant || fromPlain);
+                bool keepsParams = false;
+                if (auto dc = directCalls_.find(i); dc != directCalls_.end()) {
+                    const CodeBlock* C = dc->second.code;
+                    keepsParams = true;
+                    for (std::uint32_t j = 0; j < C->code.size() && keepsParams; j = opt::nextOf(*C, j)) {
+                        const opt::Effects ce = opt::effectsOf(*C, j);
+                        keepsParams = ce.ok;
+                        for (std::uint16_t w : ce.wr)
+                            keepsParams = keepsParams && w > C->nparams;
+                    }
+                }
+                if ((op == Op::Call || op == Op::New || op == Op::CallSpread || op == Op::NewSpread) && !keepsParams)
+                    for (unsigned r = in.b + 1u; r <= in.b + 1u + in.c && r < R; ++r)
+                        s[r] = true;  // the callee's parameters, which it may assign
+            }
+        }
+        // The long way of a call run in place: this code leaves before it.
+        if (op == Op::Call && fallbackOf(i))
+            continue;
+        const std::int64_t t = opt::jumpTarget(*code_, i);
+        // A loop's header may be entered from the interpreter (OSR), with anything in the registers.
+        if (t >= 0 && !(op == Op::JNotCallee && selfGuards_.count(i)))
+            flow(std::uint32_t(t), std::uint32_t(t) <= i ? all : s);
+        if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+            flow(i + length(i), s);
+    }
+}
+
 Tier2Code* Baseline::compileOptimized()
 {
     const std::uint32_t W = plan_->typedWebs;
@@ -1226,6 +1344,7 @@ Tier2Code* Baseline::compileOptimized()
     planWindows();
     planMathCalls();
     findPlainRegs();
+    findCells();
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);

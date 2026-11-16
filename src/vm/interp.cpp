@@ -991,6 +991,10 @@ L_PutUpval: {
 L_LoadCallee:
     COPY(ins->a, toJSValue(fn));
     NEXT();
+L_JNotCallee:
+    if (R[ins->a].bits != toJSValue(fn).bits)
+        pc += ins->jump();
+    NEXT();
 
 // ---- arithmetic ----
 L_Add: {
@@ -2472,8 +2476,12 @@ do_call: {
         SET(ins->a, made);
         NEXT();
     }
-    if (!c->tier1 && !c->tier1Failed && vm.tier1Threshold && ++c->hotness >= vm.tier1Threshold)
-        compileTier1(vm, c);
+    if (!c->tier1 && !c->tier1Failed && vm.tier1Threshold && ++c->hotness >= vm.tier1Threshold) {
+        CodeBlock* d = tierUpBlock(vm, f, c);
+        if (d == c)
+            compileTier1(vm, c);
+        c = d;
+    }
     JSValue* newR = R + base + 1;    if (c->prof.empty()) [[unlikely]]
         c->prof.assign(c->code.size() + c->nparams + 2, 0);
     if (!c->tier1) {

@@ -199,6 +199,11 @@ void VM::releaseCode(CodeBlock* code) noexcept
         code->tier1 = nullptr;
     }
     codeByUid_.erase(code->uid);
+    if (CodeBlock* from = code->inlinedFrom) {
+        if (from->selfInlined == code)
+            from->selfInlined = nullptr;
+        releaseCode(from);
+    }
     code->~CodeBlock();
     PoolAlloc<CodeBlock>().deallocate(code, 1);
 }

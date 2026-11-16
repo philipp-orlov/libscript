@@ -830,9 +830,70 @@ void Baseline::planDirectCalls()
         }
     };
     auto deadAfter = [&](std::size_t k, unsigned r) { return regDeadAfter(starts[k], r); };
+    selfGuards_.clear();
     for (std::size_t k = 0; k < starts.size(); ++k) {
         const std::uint32_t i = starts[k];
         const Ins& in = code_->code[i];
+        if (in.opcode() == Op::JNotCallee && code_->inlinedFrom) {
+            // The way into a call run in place: the global read before it, quiet instructions between.
+            const std::int64_t g = i;
+            const unsigned base = in.a;
+            const JSValue f = constantBefore(i, base);
+            if (!isFunction(f) || static_cast<JSFunction*>(asObject(f))->code != code_)
+                continue;
+            const std::int64_t fb = opt::jumpTarget(*code_, std::uint32_t(g));
+            std::int64_t d = -1, t = -1;
+            bool ok = true;
+            for (std::size_t m = k; m-- > 0;) {
+                const std::uint32_t j = starts[m];
+                if (writes(j, base)) {
+                    if (code_->code[j].opcode() == Op::GetGlobal && plan_->defWeb[j] < 0)
+                        d = j;
+                    break;
+                }
+                if (reads(j, base) || !quiet(j) || plan_->isLeader[j]) {
+                    ok = false;
+                    break;
+                }
+                if (t < 0 && writes(j, base + 1)) {
+                    const Op op = code_->code[j].opcode();
+                    if (op == Op::LoadUndef || op == Op::LoadNull)
+                        t = j;
+                }
+            }
+            if (!ok || d < 0 || fb < 0 || code_->code[std::size_t(fb)].opcode() != Op::Call ||
+                !regDeadAfter(std::uint32_t(fb), base))
+                continue;
+            JSObject* gl = vm_.global;
+            std::uint8_t attrs = 0;
+            JSValue* slot = gl->findOwn(vm_, code_->atoms[code_->code[std::size_t(d)].b], &attrs);
+            if (!slot || (attrs & attr::kAccessor) || *slot != f)
+                continue;
+            JSValue* inl = gl->inl();
+            const std::uint32_t index = slot >= inl && slot < inl + gl->h.aux ? std::uint32_t(slot - inl)
+                                                                               : std::uint32_t(slot - gl->slots) + gl->h.aux;
+            if (t >= 0) {
+                // `this` only for the long way: the body run in place does not read it, nothing between does.
+                bool used = !regDeadAfter(std::uint32_t(fb), base + 1);
+                for (std::uint32_t j = std::uint32_t(t) + 1; j < n_ && !used; j += length(j))
+                    if (j != std::uint32_t(fb) && reads(j, base + 1))
+                        used = (j > std::uint32_t(t) && j < i) || (j > std::uint32_t(g) && j < std::uint32_t(fb)) ||
+                               j == std::uint32_t(g);
+                if (used)
+                    t = -1;
+            }
+            if ((code_->prof[std::size_t(d)] | code_->prof[std::size_t(g)]) & opt::kProfFailed)
+                continue;
+            holdValue(f);
+            selfGuards_[std::uint32_t(g)] = SelfGuard{f, index, std::uint32_t(d), t};
+            skipDef_[std::size_t(d)] = 1;
+            if (t >= 0)
+                skipDef_[std::size_t(t)] = 1;
+            for (std::size_t m = 0; m < k; ++m)
+                if (starts[m] > std::uint32_t(d))
+                    exitRedirect_[starts[m]] = std::int32_t(d);
+            continue;
+        }
         if (in.opcode() != Op::Call || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
             continue;
         const unsigned base = in.b, argc = in.c;
@@ -903,6 +964,34 @@ void Baseline::planDirectCalls()
     }
 }
 
+void Baseline::emitSelfGuard(std::uint32_t i)
+{
+    const SelfGuard& sg = selfGuards_.at(i);
+    const unsigned base = code_->code[i].a;
+    Label cold, inPlace;
+    a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+    a_.jcc(CNE, cold);
+    globalSlot(sg.globalIndex);
+    a_.movImm(RAX, sg.fn.bits);
+    a_.cmp(RAX, mem(RDX, 0));
+    a_.jcc(CNE, cold);
+    a_.cmp(RAX, mem(R13, kFrameFn));
+    a_.jcc(CE, inPlace);
+    // The long way leaves this code: the global read as the skipped instruction would have, the `this` it skipped, and
+    // the guard runs again in the interpreter (registers this code never writes again).
+    a_.bind(cold);
+    sideDoor();
+    forgetFacts();
+    emit(sg.read);
+    if (sg.thisAt >= 0) {
+        const Ins& t = code_->code[std::size_t(sg.thisAt)];
+        a_.movImm(RAX, t.opcode() == Op::LoadNull ? kNull : kUndefined);
+        write(base + 1, RAX);
+    }
+    a_.jmp(exitBefore(i));
+    a_.bind(inPlace);
+}
+
 void Baseline::writePending(std::uint32_t point)
 {
     auto it = pendingAt_.find(point);
@@ -962,7 +1051,7 @@ void Baseline::emitDirectCall(std::uint32_t i)
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     for (unsigned r = 1 + argc; r < window && r < C->nregs; ++r) {
         const unsigned reg = base + 1 + r;
-        if (!(reg < plainRegs_.size() && plainRegs_[reg])) {
+        if (!windowPlain(i, reg)) {
             a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
             a_.test(RDI, R15);
             a_.jcc(CE, slowPath);

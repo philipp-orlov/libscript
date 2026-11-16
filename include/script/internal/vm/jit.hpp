@@ -78,6 +78,12 @@ bool tier1Available() noexcept;
 /// Translate `code`; sets `code->tier1` or, when the function is not suitable, `code->tier1Failed`.
 void compileTier1(VM& vm, CodeBlock* code);
 void releaseTier1(Tier1Code* code, VM* vm) noexcept;
+/// A copy of `code` that runs the function's calls of itself in place one level deep, made once and kept while a function
+/// holds it (null when the function is not one for it); it comes with no count of its own. See self_inline.cpp.
+CodeBlock* selfInline(VM& vm, CodeBlock* code);
+/// The block `f` (whose block is `code`, turning hot) runs from now on: `selfInline`'s copy when there is one, which `f` then
+/// holds in place of `code`. The copy starts cold, in the interpreter, which learns what its instructions make.
+CodeBlock* tierUpBlock(VM& vm, struct JSFunction* f, CodeBlock* code);
 /// Run the top frame, which belongs to a compiled function, from the instruction at `index`. Returns what `run` would.
 JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index);
 

@@ -3820,3 +3820,89 @@ TEST(aSlotSeenHoldingAnInt32IsReadWithoutALookUntilADoubleMayGoThere)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("997015.5 999 999 1005000 1002 1.25 3 8.5"));
     }
 }
+
+TEST(selfRecursionRunsInPlace)
+{
+    // A function calling itself by its global name runs those calls in place one level deep (self_inline.cpp): results,
+    // guards (the global reassigned), missing arguments, uninitialised variables, strict this, exceptions, overflow, doubles.
+    const char* program =
+        "var out = [];"
+        "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }"
+        "var s = 0;"
+        "for (var i = 0; i < 300; i++) s += fib(12);"
+        "out.push(s);"
+        "function deep(n) { if (n == 0) throw new Error(\"bottom\"); return deep(n - 1) + 1; }"
+        "for (var i = 0; i < 3000; i++) { try { deep(i % 7 + 1); } catch (e) { if (i == 2999) out.push(e.stack.split(\"\\n\").length); } }"
+        "function cnt(n) { return n <= 0 ? 0 : cnt(n - 1) + 1; }"
+        "for (var i = 0; i < 3000; i++) cnt(5);"
+        "var keep = cnt;"
+        "cnt = function (n) { return 100; };"
+        "out.push(keep(5));"
+        "function miss(a, b) { if (a <= 0) return b === undefined ? 1 : 2; return miss(a - 1) * 10 + (b === undefined ? 3 : 4); }"
+        "for (var i = 0; i < 3000; i++) miss(3, 1);"
+        "out.push(miss(3, 1));"
+        "function un(n) { var x; if (n > 0) { x = un(n - 1); } return x === undefined ? 0 : x + 1; }"
+        "for (var i = 0; i < 3000; i++) un(4);"
+        "out.push(un(6));"
+        "function st(n) { \"use strict\"; return n == 0 ? typeof this : st(n - 1); }"
+        "for (var i = 0; i < 3000; i++) st(3);"
+        "out.push(st(3));"
+        "function T(l, r) { this.l = l; this.r = r; }"
+        "function mk(d) { return d === 0 ? new T(null, null) : new T(mk(d - 1), mk(d - 1)); }"
+        "function chk(t) { return t.l === null ? 1 : 1 + chk(t.l) + chk(t.r); }"
+        "var c = 0;"
+        "for (var i = 0; i < 400; i++) c += chk(mk(i % 6));"
+        "out.push(c);"
+        "function thrower(n) { if (n == 3) throw n; return thrower(n + 1); }"
+        "var caught = 0;"
+        "for (var i = 0; i < 3000; i++) { try { thrower(0); } catch (e) { caught += e; } }"
+        "out.push(caught);"
+        "function dbl(n) { return n < 1 ? 0.5 : dbl(n - 1) + dbl(n - 1); }"
+        "var d = 0;"
+        "for (var i = 0; i < 2000; i++) d += dbl(4);"
+        "out.push(d);"
+        "function big(n) { return n == 0 ? 2147483647 : big(n - 1) + 1; }"
+        "for (var i = 0; i < 3000; i++) big(1);"
+        "out.push(big(3));"
+        "function strs(n) { return n == 0 ? \"\" : strs(n - 1) + n; }"
+        "for (var i = 0; i < 3000; i++) strs(3);"
+        "out.push(strs(9));"
+        "out.join(\",\");";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("43200,7,101,1334,6,undefined,7946,9000,16000,2147483650,123456789"));
+    }
+}
+
+TEST(selfRecursionRunInPlaceKeepsItsFramesInTraces)
+{
+    // A call run in place has no frame of its own: the trace shows it with its own line, then the call's.
+    const char* program =
+        "function deep2(n) {\n"
+        "  if (n == 0)\n"
+        "    throw new Error(\"b\");\n"
+        "  var r = deep2(n - 1);\n"
+        "  return r + 1;\n"
+        "}\n"
+        "var last;\n"
+        "for (var i = 0; i < 3000; i++) { try { deep2(i % 5); } catch (e) { last = e.stack; } }\n"
+        "last;\n";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("Error: b\n    at deep2 (<test>:3)\n    at deep2 (<test>:4)\n    at deep2 (<test>:4)\n    at deep2 (<test>:4)\n    at deep2 (<test>:4)\n    at <program> (<test>:8)"));
+    }
+}

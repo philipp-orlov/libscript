@@ -3934,3 +3934,29 @@ TEST(aReturnedRegisterGivesItsCountToTheResult)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("65:5,1065:5,2065:5,3065:5,4065:5|12847500"));
     }
 }
+
+TEST(aFunctionRunInPlaceThatReplacesItselfLeavesTheCopy)
+{
+    // A function run in place that assigns its global name a new function part way down: the calls after see the new one.
+    const char* program =
+        "function rf(n) { if (n == 30) rf = function (m) { return 1000; }; return n <= 0 ? 0 : rf(n - 1) + 1; }"
+        "var orig = rf, s = 0;"
+        "for (var i = 0; i < 3000; i++) s += rf(i % 20);"
+        "var r1 = orig(35);"
+        "var r2 = rf(5);"
+        "function sw(n) { return n <= 0 ? 0 : (n == 7 ? (sw = function (m) { return -100; }, 0) : 0) + sw(n - 1) + 1; }"
+        "var orig2 = sw, t = 0;"
+        "for (var i = 0; i < 3000; i++) t += sw(i % 6);"
+        "s + \",\" + r1 + \",\" + r2 + \",\" + t + \",\" + orig2(10) + \",\" + sw(3);";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("28500,1006,1000,7500,-96,-100"));
+    }
+}

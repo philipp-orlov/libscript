@@ -3416,3 +3416,31 @@ TEST(stringsAppendedInPlaceAndCharactersMadeInCompiledCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3173,93,a1!bcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz80abcdefghijklmn,3124,abcdefghij | 102,ab,false | 4096 | 303,1,121 | -356477524 | 45,hello"));
     }
 }
+
+TEST(jsonParseMakesObjectsAlongKnownShapesAndReadsShortDecimalsExactly)
+{
+    // Repeated names, names that are array indexes, `__proto__` as an own name, objects of many and few properties; and
+    // decimals read without the library that must be what it would read.
+    const char* program =
+        "var out=[]; "
+        "var docs=['{\"a\":1,\"b\":2,\"a\":3}','{\"b\":1,\"a\":2,\"1\":3,\"0\":4,\"01\":5,\"x\":{\"a\":1,\"b\":2,\"a\":5}}','{\"__proto__\":{\"p\":1},\"q\":2}','[{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9,\"j\":10},{\"a\":1},{}]','{\"a\":-0.0,\"b\":1.25e2,\"c\":\"\\\\u0041\\\\n\",\"d\":[1,2,{\"z\":null}],\"e\":true,\"f\":false}']; "
+        "for (var r=0;r<3;r++) for (var k=0;k<docs.length;k++){ var v=JSON.parse(docs[k]); out.push(JSON.stringify(v), Object.keys(v).join(','), Object.getPrototypeOf(v)===Object.prototype); if (v.__proto__ && v.q) out.push(v.p===undefined, Object.getOwnPropertyNames(v).join(',')); } "
+        "var big='['; for (var i=0;i<300;i++) big+=(i?',':'')+'{\"id\":'+i+',\"k'+(i%7)+'\":'+(i*0.25)+',\"s\":\"'+i+'\"}'; big+=']'; "
+        "var a=JSON.parse(big), t=0; for (var i=0;i<a.length;i++) t+=a[i].id+(a[i]['k'+(i%7)]||0); out.push(t, JSON.stringify(a[299])); "
+        "out.join(' | ') ";
+    const char* numbers =
+        "var xs=[\"0.1\",\"0.5\",\"-0.0\",\"12.5\",\"3.14159265358979\",\"123456789012345\",\"1234567890123456\",\"0.000000000000001\",\"99999.99999\",\"1e5\",\"-1.5e-3\",\"0.30000000000000004\",\"9007199254740993\",\"1.7976931348623157e308\",\"5e-324\",\"-12345.678901234\",\"100.0\",\"0\",\"-0\",\"4294967296.5\"]; "
+        "var out=[]; for (var k=0;k<xs.length;k++){ var v=JSON.parse(xs[k]); out.push(String(v), Object.is(v,-0)); } "
+        "var r=0; for (var i=0;i<20000;i++){ r+=JSON.parse((i*0.37).toFixed(5)) } out.push(r); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 2; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("{\"a\":3,\"b\":2} | a,b | true | {\"0\":4,\"1\":3,\"b\":1,\"a\":2,\"01\":5,\"x\":{\"a\":5,\"b\":2}} | 0,1,b,a,01,x | true | {\"__proto__\":{\"p\":1},\"q\":2} | __proto__,q | true | true | __proto__,q | [{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9,\"j\":10},{\"a\":1},{}] | 0,1,2 | false | {\"a\":0,\"b\":125,\"c\":\"A\\n\",\"d\":[1,2,{\"z\":null}],\"e\":true,\"f\":false} | a,b,c,d,e,f | true | {\"a\":3,\"b\":2} | a,b | true | {\"0\":4,\"1\":3,\"b\":1,\"a\":2,\"01\":5,\"x\":{\"a\":5,\"b\":2}} | 0,1,b,a,01,x | true | {\"__proto__\":{\"p\":1},\"q\":2} | __proto__,q | true | true | __proto__,q | [{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9,\"j\":10},{\"a\":1},{}] | 0,1,2 | false | {\"a\":0,\"b\":125,\"c\":\"A\\n\",\"d\":[1,2,{\"z\":null}],\"e\":true,\"f\":false} | a,b,c,d,e,f | true | {\"a\":3,\"b\":2} | a,b | true | {\"0\":4,\"1\":3,\"b\":1,\"a\":2,\"01\":5,\"x\":{\"a\":5,\"b\":2}} | 0,1,b,a,01,x | true | {\"__proto__\":{\"p\":1},\"q\":2} | __proto__,q | true | true | __proto__,q | [{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9,\"j\":10},{\"a\":1},{}] | 0,1,2 | false | {\"a\":0,\"b\":125,\"c\":\"A\\n\",\"d\":[1,2,{\"z\":null}],\"e\":true,\"f\":false} | a,b,c,d,e,f | true | 56062.5 | {\"id\":299,\"k5\":74.75,\"s\":\"299\"}"));
+        CHECK_EQ(ctx.eval(numbers, "<test>").toString(), std::string("0.1 false 0.5 false 0 true 12.5 false 3.14159265358979 false 123456789012345 false 1234567890123456 false 1e-15 false 99999.99999 false 100000 false -0.0015 false 0.30000000000000004 false 9007199254740992 false 1.7976931348623157e+308 false 5e-324 false -12345.678901234 false 100 false 0 false 0 true 4294967296.5 false 73996300"));
+    }
+}

@@ -163,10 +163,11 @@ struct Shape
     Shape* after(VM& vm, Key key, std::uint8_t attrs);
     /// The shape with the last property's attributes changed.
     Shape* withLastAttrs(VM& vm, std::uint8_t newAttrs);
+    /// The shape `after` has made before for `key` with `attrs`, or null. One exists only when this shape lacks `key`.
+    Shape* findTransition(Key key, std::uint8_t attrs) const noexcept;
 
 private:
     void buildTable();
-    Shape* findTransition(Key key, std::uint8_t attrs) const noexcept;
 };
 
 }  // namespace vm

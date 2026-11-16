@@ -2795,6 +2795,7 @@ struct JsonReader
         return k;
     }
     Key keys[32] = {};
+    std::uint8_t objectSlots = 3;  ///< inline slots for the next object: as many as the last one had properties
     ~JsonReader()
     {
         for (Key k : keys)
@@ -2901,6 +2902,31 @@ struct JsonReader
             if (digits && !(negative && n == 0))
                 return JSValue::int32(negative ? -n : n);
         }
+        {
+            // Up to 15 digits with a point and no exponent: the digits and the power of ten are both exact doubles, so
+            // their quotient is the correctly rounded value.
+            std::int64_t m = 0;
+            int digits = 0, fraction = -1;
+            bool plain = true;
+            for (std::size_t k = start + negative; k < i && plain; ++k) {
+                const char16_t d = s[k];
+                if (d == u'.') {
+                    fraction = 0;
+                } else if (d >= u'0' && d <= u'9' && digits < 15) {
+                    m = m * 10 + (d - u'0');
+                    ++digits;
+                    if (fraction >= 0)
+                        ++fraction;
+                } else {
+                    plain = false;
+                }
+            }
+            if (plain) {
+                static constexpr double kTens[] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15};
+                const double v = double(m) / kTens[fraction < 0 ? 0 : fraction];
+                return JSValue::boxNumber(negative ? -v : v);
+            }
+        }
         char small[64];
         std::string big;
         char* text = small;
@@ -2969,7 +2995,7 @@ struct JsonReader
         }
         if (c == u'{') {
             ++i;
-            JSObject* o = vm.newObject(vm.protos.object);
+            JSObject* o = vm.newObject(vm.protos.object, objectSlots);
             Handle keep = Handle::adopt(toJSValue(o));
             skip();
             if (i < s.size() && s[i] == u'}') {
@@ -2994,7 +3020,20 @@ struct JsonReader
                 Handle itemKeep = Handle::adopt(item);
                 Key k = key(name);
                 retain(item);
-                defineOwn(vm, o, k, item, attr::kDefault);
+                // A shape that has a transition by this name does not have the name: the slot is the next one.
+                // (An array index starts with a digit: such a name takes the long way.)
+                Shape* shape = o->shapeOf(vm);
+                const bool digit = !name.empty() && name[0] >= u'0' && name[0] <= u'9';
+                Shape* next = !shape->isDictionary() && shape->count < kMaxFastProperties && !digit
+                                  ? shape->findTransition(k, attr::kDefault)
+                                  : nullptr;
+                if (next) {
+                    o->reserveSlot(vm, shape->count);
+                    *o->slotAt(shape->count) = item;
+                    o->h.shape = next->id;
+                } else {
+                    defineOwn(vm, o, k, item, attr::kDefault);
+                }
                 detail::decRef(k);
                 skip();
                 if (i < s.size() && s[i] == u',') {
@@ -3003,6 +3042,9 @@ struct JsonReader
                 }
                 if (i < s.size() && s[i] == u'}') {
                     ++i;
+                    // The next object is likely to be like this one: room for as many properties in place.
+                    const std::uint32_t count = o->shapeOf(vm)->isDictionary() ? 8 : o->shapeOf(vm)->count;
+                    objectSlots = std::uint8_t(count < 3 ? 3 : count > 8 ? 8 : count);
                     return keep.take();
                 }
                 return fail("expected ',' or '}'");

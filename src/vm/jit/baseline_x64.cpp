@@ -1142,6 +1142,7 @@ private:
     void savePool(std::uint32_t i);
     void restorePool(std::uint32_t i);
     bool liveAcross(std::uint32_t i, std::int32_t w) const;
+    bool plainReadable(std::uint32_t i) const;
     Label& exitLabel(std::uint32_t i, int kind);
     Label& exitBefore(std::uint32_t i) { return exitLabel(i, 0); }
     Label& exitAfter(std::uint32_t i) { return exitLabel(i, 1); }
@@ -2152,6 +2153,24 @@ void Baseline::strictJump(std::uint32_t i, const Ins& in)
     const bool imm = op == Op::JStrictEqI || op == Op::JStrictNeI;
     const bool wantEqual = op == Op::JStrictEq || op == Op::JStrictEqI;
     const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
+    if (!imm && optimizing() && i > 0 && !plan_->isLeader[i]) {
+        // One side null, undefined, true or false loaded just before: the same value only as the same bits.
+        const Ins& p = code_->code[i - 1];
+        std::int64_t k = -1;
+        switch (p.opcode()) {
+        case Op::LoadNull: k = std::int64_t(kNull); break;
+        case Op::LoadUndef: k = std::int64_t(kUndefined); break;
+        case Op::LoadTrue: k = std::int64_t(kTrue); break;
+        case Op::LoadFalse: k = std::int64_t(kFalse); break;
+        default: break;
+        }
+        if (k >= 0 && (p.a == in.a) != (p.a == in.b)) {
+            a_.mov(RAX, R(p.a == in.a ? in.b : in.a));
+            a_.cmpI(RAX, std::int32_t(k));
+            goIf(wantEqual ? CE : CNE, i, target);
+            return;
+        }
+    }
     Label& bad = slow(i);
     Label eq, neq;
     a_.mov(RAX, R(in.a));

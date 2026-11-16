@@ -804,6 +804,9 @@ void Baseline::planDirectCalls()
         case Op::LoadUndef: case Op::LoadNull: case Op::LoadInt: case Op::LoadK: case Op::LoadTrue: case Op::LoadFalse:
         case Op::Mov:
             return true;
+        case Op::GetProp:
+            // A read of data properties where the site has found them: done without the runtime, or not at all.
+            return plan_->useWebs[j].size() >= 1 && plan_->useWebs[j][0] < 0 && plainReadable(j);
         case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl:
         case Op::Shr: case Op::AddI: case Op::SubI: case Op::MulI: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
         case Op::ShlI: case Op::ShrI: case Op::Inc: case Op::Dec: {

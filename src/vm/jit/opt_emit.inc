@@ -287,6 +287,27 @@ std::uint64_t doubleBits(double d)
 
 }  // namespace
 
+/// Whether the read at `i` finds data properties only, where the site has found them: compiled code does it without the
+/// runtime, and leaves when the object is another.
+bool Baseline::plainReadable(std::uint32_t i) const
+{
+    if (i + 1 >= n_ || code_->code[i + 1].opcode() != Op::Cache)
+        return false;
+    const std::uint16_t cacheId = code_->code[i + 1].a;
+    if (cacheId == kNoCache || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return false;
+    const InlineCache& ic = code_->caches[cacheId];
+    if (ic.shape == 0 || ic.next != 0 || (ic.holder && !(ic.validity && ic.validity->valid)))
+        return false;
+    if (ic.pad && ic.pad <= code_->poly.size())
+        for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k) {
+            const PolyEntry& e = code_->poly[ic.pad - 1].e[k];
+            if (!(e.kind == PolyEntry::OwnData || (e.kind == PolyEntry::ProtoData && e.validity && e.validity->valid)))
+                return false;
+        }
+    return true;
+}
+
 bool Baseline::emitTyped(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
@@ -597,9 +618,38 @@ bool Baseline::emitTyped(std::uint32_t i)
     case Op::GetProp: {
         if (inlineGetter(i))
             return true;
-        // A number read from a property the site has always found in the same place: straight into the variable.
-        if (dw < 0 || uw.empty() || uw[0] >= 0)
+        if (uw.empty() || uw[0] >= 0)
             return false;
+        if (dw < 0) {
+            // Any other value from a data property found where the site has found it: guarded, counted, into the frame. A
+            // property found elsewhere leaves the code; nothing here runs script.
+            if (!plainReadable(i))
+                return false;
+            const InlineCache& ic = code_->caches[code_->code[i + 1].a];
+            Label& bad = exitBefore(i);
+            const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
+            if (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n) {
+                const PolyCache& pc = code_->poly[ic.pad - 1];
+                PolySeen seen[5];
+                int count = 0;
+                seen[count++] = PolySeen{ic.shape, ic.index, ic.holder, ic.validity, failed ? std::uint8_t(0) : ic.aux};
+                for (std::uint8_t k = 0; k < pc.n; ++k)
+                    seen[count++] = PolySeen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity,
+                                             failed ? std::uint8_t(0) : pc.e[k].aux};
+                a_.mov(RAX, R(in.b));
+                polyRead(seen, count, bad, int(in.b));
+            } else if (ic.holder) {
+                provenShape(in.b, ic.shape, bad);
+                checkValidity(ic.validity, bad);
+                holderRead(ic.holder, ic.index);
+            } else {
+                a_.mov(RAX, provenSlotMem(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad));
+            }
+            retain(RAX);
+            write(in.a, RAX);
+            return true;
+        }
+        // A number read from a property the site has always found in the same place: straight into the variable.
         const std::uint16_t cacheId = code_->code[i + 1].a;
         if (cacheId == kNoCache)
             return false;

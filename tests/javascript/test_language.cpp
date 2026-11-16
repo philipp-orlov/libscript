@@ -3579,3 +3579,38 @@ TEST(aSlotSeenHoldingANumberIsStoredOverWithoutALookAtTheOldValue)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1000500 {\"a\":7,\"b\":2} 501500 {\"a\":7,\"b\":2} 01[object Object]3333333333333333333 {\"a\":1,\"b\":2} 0s2NaNs1NaNNaNNaNNaNNaNNaNNaNNaN {\"a\":null,\"b\":null} 500500 3 500502"));
     }
 }
+
+TEST(objectsReadFromPropertiesAndComparedWithLiteralsInCompiledCode)
+{
+    // Objects read from data properties into registers and into a direct call's arguments, then a getter or another shape
+    // there, and the called global replaced; strict comparisons with null, undefined, true and false loaded just before.
+    const char* program =
+        "var out=[]; "
+        "function T(l,r){this.l=l;this.r=r;} "
+        "function chk(t){return t.l===null?1:1+chk(t.l)+chk(t.r);} "
+        "function mk(d){return d===0?new T(null,null):new T(mk(d-1),mk(d-1));} "
+        "for (var r=0;r<30;r++) chk(mk(6)); "
+        "out.push(chk(mk(10))); "
+        "var odd=new T(null,null); Object.defineProperty(odd,'l',{get:function(){ out.push('g'); return null; }}); out.push(chk(new T(odd,new T(null,null)))); "
+        "var other={r:null,l:null}; out.push(chk(new T(other,odd))); "
+        "var saved=chk; chk=function(t){ return 1000; }; out.push(saved(new T(new T(null,null),null))); "
+        "chk=saved; "
+        "function eqs(a){ var n=0; if (a===null) n+=1; if (a!==undefined) n+=2; if (a===true) n+=4; if (a!==false) n+=8; return n; } "
+        "for (var r=0;r<500;r++) eqs(r&1?null:true); "
+        "out.push([null,undefined,true,false,0,'',{},NaN].map(eqs).join(',')); "
+        "function first(o){ return o.a; } var objs=[{a:{v:1}},{a:'s'},{b:1,a:[2]},{a:null}]; "
+        "for (var r=0;r<400;r++) first(objs[r&1]); "
+        "out.push(objs.map(function(o){ var v=first(o); return typeof v; }).join(',')); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2047 g 3 g 3 2001 11,8,14,2,10,10,10,10 object,string,object,object"));
+    }
+}

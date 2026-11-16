@@ -3121,6 +3121,36 @@ TEST(smallConstructorsRunInPlace)
     }
 }
 
+TEST(inlinedCallsReadTheirArgumentsWhereTheyAre)
+{
+    // The callee, `this` and the arguments of an inlined call are not copied into its registers; another callee, a
+    // replaced method, another receiver or argument, and `this` read after the call all behave.
+    const char* program =
+        "var out=[];"
+        "function mk(){var c=0;return function(d){c+=d;return c;};}"
+        "function k1(n,f,g){var s=0;for(var i=0;i<n;i++){s=f(i&1)+g(1);}return s;}"
+        "out.push(k1(5000,mk(),mk())); out.push(k1(3,mk(),function(d){return \"s\"+d;}));"
+        "class P{constructor(x){this.x=x;} m(o){return this.x+o;}}"
+        "function k2(n,a){var t=0;for(var i=0;i<n;i++){t+=a.m(i);}return t;}"
+        "var a=new P(2); out.push(k2(5000,a)); P.prototype.m=function(o){return -o;}; out.push(k2(3,a));"
+        "out.push(k2(3,{x:1,m(o){return 100;}}), k2(2,new P(1.5)));"
+        "function k3(n,a){var t=0;for(var i=0;i<n;i++){t+=a.m(i); t+=a.x;}return t;} P.prototype.m=function(o){return this.x*o;};"
+        "out.push(k3(4000,new P(3)), k3(2,new P(\"q\")));"
+        "function k4(n,o){ var r=0; for (var i=0;i<n;i++){ var self=o; r+=self.m(1); r+=self.x; } return r; } out.push(k4(3000,new P(2)));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("7500 1s1 12507500 -3 300 -1 24006000 NaNqNaNq 12000"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

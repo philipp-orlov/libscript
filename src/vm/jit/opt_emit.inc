@@ -260,6 +260,8 @@ namespace {
 
 /// Slots of the optimized frame for the values of inlined calls.
 constexpr std::uint32_t kInlineSlots = 32;
+/// Slots for method reads that feed an inlined call.
+constexpr std::uint32_t kWindowSlots = 4;
 
 std::uint64_t doubleBits(double d)
 {
@@ -958,6 +960,11 @@ void Baseline::emitOpt(std::uint32_t i)
         emitChain(i);
         return;
     }
+    if (windowRead_.count(i)) {
+        forgetFacts();
+        emitWindowRead(i);
+        return;
+    }
     if (emitTyped(i)) {
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
             if (r < factShape_.size()) {
@@ -1080,9 +1087,11 @@ Tier2Code* Baseline::compileOptimized()
         calls = calls || code_->code[j].opcode() == Op::Call || code_->code[j].opcode() == Op::New;
     inlineBase_ = calls ? std::int32_t(8 + 8 * W) : -1;
     chainSlot_ = std::int32_t(8 + 8 * W + (calls ? 8 * kInlineSlots : 0));
-    spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 8 + 15) & ~15u);
+    windowBase_ = chainSlot_ + 8;
+    spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 8 + 8 * kWindowSlots + 15) & ~15u);
     dirty_.assign(W, 1);
     planDirectCalls();
+    planWindows();
     findPlainRegs();
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);

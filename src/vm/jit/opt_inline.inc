@@ -74,6 +74,8 @@ void Baseline::inlineBits(const IVal& v, Reg dst)
         a_.movImm(dst, v.c.bits);
     else if (v.frameReg >= 0)
         a_.mov(dst, R(unsigned(v.frameReg)));
+    else if (v.slot <= -2)
+        a_.mov(dst, mem(RSP, windowBase_ + 8 * (-2 - v.slot)));  // a window slot
     else
         a_.mov(dst, inlineSlot(v.slot));
 }
@@ -138,6 +140,14 @@ void Baseline::inlineF64(const IVal& v, int x, Reg tmp, Label* bad)
 
 IVal Baseline::callerValue(std::uint32_t i, unsigned reg, std::size_t k, std::uint8_t hint) const
 {
+    if (auto w = windowVal_.find(i); w != windowVal_.end()) {
+        if (auto o = w->second.find(k); o != w->second.end()) {
+            IVal v = o->second;
+            if (v.kind == IVal::Box && !v.hint)
+                v.hint = hint;
+            return v;
+        }
+    }
     const auto& uw = plan_->useWebs[i];
     IVal v;
     if (k < uw.size() && uw[k] >= 0) {
@@ -176,9 +186,9 @@ bool Baseline::inlineCall(std::uint32_t i, bool decideOnly)
     }
     if (!inlinable(C))
         return false;
-    IVal callee;
-    callee.kind = IVal::Box;
-    callee.frameReg = std::int32_t(base);
+    IVal callee = callerValue(i, base, 0, 8);
+    if (callee.kind != IVal::Box && callee.kind != IVal::Const)
+        return false;
     std::vector<IVal> args;
     args.push_back(callerValue(i, base + 1, 1, 8));
     for (unsigned k = 0; k < argc; ++k)
@@ -1443,4 +1453,211 @@ bool Baseline::inlineNew(std::uint32_t i)
     if (plan_->defWeb[i] >= 0)
         loadTypedAfter(i);
     return true;
+}
+
+// ---- call windows ----
+//
+// The instructions that fill the registers of an inlined call -- the callee, `this`, the arguments -- write nothing when
+// the registers are dead after it: the inlined body reads a copy's source, a constant, or (a method read) a slot. A failed
+// guard of the body then runs again from the first of them, which have no effects.
+
+void Baseline::planWindows()
+{
+    windowVal_.clear();
+    windowRead_.clear();
+    if (!code_->handlers.empty() || inlineBase_ < 0)
+        return;
+    std::vector<std::uint32_t> starts;
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        starts.push_back(j);
+    auto reads = [&](std::uint32_t j, unsigned r) {
+        for (std::uint16_t x : opt::effectsOf(*code_, j).rd)
+            if (x == r)
+                return true;
+        return false;
+    };
+    auto writes = [&](std::uint32_t j, unsigned r) {
+        for (std::uint16_t x : opt::effectsOf(*code_, j).wr)
+            if (x == r)
+                return true;
+        return false;
+    };
+    for (std::size_t k = 0; k < starts.size(); ++k) {
+        const std::uint32_t i = starts[k];
+        const Ins& in = code_->code[i];
+        if (in.opcode() != Op::Call || directCalls_.count(i) || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+            continue;
+        const unsigned base = in.b, argc = in.c;
+        const auto& uw = plan_->useWebs[i];
+        if (uw.size() < 2u + argc)
+            continue;
+        std::map<std::size_t, IVal> vals;
+        std::map<std::uint32_t, std::pair<std::int32_t, unsigned>> reads_;
+        std::set<std::uint32_t> defs;
+        std::uint32_t first = i;
+        std::int32_t nextSlot = 0;
+        // `this` and the arguments first, the callee last: a method read takes its receiver from the copy that filled `this`.
+        for (std::size_t n = 0; n < 2u + argc; ++n) {
+            const std::size_t op = n + 1 < 2u + argc ? n + 1 : 0;
+            if (uw[op] >= 0)
+                continue;
+            const unsigned r = base + unsigned(op);
+            // Its definition in this block, with nothing between reading it but the method read of this call.
+            std::int64_t d = -1;
+            for (std::size_t m = k; m-- > 0;) {
+                const std::uint32_t j = starts[m];
+                if (writes(j, r)) {
+                    d = j;
+                    break;
+                }
+                const bool methodRead = op == 1 && code_->code[j].opcode() == Op::GetProp && code_->code[j].a == base &&
+                                        code_->code[j].b == r;
+                if ((reads(j, r) && !methodRead) || plan_->isLeader[j])
+                    break;
+            }
+            if (d < 0 || !regDeadAfter(i, r) || plan_->defWeb[std::size_t(d)] >= 0)
+                continue;
+            const Ins& di = code_->code[std::size_t(d)];
+            IVal v;
+            switch (di.opcode()) {
+            case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse:
+                v.c = di.opcode() == Op::LoadUndef ? JSValue::undefined() : di.opcode() == Op::LoadNull ? JSValue::null()
+                    : JSValue::boolean(di.opcode() == Op::LoadTrue);
+                break;
+            case Op::LoadInt:
+                v.c = JSValue::int32(di.imm());
+                break;
+            case Op::Mov: {
+                if (plan_->useWebs[std::size_t(d)].empty() || plan_->useWebs[std::size_t(d)][0] >= 0)
+                    continue;
+                // The source stays as it is up to the call.
+                bool changed = false;
+                for (std::uint32_t j = std::uint32_t(d) + length(std::uint32_t(d)); j < i; j += length(j))
+                    changed = changed || writes(j, di.b);
+                if (changed)
+                    continue;
+                v.kind = IVal::Box;
+                v.frameReg = std::int32_t(di.b);
+                break;
+            }
+            case Op::GetProp: {
+                if (!chainable(std::uint32_t(d), false) || nextSlot >= std::int32_t(kWindowSlots))
+                    continue;
+                // The receiver: a register nothing writes up to the call, or a copy that is itself a window's.
+                unsigned recv = di.b;
+                for (auto& [o, val] : vals)
+                    if (base + o == di.b && val.kind == IVal::Box && val.frameReg >= 0)
+                        recv = unsigned(val.frameReg);
+                bool changed = false;
+                for (std::uint32_t j = std::uint32_t(d) + length(std::uint32_t(d)); j < i; j += length(j))
+                    changed = changed || (writes(j, recv) && !(recv == di.b && defs.count(j)));
+                if (changed && recv == di.b)
+                    continue;
+                v.kind = IVal::Box;
+                v.slot = -2 - nextSlot;  // a window slot (resolved by inlineBits)
+                v.hint = 8;
+                reads_[std::uint32_t(d)] = {nextSlot, recv};
+                ++nextSlot;
+                break;
+            }
+            default:
+                continue;
+            }
+            vals[op] = v;
+            defs.insert(std::uint32_t(d));
+            first = std::min(first, std::uint32_t(d));
+        }
+        if (vals.empty())
+            continue;
+        // From the first of them to the call: those definitions and typed arithmetic, nothing with effects.
+        bool pure = true;
+        for (std::uint32_t j = first; j < i && pure; j += length(j)) {
+            if (defs.count(j))
+                continue;
+            if (j != first && (plan_->isLeader[j] || opt::jumpTarget(*code_, j) >= 0)) {
+                pure = false;
+                break;
+            }
+            const Op op = code_->code[j].opcode();
+            bool typed = plan_->defWeb[j] >= 0 || op == Op::LoadInt;
+            for (std::int32_t w : plan_->useWebs[j])
+                typed = typed && w >= 0;
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            if (!typed || e.wr.size() != 1) {
+                pure = false;
+                break;
+            }
+            for (const opt::LiveWeb& lw : plan_->liveBefore[first])
+                if (lw.reg == e.wr[0])
+                    pure = false;
+            for (const auto& [o, val] : vals)
+                if (val.kind == IVal::Box && val.frameReg >= 0 && e.wr[0] == unsigned(val.frameReg))
+                    pure = false;
+        }
+        if (!pure)
+            continue;
+        windowVal_[i] = vals;
+        const bool ok = inlineCall(i, true);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2WIN"))
+            std::fprintf(stderr, "window %s @%u from %u: %zu values, %s\n", codeName(code_).c_str(), i, first, vals.size(), ok ? "yes" : "no");
+#endif
+        if (!ok) {
+            windowVal_.erase(i);
+            continue;
+        }
+        for (std::uint32_t d : defs)
+            if (!reads_.count(d))
+                skipDef_[d] = 1;
+        for (auto& [d, sr] : reads_)
+            windowRead_[d] = sr;
+        for (std::uint32_t j = first + length(first); j <= i; j += length(j))
+            exitRedirect_[j] = std::int32_t(first);
+    }
+}
+
+void Baseline::emitWindowRead(std::uint32_t i)
+{
+    // A method read for an inlined call: into its slot, from the receiver the planner chose.
+    const auto& [slot, recv] = windowRead_.at(i);
+    const Ins& in = code_->code[i];
+    const InlineCache& ic = code_->caches[code_->code[i + 1].a];
+    Label& bad = exitBefore(i);
+    struct Seen
+    {
+        std::uint32_t shape, index;
+        JSObject* holder;
+        ValidityCell* validity;
+    };
+    Seen seen[5];
+    int count = 0;
+    seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+    if (ic.pad && ic.pad <= code_->poly.size()) {
+        const PolyCache& pc = code_->poly[ic.pad - 1];
+        for (std::uint8_t k = 0; k < pc.n; ++k)
+            seen[count++] = Seen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity};
+    }
+    (void)in;
+    a_.mov(RAX, R(recv));
+    needObject(RAX, bad);
+    Label got;
+    for (int k = 0; k < count; ++k) {
+        Label next;
+        a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
+        a_.jcc(CNE, k + 1 < count ? next : bad);
+        if (seen[k].holder) {
+            hold(seen[k].validity);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
+        }
+        slotAddress(seen[k].index);
+        a_.jmp(got);
+        if (k + 1 < count)
+            a_.bind(next);
+    }
+    a_.bind(got);
+    a_.mov(RAX, mem(RDX, 0));
+    a_.mov(mem(RSP, windowBase_ + 8 * slot), RAX);
 }

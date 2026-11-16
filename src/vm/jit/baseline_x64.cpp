@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <exception>
 #include <utility>
@@ -880,6 +881,12 @@ private:
         bool thisNull;       ///< the skipped `this` is null (else undefined)
     };
     std::vector<std::int32_t> exitRedirect_;  ///< an exit at an instruction runs from here instead (nothing between has effects)
+    /// Inlined calls whose window registers are not written: what the inlined body reads for each (by call, then operand).
+    std::map<std::uint32_t, std::map<std::size_t, IVal>> windowVal_;
+    std::map<std::uint32_t, std::pair<std::int32_t, unsigned>> windowRead_;  ///< a GetProp of a window: its slot, its receiver
+    std::int32_t windowBase_ = -1;
+    void planWindows();
+    void emitWindowRead(std::uint32_t i);
     std::map<std::uint32_t, DirectCall> directCalls_;
     std::vector<std::uint8_t> skipDef_;  ///< instructions whose result a direct call keeps out of the frame
     std::map<std::uint32_t, std::vector<std::pair<unsigned, JSValue>>> pendingAt_;  ///< what an exit there writes first

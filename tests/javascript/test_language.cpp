@@ -3285,3 +3285,45 @@ TEST(typeofAndNamesCompareByPointerInNativeCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("106667 1 3 2 7"));
     }
 }
+
+TEST(polymorphicReadsAndPrototypeMethodsFromCompiledCode)
+{
+    // Objects of one shape with different numbers of inline slots, a prototype that grows and whose method and getter are
+    // replaced under compiled callers, receivers of a few shapes, and a receiver register written after its method read.
+    const char* program =
+        "var out = [];"
+        "function P(x, y) { this.x = x; this.y = y; }"
+        "function mkLit(x, y) { var o = {}; o.x = x; o.y = y; return o; }"
+        "function sum(o) { return o.x + o.y; }"
+        "var s = 0; for (var i = 0; i < 20000; i++) s += sum(new P(i, 1));"
+        "for (var i = 0; i < 20000; i++) s += sum(i & 1 ? new P(i, 2) : mkLit(i, 3)); out.push(s);"
+        "class A { constructor(v) { this.v = v; } f() { return this.v + 1; } get g() { return this.v * 2; } }"
+        "class B extends A { f() { return super.f() + 10; } }"
+        "function run(a, b, n) { var t = 0; for (var i = 0; i < n; i++) t += a.f() + b.f() + a.g; return t; }"
+        "var a = new A(1), b = new B(2); out.push(run(a, b, 50000));"
+        "for (var k = 0; k < 20; k++) A.prototype['p' + k] = k; out.push(run(a, b, 50000));"
+        "A.prototype.f = function () { return 100; }; out.push(run(a, b, 50000));"
+        "Object.defineProperty(A.prototype, 'g', { get() { return -1; }, configurable: true }); out.push(run(a, b, 50000));"
+        "function Q(a) { this.a = a; this.b = a; } function R(a) { this.z = 0; this.a = a; this.b = a; }"
+        "function dot(p, q) { return p.a * q.a + p.b * q.b + p.a; }"
+        "var qs = [new Q(1), new R(2), new Q(3), new R(4)], u = 0;"
+        "for (var i = 0; i < 100000; i++) u += dot(qs[i & 3], qs[(i + 1) & 3]); out.push(u);"
+        "qs.push({ a: 5, b: 6 }); qs.push({ b: 7, a: 8 });"
+        "for (var i = 0; i < 100000; i++) u += dot(qs[i % 6], qs[(i + 1) % 6]); out.push(u);"
+        "function W() { this.k = 1; } W.prototype.m = function () { return this.k; };"
+        "function sk(n) { var w = new W(), t = 0; for (var i = 0; i < n; i++) { t += w.m(); if (i == n - 2) w = { k: 5, m: function () { return this.k * 2; } }; } return t; }"
+        "out.push(sk(30000), sk(30000));"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("400050000 850000 850000 10600000 10450000 1450000 4849958 30009 30009"));
+    }
+}

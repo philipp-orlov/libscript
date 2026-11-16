@@ -189,6 +189,8 @@ bool Baseline::inlineCall(std::uint32_t i, bool decideOnly)
     IVal callee = callerValue(i, base, 0, 8);
     if (callee.kind != IVal::Box && callee.kind != IVal::Const)
         return false;
+    if (known.isUndefined() && callee.kind == IVal::Box && callee.slot <= -2)
+        known = windowMethod(i, -2 - callee.slot, C);
     std::vector<IVal> args;
     args.push_back(callerValue(i, base + 1, 1, 8));
     for (unsigned k = 0; k < argc; ++k)
@@ -244,17 +246,12 @@ bool Baseline::inlineGetter(std::uint32_t i)
         if (cx.emit) {
             // The receiver has the shape, the prototype chain is as it was, and the getter is the one compiled in.
             Label& bad = exitBefore(i);
-            a_.mov(RAX, R(in.b));
-            needObject(RAX, bad);
-            a_.cmpI32(mem(RAX, 0), std::int32_t(e.shape));
-            a_.jcc(CNE, bad);
+            provenShape(in.b, e.shape, bad);
             hold(e.validity);
             a_.movImm(RCX, reinterpret_cast<std::uint64_t>(e.validity));
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
-            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(e.holder));
-            slotAddress(e.index);
-            a_.mov(RAX, mem(RDX, 0));
+            holderRead(e.holder, e.index);
             holdValue(gs->getter);
             a_.movImm(RCX, gs->getter.bits);
             a_.cmp(RCX, mem(RAX, kGsGetter));
@@ -495,22 +492,16 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             if (cacheId == kNoCache)
                 return false;
             const InlineCache& ic = C->caches[cacheId];
-            struct Seen
-            {
-                std::uint32_t shape, index;
-                JSObject* holder;
-                ValidityCell* validity;
-            };
-            Seen seen[5];
+            PolySeen seen[5];
             int count = 0;
             if (ic.shape != 0 && ic.next == 0 && (!ic.holder || ic.validity))
-                seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+                seen[count++] = PolySeen{ic.shape, ic.index, ic.holder, ic.validity, ic.aux};
             if (ic.pad && ic.pad <= C->poly.size()) {
                 const PolyCache& pc = C->poly[ic.pad - 1];
                 for (std::uint8_t k = 0; k < pc.n; ++k) {
                     const PolyEntry& e = pc.e[k];
                     if (e.kind == PolyEntry::OwnData || (e.kind == PolyEntry::ProtoData && e.validity))
-                        seen[count++] = Seen{e.shape, e.index, e.holder, e.validity};
+                        seen[count++] = PolySeen{e.shape, e.index, e.holder, e.validity, e.aux};
                     else
                         return false;
                 }
@@ -519,27 +510,8 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             if (!count || !bad)
                 return false;
             if (emit) {
-                Label got;
                 inlineBits(recv, RAX);
-                needObject(RAX, *bad);
-                for (int k = 0; k < count; ++k) {
-                    Label next;
-                    a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
-                    a_.jcc(CNE, k + 1 < count ? next : *bad);
-                    if (seen[k].holder) {
-                        hold(seen[k].validity);
-                        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
-                        a_.cmpI32(mem(RCX, kValidityValid), 0);
-                        a_.jcc(CE, *bad);
-                        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
-                    }
-                    slotAddress(seen[k].index);
-                    a_.jmp(got);
-                    if (k + 1 < count)
-                        a_.bind(next);
-                }
-                a_.bind(got);
-                a_.mov(RAX, mem(RDX, 0));
+                polyRead(seen, count, *bad, recv.kind == IVal::Box && recv.frameReg >= 0 ? recv.frameReg : -1);
             }
             IVal out;
             if (!takeRead(p, bad, out))
@@ -1228,41 +1200,16 @@ void Baseline::emitChain(std::uint32_t i)
     }
     case Op::GetProp: {
         const InlineCache& ic = code_->caches[code_->code[i + 1].a];
-        struct Seen
-        {
-            std::uint32_t shape, index;
-            JSObject* holder;
-            ValidityCell* validity;
-        };
-        Seen seen[5];
+        PolySeen seen[5];
         int count = 0;
-        seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+        seen[count++] = PolySeen{ic.shape, ic.index, ic.holder, ic.validity, ic.aux};
         if (ic.pad && ic.pad <= code_->poly.size()) {
             const PolyCache& pc = code_->poly[ic.pad - 1];
             for (std::uint8_t k = 0; k < pc.n; ++k)
-                seen[count++] = Seen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity};
+                seen[count++] = PolySeen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity, pc.e[k].aux};
         }
         receiver(in.b);
-        needObject(RAX, bad);
-        Label got;
-        for (int k = 0; k < count; ++k) {
-            Label next;
-            a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
-            a_.jcc(CNE, k + 1 < count ? next : bad);
-            if (seen[k].holder) {
-                hold(seen[k].validity);
-                a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
-                a_.cmpI32(mem(RCX, kValidityValid), 0);
-                a_.jcc(CE, bad);
-                a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
-            }
-            slotAddress(seen[k].index);
-            a_.jmp(got);
-            if (k + 1 < count)
-                a_.bind(next);
-        }
-        a_.bind(got);
-        a_.mov(RAX, mem(RDX, 0));
+        polyRead(seen, count, bad);
         break;
     }
     default:
@@ -1625,6 +1572,46 @@ void Baseline::planWindows()
     }
 }
 
+/// The function the method read of call `i` into window `slot` finds, when every way it has read it is from one prototype slot that now holds a
+/// function of `C`: the read checks the chain, and the call need only check it is that function (undefined: none).
+JSValue Baseline::windowMethod(std::uint32_t i, std::int32_t slot, const CodeBlock* C) const
+{
+    // The call's own reads come just before it (nothing else is between them), so the last one before it with that slot.
+    for (auto it = windowRead_.lower_bound(i); it != windowRead_.begin();) {
+        --it;
+        const auto& [d, sr] = *it;
+        if (sr.first != slot)
+            continue;
+        const InlineCache& ic = code_->caches[code_->code[d + 1].a];
+        const JSObject* holder = nullptr;
+        std::uint32_t index = 0;
+        bool ok = true;
+        auto take = [&](const JSObject* h, std::uint32_t x, const ValidityCell* v) {
+            if (!h || !v || !v->valid || (holder && (holder != h || index != x)))
+                ok = false;
+            holder = h;
+            index = x;
+        };
+        if (ic.shape != 0)
+            take(ic.holder, ic.index, ic.validity);
+        if (ic.pad && ic.pad <= code_->poly.size()) {
+            const PolyCache& pc = code_->poly[ic.pad - 1];
+            for (std::uint8_t k = 0; k < pc.n; ++k)
+                take(pc.e[k].kind == PolyEntry::ProtoData ? pc.e[k].holder : nullptr, pc.e[k].index, pc.e[k].validity);
+        }
+        if (!ok || !holder)
+            return JSValue::undefined();
+        const JSValue v = *const_cast<JSObject*>(holder)->slotAt(index);
+        if (!isFunction(v))
+            return JSValue::undefined();
+        const auto* f = static_cast<const JSFunction*>(asObject(v));
+        if ((f->flags & JSFunction::kNative) || f->code != C)
+            return JSValue::undefined();
+        return v;
+    }
+    return JSValue::undefined();
+}
+
 void Baseline::emitWindowRead(std::uint32_t i)
 {
     // A method read for an inlined call: into its slot, from the receiver the planner chose.
@@ -1632,42 +1619,17 @@ void Baseline::emitWindowRead(std::uint32_t i)
     const Ins& in = code_->code[i];
     const InlineCache& ic = code_->caches[code_->code[i + 1].a];
     Label& bad = exitBefore(i);
-    struct Seen
-    {
-        std::uint32_t shape, index;
-        JSObject* holder;
-        ValidityCell* validity;
-    };
-    Seen seen[5];
+    PolySeen seen[5];
     int count = 0;
-    seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+    seen[count++] = PolySeen{ic.shape, ic.index, ic.holder, ic.validity, ic.aux};
     if (ic.pad && ic.pad <= code_->poly.size()) {
         const PolyCache& pc = code_->poly[ic.pad - 1];
         for (std::uint8_t k = 0; k < pc.n; ++k)
-            seen[count++] = Seen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity};
+            seen[count++] = PolySeen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity, pc.e[k].aux};
     }
     (void)in;
     a_.mov(RAX, R(recv));
-    needObject(RAX, bad);
-    Label got;
-    for (int k = 0; k < count; ++k) {
-        Label next;
-        a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
-        a_.jcc(CNE, k + 1 < count ? next : bad);
-        if (seen[k].holder) {
-            hold(seen[k].validity);
-            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
-            a_.cmpI32(mem(RCX, kValidityValid), 0);
-            a_.jcc(CE, bad);
-            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
-        }
-        slotAddress(seen[k].index);
-        a_.jmp(got);
-        if (k + 1 < count)
-            a_.bind(next);
-    }
-    a_.bind(got);
-    a_.mov(RAX, mem(RDX, 0));
+    polyRead(seen, count, bad, int(recv));
     a_.mov(mem(RSP, windowBase_ + 8 * slot), RAX);
 }
 
@@ -1791,40 +1753,15 @@ void Baseline::emitReadInto(std::uint32_t i, bool fromRax, Label& bad)
         return;
     }
     const InlineCache& ic = code_->caches[code_->code[i + 1].a];
-    struct Seen
-    {
-        std::uint32_t shape, index;
-        JSObject* holder;
-        ValidityCell* validity;
-    };
-    Seen seen[5];
+    PolySeen seen[5];
     int count = 0;
-    seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+    seen[count++] = PolySeen{ic.shape, ic.index, ic.holder, ic.validity, ic.aux};
     if (ic.pad && ic.pad <= code_->poly.size()) {
         const PolyCache& pc = code_->poly[ic.pad - 1];
         for (std::uint8_t k = 0; k < pc.n; ++k)
-            seen[count++] = Seen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity};
+            seen[count++] = PolySeen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity, pc.e[k].aux};
     }
     if (!fromRax)
         a_.mov(RAX, R(in.b));
-    needObject(RAX, bad);
-    Label got;
-    for (int k = 0; k < count; ++k) {
-        Label next;
-        a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
-        a_.jcc(CNE, k + 1 < count ? next : bad);
-        if (seen[k].holder) {
-            hold(seen[k].validity);
-            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
-            a_.cmpI32(mem(RCX, kValidityValid), 0);
-            a_.jcc(CE, bad);
-            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
-        }
-        slotAddress(seen[k].index);
-        a_.jmp(got);
-        if (k + 1 < count)
-            a_.bind(next);
-    }
-    a_.bind(got);
-    a_.mov(RAX, mem(RDX, 0));
+    polyRead(seen, count, bad, fromRax ? -1 : int(in.b));
 }

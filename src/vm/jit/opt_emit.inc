@@ -581,44 +581,22 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n) {
             // Several shapes: a test for each, the slot found at run time.
             const PolyCache& pc = code_->poly[ic.pad - 1];
-            struct Seen
-            {
-                std::uint32_t shape, index;
-                JSObject* holder;
-                ValidityCell* validity;
-            };
-            Seen seen[5];
+            PolySeen seen[5];
             int count = 0;
-            seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+            seen[count++] = PolySeen{ic.shape, ic.index, ic.holder, ic.validity, ic.aux};
             for (std::uint8_t k = 0; k < pc.n; ++k) {
                 const PolyEntry& e = pc.e[k];
                 if (e.kind == PolyEntry::OwnData || (e.kind == PolyEntry::ProtoData && e.validity))
-                    seen[count++] = Seen{e.shape, e.index, e.holder, e.validity};
+                    seen[count++] = PolySeen{e.shape, e.index, e.holder, e.validity, e.aux};
                 else
                     return false;
             }
+            if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
+                for (int k = 0; k < count; ++k)
+                    seen[k].aux = 0;
             Label& bad = exitBefore(i);
-            Label got;
             a_.mov(RAX, R(in.b));
-            needObject(RAX, bad);
-            for (int k = 0; k < count; ++k) {
-                Label next;
-                a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
-                a_.jcc(CNE, k + 1 < count ? next : bad);
-                if (seen[k].holder) {
-                    hold(seen[k].validity);
-                    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
-                    a_.cmpI32(mem(RCX, kValidityValid), 0);
-                    a_.jcc(CE, bad);
-                    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
-                }
-                slotAddress(seen[k].index);
-                a_.jmp(got);
-                if (k + 1 < count)
-                    a_.bind(next);
-            }
-            a_.bind(got);
-            a_.mov(RAX, mem(RDX, 0));
+            polyRead(seen, count, bad, int(in.b));
             unboxRax(dw, bad);
             return true;
         }
@@ -629,8 +607,9 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic.validity));
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
-            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(ic.holder));
-            slotAddress(ic.index);
+            holderRead(ic.holder, ic.index);
+            unboxRax(dw, bad);
+            return true;
         } else {
             // A site whose guard failed before sees objects of this shape with other inline slot counts: the address is
             // worked out each time.
@@ -639,9 +618,6 @@ bool Baseline::emitTyped(std::uint32_t i)
             unboxRax(dw, bad);
             return true;
         }
-        a_.mov(RAX, mem(RDX, 0));
-        unboxRax(dw, bad);
-        return true;
     }
     case Op::GetElem: case Op::PutElem: {
         // An element of the one kind of indexed object the site has seen, at an int32 index: no boxing of the index, one
@@ -987,7 +963,9 @@ void Baseline::emitOpt(std::uint32_t i)
     carried_ = plan_->isLeader[i] ? -1 : raxHolds_;
     raxHolds_ = -1;
     if (skipDef_.size() > i && skipDef_[i]) {
-        forgetFacts();
+        // Nothing runs; the register it would have written no longer holds what was proven about it.
+        for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
+            forgetFact(r);
         return;
     }
     if (directCalls_.count(i)) {
@@ -1001,16 +979,15 @@ void Baseline::emitOpt(std::uint32_t i)
         return;
     }
     if (windowRead_.count(i)) {
-        forgetFacts();
+        // A pure read into a window slot: what is proven about the frame's registers stays.
         emitWindowRead(i);
+        for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
+            forgetFact(r);
         return;
     }
     if (emitTyped(i)) {
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
-            if (r < factShape_.size()) {
-                factShape_[r] = 0;
-                factAux_[r] = -1;
-            }
+            forgetFact(r);
         return;
     }
     forgetFacts();
@@ -1143,6 +1120,8 @@ Tier2Code* Baseline::compileOptimized()
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);
+    factInl_.assign(code_->nregs + 1, 0);
+    factSet_.assign(code_->nregs + 1, std::array<std::uint32_t, 4>{});
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);

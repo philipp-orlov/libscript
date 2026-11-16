@@ -383,7 +383,8 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
     for (std::uint8_t i = 0; i < pc.n; ++i)
         if (pc.e[i].shape == entry.shape)
             at = i;
-    if (at == pc.n) {
+    const bool known = at != pc.n;
+    if (!known) {
         if (pc.n < 4) {
             ++pc.n;
         } else {
@@ -391,6 +392,9 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
             pc.next = std::uint8_t((pc.next + 1) & 3);
         }
     }
+    entry.aux = std::uint8_t(o->h.aux + 1u);
+    if (known && pc.e[at].aux != entry.aux)
+        entry.aux = 0;  // objects of this shape come with different inline slot counts
     if (pc.e[at].validity)
         vm.releaseValidity(pc.e[at].validity);
     pc.e[at] = entry;

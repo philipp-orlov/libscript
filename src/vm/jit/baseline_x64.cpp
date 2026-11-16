@@ -22,6 +22,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <utility>
 #include <initializer_list>
@@ -817,7 +818,25 @@ private:
     /// and at any instruction the optimizing compiler does not do itself.
     std::vector<std::uint32_t> factShape_;
     std::vector<std::int32_t> factAux_;
-    void forgetFacts() { std::fill(factShape_.begin(), factShape_.end(), 0u); std::fill(factAux_.begin(), factAux_.end(), -1); }
+    /// Also: more inline slots than this (an object's count never changes), and one of these shapes (0 ends the list).
+    std::vector<std::int32_t> factInl_;
+    std::vector<std::array<std::uint32_t, 4>> factSet_;
+    void forgetFacts()
+    {
+        std::fill(factShape_.begin(), factShape_.end(), 0u);
+        std::fill(factAux_.begin(), factAux_.end(), -1);
+        std::fill(factInl_.begin(), factInl_.end(), 0);
+        std::fill(factSet_.begin(), factSet_.end(), std::array<std::uint32_t, 4>{});
+    }
+    void forgetFact(unsigned r)
+    {
+        if (r < factShape_.size()) {
+            factShape_[r] = 0;
+            factAux_[r] = -1;
+            factInl_[r] = 0;
+            factSet_[r] = {};
+        }
+    }
     /// Make the object in frame register `reg` (left in RAX) be of shape `shape`, else `bad`. Proved for the code after it.
     void provenShape(unsigned reg, std::uint32_t shape, Label& bad)
     {
@@ -936,6 +955,7 @@ private:
     /// Inlined calls whose window registers are not written: what the inlined body reads for each (by call, then operand).
     std::map<std::uint32_t, std::map<std::size_t, IVal>> windowVal_;
     std::map<std::uint32_t, std::pair<std::int32_t, unsigned>> windowRead_;  ///< a GetProp of a window: its slot, its receiver
+    JSValue windowMethod(std::uint32_t i, std::int32_t slot, const CodeBlock* C) const;
     std::int32_t windowBase_ = -1;
     void planWindows();
     std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> mathWin_;  ///< Math call: (its GetGlobal, its GetProp)
@@ -1116,6 +1136,173 @@ private:
         a_.alu32(5, RSI, RCX);
         a_.lea(RDX, mem(RDX, RSI, 8));
         a_.bind(done);
+    }
+
+    struct PolySeen
+    {
+        std::uint32_t shape, index;
+        JSObject* holder;
+        ValidityCell* validity;
+        std::uint8_t aux;  ///< as `PolyEntry::aux`
+    };
+    /// The value in slot `index` of `holder` (a prototype, whose chain a checked validity cell vouches for), into rax. Its
+    /// inline slots never move, and its others move only when it gains a property, which changes the chain.
+    void holderRead(const JSObject* holder, std::uint32_t index)
+    {
+        if (index < holder->h.aux) {
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(holder) + std::uint64_t(kObjInline) + 8u * index);
+            a_.mov(RAX, mem(RAX, 0));
+        } else {
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(holder));
+            a_.mov(RDX, mem(RAX, kObjSlots));
+            a_.mov(RAX, mem(RDX, std::int32_t(8 * (index - holder->h.aux))));
+        }
+    }
+    /// The access of one entry, on the object in rax (of its shape), into rax.
+    void polyEntryRead(const PolySeen& s, Label& bad, int factReg)
+    {
+        if (s.holder) {
+            hold(s.validity);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(s.validity));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+            holderRead(s.holder, s.index);
+            return;
+        }
+        if (!s.aux) {
+            slotAddress(s.index);
+            a_.mov(RAX, mem(RDX, 0));
+            return;
+        }
+        const std::int32_t inl = std::int32_t(s.aux) - 1;
+        const bool knownAux = factReg >= 0 && factAux_[unsigned(factReg)] == inl;
+        if (std::int32_t(s.index) < inl) {
+            // An inline slot: any object with more inline slots than the index has it there.
+            if (!knownAux && !(factReg >= 0 && std::int32_t(s.index) < factInl_[unsigned(factReg)])) {
+                a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(s.index));
+                a_.jcc(CBE, bad);
+                if (factReg >= 0)
+                    factInl_[unsigned(factReg)] = std::int32_t(s.index) + 1;
+            }
+            a_.mov(RAX, mem(RAX, kObjInline + std::int32_t(8 * s.index)));
+            return;
+        }
+        if (!knownAux) {
+            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
+            a_.jcc(CNE, bad);
+            if (factReg >= 0)
+                factAux_[unsigned(factReg)] = inl;
+        }
+        a_.mov(RDX, mem(RAX, kObjSlots));
+        a_.mov(RAX, mem(RDX, std::int32_t(8 * (std::int32_t(s.index) - inl))));
+    }
+    /// The slot one of `seen` names, of the value in rax, into rax; `bad` when it is not an object of one of their shapes.
+    /// Shapes reached the same way (an own slot at the same place) share one load. `factReg` is the frame register the
+    /// value came from (-1: none), whose proven shape spares the checks and which learns the shape when there is one.
+    /// Clobbers rcx, rdx, rsi.
+    void polyRead(const PolySeen* seen, int count, Label& bad, int factReg = -1)
+    {
+        if (factReg >= 0 && factShape_[unsigned(factReg)] != 0) {
+            for (int k = 0; k < count; ++k)
+                if (seen[k].shape == factShape_[unsigned(factReg)]) {
+                    polyEntryRead(seen[k], bad, factReg);
+                    return;
+                }
+        }
+        // How entry k reaches its slot: entries that agree on it share the code.
+        auto key = [&](int k) -> std::uint64_t {
+            const PolySeen& s = seen[k];
+            if (s.holder)
+                return ~std::uint64_t(k);
+            if (s.aux && std::int32_t(s.index) < std::int32_t(s.aux) - 1)
+                return std::uint64_t(s.index) << 2 | 1;
+            return std::uint64_t(s.index) << 10 | std::uint64_t(s.aux) << 2 | 2;
+        };
+        if (factReg >= 0 && factSet_[unsigned(factReg)][0] != 0) {
+            // One of a few shapes, proven: when all of them are read the same way, that is the read.
+            const auto& set = factSet_[unsigned(factReg)];
+            int common = -1;
+            bool same = true;
+            for (std::uint32_t sh : set) {
+                if (!sh)
+                    break;
+                int at = -1;
+                for (int k = 0; k < count; ++k)
+                    if (seen[k].shape == sh)
+                        at = k;
+                if (at < 0 || (common >= 0 && key(at) != key(common)))
+                    same = false;
+                else if (common < 0)
+                    common = at;
+            }
+            if (same && common >= 0 && !seen[common].holder) {
+                polyEntryRead(seen[common], bad, factReg);
+                return;
+            }
+        }
+        needObject(RAX, bad);
+        bool one = true;
+        for (int k = 1; k < count; ++k)
+            one = one && seen[k].shape == seen[0].shape;
+        if (one) {
+            a_.cmpI32(mem(RAX, 0), std::int32_t(seen[0].shape));
+            a_.jcc(CNE, bad);
+            if (factReg >= 0 && factShape_[unsigned(factReg)] != seen[0].shape) {
+                factShape_[unsigned(factReg)] = seen[0].shape;
+                factAux_[unsigned(factReg)] = -1;
+            }
+            polyEntryRead(seen[0], bad, factReg);
+            return;
+        }
+        int group[5];
+        Label labels[5];
+        int groups = 0;
+        int leader[5];
+        for (int k = 0; k < count; ++k) {
+            group[k] = -1;
+            for (int g = 0; g < groups; ++g)
+                if (key(leader[g]) == key(k))
+                    group[k] = g;
+            if (group[k] < 0) {
+                leader[groups] = k;
+                group[k] = groups++;
+            }
+        }
+        // The last entry falls through to its group's code, which comes first.
+        const int first = group[count - 1];
+        for (int k = 0; k + 1 < count; ++k) {
+            a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
+            a_.jcc(CE, labels[group[k]]);
+        }
+        a_.cmpI32(mem(RAX, 0), std::int32_t(seen[count - 1].shape));
+        a_.jcc(CNE, bad);
+        if (factReg >= 0 && factShape_[unsigned(factReg)] == 0) {
+            std::array<std::uint32_t, 4> set{};
+            int n = 0;
+            bool fits = true;
+            for (int k = 0; k < count; ++k) {
+                bool dup = false;
+                for (int m = 0; m < n; ++m)
+                    dup = dup || set[std::size_t(m)] == seen[k].shape;
+                if (dup)
+                    continue;
+                if (n == 4)
+                    fits = false;
+                else
+                    set[std::size_t(n++)] = seen[k].shape;
+            }
+            if (fits)
+                factSet_[unsigned(factReg)] = set;
+        }
+        Label got;
+        for (int n = 0; n < groups; ++n) {
+            const int g = n == 0 ? first : (n <= first ? n - 1 : n);
+            a_.bind(labels[g]);
+            polyEntryRead(seen[leader[g]], bad, -1);
+            if (n + 1 < groups)
+                a_.jmp(got);
+        }
+        a_.bind(got);
     }
 
     /// Both `x` and `y` are numbers (int32 or double), else jump to `bad`.

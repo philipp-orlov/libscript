@@ -132,6 +132,7 @@ struct PolyEntry
     JSObject* holder = nullptr;
     ValidityCell* validity = nullptr;  ///< holds a count (inherited kinds)
     Kind kind = OwnData;
+    std::uint8_t aux = 0;  ///< the inline slot count of the receiver it learned on, + 1 (0: not known or not one)
 };
 struct PolyCache
 {

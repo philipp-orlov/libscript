@@ -1433,6 +1433,37 @@ NATIVE(arrayFillImpl)
     return self;
 }
 
+/// 1 for a comparator that is `(a, b) => a - b` in effect, -1 for `b - a`, else 0: on numbers it is pure arithmetic, which the
+/// sort can do itself with the same results.
+int numericComparator(JSValue compare)
+{
+    if (!isFunction(compare))
+        return 0;
+    auto* f = static_cast<JSFunction*>(asObject(compare));
+    if ((f->flags & JSFunction::kNative) || !f->code)
+        return 0;
+    const CodeBlock* c = f->code;
+    if (c->nparams != 2 || (c->flags & (CodeBlock::kNeedsArgs | CodeBlock::kGenerator | CodeBlock::kAsync |
+                                        CodeBlock::kAsyncGen | CodeBlock::kClassConstructor)))
+        return 0;
+    if (c->code.size() < 2)
+        return 0;
+    const Ins& sub = c->code[0];
+    const Ins& ret = c->code[1];
+    if (sub.opcode() != Op::Sub || ret.opcode() != Op::Ret || ret.a != sub.a)
+        return 0;
+    for (std::size_t j = 2; j < c->code.size(); ++j) {
+        const Op op = c->code[j].opcode();
+        if (op != Op::LoadUndef && op != Op::Ret && op != Op::Nop)
+            return 0;
+    }
+    if (sub.b == 1 && sub.c == 2)
+        return 1;
+    if (sub.b == 2 && sub.c == 1)
+        return -1;
+    return 0;
+}
+
 NATIVE(arraySortImpl)
 {
     UNUSED();
@@ -1501,7 +1532,17 @@ NATIVE(arraySortImpl)
         release(sy);
         return r;
     };
-    mergeSort(items.data(), items.data() + items.size(), less);
+    // `(a, b) => a - b` on numbers: the same answers without calling it.
+    const int numeric = numericComparator(compare);
+    bool numbers = numeric != 0;
+    for (std::size_t k = 0; k < items.size() && numbers; ++k)
+        numbers = items[k].isNumber();
+    if (numbers && numeric > 0)
+        mergeSort(items.data(), items.data() + items.size(), [](JSValue x, JSValue y) { return x.asNumber() - y.asNumber() < 0; });
+    else if (numbers)
+        mergeSort(items.data(), items.data() + items.size(), [](JSValue x, JSValue y) { return y.asNumber() - x.asNumber() < 0; });
+    else
+        mergeSort(items.data(), items.data() + items.size(), less);
     if (failed) {
         for (JSValue v : items)
             release(v);

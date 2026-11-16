@@ -3906,3 +3906,31 @@ TEST(selfRecursionRunInPlaceKeepsItsFramesInTraces)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("Error: b\n    at deep2 (<test>:3)\n    at deep2 (<test>:4)\n    at deep2 (<test>:4)\n    at deep2 (<test>:4)\n    at deep2 (<test>:4)\n    at <program> (<test>:8)"));
     }
 }
+
+TEST(aReturnedRegisterGivesItsCountToTheResult)
+{
+    // The optimized code returns a register the frame clears with that register's count: with many registers holding
+    // cells the clear is a call into the runtime, which must not let the result go.
+    const char* program =
+        "function many(a) {"
+        "    var o1 = { x: a }, o2 = { x: 2 }, o3 = { x: 3 }, o4 = { x: 4 }, o5 = { x: 5 }, o6 = { x: 6 };"
+        "    var o7 = { x: 7 }, o8 = { x: 8 }, o9 = { x: 9 }, o10 = { x: 10 }, o11 = { x: 11 };"
+        "    var r = { s: o1.x + o2.x + o3.x + o4.x + o5.x + o6.x + o7.x + o8.x + o9.x + o10.x + o11.x, k: o5 };"
+        "    return r;"
+        "}"
+        "var keep = [], t = 0;"
+        "for (var i = 0; i < 5000; i++) { var r = many(i); t += r.s + r.k.x; if (i % 1000 == 0) keep.push(r); }"
+        "for (var j = 0; j < 100000; j++) ({ y: j });"
+        "keep.map(function (r) { return r.s + \":\" + r.k.x; }).join(\",\") + \"|\" + t;";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("65:5,1065:5,2065:5,3065:5,4065:5|12847500"));
+    }
+}

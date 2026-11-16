@@ -1255,6 +1255,14 @@ bool Baseline::emitMove(std::uint32_t i)
             clear = j;
             break;
         }
+        // The frame's way out clears `b`: what it held goes with the result.
+        if (x.opcode() == Op::Ret && x.a != in.b && in.b > code_->nparams) {
+            forgetFacts();
+            a_.mov(RAX, R(in.b));
+            a_.mov(R(in.b), std::int32_t(kUndefined));
+            write(in.a, RAX);
+            return true;
+        }
         const opt::Effects e = opt::effectsOf(*code_, j);
         bool touches = !e.ok;
         for (std::uint16_t r : e.rd)

@@ -3401,10 +3401,30 @@ void Baseline::call(std::uint32_t i, const Ins& in)
 void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
 {
     // `numberInRax`: the result is a number the optimized code has boxed in rax already, which needs no count.
+    const unsigned first = 1 + code_->nparams;
+    // A result in a register this frame clears on its way out goes with that register's count (optimized code).
+    const bool taken = optimizing() && !numberInRax && in.a >= first && in.a < code_->nregs;
     Label have;
     if (!numberInRax)
         a_.mov(RAX, R(in.a));
-    if (code_->constructor || (code_->flags & CodeBlock::kClassConstructor)) {
+    if (taken && (code_->constructor || (code_->flags & CodeBlock::kClassConstructor))) {
+        // A constructor's result that is not an object is `this`; the register's value is then let go.
+        Label useThis, counted;
+        a_.cmpI8(mem(R13, kFrameConstruct), 0);
+        a_.jcc(CE, counted);
+        a_.test(RAX, R15);
+        a_.jcc(CNE, useThis);
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CE, counted);
+        a_.bind(useThis);
+        a_.mov(RDX, R(in.a));
+        a_.mov(R(in.a), std::int32_t(kUndefined));
+        release(RDX);
+        a_.mov(RAX, R(0));
+        retain(RAX);
+        a_.bind(counted);
+    } else if (taken) {
+    } else if (code_->constructor || (code_->flags & CodeBlock::kClassConstructor)) {
         // A constructor's result that is not an object is `this`.
         Label useThis;
         a_.cmpI8(mem(R13, kFrameConstruct), 0);
@@ -3425,14 +3445,15 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
             a_.bind(counted);
         }
     }
-    if (!numberInRax) {
+    if (!numberInRax && !taken) {
         a_.bind(have);
         retain(RAX);
     }
     // Registers a call put its arguments in belong to the caller; those the call did not fill and everything above the
     // parameters are this frame's to clear. When none can hold a cell, nothing here calls out and rax stays.
-    const unsigned first = 1 + code_->nparams;
-    auto isPlain = [&](unsigned r) { return (r < plainRegs_.size() && plainRegs_[r]) || plainAt(i, r); };
+    auto isPlain = [&](unsigned r) {
+        return (taken && r == in.a) || (r < plainRegs_.size() && plainRegs_[r]) || plainAt(i, r);
+    };
     unsigned cells = 0;
     for (unsigned r = first; r < code_->nregs; ++r)
         cells += isPlain(r) ? 0 : 1;
@@ -3468,11 +3489,16 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
                     r += 2;
                 } else {
                     pair = pair && isPlain(r);
-                    clearReg(r);
+                    if (isPlain(r))
+                        a_.mov(R(r), std::int32_t(kUndefined));
+                    else
+                        clearReg(r);
                     r += 1;
                 }
             }
         } else {
+            if (taken)
+                a_.mov(R(in.a), std::int32_t(kUndefined));  // its count went with the result
             a_.lea(RDI, R(first));
             a_.movImm(RSI, count);
             a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitClear));

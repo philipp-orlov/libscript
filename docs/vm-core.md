@@ -85,10 +85,29 @@ that instruction (an "exit"), and the next compile does not guess there. What it
 - `Math` one-argument functions in line (`sqrtsd`), `charCodeAt`, `push` and `pop`, string `length` and String.prototype
   methods (also in tier 1).
 - A guard that fails three times in one place retires the code; code made before parts of the function had run makes way
-  once for a new compile after those parts have run a while (exit kind 2).
+  for a new compile after those parts have run a while (exit kind 2), up to four times, each given longer.
+- Facts about frame registers, kept through straight-line code: an object's shape, its inline slot count (exact, or a
+  lower bound), one of a few shapes, an array, a function of a known code, a slot that holds a number (so a store over it
+  has nothing to release), a validity cell already checked.
+- Loops (`planLoopFacts`): a register the loop never writes holds the same value all through it. The functions it calls
+  through such registers are checked once before the loop (their code cannot change). When nothing in the loop calls out
+  (no helper, no generic template, no direct call: `sideDoors_`), the loop also has checked before it the shapes of the
+  objects in those registers, the chains its prototype reads rely on, the arrays it indexes, the number slots it stores to,
+  the globals that head its read chains and its `Math` functions, and it reads once, before the loop, a number property
+  that no store in it writes. Should a loop planned that way turn out to call out, the function is compiled again without
+  that for it (`hoistBroken_`). The checks run where the loop is entered: falling into its header, OSR, and the tick stub
+  of its back edge.
+- Calls: the callee's registers come in `rdi` with its frame; a returned number is boxed in `rax` without a count; the
+  caller takes a number result from `rax`; a call saves only the variables live after it.
 
 `SCRIPT_VM_CODEDUMP=dir` writes each function's code (`t2-N-name@address.bin`, for `objdump -b binary -mi386:x86-64`);
-`T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH` print what the compiler decided and where code leaves.
+`T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH`, `T2HOIST` print what the compiler decided and where code leaves.
+
+Elsewhere for speed: `&&`, `||` and `!` in a test are jumps, not values; arrays keep their first four elements in the
+cell; array literals of up to four elements are made in compiled code; `s += t` appends in place into a string only its
+register holds; `JSON.parse` follows known shape transitions and reads short decimals without the library, and
+`JSON.stringify` keeps the quoted names of a shape while no script runs; a cycle collection that finds little to free
+waits until the cells have grown fourfold.
 
 ## Property read caches
 
@@ -104,9 +123,9 @@ time (data entries only). Getters are not inline-cached in compiled code: they g
   a live frame owns its value.
 - A cell is at most 8 KiB (larger storage is out of line), so `LocalHeap::ownerOf` finds the VM from any cell.
 - Cycles are found by a collector that runs when the context's heap budget is passed, and also when the cells alive pass
-  a budget of their own (`VM::cellBudget_`: 8192 to begin with, then a little more than what survived), because the heap
-  budget does not see the buffers of arrays and strings. A minor collection looks at the young cells; a whole one runs when
-  the cells have doubled since the last. The collector's own vectors come from the payload pool, so a steady-state workload
+  a budget of their own (`VM::cellBudget_`: 131,072 to begin with, then a little more than what survived, or four times
+  as many when the collection found little), because the heap budget does not see the buffers of arrays and strings. A minor
+  collection looks at the young cells; a whole one runs when the cells have doubled since the last. The collector's own vectors come from the payload pool, so a steady-state workload
   makes no call to the general allocator (`core.steady_state`).
 - A proxy is an object in dictionary mode whose class is `Proxy` (or a function, for a callable target): no inline cache
   can match it, so every read and write of one reaches its traps. The caches also refuse a prototype chain with a proxy in it.

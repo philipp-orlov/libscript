@@ -575,10 +575,14 @@ void VM::collectCycles(bool minor) noexcept
         detail::decRef(cell);
     for (Shape* root : deadRoots)
         retireShapeTree(root);
-    // Re-arm the budget of cells from what is alive now, whoever asked for the collection.
+    // Re-arm the budget of cells from what is alive now, whoever asked for the collection. One that found little to free
+    // is a heap growing with what it keeps: the next look waits until there are four times as many cells.
     if (!minor)
         cellsAfterFull_ = liveCells;
-    cellBudget_ = liveCells + std::max<std::uint64_t>(kMinCellBudget, cellsAfterFull_);
+    std::uint64_t room = std::max<std::uint64_t>(kMinCellBudget, cellsAfterFull_);
+    if (garbage.size() * 8 < set.size())
+        room = std::max<std::uint64_t>(room, liveCells * 3);
+    cellBudget_ = liveCells + room;
 }
 
 void VM::releaseRoots() noexcept

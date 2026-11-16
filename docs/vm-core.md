@@ -103,7 +103,7 @@ that instruction (an "exit"), and the next compile does not guess there. What it
 - Recursion in place (`self_inline.cpp`): a small function that calls itself by its global name gets, when it turns hot, a
   copy of its block in which each such call is a guard (`JNotCallee`: the callee is the running function), the function's
   own instructions with their registers where the call's frame would have put them, and the call the long way; two levels
-  deep. The copy is ordinary bytecode (the interpreter and tier 1 run it too) and starts cold so the interpreter profiles
+  deep, three for a function of at most 20 instructions (`fib`). The copy is ordinary bytecode (the interpreter and tier 1 run it too) and starts cold so the interpreter profiles
   it; stack traces show each call run in place (`CodeBlock::inlineSites`). Tier 2 skips the global read before such a
   guard and checks the global's slot and the frame's function, leaving the code when either differs; a guard (or a direct
   call of the same function) after one with nothing between that may run script does not look again.
@@ -147,11 +147,38 @@ that instruction (an "exit"), and the next compile does not guess there. What it
   variables' state at the point it is entered from.
 - Global slots are addressed directly: the global object's slot storage moves only with `VM::globalEpoch`
   (`JSObject::growSlots` bumps it), which every global access checks first. A direct call writes the frame's `new.target`
-  and generator only for a callee that reads them.
+  and generator only for a callee that reads them, and leaves alone the registers of its window no path to it has written.
+- Loop slot promotion (`LoopPromo`): a number property of an object a loop holds in a register it never writes, read and
+  stored in the loop through that register only, lives in a stack slot as a double; it is loaded before the loop and
+  written back at the loop's exits, its exit stubs and its tick stub. An element read in the loop that yields the same
+  object leaves the code (`promoGuards_`).
+- Pure functions (`planNewChecked`: only typed arithmetic, data reads, calls of itself and `new` made in place): a call of
+  itself cannot change a global, so only the first guard on each path checks the global and the frame's function, and an
+  inlined `new` checks its constructor (global slot, shape, prototype, validity) only at the first such `new` on a path.
+- Recursion that holds what it reads without counts (`planFnBorrows`, `scriptVmBorrowGate`): in a pure function that never
+  writes its parameters, a register that only ever holds a parameter, a global, or a property read from one of those (or
+  no cell at all) holds it without a count for the whole call, and passes it so to its calls of itself, which set
+  `Frame::kArgsBorrowed` on the callee's frame. What could run other code there -- a failed guard, a slow path -- first
+  calls the gate, which counts what that frame and every frame up the chain of borrowed arguments hold and marks them
+  `kOwned`; each marked frame leaves its code right after its call returns (`exitOwnedAfter`). Such a function calls its
+  own entry while the code is still the function's entry (`BorrowInfo::retired`), and makes the stack ready and takes the
+  interrupt check without leaving. A call of itself that comes back unmarked ran nothing else: what is known of the
+  frame's objects stays known across it, and the global read of a `new`'s constructor before the arguments is left out
+  (`calleeReads_`: an exit between makes it first; the `new`'s long way reads it and clears it after).
+- Facts carry into a block that only one forward jump reaches (`planSinglePreds`, `snapFacts`): `t.l === null ? ... : f(t.l)`
+  reads `t.l` the second time without a guard.
+- A counter stepped by one where every way to the step found it below an int32 (`planBoundedSteps`) has no overflow test.
+- An object guard that also fixes the inline slot count tests the kind and the count with one 16-bit compare; a double
+  read from a field is told from an int32 on its own bits and the offset taken off in place; `Math.sqrt` is `vsqrtsd` and
+  `cvtsi2sd` zeroes its register first, so neither waits on what the register held before.
+- Returns clear less: a `LoadUndef` that makes a register undefined takes it off what a return must clear, and the long
+  way of a `new` made in place clears the window registers it writes.
 
 `SCRIPT_VM_CODEDUMP=dir` writes each function's code (`t2-N-name@address.bin`, for `objdump -b binary -mi386:x86-64`);
-`T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH`, `T2HOIST`, `T2CELLS`, `T2UNDEF` print what the compiler decided and
-where code leaves; `SCRIPT_VM_SELFINLINE=n` sets how deep recursion runs in place (0: not at all).
+`T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH`, `T2HOIST` (also the registers held without counts), `T2CELLS`,
+`T2UNDEF`, `T2DIRTY` print what the compiler decided and where code leaves, `T2CODE` the bytecode it compiles (self-inlined
+copies included) and `T2NOFNBORROW` turns the recursion gate off; `SCRIPT_VM_SELFINLINE=n` sets how deep recursion runs in
+place (0: not at all).
 
 Elsewhere for speed: `&&`, `||` and `!` in a test are jumps, not values; arrays keep their first four elements in the
 cell; array literals of up to four elements are made in compiled code; `s += t` appends in place into a string only its
@@ -171,7 +198,9 @@ time (data entries only). Getters are not inline-cached in compiled code: they g
 
 - Counts, not a tracing collector. A cell of the new family has a 16-byte header with the count at offset 8; byte 7 has
   its high bit set, which is how `detail::destroyUnreferenced` and the public API tell the families apart. Every register of
-  a live frame owns its value, but for a borrowed register inside its loop (above), which the arrays it reads keep alive.
+  a live frame owns its value, but for a borrowed register inside its loop (above), which the arrays it reads keep alive,
+  and the registers a pure recursive function holds without counts until the gate counts them (above). The cycle
+  collector counts only references from cells, so a register held without a count changes nothing for it.
 - A cell is at most 8 KiB (larger storage is out of line), so `LocalHeap::ownerOf` finds the VM from any cell.
 - A chain of frees does not recurse (`VM::destroy`): a plain object whose values are all in its cell is freed in the
   loop itself, the counters summed and set once, and the first value it frees is freed next; the rest wait in `pending_`.
@@ -222,12 +251,14 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 - Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in
   registers) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in builds with
   `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). aarch64 has no compiler yet and interprets (no aarch64 hardware was available).
-- Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` take 0.91x its time in
-  geometric mean (Xeon Gold 5420+, best of seven): `sort_cmp` 0.48, `float_mandel` 0.62, `alloc_small` 0.72, `string_ops`
-  0.86, `int_loop` 0.87, `map_dict` 0.89, `prop_rw` 0.95, `array_push_hof` 0.97, `json_rt` 0.99, `method_call` 1.01,
-  `closure` 1.04, `sieve_array` 1.06, `poly_prop` 1.07, `fib_calls` 1.10, `nbody` 1.10, `tree_gc` 1.15. What is left on the
-  last three: a call still pushes a whole frame in memory (`fib_calls`), the double fields of objects are read and boxed
-  through memory each time (`nbody`), and every object made is counted and freed one by one (`tree_gc`).
+- Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` take 0.89x its time in
+  geometric mean (Xeon Gold 5420+, median of eleven runs of each engine in turn on one core): `sort_cmp` 0.49,
+  `float_mandel` 0.70, `alloc_small` 0.71, `string_ops` 0.86, `int_loop` 0.87, `map_dict` 0.91, `array_push_hof` 0.93,
+  `prop_rw` 0.93, `fib_calls` 0.96, `closure` 0.97, `nbody` 0.97, `tree_gc` 0.97, `json_rt` 1.01, `sieve_array` 1.02,
+  `poly_prop` 1.03, `method_call` 1.07. What is left: `nbody` is bound by the branch port (two tests per double field read,
+  four per object guard), `tree_gc` by touching each freed node (counting frees one by one where a tracing collector
+  touches none), and a call still pushes a whole frame in memory. Measure with both engines on the same core: the cores of
+  this machine run at different clocks under load, which moved single-core comparisons by up to 6%.
 - Calls are counted, not measured in stack: a call deeper than `Options::stackLimit` frames (512 by default) is a
   `RangeError`. Recursion run in place can take one frame for up to three levels.
 - Not compiled by tier 1: generators and async functions (they stay in the interpreter), functions of more than 20,000

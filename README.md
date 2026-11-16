@@ -115,22 +115,23 @@ engine goes once no language needs it. The vm core's compilers generate x86-64 c
 ## 🏁 Against JavaScriptCore
 
 The vm core runs JavaScript, TypeScript and Python with an interpreter, a baseline compiler and an optimizing compiler.
-On the 16 kernels in [`bench/kernels/js`](bench/kernels/js), it takes 0.91× the time of JavaScriptCore 2.52.6 with all its
-tiers, as a geometric mean:
+On the 16 kernels in [`bench/kernels/js`](bench/kernels/js), it takes 0.89× the time of JavaScriptCore 2.52.6 with all its
+tiers, as a geometric mean, and is ahead on 13 of them:
 
 | Kernel | vm / JSC | Kernel | vm / JSC |
 | --- | --: | --- | --: |
-| `sort_cmp` | **0.48** | `json_rt` | 0.99 |
-| `float_mandel` | **0.62** | `method_call` | 1.01 |
-| `alloc_small` | **0.72** | `closure` | 1.04 |
-| `string_ops` | **0.86** | `sieve_array` | 1.06 |
-| `int_loop` | **0.87** | `poly_prop` | 1.07 |
-| `map_dict` | **0.89** | `fib_calls` | 1.10 |
-| `prop_rw` | **0.95** | `nbody` | 1.10 |
-| `array_push_hof` | **0.97** | `tree_gc` | 1.15 |
+| `sort_cmp` | **0.49** | `fib_calls` | **0.96** |
+| `float_mandel` | **0.70** | `closure` | **0.97** |
+| `alloc_small` | **0.71** | `nbody` | **0.97** |
+| `string_ops` | **0.86** | `tree_gc` | **0.97** |
+| `int_loop` | **0.87** | `json_rt` | 1.01 |
+| `map_dict` | **0.91** | `sieve_array` | 1.02 |
+| `array_push_hof` | **0.93** | `poly_prop` | 1.03 |
+| `prop_rw` | **0.93** | `method_call` | 1.07 |
 
-<sub>Whole-process wall-clock time, best of seven, on one core of a Xeon Gold 5420+ (x86-64, Linux, GCC 13, Release);
-lower is better. How each kernel was won and what is left is in [vm-core.md](docs/vm-core.md).</sub>
+<sub>Whole-process wall-clock time, median of eleven runs of each engine taken in turn on the same core of a Xeon Gold
+5420+ (x86-64, Linux, GCC 13, Release); lower is better. How each kernel was won and what is left is in
+[vm-core.md](docs/vm-core.md).</sub>
 
 ## 🚀 The numbers
 

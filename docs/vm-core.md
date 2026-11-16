@@ -138,6 +138,13 @@ that instruction (an "exit"), and the next compile does not guess there. What it
 - Moves join the variables they connect when one ends where the other begins (`opt_analysis.cpp`): the two share a register
   or a slot and the `Mov` emits nothing. The peephole sees across instruction boundaries nothing jumps to
   (`bindFallthrough`), so a variable stored to its slot by one instruction is not loaded again by the next.
+- `new` of a small constructor in place: when the callee, `this` and the arguments come from instructions without effects
+  (`new T(null, null)`), their registers are not written (`planWindows`, `newCallee_`): the code reads the global itself,
+  and the long way fills them first. An argument whose register dies there gives its count to the object.
+- `x = o.p; y = null; if (x !== y)` with both registers dead after the jump: the jump reads the property itself and
+  compares bits (`planTestReads`); neither register is written, and a return does not clear them.
+- Slow paths of inlined `new` and direct calls are emitted after the function's code (`deferCold`), each with the
+  variables' state at the point it is entered from.
 - Global slots are addressed directly: the global object's slot storage moves only with `VM::globalEpoch`
   (`JSObject::growSlots` bumps it), which every global access checks first. A direct call writes the frame's `new.target`
   and generator only for a callee that reads them.
@@ -166,6 +173,9 @@ time (data entries only). Getters are not inline-cached in compiled code: they g
   its high bit set, which is how `detail::destroyUnreferenced` and the public API tell the families apart. Every register of
   a live frame owns its value, but for a borrowed register inside its loop (above), which the arrays it reads keep alive.
 - A cell is at most 8 KiB (larger storage is out of line), so `LocalHeap::ownerOf` finds the VM from any cell.
+- A chain of frees does not recurse (`VM::destroy`): a plain object whose values are all in its cell is freed in the
+  loop itself, the counters summed and set once, and the first value it frees is freed next; the rest wait in `pending_`.
+  The cycle collector reads such an object's values in place too.
 - Cycles are found by a collector that runs when the context's heap budget is passed, and also when the cells alive pass
   a budget of their own (`VM::cellBudget_`: 131,072 to begin with, then a little more than what survived, or four times
   as many when the collection found little), because the heap budget does not see the buffers of arrays and strings. A minor

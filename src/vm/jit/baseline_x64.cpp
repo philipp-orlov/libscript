@@ -883,6 +883,45 @@ private:
     std::vector<LoopFact> loopFacts_;
     std::map<std::uint32_t, Label> preLoop_;  ///< a loop header with checks made before it: where they start
     std::uint32_t factAt_ = 0;               ///< the instruction being emitted
+    /// Validity cells checked since the facts were last forgotten.
+    std::set<const ValidityCell*> factValid_;
+    /// A loop that nothing in calls out of the optimized code (`sideDoors_`) keeps every object's shape and every chain as
+    /// they were at its start: the shapes of the objects in registers it does not write, and the chains its reads rely on,
+    /// are checked before it and known inside it. Should a way out turn up in its code after all, the function is compiled
+    /// again without that (`hoistBroken_`, then `noHoist_`).
+    struct LoopShape
+    {
+        std::uint32_t from, to;
+        unsigned reg;
+        std::uint32_t shape;
+        std::int32_t aux;  ///< its inline slot count (-1: not checked)
+    };
+    std::vector<LoopShape> loopShapes_;
+    struct LoopValid
+    {
+        std::uint32_t from, to;
+        ValidityCell* cell;
+    };
+    std::vector<LoopValid> loopValids_;
+    std::uint64_t sideDoors_ = 0;  ///< code emitted so far that may run script or call into the runtime
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint64_t>> hoistWatch_;  ///< header: its end, `sideDoors_` there
+public:
+    std::set<std::uint32_t> noHoist_;
+    std::set<std::uint32_t> hoistBroken_;
+private:
+    void sideDoor() { ++sideDoors_; }
+    /// `bad` unless validity cell `c` still holds; nothing to do when it was checked already.
+    void checkValidity(ValidityCell* c, Label& bad, bool remember = true)
+    {
+        if (factValid_.count(c))
+            return;
+        hold(c);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(c));
+        a_.cmpI32(mem(RCX, kValidityValid), 0);
+        a_.jcc(CE, bad);
+        if (remember)
+            factValid_.insert(c);
+    }
     void planLoopFacts();
     void emitLoopGuards(std::uint32_t h);
     void forgetFacts()
@@ -892,9 +931,18 @@ private:
         std::fill(factInl_.begin(), factInl_.end(), 0);
         std::fill(factSet_.begin(), factSet_.end(), std::array<std::uint32_t, 4>{});
         std::fill(factCode_.begin(), factCode_.end(), nullptr);
+        factValid_.clear();
         for (const LoopFact& lf : loopFacts_)
             if (lf.from <= factAt_ && factAt_ <= lf.to && lf.reg < factCode_.size())
                 factCode_[lf.reg] = lf.code;
+        for (const LoopShape& ls : loopShapes_)
+            if (ls.from <= factAt_ && factAt_ <= ls.to && ls.reg < factShape_.size()) {
+                factShape_[ls.reg] = ls.shape;
+                factAux_[ls.reg] = ls.aux;
+            }
+        for (const LoopValid& lv : loopValids_)
+            if (lv.from <= factAt_ && factAt_ <= lv.to)
+                factValid_.insert(lv.cell);
     }
     void forgetFact(unsigned r)
     {
@@ -1107,6 +1155,7 @@ private:
     /// A label that runs instruction `i` in the interpreter and then goes on after it.
     Label& slow(std::uint32_t i, HelperFn helper = nullptr, bool saved = false)
     {
+        sideDoor();
         slows_.push_back(Slow{i, Label{}, helper, saved});
         return slows_.back().label;
     }
@@ -1118,6 +1167,7 @@ private:
     /// Run the instruction's helper from here; no template.
     void helperOp(std::uint32_t i, HelperFn fn)
     {
+        sideDoor();
         savePool(i);
         a_.mov(RDI, R12);
         a_.movImm(RSI, i);
@@ -1233,10 +1283,7 @@ private:
     void polyEntryRead(const PolySeen& s, Label& bad, int factReg)
     {
         if (s.holder) {
-            hold(s.validity);
-            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(s.validity));
-            a_.cmpI32(mem(RCX, kValidityValid), 0);
-            a_.jcc(CE, bad);
+            checkValidity(s.validity, bad, factReg >= 0);
             holderRead(s.holder, s.index);
             return;
         }
@@ -1464,6 +1511,7 @@ private:
     }
     void emitStep(std::uint32_t i)
     {
+        sideDoor();
         savePool(i);
         callStep(i);
         a_.cmpI(RAX, std::int32_t(kStepFall));
@@ -2390,6 +2438,7 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
 
 void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
 {
+    sideDoor();
     // The getter's frame goes above this function's registers: `this` (not counted: the receiver register holds it until
     // the result is written) and nothing else, the rest of the stack there being undefined already.
     Label& bad = slow(i, &helperThunk<jitGetProp>, true);
@@ -2763,6 +2812,7 @@ void Baseline::putGlobal(std::uint32_t i, const Ins& in)
 
 void Baseline::call(std::uint32_t i, const Ins& in)
 {
+    sideDoor();
     if (optimizing() && (i >= code_->callProf.size() || !code_->callProf[i]) && !isFunction(constantBefore(i, in.b)))
         immature(i);
     Label& bad = slow(i, nullptr, true);
@@ -3250,8 +3300,21 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
         std::fprintf(stderr, "%s\n", dump(*code).c_str());
     }
 #endif
-    Baseline compiler(vm, code);
-    return compiler.optimize(plan, code->tier1);
+    // A loop whose shapes were taken as known turned out to call out: again, without that for it.
+    std::set<std::uint32_t> noHoist;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        Baseline compiler(vm, code);
+        compiler.noHoist_ = noHoist;
+        Tier2Code* t = compiler.optimize(plan, code->tier1);
+        if (compiler.hoistBroken_.empty())
+            return t;
+        noHoist.insert(compiler.hoistBroken_.begin(), compiler.hoistBroken_.end());
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2HOIST"))
+            std::fprintf(stderr, "hoist: a loop calls out; compiled again\n");
+#endif
+    }
+    return nullptr;
 }
 
 }  // namespace

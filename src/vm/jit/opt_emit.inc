@@ -631,10 +631,7 @@ bool Baseline::emitTyped(std::uint32_t i)
         Label& bad = exitBefore(i);
         if (ic.holder) {
             provenShape(in.b, ic.shape, bad);
-            hold(ic.validity);
-            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic.validity));
-            a_.cmpI32(mem(RCX, kValidityValid), 0);
-            a_.jcc(CE, bad);
+            checkValidity(ic.validity, bad);
             holderRead(ic.holder, ic.index);
             unboxRax(dw, bad);
             return true;
@@ -1066,7 +1063,14 @@ void Baseline::emitOptTails()
         a_.test32(RAX, RAX);
         a_.jcc(CNE, exception(t.first));
         restorePool(t.first);
-        a_.jmp(tickBack_[k]);
+        // What the interrupt ran may have changed what a loop takes as known: through its checks again.
+        const std::int64_t target = opt::jumpTarget(*code_, t.first);
+        auto pre = target >= 0 ? preLoop_.find(std::uint32_t(target)) : preLoop_.end();
+        if (pre != preLoop_.end() && target <= std::int64_t(t.first)) {
+            a_.jmp(pre->second);
+        } else {
+            a_.jmp(tickBack_[k]);
+        }
     }
     emitExits();
     a_.bind(entryFail_);
@@ -1165,6 +1169,9 @@ Tier2Code* Baseline::compileOptimized()
         a_.bind(at_[i]);
         offsets_[i] = std::uint32_t(a_.here());
         emitOpt(i);
+        for (const auto& [h, w] : hoistWatch_)
+            if (w.first == i && w.second != sideDoors_)
+                hoistBroken_.insert(h);
         i += length(i);
     }
     a_.bind(at_[n_]);
@@ -1194,7 +1201,7 @@ Tier2Code* Baseline::compileOptimized()
         a_.jmp(RAX);
     }
     emitTails();
-    CodeSpan span = allocateCode(a_.buf.size());
+    CodeSpan span = hoistBroken_.empty() ? allocateCode(a_.buf.size()) : CodeSpan{};
     if (!span) {
         for (ValidityCell* v : validities_)
             vm_.releaseValidity(v);

@@ -3502,3 +3502,46 @@ TEST(callsOfALoopsUnchangedFunctionsAreCheckedBeforeIt)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("17500 6000 6000 4004001 24229700 2770 -129242144 string/2500/2500"));
     }
 }
+
+TEST(shapesAndChainsALoopTakesAsKnownHoldOrTheLoopIsCompiledWithout)
+{
+    // Loops whose objects' shapes and prototype chains are checked before them: a call, a getter, a delete, an accessor, a
+    // new prototype or a property added inside the loop, and objects of other shapes on the way in.
+    const char* program =
+        "var out=[]; "
+        "function P(){this.a=1;this.b=2;} "
+        "function grow(o,i){ if(i==500) o.z=9; } "
+        "function k1(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.a+o.b; grow(o,i); o.a=o.b+1; }return s;} "
+        "for (var r=0;r<20;r++) k1(new P(),100); out.push(k1(new P(),2000)); "
+        "var gp={get g(){ this.q=1; return 3; }}; "
+        "function k2(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.a; if(i==700) s+=o.g; o.a=i&7; }return s;} "
+        "for (var r=0;r<20;r++) k2(Object.assign(Object.create(gp),{a:1}),100); out.push(k2(Object.assign(Object.create(gp),{a:1}),2000)); "
+        "function A(v){this.v=v;} A.prototype.f=function(){return this.v;}; "
+        "function k3(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.f(); if(i==600) swapf(); }return s;} "
+        "function swapf(){ A.prototype.f=function(){return 100;}; } "
+        "for (var r=0;r<20;r++) k3(new A(1),100); A.prototype.f=function(){return this.v;}; out.push(k3(new A(2),2000)); "
+        "function k4(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.a+(o.b|0); if(i==800) delete o.b; }return s;} "
+        "for (var r=0;r<20;r++) k4(new P(),100); out.push(k4(new P(),2000)); "
+        "function k5(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.a; o.a=i; if(i==900) Object.defineProperty(o,'a',{get:function(){return 5;},set:function(v){},configurable:true}); }return s;} "
+        "for (var r=0;r<20;r++) k5(new P(),100); out.push(k5(new P(),2000)); "
+        "function Q(){this.b=2;this.a=1;} "
+        "function k6(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.a*2+o.b; o.b=i&3; }return s;} "
+        "for (var r=0;r<30;r++) k6(new P(),200); out.push(k6(new Q(),3000), k6(new P(),3000), k6({a:5,b:6},3000)); "
+        "function k7(){var o=new P(),s=0;for(var i=0;i<300000;i++){ s=(s+o.a+o.b)|0; o.b=(o.b+1)&15; if(i==150000) o.c=1; }return s;} "
+        "out.push(k7()); "
+        "function B(){} B.prototype.m=function(){return 1;}; "
+        "function k8(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.m(); if(i==400) Object.setPrototypeOf(o,{m:function(){return 10;}}); }return s;} "
+        "for (var r=0;r<20;r++) k8(new B(),100); out.push(k8(new B(),2000)); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9998 6997 141102 3602 410046 10499 10499 34503 2550000 16391"));
+    }
+}

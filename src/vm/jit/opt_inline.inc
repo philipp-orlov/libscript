@@ -247,10 +247,7 @@ bool Baseline::inlineGetter(std::uint32_t i)
             // The receiver has the shape, the prototype chain is as it was, and the getter is the one compiled in.
             Label& bad = exitBefore(i);
             provenShape(in.b, e.shape, bad);
-            hold(e.validity);
-            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(e.validity));
-            a_.cmpI32(mem(RCX, kValidityValid), 0);
-            a_.jcc(CE, bad);
+            checkValidity(e.validity, bad);
             holderRead(e.holder, e.index);
             holdValue(gs->getter);
             a_.movImm(RCX, gs->getter.bits);
@@ -548,10 +545,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                 a_.movImm(RCX, reinterpret_cast<std::uint64_t>(sc.home));
                 a_.cmp(RCX, mem(RAX, kRareHome));
                 a_.jcc(CNE, *bad);
-                hold(sc.validity);
-                a_.movImm(RCX, reinterpret_cast<std::uint64_t>(sc.validity));
-                a_.cmpI32(mem(RCX, kValidityValid), 0);
-                a_.jcc(CE, *bad);
+                checkValidity(sc.validity, *bad);
                 a_.movImm(RCX, reinterpret_cast<std::uint64_t>(sc.slot));
                 a_.mov(RAX, mem(RCX, 0));
             }
@@ -913,6 +907,7 @@ void Baseline::writePending(std::uint32_t point)
 
 void Baseline::emitDirectCall(std::uint32_t i)
 {
+    sideDoor();
     const Ins& in = code_->code[i];
     const DirectCall& dc = directCalls_.at(i);
     CodeBlock* C = dc.code;
@@ -1673,6 +1668,9 @@ void Baseline::emitWindowRead(std::uint32_t i)
 void Baseline::planLoopFacts()
 {
     loopFacts_.clear();
+    loopShapes_.clear();
+    loopValids_.clear();
+    hoistWatch_.clear();
     preLoop_.clear();
     if (!code_->handlers.empty() || inlineBase_ < 0)
         return;
@@ -1740,6 +1738,71 @@ void Baseline::planLoopFacts()
                 loopFacts_.push_back(LoopFact{h, std::uint32_t(end), r, C});
                 preLoop_[h];
             }
+        if (noHoist_.count(h))
+            continue;
+        // The shapes of objects in registers the loop does not write, as the reads and stores of its own code have seen
+        // them, and the chains of its reads from prototypes.
+        std::map<unsigned, std::pair<std::uint32_t, std::int32_t>> shapes;
+        std::set<unsigned> mixedShape;
+        std::set<ValidityCell*> cells;
+        auto wantShape = [&](unsigned r, std::uint32_t shape, std::int32_t aux) {
+            if (r >= written.size() || written[r] || shape == 0)
+                return;
+            const auto [it, fresh] = shapes.emplace(r, std::make_pair(shape, aux));
+            if (fresh)
+                return;
+            if (it->second.first != shape)
+                mixedShape.insert(r);
+            else if (it->second.second != aux)
+                it->second.second = -1;
+        };
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            const Ins& in = code_->code[j];
+            const Op op = in.opcode();
+            if (op != Op::GetProp && op != Op::PutProp)
+                continue;
+            if (j + 1 >= n_ || code_->code[j + 1].opcode() != Op::Cache || code_->code[j + 1].a == kNoCache)
+                continue;
+            const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+            if (ic.shape == 0 || (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n))
+                continue;
+            const bool failed = j < code_->prof.size() && (code_->prof[j] & opt::kProfFailed);
+            const std::int32_t aux = failed || !ic.aux || ic.holder ? -1 : std::int32_t(ic.aux) - 1;
+            if (op == Op::PutProp) {
+                if (ic.next == 0 && !ic.holder)
+                    wantShape(in.a, ic.shape, aux);
+                continue;
+            }
+            unsigned recv = in.b;
+            if (auto wr = windowRead_.find(j); wr != windowRead_.end())
+                recv = wr->second.second;
+            else if (j < chainRole_.size() && (chainRole_[j] & 2))
+                continue;
+            if (ic.holder && !(ic.validity && ic.validity->valid))
+                continue;
+            wantShape(recv, ic.shape, aux);
+            if (ic.holder)
+                cells.insert(ic.validity);
+        }
+        bool any = false;
+        for (const auto& [r, sa] : shapes)
+            if (!mixedShape.count(r)) {
+                loopShapes_.push_back(LoopShape{h, std::uint32_t(end), r, sa.first, sa.second});
+                any = true;
+            }
+        for (ValidityCell* c : cells) {
+            loopValids_.push_back(LoopValid{h, std::uint32_t(end), c});
+            any = true;
+        }
+        if (any) {
+            preLoop_[h];
+            hoistWatch_[h] = std::make_pair(std::uint32_t(end), std::uint64_t(0));
+        }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2HOIST"))
+            std::fprintf(stderr, "hoist %s loop @%u..%lld: %zu shapes %zu chains\n", codeName(code_).c_str(), h,
+                         (long long)end, shapes.size() - mixedShape.size(), cells.size());
+#endif
     }
 }
 
@@ -1747,6 +1810,28 @@ void Baseline::emitLoopGuards(std::uint32_t h)
 {
     a_.bind(preLoop_.at(h));
     Label& bad = exitBefore(h);
+    if (auto w = hoistWatch_.find(h); w != hoistWatch_.end())
+        w->second.second = sideDoors_;
+    for (const LoopShape& ls : loopShapes_) {
+        if (ls.from != h)
+            continue;
+        a_.mov(RAX, R(ls.reg));
+        needObject(RAX, bad);
+        a_.cmpI32(mem(RAX, 0), std::int32_t(ls.shape));
+        a_.jcc(CNE, bad);
+        if (ls.aux >= 0) {
+            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ls.aux));
+            a_.jcc(CNE, bad);
+        }
+    }
+    for (const LoopValid& lv : loopValids_) {
+        if (lv.from != h)
+            continue;
+        hold(lv.cell);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(lv.cell));
+        a_.cmpI32(mem(RCX, kValidityValid), 0);
+        a_.jcc(CE, bad);
+    }
     for (const LoopFact& lf : loopFacts_) {
         if (lf.from != h)
             continue;

@@ -4135,3 +4135,27 @@ TEST(callsNewAndReturnsInOptimizedCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("210000,45000,3749263500,240000,254488,undefinedundefined,3350000,46368,2,6765"));
     }
 }
+
+TEST(directCallsSetNewTargetOnlyForCalleesThatReadIt)
+{
+    // A direct call leaves the frame's new.target unset for a callee that never reads it; one that does sees undefined.
+    const char* program =
+        "function nt(x) { return new.target === undefined ? x : -x; }"
+        "function plain(x) { return x + 1; }"
+        "function caller(n) { var s = 0; for (var i = 0; i < n; i++) { s += nt(i) + plain(i); } return s; }"
+        "var t = 0; for (var r = 0; r < 300; r++) t += caller(100);"
+        "var o = new nt(3); t += (o instanceof nt) ? 1 : 0;"
+        "for (var r = 0; r < 300; r++) { t += caller(10); new nt(1); }"
+        "t;";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3030001"));
+    }
+}

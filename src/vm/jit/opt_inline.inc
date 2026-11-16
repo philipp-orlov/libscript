@@ -1188,8 +1188,14 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
     a_.mov(mem(R11, kFrameRetDst), RDI);
     a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
-    a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
-    a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+    // A callee that never reads `new.target` (nor calls `super`) and is no generator never looks at either.
+    bool reads = (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen)) != 0;
+    for (const Ins& ci : C->code)
+        reads = reads || ci.opcode() == Op::NewTarget || ci.opcode() == Op::SetNewTarget || ci.opcode() == Op::SuperCall;
+    if (reads) {
+        a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+        a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+    }
     a_.mov(RSI, R11);
     a_.mov(RDI, R9);
     a_.mov(RDX, mem(RDX, kTierEntry));

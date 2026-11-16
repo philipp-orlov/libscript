@@ -253,9 +253,9 @@ struct VM : EngineRuntime
     std::uint32_t tier1Threshold = 0;
     /// Entries and loop back edges of baseline code before the optimizing compiler is asked; 0 leaves it off.
     std::int32_t tier2Threshold = 0;
-    /// Whether a function that calls itself by name runs those calls in place one level deep, from when it turns hot
-    /// (`selfInline`); only with the optimizing compiler on.
-    bool selfInlining = false;
+    /// How many levels deep a function that calls itself by name runs those calls in place, from when it turns hot
+    /// (`selfInline`); 0 for not at all; only with the optimizing compiler on.
+    std::uint8_t selfInlining = 0;
     /// The lowest machine stack address compiled code may reach before a call is made the slow way (0: no limit).
     std::uintptr_t jitStackFloor = 0;
     Frame* frameBase = nullptr;

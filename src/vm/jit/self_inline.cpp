@@ -26,6 +26,7 @@ namespace {
 
 constexpr std::uint32_t kSelfInlineMaxCode = 64;
 constexpr unsigned kSelfInlineMaxSites = 4;
+constexpr std::size_t kSelfInlineMaxTotal = 1024;
 
 /// The instructions a body run in place may hold: none looks at the frame beyond its registers and its function.
 bool inPlaceOp(Op op)
@@ -112,6 +113,7 @@ std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reach
 
 CodeBlock* selfInline(VM& vm, CodeBlock* c)
 {
+    const int depth = vm.selfInlining;
     if (c->selfInlined)
         return c->selfInlined;
     if (c->selfInlineTried || c->inlinedFrom)
@@ -170,9 +172,6 @@ CodeBlock* selfInline(VM& vm, CodeBlock* c)
     }
     if (sites.empty())
         return nullptr;
-    for (std::uint32_t s : sites)
-        if (std::uint32_t(c->code[s].b) + 1 + c->nregs > 0xFFF0)
-            return nullptr;
     std::vector<bool> reached;
     const std::vector<bool> needInit = readBeforeWritten(*c, reached);
 
@@ -214,84 +213,91 @@ CodeBlock* selfInline(VM& vm, CodeBlock* c)
             in.setJump(std::int32_t(to) - std::int32_t(from) - 1);
     };
     // Each call site in place: the guard, the body, its returns, then the call the long way, which falls through to what
-    // follows. Every jump goes forward. Jumps of the function's own instructions are moved to where their targets went.
-    std::vector<std::uint32_t> moved(n + 1, 0);
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> ownJumps;  // (new index, old target)
-    std::vector<std::uint32_t> continuations;                         // jumps to the instruction after a site
-    for (std::uint32_t j = 0; j < n; ++j) {
-        moved[j] = std::uint32_t(d->code.size());
-        if (std::find(sites.begin(), sites.end(), j) == sites.end()) {
-            const std::uint32_t at = put(c->code[j], c->lines[j]);
-            const std::int64_t t = c->code[j].opcode() == Op::Cache ? -1 : opt::jumpTarget(*c, j);
-            if (t >= 0)
-                ownJumps.emplace_back(at, std::uint32_t(t));
-            continue;
-        }
-        const Ins call = c->code[j];
-        const std::uint32_t line = c->lines[j];
-        const unsigned off = call.b + 1u, argc = call.c;
-        const std::uint32_t guard = put(Ins::make(Op::JNotCallee, call.b), line);
-        for (unsigned p = argc; p < c->nparams; ++p)
-            put(Ins::make(Op::LoadUndef, std::uint16_t(off + 1 + p)), line);
-        for (unsigned r = 1u + c->nparams; r < c->nregs; ++r)
-            if (needInit[r])
-                put(Ins::make(Op::LoadUndef, std::uint16_t(off + r)), line);
-        const std::uint32_t body = std::uint32_t(d->code.size());
-        std::vector<std::pair<std::uint32_t, std::uint16_t>> rets;
+    // follows. Every jump goes forward. Jumps of a copy's own instructions are moved to where their targets went. A body
+    // in place has its own calls of the function in place in turn, down to `depth` levels.
+    bool tooFar = false;
+    // The function's instructions with registers moved up by `off`; at a level below the top a return goes to the
+    // instruction after the copy with the value in `dst` (its jumps are left in `outs`).
+    auto emitCopy = [&](auto& self, int level, unsigned off, unsigned dst, std::vector<std::uint32_t>& outs) -> void {
+        std::vector<std::uint32_t> moved(n + 1, 0);
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> ownJumps;  // (new index, old target)
         for (std::uint32_t k = 0; k < n; ++k) {
+            moved[k] = std::uint32_t(d->code.size());
             Ins in = c->code[k];
             const Op op = in.opcode();
             const bool live = op == Op::Cache ? k > 0 && reached[k - 1] : reached[k];
-            if (!live) {
+            if (level > 0 && !live) {
                 // Never runs (`return undefined` after a last `return`): nothing of it may seem to flow anywhere.
                 put(Ins::make(Op::Nop), c->lines[k]);
                 continue;
             }
+            const bool site = level < depth && std::find(sites.begin(), sites.end(), k) != sites.end();
+            if (site) {
+                const unsigned inner = off + in.b + 1u, argc = in.c;
+                const std::uint32_t line = c->lines[k];
+                const std::uint32_t guard = put(Ins::make(Op::JNotCallee, std::uint16_t(off + in.b)), line);
+                for (unsigned p = argc; p < c->nparams; ++p)
+                    put(Ins::make(Op::LoadUndef, std::uint16_t(inner + 1 + p)), line);
+                for (unsigned r = 1u + c->nparams; r < c->nregs; ++r)
+                    if (needInit[r])
+                        put(Ins::make(Op::LoadUndef, std::uint16_t(inner + r)), line);
+                const std::uint32_t body = std::uint32_t(d->code.size());
+                std::vector<std::uint32_t> back;
+                self(self, level + 1, inner, off + in.a, back);
+                d->inlineSites.push_back(InlineSite{body, std::uint32_t(d->code.size()), guard});
+                jumpTo(guard, std::uint32_t(d->code.size()));
+                Ins call = in;
+                call.a = std::uint16_t(call.a + off);
+                call.b = std::uint16_t(call.b + off);
+                put(call, line);
+                for (std::uint32_t at : back)
+                    jumpTo(at, std::uint32_t(d->code.size()));
+                d->nregs = std::max<std::uint32_t>(d->nregs, inner + c->nregs);
+                if (inner + c->nregs > 0xFFF0)
+                    tooFar = true;
+                continue;
+            }
+            if (level > 0 && op == Op::Ret) {
+                // The value to the call's destination, the body's registers let go (as the frame of a call would have on
+                // its way out), then on after the call.
+                put(Ins::make(Op::Mov, std::uint16_t(dst), std::uint16_t(in.a + off)), c->lines[k]);
+                for (unsigned r = 0; r < c->nregs; ++r)
+                    put(Ins::make(Op::LoadUndef, std::uint16_t(off + r)), c->lines[k]);
+                outs.push_back(put(Ins::make(Op::Jmp), c->lines[k]));
+                continue;
+            }
             if (op == Op::Cache) {
-                if (in.a != kNoCache) {
+                if (level > 0 && in.a != kNoCache) {
                     in.a = std::uint16_t(d->caches.size());
                     d->caches.emplace_back();
                 }
-            } else if (op == Op::Ret) {
-                rets.emplace_back(std::uint32_t(d->code.size()), std::uint16_t(in.a + off));
-                in = Ins::make(Op::Jmp);
-            } else {
+            } else if (off) {
                 const char* kinds = opKinds(op);
                 std::uint16_t* fields[3] = {&in.a, &in.b, &in.c};
                 for (int f = 0; f < 3 && kinds[f]; ++f)
                     if (kinds[f] == 'R')
                         *fields[f] = std::uint16_t(*fields[f] + off);
             }
-            put(in, c->lines[k]);
+            const std::uint32_t at = put(in, c->lines[k]);
+            const std::int64_t t = op == Op::Cache ? -1 : opt::jumpTarget(*c, k);
+            if (t >= 0)
+                ownJumps.emplace_back(at, std::uint32_t(t));
         }
-        const std::uint32_t bodyEnd = std::uint32_t(d->code.size());
-        // Each return hands its value to the call's destination, lets go of what the body's registers hold (as the frame
-        // of a call would have on its way out) and goes on after the call.
-        for (const auto& [at, reg] : rets) {
-            jumpTo(at, std::uint32_t(d->code.size()));
-            put(Ins::make(Op::Mov, call.a, reg), c->lines[at - body]);
-            for (unsigned r = 0; r < c->nregs; ++r)
-                put(Ins::make(Op::LoadUndef, std::uint16_t(off + r)), line);
-            continuations.push_back(put(Ins::make(Op::Jmp), line));
+        moved[n] = std::uint32_t(d->code.size());
+        for (const auto& [at, t] : ownJumps) {
+            const std::int64_t delta = std::int64_t(moved[t]) - std::int64_t(at) - 1;
+            const char* kinds = opKinds(d->code[at].opcode());
+            if (kinds[1] != '-' && kinds[1] != 'J' && kinds[2] == 'J' && (delta < -32768 || delta > 32767))
+                tooFar = true;
+            else
+                jumpTo(at, moved[t]);
         }
-        jumpTo(guard, std::uint32_t(d->code.size()));
-        put(call, line);
-        const std::uint32_t after = std::uint32_t(d->code.size());
-        for (std::uint32_t at : continuations)
-            jumpTo(at, after);
-        continuations.clear();
-        d->inlineSites.push_back(InlineSite{body, bodyEnd, guard});
-        d->nregs = std::max<std::uint32_t>(d->nregs, off + c->nregs);
-    }
-    moved[n] = std::uint32_t(d->code.size());
-    for (const auto& [at, t] : ownJumps) {
-        const std::int64_t delta = std::int64_t(moved[t]) - std::int64_t(at) - 1;
-        const char* kinds = opKinds(d->code[at].opcode());
-        if (kinds[1] != '-' && kinds[1] != 'J' && kinds[2] == 'J' && (delta < -32768 || delta > 32767)) {
-            vm.releaseCode(d);
-            return nullptr;
-        }
-        jumpTo(at, moved[t]);
+    };
+    std::vector<std::uint32_t> none;
+    emitCopy(emitCopy, 0, 0, 0, none);
+    if (tooFar || d->code.size() > kSelfInlineMaxTotal) {
+        vm.releaseCode(d);
+        return nullptr;
     }
     d->inlinedFrom = c;
     ++c->refs;

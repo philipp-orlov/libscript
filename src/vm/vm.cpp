@@ -65,10 +65,10 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     if (const char* t = std::getenv("SCRIPT_VM_TIER2"))
         tier2Threshold = std::atoi(t);
 #endif
-    selfInlining = tier2Threshold > 0;
+    selfInlining = tier2Threshold > 0 ? 2 : 0;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_SELFINLINE"))
-        selfInlining = selfInlining && std::atoi(t) != 0;
+        selfInlining = selfInlining ? std::uint8_t(std::min(std::max(std::atoi(t), 0), 4)) : 0;
 #endif
 
     atoms.length = internKey("length");
@@ -156,14 +156,19 @@ std::string VM::captureStack() const
             const std::size_t idx = at ? at - 1 : 0;
             if (idx < c->lines.size())
                 line = c->lines[idx];
-            // A call the function made of itself, run in place: its own line, then the call's.
+            // Calls the function made of itself, run in place: the innermost's own line, then each call's.
+            std::vector<const InlineSite*> in;
             for (const InlineSite& s : c->inlineSites)
-                if (idx >= s.start && idx < s.end && shown + 1 < 16) {
-                    out += "\n    at " + name + " (" + toUtf8(c->file) + ":" + std::to_string(line) + ")";
-                    ++shown;
-                    line = s.site < c->lines.size() ? c->lines[s.site] : 0;
+                if (idx >= s.start && idx < s.end)
+                    in.push_back(&s);
+            std::sort(in.begin(), in.end(), [](const InlineSite* x, const InlineSite* y) { return x->start > y->start; });
+            for (const InlineSite* s : in) {
+                if (shown + 1 >= 16)
                     break;
-                }
+                out += "\n    at " + name + " (" + toUtf8(c->file) + ":" + std::to_string(line) + ")";
+                ++shown;
+                line = s->site < c->lines.size() ? c->lines[s->site] : 0;
+            }
         }
         out += "\n    at " + name + " (" + toUtf8(c->file) + ":" + std::to_string(line) + ")";
     }

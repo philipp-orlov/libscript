@@ -1742,6 +1742,10 @@ NATIVE(stringCtor)
 NATIVE(stringFromCharCode)
 {
     UNUSED();
+    if (argc == 1 && args[0].isInt32()) {
+        const Char c = Char(std::uint32_t(args[0].asInt32()) & 0xFFFF);
+        return makeString(vm, StringView(&c, 1));
+    }
     String out;
     for (std::uint32_t i = 0; i < argc; ++i) {
         double d;
@@ -3606,6 +3610,11 @@ FastNative arrayPushNative() noexcept
 FastNative arrayPopNative() noexcept
 {
     return arrayPop;
+}
+
+FastNative stringFromCharCodeNative() noexcept
+{
+    return stringFromCharCode;
 }
 
 }  // namespace vm

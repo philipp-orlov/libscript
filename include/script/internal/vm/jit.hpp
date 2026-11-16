@@ -47,6 +47,8 @@ FastNative stringCharNative() noexcept;
 /// `Array.prototype.push` and `pop`: compiled code does the usual case itself.
 FastNative arrayPushNative() noexcept;
 FastNative arrayPopNative() noexcept;
+/// `String.fromCharCode`: compiled code gives a one-argument call of a character below 256 its kept string.
+FastNative stringFromCharCodeNative() noexcept;
 /// Whether a `Math` native's data is `Math.sqrt`'s, which compiled code does with one instruction.
 bool mathUnaryIsSqrt(const void* data) noexcept;
 

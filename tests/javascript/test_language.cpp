@@ -3386,3 +3386,33 @@ TEST(arrayLiteralsMadeInCompiledCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("450465000 | [[0,0.5,\"x0\",[0],{\"v\":0},null,null,0],[0],[0,\"s\"],[0,null,0],[0,0,9]] | 1,3 | 2,b | 9,10 | object | 6 | 123"));
     }
 }
+
+TEST(stringsAppendedInPlaceAndCharactersMadeInCompiledCode)
+{
+    // `s += t` copies into a string only its register holds; a string kept elsewhere, interned or appended to itself is
+    // left as it was. `String.fromCharCode` of a character below 256 is the string the VM keeps for it.
+    const char* program =
+        "var out=[]; "
+        "function f(n){var s=\"\", keep=[]; for(var i=0;i<n;i++){ s+=String.fromCharCode(97+i%26); if(i%50==0){ keep.push(s); } if(i%77==0) s+=s.length; if(i%91==0){ var t=s; s+=\"!\"; keep.push(t); } } return [s.length, keep.length, keep[3], keep[keep.length-1].length, s.slice(-10)];} "
+        "out.push(f(3000).join(',')); "
+        "function g(){ var a=\"ab\", b=a; for (var i=0;i<100;i++){ a+=\"c\"; } return [a.length, b, a===b]; } "
+        "out.push(g().join(',')); "
+        "function h(){ var s=\"x\"; for (var i=0;i<12;i++) s+=s; return s.length; } out.push(h()); "
+        "function k(){ var s=\"pre\"; var o={}; for (var i=0;i<300;i++){ s+=(i&1?\"y\":String.fromCharCode(i)); o[s.slice(0,4)]=1; } return [s.length, Object.keys(o).length, s.charCodeAt(100)]; } "
+        "out.push(k().join(',')); "
+        "function m(){ var s=\"\"; for (var i=0;i<1000;i++){ s+=String.fromCharCode(i*7); } var c=0; for (var i=0;i<s.length;i++) c=(c*31+s.charCodeAt(i))|0; return c; } "
+        "out.push(m()); "
+        "var lit=\"hello\"; function q(){ var s=lit; for (var i=0;i<40;i++) s+=\"!\"; return [s.length, lit]; } out.push(q().join(',')); "
+        "out.join(' | ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3173,93,a1!bcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz80abcdefghijklmn,3124,abcdefghij | 102,ab,false | 4096 | 303,1,121 | -356477524 | 45,hello"));
+    }
+}

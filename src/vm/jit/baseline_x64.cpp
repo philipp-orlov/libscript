@@ -420,6 +420,26 @@ extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
     }
 }
 
+/// `s += y` where the register holds the only count of a string with room for `y`'s characters: they are copied in
+/// place. Allocates nothing, so it needs no frame state; false, with nothing done, for anything else.
+extern "C" bool scriptVmJitAppendInPlace(JSValue* slot, std::uint64_t yBits) noexcept
+{
+    const JSValue y{yBits};
+    if (!isString(*slot) || !isString(y) || *slot == y)
+        return false;
+    StringCell* s = asString(*slot);
+    StringCell* t = asString(y);
+    if (s->interned || s->rc != 1 || (s->bits & StringCell::kOutOfLine) || (t->bits & StringCell::kOutOfLine))
+        return false;
+    const std::size_t length = std::size_t(s->length) + t->length;
+    if (s->capacity() < length)
+        return false;
+    std::memmove(s->mutableChars() + s->length, t->mutableChars(), std::size_t(t->length) * sizeof(Char));
+    s->length = std::uint32_t(length);
+    s->hash_ = 0;
+    return true;
+}
+
 /// A native function called from compiled code, the frame's `pc` and the stack top already set. Owned result, or 0 with
 /// the exception pending (a C++ one parked).
 extern "C" std::uint64_t scriptVmJitNative(VM* vm, JSFunction* f, JSValue* thisAndArgs, std::uint32_t argc)
@@ -1853,6 +1873,21 @@ void Baseline::arith(std::uint32_t i, const Ins& in)
         if (op != Op::Div)
             a_.jmp(done);
         a_.bind(dbl);
+        if (op == Op::Add && in.a == in.b) {
+            // `s += t` into a string only this register holds, with room: the characters copied in place.
+            Label notCell;
+            a_.test(RAX, R15);
+            a_.jcc(CNE, notCell);
+            savePool(i);
+            a_.lea(RDI, R(in.a));
+            a_.mov(RSI, RCX);
+            a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitAppendInPlace));
+            restorePool(i);
+            a_.aluI32(4, RAX, 0xFF);  // a bool comes back in al alone
+            a_.jcc(CE, bad);
+            a_.jmp(done);
+            a_.bind(notCell);
+        }
         needNumber(RAX, bad);
         needNumber(RCX, bad);
         loadNumber(0, RAX, RDX);
@@ -2992,6 +3027,34 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.movzx16(RAX, mem(RCX, RDX, 2));
         a_.or_(RAX, R14);
         write(in.a, RAX, false);
+        a_.jmp(afterCall);
+        a_.bind(generic);
+    }
+    if (in.opcode() == Op::Call && argc == 1) {
+        // `String.fromCharCode(c)` of a character below 256: the string the VM keeps for it.
+        Label generic;
+        a_.mov(RAX, R(base));
+        needObject(RAX, generic);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, generic);
+        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+        a_.jcc(CE, generic);
+        a_.mov(RCX, mem(RAX, kObjSlots));
+        a_.mov(RCX, mem(RCX, -16));
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(stringFromCharCodeNative()));
+        a_.cmp(RDX, mem(RCX, kRareNative));
+        a_.jcc(CNE, generic);
+        a_.mov(RDX, R(base + 2));
+        needInt(RDX, generic);
+        a_.aluI32(4, RDX, 0xFFFF);
+        a_.aluI32(7, RDX, 255);
+        a_.jcc(CA, generic);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(&vm_.smallStrings[0]));
+        a_.mov(RAX, mem(RCX, RDX, 8));
+        a_.cmpI(RAX, std::int32_t(kUndefined));
+        a_.jcc(CE, generic);
+        retain(RAX);
+        write(in.a, RAX);
         a_.jmp(afterCall);
         a_.bind(generic);
     }

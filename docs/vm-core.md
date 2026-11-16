@@ -65,6 +65,31 @@ includes what it calls), and an exception handler is entered by looking its labe
 - Tests: `everySnippetAgreesInCompiledCode` runs every snippet and `snippets_jit.inc` Eager and Tiered; `FUZZ_TIER1=1
   tools/vm_fuzz.py` fuzzes compiled code; the suites run with `SCRIPT_VM_TIER1=1`.
 
+## The optimizing compiler
+
+Tier 2 (`opt_analysis.cpp`, `opt_emit.inc`, `opt_inline.inc`) recompiles a function that stays hot in tier 1. It keeps int32 and
+double values ("webs") in registers, and the rest of the frame as tier 1 does; a guard that fails leaves for the interpreter at
+that instruction (an "exit"), and the next compile does not guess there. What it does besides arithmetic:
+
+- Property reads and writes against the inline cache with the slot address fixed at compile time (one to five shapes);
+  array and typed-array elements of the one kind a site has seen (`CodeBlock::elemProf`); `ToInt32` wrapping of `(a + b) | 0`
+  without an overflow check.
+- Inlining: a call, a getter read or `new` of a small function runs its body in place (`opt_inline.inc`). Bodies are
+  straight-line (property reads, arithmetic, up-values, `super.x`, nested calls two deep, stores into a fresh `this` for
+  constructors); every guard comes before the body's first side effect, so a failed one runs the call again in the
+  interpreter. Callees come from a constant (`f` a global) or the call site's profile (`CodeBlock::callProf`, by `uid`).
+- Direct calls of global functions: the callee is checked at the call and its frame pushed from constants; the registers
+  that held the callee and `this` are never written.
+- Registers that only carry a value to its one reader are not written: read chains (`os[i & 3].x`), the window of an
+  inlined call, `Math.sqrt` and its kin. A failed guard in such a stretch runs it again from its start, which has no effects.
+- `Math` one-argument functions in line (`sqrtsd`), `charCodeAt`, `push` and `pop`, string `length` and String.prototype
+  methods (also in tier 1).
+- A guard that fails three times in one place retires the code; code made before parts of the function had run makes way
+  once for a new compile after those parts have run a while (exit kind 2).
+
+`SCRIPT_VM_CODEDUMP=dir` writes each function's code (`t2-N-name@address.bin`, for `objdump -b binary -mi386:x86-64`);
+`T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH` print what the compiler decided and where code leaves.
+
 ## Property read caches
 
 A read site has one inline cache (own property, prototype property with a validity cell, in the word after the instruction) and,
@@ -124,9 +149,10 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 - Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in
   registers) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in builds with
   `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). aarch64 has no compiler yet and interprets (no aarch64 hardware was available).
-- Speed: ahead of JavaScriptCore without its JITs on most kernels and level with the old core on `map_dict`; the old core's JIT is
-  still 2x to 5x faster on call-heavy, allocation-heavy and callback-heavy code (`fib_calls`, `closure`, `alloc_small`, `tree_gc`,
-  `sort_cmp`, `array_push_hof`), which needs inlining and cheaper native-to-script calls.
+- Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` run 1.45x as long in geometric
+  mean; faster on `sort_cmp`, `int_loop` and `map_dict`, within 1.4x on seven more, and furthest behind on recursive calls
+  (`fib_calls`, 3.7x: every call pushes a frame in memory and counts what it stores) and small methods (`method_call` 2.7x,
+  `tree_gc` 2.2x).
 - Not compiled by tier 1: generators and async functions (they stay in the interpreter), functions of more than 20,000
   instructions.
 - Arrays are dense: a length past what a gap of `JSArray::kMaxDenseGap` allows (`a.length = 2**32 - 1`) ends in

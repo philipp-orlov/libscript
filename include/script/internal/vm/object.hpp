@@ -133,9 +133,13 @@ static_assert(sizeof(JSObject) == JSObject::kHeaderBytes, "");
 
 struct JSArray : JSObject
 {
-    JSValue* elems;  ///< out-of-line elements, `capacity` of them; null when there are none
+    JSValue* elems;  ///< the elements, `capacity` of them: `small` until there are more than it holds
     std::uint32_t length;
     std::uint32_t capacity;
+    static constexpr std::uint32_t kSmall = 4;
+    JSValue small[kSmall];  ///< the first elements of an array that has never had more
+
+    bool ownsElems() const noexcept { return elems && elems != small; }
 
     static constexpr std::uint32_t kMaxDenseGap = 1u << 24;
 

@@ -6,12 +6,13 @@
 
 using namespace vmtest;
 
-TEST(anArrayIsFortyBytesAndHoldsEightByteElements)
+TEST(anArrayIsSeventyTwoBytesWithFourElementsInPlaceAndHoldsEightByteElements)
 {
     Fixture f;
     JSArray* a = f.vm.newArray(nullptr);
     CHECK_EQ(cellBytesOf(reinterpret_cast<CellPtr>(a)), sizeof(JSArray));
-    CHECK_EQ(sizeof(JSArray), std::size_t(40));
+    CHECK_EQ(sizeof(JSArray), std::size_t(72));
+    CHECK(a->elems == a->small && !a->ownsElems() && a->capacity == JSArray::kSmall);
     CHECK(a->allNumbers());
     for (int i = 0; i < 100; ++i)
         a->append(f.vm, num(i));

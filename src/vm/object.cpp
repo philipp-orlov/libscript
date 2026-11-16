@@ -121,9 +121,9 @@ JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capac
     a->h.shape = root->id;
     a->h.flags |= cellflags::kAllNumbers;
     a->slots = nullptr;
-    a->elems = nullptr;
+    a->elems = a->small;
     a->length = 0;
-    a->capacity = 0;
+    a->capacity = JSArray::kSmall;
     try {
         a->reserve(*this, capacity);
     } catch (...) {
@@ -593,7 +593,7 @@ void JSArray::reserve(VM& vm, std::uint32_t wanted)
     auto* fresh = static_cast<JSValue*>(vm.allocPayload(8u * std::size_t(grown)));
     if (length)
         std::memcpy(fresh, elems, 8u * length);
-    if (elems)
+    if (ownsElems())
         vm.freePayload(elems, 8u * capacity);
     elems = fresh;
     capacity = std::uint32_t(grown);

@@ -199,7 +199,7 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
             if (!vm.tearingDown)
                 for (std::uint32_t i = 0; i < a->length; ++i)
                     release(a->elems[i]);
-            if (a->elems)
+            if (a->ownsElems())
                 vm.freePayload(a->elems, 8u * a->capacity);
             break;
         }
@@ -292,7 +292,7 @@ void VM::destroyNow(CellPtr cell) noexcept
                 auto* a = static_cast<JSArray*>(o);
                 for (std::uint32_t i = 0; i < a->length; ++i)
                     drop(a->elems[i]);
-                if (a->elems)
+                if (a->ownsElems())
                     freePayload(a->elems, 8u * a->capacity);
                 bytes = sizeof(JSArray);
             } else {

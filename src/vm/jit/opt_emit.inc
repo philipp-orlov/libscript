@@ -641,6 +641,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
             a_.mov(RAX, provenSlotMem(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad));
             unboxRax(dw, bad);
+            factNum_.insert({in.b, ic.index});
             return true;
         }
     }
@@ -786,9 +787,14 @@ bool Baseline::emitTyped(std::uint32_t i)
             boxDouble(operandF64(vw, 0, RCX));
             a_.mov(RCX, RAX);
         }
-        a_.mov(RSI, mem(RDX, 0));
-        a_.mov(mem(RDX, 0), RCX);
-        release(RSI);
+        if (factNum_.count({in.a, ic.index})) {
+            a_.mov(mem(RDX, 0), RCX);  // over a number
+        } else {
+            a_.mov(RSI, mem(RDX, 0));
+            a_.mov(mem(RDX, 0), RCX);
+            release(RSI);
+        }
+        factNum_.insert({in.a, ic.index});
         return true;
     }
     case Op::New:

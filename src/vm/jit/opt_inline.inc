@@ -1670,6 +1670,7 @@ void Baseline::planLoopFacts()
     loopFacts_.clear();
     loopShapes_.clear();
     loopValids_.clear();
+    loopNums_.clear();
     hoistWatch_.clear();
     preLoop_.clear();
     if (!code_->handlers.empty() || inlineBase_ < 0)
@@ -1790,6 +1791,25 @@ void Baseline::planLoopFacts()
                 loopShapes_.push_back(LoopShape{h, std::uint32_t(end), r, sa.first, sa.second});
                 any = true;
             }
+        // Of those objects, the own slots the loop reads or stores numbers in (typed, so each store is a number): checked
+        // to hold a number before the loop, they hold one all through it.
+        std::set<std::pair<unsigned, std::uint32_t>> nums;
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            const Ins& in = code_->code[j];
+            const Op op = in.opcode();
+            if ((op != Op::GetProp && op != Op::PutProp) || j + 1 >= n_ || code_->code[j + 1].a == kNoCache)
+                continue;
+            const auto& uw = plan_->useWebs[j];
+            const bool typed = op == Op::PutProp ? uw.size() >= 2 && uw[0] < 0 && uw[1] >= 0 : plan_->defWeb[j] >= 0;
+            const unsigned r = op == Op::PutProp ? in.a : in.b;
+            const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+            if (!typed || ic.holder || !shapes.count(r) || mixedShape.count(r) || shapes[r].second < 0 ||
+                shapes[r].first != ic.shape)
+                continue;
+            nums.insert({r, ic.index});
+        }
+        for (const auto& [r, k] : nums)
+            loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k});
         for (ValidityCell* c : cells) {
             loopValids_.push_back(LoopValid{h, std::uint32_t(end), c});
             any = true;
@@ -1823,6 +1843,23 @@ void Baseline::emitLoopGuards(std::uint32_t h)
             a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ls.aux));
             a_.jcc(CNE, bad);
         }
+    }
+    for (const LoopNum& ln : loopNums_) {
+        if (ln.from != h)
+            continue;
+        std::int32_t aux = -1;
+        for (const LoopShape& ls : loopShapes_)
+            if (ls.from == h && ls.reg == ln.reg)
+                aux = ls.aux;
+        a_.mov(RAX, R(ln.reg));
+        if (std::int32_t(ln.index) < aux) {
+            a_.mov(RAX, mem(RAX, kObjInline + std::int32_t(8 * ln.index)));
+        } else {
+            a_.mov(RDX, mem(RAX, kObjSlots));
+            a_.mov(RAX, mem(RDX, std::int32_t(8 * (std::int32_t(ln.index) - aux))));
+        }
+        a_.test(RAX, R14);
+        a_.jcc(CE, bad);
     }
     for (const LoopValid& lv : loopValids_) {
         if (lv.from != h)

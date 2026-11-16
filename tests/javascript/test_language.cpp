@@ -3545,3 +3545,37 @@ TEST(shapesAndChainsALoopTakesAsKnownHoldOrTheLoopIsCompiledWithout)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9998 6997 141102 3602 410046 10499 10499 34503 2550000 16391"));
     }
 }
+
+TEST(aSlotSeenHoldingANumberIsStoredOverWithoutALookAtTheOldValue)
+{
+    // Slots read and stored as numbers, then given an object through another register, a call, the same object under two
+    // names, or holding a string or an object when the loop begins.
+    const char* program =
+        "var out=[]; "
+        "function P(){this.a=1;this.b=2;} "
+        "function setObj(o){ o.a={v:1}; } "
+        "function k1(o,p,n){var s=0;for(var i=0;i<n;i++){ s+=o.b; o.a=i; p.a=i*2; if(i==300) setObj(p); s+= (typeof o.a=='object')?100:o.a; o.a=7; }return s;} "
+        "for (var r=0;r<20;r++){ var x=new P(); k1(x,new P(),50); k1(x,x,50); } "
+        "var x=new P(); out.push(k1(x,x,1000), JSON.stringify(x)); var y=new P(); out.push(k1(y,new P(),1000), JSON.stringify(y)); "
+        "function k2(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.a+o.b; o.b=o.a+1; o.a=o.b-1; }return s;} "
+        "for (var r=0;r<20;r++) k2(new P(),100); "
+        "var z=new P(); z.b={q:1}; try { out.push(k2(z,20)); } catch(e) { out.push('E'); } out.push(JSON.stringify(z)); "
+        "var w=new P(); w.a='s'; out.push(k2(w,10), JSON.stringify(w)); "
+        "function k3(o,n){var t=0;for(var i=0;i<n;i++){ o.a=i; t+=o.a; o.a=o; t+= (o.a===o)?1:0; o.a=3; }return t;} "
+        "for (var r=0;r<20;r++) k3(new P(),100); var v=new P(); out.push(k3(v,1000), v.a); "
+        "function N(){this.x=1;this.y={k:2};} "
+        "function k4(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.x; o.x=i; s+=o.y.k; }return s;} "
+        "for (var r=0;r<20;r++) k4(new N(),100); out.push(k4(new N(),1000)); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1000500 {\"a\":7,\"b\":2} 501500 {\"a\":7,\"b\":2} 01[object Object]3333333333333333333 {\"a\":1,\"b\":2} 0s2NaNs1NaNNaNNaNNaNNaNNaNNaNNaN {\"a\":null,\"b\":null} 500500 3 500502"));
+    }
+}

@@ -885,6 +885,16 @@ private:
     std::uint32_t factAt_ = 0;               ///< the instruction being emitted
     /// Validity cells checked since the facts were last forgotten.
     std::set<const ValidityCell*> factValid_;
+    /// Slots (register, property index) seen holding a number: only a typed store (a number) writes a slot without the
+    /// facts being forgotten, so a store over one has nothing to let go of.
+    std::set<std::pair<unsigned, std::uint32_t>> factNum_;
+    struct LoopNum
+    {
+        std::uint32_t from, to;
+        unsigned reg;
+        std::uint32_t index;
+    };
+    std::vector<LoopNum> loopNums_;
     /// A loop that nothing in calls out of the optimized code (`sideDoors_`) keeps every object's shape and every chain as
     /// they were at its start: the shapes of the objects in registers it does not write, and the chains its reads rely on,
     /// are checked before it and known inside it. Should a way out turn up in its code after all, the function is compiled
@@ -932,6 +942,10 @@ private:
         std::fill(factSet_.begin(), factSet_.end(), std::array<std::uint32_t, 4>{});
         std::fill(factCode_.begin(), factCode_.end(), nullptr);
         factValid_.clear();
+        factNum_.clear();
+        for (const LoopNum& ln : loopNums_)
+            if (ln.from <= factAt_ && factAt_ <= ln.to)
+                factNum_.insert({ln.reg, ln.index});
         for (const LoopFact& lf : loopFacts_)
             if (lf.from <= factAt_ && factAt_ <= lf.to && lf.reg < factCode_.size())
                 factCode_[lf.reg] = lf.code;
@@ -952,6 +966,8 @@ private:
             factInl_[r] = 0;
             factSet_[r] = {};
             factCode_[r] = nullptr;
+            for (auto it = factNum_.lower_bound({r, 0}); it != factNum_.end() && it->first == r;)
+                it = factNum_.erase(it);
         }
     }
     /// Make the object in frame register `reg` (left in RAX) be of shape `shape`, else `bad`. Proved for the code after it.

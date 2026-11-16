@@ -1281,6 +1281,15 @@ private:
     void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
     void putElem(std::uint32_t i, const Ins& in);
     void ret(std::uint32_t i, const Ins& in);
+    // R11 = the frame after the top one (R13), R10 = its index; read from the address so that nothing waits on the
+    // last store of the count.
+    void topFrameIndex()
+    {
+        a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame))));
+        a_.mov(R10, R11);
+        a_.alu(5, R10, mem(R12, kVmFrameBase));
+        a_.shiftI(5, R10, 6);
+    }
     void call(std::uint32_t i, const Ins& in);
     void getGlobal(std::uint32_t i, const Ins& in);
     void putGlobal(std::uint32_t i, const Ins& in);
@@ -2124,7 +2133,7 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
     a_.lea(R10, mem(R9, RSI, 8));
     a_.alu(7, R10, mem(R12, kVmStackInit));
     a_.jcc(CA, bad);
-    a_.mov32(R10, mem(R12, kVmFrameCount));
+    topFrameIndex();
     a_.aluI32(0, R10, 2);
     a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
     a_.jcc(CAE, bad);
@@ -2137,11 +2146,9 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
     a_.dec32(mem(R12, kVmTicks));
     a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + length(i)]));
     a_.mov(mem(R13, kFramePc), RDI);
-    a_.mov32(R10, mem(R12, kVmFrameCount));
-    a_.mov(R11, mem(R12, kVmFrameBase));
-    a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
-    a_.add(R11, RDI);
-    a_.inc32(mem(R12, kVmFrameCount));
+    topFrameIndex();
+    a_.lea(RDI, mem(R10, 1));
+    a_.mov32(mem(R12, kVmFrameCount), RDI);
     a_.mov(mem(R11, kFrameCode), RCX);
     a_.mov(mem(R11, kFrameFn), RAX);
     a_.mov(mem(R11, kFramePc), 0);
@@ -2501,7 +2508,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.lea(R10, mem(R9, RSI, 8));
         a_.alu(7, R10, mem(R12, kVmStackInit));
         a_.jcc(CA, helper);
-        a_.mov32(R10, mem(R12, kVmFrameCount));
+        topFrameIndex();
         a_.aluI32(0, R10, 2);
         a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
         a_.jcc(CAE, helper);
@@ -2538,11 +2545,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.dec32(mem(R12, kVmTicks));
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
         a_.mov(mem(R13, kFramePc), RDI);
-        a_.mov32(R10, mem(R12, kVmFrameCount));
-        a_.mov(R11, mem(R12, kVmFrameBase));
-        a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
-        a_.add(R11, RDI);
-        a_.inc32(mem(R12, kVmFrameCount));
+        topFrameIndex();
+        a_.lea(RDI, mem(R10, 1));
+        a_.mov32(mem(R12, kVmFrameCount), RDI);
         a_.mov(mem(R11, kFrameCode), RCX);
         a_.mov(mem(R11, kFrameFn), RAX);
         a_.mov(mem(R11, kFramePc), 0);
@@ -2587,7 +2592,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.lea(R10, mem(R9, RSI, 8));
         a_.alu(7, R10, mem(R12, kVmStackInit));
         a_.jcc(CA, helper);
-        a_.mov32(R10, mem(R12, kVmFrameCount));
+        topFrameIndex();
         a_.aluI32(0, R10, 2);
         a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
         a_.jcc(CAE, helper);
@@ -2651,11 +2656,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.lea(R9, R(base + 1));
         a_.dec32(mem(R12, kVmTicks));
-        a_.mov32(R10, mem(R12, kVmFrameCount));
-        a_.mov(R11, mem(R12, kVmFrameBase));
-        a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
-        a_.add(R11, RDI);
-        a_.inc32(mem(R12, kVmFrameCount));
+        topFrameIndex();
+        a_.lea(RDI, mem(R10, 1));
+        a_.mov32(mem(R12, kVmFrameCount), RDI);
         a_.mov(mem(R11, kFrameCode), RCX);
         a_.mov(mem(R11, kFrameFn), RAX);
         a_.mov(mem(R11, kFramePc), 0);

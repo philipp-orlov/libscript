@@ -382,6 +382,21 @@ public:
     void movaps(int x, int y) { opReg(false, 0x0F, x, y, 0x28); }
     void cvtsi2sd64(int x, Reg r) { opReg(true, 0x0F, x, r, 0x2A, 0xF2); }
     void sqrtsd(int x, int y) { sse(0x51, x, y); }
+    /// AVX scalar double `d = a op b` (op: 0x58 add, 0x5C sub, 0x59 mul, 0x5E div), VEX.128.F2.0F: no copy of `a` first.
+    void vsd(std::uint8_t op, int d, int a, int bx)
+    {
+        const unsigned R = (d >> 3) & 1, B = (bx >> 3) & 1, vvvv = unsigned(~a) & 15;
+        if (!B) {
+            b(0xC5);
+            b(std::uint8_t(((R ^ 1) << 7) | (vvvv << 3) | 3));
+        } else {
+            b(0xC4);
+            b(std::uint8_t(((R ^ 1) << 7) | (1 << 6) | ((B ^ 1) << 5) | 1));
+            b(std::uint8_t((vvvv << 3) | 3));
+        }
+        b(op);
+        b(std::uint8_t(0xC0 | ((d & 7) << 3) | (bx & 7)));
+    }
     void cvtsd2ss(int x, int y) { opReg(false, 0x0F, x, y, 0x5A, 0xF2); }
     void cvtss2sd(int x, int y) { opReg(false, 0x0F, x, y, 0x5A, 0xF3); }
     void movsdLoad(int x, const Mem& m) { opMem(false, 0x0F, x, m, 0x10, 0xF2); }

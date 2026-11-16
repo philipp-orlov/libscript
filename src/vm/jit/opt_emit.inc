@@ -597,6 +597,14 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (op != Op::Add && op != Op::AddI && op != Op::Sub && op != Op::SubI && op != Op::Mul && op != Op::MulI &&
             op != Op::Div)
             return false;
+        const std::uint8_t vop = op == Op::Add || op == Op::AddI ? 0x58 : op == Op::Sub || op == Op::SubI ? 0x5C
+                                 : op == Op::Mul || op == Op::MulI ? 0x59 : 0x5E;
+        // Three operands with AVX: `d = a op b` in one instruction.
+        if (inReg(dw) && hasAvx()) {
+            a_.vsd(vop, xmmOf(dw), x0, x1);
+            dirty_[std::size_t(dw)] = 1;
+            return true;
+        }
         // Straight into the variable's own register when it has one: `d = a op b` as `d = a; d op= b`.
         if (inReg(dw) && xmmOf(dw) != x1) {
             const int d = xmmOf(dw);
@@ -612,9 +620,13 @@ bool Baseline::emitTyped(std::uint32_t i)
             dirty_[std::size_t(dw)] = 1;
             return true;
         }
-        if (x0 != 0)
-            a_.movaps(0, x0);
-        apply(0, x1);
+        if (hasAvx()) {
+            a_.vsd(vop, 0, x0, x1);
+        } else {
+            if (x0 != 0)
+                a_.movaps(0, x0);
+            apply(0, x1);
+        }
         defF64(dw, 0);
         return true;
     }

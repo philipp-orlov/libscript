@@ -1672,6 +1672,11 @@ private:
     }
     /// xmm0 as a boxed double in rax; every NaN becomes the canonical one.
     void boxDouble0() { boxDouble(0); }
+    static bool hasAvx()
+    {
+        static const bool avx = __builtin_cpu_supports("avx");
+        return avx;
+    }
     /// xmm`x` as a boxed double in rax; every NaN becomes the canonical one.
     void boxDouble(int x) { boxDoubleTo(RAX, x); }
     void boxDoubleTo(Reg dst, int x)

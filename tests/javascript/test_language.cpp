@@ -3327,3 +3327,31 @@ TEST(polymorphicReadsAndPrototypeMethodsFromCompiledCode)
                  std::string("400050000 850000 850000 10600000 10450000 1450000 4849958 30009 30009"));
     }
 }
+
+TEST(logicalOperatorsInTestsAreControlFlow)
+{
+    // `&&`, `||` and `!` in the test of a loop (made at its top and its bottom), an `if`, and a conditional: what is
+    // evaluated, in which order, and where it goes.
+    const char* program =
+        "var out = [];"
+        "function f(a, b, c) { var n = 0; while (a < 10 && (b > 0 || c)) { a++; if (!(a & 1) || !c) n += a; else if (!(b && c)) n -= 1; b--; } return n; }"
+        "out.push(f(0, 5, 0), f(0, 5, 1), f(0, 0, 1), f(3, 2, ''), f(0, 20, 'x'));"
+        "var k = 0; do { k++; } while (!(k >= 5) && k !== 3 || k < 2); out.push(k);"
+        "for (var i = 0, s = 0; i < 10 && !(s > 20) || i == 0; i++) s += i; out.push(i, s);"
+        "var side = []; function t(v) { side.push(v); return v; }"
+        "if (t(0) || t(null) || !t(1) && t(2)) out.push('y'); else out.push('n');"
+        "while (t(1) && !t(0) && t(false)) {}"
+        "out.push(side.join(','), (0 || !1) ? 1 : 2, !(1 && 0) ? 3 : 4);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("15 30 29 9 30 3 7 21 n 0,,1,1,0,false 2 3"));
+    }
+}

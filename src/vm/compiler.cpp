@@ -2174,6 +2174,23 @@ std::uint16_t Compiler::conditional(const Node& n, int dst)
 void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
 {
     checkNativeStack();
+    // Only the jumps matter in a test: `&&`, `||` and `!` become control flow, no value made.
+    if (cond.kind == NK::Logical && cond.op == Tok::AndAnd) {
+        Label no;
+        condJump(*cond.a, no);
+        condJumpTrue(*cond.b, whenTrue);
+        bind(no);
+        return;
+    }
+    if (cond.kind == NK::Logical && cond.op == Tok::OrOr) {
+        condJumpTrue(*cond.a, whenTrue);
+        condJumpTrue(*cond.b, whenTrue);
+        return;
+    }
+    if (cond.kind == NK::Unary && cond.op == Tok::Bang) {
+        condJump(*cond.a, whenTrue);
+        return;
+    }
     if (cond.kind == NK::Binary && !noFuse_) {
         Op fused = Op::Nop;
         switch (cond.op) {
@@ -2212,6 +2229,17 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
     if (cond.kind == NK::Logical && cond.op == Tok::AndAnd) {
         condJump(*cond.a, whenFalse);
         condJump(*cond.b, whenFalse);
+        return;
+    }
+    if (cond.kind == NK::Logical && cond.op == Tok::OrOr) {
+        Label yes;
+        condJumpTrue(*cond.a, yes);
+        condJump(*cond.b, whenFalse);
+        bind(yes);
+        return;
+    }
+    if (cond.kind == NK::Unary && cond.op == Tok::Bang) {
+        condJumpTrue(*cond.a, whenFalse);
         return;
     }
     if (cond.kind == NK::Binary && !noFuse_) {

@@ -694,9 +694,43 @@ private:
     }
     bool allocObject(std::uint32_t shape, std::uint8_t aux, Label& slow, bool shapeInR8 = false)
     {
-        const std::size_t bytes = JSObject::bytesFor(aux);
         if (!canAllocObject(aux))
             return false;
+        CellHeader h{};
+        h.shape = shape;
+        h.cls = std::uint8_t(ObjClass::Plain);
+        h.flags = cellflags::kYoung;
+        h.aux = aux;
+        h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
+        allocCellHere(JSObject::bytesFor(aux), h, slow, shapeInR8);
+        a_.mov(mem(RAX, kObjSlots), 0);
+        return true;
+    }
+    /// An empty array of `Array.prototype`, its elements in place, made as `VM::newArray` does; else `slow`. The array,
+    /// owned, in rax; clobbers rcx, rdx, rsi. False when it cannot be done here at all.
+    bool allocArray(Label& slow)
+    {
+        if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit)
+            return false;
+        CellHeader h{};
+        h.shape = vm_.rootShapeFor(vm_.protos.array)->id;
+        h.cls = std::uint8_t(ObjClass::Array);
+        h.flags = cellflags::kYoung | cellflags::kAllNumbers;
+        h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
+        allocCellHere(sizeof(JSArray), h, slow, false);
+        static_assert(offsetof(JSArray, capacity) == offsetof(JSArray, length) + 4, "length and capacity in one store");
+        a_.mov(mem(RAX, kObjSlots), 0);
+        a_.lea(RDX, mem(RAX, std::int32_t(offsetof(JSArray, small))));
+        a_.mov(mem(RAX, kArrayElems), RDX);
+        a_.movImm(RDX, std::uint64_t(JSArray::kSmall) << 32);
+        a_.mov(mem(RAX, kArrayLength), RDX);
+        return true;
+    }
+    /// A cell of `bytes` with header `h` (its shape or-ed with r8 when `shapeInR8`) and a count of one, made here as
+    /// `VM::allocCell` does, counters and all, when the heap's current block has room and no collection is due; else
+    /// `slow`. The cell in rax; clobbers rcx, rdx, rsi.
+    void allocCellHere(std::size_t bytes, const CellHeader& h, Label& slow, bool shapeInR8)
+    {
         auto& ctx = vm_.ctx;
         auto at = [&](const void* field) {
             return std::int32_t(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&ctx));
@@ -734,13 +768,6 @@ private:
         a_.alu(0, mem(RDX, std::int32_t(mem::LocalHeap::kBlockBumpOffset)), RSI);
         a_.bind(got);
         a_.inc32(mem(RDX, std::int32_t(mem::LocalHeap::kBlockLiveOffset)));
-        // The header: shape, class, flags, inline slots, kind; a count of one; no slots outside.
-        CellHeader h{};
-        h.shape = shape;
-        h.cls = std::uint8_t(ObjClass::Plain);
-        h.flags = cellflags::kYoung;
-        h.aux = aux;
-        h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
         std::uint64_t word;
         std::memcpy(&word, &h, sizeof word);
         a_.movImm(RSI, word);
@@ -748,13 +775,11 @@ private:
             a_.or_(RSI, R8);
         a_.mov(mem(RAX, 0), RSI);
         a_.mov(mem(RAX, 8), 1);
-        a_.mov(mem(RAX, kObjSlots), 0);
         a_.aluI(0, mem(RCX, at(&ctx.heapBytes)), std::int32_t(bytes));
         a_.aluI(0, mem(RCX, at(&ctx.totalAllocated)), std::int32_t(bytes));
         a_.aluI(0, mem(RCX, at(&ctx.liveObjects)), 1);
         a_.aluI(0, mem(R12, atVm(&vm_.ownedBytes_)), std::int32_t(bytes));
         a_.aluI(0, mem(R12, atVm(&vm_.liveCells)), 1);
-        return true;
     }
     /// The value in `v` is a string (a cell of the core's own kind String), else `bad`.
     void needString(Reg v, Label& bad)
@@ -1741,11 +1766,36 @@ void Baseline::emit(std::uint32_t i)
         write(in.a, RAX);
         return;
     }
-    case Op::NewArray:
-        helperOp(i, &helperThunk<jitNewArray>);
+    case Op::NewArray: {
+        // A literal of a few elements: the array made here, its elements in place.
+        if (in.b > JSArray::kSmall || !mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit) {
+            helperOp(i, &helperThunk<jitNewArray>);
+            break;
+        }
+        allocArray(slow(i, &helperThunk<jitNewArray>));
+        write(in.a, RAX);
+        break;
+    }
         return;
-    case Op::ArrayPush:
-        helperOp(i, &helperThunk<jitArrayPush>);
+    case Op::ArrayPush: {
+        // An element of a literal, while there is room for it.
+        Label& sl = slow(i, &helperThunk<jitArrayPush>);
+        Label counted, number;
+        a_.mov(RAX, R(in.a));
+        a_.mov32(RCX, mem(RAX, kArrayLength));
+        a_.alu32(7, RCX, mem(RAX, kArrayCapacity));
+        a_.jcc(CAE, sl);
+        a_.mov(RDX, R(in.b));
+        a_.test(RDX, R14);
+        a_.jcc(CNE, number);
+        a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+        retain(RDX);
+        a_.bind(number);
+        a_.mov(RSI, mem(RAX, kArrayElems));
+        a_.mov(mem(RSI, RCX, 8), RDX);
+        a_.inc32(mem(RAX, kArrayLength));
+        break;
+    }
         return;
     default:
         emitStep(i);

@@ -3355,3 +3355,34 @@ TEST(logicalOperatorsInTestsAreControlFlow)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("15 30 29 9 30 3 7 21 n 0,,1,1,0,false 2 3"));
     }
 }
+
+TEST(arrayLiteralsMadeInCompiledCode)
+{
+    // Literals of a few elements made in place (numbers, strings, objects, holes, spread), then grown, sorted and kept.
+    const char* program =
+        "var out=[]; "
+        "function mk(i){ return [i, i+0.5, 'x'+i, [i], {v:i}, null, undefined, i]; } "
+        "function sm(i){ return [i]; } "
+        "function two(a,b){ return [a,b]; } "
+        "function holes(i){ return [i,,i]; } "
+        "function sp(a){ return [0, ...a, 9]; } "
+        "var t=0, keep=[]; "
+        "for (var i=0;i<30000;i++){ var a=mk(i), b=sm(i), c=two(i,'s'), d=holes(i), e=sp(b); t+=a.length+b[0]+c.length+d.length+(1 in d?1:0)+e.length; if(i%5000==0) keep.push(a,b,c,d,e); } "
+        "out.push(t, JSON.stringify(keep.slice(0,5))); "
+        "var n=two(3,1); n.sort(); var m=two('b',2); m.sort(); var q=two(10,9); q.sort(function(x,y){return x-y;}); "
+        "out.push(n.join(), m.join(), q.join()); "
+        "var w=two(1,{}); w.sort(function(x,y){return 0;}); out.push(typeof w[1]); "
+        "var big=[]; for (var i=0;i<20000;i++){ var z=sm(i); z.push(i,i,i,i,i); big.push(z); } out.push(big[19999].length, big[123][5]); "
+        "out.join(' | ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("450465000 | [[0,0.5,\"x0\",[0],{\"v\":0},null,null,0],[0],[0,\"s\"],[0,null,0],[0,0,9]] | 1,3 | 2,b | 9,10 | object | 6 | 123"));
+    }
+}

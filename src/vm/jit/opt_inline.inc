@@ -1829,7 +1829,7 @@ void Baseline::planLoopFacts()
             }
         // Of those objects, the own slots the loop reads or stores numbers in (typed, so each store is a number): checked
         // to hold a number before the loop, they hold one all through it.
-        std::set<std::pair<unsigned, std::uint32_t>> nums;
+        std::set<std::pair<unsigned, std::uint32_t>> nums, readNotInt;
         for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
             const Ins& in = code_->code[j];
             const Op op = in.opcode();
@@ -1843,6 +1843,9 @@ void Baseline::planLoopFacts()
                 shapes[r].first != ic.shape)
                 continue;
             nums.insert({r, ic.index});
+            const bool int32 = op == Op::PutProp ? isI32(uw[1]) : isI32(plan_->defWeb[j]);
+            if (!int32)
+                readNotInt.insert({r, ic.index});
         }
         // Int32 all through when every typed store of the loop to that index stores one (any object: it may be the same).
         std::set<std::uint32_t> notInt;
@@ -1855,7 +1858,7 @@ void Baseline::planLoopFacts()
                 notInt.insert(code_->caches[code_->code[j + 1].a].index);
         }
         for (const auto& [r, k] : nums)
-            loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k, !notInt.count(k)});
+            loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k, !notInt.count(k) && !readNotInt.count({r, k})});
         // Number reads of those objects' own slots that no store of the loop writes (to an object of that shape, which may
         // be the same one): read once before it.
         std::set<std::pair<std::uint32_t, std::uint32_t>> stored;

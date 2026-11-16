@@ -2494,8 +2494,8 @@ do_call: {
     JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArguments(vm, newR + 1, argc) : nullptr;
     // Past what is initialised the registers are fresh; below it, what this frame sits on top of may be the caller's dead
     // temporaries or arguments the callee has no parameter for, which let go of their values now.
-    if (newR + c->nregs > vm.stackInit) [[unlikely]]
-        vm.fillStack(newR + c->nregs);
+    if (newR + c->nregs + 1 > vm.stackInit) [[unlikely]]
+        vm.fillStack(newR + c->nregs + 1);  // one past: compiled code's test of the stack wants it
     {
         JSValue* callerEnd = R + code->nregs;
         const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(std::min<std::ptrdiff_t>(callerEnd - newR, c->nregs)) : 0;

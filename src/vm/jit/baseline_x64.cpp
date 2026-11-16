@@ -386,8 +386,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         release(old);
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
-    if (newR + c->nregs > vm.stackInit) [[unlikely]]
-        vm.fillStack(newR + c->nregs);
+    if (newR + c->nregs + 1 > vm.stackInit) [[unlikely]]
+        vm.fillStack(newR + c->nregs + 1);  // one past: compiled code's test of the stack wants it
     {
         // What the frame sits on may be the caller's dead temporaries, or arguments the callee has no parameter for.
         JSValue* callerEnd = R + code->nregs;

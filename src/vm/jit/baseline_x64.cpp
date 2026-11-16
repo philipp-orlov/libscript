@@ -746,6 +746,19 @@ private:
         a_.mov(dst, mem(s, kStrChars));
         a_.bind(done);
     }
+    /// The address of slot `index` of the global object, into rdx: its inline slots never change in number, so only a
+    /// slot outside them needs a load (of where they are now).
+    void globalSlot(std::uint32_t index)
+    {
+        JSObject* g = vm_.global;
+        if (index < g->h.aux) {
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->inl()[index]));
+        } else {
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->slots));
+            a_.mov(RDX, mem(RDX, 0));
+            a_.lea(RDX, mem(RDX, std::int32_t(8 * (index - g->h.aux))));
+        }
+    }
     /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
     void hold(ValidityCell* cell)
     {
@@ -888,6 +901,7 @@ private:
     /// Optimized code: registers that only ever hold numbers and other plain values while it runs, so clearing one is a
     /// store. Not those a call passes arguments in (the callee may assign its parameters) nor with exception handlers.
     std::vector<std::uint8_t> plainRegs_;
+    std::map<std::uint32_t, std::vector<unsigned>> windowCleanup_;  ///< a direct call's slow path lets these go after it
     void findPlainRegs();  ///< where the slots of inlined calls start in the optimized frame (rsp-relative)
     void emitExits();
     void emitOptTails();
@@ -979,7 +993,7 @@ private:
     /// R[dst] = the value in `v`, whose count the caller has taken; the old value is let go. Clobbers rdx, rdi.
     void write(unsigned dst, Reg v, bool oldIsNumber = false)
     {
-        if (oldIsNumber) {
+        if (oldIsNumber || (dst < plainRegs_.size() && plainRegs_[dst])) {
             a_.mov(R(dst), v);
             return;
         }
@@ -2328,8 +2342,7 @@ void Baseline::getGlobal(std::uint32_t i, const Ins& in)
     Label& bad = slow(i, &helperThunk<jitGetGlobal>);
     a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, bad);
-    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(g));
-    slotAddress(index);
+    globalSlot(index);
     a_.mov(RAX, mem(RDX, 0));
     deliver(i, in.a);
 }
@@ -2354,8 +2367,7 @@ void Baseline::putGlobal(std::uint32_t i, const Ins& in)
     Label& bad = slow(i);
     a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, bad);
-    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(g));
-    slotAddress(index);
+    globalSlot(index);
     a_.mov(RCX, R(in.b));
     retain(RCX);
     a_.mov(RSI, mem(RDX, 0));

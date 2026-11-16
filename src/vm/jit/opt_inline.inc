@@ -924,8 +924,7 @@ void Baseline::emitDirectCall(std::uint32_t i)
     // The global still holds the function.
     a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, slowPath);
-    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(vm_.global));
-    slotAddress(dc.globalIndex);
+    globalSlot(dc.globalIndex);
     a_.movImm(RAX, dc.fn.bits);
     a_.cmp(RAX, mem(RDX, 0));
     a_.jcc(CNE, slowPath);
@@ -1010,6 +1009,14 @@ void Baseline::emitDirectCall(std::uint32_t i)
         write(base + 1, RAX);
     }
     call(i, in);
+    if (auto wc = windowCleanup_.find(i); wc != windowCleanup_.end()) {
+        // What another callee may have left in its parameters, which this code takes for plain values.
+        for (unsigned r : wc->second) {
+            a_.mov(RDX, R(r));
+            a_.mov(R(r), std::int32_t(kUndefined));
+            release(RDX);
+        }
+    }
     a_.bind(done);
     if (plan_->defWeb[i] >= 0)
         loadTypedAfter(i);
@@ -1173,8 +1180,7 @@ void Baseline::emitChain(std::uint32_t i)
                                                                           : std::uint32_t(slot - g->slots) + g->h.aux;
         a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
         a_.jcc(CNE, bad);
-        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(g));
-        slotAddress(index);
+        globalSlot(index);
         a_.mov(RAX, mem(RDX, 0));
         break;
     }

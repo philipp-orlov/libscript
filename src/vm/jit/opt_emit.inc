@@ -1026,6 +1026,7 @@ void Baseline::emitOptTails()
 void Baseline::findPlainRegs()
 {
     plainRegs_.assign(code_->nregs, 1);
+    windowCleanup_.clear();
     if (!plainRegs_.empty())
         plainRegs_[0] = 0;
     if (!code_->handlers.empty() || (code_->flags & (CodeBlock::kGenerator | CodeBlock::kAsync))) {
@@ -1044,9 +1045,30 @@ void Baseline::findPlainRegs()
             if (!typed && !constant && e.wr[k] < plainRegs_.size())
                 plainRegs_[e.wr[k]] = 0;
         }
-        if (op == Op::Call || op == Op::New)
-            for (unsigned r = in.b + 1u; r <= in.b + 1u + in.c && r < plainRegs_.size(); ++r)
-                plainRegs_[r] = 0;
+        if (op == Op::Call || op == Op::New) {
+            // The callee may assign its parameters (or `this`), which are these registers: unless it is a known one that
+            // does not, and they are dead after the call (its slow path, which may reach another, lets them go).
+            bool keep = false;
+            auto dc = directCalls_.find(i);
+            if (dc != directCalls_.end()) {
+                const CodeBlock* C = dc->second.code;
+                keep = true;
+                for (std::uint32_t j = 0; j < C->code.size() && keep; j = opt::nextOf(*C, j)) {
+                    const opt::Effects ce = opt::effectsOf(*C, j);
+                    keep = ce.ok;
+                    for (std::uint16_t w : ce.wr)
+                        keep = keep && w > C->nparams;
+                }
+                for (unsigned r = in.b + 1u; r <= in.b + 1u + in.c && keep; ++r)
+                    keep = regDeadAfter(i, r);
+            }
+            for (unsigned r = in.b + 1u; r <= in.b + 1u + in.c && r < plainRegs_.size(); ++r) {
+                if (!keep)
+                    plainRegs_[r] = 0;
+                else
+                    windowCleanup_[i].push_back(r);
+            }
+        }
     }
 }
 
@@ -1060,8 +1082,8 @@ Tier2Code* Baseline::compileOptimized()
     chainSlot_ = std::int32_t(8 + 8 * W + (calls ? 8 * kInlineSlots : 0));
     spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 8 + 15) & ~15u);
     dirty_.assign(W, 1);
-    findPlainRegs();
     planDirectCalls();
+    findPlainRegs();
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);

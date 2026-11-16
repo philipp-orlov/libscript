@@ -886,6 +886,9 @@ private:
     std::map<std::uint32_t, std::pair<std::int32_t, unsigned>> windowRead_;  ///< a GetProp of a window: its slot, its receiver
     std::int32_t windowBase_ = -1;
     void planWindows();
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> mathWin_;  ///< Math call: (its GetGlobal, its GetProp)
+    void planMathCalls();
+    void emitReadInto(std::uint32_t i, bool fromRax, Label& bad);
     void emitWindowRead(std::uint32_t i);
     std::map<std::uint32_t, DirectCall> directCalls_;
     std::vector<std::uint8_t> skipDef_;  ///< instructions whose result a direct call keeps out of the frame

@@ -1661,3 +1661,161 @@ void Baseline::emitWindowRead(std::uint32_t i)
     a_.mov(RAX, mem(RDX, 0));
     a_.mov(mem(RSP, windowBase_ + 8 * slot), RAX);
 }
+
+// ---- Math calls ----
+//
+// `Math.sqrt(x)`: when the registers of `Math` and of its method are dead after the call, neither read writes them; the
+// call reads both itself and checks the function, and a failed check runs again from the read of `Math`.
+
+void Baseline::planMathCalls()
+{
+    mathWin_.clear();
+    if (!code_->handlers.empty())
+        return;
+    std::vector<std::uint32_t> starts;
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        starts.push_back(j);
+    auto reads = [&](std::uint32_t j, unsigned r) {
+        for (std::uint16_t x : opt::effectsOf(*code_, j).rd)
+            if (x == r)
+                return true;
+        return false;
+    };
+    for (std::size_t k = 0; k < starts.size(); ++k) {
+        const std::uint32_t i = starts[k];
+        const Ins& in = code_->code[i];
+        if (in.opcode() != Op::Call || in.c != 1 || directCalls_.count(i) || windowVal_.count(i))
+            continue;
+        if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
+            continue;
+        const auto& uw = plan_->useWebs[i];
+        if (plan_->defWeb[i] < 0 || uw.size() < 3 || uw[2] < 0 || uw[0] >= 0 || uw[1] >= 0)
+            continue;
+        const JSValue callee = constantBefore(i, in.b);
+        if (!isFunction(callee))
+            continue;
+        auto* fn = static_cast<JSFunction*>(asObject(callee));
+        if (!(fn->flags & JSFunction::kNative) || !fn->rare() || fn->rare()->native != mathUnaryNative())
+            continue;
+        const unsigned base = in.b;
+        // GetGlobal base+1; GetProp base base+1; then only typed arithmetic up to the call.
+        if (k < 2)
+            continue;
+        std::size_t m = k;
+        std::uint32_t d2 = 0, d1 = 0;
+        bool found2 = false;
+        while (m-- > 0) {
+            const std::uint32_t j = starts[m];
+            const Ins& ji = code_->code[j];
+            if (!found2 && ji.opcode() == Op::GetProp && ji.a == base && ji.b == base + 1) {
+                d2 = j;
+                found2 = true;
+                continue;
+            }
+            if (found2 && ji.opcode() == Op::GetGlobal && ji.a == base + 1) {
+                d1 = j;
+                break;
+            }
+            // Between: typed arithmetic that touches neither register.
+            bool typed = plan_->defWeb[j] >= 0 || ji.opcode() == Op::LoadInt;
+            for (std::int32_t w : plan_->useWebs[j])
+                typed = typed && w >= 0;
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            if (!typed || e.wr.size() != 1 || e.wr[0] == base || e.wr[0] == base + 1 || reads(j, base) ||
+                reads(j, base + 1) || plan_->isLeader[j] || opt::jumpTarget(*code_, j) >= 0) {
+                m = 0;
+                found2 = false;
+                break;
+            }
+        }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2MATH"))
+            std::fprintf(stderr, "math @%u found %d d1 %u d2 %u leader %d c1 %d c2 %d w1 %d w2 %d dead %d %d\n", i, found2, d1, d2,
+                         found2 ? int(plan_->isLeader[d2]) : -1, found2 ? int(chainable(d1, false)) : -1,
+                         found2 ? int(chainable(d2, false)) : -1, found2 ? plan_->defWeb[d1] : -9, found2 ? plan_->defWeb[d2] : -9,
+                         int(regDeadAfter(i, base)), int(regDeadAfter(i, base + 1)));
+#endif
+        if (!found2 || code_->code[d1].opcode() != Op::GetGlobal || plan_->isLeader[d2] || !chainable(d1, false) ||
+            !chainable(d2, false) || plan_->defWeb[d1] >= 0 || plan_->defWeb[d2] >= 0)
+            continue;
+        if (!regDeadAfter(i, base) || !regDeadAfter(i, base + 1))
+            continue;
+        // Nothing between the read of `Math` and the call holds what was there at the start, or exits elsewhere.
+        bool clean = true;
+        for (std::uint32_t j = d1 + length(d1); j < i && clean; j += length(j)) {
+            if (j == d2)
+                continue;
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            for (const opt::LiveWeb& lw : plan_->liveBefore[d1])
+                if (!e.wr.empty() && lw.reg == e.wr[0])
+                    clean = false;
+        }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2MATH"))
+            std::fprintf(stderr, "math @%u clean %d\n", i, int(clean));
+#endif
+        if (!clean)
+            continue;
+        mathWin_[i] = {d1, d2};
+        skipDef_[d1] = 1;
+        skipDef_[d2] = 1;
+        for (std::uint32_t j = d1 + length(d1); j <= i; j += length(j))
+            exitRedirect_[j] = std::int32_t(d1);
+    }
+}
+
+/// The value a skipped GetGlobal or GetProp (on rax, when `fromRax`) reads, into rax; `bad` when its guards fail.
+void Baseline::emitReadInto(std::uint32_t i, bool fromRax, Label& bad)
+{
+    const Ins& in = code_->code[i];
+    if (in.opcode() == Op::GetGlobal) {
+        JSObject* g = vm_.global;
+        std::uint8_t attrs = 0;
+        JSValue* slot = g->findOwn(vm_, code_->atoms[in.b], &attrs);
+        JSValue* inl = g->inl();
+        const std::uint32_t index = slot >= inl && slot < inl + g->h.aux ? std::uint32_t(slot - inl)
+                                                                          : std::uint32_t(slot - g->slots) + g->h.aux;
+        a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+        a_.jcc(CNE, bad);
+        globalSlot(index);
+        a_.mov(RAX, mem(RDX, 0));
+        return;
+    }
+    const InlineCache& ic = code_->caches[code_->code[i + 1].a];
+    struct Seen
+    {
+        std::uint32_t shape, index;
+        JSObject* holder;
+        ValidityCell* validity;
+    };
+    Seen seen[5];
+    int count = 0;
+    seen[count++] = Seen{ic.shape, ic.index, ic.holder, ic.validity};
+    if (ic.pad && ic.pad <= code_->poly.size()) {
+        const PolyCache& pc = code_->poly[ic.pad - 1];
+        for (std::uint8_t k = 0; k < pc.n; ++k)
+            seen[count++] = Seen{pc.e[k].shape, pc.e[k].index, pc.e[k].holder, pc.e[k].validity};
+    }
+    if (!fromRax)
+        a_.mov(RAX, R(in.b));
+    needObject(RAX, bad);
+    Label got;
+    for (int k = 0; k < count; ++k) {
+        Label next;
+        a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
+        a_.jcc(CNE, k + 1 < count ? next : bad);
+        if (seen[k].holder) {
+            hold(seen[k].validity);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
+        }
+        slotAddress(seen[k].index);
+        a_.jmp(got);
+        if (k + 1 < count)
+            a_.bind(next);
+    }
+    a_.bind(got);
+    a_.mov(RAX, mem(RDX, 0));
+}

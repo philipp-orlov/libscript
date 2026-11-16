@@ -780,9 +780,18 @@ bool Baseline::emitTyped(std::uint32_t i)
         void* const target = fn->rare()->nativeData;
         holdValue(callee);
         Label& bad = exitBefore(i);
-        a_.movImm(RCX, callee.bits);
-        a_.cmp(RCX, R(in.b));
-        a_.jcc(CNE, bad);
+        if (auto mw = mathWin_.find(i); mw != mathWin_.end()) {
+            // `Math` and its method read here: their registers were never written.
+            emitReadInto(mw->second.first, false, bad);
+            emitReadInto(mw->second.second, true, bad);
+            a_.movImm(RCX, callee.bits);
+            a_.cmp(RCX, RAX);
+            a_.jcc(CNE, bad);
+        } else {
+            a_.movImm(RCX, callee.bits);
+            a_.cmp(RCX, R(in.b));
+            a_.jcc(CNE, bad);
+        }
         const int x = operandF64(uw[2], 0, RAX);
         if (x != 0)
             a_.movaps(0, x);
@@ -1092,6 +1101,7 @@ Tier2Code* Baseline::compileOptimized()
     dirty_.assign(W, 1);
     planDirectCalls();
     planWindows();
+    planMathCalls();
     findPlainRegs();
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);

@@ -240,7 +240,8 @@ NATIVE(arrayIterate)
             if (!found)
                 continue;
         }
-        JSValue call[3] = {e.get(), JSValue::boxNumber(i), o.get()};
+        const JSValue index = i < 2147483648.0 ? JSValue::int32(std::int32_t(i)) : JSValue::boxNumber(i);
+        JSValue call[3] = {e.get(), index, o.get()};
         JSValue r = vm.call(callback, thisArg, call, 3);
         if (r.isException())
             return r;

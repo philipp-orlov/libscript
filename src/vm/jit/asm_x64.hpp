@@ -386,6 +386,8 @@ public:
     void cvtss2sd(int x, int y) { opReg(false, 0x0F, x, y, 0x5A, 0xF3); }
     void movsdLoad(int x, const Mem& m) { opMem(false, 0x0F, x, m, 0x10, 0xF2); }
     void movsdStore(const Mem& m, int x) { opMem(false, 0x0F, x, m, 0x11, 0xF2); }
+    void movupsStore(const Mem& m, int x) { opMem(false, 0x0F, x, m, 0x11); }
+    void punpcklqdq(int x, int y) { opReg(false, 0x0F, x, y, 0x6C, 0x66); }
     void movssLoad(int x, const Mem& m) { opMem(false, 0x0F, x, m, 0x10, 0xF3); }
     void movssStore(const Mem& m, int x) { opMem(false, 0x0F, x, m, 0x11, 0xF3); }
     void movsx8(Reg d, const Mem& m) { opMem(false, 0x0F, d, m, 0xBE); }

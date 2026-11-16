@@ -3372,8 +3372,25 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
     if (code_->nregs > first) {
         const unsigned count = code_->nregs - first;
         if (count <= 12) {
-            for (unsigned r = first; r < code_->nregs; ++r)
-                clearReg(r);
+            // Two registers that never hold a cell at a time, from xmm0 (two undefineds); a release calls out (xmm0 goes).
+            auto isPlain = [&](unsigned r) { return r < plainRegs_.size() && plainRegs_[r]; };
+            bool pair = false;
+            for (unsigned r = first; r < code_->nregs;) {
+                if (r + 1 < code_->nregs && isPlain(r) && isPlain(r + 1)) {
+                    if (!pair) {
+                        a_.movImm(RDX, kUndefined);
+                        a_.movqToX(0, RDX);
+                        a_.punpcklqdq(0, 0);
+                        pair = true;
+                    }
+                    a_.movupsStore(R(r), 0);
+                    r += 2;
+                } else {
+                    pair = pair && isPlain(r);
+                    clearReg(r);
+                    r += 1;
+                }
+            }
         } else {
             a_.lea(RDI, R(first));
             a_.movImm(RSI, count);

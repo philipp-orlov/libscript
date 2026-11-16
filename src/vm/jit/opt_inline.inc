@@ -997,18 +997,9 @@ void Baseline::planDirectCalls()
 /// calls of itself and such `new`s) -- need not check them again.
 void Baseline::planNewChecked()
 {
-    if (newInline_.empty() || !code_->handlers.empty() || !plan_->loopHeaders.empty())
+    pureFn_ = false;
+    if (!code_->handlers.empty() || !plan_->loopHeaders.empty())
         return;
-    JSValue known = JSValue::undefined();
-    for (std::uint32_t j : newInline_) {
-        JSValue k = constantBefore(j, code_->code[j].b);
-        if (!isFunction(k))
-            k = guessBefore(j, code_->code[j].b);
-        if (known.isUndefined())
-            known = k;
-        else if (k != known)
-            return;
-    }
     auto typedUses = [&](std::uint32_t j) {
         for (std::int32_t w : plan_->useWebs[j])
             if (w < 0)
@@ -1055,6 +1046,19 @@ void Baseline::planNewChecked()
         if (!ok)
             return;
     }
+    pureFn_ = true;
+    if (newInline_.empty())
+        return;
+    JSValue known = JSValue::undefined();
+    for (std::uint32_t j : newInline_) {
+        JSValue k = constantBefore(j, code_->code[j].b);
+        if (!isFunction(k))
+            k = guessBefore(j, code_->code[j].b);
+        if (known.isUndefined())
+            known = k;
+        else if (k != known)
+            return;
+    }
     // Forward, meeting by "and": 2 unreached, 1 checked, 0 not.
     std::vector<std::uint8_t> in(n_ + 1, 2);
     std::vector<std::uint32_t> work{0};
@@ -1083,6 +1087,185 @@ void Baseline::planNewChecked()
     }
     for (std::uint32_t j = 0; j < n_; ++j)
         newChecked_[j] = code_->code[j].opcode() == Op::New && in[j] == 1;
+}
+
+/// In a function that changes no object it did not make and no global (`pureFn_`), and never writes its parameters, a
+/// register that only ever holds a parameter, `this`, a global, or a property read from one of those -- or no cell at all --
+/// holds them without a count all through the call: what holds them cannot let go of them meanwhile.
+void Baseline::planFnBorrows()
+{
+    fnBorrow_.clear();
+    gated_ = false;
+    calleeReads_.clear();
+    if (!pureFn_ || code_->nregs > 250)
+        return;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2NOFNBORROW"))
+        return;
+#endif
+    const unsigned first = 1 + code_->nparams;
+    std::vector<std::uint8_t> cand(code_->nregs, 0), bad(code_->nregs, 0);
+    // Registers past a call's arguments can be released by the long way of the call (the callee's frame covers them).
+    // Registers a callee's frame covers past the arguments: its code takes them for its own (it may let go of what they
+    // hold), so none of these is held without a count.
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        const Ins& in = code_->code[j];
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        for (std::uint16_t r : e.wr)
+            if (r < first)
+                return;  // a parameter or `this` written
+        if ((in.opcode() == Op::Call || in.opcode() == Op::New) && !(in.opcode() == Op::Call && fallbackOf(j))) {
+            unsigned calleeRegs = code_->nregs + 1u;  // unknown: all the way up
+            if (auto dc = directCalls_.find(j); dc != directCalls_.end()) {
+                calleeRegs = dc->second.code->nregs;
+            } else if (in.opcode() == Op::New && newInline_.count(j)) {
+                JSValue k = constantBefore(j, in.b);
+                if (!isFunction(k))
+                    k = guessBefore(j, in.b);
+                if (isFunction(k) && static_cast<JSFunction*>(asObject(k))->code)
+                    calleeRegs = static_cast<JSFunction*>(asObject(k))->code->nregs;
+            }
+            for (unsigned r = unsigned(in.b) + 2 + unsigned(in.c); r < unsigned(in.b) + 1 + calleeRegs && r < code_->nregs; ++r)
+                bad[r] = 1;
+            // The callee and `this`: written the long way (an inlined `new` only compares its callee, and its long way
+            // constructs with the one compared).
+            const bool inlined = in.opcode() == Op::New &&
+                                 std::find(newInline_.begin(), newInline_.end(), j) != newInline_.end();
+            for (unsigned r = inlined ? in.b + 1u : in.b; r < unsigned(in.b) + 2 && r < code_->nregs; ++r)
+                bad[r] = 1;
+            if (auto dc = directCalls_.find(j); dc != directCalls_.end()) {
+                const CodeBlock* C = dc->second.code;
+                if (C != code_ || unsigned(in.c) > C->nparams)
+                    return;  // arguments past the parameters are the callee's to let go of
+                gated_ = true;
+            }
+        }
+    }
+    if (!gated_)
+        return;  // no call of itself: nothing to gain
+    planCalleeReads();
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        const Ins& in = code_->code[j];
+        const Op op = in.opcode();
+        if (op == Op::Ret && in.a < code_->nregs)
+            bad[in.a] = 1;  // what is returned goes with its count
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        if (e.wr.empty() || (op == Op::Call && fallbackOf(j)) || quietDefs_.count(j))
+            continue;
+        const unsigned r = e.wr[0];
+        if (r >= code_->nregs)
+            continue;
+        const bool skipped = (j < skipDef_.size() && skipDef_[j]);
+        const bool neutral = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue || op == Op::LoadFalse ||
+                             op == Op::LoadInt || (op == Op::LoadK && !code_->consts[in.b].isCell()) ||
+                             plan_->defWeb[j] >= 0;
+        std::uint8_t attrs = 0;
+        const bool source = !skipped && plan_->defWeb[j] < 0 &&
+                            ((op == Op::GetGlobal && vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs) &&
+                              !(attrs & attr::kAccessor)) ||
+                             (op == Op::GetProp && !(j < chainRole_.size() && chainRole_[j]) && !windowRead_.count(j) &&
+                              !reuseRead_.count(j)) ||
+                             op == Op::Mov);
+        // A def this code leaves out writes nothing here (where it is written, the code is leaving, and counts first).
+        if (skipped)
+            continue;
+        if (e.wr.size() != 1 || (!neutral && !source))
+            bad[r] = 1;
+        else if (source)
+            cand[r] = 1;
+    }
+    // What each source reads must itself be a parameter or such a register.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::uint32_t j = 0; j < n_; j += length(j)) {
+            const Ins& in = code_->code[j];
+            const Op op = in.opcode();
+            unsigned from = ~0u;
+            if (op == Op::GetProp)
+                from = in.b;
+            else if (op == Op::Mov)
+                from = in.b;
+            else
+                continue;
+            if (in.a >= code_->nregs || !cand[in.a] || bad[in.a])
+                continue;
+            if (from >= first && (from >= code_->nregs || !cand[from] || bad[from])) {
+                bad[in.a] = 1;
+                changed = true;
+            }
+        }
+    }
+    for (unsigned r = first; r < code_->nregs; ++r)
+        if (cand[r] && !bad[r])
+            fnBorrow_.insert(r);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2HOIST"))
+        for (unsigned r : fnBorrow_)
+            std::fprintf(stderr, "fnborrow %s r%u\n", codeName(code_).c_str(), r);
+#endif
+}
+
+void Baseline::planCalleeReads()
+{
+    std::vector<std::uint32_t> starts;
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        starts.push_back(j);
+    auto touches = [&](std::uint32_t j, unsigned r) {
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        for (std::uint16_t x : e.rd)
+            if (x == r)
+                return true;
+        for (std::uint16_t x : e.wr)
+            if (x == r)
+                return true;
+        return !e.ok;
+    };
+    for (std::size_t k = 0; k < starts.size(); ++k) {
+        const std::uint32_t i = starts[k];
+        const Ins& in = code_->code[i];
+        if (in.opcode() != Op::New || !newInline_.count(i) || windowVal_.count(i) || newCallee_.count(i))
+            continue;
+        const unsigned base = in.b;
+        if (!regDeadAfter(i, base))
+            continue;
+        // The read of the constructor: the last instruction before that touches its register.
+        std::int64_t d = -1;
+        for (std::size_t m = k; m-- > 0;)
+            if (touches(starts[m], base)) {
+                d = starts[m];
+                break;
+            }
+        if (d < 0)
+            continue;
+        const Ins& g = code_->code[std::size_t(d)];
+        std::uint8_t attrs = 0;
+        if (g.opcode() != Op::GetGlobal || g.a != base || (std::size_t(d) < skipDef_.size() && skipDef_[std::size_t(d)]) ||
+            plan_->defWeb[std::size_t(d)] >= 0 || !vm_.global->findOwn(vm_, code_->atoms[g.b], &attrs) ||
+            (attrs & attr::kAccessor))
+            continue;
+        // Between them: the arguments, entered only at the read and left only at the `new`.
+        bool closed = true;
+        for (std::uint32_t j = 0; j < n_ && closed; j += length(j)) {
+            const Op op = code_->code[j].opcode();
+            const std::int64_t t = opt::jumpTarget(*code_, j);
+            const bool inside = std::int64_t(j) > d && j < i;
+            if (inside && (op == Op::Ret || op == Op::Throw || op == Op::ThrowError))
+                closed = false;
+            if (t < 0)
+                continue;
+            const bool toInside = t > d && t <= std::int64_t(i);
+            if (inside != toInside && !(inside && t == std::int64_t(i)))
+                closed = false;
+            if (inside && !toInside)
+                closed = false;
+        }
+        if (!closed)
+            continue;
+        newCallee_[i] = std::uint32_t(d);
+        skipDef_[std::size_t(d)] = 1;
+        newWinDefs_.insert(std::uint32_t(d));
+        calleeReads_.emplace_back(std::uint32_t(d), i);
+    }
 }
 
 void Baseline::planSelfChecked()
@@ -1245,6 +1428,11 @@ void Baseline::emitDirectCall(std::uint32_t i)
     Label& done = coldLabels_.emplace_back();
     throws_.emplace_back(i, Label{});
     Label& exc = throws_.back().second;
+    const bool borrowing = borrowInfo_ && C == code_;
+    Label& retry = coldLabels_.emplace_back();
+    Label& tickStub = coldLabels_.emplace_back();
+    Label& fillStub = coldLabels_.emplace_back();
+    a_.bind(retry);
     // The global still holds the function (unless a self guard just saw that it does).
     if (selfChecked_[i] && dc.fn == selfFn_) {
         a_.movImm(RAX, dc.fn.bits);
@@ -1257,18 +1445,24 @@ void Baseline::emitDirectCall(std::uint32_t i)
         a_.jcc(CNE, slowPath);
     }
     // Its baseline code (once made, it stays while the block lives), room for its frame (stack, initialised stack, a
-    // frame, native stack) and a tick.
+    // frame, native stack) and a tick. Code that holds registers without a count calls itself, while it is the entry.
     a_.movImm(RCX, reinterpret_cast<std::uint64_t>(C));
-    a_.mov(RDX, mem(RCX, kCbTier1));
-    if (!C->tier1) {
-        a_.test(RDX, RDX);
-        a_.jcc(CE, slowPath);
+    if (borrowing) {
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&borrowInfo_->retired));
+        a_.cmpI8(mem(RDX, 0), 0);
+        a_.jcc(CNE, slowPath);
+    } else {
+        a_.mov(RDX, mem(RCX, kCbTier1));
+        if (!C->tier1) {
+            a_.test(RDX, RDX);
+            a_.jcc(CE, slowPath);
+        }
     }
     a_.lea(R9, R(base + 1));
     // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
     a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 8)));
     a_.alu(7, R10, mem(R12, kVmStackInit));
-    a_.jcc(CA, slowPath);
+    a_.jcc(CA, borrowing ? fillStub : slowPath);
     // The new frame follows this one (the top one): its index from the address, so nothing waits on the count's last
     // store.
     a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame))));
@@ -1277,7 +1471,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.alu(7, RSP, mem(R12, kVmStackFloor));
     a_.jcc(CB, slowPath);
     a_.cmpI32(mem(R12, kVmTicks), 1);
-    a_.jcc(CBE, slowPath);
+    // The interrupt check runs no script: code that holds registers without a count stays (the long way may not).
+    a_.jcc(CBE, borrowing ? tickStub : slowPath);
     a_.dec32(mem(R12, kVmTicks));
     // Caller registers the callee's frame covers past the arguments: plain values are overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
@@ -1310,7 +1505,7 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.mov(mem(R11, kFrameFn), RAX);
     a_.mov(mem(R11, kFramePc), 0);
     a_.mov(mem(R11, kFrameR), R9);
-    a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
+    a_.movImm(RDI, (std::uint64_t(argc) << 32) | (std::uint64_t(borrowing ? Frame::kArgsBorrowed : 0) << 16) | in.a);
     a_.mov(mem(R11, kFrameRetDst), RDI);
     a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
     // A callee that never reads `new.target` (nor calls `super`) and is no generator never looks at either.
@@ -1323,12 +1518,21 @@ void Baseline::emitDirectCall(std::uint32_t i)
     }
     a_.mov(RSI, R11);
     a_.mov(RDI, R9);
-    a_.mov(RDX, mem(RDX, kTierEntry));
-    a_.callReg(RDX);
+    if (borrowing) {
+        a_.call(selfEntry_);
+    } else {
+        a_.mov(RDX, mem(RDX, kTierEntry));
+        a_.callReg(RDX);
+    }
     a_.test(RAX, RAX);
     a_.jcc(CE, exc);
     write(in.a, RAX);
     restorePool(i);
+    if (borrowing) {
+        // Other code ran below: what this frame holds was counted, and the code leaves.
+        a_.testI8(mem(R13, kFrameBorrow), Frame::kOwned);
+        a_.jcc(CNE, exitOwnedAfter(i));
+    }
     Label typedDone;
     const std::int32_t dw = plan_->defWeb[i];
     const bool typedFast = dw >= 0 && in.a < plainRegs_.size() && plainRegs_[in.a];
@@ -1345,12 +1549,31 @@ void Baseline::emitDirectCall(std::uint32_t i)
         loadTypedAfter(i);
     a_.bind(typedDone);
     const Ins inCopy = in;
-    deferCold(i, [this, i, inCopy, base, &slowPath, &done]() {
+    deferCold(i, [this, i, inCopy, base, borrowing, &slowPath, &done, &retry, &tickStub, &fillStub, &exc]() {
     const Ins& in = inCopy;
     const DirectCall& dc = directCalls_.at(i);
+    if (borrowing) {
+        // The stack made ready, which runs no script: the code stays.
+        a_.bind(fillStub);
+        a_.mov(RDI, R12);
+        a_.mov(RSI, R10);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFillStack));
+        a_.callReg(RAX);
+        a_.test32(RAX, RAX);
+        a_.jcc(CE, slowPath);
+        a_.jmp(retry);
+        a_.bind(tickStub);
+        a_.mov(RDI, R12);
+        a_.call(tick_);
+        a_.test32(RAX, RAX);
+        a_.jcc(CNE, exc);
+        a_.jmp(retry);
+    }
     a_.bind(slowPath);
     restorePool(i);
     savePool(i);
+    if (borrowing)
+        borrowGate(true);  // the long way may run other code
     a_.mov(RDI, R12);
     a_.movImm(RSI, dc.read);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
@@ -1371,7 +1594,12 @@ void Baseline::emitDirectCall(std::uint32_t i)
             release(RDX);
         }
     }
-    a_.jmp(done);
+    if (borrowing) {
+        restorePool(i);
+        a_.jmp(exitOwnedAfter(i));
+    } else {
+        a_.jmp(done);
+    }
     });
 }
 
@@ -1832,6 +2060,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         const IVal& v = stores[k].value;
         int from = -1;
         if (v.kind == IVal::Box && v.frameReg > int(code_->nparams) && v.slot > -2 && !movedFrom.count(v.frameReg) &&
+            !fnBorrowed(unsigned(v.frameReg)) &&
             regDeadAfter(i, unsigned(v.frameReg))) {
             // The register dies here: the object takes its value with its count, and the register holds undefined.
             bool twice = false;
@@ -1883,7 +2112,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     deferCold(i, [this, i, inCopy, windowed, base, &slowPath, &done]() {
     const Ins& in = inCopy;
     a_.bind(slowPath);
-    if (windowed) {
+    const bool calleeRead = newCallee_.count(i) != 0;
+    if (windowed || calleeRead) {
         // The registers as the instructions would have written them (the global read now), then the call the long way.
         sideDoor();
         if (auto nc = newCallee_.find(i); nc != newCallee_.end()) {
@@ -1896,7 +2126,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             a_.jcc(CNE, exception(i));
             restorePool(i);
         }
-        for (const auto& [k, v] : windowVal_.at(i)) {
+        for (const auto& [k, v] : windowed ? windowVal_.at(i) : std::map<std::size_t, IVal>{}) {
             if (k == 0)
                 continue;
             inlineBoxed(v);
@@ -1907,6 +2137,21 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     }
     materializeReads(i);
     call(i, in);
+    if (windowed || calleeRead) {
+        // The registers written above are dead: as the way in place leaves them (the frame's way out takes them as such).
+        std::set<unsigned> regs;
+        if (calleeRead)
+            regs.insert(base);
+        if (windowed)
+            for (const auto& [k, v] : windowVal_.at(i))
+                if (k != 0)
+                    regs.insert(base + unsigned(k));
+        for (unsigned r : regs) {
+            a_.mov(RDX, R(r));
+            a_.mov(R(r), std::int32_t(kUndefined));
+            release(RDX);
+        }
+    }
     a_.jmp(done);  // where the typed result, if any, is loaded as on the way in place
     });
     return true;
@@ -1923,6 +2168,7 @@ void Baseline::planWindows()
     windowVal_.clear();
     windowRead_.clear();
     newCallee_.clear();
+    newWinDefs_.clear();
     if (!code_->handlers.empty() || inlineBase_ < 0)
         return;
     std::vector<std::uint32_t> starts;
@@ -2082,8 +2328,11 @@ void Baseline::planWindows()
             continue;
         }
         for (std::uint32_t d : defs)
-            if (!reads_.count(d))
+            if (!reads_.count(d)) {
                 skipDef_[d] = 1;
+                if (isNew)
+                    newWinDefs_.insert(d);
+            }
         for (auto& [d, sr] : reads_)
             windowRead_[d] = sr;
         for (std::uint32_t j = first + length(first); j <= i; j += length(j))

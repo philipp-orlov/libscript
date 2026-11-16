@@ -52,9 +52,19 @@ FastNative stringFromCharCodeNative() noexcept;
 /// Whether a `Math` native's data is `Math.sqrt`'s, which compiled code does with one instruction.
 bool mathUnaryIsSqrt(const void* data) noexcept;
 
+/// Optimized code of a function that changes no object it did not make and no global, and calls only itself, holds some
+/// registers without a count (`regs`), and passes them to its calls of itself. Whatever could run other code there -- a
+/// failed guard, a slow path -- counts first what every such frame from there up holds (`scriptVmBorrowGate`).
+struct BorrowInfo
+{
+    std::vector<std::uint16_t> regs;
+    std::uint8_t retired = 0;  ///< the code is no longer the function's entry: its calls of itself go the long way
+};
+
 /// What the optimizing compiler makes. Owned by its code block.
 struct Tier2Code
 {
+    BorrowInfo* borrow = nullptr;                                 ///< owned
     std::uint8_t* rx = nullptr;
     std::size_t bytes = 0;
     void* entry = nullptr;                                        ///< the function's entry, as the baseline code's

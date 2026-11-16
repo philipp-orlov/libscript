@@ -190,7 +190,8 @@ Label& Baseline::exitLabel(std::uint32_t i, int kind)
     std::uint64_t ctx = 0;
     std::vector<unsigned> own;
     std::vector<std::size_t> promos;
-    if (optimizing() && !borrows_.empty()) {
+    if (optimizing()) {
+        own.assign(fnBorrow_.begin(), fnBorrow_.end());  // empty unless `borrowInfo_`
         for (std::size_t k = 0; k < borrows_.size(); ++k)
             if (borrows_[k].from <= factAt_ && factAt_ <= borrows_[k].to) {
                 ctx |= std::uint64_t(1) << (k % 10);
@@ -217,7 +218,8 @@ void Baseline::deliver(std::uint32_t i, unsigned dst)
 {
     const std::int32_t w = optimizing() ? plan_->defWeb[i] : -1;
     if (w < 0) {
-        retain(RAX);
+        if (!fnBorrowed(dst))
+            retain(RAX);
         write(dst, RAX);
         return;
     }
@@ -708,7 +710,8 @@ bool Baseline::emitTyped(std::uint32_t i)
             } else {
                 a_.mov(RAX, provenSlotMem(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad));
             }
-            retain(RAX);
+            if (!fnBorrowed(in.a))
+                retain(RAX);
             write(in.a, RAX);
             return true;
         }
@@ -1154,14 +1157,58 @@ void Baseline::typedJump(std::uint32_t i, const Ins& in)
     goIf(rel.dc, i, target);
 }
 
+void Baseline::planSinglePreds()
+{
+    singlePred_.assign(n_ + 1, -1);
+    factSnaps_.clear();
+    if (!code_->handlers.empty())
+        return;
+    std::vector<std::uint32_t> preds(n_ + 1, 0);
+    std::vector<std::int64_t> from(n_ + 1, -1);
+    std::uint32_t prev = ~0u;
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        if (prev != ~0u) {
+            const Op op = code_->code[prev].opcode();
+            if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+                ++preds[j];  // falls in
+        } else {
+            ++preds[j];  // the way in
+        }
+        const std::int64_t t = opt::jumpTarget(*code_, j);
+        if (t >= 0 && std::uint64_t(t) <= n_) {
+            ++preds[std::size_t(t)];
+            from[std::size_t(t)] = t > std::int64_t(j) ? std::int64_t(j) : -2;
+        }
+        prev = j;
+    }
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        if (plan_->isLeader[j] && preds[j] == 1 && from[j] >= 0 && code_->code[std::size_t(from[j])].opcode() != Op::JNotCallee)
+            singlePred_[j] = from[j];
+}
+
 void Baseline::emitOpt(std::uint32_t i)
 {
     factAt_ = i;
     if (plan_->isLeader[i]) {
         std::fill(dirty_.begin(), dirty_.end(), 1);
-        forgetFacts();
+        if (auto sn = factSnaps_.find(i); sn != factSnaps_.end()) {
+            // Reached from one jump only: what was known there holds.
+            FactSnap& f = sn->second;
+            factShape_ = std::move(f.shape);
+            factAux_ = std::move(f.aux);
+            factInl_ = std::move(f.inl);
+            factSet_ = std::move(f.set);
+            factCode_ = std::move(f.code);
+            factValid_ = std::move(f.valid);
+            factNum_ = std::move(f.num);
+            factArr_ = std::move(f.arr);
+            factSnaps_.erase(sn);
+        } else {
+            forgetFacts();
+        }
         raxObj_ = -1;
     }
+
     delivered_ = false;
     carried_ = plan_->isLeader[i] ? -1 : raxHolds_;
     raxHolds_ = -1;
@@ -1197,7 +1244,16 @@ void Baseline::emitOpt(std::uint32_t i)
         return;
     }
     if (directCalls_.count(i)) {
-        forgetFacts();
+        if (borrowInfo_ && directCalls_.at(i).code == code_) {
+            // A call of itself that comes back here ran nothing else (`scriptVmBorrowGate`) and changed no object it did
+            // not make: what is known of this frame's registers below the callee's holds.
+            const Ins& ci = code_->code[i];
+            for (unsigned r = ci.b; r < code_->nregs; ++r)
+                forgetFact(r);
+            forgetFact(ci.a);
+        } else {
+            forgetFacts();
+        }
         emitDirectCall(i);
         return;
     }
@@ -1340,15 +1396,21 @@ void Baseline::planDirty()
     const std::size_t words = (code_->nregs + 63) / 64;
     std::vector<std::vector<std::uint64_t>> in(n_ + 1, std::vector<std::uint64_t>(words, 0));
     std::vector<opt::Effects> eff(n_);
+    std::vector<std::int32_t> kill(n_, -1);
     for (std::uint32_t j = 0; j < n_; j += length(j)) {
         eff[j] = opt::effectsOf(*code_, j);
         if (!eff[j].ok)
             return;
-        if (quietDefs_.count(j))
-            eff[j].wr.clear();  // writes nothing (`planTestReads`)
-        // Undefined, or left out and so leaving the register as it was: no new value either way.
-        if (code_->code[j].opcode() == Op::LoadUndef)
+        if (quietDefs_.count(j) || newWinDefs_.count(j))
+            eff[j].wr.clear();  // writes nothing (`planTestReads`; a `new`'s long way clears what it writes)
+        // Undefined, or left out and so leaving the register as it was: no new value either way. Undefined when it is
+        // made, or a move took the value (`emitMove`, `inlineNew`): as the frame found it, nothing to clear on the way out.
+        if (code_->code[j].opcode() == Op::LoadUndef) {
+            const unsigned r = code_->code[j].a;
             eff[j].wr.clear();
+            if (!(j < skipDef_.size() && skipDef_[j]) && !(plainAt(j, r) && regDeadAfter(j, r)))
+                kill[j] = std::int32_t(r);
+        }
     }
     // The global read before a self guard is written only on its way out to the interpreter.
     for (const auto& [g, sg] : selfGuards_)
@@ -1394,6 +1456,8 @@ void Baseline::planDirty()
         changed = false;
         for (std::uint32_t j = 0; j < n_; j += length(j)) {
             std::vector<std::uint64_t> out = in[j];
+            if (kill[j] >= 0 && unsigned(kill[j]) < code_->nregs)
+                out[unsigned(kill[j]) / 64] &= ~(std::uint64_t(1) << (unsigned(kill[j]) % 64));
             for (std::uint16_t r : eff[j].wr)
                 if (r < code_->nregs)
                     out[r / 64] |= std::uint64_t(1) << (r % 64);
@@ -1500,7 +1564,19 @@ void Baseline::emitExits()
                 if (std::int32_t(lw.web) != skip)
                     spillToFrame(lw.reg, std::int32_t(lw.web));
         writePending(at);
+        for (const auto& [d, n] : calleeReads_)
+            if (d < at && at <= n) {
+                // The constructor's global read this code left out, as it would have been (nothing else ran since).
+                a_.mov(RDI, R12);
+                a_.movImm(RSI, d);
+                a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
+                a_.callReg(RAX);
+                a_.aluI32(7, RAX, 1);
+                a_.jcc(CNE, exception(e.index));
+            }
         a_.aluI(0, RSP, spill_);
+        if (borrowInfo_ && !e.preOwned)
+            borrowGate(false);  // this frame's own were counted above
         a_.mov(RDI, R12);
         a_.movImm(RSI, e.index);
         a_.movImm(RDX, std::uint64_t(e.kind));
@@ -1614,7 +1690,7 @@ void Baseline::findPlainRegs()
 bool Baseline::emitMove(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
-    if (in.opcode() != Op::Mov || in.a == in.b || plan_->defWeb[i] >= 0)
+    if (in.opcode() != Op::Mov || in.a == in.b || plan_->defWeb[i] >= 0 || fnBorrowed(in.a) || fnBorrowed(in.b))
         return false;
     const auto& uw = plan_->useWebs[i];
     if (!uw.empty() && uw[0] >= 0)
@@ -1929,7 +2005,20 @@ Tier2Code* Baseline::compileOptimized()
         if (guardsCovered(h))
             preLoopFull_[h];
     planBorrows();
+    planFnBorrows();
+    planSinglePreds();
     planDirty();
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2CODE"))
+        std::fprintf(stderr, "== code %u regs\n%s", unsigned(code_->nregs), dump(*code_).c_str());
+#endif
+    delete borrowInfo_;
+    borrowInfo_ = nullptr;
+    if (gated_) {
+        borrowInfo_ = new BorrowInfo;
+        borrowInfo_->regs.assign(fnBorrow_.begin(), fnBorrow_.end());
+    }
+    a_.bind(selfEntry_);
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
@@ -2030,6 +2119,8 @@ Tier2Code* Baseline::compileOptimized()
             vm_.releaseValidity(v);
         for (JSValue v : held_)
             vm::release(v);
+        delete borrowInfo_;
+        borrowInfo_ = nullptr;
         return nullptr;
     }
     std::memcpy(span.rw, a_.buf.data(), a_.buf.size());
@@ -2048,6 +2139,8 @@ Tier2Code* Baseline::compileOptimized()
     t->osr = std::move(osr);
     t->validities = std::move(validities_);
     t->held = std::move(held_);
+    t->borrow = borrowInfo_;
+    borrowInfo_ = nullptr;
     return t;
 }
 

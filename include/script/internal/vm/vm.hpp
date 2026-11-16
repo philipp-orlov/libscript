@@ -118,11 +118,15 @@ struct Intrinsics
 /// from bytecode shares its first registers with the call window of its caller.
 struct Frame
 {
+    static constexpr std::uint8_t kArgsBorrowed = 1, kOwned = 2;
     CodeBlock* code;
     JSFunction* fn;
     const struct Ins* pc;       ///< where to go on in this frame: set when it calls out
     JSValue* R;
     std::uint16_t retDst;       ///< the caller's register that receives the result
+    /// Optimized code of a function that changes nothing it did not make (see `BorrowInfo`): `kArgsBorrowed`, its caller
+    /// passed arguments it holds without a count; `kOwned`, those it held so have been counted since.
+    std::uint8_t borrow;
     std::uint32_t argc;
     bool construct;             ///< `new`: a result that is not an object is replaced by `this`
     bool entry;                 ///< entered from C++: leaving it returns from `run`

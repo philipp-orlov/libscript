@@ -191,12 +191,49 @@ extern "C" int scriptVmJitTick(VM* vm)
     return 0;
 }
 
+/// Optimized code that holds registers without a count (`BorrowInfo`) is about to let other code run: count what they
+/// hold in the frame `f` (when `self`) and in each frame up from it that passed it arguments so, and mark those frames:
+/// each leaves its optimized code when its call returns. Every frame on that way runs the code `info` belongs to (such a
+/// call goes the long way once the code is no longer the entry).
+extern "C" void scriptVmBorrowGate(VM* vm, Frame* f, const BorrowInfo* info, int self)
+{
+    (void)vm;
+    auto own = [&](Frame* fr) {
+        for (std::uint16_t r : info->regs)
+            retain(fr->R[r]);
+        fr->borrow |= Frame::kOwned;
+    };
+    if (self) {
+        if (f->borrow & Frame::kOwned)
+            return;
+        own(f);
+    }
+    while (f->borrow & Frame::kArgsBorrowed) {
+        --f;
+        if (f->borrow & Frame::kOwned)
+            break;
+        own(f);
+    }
+}
+
+/// A call of optimized code that holds registers without a count needs the stack made ready up to `upTo`: done here, which
+/// runs no script. 0 when the stack has no room for it (the call goes the long way).
+extern "C" int scriptVmJitFillStack(VM* vm, JSValue* upTo)
+{
+    if (upTo + 8 > vm->stackEnd)
+        return 0;
+    vm->fillStack(upTo);
+    return 1;
+}
+
 /// Take optimized code out of use for new calls and entries: what it was told is no longer true. Frames already in it
 /// finish there.
 void retireTier2(VM& vm, CodeBlock* code) noexcept
 {
     if (code->tier1 && code->tier2 && code->tier1->entry == code->tier2->entry)
         code->tier1->entry = code->tier1->rx;
+    if (code->tier2 && code->tier2->borrow)
+        code->tier2->borrow->retired = 1;
     code->tier2Counter = vm.tier2Threshold > 0 ? vm.tier2Threshold : 0x40000000;
     if (code->tier2Tries < 255)
         ++code->tier2Tries;
@@ -409,7 +446,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         }
     }
     *vm.frameTop++ =
-        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew, true, isNew ? callee : JSValue::undefined()};
+        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, isNew, true, isNew ? callee : JSValue::undefined()};
     // `new` runs the baseline code: optimized code is made for calls only.
     return {reinterpret_cast<std::uint64_t>(vm.frameTop - 1),
             reinterpret_cast<std::uint64_t>(isNew ? static_cast<void*>(c->tier1->rx) : c->tier1->entry)};
@@ -507,6 +544,9 @@ constexpr std::int32_t kFramePc = std::int32_t(offsetof(Frame, pc));
 constexpr std::int32_t kFrameR = std::int32_t(offsetof(Frame, R));
 constexpr std::int32_t kFrameRetDst = std::int32_t(offsetof(Frame, retDst));
 constexpr std::int32_t kFrameEntry = std::int32_t(offsetof(Frame, entry));
+constexpr std::int32_t kFrameBorrow = std::int32_t(offsetof(Frame, borrow));
+static_assert(offsetof(Frame, borrow) == offsetof(Frame, retDst) + 2 && offsetof(Frame, argc) == offsetof(Frame, retDst) + 4,
+              "the return register, the borrow flags and the count of arguments are one 64-bit store");
 constexpr std::int32_t kFrameNewTarget = std::int32_t(offsetof(Frame, newTarget));
 constexpr std::int32_t kFrameGen = std::int32_t(offsetof(Frame, gen));
 static_assert(offsetof(Frame, argc) == offsetof(Frame, retDst) + 4, "retDst and argc are stored together");
@@ -656,7 +696,8 @@ private:
             if (!writes)
                 continue;
             const Ins& in = code_->code[j];
-            if (in.opcode() == Op::GetGlobal && in.a == reg && !(j < skipDef_.size() && skipDef_[j])) {
+            if (in.opcode() == Op::GetGlobal && in.a == reg &&
+                !(j < skipDef_.size() && skipDef_[j] && !newWinDefs_.count(j))) {  // a `new`'s, read by the `new`
                 std::uint8_t attrs = 0;
                 JSValue* slot = vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs);
                 return slot && !(attrs & attr::kAccessor) ? *slot : JSValue::undefined();
@@ -936,6 +977,20 @@ private:
     std::vector<LoopNum> loopNums_;
     /// A frame register's object is an array (1), and one that may be stored to: neither frozen nor closed to growth (2).
     std::vector<std::uint8_t> factArr_;
+    /// What is known where a forward jump leaves, for its target when nothing else reaches that (`singlePred_`).
+    struct FactSnap
+    {
+        std::vector<std::uint32_t> shape;
+        std::vector<std::int32_t> aux, inl;
+        std::vector<std::array<std::uint32_t, 4>> set;
+        std::vector<const CodeBlock*> code;
+        std::set<const ValidityCell*> valid;
+        std::map<std::pair<unsigned, std::uint32_t>, std::uint8_t> num;
+        std::vector<std::uint8_t> arr;
+    };
+    std::map<std::uint32_t, FactSnap> factSnaps_;
+    std::vector<std::int64_t> singlePred_;  ///< per leader: the one forward jump that reaches it, or -1
+    void planSinglePreds();
     struct LoopArr
     {
         std::uint32_t from, to;
@@ -1290,6 +1345,7 @@ private:
         Label label;
         std::vector<unsigned> own;  ///< registers held without a count where the exit is taken (`borrows_`)
         std::vector<std::size_t> promos;  ///< promoted slots to write back first (`loopPromos_`)
+        bool preOwned = false;  ///< what the frame holds without a count was counted already (`scriptVmBorrowGate`)
     };
     std::deque<ExitReq> exits_;
     std::map<std::uint64_t, Label*> exitIndex_;
@@ -1330,6 +1386,7 @@ private:
     bool inlineCall(std::uint32_t i, bool decideOnly = false);
     bool inlineGetter(std::uint32_t i);
     bool inlineNew(std::uint32_t i, bool decideOnly = false);
+    std::set<std::uint32_t> newWinDefs_;  ///< instructions left out that fill a `new` made in place (written by its long way only)
     std::map<std::uint32_t, std::uint32_t> newCallee_;  ///< a `new` whose constructor's global read writes nothing: that read
     bool inlineTop(std::uint32_t i, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
                    unsigned dst, bool decideOnly);
@@ -1362,6 +1419,16 @@ private:
     std::set<std::uint32_t> newInline_;     ///< `new` sites made in place
     std::vector<std::uint8_t> newChecked_;  ///< per instruction: a `new` whose constructor an earlier one checked
     void planNewChecked();
+    bool pureFn_ = false;  ///< changes no object it did not make and no global, calls only itself (`planNewChecked`)
+    std::set<unsigned> fnBorrow_;  ///< registers that hold their cells without a count all through the call
+    /// `pureFn_`, and its calls of itself pass the gate (`scriptVmBorrowGate`): when one comes back here, nothing else ran.
+    bool gated_ = false;
+    void planFnBorrows();
+    /// (read, new): a `new` whose constructor's global read writes nothing (`gated_`: no other code runs between); an
+    /// exit between them makes the read first.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> calleeReads_;
+    void planCalleeReads();
+    bool fnBorrowed(unsigned reg) const { return optimizing() && fnBorrow_.count(reg) != 0; }
     /// A strict test against null, undefined or a boolean loaded just before: it compares bits and runs nothing.
     bool bitTestAt(std::uint32_t i) const
     {
@@ -1479,6 +1546,28 @@ private:
     Label& exitLabel(std::uint32_t i, int kind);
     Label& exitBefore(std::uint32_t i) { return exitLabel(i, 0); }
     Label& exitAfter(std::uint32_t i) { return exitLabel(i, 1); }
+    /// After instruction `i`, in a frame `scriptVmBorrowGate` has counted the registers of (`kOwned`).
+    Label& exitOwnedAfter(std::uint32_t i)
+    {
+        const std::uint64_t key = (std::uint64_t(1) << 63) | (std::uint64_t(i) << 2) | 1u;
+        if (auto it = exitIndex_.find(key); it != exitIndex_.end())
+            return *it->second;
+        exits_.push_back(ExitReq{i, 1, Label{}, {}, {}, true});
+        exitIndex_[key] = &exits_.back().label;
+        return exits_.back().label;
+    }
+    /// Code that holds registers without a count (`fnBorrow_`): the frame (`self`) and those up from it counted.
+    void borrowGate(bool self)
+    {
+        a_.mov(RDI, R12);
+        a_.mov(RSI, R13);
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(borrowInfo_));
+        a_.movImm(RCX, self ? 1 : 0);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmBorrowGate));
+        a_.callReg(RAX);
+    }
+    BorrowInfo* borrowInfo_ = nullptr;
+    Label selfEntry_;  ///< the optimized code's entry, which its calls of itself call directly (`borrowInfo_`)
     /// A site that knew nothing when this code was made: after a while the code makes way for one made with what the
     /// baseline code has learned since (exit kind 2: the instruction runs in the interpreter, nothing is marked failed).
     void immature(std::uint32_t i)
@@ -1557,7 +1646,7 @@ private:
     /// R[dst] = the value in `v`, whose count the caller has taken; the old value is let go. Clobbers rdx, rdi.
     void write(unsigned dst, Reg v, bool oldIsNumber = false)
     {
-        if (oldIsNumber || (dst < plainRegs_.size() && plainRegs_[dst])) {
+        if (oldIsNumber || (dst < plainRegs_.size() && plainRegs_[dst]) || fnBorrowed(dst)) {
             a_.mov(R(dst), v);
             return;
         }
@@ -1935,8 +2024,17 @@ private:
         a_.mov32(mem(R12, kVmTicks), RDX);
     }
     /// Go to instruction `target` from the jump at `i`.
+    /// A forward jump to an instruction nothing else reaches: what is known as it leaves holds there (the first such jump
+    /// of an instruction knows the least).
+    void snapFacts(std::uint32_t i, std::uint32_t target)
+    {
+        if (optimizing() && target > i && target < singlePred_.size() && singlePred_[target] == std::int64_t(i) &&
+            !factSnaps_.count(target))
+            factSnaps_[target] = FactSnap{factShape_, factAux_, factInl_, factSet_, factCode_, factValid_, factNum_, factArr_};
+    }
     void go(std::uint32_t i, std::uint32_t target)
     {
+        snapFacts(i, target);
         if (target <= i) {
             tick(i);
             if (!optimizing() && vm_.tier2Threshold > 0)
@@ -1948,6 +2046,7 @@ private:
     void goIf(Cond cond, std::uint32_t i, std::uint32_t target)
     {
         if (target > i) {
+            snapFacts(i, target);
             a_.jcc(cond, at_[target]);
             return;
         }
@@ -2031,6 +2130,11 @@ void Baseline::emitTails()
         a_.bind(s.label);
         if (!s.saved)
             savePool(s.index);
+        // The runtime may run other code: the code leaves after it. Not a `new` made in place, whose long way only
+        // constructs with the constructor checked (`inlineNew`).
+        const bool gated = optimizing() && borrowInfo_ && !newInline_.count(s.index);
+        if (gated)
+            borrowGate(true);
         if (s.helper) {
             a_.mov(RDI, R12);
             a_.movImm(RSI, s.index);
@@ -2044,6 +2148,10 @@ void Baseline::emitTails()
             a_.jcc(CNE, tail_);
         }
         restorePool(s.index);
+        if (gated) {
+            a_.jmp(exitOwnedAfter(s.index));
+            continue;
+        }
         afterGeneric(s.index);
         a_.jmp(at_[s.index + length(s.index)]);
     }
@@ -2061,6 +2169,14 @@ void Baseline::emitTails()
     }
     for (auto& t : throws_) {
         a_.bind(t.second);
+        if (optimizing() && borrowInfo_) {
+            // The unwinding lets go of every register: unless the gate counted them already.
+            Label counted;
+            a_.testI8(mem(R13, kFrameBorrow), Frame::kOwned);
+            a_.jcc(CNE, counted);
+            ownRegs(std::vector<unsigned>(fnBorrow_.begin(), fnBorrow_.end()));
+            a_.bind(counted);
+        }
         a_.mov(RDI, R12);
         a_.movImm(RSI, t.first);
         a_.call(throw_);
@@ -2167,7 +2283,8 @@ void Baseline::emit(std::uint32_t i)
         return;
     case Op::Mov:
         a_.mov(RAX, R(in.b));
-        retain(RAX);
+        if (!fnBorrowed(in.a))
+            retain(RAX);
         write(in.a, RAX);
         return;
     case Op::LoadK: {
@@ -3708,7 +3825,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
     // Registers a call put its arguments in belong to the caller; those the call did not fill and everything above the
     // parameters are this frame's to clear. When none can hold a cell, nothing here calls out and rax stays.
     auto isPlain = [&](unsigned r) {
-        return (taken && r == in.a) || (r < plainRegs_.size() && plainRegs_[r]) || plainAt(i, r);
+        return (taken && r == in.a) || (r < plainRegs_.size() && plainRegs_[r]) || plainAt(i, r) || fnBorrowed(r);
     };
     unsigned cells = 0;
     for (unsigned r = first; r < code_->nregs; ++r)
@@ -3861,6 +3978,7 @@ void releaseTier2(Tier2Code* code, VM* vm) noexcept
         span.bytes = code->bytes;
         releaseCode(span);
         Tier2Code* older = code->older;
+        delete code->borrow;
         delete code;
         code = older;
     }

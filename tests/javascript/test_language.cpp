@@ -4323,3 +4323,94 @@ TEST(newInPlaceChecksItsConstructorOncePerPath)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("18900,tree,127,1,1,true,15,false,true,1,1,15,255"));
     }
 }
+
+TEST(recursionThatHoldsReadsWithoutCountsKeepsThemWhenAGetterRuns)
+{
+    // A function that changes nothing and calls only itself holds what it reads from its parameters without a count, and passes
+    // it on so; a getter met deep down (the code has left) replaces what the frames above still read after their calls.
+    const char* program =
+        "function N(l,r,v){this.l=l;this.r=r;this.v=v;}"
+        "function mk(d,v){return d===0?new N(null,null,v):new N(mk(d-1,v*2),mk(d-1,v*2+1),v);}"
+        "function f(t){var a=t.l; return a===null?1:f(a)+f(t.r)+a.v;}"
+        "var s=0; for (var i=0;i<20000;i++) s+=f(mk(4,1));"
+        "var res=[s];"
+        "for (var depth=1; depth<8; depth++) {"
+        "  var b=mk(8,1), parent=b; for (var k=0;k<depth;k++) parent=parent.l;"
+        "  var X=parent.l, once=true;"
+        "  Object.defineProperty(X,'r',{get:function(){ if(once){once=false; parent.l=mk(1,7); X=null;} var junk=[]; for(var q=0;q<200;q++) junk.push(new N(q,q,q)); keep.push(junk); return mk(1,5);}});"
+        "  X=null;"
+        "  var keep=[];"
+        "  res.push(f(b));"
+        "}"
+        "res.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("5120000 59068 62572 64140 64892 65288 65547 65536"));
+    }
+}
+
+TEST(recursionThatHoldsReadsWithoutCountsKeepsAParameterAGetterDrops)
+{
+    // The node a frame was given, held without a count all the way up, is dropped by a getter of its own: the frame goes on with it.
+    const char* program =
+        "function T(l,r){this.l=l;this.r=r;}"
+        "function mk(d){return d===0?new T(null,null):new T(mk(d-1),mk(d-1));}"
+        "function chk(t){return t.l===null?1:1+chk(t.l)+chk(t.r);}"
+        "var s=0; for (var i=0;i<20000;i++) s+=chk(mk(4));"
+        "var res=[], keep=[];"
+        "for (var depth=1; depth<8; depth++) {"
+        "  var b=mk(9), parent=b; for (var k=0;k<depth;k++) parent=parent.l;"
+        "  var P=parent.l, once=true;"
+        "  Object.defineProperty(P,'l',{get:function(){ if(once){once=false; parent.l=null; P=null;} for(var q=0;q<50;q++) keep.push(new T('x','x')); return mk(1);}});"
+        "  P=null;"
+        "  res.push(chk(b));"
+        "}"
+        "s + \" \" + res.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("620000 899 963 995 1011 1019 1023 1025"));
+    }
+}
+
+TEST(newOfAGlobalConstructorReadBeforeItsArgumentsKeepsWhatWasRead)
+{
+    // A recursive function whose `new` reads its constructor from a global, then calls itself for the arguments: the read is
+    // left out while nothing else can run; a `valueOf` met in the arguments replaces the global, and the `new` still uses the old.
+    const char* program =
+        "function T(l,r){this.l=l;this.r=r;}"
+        "function U(l,r){this.l=l;this.r=r;this.u=1;}"
+        "function mk(d){return d===0?new T(null,null):new T(mk(d-1),mk(d-1));}"
+        "function count(t){return t.l===null?1:1+count(t.l)+count(t.r);}"
+        "var s=0; for (var i=0;i<3000;i++) s+=count(mk(4));"
+        "var Old=T, calls=0;"
+        "var o={valueOf:function(){ calls++; if(calls===1) T=U; return 3; }};"
+        "var t=mk(o);"
+        "var out=[s, t instanceof Old, t.l instanceof U, t.r instanceof U, count(t), calls];"
+        "T=Old; out.push(count(mk(5)), mk(2) instanceof Old);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("93000 true true true 15 2 63 true"));
+    }
+}

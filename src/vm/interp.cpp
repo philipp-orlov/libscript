@@ -2525,7 +2525,7 @@ do_call: {
             vm.fillStack(newR + 2 + c->nparams);
         setReg(newR[1 + c->nparams], toJSValue(argsArray));
     }
-    *vm.frameTop++ = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), argc, isNew || isSuper, false,
+    *vm.frameTop++ = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, isNew || isSuper, false,
                                           isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
     if (c->tier1) {
         // Compiled code runs on the machine stack: the frame is its own entry, and the result comes back here.
@@ -3535,7 +3535,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
                 retain(args[i]);
                 R[1 + i] = args[i];
             }
-            *frameTop++ = Frame{c, f, nullptr, R, 0, n, false, true, JSValue::undefined()};
+            *frameTop++ = Frame{c, f, nullptr, R, 0, 0, n, false, true, JSValue::undefined()};
             const JSValue result = enterTier1(*this, c->tier1, 0);
             stackTop = R;
             clearRegs(R, 0, 1 + n);
@@ -3573,7 +3573,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     if (argsArray)
         setReg(R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;
-    *frameTop++ = Frame{c, f, nullptr, R, 0, argc, construct, true,
+    *frameTop++ = Frame{c, f, nullptr, R, 0, 0, argc, construct, true,
                                           construct ? (target.isUndefined() ? callee : target) : JSValue::undefined()};
     if (!c->tier1 && !c->tier1Failed && tier1Threshold && ++c->hotness >= tier1Threshold)
         compileTier1(*this, c);
@@ -3718,7 +3718,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     }
     g->state = GenState::Running;
     JSValue* savedTop = stackTop;
-    *frameTop++ = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, false, true, JSValue::undefined(), generator};
+    *frameTop++ = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, 0, false, true, JSValue::undefined(), generator};
     const JSValue result = run(*this);
     stackTop = savedTop;
     const bool finished = g->state == GenState::Running;

@@ -480,10 +480,24 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
     auto numeric = [](const IVal& v) {
         return v.kind == IVal::I32 || v.kind == IVal::F64 || (v.kind == IVal::Const && v.c.isNumber());
     };
+    // The box of the upvalue `GetUpval` just read, still in rdi (-1: none): a `PutUpval` of it after only arithmetic and
+    // loads stores through it.
+    std::int64_t boxInRdi = -1;
     for (std::uint32_t j = 0; j < C->code.size(); j = opt::nextOf(*C, j)) {
         const Ins& ci = C->code[j];
         const Op op = ci.opcode();
         const std::uint8_t p = C->prof[j];
+        switch (op) {
+        case Op::LoadInt: case Op::LoadK: case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse:
+        case Op::Mov: case Op::PutUpval: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::BitAnd:
+        case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr: case Op::AddI: case Op::SubI: case Op::MulI:
+        case Op::BitAndI: case Op::BitOrI: case Op::BitXorI: case Op::ShlI: case Op::ShrI: case Op::UShrI: case Op::Inc:
+        case Op::Dec:
+            break;
+        default:
+            boxInRdi = -1;
+            break;
+        }
         switch (op) {
         case Op::LoadInt:
             regs[ci.a] = IVal{};
@@ -607,8 +621,8 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             Label* bad = cx.fail(this);
             if (emit) {
                 loadCallee();
-                a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * ci.b)));
-                a_.mov(RAX, mem(RAX, kBoxValue));
+                a_.mov(RDI, mem(RAX, kFnUpvals + std::int32_t(8 * ci.b)));
+                a_.mov(RAX, mem(RDI, kBoxValue));
             }
             IVal out;
             if (!takeRead(p, bad, out))
@@ -616,6 +630,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             if (numeric(out) && ci.b < upNumber.size())
                 upNumber[ci.b] = std::int64_t(cx.epoch);
             regs[ci.a] = out;
+            boxInRdi = std::int64_t(ci.b);
             break;
         }
         case Op::PutUpval: {
@@ -624,7 +639,19 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             const IVal v = regs[ci.b];
             if (stale(v))
                 return false;
-            if (emit) {
+            if (emit && boxInRdi == std::int64_t(ci.a)) {
+                // The box the read before found, in rdi: the value stored through it.
+                inlineBoxed(v);
+                if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
+                    retain(RAX);
+                if (upNumber[ci.a] == std::int64_t(cx.epoch)) {
+                    a_.mov(mem(RDI, kBoxValue), RAX);  // over a number seen since the last effect
+                } else {
+                    a_.mov(RSI, mem(RDI, kBoxValue));
+                    a_.mov(mem(RDI, kBoxValue), RAX);
+                    release(RSI);
+                }
+            } else if (emit) {
                 inlineBoxed(v);
                 a_.mov(RCX, RAX);
                 if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
@@ -639,6 +666,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                     release(RSI);
                 }
             }
+            boxInRdi = -1;
             cx.sideEffect = true;
             ++cx.epoch;
             upNumber[ci.a] = numeric(v) ? std::int64_t(cx.epoch) : -1;
@@ -1356,8 +1384,12 @@ void Baseline::emitChain(std::uint32_t i)
     auto receiver = [&](unsigned reg) {
         if (role & 2) {
             // The link before left its value in rax when nothing has been emitted since and nothing jumps in here.
-            if (!(chainLeft_ == a_.here() && !plan_->isLeader[i]))
-                a_.mov(RAX, mem(RSP, chainSlot_));
+            if (!(chainLeft_ == a_.here() && !plan_->isLeader[i])) {
+                if (chainFrom_ < 0)
+                    a_.int3();  // the link before kept its value only in rax (never so: it comes right after)
+                else
+                    a_.mov(RAX, mem(RSP, chainFrom_));
+            }
         } else {
             a_.mov(RAX, R(reg));
         }
@@ -1366,6 +1398,11 @@ void Baseline::emitChain(std::uint32_t i)
     case Op::GetGlobal: {
         if (const LoopGlobal* lg = hoistedGlobal(i)) {
             a_.mov(RAX, mem(RSP, lg->slot));  // read before the loop, which does not change it
+            if (role & 1) {
+                chainFrom_ = lg->slot;  // the next link reads it from there if it must
+                chainLeft_ = a_.here();
+                return;
+            }
             break;
         }
         JSObject* g = vm_.global;
@@ -1429,7 +1466,14 @@ void Baseline::emitChain(std::uint32_t i)
         break;
     }
     if (role & 1) {
-        a_.mov(mem(RSP, chainSlot_), RAX);
+        // Kept for the next link unless that comes right after (nothing between can take rax).
+        const std::uint32_t nx = i + length(i);
+        if (nx < n_ && (chainRole_[nx] & 2) && !plan_->isLeader[nx]) {
+            chainFrom_ = -1;
+        } else {
+            a_.mov(mem(RSP, chainSlot_), RAX);
+            chainFrom_ = chainSlot_;
+        }
         chainLeft_ = a_.here();
         return;
     }

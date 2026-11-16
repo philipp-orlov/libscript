@@ -1272,6 +1272,9 @@ private:
     std::vector<std::int32_t> chainHead_;  ///< for an instruction inside a chain: where a failed guard restarts
     std::int32_t chainSlot_ = -1;          ///< rsp-relative
     std::int32_t chainLeft_ = -1;  ///< where the code was when a chain link last left its value in rax
+    /// Where on the stack the last link's value is kept (the chain's slot, or the slot of a global read before the loop);
+    /// -1 when only rax has it (the next link comes right after).
+    std::int32_t chainFrom_ = -1;
     void planChains();
     bool regDeadAfter(std::uint32_t i, unsigned r);
     bool chainable(std::uint32_t i, bool asConsumer);

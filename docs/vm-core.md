@@ -98,16 +98,33 @@ that instruction (an "exit"), and the next compile does not guess there. What it
   that for it (`hoistBroken_`). The checks run where the loop is entered: falling into its header, OSR, and the tick stub
   of its back edge.
 - Calls: the callee's registers come in `rdi` with its frame; a returned number is boxed in `rax` without a count; the
-  caller takes a number result from `rax`; a call saves only the variables live after it.
+  caller takes a number result from `rax`; a call saves only the variables live after it. `VM::frameTop` points one past
+  the top frame, so a push or a pop is one store.
+- Recursion in place (`self_inline.cpp`): a small function that calls itself by its global name gets, when it turns hot, a
+  copy of its block in which each such call is a guard (`JNotCallee`: the callee is the running function), the function's
+  own instructions with their registers where the call's frame would have put them, and the call the long way; two levels
+  deep. The copy is ordinary bytecode (the interpreter and tier 1 run it too) and starts cold so the interpreter profiles
+  it; stack traces show each call run in place (`CodeBlock::inlineSites`). Tier 2 skips the global read before such a
+  guard and checks the global's slot and the frame's function, leaving the code when either differs; a guard (or a direct
+  call of the same function) after one with nothing between that may run script does not look again.
+- Which frame registers may hold a cell where (`findCells`, flow-sensitive): returns and call windows store over the
+  others without a look, and a `LoadUndef` over no cell that nothing reads is dropped. A returned register the frame clears
+  gives its count to the result; `Mov a, b` followed by `LoadUndef b` (or the return) moves the value with its count.
+- A number read of a property that the block read before from the same register, with nothing between that may change it,
+  takes the first read's value from its home slot (`planReadReuse`).
+- Double arithmetic takes three operands with AVX (`vaddsd` and kin); a 32-bit load of the stack slot just stored from the
+  same register is only a zero-extension.
 
 `SCRIPT_VM_CODEDUMP=dir` writes each function's code (`t2-N-name@address.bin`, for `objdump -b binary -mi386:x86-64`);
-`T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH`, `T2HOIST` print what the compiler decided and where code leaves.
+`T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH`, `T2HOIST`, `T2CELLS`, `T2UNDEF` print what the compiler decided and
+where code leaves; `SCRIPT_VM_SELFINLINE=n` sets how deep recursion runs in place (0: not at all).
 
 Elsewhere for speed: `&&`, `||` and `!` in a test are jumps, not values; arrays keep their first four elements in the
 cell; array literals of up to four elements are made in compiled code; `s += t` appends in place into a string only its
 register holds; `JSON.parse` follows known shape transitions and reads short decimals without the library, and
 `JSON.stringify` keeps the quoted names of a shape while no script runs; a cycle collection that finds little to free
-waits until the cells have grown fourfold.
+waits until the cells have grown fourfold; `String.fromCharCode`, `Array.prototype.map`/`filter`/`forEach` and short
+decimals in `Number.prototype.toString` have fast paths; `MulI` wraps when its result only reaches `ToInt32`.
 
 ## Property read caches
 

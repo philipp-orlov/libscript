@@ -1,7 +1,9 @@
 # Native code generation
 
 The typed engine -- the machine C#, C and C++ run on -- compiles to machine code by default once a method gets hot, on arm64
-and on x86-64 with the System V convention. The tables below were measured on arm64. The x86-64 back end has only been run
+and on x86-64 with the System V convention. JavaScript, TypeScript and Python run on the vm core, whose own two compilers
+are described in [vm-core.md](vm-core.md); this page's section on those languages is about the older dynamic engine,
+which a context still runs with `Options::core = Dyn`. The tables below were measured on arm64. The x86-64 back end has only been run
 under qemu here, where it passes the same tests and the same fuzzing; its speed has not been measured.
 
 ## Asking for it
@@ -89,6 +91,9 @@ Everything in the language, in principle. `lowerMethod` refuses a method with a 
 `--dump-native` prints what was refused and why, along with the code that was made.
 
 ## JavaScript, TypeScript and Python
+
+This section is about the dynamic engine (`Options::core = Dyn`, or a build with `SCRIPT_JS_CORE=dyn`). The vm core, the
+default, compiles with a baseline and an optimizing compiler of its own: see [vm-core.md](vm-core.md).
 
 The dynamic engine has its own lowering (`src/dyn/jit_lower.cpp`) onto the same IR, passes and back ends. It compiles
 what the interpreter has seen, and when that turns out wrong it hands the call back:

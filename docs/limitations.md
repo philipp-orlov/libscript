@@ -185,7 +185,9 @@ no annotation is `any` rather than a shape inferred from the pattern.
 ## JavaScript
 
 Applies to TypeScript as well, since the erased program runs on the same
-machine.
+machine: the vm core by default ([vm-core.md](vm-core.md) has its own list), or
+the older dynamic engine with `Options::core = Dyn`. Where the two differ, the
+entry says which.
 
 ### Not implemented
 
@@ -209,9 +211,10 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
 
 ### Approximations
 
-- **One execution mode.** There is no sloppy/strict split. Assigning to an
-  undeclared name creates a global, writes to non-writable properties are
-  ignored instead of throwing, and duplicate parameter names are accepted.
+- **One execution mode on the dynamic engine.** It has no sloppy/strict split:
+  assigning to an undeclared name creates a global, writes to non-writable
+  properties are ignored instead of throwing, and duplicate parameter names are
+  accepted. The vm core keeps the two modes apart as the language does.
 - **A temporal dead zone for code in the same function only.** Reading or writing a
   `let`, `const` or `class` binding above its declaration in the same function (`x; let x`,
   `let x = x + 1`, `typeof x; let x`) is a `ReferenceError`. A closure that runs before the
@@ -226,10 +229,11 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
   visible through it.
 - **Block-scoped function declarations** are hoisted to the enclosing function
   rather than to the block.
-- **Arrays are dense, with holes.** An assignment more than about four million
-  elements past the end raises a `RangeError` instead of switching to a sparse
-  representation. Holes are real: `delete a[i]` makes one, and `in`, the keys
-  and the methods that skip holes see it.
+- **Arrays are dense, with holes.** An assignment far past the end does not
+  switch to a sparse representation: the vm core fills the gap with holes up to
+  2^24 elements and gives `OutOfMemory` past that; the dynamic engine raises a
+  `RangeError` past about four million. Holes are real: `delete a[i]` makes one,
+  and `in`, the keys and the methods that skip holes see it.
 - **`Date` has no `Intl`:** local time is the host's time zone, and the
   `toLocale...String` methods give en-US forms (`2/1/2022, 12:00:00 AM`).
   `Date.parse` reads the standard format, what `toString` and `toUTCString`
@@ -237,15 +241,17 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
   format a browser guesses at.
 - **`WeakRef` holds its target, and `FinalizationRegistry` never calls back.**
   Both are allowed by the specification, which promises neither collection
-  nor cleanup. `WeakMap` and `WeakSet` are truly weak: a value is kept on its
-  key and goes with it, even when it refers back to the key.
+  nor cleanup. On the dynamic engine `WeakMap` and `WeakSet` are truly weak: a
+  value is kept on its key and goes with it, even when it refers back to the
+  key. On the vm core they hold their keys for as long as the collection lives.
 - **`arguments`** is an Arguments object to the program, but its prototype is
   one that holds only `Symbol.iterator` rather than `Object.prototype` itself,
   and `arguments.callee` is not the function.
 - **A function made inside a template literal's `${...}`** shows
   `{ [native code] }` to `Function.prototype.toString`; every other function
   shows its source text.
-- **A big program compiles a function when it is first called.** Past 64 KiB of
+- **A big program compiles a function when it is first called** (the dynamic
+  engine; the vm core compiles a program whole). Past 64 KiB of
   source, a plain function of 128 bytes or more (not an arrow, method or
   anything in a class, and not next to a direct `eval`) is parsed again from its
   text on its first call and compiled then: loading a library costs little more
@@ -260,9 +266,12 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
 
 ### Operational bounds
 
-- Interpreter recursion is capped by `Options::stackLimit` (default 512), not
-  by the OS stack. A very deep native/script sandwich can still be expensive:
-  budget roughly a kilobyte of C++ stack per script frame.
+- Recursion is capped by `Options::stackLimit` (default 512), not by the OS
+  stack. The vm core counts frames, which take no C++ stack (a call does not
+  recurse in the interpreter, and compiled code takes well under a kilobyte of
+  machine stack a frame); recursion it runs in place counts once for up to three
+  levels. The dynamic engine's native code counts stack instead, so it goes deeper;
+  its interpreter costs roughly a kilobyte of C++ stack per script frame.
 - The interrupt handler is polled every few thousand instructions, so a single
   pathological built-in call -- `'x'.repeat(1e8)` -- is not interruptible
   mid-operation. Sizes are capped where that could matter.
@@ -285,7 +294,7 @@ matcher polls the interrupt hook and charges its stack to `memoryLimit`, so a ho
 
 ## Python
 
-libscript implements the everyday core of Python 3 on the dynamic engine, by
+libscript implements the everyday core of Python 3 on the vm core, by
 lowering to the ECMAScript syntax tree. [languages/python.md](languages/python.md)
 lists what is in; this is what is out, and where the object model shows.
 
@@ -293,7 +302,7 @@ lists what is in; this is what is out, and where the object model shows.
 
 | Construct | Note |
 | --- | --- |
-| generators, `yield`, `async`/`await` | the dynamic VM suspends JavaScript's coroutines, but the Python front end does not lower these to them yet; write an iterator class with `__iter__` |
+| generators, `yield`, `async`/`await` | the vm core suspends JavaScript's coroutines, but the Python front end does not lower these to them yet; write an iterator class with `__iter__` |
 | `with` | there is nothing to manage: no files, no locks |
 | `import` of anything but `math`, `random`, `sys`, `time` | there is no module system and no file system; the host exposes what it wants through `hostClass` |
 | `**kwargs`, keyword-only parameters, `**` in calls | keyword arguments are matched by position at compile time, which a dictionary of them defeats |

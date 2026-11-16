@@ -8,7 +8,7 @@ host names with a `.ts` or `.mts` extension, passes with
 `Language::TypeScript`, or runs in a context whose `Options::language` says
 so. It goes through the shared ECMAScript lexer and parser with the TypeScript
 syntax on, then the structural checker, then the eraser, and what is left
-runs on the dynamic engine exactly as [JavaScript](javascript.md) does; the
+runs on the vm core exactly as [JavaScript](javascript.md) does; the
 JavaScript page's syntax, library and semantics apply here unchanged. The
 second half of this page is what the type checker does with the type syntax.
 

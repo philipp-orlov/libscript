@@ -16,15 +16,18 @@ parser and a registration of its own (`src/lang/cpp/cpp.cpp`).
 | If the language is | Use | Its input form | Copy from |
 | --- | --- | --- | --- |
 | statically typed, with classes, fields and methods resolved before it runs (BASIC with `Dim x As Integer`, a Java or Go subset) | the **typed engine**, `src/typed/` | the resolved AST in `include/script/internal/typed/ast.hpp`: every `TypeRef` bound to a `TypeInfo`, every local given a slot, every call bound to a `MethodInfo`, every conversion chosen -- the shape the C# checker leaves behind | `src/lang/csharp/` |
-| dynamically typed, with objects as property bags and closures (Python, Lua, Ruby, a Lisp) | the **dynamic engine**, `src/dyn/` | the ECMAScript AST in `include/script/internal/dyn/ast.hpp`: one `Node` kind per construct, no type nodes | `src/lang/javascript/` |
+| dynamically typed, with objects as property bags and closures (Python, Lua, Ruby, a Lisp) | the **vm core**, `src/vm/` (or the older dynamic engine, `src/dyn/`, which compiles the same input) | the ECMAScript AST in `include/script/internal/dyn/ast.hpp`: one `Node` kind per construct, no type nodes | `src/lang/javascript/` |
 
 The typed engine gives you typed bytecode, an interpreter with no dynamic
 lookups, arm64 and x86-64 code generation, and portable images; the price is a
 front end that resolves everything, which for C# is the 4,400-line checker.
-The dynamic engine gives you prototypes, closures, `typeof`-style dynamism and
-a compiler you call as one function; the price is that your language's object
-model has to fit JavaScript's, which for Python's classes, dicts and lists it
-largely does.
+The vm core gives you prototypes, closures, `typeof`-style dynamism, a
+compiler you call as one function and two x86-64 compilers above its
+interpreter; the price is that your language's object model has to fit
+JavaScript's, which for Python's classes, dicts and lists it largely does. A
+language reaches the vm core through `SCRIPT_VM_LANGS` and its glue in
+`src/vm/language.cpp`, as TypeScript does, or with natives of its own, as
+Python does (`src/vm/python.cpp`).
 
 A typed language whose declarations map onto classes, arrays and static
 members has a shortcut the C front end takes: build the *unresolved* C#-shaped

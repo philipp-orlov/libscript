@@ -7,7 +7,8 @@ A JavaScript source is one the host names with a `.js`, `.mjs` or `.cjs`
 extension, passes with `Language::JavaScript`, or runs in a context whose
 `Options::language` says so. It goes through the ECMAScript lexer and parser
 that TypeScript also uses, with the TypeScript syntax switched off, and
-straight into the dynamic engine's compiler; nothing is type-checked.
+straight into the vm core's compiler ([vm-core.md](../vm-core.md)); nothing is
+type-checked.
 
 ## Syntax
 

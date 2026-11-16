@@ -8,8 +8,8 @@ a test in `tests/python/`. A Python source is one the host names with a `.py`
 extension, passes with `Language::Python`, or runs in a context whose
 `Options::language` says so.
 
-Python runs on the dynamic engine. The front end parses Python and lowers it
-directly to the engine's ECMAScript syntax tree -- there is no Python
+Python runs on the vm core, as JavaScript does. The front end parses Python and lowers it
+directly to the ECMAScript syntax tree -- there is no Python
 interpreter and no Python object model of its own. A Python list *is* an
 engine array, a dict *is* a `Map`, a class *is* a class, a function *is* a
 function; which is what lets a value cross to JavaScript, TypeScript or the

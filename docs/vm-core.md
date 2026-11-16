@@ -222,10 +222,14 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 - Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in
   registers) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in builds with
   `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). aarch64 has no compiler yet and interprets (no aarch64 hardware was available).
-- Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` run 1.45x as long in geometric
-  mean; faster on `sort_cmp`, `int_loop` and `map_dict`, within 1.4x on seven more, and furthest behind on recursive calls
-  (`fib_calls`, 3.7x: every call pushes a frame in memory and counts what it stores) and small methods (`method_call` 2.7x,
-  `tree_gc` 2.2x).
+- Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` take 0.91x its time in
+  geometric mean (Xeon Gold 5420+, best of seven): `sort_cmp` 0.48, `float_mandel` 0.62, `alloc_small` 0.72, `string_ops`
+  0.86, `int_loop` 0.87, `map_dict` 0.89, `prop_rw` 0.95, `array_push_hof` 0.97, `json_rt` 0.99, `method_call` 1.01,
+  `closure` 1.04, `sieve_array` 1.06, `poly_prop` 1.07, `fib_calls` 1.10, `nbody` 1.10, `tree_gc` 1.15. What is left on the
+  last three: a call still pushes a whole frame in memory (`fib_calls`), the double fields of objects are read and boxed
+  through memory each time (`nbody`), and every object made is counted and freed one by one (`tree_gc`).
+- Calls are counted, not measured in stack: a call deeper than `Options::stackLimit` frames (512 by default) is a
+  `RangeError`. Recursion run in place can take one frame for up to three levels.
 - Not compiled by tier 1: generators and async functions (they stay in the interpreter), functions of more than 20,000
   instructions.
 - Arrays are dense: a length past what a gap of `JSArray::kMaxDenseGap` allows (`a.length = 2**32 - 1`) ends in

@@ -13,6 +13,7 @@
 
 <p align="center">
   <a href="#-see-it-run"><b>See it run</b></a> ·
+  <a href="#-against-javascriptcore"><b>Against JSC</b></a> ·
   <a href="#-the-numbers"><b>The numbers</b></a> ·
   <a href="#-under-the-hood"><b>Under the hood</b></a> ·
   <a href="#-build-it"><b>Build it</b></a> ·
@@ -101,14 +102,35 @@ bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
 | Language | Runs on | What you get | Reference |
 | --- | --- | --- | --- |
 | **C#** | typed engine + JIT | static checking, reified generics, records, patterns, tuples, ranges | [csharp.md](docs/languages/csharp.md) |
-| **TypeScript** | dynamic engine | a structural type checker, then erased; generics, narrowing, `strict` mode | [typescript.md](docs/languages/typescript.md) |
-| **JavaScript** | dynamic engine + JIT | ES2024 and more: classes, generators, async, regular expressions, `BigInt`, typed arrays, `Proxy`, `WeakMap`; 76% of test262 | [javascript.md](docs/languages/javascript.md) |
-| **Python** | dynamic engine | the everyday core of Python 3: functions, classes, dicts, lambdas | [python.md](docs/languages/python.md) |
+| **TypeScript** | vm core + JIT | a structural type checker, then erased; generics, narrowing, `strict` mode | [typescript.md](docs/languages/typescript.md) |
+| **JavaScript** | vm core + JIT | ES2024 and more: classes, generators, async, regular expressions, `BigInt`, typed arrays, `Proxy`, `WeakMap`; 79% of test262 | [javascript.md](docs/languages/javascript.md) |
+| **Python** | vm core + JIT | the everyday core of Python 3: functions, classes, dicts, lambdas | [python.md](docs/languages/python.md) |
 | **C** | typed engine + JIT | a sandboxed C with a `libc` of natives; no ambient file or OS access | [c.md](docs/languages/c.md) |
 | **C++** | typed engine + JIT | classes, virtual dispatch, exceptions, the standard containers | [cpp.md](docs/languages/cpp.md) |
 
 Every language is a CMake option. Turn off what you don't ship, and its front end, tests and examples go with it; an
-engine goes once no language needs it.
+engine goes once no language needs it. The vm core's compilers generate x86-64 code on Linux; elsewhere it interprets
+(an arm64 back end for it is not written yet).
+
+## 🏁 Against JavaScriptCore
+
+The vm core runs JavaScript, TypeScript and Python with an interpreter, a baseline compiler and an optimizing compiler.
+On the 16 kernels in [`bench/kernels/js`](bench/kernels/js), it takes 0.91× the time of JavaScriptCore 2.52.6 with all its
+tiers, as a geometric mean:
+
+| Kernel | vm / JSC | Kernel | vm / JSC |
+| --- | --: | --- | --: |
+| `sort_cmp` | **0.48** | `json_rt` | 0.99 |
+| `float_mandel` | **0.62** | `method_call` | 1.01 |
+| `alloc_small` | **0.72** | `closure` | 1.04 |
+| `string_ops` | **0.86** | `sieve_array` | 1.06 |
+| `int_loop` | **0.87** | `poly_prop` | 1.07 |
+| `map_dict` | **0.89** | `fib_calls` | 1.10 |
+| `prop_rw` | **0.95** | `nbody` | 1.10 |
+| `array_push_hof` | **0.97** | `tree_gc` | 1.15 |
+
+<sub>Whole-process wall-clock time, best of seven, on one core of a Xeon Gold 5420+ (x86-64, Linux, GCC 13, Release);
+lower is better. How each kernel was won and what is left is in [vm-core.md](docs/vm-core.md).</sub>
 
 ## 🚀 The numbers
 
@@ -161,9 +183,9 @@ C++ signature, and the dynamic languages see the same functions on the same obje
 
 ### 🏎️ Two machines, one heap
 C#, C and C++ compile to typed bytecode, with arm64 and x86-64 back ends around 10× faster than interpreting for the
-arithmetic-and-loops core of a method. TypeScript, JavaScript and Python run on a prototype-based stack machine,
-with hidden classes, inline caches and the same back ends compiling hot functions.
-[More](docs/design.md)
+arithmetic-and-loops core of a method. TypeScript, JavaScript and Python run on the vm core: NaN-boxed values, shapes
+and inline caches, a register interpreter, and two compilers on top, the second keeping numbers in machine registers,
+running small functions and recursion in place. [More](docs/vm-core.md)
 
 </td>
 <td valign="top">
@@ -186,9 +208,10 @@ portable image another process loads without lexing, parsing or checking. [More]
 <td valign="top">
 
 ### 🧪 Tested as if it had to last
-42 test suites across the languages, all of them under AddressSanitizer and UndefinedBehaviorSanitizer, the ones that
-share state under ThreadSanitizer, with long-run soak tests that check the resident size. CI runs both code generators on their own hardware. Known gaps are
-written down in [limitations.md](docs/limitations.md).
+53 test suites across the languages, all of them under AddressSanitizer and UndefinedBehaviorSanitizer, the ones that
+share state under ThreadSanitizer, test262 for JavaScript, differential fuzzers that hold compiled code to the
+interpreter, and long-run soak tests that check the resident size. CI runs both code generators on their own hardware.
+Known gaps are written down in [limitations.md](docs/limitations.md).
 
 </td>
 </tr>
@@ -233,13 +256,14 @@ target_link_libraries(my_app PRIVATE script::script)
 | Option | Default | Effect |
 | --- | --- | --- |
 | `SCRIPT_LANG_CSHARP` | ON | the C# front end and the typed engine |
-| `SCRIPT_LANG_TYPESCRIPT` | ON | the TypeScript front end and the dynamic engine |
-| `SCRIPT_LANG_JAVASCRIPT` | ON | the JavaScript front end and the dynamic engine |
-| `SCRIPT_LANG_PYTHON` | ON | the Python front end and the dynamic engine |
+| `SCRIPT_LANG_TYPESCRIPT` | ON | the TypeScript front end and the vm core |
+| `SCRIPT_LANG_JAVASCRIPT` | ON | the JavaScript front end and the vm core |
+| `SCRIPT_LANG_PYTHON` | ON | the Python front end and the vm core |
 | `SCRIPT_LANG_C` | ON | the C front end and the typed engine |
 | `SCRIPT_LANG_CPP` | ON | the C++ dialect of the C front end and the typed engine |
-| `SCRIPT_ENABLE_JIT` | ON | the arm64 and x86-64 code generators (needs the typed engine) |
-| `SCRIPT_JIT_THREAD` | ON | JavaScript, TypeScript, Python: a large function compiles on a thread of its own while it is interpreted |
+| `SCRIPT_ENABLE_JIT` | ON | the arm64 and x86-64 code generators of the typed engine |
+| `SCRIPT_JS_CORE` | `vm` | what runs JavaScript, TypeScript and Python: `vm` (the vm core, with the old dynamic engine built beside it as the oracle), `both` (the same), or `dyn` (the old engine only) |
+| `SCRIPT_JIT_THREAD` | ON | the dynamic engine: a large function compiles on a thread of its own while it is interpreted |
 | `SCRIPT_UNICODE_PROPERTIES` | ON (OFF in Compact) | the 43 KB of tables behind `\p{...}` in regular expressions |
 | `SCRIPT_BUILD_TESTS` | ON | the test suites, one executable per suite |
 | `SCRIPT_BUILD_EXAMPLES` | ON | the examples |
@@ -250,8 +274,8 @@ target_link_libraries(my_app PRIVATE script::script)
 | `SCRIPT_ENABLE_ASAN` | OFF | address and undefined-behaviour sanitizers |
 | `SCRIPT_WARNINGS_AS_ERRORS` | OFF | `-Werror` / `/WX` |
 
-An engine is built only when a language needs it: turning off C#, C and C++ drops the typed engine and the JIT, turning
-off TypeScript, JavaScript and Python drops the dynamic engine. C and C++ share one front end, so either brings it. At
+An engine is built only when a language needs it: turning off C#, C and C++ drops the typed engine and its JIT, turning
+off TypeScript, JavaScript and Python drops the vm core and the dynamic engine. C and C++ share one front end, so either brings it. At
 least one language must stay on. The generated `script/config.hpp` tells the embedder what the build contains, and
 `script::supported(Language)` says the same at run time.
 
@@ -335,11 +359,12 @@ The `polyglot/` examples are built only when every language is on.
 
 | Read this | For |
 | --- | --- |
-| [design.md](docs/design.md) | the core, the two engines, the front ends, and why the split is where it is |
+| [design.md](docs/design.md) | the core, the engines, the front ends, and why the split is where it is |
+| [vm-core.md](docs/vm-core.md) | the vm core: JavaScript, TypeScript and Python, its interpreter and its two compilers |
 | [embedding.md](docs/embedding.md) | the C++ API |
 | [languages/](docs/languages/) | what each language and its library support |
 | [compilation.md](docs/compilation.md) | assemblies, units and the image format |
-| [jit.md](docs/jit.md) | the arm64 and x86-64 back ends |
+| [jit.md](docs/jit.md) | the typed engine's arm64 and x86-64 back ends (and the old dynamic engine's) |
 | [memory.md](docs/memory.md) | the heap, the collector, and what a long run costs |
 | [limitations.md](docs/limitations.md) | what is not there, stated plainly |
 | [adding-a-language.md](docs/adding-a-language.md) | the hook a new front end plugs into |

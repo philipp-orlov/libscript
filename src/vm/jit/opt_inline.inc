@@ -1917,6 +1917,7 @@ void Baseline::planLoopFacts()
     loopGlobals_.clear();
     loopMaths_.clear();
     loopReads_.clear();
+    hoistSlots_ = 0;
     loopWins_.clear();
     hoistWatch_.clear();
     preLoop_.clear();
@@ -2085,15 +2086,14 @@ void Baseline::planLoopFacts()
             const Ins& in = code_->code[j];
             if (in.opcode() != Op::GetProp || j + 1 >= n_ || code_->code[j + 1].a == kNoCache || plan_->defWeb[j] < 0 ||
                 (j < chainRole_.size() && chainRole_[j]) || windowRead_.count(j) ||
-                loopGlobals_.size() + loopReads_.size() >= kHoistSlots)
+                hoistSlots_ >= kHoistSlots)
                 continue;
             const InlineCache& ic = code_->caches[code_->code[j + 1].a];
             const unsigned r = in.b;
             if (ic.holder || (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n) || !shapes.count(r) ||
                 mixedShape.count(r) || shapes[r].first != ic.shape || shapes[r].second < 0 || stored.count({ic.shape, ic.index}))
                 continue;
-            loopReads_.push_back(LoopRead{h, std::uint32_t(end), j,
-                                          hoistBase_ + std::int32_t(8 * (loopGlobals_.size() + loopReads_.size()))});
+            loopReads_.push_back(LoopRead{h, std::uint32_t(end), j, hoistBase_ + std::int32_t(8 * hoistSlots_++)});
             any = true;
         }
         // Methods read from prototypes for inlined calls on those objects.
@@ -2149,7 +2149,7 @@ void Baseline::planLoopFacts()
             for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
                 const Ins& in = code_->code[j];
                 if (in.opcode() != Op::GetGlobal || j >= chainRole_.size() || !(chainRole_[j] & 1) || (chainRole_[j] & 2) ||
-                    loopGlobals_.size() >= kHoistSlots)
+                    hoistSlots_ >= kHoistSlots)
                     continue;
                 std::uint8_t attrs = 0;
                 if (!vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs) || (attrs & attr::kAccessor))
@@ -2162,7 +2162,7 @@ void Baseline::planLoopFacts()
                 const bool array = next < n_ && std::int64_t(next) <= end && code_->code[next].opcode() == Op::GetElem &&
                                    code_->code[next].b == in.a && (ep == 0 || ep == elemprof::kArray);
                 loopGlobals_.push_back(LoopGlobal{h, std::uint32_t(end), j,
-                                                  hoistBase_ + std::int32_t(8 * loopGlobals_.size()), array, next});
+                                                  hoistBase_ + std::int32_t(8 * hoistSlots_++), array, next});
                 any = true;
             }
             for (const auto& [c, reads] : mathWin_)

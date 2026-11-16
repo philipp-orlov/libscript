@@ -3987,3 +3987,25 @@ TEST(aPropertyReadAgainSeesStoresThroughOtherNames)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("300335000"));
     }
 }
+
+TEST(aLoopReadingAFieldAndAGlobalKeepsBoth)
+{
+    // A loop that reads a property it never stores to and a global array keeps each in a stack slot of its own before it.
+    const char* program =
+        "var G = [1, 2, 3, 4, 5, 6, 7, 8];"
+        "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += o.x + G[i & 7]; } return s; }"
+        "var o = { x: 0.5, y: 2 }, r = 0;"
+        "for (var k = 0; k < 3000; k++) r += f(o, 100);"
+        "r;";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1476000"));
+    }
+}

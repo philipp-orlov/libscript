@@ -987,7 +987,8 @@ private:
                 return &r;
         return nullptr;
     }
-    std::int32_t hoistBase_ = -1;  ///< rsp-relative: the slots of `loopGlobals_`
+    std::int32_t hoistBase_ = -1;  ///< rsp-relative: the slots of `loopReads_` and `loopGlobals_`
+    std::uint32_t hoistSlots_ = 0;  ///< of those, taken so far (every loop's its own)
     const LoopGlobal* hoistedGlobal(std::uint32_t read) const
     {
         for (const LoopGlobal& g : loopGlobals_)

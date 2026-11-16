@@ -72,10 +72,11 @@ struct Region
     }
 };
 
+/// Never destroyed: a context that outlives static destruction (one held in a static of its own) still gives its code back.
 Region& region()
 {
-    static Region r;
-    return r;
+    static Region* r = new Region;
+    return *r;
 }
 
 }  // namespace

@@ -68,6 +68,9 @@ inline constexpr std::uint8_t kOtherTyped = 16;
 inline constexpr std::uint8_t kOther = 32;
 }  // namespace elemprof
 
+/// `CodeBlock::thisSlots`, counted on first use from the properties the code stores into `this`.
+inline std::uint8_t thisSlotsOf(CodeBlock* c) noexcept;
+
 inline std::uint8_t profBit(JSValue v) noexcept
 {
     return v.isInt32() ? 1 : v.isDouble() ? 2 : 8;
@@ -187,7 +190,10 @@ struct CodeBlock
     /// The `uid` of the function the baseline code last called from each `Call` (0 for none): the optimizing compiler's hint
     /// for what to inline. One per instruction once the baseline code is made.
     Vec<std::uint64_t> callProf;
-    std::uint64_t uid = 0;  ///< never reused; `VM::codeByUid` finds the block while it lives  ///< one per instruction, made with the baseline code of a function that reads `super.x`
+    std::uint64_t uid = 0;  ///< never reused; `VM::codeByUid` finds the block while it lives
+    /// Inline slots for the objects `new` makes for this function: 3, or 8 when it gives `this` more properties than
+    /// that (0 until counted; see `thisSlotsOf`).
+    std::uint8_t thisSlots = 0;  ///< one per instruction, made with the baseline code of a function that reads `super.x`
     /// What the instructions have made so far (profBit: 1 int32, 2 double, 8 anything else), one byte per instruction, then
     /// one per parameter for what calls passed: the optimizing compiler's type feedback. Empty until the code first runs.
     Vec<std::uint8_t> prof;
@@ -215,6 +221,28 @@ struct CodeBlock
 
 /// The instructions of a block, one per line, with its constants and children after them.
 std::string dump(const CodeBlock& block);
+
+inline std::uint8_t thisSlotsOf(CodeBlock* c) noexcept
+{
+    if (c->thisSlots)
+        return c->thisSlots;
+    Key seen[9];
+    unsigned n = 0;
+    for (std::size_t j = 0; j < c->code.size() && n < 9; ++j) {
+        const Ins& in = c->code[j];
+        const Op op = in.opcode();
+        if ((op == Op::PutProp || op == Op::InitProp) && in.a == 0) {
+            const Key k = c->atoms[in.b];
+            bool dup = false;
+            for (unsigned m = 0; m < n; ++m)
+                dup = dup || seen[m] == k;
+            if (!dup)
+                seen[n++] = k;
+        }
+    }
+    c->thisSlots = n <= 3 ? 3 : 8;
+    return c->thisSlots;
+}
 
 }  // namespace vm
 }  // namespace internal

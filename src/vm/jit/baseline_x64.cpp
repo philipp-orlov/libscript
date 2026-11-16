@@ -210,7 +210,15 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
             std::fprintf(stderr, "tier2 exit %s @%u kind %d\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind);
 #endif
         SCRIPT_VM_CENSUS(Tier2Exit);
-        if (++code->optExits > 40)
+        // A guard that keeps failing in one place: the code was made for something that no longer happens there.
+        bool again = false;
+        if (Tier2Code* t = code->tier2) {
+            if (t->siteExits.size() < code->code.size())
+                t->siteExits.resize(code->code.size(), 0);
+            if (index < t->siteExits.size() && t->siteExits[index] < 255)
+                again = ++t->siteExits[index] >= 3;
+        }
+        if (++code->optExits > 40 || again)
             retireTier2(*vm, code);
         else if (code->tier2Counter > 300)
             code->tier2Counter = 300;  // a loop that left optimized code goes back in soon
@@ -232,7 +240,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
     try {
         Frame* fr = vm->frameBase + vm->frameCount - 1;
         CodeBlock* code = fr->code;
-        if (!code->tier1 || code->tier2Tries >= 3) {
+        if (!code->tier1 || code->tier2Tries >= 5) {
             code->tier2Counter = 0x40000000;
             return nullptr;
         }
@@ -255,7 +263,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             Tier2Code* t = compileOptimizedCode(*vm, code);
             if (!t) {
                 code->tier2Counter = 0x40000000;
-                code->tier2Tries = 3;
+                code->tier2Tries = 5;
                 return nullptr;
             }
             t->older = code->tier2;
@@ -348,7 +356,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     --vm.ticks;
     if (isNew) {
         const JSValue pv = *f->slotAt(2);
-        JSObject* made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object);
+        JSObject* made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object, thisSlotsOf(f->code));
         const JSValue old = R[base + 1];
         R[base + 1] = toJSValue(made);
         release(old);
@@ -390,7 +398,7 @@ extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
 {
     try {
         const JSValue pv = *f->slotAt(2);
-        return toJSValue(vm->newObject(isObject(pv) ? asObject(pv) : vm->protos.object)).bits;
+        return toJSValue(vm->newObject(isObject(pv) ? asObject(pv) : vm->protos.object, thisSlotsOf(f->code))).bits;
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -446,6 +454,7 @@ constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
 constexpr std::int32_t kCbTier1 = std::int32_t(offsetof(CodeBlock, tier1));
 constexpr std::int32_t kCbUid = std::int32_t(offsetof(CodeBlock, uid));
 constexpr std::int32_t kCbConstructor = std::int32_t(offsetof(CodeBlock, constructor));
+constexpr std::int32_t kCbThisSlots = std::int32_t(offsetof(CodeBlock, thisSlots));
 constexpr std::int32_t kVmFnProtoShape = std::int32_t(offsetof(VM, fnProtoShape));
 constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
 constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
@@ -2512,7 +2521,15 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.test(RSI, RSI);
             a_.jcc(CE, viaRuntime);
             a_.mov32(R8, mem(RSI, kShapeId));
+            Label big;
+            a_.cmpI8(mem(RCX, kCbThisSlots), 3);
+            a_.jcc(CNE, big);
             if (allocObject(0, 3, viaRuntime, true))
+                a_.jmp(made);
+            else
+                a_.jmp(viaRuntime);
+            a_.bind(big);
+            if (allocObject(0, 8, viaRuntime, true))
                 a_.jmp(made);
             a_.bind(viaRuntime);
             a_.mov(RAX, R(base));
@@ -2750,6 +2767,7 @@ void compileTier1(VM& vm, CodeBlock* code)
     if (!t)
         return;
     code->tier1 = t;
+    thisSlotsOf(code);
     {
         bool reads = false;
         for (std::uint32_t j = 0; j < code->code.size() && !reads; j = opt::nextOf(*code, j)) {

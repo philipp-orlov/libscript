@@ -600,7 +600,10 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(ic.holder));
             slotAddress(ic.index);
         } else {
-            provenSlot(in.b, ic.shape, ic.index, ic.aux, bad);
+            // A site whose guard failed before sees objects of this shape with other inline slot counts: the address is
+            // worked out each time.
+            const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
+            provenSlot(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
         }
         a_.mov(RAX, mem(RDX, 0));
         unboxRax(dw, bad);
@@ -738,7 +741,8 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (ic.shape == 0 || ic.holder || ic.next != 0)
             return false;
         Label& bad = exitBefore(i);
-        provenSlot(in.a, ic.shape, ic.index, ic.aux, bad);
+        const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
+        provenSlot(in.a, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
         const std::int32_t vw = uw[1];
         if (isI32(vw)) {
             const Reg r = useI32(vw, RCX);

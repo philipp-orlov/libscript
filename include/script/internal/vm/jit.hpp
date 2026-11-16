@@ -56,6 +56,7 @@ struct Tier2Code
     std::vector<std::pair<std::uint32_t, std::uint32_t>> osr;     ///< (loop header, offset from `rx` of the way in)
     std::vector<ValidityCell*> validities;
     std::vector<JSValue> held;                                    ///< values the code compares against, each counted
+    std::vector<std::uint8_t> siteExits;                          ///< exits so far at each instruction
     Tier2Code* older = nullptr;                                   ///< a version it replaced, kept while frames may be in it
     void* osrAddress(std::uint32_t header) const noexcept
     {

@@ -2420,13 +2420,14 @@ do_call: {
         if (f->h.shape == vm.fnProtoShape) [[likely]] {
             // The shape every ordinary function has once its `prototype` is made: `length`, `name`, `prototype`.
             const JSValue pv = *f->slotAt(2);
-            made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object);
+            made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object,
+                                (f->flags & JSFunction::kNative) ? 3 : thisSlotsOf(f->code));
         } else {
             JSValue protoValue = getProperty(vm, callee, vm.atoms.prototype);
             if (protoValue.isException())
                 FAIL();
             JSObject* proto = isObject(protoValue) ? asObject(protoValue) : vm.protos.object;
-            made = vm.newObject(proto);
+            made = vm.newObject(proto, (f->flags & JSFunction::kNative) ? 3 : thisSlotsOf(f->code));
             release(protoValue);
             if (!(f->flags & JSFunction::kNative) && !f->isDictionary(vm) && f->shapeOf(vm)->indexOf(vm.atoms.prototype) == 2)
                 vm.fnProtoShape = f->h.shape;

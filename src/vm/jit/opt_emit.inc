@@ -760,6 +760,8 @@ bool Baseline::emitTyped(std::uint32_t i)
         release(RSI);
         return true;
     }
+    case Op::New:
+        return inlineNew(i);
     case Op::Call: {
         if (inlineCall(i))
             return true;
@@ -1053,7 +1055,7 @@ Tier2Code* Baseline::compileOptimized()
     const std::uint32_t W = plan_->typedWebs;
     bool calls = false;
     for (std::uint32_t j = 0; j < n_; j += length(j))
-        calls = calls || code_->code[j].opcode() == Op::Call;
+        calls = calls || code_->code[j].opcode() == Op::Call || code_->code[j].opcode() == Op::New;
     inlineBase_ = calls ? std::int32_t(8 + 8 * W) : -1;
     chainSlot_ = std::int32_t(8 + 8 * W + (calls ? 8 * kInlineSlots : 0));
     spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 8 + 15) & ~15u);

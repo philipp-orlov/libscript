@@ -653,10 +653,15 @@ private:
     /// A plain object of shape `shape` with `aux` inline slots, made here (as `VM::newObject` does, counters and all) when
     /// the heap's current block has room and no collection is due; else `slow`. The object, owned, in rax; clobbers rcx,
     /// rdx, rsi. False when it cannot be done here at all.
+    /// Whether `allocObject` can make an object with `aux` inline slots here.
+    bool canAllocObject(std::uint8_t aux) const
+    {
+        return mem::LocalHeap::kCanPopInline && !vm_.ctx.options.memoryLimit && JSObject::bytesFor(aux) <= 256;
+    }
     bool allocObject(std::uint32_t shape, std::uint8_t aux, Label& slow, bool shapeInR8 = false)
     {
         const std::size_t bytes = JSObject::bytesFor(aux);
-        if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit || bytes > 256)
+        if (!canAllocObject(aux))
             return false;
         auto& ctx = vm_.ctx;
         auto at = [&](const void* field) {
@@ -848,6 +853,7 @@ private:
     void inlineBoxed(const IVal& v);
     bool inlineCall(std::uint32_t i, bool decideOnly = false);
     bool inlineGetter(std::uint32_t i);
+    bool inlineNew(std::uint32_t i);
     bool inlineTop(std::uint32_t i, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
                    unsigned dst, bool decideOnly);
     // direct calls (opt_inline.inc)

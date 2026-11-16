@@ -3088,6 +3088,39 @@ TEST(chainsOfReadsFromOptimizedCode)
     }
 }
 
+TEST(smallConstructorsRunInPlace)
+{
+    // `new T(a, b)` of a constructor that only stores into `this` makes the object in place; a new prototype, a setter on
+    // it, a replaced constructor, constants, missing arguments and a constructor returning an object all behave.
+    const char* program =
+        "var out=[];"
+        "function T(l,r){this.l=l;this.r=r;}"
+        "function mk(n){ var t=null; for (var i=0;i<n;i++) t=new T(t,i); return t; }"
+        "function len(t){ var c=0; while (t) { c+=t.r; t=t.l; } return c; }"
+        "out.push(len(mk(5000)));"
+        "T.prototype.sum=function(){ return this.r; }; out.push(mk(3).sum());"
+        "T.prototype={kind:\"new\"}; out.push(mk(2).kind, Object.getPrototypeOf(mk(1))===T.prototype);"
+        "Object.defineProperty(T.prototype, \"l\", {set(v){ out.push(\"setter\"); }, configurable:true}); var x=mk(1); out.push(x.hasOwnProperty(\"l\"));"
+        "T.prototype={}; "
+        "function U(a){ this.a=a; this.b=7; this.c=undefined; }"
+        "function mku(n){ var s=0; for (var i=0;i<n;i++){ var u=new U(i); s+=u.a+u.b; } return s; } out.push(mku(5000), mku(3));"
+        "function V(a,b){ this.a=a; this.b=b; } function mkv(n){ var r; for (var i=0;i<n;i++) r=new V(i); return r; } out.push(mkv(3000).b, \"b\" in mkv(2));"
+        "var keep=T; function mkt(n){ var r; for (var i=0;i<n;i++) r=new T(i,i); return r; } mkt(3000); T=function(l,r){ this.z=1; }; out.push(mkt(2).z);"
+        "function W(x){ this.x=x; return {w:1}; } function mkw(n){ var r; for (var i=0;i<n;i++) r=new W(i); return r; } out.push(mkw(3000).w);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("12497500 2 new true setter false 12532500 24  true 1 1"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

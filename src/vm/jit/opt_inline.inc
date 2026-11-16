@@ -1297,3 +1297,144 @@ bool Baseline::regDeadAfter(std::uint32_t i, unsigned r)
     }
     return true;
 }
+
+// ---- constructors ----
+//
+// `new T(a, b)` where T only stores its arguments (and constants) into new properties of `this`: the object is made here
+// with its final shape and the values written into its slots. Every check comes before the object is made; anything that
+// does not hold runs the baseline sequence instead.
+
+bool Baseline::inlineNew(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const unsigned base = in.b, argc = in.c;
+    const auto& uw = plan_->useWebs[i];
+    if (inlineBase_ < 0 || uw.size() < 2u + argc || uw[0] >= 0)
+        return false;
+    const JSValue known = constantBefore(i, base);
+    if (!isFunction(known))
+        return false;
+    auto* f = static_cast<JSFunction*>(asObject(known));
+    if ((f->flags & JSFunction::kNative) || f->h.shape != vm_.fnProtoShape || f->isDictionary(vm_))
+        return false;
+    CodeBlock* C = f->code;
+    if (!C || !C->constructor || (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
+                                              CodeBlock::kNeedsArgs | CodeBlock::kClassConstructor | CodeBlock::kDerived)))
+        return false;
+    const JSValue pv = *f->slotAt(2);
+    if (!isObject(pv))
+        return false;
+    JSObject* proto = asObject(pv);
+    if (!regDeadAfter(i, base + 1))
+        return false;
+    // The body: stores of arguments or constants into new properties of `this`, then `return undefined`.
+    struct Store
+    {
+        std::uint32_t index;
+        IVal value;
+    };
+    std::vector<Store> stores;
+    std::vector<ValidityCell*> cells;
+    const std::uint8_t aux = thisSlotsOf(C);
+    std::uint32_t shape = vm_.rootShapeFor(proto)->id;
+    std::vector<std::int8_t> constReg(C->nregs, 0);
+    std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
+    bool returned = false;
+    for (std::uint32_t j = 0; j < C->code.size() && !returned; j = opt::nextOf(*C, j)) {
+        const Ins& ci = C->code[j];
+        switch (ci.opcode()) {
+        case Op::PutProp: {
+            if (ci.a != 0 || ci.c == 0 || ci.c >= C->nregs)
+                return false;
+            const std::uint16_t cacheId = C->code[j + 1].a;
+            if (cacheId == kNoCache)
+                return false;
+            const InlineCache& ic = C->caches[cacheId];
+            if (ic.shape != shape || ic.next == 0 || ic.index >= aux)
+                return false;
+            if (ic.validity) {
+                if (!ic.validity->valid)
+                    return false;
+                cells.push_back(ic.validity);
+            }
+            // The value as the register holds it at this store: an argument (undefined past them) or a constant.
+            IVal v;
+            if (constReg[ci.c]) {
+                v.c = constVal[ci.c];
+            } else if (ci.c <= C->nparams) {
+                const unsigned k = ci.c - 1;
+                if (k < argc)
+                    v = callerValue(i, base + 2 + k, 2 + k, 8);
+            } else {
+                return false;
+            }
+            stores.push_back(Store{ic.index, v});
+            shape = ic.next;
+            break;
+        }
+        case Op::LoadUndef:
+            if (ci.a == 0 || ci.a <= C->nparams)
+                return false;
+            constReg[ci.a] = 1;
+            constVal[ci.a] = JSValue::undefined();
+            break;
+        case Op::LoadInt:
+            if (ci.a == 0 || ci.a <= C->nparams)
+                return false;
+            constReg[ci.a] = 1;
+            constVal[ci.a] = JSValue::int32(ci.imm());
+            break;
+        case Op::Ret:
+            if (!constReg[ci.a] || !constVal[ci.a].isUndefined())
+                return false;
+            returned = true;
+            break;
+        default:
+            return false;
+        }
+    }
+    if (!returned)
+        return false;
+    if (!canAllocObject(aux))
+        return false;
+    Label slowPath, done;
+    // The callee, its prototype and the chain the stores were learned on are as they were.
+    holdValue(known);
+    a_.movImm(RCX, known.bits);
+    a_.cmp(RCX, R(base));
+    a_.jcc(CNE, slowPath);
+    a_.mov(RAX, R(base));
+    a_.cmpI32(mem(RAX, 0), std::int32_t(f->h.shape));
+    a_.jcc(CNE, slowPath);
+    a_.mov(RDX, mem(RAX, kObjSlots));
+    holdValue(pv);
+    a_.movImm(RCX, pv.bits);
+    a_.cmp(RCX, mem(RDX, 16));
+    a_.jcc(CNE, slowPath);
+    for (ValidityCell* c : cells) {
+        hold(c);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(c));
+        a_.cmpI32(mem(RCX, kValidityValid), 0);
+        a_.jcc(CE, slowPath);
+    }
+    allocObject(shape, aux, slowPath);
+    a_.mov(inlineSlot(0), RAX);
+    for (std::size_t k = 0; k < stores.size(); ++k) {
+        const IVal& v = stores[k].value;
+        inlineBoxed(v);
+        if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
+            retain(RAX);
+        a_.mov(RCX, inlineSlot(0));
+        a_.mov(mem(RCX, kObjInline + std::int32_t(8 * stores[k].index)), RAX);
+    }
+    a_.mov(RAX, inlineSlot(0));
+    write(in.a, RAX);
+    a_.jmp(done);
+    a_.bind(slowPath);
+    materializeReads(i);
+    call(i, in);
+    a_.bind(done);
+    if (plan_->defWeb[i] >= 0)
+        loadTypedAfter(i);
+    return true;
+}

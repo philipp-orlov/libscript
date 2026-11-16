@@ -3731,3 +3731,32 @@ TEST(numbersOfAFewDecimalsPrintAsTheShortestFormSays)
     js::Context ctx;
     CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("0.1 0.5 12.5 0.05 1.25 -3.75 100 1000000000000000 123456789.0625 0.0001 0.00015 0.000015 0.3 0.30000000000000004 2.675 0.3333333333333333 -0.0025 999999999999.9999 1099511.6277 4.35 0.07 7e-7 1e+21 1.23e-18 5e-324 2147483648.5 -1234.5678 0.30000000000000004 1.0000000000000002 65.53500000000001 1977904470 268958"));
 }
+
+TEST(aProductByAConstantThatOnlyFeedsATruncationWraps)
+{
+    // Hash loops of the form (h * k + x) | 0: the product wraps in 32 bits as the truncation would make it; a product used
+    // whole, and one that would be -0, are left exact. The expected text is JavaScriptCore's for the same program.
+    const char* program =
+        "var out=[]; "
+        "function h1(s){var h=0;for(var i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))|0;return h;} "
+        "function h2(a){var h=7;for(var i=0;i<a.length;i++)h=(h*-1000003 ^ a[i])|0;return h;} "
+        "function h3(a){var h=0;for(var i=0;i<a.length;i++){h=(h*33+a[i])|0;}return h;} "
+        "function h4(a){var h=1;for(var i=0;i<a.length;i++){var t=h*31; h=(t+a[i])|0; if(i==5) out.push(t);}return h;} "
+        "function h5(a){var h=0, z=[];for(var i=0;i<a.length;i++){ z.push(1/((a[i]*-5)|0)); h=(h*-7+a[i])|0;}return [h,z.slice(0,3).join()];} "
+        "var s=''; for (var i=0;i<5000;i++) s+=String.fromCharCode(32+(i*7)%90); "
+        "var arr=[]; for (var i=0;i<5000;i++) arr.push((i*2654435761)%1000003 - 500000); "
+        "for (var r=0;r<10;r++){ h1(s); h2(arr); h3(arr); h4(arr); h5([0,1,2,3]); } "
+        "out.push(h1(s), h2(arr), h3(arr), h4(arr), h5([0,1,-2,3]).join('/'), h1('hello world'), h3([2147483647,2147483647,-2147483648])); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 -1411265306 1697116766 1944858387 1862405418 66/Infinity,-0.2,0.1 1794106052 2147482526"));
+    }
+}

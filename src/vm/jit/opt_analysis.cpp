@@ -468,8 +468,11 @@ Plan analyse(const CodeBlock& code)
             }
         }
     }
+    // A product by a constant wraps too: its input is never truncated-only through it (a product needs the whole value), so
+    // the input is an exact int32, and the exact product (below 2^47) agrees with the wrapped one in its low 32 bits.
     auto wrapping = [&](std::uint32_t i) {
-        return additive(code.code[i].opcode()) && !insDefs[i].empty() && truncOnly[webOf(insDefs[i][0])];
+        const Op op = code.code[i].opcode();
+        return (additive(op) || op == Op::MulI) && !insDefs[i].empty() && truncOnly[webOf(insDefs[i][0])];
     };
 
     auto useRep = [&](std::uint32_t i, std::size_t k) { return rep[webOf(useDef[i][k])]; };

@@ -522,6 +522,8 @@ bool Baseline::emitTyped(std::uint32_t i)
                     a_.imul32(RAX, useI32(uw[1], RCX));
                 else
                     a_.imulI32(RAX, RAX, k);
+                if (plan_->wraps[i])
+                    break;  // only its low 32 bits matter, and -0 is 0 there
                 a_.jcc(CO, bad);
                 Label ok;
                 a_.test32(RAX, RAX);

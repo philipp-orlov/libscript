@@ -841,21 +841,21 @@ bool Baseline::emitTyped(std::uint32_t i)
             return false;
         Label& bad = exitBefore(i);
         const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
-        provenSlot(in.a, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
+        // The value boxed in rdi first (finding the slot uses rax, rcx, rdx and rsi), then stored into the slot.
         const std::int32_t vw = uw[1];
         if (isI32(vw)) {
-            const Reg r = useI32(vw, RCX);
-            a_.mov32(RCX, r);
-            a_.or_(RCX, R14);
+            const Reg r = useI32(vw, RDI);
+            a_.mov32(RDI, r);
+            a_.or_(RDI, R14);
         } else {
-            boxDouble(operandF64(vw, 0, RCX));
-            a_.mov(RCX, RAX);
+            boxDoubleTo(RDI, operandF64(vw, 0, RDI));
         }
+        const Mem slot = provenSlotMem(in.a, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
         if (factNum_.count({in.a, ic.index})) {
-            a_.mov(mem(RDX, 0), RCX);  // over a number
+            a_.mov(slot, RDI);  // over a number
         } else {
-            a_.mov(RSI, mem(RDX, 0));
-            a_.mov(mem(RDX, 0), RCX);
+            a_.mov(RSI, slot);
+            a_.mov(slot, RDI);
             release(RSI);
         }
         if (!isI32(vw))

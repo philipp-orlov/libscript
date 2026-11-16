@@ -1668,15 +1668,16 @@ private:
     /// xmm0 as a boxed double in rax; every NaN becomes the canonical one.
     void boxDouble0() { boxDouble(0); }
     /// xmm`x` as a boxed double in rax; every NaN becomes the canonical one.
-    void boxDouble(int x)
+    void boxDouble(int x) { boxDoubleTo(RAX, x); }
+    void boxDoubleTo(Reg dst, int x)
     {
         Label ok;
-        a_.movqFromX(RAX, x);
+        a_.movqFromX(dst, x);
         a_.ucomisd(x, x);
         a_.jcc(CNP, ok);
-        a_.movImm(RAX, kCanonicalNaN);
+        a_.movImm(dst, kCanonicalNaN);
         a_.bind(ok);
-        a_.add(RAX, RBP);
+        a_.add(dst, RBP);
     }
 
     void callStep(std::uint32_t i)

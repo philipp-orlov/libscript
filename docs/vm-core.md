@@ -130,6 +130,17 @@ that instruction (an "exit"), and the next compile does not guess there. What it
   of the increment of the same cell.
 - The object a property read or a number store leaves in rax serves the next access of the same register while only code
   known to leave rax alone has been emitted (`raxObj_`).
+- Optimized code runs calls only: a frame `new` made enters the baseline code (the interpreter, `scriptVmJitCall`, the
+  baseline `New` sequence and OSR into tier 2 all see to it), so a return has no `this` to look for.
+- Returns clear less (`planDirty`): a register no path to the return has written is undefined still. A forward `Jmp` to a
+  `Ret` (or to `Mov a, b; Ret a`) makes a return of its own, which clears only what its path wrote, so the early return of
+  `n < 2 ? n : ...` stores one register. A parameter given no argument is cleared only if the function writes it.
+- Moves join the variables they connect when one ends where the other begins (`opt_analysis.cpp`): the two share a register
+  or a slot and the `Mov` emits nothing. The peephole sees across instruction boundaries nothing jumps to
+  (`bindFallthrough`), so a variable stored to its slot by one instruction is not loaded again by the next.
+- Global slots are addressed directly: the global object's slot storage moves only with `VM::globalEpoch`
+  (`JSObject::growSlots` bumps it), which every global access checks first. A direct call writes the frame's `new.target`
+  and generator only for a callee that reads them.
 
 `SCRIPT_VM_CODEDUMP=dir` writes each function's code (`t2-N-name@address.bin`, for `objdump -b binary -mi386:x86-64`);
 `T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH`, `T2HOIST`, `T2CELLS`, `T2UNDEF` print what the compiler decided and

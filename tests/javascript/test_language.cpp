@@ -3760,3 +3760,34 @@ TEST(aProductByAConstantThatOnlyFeedsATruncationWraps)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 9575379603 -1411265306 1697116766 1944858387 1862405418 66/Infinity,-0.2,0.1 1794106052 2147482526"));
     }
 }
+
+TEST(aMethodALoopCallsIsReadOnceBeforeItWhileNothingStoresThere)
+{
+    // Methods read from a prototype for inlined calls in loops: one that stores a number over the method through another
+    // name, one that replaces it through a call.
+    const char* program =
+        "var out=[]; "
+        "function P(v){this.v=v;} P.prototype.f=function(){return this.v;}; "
+        "function k(o,pr,n){var s=0;for(var i=0;i<n;i++){ s+=o.f(); if(i==n-3) pr.f=7; }return s;} "
+        "for (var r=0;r<20;r++){ k(new P(1),{f:0},100); } "
+        "try { out.push(k(new P(2),P.prototype,500)); } catch(e) { out.push(e instanceof TypeError); } "
+        "P.prototype.f=function(){return this.v*10;}; "
+        "function k2(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.f(); }return s;} "
+        "for (var r=0;r<20;r++) k2(new P(1),100); out.push(k2(new P(3),1000)); "
+        "function swap(){ P.prototype.f=function(){return -1;}; } "
+        "function k3(o,n){var s=0;for(var i=0;i<n;i++){ s+=o.f(); if(i==300) swap(); }return s;} "
+        "for (var r=0;r<20;r++){ P.prototype.f=function(){return this.v;}; k3(new P(1),100); } "
+        "P.prototype.f=function(){return this.v;}; out.push(k3(new P(4),1000)); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("true 30000 505"));
+    }
+}

@@ -189,13 +189,21 @@ bool Baseline::inlineCall(std::uint32_t i, bool decideOnly)
     IVal callee = callerValue(i, base, 0, 8);
     if (callee.kind != IVal::Box && callee.kind != IVal::Const)
         return false;
-    if (known.isUndefined() && callee.kind == IVal::Box && callee.slot <= -2)
-        known = windowMethod(i, -2 - callee.slot, C);
+    calleeChecked_ = false;
+    if (known.isUndefined() && callee.kind == IVal::Box && callee.slot <= -2) {
+        std::int64_t read = -1;
+        known = windowMethod(i, -2 - callee.slot, C, &read);
+        if (read >= 0)
+            if (const LoopWin* lw = hoistedWin(std::uint32_t(read)))
+                calleeChecked_ = lw->known == known && !known.isUndefined();
+    }
     std::vector<IVal> args;
     args.push_back(callerValue(i, base + 1, 1, 8));
     for (unsigned k = 0; k < argc; ++k)
         args.push_back(callerValue(i, base + 2 + k, 2 + k, k < C->nparams ? C->prof[C->code.size() + k] : 8));
-    return inlineTop(i, C, callee, known, args, in.a, decideOnly);
+    const bool done = inlineTop(i, C, callee, known, args, in.a, decideOnly);
+    calleeChecked_ = false;
+    return done;
 }
 
 bool Baseline::inlineGetter(std::uint32_t i)
@@ -429,8 +437,8 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             return false;
         if (emit) {
             if (!known.isUndefined()) {
-                if (callee.kind != IVal::Const) {
-                    holdValue(known);
+                holdValue(known);
+                if (callee.kind != IVal::Const && !(depth == 0 && calleeChecked_)) {
                     inlineBits(callee, RAX);
                     a_.movImm(RCX, known.bits);
                     a_.cmp(RCX, RAX);
@@ -1616,7 +1624,7 @@ void Baseline::planWindows()
 
 /// The function the method read of call `i` into window `slot` finds, when every way it has read it is from one prototype slot that now holds a
 /// function of `C`: the read checks the chain, and the call need only check it is that function (undefined: none).
-JSValue Baseline::windowMethod(std::uint32_t i, std::int32_t slot, const CodeBlock* C) const
+JSValue Baseline::windowMethod(std::uint32_t i, std::int32_t slot, const CodeBlock* C, std::int64_t* read) const
 {
     // The call's own reads come just before it (nothing else is between them), so the last one before it with that slot.
     for (auto it = windowRead_.lower_bound(i); it != windowRead_.begin();) {
@@ -1649,6 +1657,8 @@ JSValue Baseline::windowMethod(std::uint32_t i, std::int32_t slot, const CodeBlo
         const auto* f = static_cast<const JSFunction*>(asObject(v));
         if ((f->flags & JSFunction::kNative) || f->code != C)
             return JSValue::undefined();
+        if (read)
+            *read = std::int64_t(d);
         return v;
     }
     return JSValue::undefined();
@@ -1658,6 +1668,11 @@ void Baseline::emitWindowRead(std::uint32_t i)
 {
     // A method read for an inlined call: into its slot, from the receiver the planner chose.
     const auto& [slot, recv] = windowRead_.at(i);
+    if (const LoopWin* lw = hoistedWin(i)) {
+        a_.movImm(RAX, lw->known.bits);  // read and checked before the loop
+        a_.mov(mem(RSP, windowBase_ + 8 * slot), RAX);
+        return;
+    }
     const Ins& in = code_->code[i];
     const InlineCache& ic = code_->caches[code_->code[i + 1].a];
     Label& bad = exitBefore(i);
@@ -1691,6 +1706,7 @@ void Baseline::planLoopFacts()
     loopGlobals_.clear();
     loopMaths_.clear();
     loopReads_.clear();
+    loopWins_.clear();
     hoistWatch_.clear();
     preLoop_.clear();
     if (!code_->handlers.empty())
@@ -1854,6 +1870,24 @@ void Baseline::planLoopFacts()
                 continue;
             loopReads_.push_back(LoopRead{h, std::uint32_t(end), j,
                                           hoistBase_ + std::int32_t(8 * (loopGlobals_.size() + loopReads_.size()))});
+            any = true;
+        }
+        // Methods read from prototypes for inlined calls on those objects.
+        for (const auto& [d, sr] : windowRead_) {
+            if (d < h || std::int64_t(d) > end || d + 1 >= n_ || code_->code[d + 1].a == kNoCache)
+                continue;
+            const unsigned recv = sr.second;
+            const InlineCache& ic = code_->caches[code_->code[d + 1].a];
+            if (!ic.holder || !ic.validity || !ic.validity->valid || (ic.pad && ic.pad <= code_->poly.size() &&
+                                                                      code_->poly[ic.pad - 1].n) ||
+                !shapes.count(recv) || mixedShape.count(recv) || shapes[recv].first != ic.shape ||
+                stored.count({ic.holder->h.shape, ic.index}) || (d < code_->prof.size() && (code_->prof[d] & opt::kProfFailed)))
+                continue;
+            const JSValue v = *const_cast<JSObject*>(ic.holder)->slotAt(ic.index);
+            if (!isFunction(v) || (static_cast<const JSFunction*>(asObject(v))->flags & JSFunction::kNative))
+                continue;
+            loopWins_.push_back(LoopWin{h, std::uint32_t(end), d, v});
+            cells.insert(ic.validity);
             any = true;
         }
         // Arrays in registers the loop does not write, which it reads or stores elements of.
@@ -2028,6 +2062,16 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         a_.movImm(RCX, reinterpret_cast<std::uint64_t>(lv.cell));
         a_.cmpI32(mem(RCX, kValidityValid), 0);
         a_.jcc(CE, bad);
+    }
+    for (const LoopWin& lw : loopWins_) {
+        if (lw.from != h)
+            continue;
+        const InlineCache& ic = code_->caches[code_->code[lw.read + 1].a];
+        holdValue(lw.known);
+        holderRead(ic.holder, ic.index);
+        a_.movImm(RCX, lw.known.bits);
+        a_.cmp(RCX, RAX);
+        a_.jcc(CNE, bad);
     }
     for (const LoopFact& lf : loopFacts_) {
         if (lf.from != h)

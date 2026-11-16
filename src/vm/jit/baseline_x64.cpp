@@ -934,6 +934,23 @@ private:
         std::int32_t slot;  ///< rsp-relative
     };
     std::vector<LoopRead> loopReads_;
+    /// A method read from a prototype for an inlined call, in a loop that changes neither the receiver, nor its shape, nor
+    /// the chain, nor that slot: read and compared once before the loop; inside, its window slot gets the function as a
+    /// constant and the call needs no look at it.
+    struct LoopWin
+    {
+        std::uint32_t from, to, read;
+        JSValue known;
+    };
+    std::vector<LoopWin> loopWins_;
+    const LoopWin* hoistedWin(std::uint32_t read) const
+    {
+        for (const LoopWin& w : loopWins_)
+            if (w.read == read && w.from <= factAt_ && factAt_ <= w.to)
+                return &w;
+        return nullptr;
+    }
+    bool calleeChecked_ = false;  ///< the inlined call being compiled has its callee checked already (before its loop)
     const LoopRead* hoistedRead(std::uint32_t read) const
     {
         for (const LoopRead& r : loopReads_)
@@ -1169,7 +1186,7 @@ private:
     /// Inlined calls whose window registers are not written: what the inlined body reads for each (by call, then operand).
     std::map<std::uint32_t, std::map<std::size_t, IVal>> windowVal_;
     std::map<std::uint32_t, std::pair<std::int32_t, unsigned>> windowRead_;  ///< a GetProp of a window: its slot, its receiver
-    JSValue windowMethod(std::uint32_t i, std::int32_t slot, const CodeBlock* C) const;
+    JSValue windowMethod(std::uint32_t i, std::int32_t slot, const CodeBlock* C, std::int64_t* read = nullptr) const;
     std::int32_t windowBase_ = -1;
     void planWindows();
     std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> mathWin_;  ///< Math call: (its GetGlobal, its GetProp)

@@ -3183,6 +3183,28 @@ TEST(pushAndPopFromCompiledCode)
     }
 }
 
+TEST(aProductOfInt32sThatIsANegativeZeroLeavesTheInt32s)
+{
+    // `a * b` of int32s that is zero is -0 when either operand is negative, whether the operands are in registers or not.
+    const char* program =
+        "function f(a,b){ var s=0; for (var i=0;i<3000;i++){ var x = a*b; s += 1/x; } return s; }"
+        "var r1 = [f(-5,0), f(5,0), f(0,-5), f(-3,2)].join(\" \");"
+        "function g(n){ var s=0; var a=-1,b=0,c=0,d=0,e=0,f1=0,g1=0,h=0,j=0; for (var i=0;i<n;i++){ a=-((i&3)+1); b+=a; c+=b; d+=c; e+=d; f1+=e; g1+=f1; h+=g1; var z = a*j; s += 1/z; } return [s, h]; }"
+        "r1 + \" \" + g(100).join(\",\")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("-Infinity Infinity -Infinity -500.0000000000219 -Infinity,-58855775225"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

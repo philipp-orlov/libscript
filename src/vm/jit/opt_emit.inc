@@ -19,6 +19,7 @@ Reg Baseline::useI32(std::int32_t w, Reg tmp)
 
 void Baseline::defI32(std::int32_t w, Reg src)
 {
+    raxHolds_ = src == RAX ? w : -1;
     if (inReg(w)) {
         if (gpr(w) != src)
             a_.mov32(gpr(w), src);
@@ -447,8 +448,10 @@ bool Baseline::emitTyped(std::uint32_t i)
                 defI32(dw, RAX);
                 return true;
             }
-            const Reg a = useI32(uw[0], RAX);
-            a_.mov32(RAX, a);
+            if (uw[0] != carried_) {
+                const Reg a = useI32(uw[0], RAX);
+                a_.mov32(RAX, a);
+            }
             switch (op) {
             case Op::Add: a_.alu32(0, RAX, useI32(uw[1], RCX)); break;
             case Op::Sub: a_.alu32(5, RAX, useI32(uw[1], RCX)); break;
@@ -474,15 +477,16 @@ bool Baseline::emitTyped(std::uint32_t i)
                 a_.test32(RAX, RAX);
                 a_.jcc(CNE, ok);
                 // A zero that is not +0: a negative operand makes it -0.
+                // The operands from their variables (rax holds the product).
                 if (op == Op::Mul) {
-                    a_.mov32(RDX, a);
+                    a_.mov32(RDX, useI32(uw[0], RDX));
                     a_.mov32(RCX, useI32(uw[1], RCX));
                     a_.alu32(1, RDX, RCX);
                     a_.jcc(CS, bad);
                 } else if (k < 0) {
                     a_.jmp(bad);
                 } else if (k == 0) {
-                    a_.mov32(RDX, a);
+                    a_.mov32(RDX, useI32(uw[0], RDX));
                     a_.test32(RDX, RDX);
                     a_.jcc(CS, bad);
                 }
@@ -631,7 +635,9 @@ bool Baseline::emitTyped(std::uint32_t i)
             // A site whose guard failed before sees objects of this shape with other inline slot counts: the address is
             // worked out each time.
             const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
-            provenSlot(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
+            a_.mov(RAX, provenSlotMem(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad));
+            unboxRax(dw, bad);
+            return true;
         }
         a_.mov(RAX, mem(RDX, 0));
         unboxRax(dw, bad);
@@ -978,6 +984,8 @@ void Baseline::emitOpt(std::uint32_t i)
         forgetFacts();
     }
     delivered_ = false;
+    carried_ = plan_->isLeader[i] ? -1 : raxHolds_;
+    raxHolds_ = -1;
     if (skipDef_.size() > i && skipDef_[i]) {
         forgetFacts();
         return;

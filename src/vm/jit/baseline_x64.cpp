@@ -832,6 +832,25 @@ private:
     }
     /// The address of slot `index` of the object of shape `shape` in frame register `reg`, in RDX (the object in RAX), `bad`
     /// when it is another. `aux` is the inline slot count the cache saw, plus one (0: unknown): with it the address is fixed.
+    /// As `provenSlot`, for a read: the slot as a memory operand (on rax or rdx) instead of its address.
+    Mem provenSlotMem(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
+    {
+        provenShape(reg, shape, bad);
+        if (aux == 0) {
+            slotAddress(index);
+            return mem(RDX, 0);
+        }
+        const std::int32_t inl = std::int32_t(aux) - 1;
+        if (factAux_[reg] != inl) {
+            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
+            a_.jcc(CNE, bad);
+            factAux_[reg] = inl;
+        }
+        if (std::int32_t(index) < inl)
+            return mem(RAX, kObjInline + std::int32_t(8 * index));
+        a_.mov(RDX, mem(RAX, kObjSlots));
+        return mem(RDX, std::int32_t(8 * (std::int32_t(index) - inl)));
+    }
     void provenSlot(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
         provenShape(reg, shape, bad);
@@ -853,6 +872,9 @@ private:
         }
     }
     bool delivered_ = false;           ///< the template just emitted put a typed destination in its variable
+    /// The int32 web whose value rax still holds from the instruction just emitted (-1: none); `carried_` is it as the
+    /// current instruction began, when nothing can have jumped in between.
+    std::int32_t raxHolds_ = -1, carried_ = -1;
     struct ExitReq
     {
         std::uint32_t index;

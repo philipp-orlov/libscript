@@ -3469,3 +3469,36 @@ TEST(jsonStringifyKeepsTheNamesOfShapesWhileNoScriptRuns)
     js::Context ctx;
     CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("[{\"a\":0,\"b\":\"s0\",\"c\":{\"a\":0,\"b\":[0]}},{\"a\":1,\"b\":\"s1\",\"c\":{\"a\":1,\"b\":[1]}},{\"a\":2,\"b\":\"s2\",\"c\":{\"a\":2,\"b\":[2]}},{\"a\":3,\"b\":\"s3\",\"c\":{\"a\":3,\"b\":[3]}},{\"a\":4,\"b\":\"s4\",\"c\":{\"a\":4,\"b\":[4]}},{\"a\":5,\"b\":\"s5\",\"c\":{\"a\":5,\"b\":[5]}}] | 590 | [{\"a\":0,\"c\":{\"a\":0}},{\"a\":1,\"c\":{\"a\":1}},{\"a\":2,\"c\":{\"a\":2}},{\"a\":3,\"c\":{\"a\":3}},{\"a\":4,\"c\":{\"a\":4}},{\"a\":5,\"c\":{\"a\":5}}] | [{\"a\":0,\"c\":{\"a\":0}},{\"a\":1,\"c\":{\"a\":1}},{\"a\":2,\"c\":{\"a\":2}},{\"a\":3,\"c\":{\"a\":3}},{\"a\":4,\"c\":{\"a\":4}},{\"a\":5,\"c\":{\"a\":5}}] | [{\"a\":1,\"b\":2},{\"a\":\"y\"},{\"a\":1,\"b\":2,\"c\":9},{\"b\":6,\"q\":7},{\"a\":1,\"b\":2}] | [{\"a\":0,\"b\":1},{\"a\":1,\"b\":\"got\"},{\"a\":2,\"b\":3}] | [{\"a\":1,\"b\":2},{\"a\":\"T\",\"b\":{\"a\":100,\"b\":200}},{\"a\":100,\"b\":200}] | 263 | {\"a\":{\"a\":1,\"b\":2},\"b\":{\"a\":{\"a\":1,\"b\":2},\"b\":{\"a\":{\"a\":1,\"b\":2},\"b\":{\"a\":1,\"b\":2}}}} | {\"a\":3,\"b\":\"x\",\"c\":false} | {\"1\":3,\"b\":1,\"a\":2}"));
 }
+
+TEST(callsOfALoopsUnchangedFunctionsAreCheckedBeforeIt)
+{
+    // Closures called in loops whose registers the loop does not write: checked once before the loop, also on the way in
+    // from the baseline code, and a closure of other code there leaves; a register the loop writes is checked each time.
+    // An upvalue seen to hold a number is stored over without letting go of it, and one that becomes a string is let go.
+    const char* program =
+        "var out=[]; "
+        "function mk(k){var c=0;return function(d){c+=d*k;return c;};} "
+        "function mk2(){var c=\"\";return function(d){c+=d;return c.length;};} "
+        "function run(f,g,n){var s=0;for(var i=0;i<n;i++){s=f(i&1)+g(1);}return s;} "
+        "for (var r=0;r<30;r++) run(mk(1),mk(2),1000); "
+        "out.push(run(mk(1),mk(3),5000), run(mk2(),mk(1),3000), run(mk(2),mk2(),3000)); "
+        "function swap(n){var f=mk(1),s=0;for(var i=0;i<n;i++){s+=f(1); if(i==n>>1) f=mk2();}return s;} "
+        "for (var r=0;r<20;r++) swap(200); out.push(swap(4001)); "
+        "function nest(n){var f=mk(1),g=mk(5),s=0;for(var i=0;i<n;i++){for(var j=0;j<3;j++){s+=f(j)+g(1);} if(i%100==99) g=mk(7);}return s;} "
+        "out.push(nest(2000), nest(10)); "
+        "function once(){var f=mk(3),s=0;for(var i=0;i<200000;i++){s=(s+f(1))|0;}return s;} out.push(once()); "
+        "function up(){var c=0;function add(d){c+=d;return c;} var s=0; for(var i=0;i<5000;i++){ s=add(1); if(i==2500){ c=\"x\"; } } return [typeof s, s.length, c.length]; } "
+        "out.push(up().join('/')); "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("17500 6000 6000 4004001 24229700 2770 -129242144 string/2500/2500"));
+    }
+}

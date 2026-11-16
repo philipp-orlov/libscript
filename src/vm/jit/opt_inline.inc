@@ -440,16 +440,23 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                     a_.jcc(CNE, *bad);
                 }
             } else {
-                inlineBits(callee, RAX);
-                needObject(RAX, *bad);
-                a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
-                a_.jcc(CNE, *bad);
-                a_.mov(RCX, mem(RAX, kFnCode));
-                a_.test(RCX, RCX);
-                a_.jcc(CE, *bad);
-                a_.movImm(RDX, C->uid);
-                a_.cmp(RDX, mem(RCX, kCbUid));
-                a_.jcc(CNE, *bad);
+                // A frame register already known to hold a function of this code needs no look.
+                const bool inFrame = callee.kind == IVal::Box && callee.frameReg >= 0 &&
+                                     std::size_t(callee.frameReg) < factCode_.size();
+                if (!(inFrame && factCode_[std::size_t(callee.frameReg)] == C)) {
+                    inlineBits(callee, RAX);
+                    needObject(RAX, *bad);
+                    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+                    a_.jcc(CNE, *bad);
+                    a_.mov(RCX, mem(RAX, kFnCode));
+                    a_.test(RCX, RCX);
+                    a_.jcc(CE, *bad);
+                    a_.movImm(RDX, C->uid);
+                    a_.cmp(RDX, mem(RCX, kCbUid));
+                    a_.jcc(CNE, *bad);
+                    if (inFrame)
+                        factCode_[std::size_t(callee.frameReg)] = C;
+                }
             }
             if (sloppyThis) {
                 inlineBits(args[0], RAX);
@@ -463,6 +470,11 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
         regs[k] = args[k];
     std::vector<std::int8_t> upKnown(C->upvals.size() + 1, -1);
     std::vector<IVal> upVal(C->upvals.size() + 1);
+    // The epoch at which an upvalue's box was last seen holding a number (-1: never): one to store over needs no release.
+    std::vector<std::int64_t> upNumber(C->upvals.size() + 1, -1);
+    auto numeric = [](const IVal& v) {
+        return v.kind == IVal::I32 || v.kind == IVal::F64 || (v.kind == IVal::Const && v.c.isNumber());
+    };
     for (std::uint32_t j = 0; j < C->code.size(); j = opt::nextOf(*C, j)) {
         const Ins& ci = C->code[j];
         const Op op = ci.opcode();
@@ -599,6 +611,8 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             IVal out;
             if (!takeRead(p, bad, out))
                 return false;
+            if (numeric(out) && ci.b < upNumber.size())
+                upNumber[ci.b] = std::int64_t(cx.epoch);
             regs[ci.a] = out;
             break;
         }
@@ -615,12 +629,17 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                     retain(RCX);
                 loadCallee();
                 a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * ci.a)));
-                a_.mov(RSI, mem(RAX, kBoxValue));
-                a_.mov(mem(RAX, kBoxValue), RCX);
-                release(RSI);
+                if (upNumber[ci.a] == std::int64_t(cx.epoch)) {
+                    a_.mov(mem(RAX, kBoxValue), RCX);  // over a number seen since the last effect
+                } else {
+                    a_.mov(RSI, mem(RAX, kBoxValue));
+                    a_.mov(mem(RAX, kBoxValue), RCX);
+                    release(RSI);
+                }
             }
             cx.sideEffect = true;
             ++cx.epoch;
+            upNumber[ci.a] = numeric(v) ? std::int64_t(cx.epoch) : -1;
             upKnown[ci.a] = 1;
             upVal[ci.a] = v;
             if (v.kind == IVal::Box)
@@ -1643,6 +1662,105 @@ void Baseline::emitWindowRead(std::uint32_t i)
     a_.mov(RAX, R(recv));
     polyRead(seen, count, bad, int(recv));
     a_.mov(mem(RSP, windowBase_ + 8 * slot), RAX);
+}
+
+// ---- facts of a whole loop ----
+//
+// A frame register no instruction of a loop writes holds the same value all through it. When the loop calls (inlined) the
+// function in it, that the register holds a function of the code compiled in is checked once, before the loop, and taken
+// as known inside it. The loop must be entered only by falling into its header (or by OSR, which goes through the checks).
+
+void Baseline::planLoopFacts()
+{
+    loopFacts_.clear();
+    preLoop_.clear();
+    if (!code_->handlers.empty() || inlineBase_ < 0)
+        return;
+    std::vector<std::int64_t> prev(n_ + 1, -1);
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        prev[j + length(j)] = j;
+    for (std::uint32_t h : plan_->loopHeaders) {
+        if (h < code_->prof.size() && (code_->prof[h] & opt::kProfFailed))
+            continue;
+        std::int64_t end = -1;
+        for (std::uint32_t j = h; j < n_; j += length(j))
+            if (opt::jumpTarget(*code_, j) == std::int64_t(h))
+                end = j;
+        if (end < 0)
+            continue;
+        bool enteredElsewhere = false;
+        for (std::uint32_t j = 0; j < n_ && !enteredElsewhere; j += length(j)) {
+            const std::int64_t t = opt::jumpTarget(*code_, j);
+            const bool inside = j >= h && std::int64_t(j) <= end;
+            if (!inside && t >= std::int64_t(h) && t <= end)
+                enteredElsewhere = true;
+        }
+        if (enteredElsewhere)
+            continue;
+        if (h > 0) {
+            const std::int64_t p = prev[h];
+            if (p < 0)
+                continue;
+            const Op op = code_->code[std::size_t(p)].opcode();
+            if (op == Op::Jmp || op == Op::Ret || op == Op::Throw || op == Op::ThrowError)
+                continue;
+        }
+        // What the loop writes; a call, everything from its window up (the callee's frame).
+        std::vector<char> written(code_->nregs + 1, 0);
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            for (std::uint16_t r : opt::effectsOf(*code_, j).wr)
+                if (r < written.size())
+                    written[r] = 1;
+            const Op op = code_->code[j].opcode();
+            if (op == Op::Call || op == Op::New)
+                for (unsigned r = code_->code[j].b; r < written.size(); ++r)
+                    written[r] = 1;
+        }
+        std::map<unsigned, const CodeBlock*> want;
+        std::set<unsigned> mixed;
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            const Ins& in = code_->code[j];
+            if (in.opcode() != Op::Call || (j < code_->prof.size() && (code_->prof[j] & opt::kProfFailed)))
+                continue;
+            if (j >= code_->callProf.size() || !code_->callProf[j] || isFunction(constantBefore(j, in.b)))
+                continue;
+            CodeBlock* C = vm_.codeByUid(code_->callProf[j]);
+            if (!inlinable(C))
+                continue;
+            const IVal callee = callerValue(j, in.b, 0, 8);
+            if (callee.kind != IVal::Box || callee.frameReg < 0 || std::size_t(callee.frameReg) >= written.size() ||
+                written[std::size_t(callee.frameReg)])
+                continue;
+            const auto [it, fresh] = want.emplace(unsigned(callee.frameReg), C);
+            if (!fresh && it->second != C)
+                mixed.insert(unsigned(callee.frameReg));
+        }
+        for (const auto& [r, C] : want)
+            if (!mixed.count(r)) {
+                loopFacts_.push_back(LoopFact{h, std::uint32_t(end), r, C});
+                preLoop_[h];
+            }
+    }
+}
+
+void Baseline::emitLoopGuards(std::uint32_t h)
+{
+    a_.bind(preLoop_.at(h));
+    Label& bad = exitBefore(h);
+    for (const LoopFact& lf : loopFacts_) {
+        if (lf.from != h)
+            continue;
+        a_.mov(RAX, R(lf.reg));
+        needObject(RAX, bad);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, bad);
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.test(RCX, RCX);
+        a_.jcc(CE, bad);
+        a_.movImm(RDX, lf.code->uid);
+        a_.cmp(RDX, mem(RCX, kCbUid));
+        a_.jcc(CNE, bad);
+    }
 }
 
 // ---- Math calls ----

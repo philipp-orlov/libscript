@@ -871,12 +871,30 @@ private:
     /// Also: more inline slots than this (an object's count never changes), and one of these shapes (0 ends the list).
     std::vector<std::int32_t> factInl_;
     std::vector<std::array<std::uint32_t, 4>> factSet_;
+    /// And: a function of this code (null: not known). That cannot change while the register is not written, so a loop
+    /// that writes none of them has the ones checked before it all through it (`loopFacts_`).
+    std::vector<const CodeBlock*> factCode_;
+    struct LoopFact
+    {
+        std::uint32_t from, to;  ///< the loop: its header and its last back edge
+        unsigned reg;
+        const CodeBlock* code;
+    };
+    std::vector<LoopFact> loopFacts_;
+    std::map<std::uint32_t, Label> preLoop_;  ///< a loop header with checks made before it: where they start
+    std::uint32_t factAt_ = 0;               ///< the instruction being emitted
+    void planLoopFacts();
+    void emitLoopGuards(std::uint32_t h);
     void forgetFacts()
     {
         std::fill(factShape_.begin(), factShape_.end(), 0u);
         std::fill(factAux_.begin(), factAux_.end(), -1);
         std::fill(factInl_.begin(), factInl_.end(), 0);
         std::fill(factSet_.begin(), factSet_.end(), std::array<std::uint32_t, 4>{});
+        std::fill(factCode_.begin(), factCode_.end(), nullptr);
+        for (const LoopFact& lf : loopFacts_)
+            if (lf.from <= factAt_ && factAt_ <= lf.to && lf.reg < factCode_.size())
+                factCode_[lf.reg] = lf.code;
     }
     void forgetFact(unsigned r)
     {
@@ -885,6 +903,7 @@ private:
             factAux_[r] = -1;
             factInl_[r] = 0;
             factSet_[r] = {};
+            factCode_[r] = nullptr;
         }
     }
     /// Make the object in frame register `reg` (left in RAX) be of shape `shape`, else `bad`. Proved for the code after it.

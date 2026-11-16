@@ -982,6 +982,7 @@ void Baseline::typedJump(std::uint32_t i, const Ins& in)
 
 void Baseline::emitOpt(std::uint32_t i)
 {
+    factAt_ = i;
     if (plan_->isLeader[i]) {
         std::fill(dirty_.begin(), dirty_.end(), 1);
         forgetFacts();
@@ -1149,6 +1150,8 @@ Tier2Code* Baseline::compileOptimized()
     factAux_.assign(code_->nregs + 1, -1);
     factInl_.assign(code_->nregs + 1, 0);
     factSet_.assign(code_->nregs + 1, std::array<std::uint32_t, 4>{});
+    factCode_.assign(code_->nregs + 1, nullptr);
+    planLoopFacts();
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
@@ -1157,6 +1160,8 @@ Tier2Code* Baseline::compileOptimized()
     for (const opt::LiveWeb& lw : plan_->liveBefore[0])
         loadFromFrame(lw.reg, std::int32_t(lw.web), entryFail_);
     for (std::uint32_t i = 0; i < n_;) {
+        if (preLoop_.count(i))
+            emitLoopGuards(i);
         a_.bind(at_[i]);
         offsets_[i] = std::uint32_t(a_.here());
         emitOpt(i);
@@ -1179,7 +1184,10 @@ Tier2Code* Baseline::compileOptimized()
         }
         for (const opt::LiveWeb& lw : plan_->liveBefore[h])
             loadFromFrame(lw.reg, std::int32_t(lw.web), fail);
-        a_.jmp(at_[h]);
+        if (auto pre = preLoop_.find(h); pre != preLoop_.end())
+            a_.jmp(pre->second);  // through the checks the loop's code relies on
+        else
+            a_.jmp(at_[h]);
         a_.bind(fail);
         a_.aluI(0, RSP, spill_);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(h)));

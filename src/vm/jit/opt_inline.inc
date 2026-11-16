@@ -1418,7 +1418,10 @@ bool Baseline::inlineNew(std::uint32_t i)
     const auto& uw = plan_->useWebs[i];
     if (inlineBase_ < 0 || uw.size() < 2u + argc || uw[0] >= 0)
         return false;
-    const JSValue known = constantBefore(i, base);
+    // The callee is compared with what is known of it below: what the global read before held is guess enough.
+    JSValue known = constantBefore(i, base);
+    if (!isFunction(known))
+        known = guessBefore(i, base);
     if (!isFunction(known))
         return false;
     auto* f = static_cast<JSFunction*>(asObject(known));

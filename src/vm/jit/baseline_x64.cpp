@@ -638,6 +638,29 @@ private:
     }
     /// The value frame register `reg` will hold when instruction `i` runs, if straight-line code before it in the same block
     /// loads it from a global and (optionally) one property of that: read now, to be guarded at run time. Undefined if not.
+    /// What register `reg` likely holds as instruction `i` begins: the global the nearest instruction before it that writes
+    /// the register read, as it is now. Calls and joins between are passed over: only for code that checks the guess.
+    JSValue guessBefore(std::uint32_t i, unsigned reg) const
+    {
+        for (std::uint32_t j = i; j-- > 0;) {
+            if (code_->code[j].opcode() == Op::Cache)
+                continue;
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            bool writes = false;
+            for (std::uint16_t w : e.wr)
+                writes = writes || w == reg;
+            if (!writes)
+                continue;
+            const Ins& in = code_->code[j];
+            if (in.opcode() == Op::GetGlobal && in.a == reg && !(j < skipDef_.size() && skipDef_[j])) {
+                std::uint8_t attrs = 0;
+                JSValue* slot = vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs);
+                return slot && !(attrs & attr::kAccessor) ? *slot : JSValue::undefined();
+            }
+            return JSValue::undefined();
+        }
+        return JSValue::undefined();
+    }
     JSValue constantBefore(std::uint32_t i, unsigned reg, int depth = 0)
     {
         if (depth > 2)
@@ -1243,6 +1266,8 @@ private:
     std::vector<std::uint8_t> plainRegs_;
     /// For each instruction, the frame registers that may hold a cell as it begins (flow-sensitive; empty: never reached).
     std::vector<std::vector<bool>> cellAt_;
+    std::set<std::uint32_t> movedOut_;  ///< `LoadUndef`s whose register a move already let go of
+    bool emitMove(std::uint32_t i);
     void findCells();
     /// Whether register `reg` cannot hold a cell as instruction `i` begins.
     bool plainAt(std::uint32_t i, unsigned reg) const

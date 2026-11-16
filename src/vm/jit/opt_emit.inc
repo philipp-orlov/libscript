@@ -1068,11 +1068,13 @@ void Baseline::emitOpt(std::uint32_t i)
         std::fprintf(stderr, "undef @%u r%u plain %d dead %d\n", i, unsigned(code_->code[i].a),
                      int(plainAt(i, code_->code[i].a)), int(regDeadAfter(i, code_->code[i].a)));
 #endif
-    if (code_->code[i].opcode() == Op::LoadUndef && plainAt(i, code_->code[i].a) && regDeadAfter(i, code_->code[i].a)) {
-        // Over no cell, and nothing reads it: the frame's way out writes it anyway.
+    if (code_->code[i].opcode() == Op::LoadUndef && (movedOut_.count(i) ||
+        (plainAt(i, code_->code[i].a) && regDeadAfter(i, code_->code[i].a)))) {
+        // Over no cell, and nothing reads it: the frame's way out writes it anyway. Or a move took what it held.
         forgetFact(code_->code[i].a);
         return;
     }
+
     if (skipDef_.size() > i && skipDef_[i]) {
         // Nothing runs; the register it would have written no longer holds what was proven about it.
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)
@@ -1105,6 +1107,13 @@ void Baseline::emitOpt(std::uint32_t i)
             forgetFact(r);
         return;
     }
+    if (code_->code[i].opcode() == Op::LoadUndef && plainAt(i, code_->code[i].a)) {
+        forgetFact(code_->code[i].a);
+        a_.mov(R(code_->code[i].a), std::int32_t(kUndefined));  // over no cell
+        return;
+    }
+    if (emitMove(i))
+        return;
     forgetFacts();
     materializeReads(i);
     // A jump that may run the interpreter (a test of an object, a tick) leaves the frame as the interpreter wants it. A
@@ -1229,6 +1238,42 @@ void Baseline::findPlainRegs()
     }
 }
 
+/// `Mov a, b` of a boxed value with `LoadUndef b` later in the block and nothing between that touches `b`: the value moves
+/// with its count, and `b` is let go of at once (the `LoadUndef` then does nothing).
+bool Baseline::emitMove(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    if (in.opcode() != Op::Mov || in.a == in.b || plan_->defWeb[i] >= 0)
+        return false;
+    const auto& uw = plan_->useWebs[i];
+    if (!uw.empty() && uw[0] >= 0)
+        return false;
+    std::int64_t clear = -1;
+    for (std::uint32_t j = i + length(i); j < n_ && !plan_->isLeader[j]; j += length(j)) {
+        const Ins& x = code_->code[j];
+        if (x.opcode() == Op::LoadUndef && x.a == in.b) {
+            clear = j;
+            break;
+        }
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        bool touches = !e.ok;
+        for (std::uint16_t r : e.rd)
+            touches = touches || r == in.b;
+        for (std::uint16_t r : e.wr)
+            touches = touches || r == in.b;
+        if (touches || opt::jumpTarget(*code_, j) >= 0)
+            return false;
+    }
+    if (clear < 0)
+        return false;
+    forgetFacts();
+    a_.mov(RAX, R(in.b));
+    a_.mov(R(in.b), std::int32_t(kUndefined));
+    write(in.a, RAX);
+    movedOut_.insert(std::uint32_t(clear));
+    return true;
+}
+
 void Baseline::findCells()
 {
     struct Dump
@@ -1345,6 +1390,7 @@ Tier2Code* Baseline::compileOptimized()
     planMathCalls();
     findPlainRegs();
     findCells();
+    movedOut_.clear();
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);

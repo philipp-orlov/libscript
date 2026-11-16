@@ -156,6 +156,14 @@ int bigintCompareWith(VM& vm, JSValue a, JSValue other, bool* ok)
 
 JSValue makeString(VM& vm, StringView text)
 {
+    // The empty string and those of one character below 256: made once, kept for the VM's life.
+    if (text.size() <= 1 && (text.empty() || text[0] < 256) && !vm.tearingDown) {
+        JSValue& cached = vm.smallStrings[text.empty() ? 256 : text[0]];
+        if (cached.isUndefined())
+            cached = fromValue(vm, vm.ctx.str(text));
+        retain(cached);
+        return cached;
+    }
     return fromValue(vm, vm.ctx.str(text));
 }
 

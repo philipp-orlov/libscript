@@ -338,6 +338,8 @@ struct VM : EngineRuntime
     bool overflowing = false;                    ///< raising a stack overflow right now
     std::string ambient;                         ///< TypeScript declarations the embedder added with `Context::declare`
     JSValue typedCtors[16] = {};                 ///< the typed array constructors as made, by ElemKind
+    /// `makeString`'s strings of one character below 256 (and, last, the empty one), each counted; undefined until made.
+    JSValue smallStrings[257];
     struct RegExpSlot
     {
         JSObject* owner;  ///< holds a count

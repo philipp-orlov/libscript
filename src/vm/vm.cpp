@@ -30,6 +30,8 @@ mem::LocalHeap::Options heapOptionsFor(VM* owner)
 
 VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
 {
+    for (JSValue& v : smallStrings)
+        v = JSValue::undefined();
     // 2^20 ids, eight bytes each, reserved once so that the table never moves.
     const sys::VmRegion region = sys::vmReserve(std::size_t(kDefaultMaxShapes) * sizeof(Shape*));
     shapeRegionBase_ = region.base;

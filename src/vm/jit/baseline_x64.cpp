@@ -417,6 +417,23 @@ extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
     }
 }
 
+/// A native function called from compiled code, the frame's `pc` and the stack top already set. Owned result, or 0 with
+/// the exception pending (a C++ one parked).
+extern "C" std::uint64_t scriptVmJitNative(VM* vm, JSFunction* f, JSValue* thisAndArgs, std::uint32_t argc)
+{
+    try {
+        Rare* r = f->rare();
+        const JSValue saved = vm->newTarget;
+        vm->newTarget = JSValue::undefined();
+        const JSValue res = r->native(*vm, thisAndArgs[0], thisAndArgs + 1, argc, r->nativeData);
+        vm->newTarget = saved;
+        return res.bits;
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
 extern "C" CallResult scriptVmJitCall(VM* vm, std::uint32_t index)
 {
     try {
@@ -456,6 +473,7 @@ constexpr std::int32_t kFrameGen = std::int32_t(offsetof(Frame, gen));
 static_assert(offsetof(Frame, argc) == offsetof(Frame, retDst) + 4, "retDst and argc are stored together");
 static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "construct and entry are stored together");
 constexpr std::int32_t kVmStackEnd = std::int32_t(offsetof(VM, stackEnd));
+constexpr std::int32_t kVmStackTop = std::int32_t(offsetof(VM, stackTop));
 constexpr std::int32_t kVmStackInit = std::int32_t(offsetof(VM, stackInit));
 constexpr std::int32_t kVmFrameCapacity = std::int32_t(offsetof(VM, frameCapacity));
 constexpr std::int32_t kVmFrameBase = std::int32_t(offsetof(VM, frameBase));
@@ -2733,6 +2751,30 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         write(in.a, RAX);
         a_.jmp(afterCall);
         a_.bind(generic);
+    }
+    if (in.opcode() == Op::Call) {
+        // Any other native: called directly.
+        Label notNative;
+        a_.mov(RAX, R(base));
+        needObject(RAX, notNative);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, notNative);
+        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+        a_.jcc(CE, notNative);
+        a_.testI8(mem(RAX, kHdrFlags), cellflags::kHasRare);
+        a_.jcc(CE, notNative);
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+        a_.mov(mem(R13, kFramePc), RDI);
+        a_.lea(RDI, R(code_->nregs));
+        a_.mov(mem(R12, kVmStackTop), RDI);
+        a_.mov(RDI, R12);
+        a_.mov(RSI, RAX);
+        a_.lea(RDX, R(base + 1));
+        a_.movImm(RCX, argc);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitNative));
+        a_.callReg(RAX);
+        a_.jmp(native);
+        a_.bind(notNative);
     }
     a_.mov(RDI, R12);
     a_.movImm(RSI, i);

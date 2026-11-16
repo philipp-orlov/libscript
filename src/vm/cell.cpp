@@ -583,6 +583,10 @@ void VM::collectCycles(bool minor) noexcept
 
 void VM::releaseRoots() noexcept
 {
+    for (JSValue& v : smallStrings) {
+        release(v);
+        v = JSValue::undefined();
+    }
     tearingDown = true;
     for (MicroJob& job : jobs) {
         release(job.a);

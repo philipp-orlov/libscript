@@ -437,7 +437,15 @@ extern "C" bool scriptVmJitAppendInPlace(JSValue* slot, std::uint64_t yBits) noe
     const std::size_t length = std::size_t(s->length) + t->length;
     if (s->capacity() < length)
         return false;
-    std::memmove(s->mutableChars() + s->length, t->mutableChars(), std::size_t(t->length) * sizeof(Char));
+    // Mostly a character or a few: copied here rather than by the library.
+    Char* to = s->mutableChars() + s->length;
+    const Char* from = t->mutableChars();
+    if (t->length <= 8) {
+        for (std::uint32_t k = 0; k < t->length; ++k)
+            to[k] = from[k];
+    } else {
+        std::memcpy(to, from, std::size_t(t->length) * sizeof(Char));
+    }
     s->length = std::uint32_t(length);
     s->hash_ = 0;
     return true;

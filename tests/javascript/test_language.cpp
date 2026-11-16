@@ -3444,3 +3444,28 @@ TEST(jsonParseMakesObjectsAlongKnownShapesAndReadsShortDecimalsExactly)
         CHECK_EQ(ctx.eval(numbers, "<test>").toString(), std::string("0.1 false 0.5 false 0 true 12.5 false 3.14159265358979 false 123456789012345 false 1234567890123456 false 1e-15 false 99999.99999 false 100000 false -0.0015 false 0.30000000000000004 false 9007199254740992 false 1.7976931348623157e+308 false 5e-324 false -12345.678901234 false 100 false 0 false 0 true 4294967296.5 false 73996300"));
     }
 }
+
+TEST(jsonStringifyKeepsTheNamesOfShapesWhileNoScriptRuns)
+{
+    // A toJSON that changes objects of a shape already written, a getter, replacers, indentation, nesting.
+    const char* program =
+        "var out=[]; "
+        "function P(a,b){this.a=a;this.b=b;} "
+        "var arr=[]; for (var i=0;i<6;i++) arr.push({a:i,b:'s'+i,c:{a:i,b:[i]}}); "
+        "out.push(JSON.stringify(arr)); "
+        "out.push(JSON.stringify(arr,null,2).length, JSON.stringify(arr,['a','c']), JSON.stringify(arr,function(k,v){ return k==='b'? undefined : v; })); "
+        "var x={a:1,b:2}, y={a:3,b:4}, z={a:5,b:6}; "
+        "y.toJSON=function(){ x.c=9; delete z.a; z.q=7; return {a:'y'}; }; "
+        "out.push(JSON.stringify([x,y,x,z,{a:1,b:2}])); "
+        "var g={a:1,b:2}; Object.defineProperty(g,'b',{get:function(){ return 'got'; },enumerable:true}); "
+        "out.push(JSON.stringify([{a:0,b:1},g,{a:2,b:3}])); "
+        "var m={a:1,b:2}; var n={a:{toJSON:function(){ m.a=100; m.b=200; return 'T'; }},b:m}; "
+        "out.push(JSON.stringify([m,n,m])); "
+        "var deep={a:1,b:2}; for (var i=0;i<20;i++) deep={a:deep,b:i}; "
+        "out.push(JSON.stringify(deep).length); "
+        "var w={a:1,b:2}; var nested={a:w,b:{a:w,b:{a:w,b:w}}}; out.push(JSON.stringify(nested)); "
+        "out.push(JSON.stringify({a:new Number(3),b:new String('x'),c:new Boolean(false)}), JSON.stringify({b:1,a:2,1:3})); "
+        "out.join(' | ') ";
+    js::Context ctx;
+    CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("[{\"a\":0,\"b\":\"s0\",\"c\":{\"a\":0,\"b\":[0]}},{\"a\":1,\"b\":\"s1\",\"c\":{\"a\":1,\"b\":[1]}},{\"a\":2,\"b\":\"s2\",\"c\":{\"a\":2,\"b\":[2]}},{\"a\":3,\"b\":\"s3\",\"c\":{\"a\":3,\"b\":[3]}},{\"a\":4,\"b\":\"s4\",\"c\":{\"a\":4,\"b\":[4]}},{\"a\":5,\"b\":\"s5\",\"c\":{\"a\":5,\"b\":[5]}}] | 590 | [{\"a\":0,\"c\":{\"a\":0}},{\"a\":1,\"c\":{\"a\":1}},{\"a\":2,\"c\":{\"a\":2}},{\"a\":3,\"c\":{\"a\":3}},{\"a\":4,\"c\":{\"a\":4}},{\"a\":5,\"c\":{\"a\":5}}] | [{\"a\":0,\"c\":{\"a\":0}},{\"a\":1,\"c\":{\"a\":1}},{\"a\":2,\"c\":{\"a\":2}},{\"a\":3,\"c\":{\"a\":3}},{\"a\":4,\"c\":{\"a\":4}},{\"a\":5,\"c\":{\"a\":5}}] | [{\"a\":1,\"b\":2},{\"a\":\"y\"},{\"a\":1,\"b\":2,\"c\":9},{\"b\":6,\"q\":7},{\"a\":1,\"b\":2}] | [{\"a\":0,\"b\":1},{\"a\":1,\"b\":\"got\"},{\"a\":2,\"b\":3}] | [{\"a\":1,\"b\":2},{\"a\":\"T\",\"b\":{\"a\":100,\"b\":200}},{\"a\":100,\"b\":200}] | 263 | {\"a\":{\"a\":1,\"b\":2},\"b\":{\"a\":{\"a\":1,\"b\":2},\"b\":{\"a\":{\"a\":1,\"b\":2},\"b\":{\"a\":1,\"b\":2}}}} | {\"a\":3,\"b\":\"x\",\"c\":false} | {\"1\":3,\"b\":1,\"a\":2}"));
+}

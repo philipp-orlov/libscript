@@ -2311,6 +2311,30 @@ struct JsonWriter
     ValidityCell* protoCell = nullptr;
     bool protosClean = false;
     std::uint32_t cleanShape = 0;  ///< the last shape of a plain object found to have no `toJSON` of its own
+    std::uint32_t scriptRuns = 0;  ///< moved on whenever script may have run (a toJSON, a replacer, a getter, a valueOf)
+    /// The names of a plain object's shape read off it once, for its other objects while no script has run since (a
+    /// shape that script let go of could come back as another).
+    struct ShapeKeys
+    {
+        std::uint32_t shape = 0;
+        std::uint32_t runs = 0;
+        int busy = 0;  ///< objects of this shape being written: it is not to be replaced
+        Vec<Key> names;
+        Vec<std::uint32_t> slots;  ///< where each name's value is while the shape is unchanged
+        Vec<String> quoted;        ///< each name quoted, with its colon
+        void clear()
+        {
+            for (Key k : names)
+                detail::decRef(k);
+            names.clear();
+            slots.clear();
+            quoted.clear();
+            shape = 0;
+        }
+        ~ShapeKeys() { clear(); }
+    };
+    ShapeKeys shapeKeys[4];
+    std::uint32_t nextShapeKeys = 0;
     ~JsonWriter()
     {
         if (protoCell)
@@ -2408,6 +2432,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
     }
     Handle value = Handle::retained(input);
     if ((isObject(value.get()) && !j.noToJson(asObject(value.get()))) || isBigInt(value.get())) {
+        ++j.scriptRuns;
         JSValue fn = getProperty(vm, value.get(), j.toJson);
         if (fn.isException())
             return 0;
@@ -2426,6 +2451,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         }
     }
     if (j.replacerFn.get() != JSValue::undefined()) {
+        ++j.scriptRuns;
         Handle made;
         if (keyIndex >= 0) {
             made = Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(keyIndex))));
@@ -2441,6 +2467,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         // The wrapper objects of primitives serialize as what they wrap.
         switch (asObject(value.get())->cls()) {
             case ObjClass::Number: {
+                ++j.scriptRuns;
                 double d;
                 if (!toNumber(vm, value.get(), &d))
                     return 0;
@@ -2448,6 +2475,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
                 break;
             }
             case ObjClass::String: {
+                ++j.scriptRuns;
                 JSValue t = toStringValue(vm, value.get());
                 if (t.isException())
                     return 0;
@@ -2518,53 +2546,69 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
     Vec<Handle> keys;
     // A plain object made of data properties with names that are not indexes: its keys are read off the shape, and each value
     // is read from its slot as long as the shape is the one the keys came from (a toJSON that changes the object gets `Get`).
-    struct KeyList
-    {
-        Vec<Key> names;
-        Vec<std::uint32_t> slots;  ///< where each name's value is while the shape is unchanged
-        ~KeyList()
-        {
-            for (Key k : names)
-                detail::decRef(k);
-        }
-    } fastKeys;
-    bool fast = false;
-    Shape* shape0 = nullptr;
+    JsonWriter::ShapeKeys* fastKeys = nullptr;
+    JsonWriter::ShapeKeys spare;
     if (!array && !j.hasAllow && o->cls() == ObjClass::Plain && !proxyOf(o) && !o->isDictionary(vm)) {
-        fast = true;
-        shape0 = o->shapeOf(vm);
-        fastKeys.names.reserve(shape0->count);
-        fastKeys.slots.reserve(shape0->count);
-        for (std::uint32_t i = 0; i < shape0->count && fast; ++i) {
-            const Entry e = shape0->entryAt(i);
-            if (e.attrs & attr::kAccessor) {
-                fast = false;
-            } else if (e.key->kind == detail::CellKind::Symbol) {
-                continue;
-            } else {
-                std::uint32_t index;
-                if (arrayIndexOf(e.key, &index)) {
-                    fast = false;
-                } else if (e.attrs & attr::kEnumerable) {
-                    detail::incRef(e.key);
-                    fastKeys.names.push_back(e.key);
-                    fastKeys.slots.push_back(i);
+        for (JsonWriter::ShapeKeys& e : j.shapeKeys)
+            if (e.shape == o->h.shape && e.runs == j.scriptRuns)
+                fastKeys = &e;
+        if (!fastKeys) {
+            // Into an entry no object being written uses, else one of its own.
+            JsonWriter::ShapeKeys* into = &spare;
+            for (int tries = 0; tries < 4; ++tries) {
+                JsonWriter::ShapeKeys& e = j.shapeKeys[j.nextShapeKeys++ & 3];
+                if (!e.busy) {
+                    into = &e;
+                    break;
                 }
             }
-        }
-        if (!fast) {
-            for (Key k : fastKeys.names)
-                detail::decRef(k);
-            fastKeys.names.clear();
-            fastKeys.slots.clear();
+            into->clear();
+            Shape* shape0 = o->shapeOf(vm);
+            bool ok = true;
+            into->names.reserve(shape0->count);
+            into->slots.reserve(shape0->count);
+            for (std::uint32_t i = 0; i < shape0->count && ok; ++i) {
+                const Entry e = shape0->entryAt(i);
+                if (e.attrs & attr::kAccessor) {
+                    ok = false;
+                } else if (e.key->kind == detail::CellKind::Symbol) {
+                    continue;
+                } else {
+                    std::uint32_t index;
+                    if (arrayIndexOf(e.key, &index)) {
+                        ok = false;
+                    } else if (e.attrs & attr::kEnumerable) {
+                        detail::incRef(e.key);
+                        into->names.push_back(e.key);
+                        into->slots.push_back(i);
+                        String q;
+                        jsonQuote(q, static_cast<StringCell*>(e.key)->text());
+                        q.push_back(u':');
+                        if (!j.gap.empty())
+                            q.push_back(u' ');
+                        into->quoted.push_back(std::move(q));
+                    }
+                }
+            }
+            if (ok) {
+                into->shape = o->h.shape;
+                into->runs = j.scriptRuns;
+                fastKeys = into;
+            } else {
+                into->clear();
+            }
         }
     }
+    const bool fast = fastKeys != nullptr;
     if (array || fast) {
         // Elements are read through `length`, as the spec says.
     } else if (j.hasAllow) {
+        ++j.scriptRuns;
         keys = j.allow;
-    } else if (!ownKeys(vm, o, true, false, true, keys)) {
-        return 0;
+    } else {
+        ++j.scriptRuns;
+        if (!ownKeys(vm, o, true, false, true, keys))
+            return 0;
     }
     bool wroteAny = false;
     j.out.push_back(array ? u'[' : u'{');
@@ -2589,6 +2633,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
             if (plainArray && i < arr->length && !arr->at(i).isHole()) {
                 elementKeep = Handle::retained(arr->at(i));
             } else {
+                ++j.scriptRuns;
                 Handle idx = Handle::adopt(toStringValue(vm, JSValue::boxNumber(double(i))));
                 Key k = toPropertyKey(vm, idx.get());
                 if (!k)
@@ -2607,12 +2652,21 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
                 j.out += u"null";
         }
     } else if (fast) {
-        for (std::size_t n = 0; n < fastKeys.names.size(); ++n) {
-            const Key name = fastKeys.names[n];
+        ++fastKeys->busy;
+        struct Done
+        {
+            int& busy;
+            ~Done() { --busy; }
+        } done{fastKeys->busy};
+        const std::uint32_t shape0 = fastKeys->shape;
+        const std::uint32_t runs0 = j.scriptRuns;
+        for (std::size_t n = 0; n < fastKeys->names.size(); ++n) {
+            const Key name = fastKeys->names[n];
             Handle propKeep;
-            if (o->h.shape == shape0->id) {
-                propKeep = Handle::retained(*o->slotAt(fastKeys.slots[n]));
+            if (o->h.shape == shape0 && j.scriptRuns == runs0) {
+                propKeep = Handle::retained(*o->slotAt(fastKeys->slots[n]));
             } else {
+                ++j.scriptRuns;
                 JSValue prop = getProperty(vm, v, name);
                 if (prop.isException())
                     return 0;
@@ -2621,10 +2675,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
             const std::size_t before = j.out.size();
             const bool hadAny = wroteAny;
             separator();
-            jsonQuote(j.out, static_cast<StringCell*>(name)->text());
-            j.out.push_back(u':');
-            if (!j.gap.empty())
-                j.out.push_back(u' ');
+            j.out += fastKeys->quoted[n];
             const int r = jsonSerialize(j, v, JSValue::cell(name), propKeep.get());
             if (r == 0)
                 return 0;
@@ -3028,7 +3079,8 @@ struct JsonReader
                                   ? shape->findTransition(k, attr::kDefault)
                                   : nullptr;
                 if (next) {
-                    o->reserveSlot(vm, shape->count);
+                    if (shape->count >= o->h.aux)
+                        o->reserveSlot(vm, shape->count);
                     *o->slotAt(shape->count) = item;
                     o->h.shape = next->id;
                 } else {

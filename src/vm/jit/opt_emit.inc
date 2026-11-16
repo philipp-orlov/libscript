@@ -70,7 +70,7 @@ void Baseline::spillToFrame(unsigned reg, std::int32_t w)
         a_.mov32(RAX, r);
         a_.or_(RAX, R14);
     } else {
-        boxDouble(operandF64(w, 0, RAX));
+        boxDoubleTo(RAX, operandF64(w, 0, RAX), tame(w));
     }
     write(reg, RAX);
     dirty_[std::size_t(w)] = 0;
@@ -93,18 +93,16 @@ void Baseline::materializeLive(std::uint32_t i)
 }
 
 /// RAX (a boxed value, not counted) into web `w`; `fail` when it is not a number of the web's kind.
-void Baseline::unboxRax(std::int32_t w, Label& fail)
+void Baseline::unboxRax(std::int32_t w, Label& fail, bool number)
 {
     if (isI32(w)) {
         needInt(RAX, fail);
         defI32(w, RAX);
     } else if (inReg(w)) {
-        needNumber(RAX, fail);
-        loadNumber(xmmOf(w), RAX, RDX);
+        unboxDouble(xmmOf(w), RAX, RDX, number ? nullptr : &fail);
         dirty_[std::size_t(w)] = 1;
     } else {
-        needNumber(RAX, fail);
-        loadNumber(0, RAX, RDX);
+        unboxDouble(0, RAX, RDX, number ? nullptr : &fail);
         defF64(w, 0);
     }
 }
@@ -332,7 +330,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.mov32(RAX, r);
             a_.or_(RAX, R14);
         } else {
-            boxDouble(operandF64(w, 0, RAX));
+            boxDoubleTo(RAX, operandF64(w, 0, RAX), tame(w));
         }
         ret(i, in, true);
         return true;
@@ -496,6 +494,22 @@ bool Baseline::emitTyped(std::uint32_t i)
                 a_.jcc(CS, bad);  // a negative zero
                 a_.bind(ok);
                 defI32(dw, RAX);
+                return true;
+            }
+            if ((op == Op::Inc || op == Op::Dec || op == Op::AddI || op == Op::SubI) && uw[0] == dw && inReg(dw) &&
+                !plan_->wraps[i]) {
+                // A variable counted in place: an overflow takes the step back out of line before it leaves.
+                const std::int32_t step = op == Op::Inc ? 1 : op == Op::Dec ? -1 : op == Op::AddI ? k : -k;
+                const Reg r = gpr(dw);
+                a_.aluI32(0, r, step);
+                coldUndos_.emplace_back();
+                ColdUndo& u = coldUndos_.back();
+                u.r = r;
+                u.step = step;
+                u.bad = &bad;
+                a_.jcc(CO, u.entry);
+                dirty_[std::size_t(dw)] = 1;
+                raxHolds_ = -1;
                 return true;
             }
             if (uw[0] != carried_) {
@@ -667,11 +681,13 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (const LoopRead* lr = hoistedRead(i)) {
             // Read before the loop, which stores to it nowhere: from its slot on the stack.
             if (isI32(dw)) {
-                a_.mov32(RAX, mem(RSP, lr->slot));
-                defI32(dw, RAX);
+                const Reg r = inReg(dw) ? gpr(dw) : RAX;
+                a_.mov32(r, mem(RSP, lr->slot));
+                defI32(dw, r);
             } else {
-                a_.movsdLoad(0, mem(RSP, lr->slot));
-                defF64(dw, 0);
+                const int x = inReg(dw) ? xmmOf(dw) : 0;
+                a_.movsdLoad(x, mem(RSP, lr->slot));
+                defF64(dw, x);
             }
             return true;
         }
@@ -720,7 +736,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             if (known == 2 && isI32(dw))
                 defI32(dw, RAX);  // an int32 there, seen or stored
             else
-                unboxRax(dw, bad);
+                unboxRax(dw, bad, known != 0);
             known = isI32(dw) ? std::uint8_t(2) : std::max<std::uint8_t>(known, 1);
             return true;
         }
@@ -860,7 +876,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.mov32(RDI, r);
             a_.or_(RDI, R14);
         } else {
-            boxDoubleTo(RDI, operandF64(vw, 0, RDI));
+            boxDoubleTo(RDI, operandF64(vw, 0, RDI), tame(vw));
         }
         const Mem slot = provenSlotMem(in.a, ic.shape, ic.index, failed ? 0 : ic.aux, bad);
         if (factNum_.count({in.a, ic.index})) {
@@ -1210,7 +1226,7 @@ void Baseline::emitOptTails()
         const std::int64_t target = opt::jumpTarget(*code_, t.first);
         auto pre = target >= 0 ? preLoop_.find(std::uint32_t(target)) : preLoop_.end();
         if (pre != preLoop_.end() && target <= std::int64_t(t.first)) {
-            a_.jmp(pre->second);
+            a_.jmp(loopEntry(std::uint32_t(target)));
         } else {
             a_.jmp(tickBack_[k]);
         }
@@ -1410,6 +1426,61 @@ void Baseline::planReadReuse()
     }
 }
 
+/// The double webs whose NaNs can only be the ones arithmetic makes from boxed numbers: the canonical NaN, or the
+/// processor's default (0xFFF8...), as they came or with the sign flipped. Boxed by adding the offset, neither runs into the
+/// tags, so such a web is boxed without the test for NaN. Not so a double straight from a typed array or from a native,
+/// which can be any NaN.
+void Baseline::planTame()
+{
+    tame_.assign(plan_->webs.size(), 1);
+    auto from = [&](std::uint32_t i) {
+        for (std::int32_t w : plan_->useWebs[i])
+            if (w >= 0 && !isI32(w) && !tame_[std::size_t(w)])
+                return false;
+        return true;
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::uint32_t i = 0; i < n_; i += length(i)) {
+            const std::int32_t w = plan_->defWeb[i];
+            if (w < 0 || isI32(w) || !tame_[std::size_t(w)])
+                continue;
+            const Ins& in = code_->code[i];
+            bool t = false;
+            switch (in.opcode()) {
+            case Op::Mov: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod: case Op::AddI: case Op::SubI:
+            case Op::MulI: case Op::ModI: case Op::Inc: case Op::Dec: case Op::Neg: case Op::LoadK: case Op::LoadInt:
+            case Op::GetProp: case Op::GetGlobal: case Op::GetUpval: case Op::GetBox: case Op::ToNumber: case Op::ToNumeric:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr: case Op::UShr: case Op::BitAndI:
+            case Op::BitOrI: case Op::BitXorI: case Op::ShlI: case Op::ShrI: case Op::UShrI:
+                t = from(i);
+                break;
+            case Op::GetElem: {
+                const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+                t = (ep == 0 || ep == elemprof::kArray) && from(i);
+                break;
+            }
+            case Op::Call: {
+                // Math.sqrt: one instruction, whose NaN is the default one or its operand's.
+                const JSValue callee = constantBefore(i, in.b);
+                if (in.c == 1 && isFunction(callee)) {
+                    auto* fn = static_cast<JSFunction*>(asObject(callee));
+                    t = (fn->flags & JSFunction::kNative) && fn->rare() && fn->rare()->native == mathUnaryNative() &&
+                        mathUnaryIsSqrt(fn->rare()->nativeData) && from(i);
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            if (!t) {
+                tame_[std::size_t(w)] = 0;
+                changed = true;
+            }
+        }
+    }
+}
+
 void Baseline::findCells()
 {
     struct Dump
@@ -1524,6 +1595,7 @@ Tier2Code* Baseline::compileOptimized()
     planDirectCalls();
     planWindows();
     planMathCalls();
+    planTame();
     findPlainRegs();
     findCells();
     planSelfChecked();
@@ -1537,6 +1609,10 @@ Tier2Code* Baseline::compileOptimized()
     factCode_.assign(code_->nregs + 1, nullptr);
     factArr_.assign(code_->nregs + 1, 0);
     planLoopFacts();
+    preLoopFull_.clear();
+    for (const auto& [h, label] : preLoop_)
+        if (guardsCovered(h))
+            preLoopFull_[h];
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
@@ -1572,14 +1648,19 @@ Tier2Code* Baseline::compileOptimized()
         }
         for (const opt::LiveWeb& lw : plan_->liveBefore[h])
             loadFromFrame(lw.reg, std::int32_t(lw.web), fail);
-        if (auto pre = preLoop_.find(h); pre != preLoop_.end())
-            a_.jmp(pre->second);  // through the checks the loop's code relies on
+        if (preLoop_.count(h))
+            a_.jmp(loopEntry(h));  // through the checks the loop's code relies on
         else
             a_.jmp(at_[h]);
         a_.bind(fail);
         a_.aluI(0, RSP, spill_);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(h)));
         a_.jmp(RAX);
+    }
+    for (auto& [h, full] : preLoopFull_) {
+        a_.bind(full);
+        emitLoopGuards(h, true);
+        a_.jmp(preLoop_.at(h));
     }
     emitTails();
     CodeSpan span = hoistBroken_.empty() ? allocateCode(a_.buf.size()) : CodeSpan{};

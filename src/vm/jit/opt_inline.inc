@@ -2093,7 +2093,17 @@ void Baseline::planLoopFacts()
             if (ic.holder || (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n) || !shapes.count(r) ||
                 mixedShape.count(r) || shapes[r].first != ic.shape || shapes[r].second < 0 || stored.count({ic.shape, ic.index}))
                 continue;
-            loopReads_.push_back(LoopRead{h, std::uint32_t(end), j, hoistBase_ + std::int32_t(8 * hoistSlots_++)});
+            // The same slot read again (as the same kind) shares the first read's.
+            const LoopRead* same = nullptr;
+            for (const LoopRead& lr : loopReads_)
+                if (lr.from == h && !lr.dup && code_->code[lr.read].b == r &&
+                    code_->caches[code_->code[lr.read + 1].a].index == ic.index &&
+                    isI32(plan_->defWeb[lr.read]) == isI32(plan_->defWeb[j]))
+                    same = &lr;
+            if (same)
+                loopReads_.push_back(LoopRead{h, std::uint32_t(end), j, same->slot, true});
+            else
+                loopReads_.push_back(LoopRead{h, std::uint32_t(end), j, hoistBase_ + std::int32_t(8 * hoistSlots_++)});
             any = true;
         }
         // Methods read from prototypes for inlined calls on those objects.
@@ -2187,14 +2197,86 @@ void Baseline::planLoopFacts()
     }
 }
 
-void Baseline::emitLoopGuards(std::uint32_t h)
+/// Whether loop `h` leaves out checks an enclosing loop makes (a way in that does not come through them needs its own).
+bool Baseline::guardsCovered(std::uint32_t h) const
 {
-    a_.bind(preLoop_.at(h));
+    for (const LoopShape& ls : loopShapes_)
+        if (ls.from == h && coveredShape(h, ls))
+            return true;
+    for (const LoopMath& lm : loopMaths_)
+        if (lm.from == h && coveredMath(h, lm))
+            return true;
+    for (const LoopArr& la : loopArrs_)
+        if (la.from == h && coveredArr(h, la))
+            return true;
+    for (const LoopNum& ln : loopNums_)
+        if (ln.from == h && coveredNum(h, ln))
+            return true;
+    for (const LoopValid& lv : loopValids_)
+        if (lv.from == h && coveredValid(h, lv))
+            return true;
+    return false;
+}
+
+/// Whether the loop at `from`..`to` holds all through loop `h` (it encloses it) and made its checks before it.
+bool Baseline::encloses(std::uint32_t from, std::uint32_t to, std::uint32_t h) const
+{
+    const auto w = hoistWatch_.find(h);
+    return w != hoistWatch_.end() && from < h && to >= w->second.first && !noHoist_.count(from) && hoistWatch_.count(from);
+}
+bool Baseline::coveredShape(std::uint32_t h, const LoopShape& x) const
+{
+    for (const LoopShape& o : loopShapes_)
+        if (encloses(o.from, o.to, h) && o.reg == x.reg && o.shape == x.shape && (x.aux < 0 || o.aux == x.aux))
+            return true;
+    return false;
+}
+bool Baseline::coveredMath(std::uint32_t h, const LoopMath& x) const
+{
+    for (const LoopMath& o : loopMaths_)
+        if (encloses(o.from, o.to, h) && o.call == x.call)
+            return true;
+    return false;
+}
+bool Baseline::coveredArr(std::uint32_t h, const LoopArr& x) const
+{
+    for (const LoopArr& o : loopArrs_)
+        if (encloses(o.from, o.to, h) && o.reg == x.reg && (o.bits & x.bits) == x.bits)
+            return true;
+    return false;
+}
+bool Baseline::coveredNum(std::uint32_t h, const LoopNum& x) const
+{
+    for (const LoopNum& o : loopNums_)
+        if (encloses(o.from, o.to, h) && o.reg == x.reg && o.index == x.index && (o.int32 || !x.int32))
+            return true;
+    // A read of the slot hoisted before this loop checks it (as an int32 when its variable is one).
+    for (const LoopRead& lr : loopReads_)
+        if (lr.from == h && !lr.dup && code_->code[lr.read].b == x.reg &&
+            code_->caches[code_->code[lr.read + 1].a].index == x.index && (!x.int32 || isI32(plan_->defWeb[lr.read])))
+            return true;
+    return false;
+}
+bool Baseline::coveredValid(std::uint32_t h, const LoopValid& x) const
+{
+    for (const LoopValid& o : loopValids_)
+        if (encloses(o.from, o.to, h) && o.cell == x.cell)
+            return true;
+    return false;
+}
+
+/// The checks before loop `h`. `covered` false: the loop's own, leaving out what an enclosing loop checked before it (or a
+/// hoisted read checks); true: only what was left out, for a way into the loop that did not come through those checks.
+void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
+{
+    if (!covered)
+        a_.bind(preLoop_.at(h));
     Label& bad = exitBefore(h);
-    if (auto w = hoistWatch_.find(h); w != hoistWatch_.end())
-        w->second.second = sideDoors_;
+    if (!covered)
+        if (auto w = hoistWatch_.find(h); w != hoistWatch_.end())
+            w->second.second = sideDoors_;
     for (const LoopShape& ls : loopShapes_) {
-        if (ls.from != h)
+        if (ls.from != h || coveredShape(h, ls) != covered)
             continue;
         a_.mov(RAX, R(ls.reg));
         needObject(RAX, bad);
@@ -2206,7 +2288,7 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         }
     }
     for (const LoopRead& lr : loopReads_) {
-        if (lr.from != h)
+        if (lr.from != h || lr.dup || covered)
             continue;
         const Ins& in = code_->code[lr.read];
         const InlineCache& ic = code_->caches[code_->code[lr.read + 1].a];
@@ -2225,13 +2307,12 @@ void Baseline::emitLoopGuards(std::uint32_t h)
             needInt(RAX, bad);
             a_.mov32(mem(RSP, lr.slot), RAX);
         } else {
-            needNumber(RAX, bad);
-            loadNumber(0, RAX, RDX);
+            unboxDouble(0, RAX, RDX, &bad);
             a_.movsdStore(mem(RSP, lr.slot), 0);
         }
     }
     for (const LoopGlobal& lg : loopGlobals_) {
-        if (lg.from != h)
+        if (lg.from != h || covered)
             continue;
         emitReadInto(lg.read, false, bad);
         a_.mov(mem(RSP, lg.slot), RAX);
@@ -2242,7 +2323,7 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         }
     }
     for (const LoopMath& lm : loopMaths_) {
-        if (lm.from != h)
+        if (lm.from != h || coveredMath(h, lm) != covered)
             continue;
         const auto& reads = mathWin_.at(lm.call);
         const JSValue callee = constantBefore(lm.call, code_->code[lm.call].b);
@@ -2254,7 +2335,7 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         a_.jcc(CNE, bad);
     }
     for (const LoopArr& la : loopArrs_) {
-        if (la.from != h)
+        if (la.from != h || coveredArr(h, la) != covered)
             continue;
         a_.mov(RAX, R(la.reg));
         needObject(RAX, bad);
@@ -2266,7 +2347,7 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         }
     }
     for (const LoopNum& ln : loopNums_) {
-        if (ln.from != h)
+        if (ln.from != h || coveredNum(h, ln) != covered)
             continue;
         std::int32_t aux = -1;
         for (const LoopShape& ls : loopShapes_)
@@ -2288,7 +2369,7 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         }
     }
     for (const LoopValid& lv : loopValids_) {
-        if (lv.from != h)
+        if (lv.from != h || coveredValid(h, lv) != covered)
             continue;
         hold(lv.cell);
         a_.movImm(RCX, reinterpret_cast<std::uint64_t>(lv.cell));
@@ -2296,7 +2377,7 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         a_.jcc(CE, bad);
     }
     for (const LoopWin& lw : loopWins_) {
-        if (lw.from != h)
+        if (lw.from != h || covered)
             continue;
         const InlineCache& ic = code_->caches[code_->code[lw.read + 1].a];
         holdValue(lw.known);
@@ -2306,7 +2387,7 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         a_.jcc(CNE, bad);
     }
     for (const LoopFact& lf : loopFacts_) {
-        if (lf.from != h)
+        if (lf.from != h || covered)
             continue;
         a_.mov(RAX, R(lf.reg));
         needObject(RAX, bad);

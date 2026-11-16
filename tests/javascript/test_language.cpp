@@ -4009,3 +4009,43 @@ TEST(aLoopReadingAFieldAndAGlobalKeepsBoth)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1476000"));
     }
 }
+
+TEST(optimizedNumbersNaNsCountersAndNestedLoopChecks)
+{
+    // Doubles boxed without the NaN test only when they cannot hold an odd NaN (a typed array's can), a counter stepped in place
+    // that overflows, the checks of an inner loop that leave out the outer loop's (entered part way, Math.sqrt replaced), and
+    // a property known to hold a number that later does not.
+    const char* program =
+        "var buf = new ArrayBuffer(8), dv = new DataView(buf), f64 = new Float64Array(buf);"
+        "dv.setUint32(0, 0xffffffff); dv.setUint32(4, 0xffffffff);"
+        "function P() { this.v = 0.5; this.w = 1.5; }"
+        "function nanStore(o, n, k) { for (var i = 0; i < n; i++) { o.v = f64[0] + k; o.w = (o.w - o.w) * Infinity; } return o; }"
+        "var o = new P(), out = [];"
+        "for (var r = 0; r < 300; r++) nanStore(o, 50, r);"
+        "var m = new Map(); m.set(o.v, 1); m.set(o.w, 2);"
+        "out.push(typeof o.v, o.v !== o.v, Object.is(o.w, NaN), m.size, m.get(NaN), [o.v].includes(NaN), String(o.w + 1));"
+        "function count(from, n) { var s = 0; for (var i = from; i < from + n; i++) s += i & 7; return s; }"
+        "var c = 0; for (var r = 0; r < 300; r++) c += count(2147483600, 40) + count(2147483640, 10);"
+        "out.push(c);"
+        "function nest(bs, n) { var t = 0; for (var i = 0; i < n; i++) { var a = bs[i % bs.length]; for (var j = 0; j < 30; j++) t += Math.sqrt(a.x + j) + a.y; } return t; }"
+        "var bs = [{ x: 1, y: 2.5 }, { x: 4, y: 0.25 }], t = 0;"
+        "for (var r = 0; r < 200; r++) t += nest(bs, 20);"
+        "var keep = Math.sqrt; Math.sqrt = function (x) { return x; }; t += nest(bs, 20); Math.sqrt = keep; t += nest(bs, 20);"
+        "bs[1].y = 'z'; out.push(String(nest(bs, 3)).slice(0, 12)); bs[1].y = 0.25;"
+        "out.push(Math.round(t * 1000));"
+        "function field(q, n) { var s = 0; for (var i = 0; i < n; i++) { s += q.a * 2; q.a = q.a + 1; } return s; }"
+        "var q = { a: 1.5 }, fs = 0; for (var r = 0; r < 400; r++) { q.a = 1.5; fs += field(q, 20); }"
+        "q.a = 'x'; out.push(field(q, 2)); out.push(fs);"
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("number,true,true,1,2,true,NaN,50700,187.08284521,653197101,NaN,176000"));
+    }
+}

@@ -961,6 +961,7 @@ private:
     {
         std::uint32_t from, to, read;
         std::int32_t slot;  ///< rsp-relative
+        bool dup = false;   ///< another read of the loop fills the slot
     };
     std::vector<LoopRead> loopReads_;
     /// A method read from a prototype for an inlined call, in a loop that changes neither the receiver, nor its shape, nor
@@ -1056,7 +1057,23 @@ private:
             factValid_.insert(c);
     }
     void planLoopFacts();
-    void emitLoopGuards(std::uint32_t h);
+    void emitLoopGuards(std::uint32_t h, bool covered = false);
+    bool encloses(std::uint32_t from, std::uint32_t to, std::uint32_t h) const;
+    bool coveredShape(std::uint32_t h, const LoopShape& x) const;
+    bool coveredMath(std::uint32_t h, const LoopMath& x) const;
+    bool coveredArr(std::uint32_t h, const LoopArr& x) const;
+    bool coveredNum(std::uint32_t h, const LoopNum& x) const;
+    bool coveredValid(std::uint32_t h, const LoopValid& x) const;
+    bool guardsCovered(std::uint32_t h) const;
+    /// A loop header whose checks leave out what enclosing loops check: the way in for a jump from elsewhere (an entry
+    /// from the interpreter, the return from an interrupt), which makes those checks first.
+    std::map<std::uint32_t, Label> preLoopFull_;
+    Label& loopEntry(std::uint32_t h)
+    {
+        if (auto f = preLoopFull_.find(h); f != preLoopFull_.end())
+            return f->second;
+        return preLoop_.at(h);
+    }
     void forgetFacts()
     {
         std::fill(factShape_.begin(), factShape_.end(), 0u);
@@ -1294,6 +1311,9 @@ private:
     std::set<std::uint32_t> movedOut_;  ///< `LoadUndef`s whose register a move already let go of
     bool emitMove(std::uint32_t i);
     void findCells();
+    void planTame();
+    std::vector<std::uint8_t> tame_;  ///< per web: its NaNs box without the test (`planTame`)
+    bool tame(std::int32_t w) const { return w >= 0 && std::size_t(w) < tame_.size() && tame_[std::size_t(w)]; }
     /// Whether register `reg` cannot hold a cell as instruction `i` begins.
     bool plainAt(std::uint32_t i, unsigned reg) const
     {
@@ -1321,7 +1341,7 @@ private:
     void materializeReads(std::uint32_t i);
     void materializeLive(std::uint32_t i);
     void loadFromFrame(unsigned reg, std::int32_t w, Label& fail);
-    void unboxRax(std::int32_t w, Label& fail);
+    void unboxRax(std::int32_t w, Label& fail, bool number = false);
     void loadTypedAfter(std::uint32_t i);
     void savePool(std::uint32_t i);
     void restorePool(std::uint32_t i);
@@ -1644,6 +1664,39 @@ private:
         a_.movqToX(x, tmp);
         a_.bind(done);
     }
+    /// The number in `v` as a double in xmm`x`, else `bad` (null: known to be a number). A double falls straight through;
+    /// an int32 is converted out of line. `tmp` (not `v`) is clobbered.
+    struct ColdInt
+    {
+        Label entry, back;
+        int x;
+        Reg v;
+    };
+    std::deque<ColdInt> coldInts_;
+    /// An int32 variable that overflowed when stepped in place: stepped back, then out by `bad`.
+    struct ColdUndo
+    {
+        Label entry;
+        Reg r;
+        std::int32_t step;
+        Label* bad;
+    };
+    std::deque<ColdUndo> coldUndos_;
+    void unboxDouble(int x, Reg v, Reg tmp, Label* bad)
+    {
+        a_.mov(tmp, v);
+        a_.sub(tmp, RBP);
+        if (bad)
+            a_.jcc(CB, *bad);  // below the first double: not a number
+        a_.cmp(v, R14);
+        coldInts_.emplace_back();
+        ColdInt& c = coldInts_.back();
+        c.x = x;
+        c.v = v;
+        a_.jcc(CAE, c.entry);
+        a_.movqToX(x, tmp);
+        a_.bind(c.back);
+    }
     /// The int32 a number in `src` converts to, into `dst`: a plain int32, or a double that truncates without going out of
     /// range (NaN and the rest go to `bad`). Clobbers rdx and xmm0.
     void int32From(Reg dst, Reg src, Label& bad)
@@ -1699,10 +1752,14 @@ private:
     }
     /// xmm`x` as a boxed double in rax; every NaN becomes the canonical one.
     void boxDouble(int x) { boxDoubleTo(RAX, x); }
-    void boxDoubleTo(Reg dst, int x)
+    void boxDoubleTo(Reg dst, int x, bool tame = false)
     {
         Label ok;
         a_.movqFromX(dst, x);
+        if (tame) {
+            a_.add(dst, RBP);
+            return;
+        }
         a_.ucomisd(x, x);
         a_.jcc(CNP, ok);
         a_.movImm(dst, kCanonicalNaN);
@@ -1729,19 +1786,21 @@ private:
     /// For a taken backward jump: count down to the next look at the interrupt flag, in the interpreter when it is time.
     void tick(std::uint32_t i)
     {
-        a_.mov32(RDX, mem(R12, kVmTicks));
-        a_.aluI32(5, RDX, 1);
         if (optimizing()) {
             // The optimizing code may not leave for the interpreter here (its variables are in registers): a stub makes the
-            // call that looks at the flag and comes back.
+            // call that looks at the flag, sets the count again and comes back.
             tickStubs_.emplace_back(i, Label{});
             Label& stub = tickStubs_.back().second;
+            a_.mov32(RDX, mem(R12, kVmTicks));
+            a_.aluI32(5, RDX, 1);
             a_.jcc(CE, stub);
             a_.mov32(mem(R12, kVmTicks), RDX);
             tickBack_.emplace_back(Label{});
             a_.bind(tickBack_.back());
             return;
         }
+        a_.mov32(RDX, mem(R12, kVmTicks));
+        a_.aluI32(5, RDX, 1);
         a_.jcc(CE, slow(i));
         a_.mov32(mem(R12, kVmTicks), RDX);
     }
@@ -1852,6 +1911,16 @@ void Baseline::emitTails()
     }
     if (optimizing())
         emitOptTails();
+    for (ColdUndo& u : coldUndos_) {
+        a_.bind(u.entry);
+        a_.aluI32(5, u.r, u.step);
+        a_.jmp(*u.bad);
+    }
+    for (ColdInt& c : coldInts_) {
+        a_.bind(c.entry);
+        a_.cvtsi2sd32(c.x, c.v);
+        a_.jmp(c.back);
+    }
     for (auto& t : throws_) {
         a_.bind(t.second);
         a_.mov(RDI, R12);

@@ -86,6 +86,20 @@ bool createData(VM& vm, JSValue a, double i, JSValue v)
     Key k = toPropertyKey(vm, JSValue::boxNumber(i));
     if (!k)
         return false;
+    // A frozen object takes nothing; one closed to growth only what it has (and can change).
+    if (isObject(a) && !proxyOf(asObject(a))) {
+        JSObject* obj = asObject(a);
+        std::uint8_t attrs = 0;
+        const bool has = obj->findOwn(vm, k, &attrs) ||
+                         (hasElems(obj) && i < double(static_cast<JSArray*>(obj)->length) &&
+                          !static_cast<JSArray*>(obj)->at(std::uint32_t(i)).isHole());
+        if ((obj->h.flags & cellflags::kFrozen) || ((obj->h.flags & cellflags::kNotExtensible) && !has)) {
+            detail::decRef(k);
+            vm.throwError(ErrorCode::TypeError, "Cannot define property " + std::to_string(std::uint64_t(i)) +
+                                                    ", object is not extensible");
+            return false;
+        }
+    }
     retain(v);
     const bool ok = isObject(a) && defineOwn(vm, asObject(a), k, v, attr::kDefault);
     detail::decRef(k);
@@ -166,14 +180,66 @@ NATIVE(arrayIterate)
     const bool finder = kind >= 5;
     const bool backwards = kind >= 7;
     double kept = 0;
+    // The result array as made: a plain array of the realm's prototype, whose chain has no index properties. While its shape,
+    // its flags and that chain stay as they are, an element goes straight in.
+    JSArray* plainOut = nullptr;
+    std::uint32_t plainShape = 0;
+    ValidityCell* chain = nullptr;
+    if (out.get().isCell() && isArray(out.get()) && vm.protos.array && vm.protos.object) {
+        auto* a = static_cast<JSArray*>(asObject(out.get()));
+        if (a->cls() == ObjClass::Array && a->proto(vm) == vm.protos.array && !a->isDictionary(vm) &&
+            a->shapeOf(vm)->count == 0 && vm.protos.array->proto(vm) == vm.protos.object &&
+            !(a->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
+            plainOut = a;
+            plainShape = a->h.shape;
+            chain = vm.validityOf(vm.protos.array);
+            vm.retainValidity(chain);
+        }
+    }
+    struct Release
+    {
+        VM& vm;
+        ValidityCell* cell;
+        ~Release()
+        {
+            if (cell)
+                vm.releaseValidity(cell);
+        }
+    } releaseChain{vm, chain};
+    auto store = [&](double at, JSValue v) {
+        if (plainOut && plainOut->h.shape == plainShape && chain->valid &&
+            !(plainOut->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible)) && at <= double(plainOut->length)) {
+            const std::uint32_t k = std::uint32_t(at);
+            retain(v);
+            if (k < plainOut->length) {
+                const JSValue old = plainOut->elems[k];
+                plainOut->elems[k] = v;
+                if (!v.isNumber())
+                    plainOut->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
+                release(old);
+            } else {
+                plainOut->append(vm, v);
+            }
+            return true;
+        }
+        return createData(vm, out.get(), at, v);
+    };
+    JSArray* const source = isArray(o.get()) && asObject(o.get())->cls() == ObjClass::Array
+                                ? static_cast<JSArray*>(asObject(o.get()))
+                                : nullptr;
     for (double n = 0; n < len; ++n) {
         const double i = backwards ? len - 1 - n : n;
         Handle e;
-        const int found = readIndex(vm, o.get(), i, &e, !finder);
-        if (found < 0)
-            return JSValue::exception();
-        if (!found)
-            continue;
+        // An element there in a plain array is read in place; anything else as the spec says.
+        if (source && i < double(source->length) && !source->elems[std::uint32_t(i)].isHole()) {
+            e = Handle::retained(source->elems[std::uint32_t(i)]);
+        } else {
+            const int found = readIndex(vm, o.get(), i, &e, !finder);
+            if (found < 0)
+                return JSValue::exception();
+            if (!found)
+                continue;
+        }
         JSValue call[3] = {e.get(), JSValue::boxNumber(i), o.get()};
         JSValue r = vm.call(callback, thisArg, call, 3);
         if (r.isException())
@@ -182,11 +248,11 @@ NATIVE(arrayIterate)
         switch (kind) {
             case 0: break;
             case 1:
-                if (!createData(vm, out.get(), i, r))
+                if (!store(i, r))
                     return JSValue::exception();
                 break;
             case 2:
-                if (toBoolean(r) && !createData(vm, out.get(), kept++, e.get()))
+                if (toBoolean(r) && !store(kept++, e.get()))
                     return JSValue::exception();
                 break;
             case 3:

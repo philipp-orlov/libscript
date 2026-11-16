@@ -3683,3 +3683,38 @@ TEST(numberReadsALoopNeverStoresOverAreReadOnceBeforeIt)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3000 750 750 249004 499.5 2000 2500 0sss 50401"));
     }
 }
+
+TEST(arrayCallbackMethodsReadAndWriteInPlaceAsTheSpecSays)
+{
+    // map, filter and their kin over holes, a source that grows or shrinks, a subclass, an index setter added to
+    // Array.prototype meanwhile, array-likes, typed arrays, and a species that gives a frozen array (same as JSC).
+    const char* program =
+        "var out=[]; "
+        "var a=[1,,3,4,,6]; "
+        "out.push(JSON.stringify(a.map(function(x){return x*2;})), JSON.stringify(a.filter(function(x){return x>2;}))); "
+        "var b=[1,2,3,4,5]; out.push(JSON.stringify(b.map(function(x,i,arr){ if(i==1) arr.push(9); if(i==2) arr.pop(); return x+i; })), b.length); "
+        "var c=[1,2,3,4,5,6]; out.push(JSON.stringify(c.filter(function(x,i,arr){ if(i==2) arr.length=4; return true; }))); "
+        "class MyArr extends Array {} var m=MyArr.from([1,2,3]); var mm=m.map(function(x){return x+1;}); out.push(mm instanceof MyArr, JSON.stringify(mm)); "
+        "var log=[]; var d=[1,2,3,4]; var r=d.map(function(x,i){ if(i==1) Object.defineProperty(Array.prototype, 3, {set:function(v){log.push('set'+v);}, get:function(){return 'g';}, configurable:true}); return x*10; }); "
+        "out.push(JSON.stringify(r), log.join()); delete Array.prototype[3]; "
+        "var e=[1,,3]; var f=e.map(function(x){return x;}); out.push(1 in f, f.length); "
+        "out.push(JSON.stringify(Array.prototype.map.call({length:3,0:'a',2:'c'},function(x){return x+'!';}))); "
+        "out.push(JSON.stringify(Array.prototype.filter.call(new Int8Array([1,-2,3]),function(x){return x>0;}))); "
+        "var g=[3,1,2]; out.push(g.every(function(x){return x>0;}), g.some(function(x){return x>2;}), g.find(function(x){return x<3;}), g.findIndex(function(x){return x==2;}), g.findLast(function(x){return x>1;}), g.findLastIndex(function(x){return x>5;})); "
+        "var cnt=0; [1,2,3].forEach(function(){cnt++;}); out.push(cnt); "
+        "var big=[]; for (var i=0;i<1000;i++) big.push(i); var t=0; for (var r2=0;r2<50;r2++) t+=big.map(function(x){return x*2;}).filter(function(x){return x%3===0;}).reduce(function(p,x){return p+x;},0); out.push(t); "
+        "var objs=[{v:1},{v:2}]; var mapped=objs.map(function(o){return o;}); out.push(mapped[0]===objs[0], JSON.stringify(objs.filter(function(o){return o.v>1;}))); "
+        "Object.defineProperty(Array, Symbol.species, {get:function(){ return function(n){ var x=[]; Object.freeze(x); return x; }; }, configurable:true}); "
+        "try { [1,2].map(function(x){return x;}); out.push('nofail'); } catch(err) { out.push(err instanceof TypeError); } "
+        "delete Array[Symbol.species]; "
+        "out.join(' | ') ";
+    for (int mode = 0; mode < 2; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("[2,null,6,8,null,12] | [3,4,6] | [1,3,5,7,9] | 5 | [1,2,3,4] | true | [2,3,4] | [10,20,30,40] |  | false | 3 | [\"a!\",null,\"c!\"] | [1,3] | true | true | 1 | 2 | 2 | -1 | 3 | 16683300 | true | [{\"v\":2}] | true"));
+    }
+}

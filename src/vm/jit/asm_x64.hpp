@@ -48,6 +48,30 @@ class X64
 public:
     std::vector<std::uint8_t> buf;
 
+private:
+    std::size_t stored_ = ~std::size_t(0);  ///< where the last instruction, a store of a register to the stack, ends
+    Reg storedReg_ = RAX;
+    std::int32_t storedDisp_ = 0;
+    bool storedWide_ = false;
+    std::size_t zeroed_ = ~std::size_t(0);  ///< where the last instruction, a 32-bit write of `zeroedReg_`, ends
+    Reg zeroedReg_ = RAX;
+    void noteStore(Reg s, const Mem& m, bool wide)
+    {
+        if (m.base == RSP && m.index < 0) {
+            stored_ = buf.size();
+            storedReg_ = s;
+            storedDisp_ = m.disp;
+            storedWide_ = wide;
+        }
+    }
+    bool justStored(Reg d, const Mem& m, bool wide) const
+    {
+        return stored_ == buf.size() && m.base == RSP && m.index < 0 && m.disp == storedDisp_ && d == storedReg_ &&
+               wide == storedWide_;
+    }
+
+public:
+
     std::int32_t here() const noexcept { return std::int32_t(buf.size()); }
 
     // ---- raw ----
@@ -71,6 +95,8 @@ public:
     // ---- labels ----
     void bind(Label& l)
     {
+        stored_ = ~std::size_t(0);
+        zeroed_ = ~std::size_t(0);
         l.pos = here();
         for (std::int32_t at : l.uses)
             patch32(at, l.pos - (at + 4));
@@ -163,11 +189,43 @@ public:
 
     // ---- moves ----
     void mov(Reg d, Reg s) { opReg(true, 0x8B, d, s); }
-    void mov32(Reg d, Reg s) { opReg(false, 0x8B, d, s); }
-    void mov(Reg d, const Mem& m) { opMem(true, 0x8B, d, m); }
-    void mov(const Mem& m, Reg s) { opMem(true, 0x89, s, m); }
-    void mov32(Reg d, const Mem& m) { opMem(false, 0x8B, d, m); }
-    void mov32(const Mem& m, Reg s) { opMem(false, 0x89, s, m); }
+    void mov32(Reg d, Reg s)
+    {
+        // A register the instruction just before wrote as 32 bits is zero-extended already.
+        if (d == s && zeroed_ == buf.size() && zeroedReg_ == d)
+            return;
+        opReg(false, 0x8B, d, s);
+        zeroed_ = buf.size();
+        zeroedReg_ = d;
+    }
+    // A load of the stack slot the instruction just before stored from the same register reads what the register holds:
+    // a 64-bit one is dropped, a 32-bit one only zero-extends. A label between ends this (`bind`).
+    void mov(Reg d, const Mem& m)
+    {
+        if (justStored(d, m, true))
+            return;
+        opMem(true, 0x8B, d, m);
+    }
+    void mov(const Mem& m, Reg s)
+    {
+        opMem(true, 0x89, s, m);
+        noteStore(s, m, true);
+    }
+    void mov32(Reg d, const Mem& m)
+    {
+        if (justStored(d, m, false)) {
+            mov32(d, d);
+            return;
+        }
+        opMem(false, 0x8B, d, m);
+        zeroed_ = buf.size();
+        zeroedReg_ = d;
+    }
+    void mov32(const Mem& m, Reg s)
+    {
+        opMem(false, 0x89, s, m);
+        noteStore(s, m, false);
+    }
     void mov16(const Mem& m, Reg s) { opMem(false, 0x89, s, m, -1, 0x66); }
     void mov8(const Mem& m, Reg s)
     {

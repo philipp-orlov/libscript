@@ -919,10 +919,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
         a_.jcc(CE, slowPath);
     }
     a_.lea(R9, R(base + 1));
-    a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 64)));
-    a_.alu(7, R10, mem(R12, kVmStackEnd));
-    a_.jcc(CA, slowPath);
-    a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs)));
+    // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
+    a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 8)));
     a_.alu(7, R10, mem(R12, kVmStackInit));
     a_.jcc(CA, slowPath);
     // The new frame follows this one (the top one): its index from the address, so nothing waits on the count's last
@@ -976,13 +974,23 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
     a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
     a_.mov(RSI, R11);
+    a_.mov(RDI, R9);
     a_.mov(RDX, mem(RDX, kTierEntry));
     a_.callReg(RDX);
     a_.test(RAX, RAX);
     a_.jcc(CE, exc);
     write(in.a, RAX);
     restorePool(i);
-    a_.jmp(done);
+    Label typedDone;
+    const std::int32_t dw = plan_->defWeb[i];
+    if (dw >= 0 && in.a < plainRegs_.size() && plainRegs_[in.a]) {
+        // The result into its variable from rax (the write called nothing), as the frame has it.
+        unboxRax(dw, exitAfter(i));
+        dirty_[std::size_t(dw)] = 0;
+        a_.jmp(typedDone);
+    } else {
+        a_.jmp(done);
+    }
     // The long way: the registers written as the instructions would have (the global read now), then the baseline call
     // sequence.
     a_.bind(slowPath);
@@ -1011,6 +1019,7 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.bind(done);
     if (plan_->defWeb[i] >= 0)
         loadTypedAfter(i);
+    a_.bind(typedDone);
 }
 
 // ---- read chains ----

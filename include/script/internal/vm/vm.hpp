@@ -259,6 +259,8 @@ struct VM : EngineRuntime
     std::uint32_t frameCount = 0;
     std::uint32_t frameCapacity = 0;
     /// Registers below this hold a value (undefined unless a frame wrote another): the stack is filled as it is first used.
+    /// Every filler has made sure of 8 registers past what it fills, so this stays 8 short of `stackEnd`, and compiled
+    /// code that finds a frame (and one more) below it needs no other test of the stack's end.
     JSValue* stackInit = nullptr;
     void fillStack(JSValue* upTo) noexcept
     {

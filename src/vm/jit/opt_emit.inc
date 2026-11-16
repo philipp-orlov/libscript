@@ -134,13 +134,26 @@ void Baseline::afterGeneric(std::uint32_t i)
     loadTypedAfter(i);
 }
 
+/// Whether web `w`, live before instruction `i`, is still wanted after it: what a call out at `i` must keep. With
+/// handlers in the function every one is kept (one may catch at `i` and want them).
+bool Baseline::liveAcross(std::uint32_t i, std::int32_t w) const
+{
+    const std::uint32_t next = i + length(i);
+    if (!code_->handlers.empty() || next >= n_ || opt::jumpTarget(*code_, i) >= 0)
+        return true;  // (after a jump, what is wanted is what its target wants)
+    for (const opt::LiveWeb& lw : plan_->liveBefore[next])
+        if (std::int32_t(lw.web) == w)
+            return true;
+    return false;
+}
+
 void Baseline::savePool(std::uint32_t i)
 {
     if (!optimizing())
         return;
     for (const opt::LiveWeb& lw : plan_->liveBefore[i]) {
         const std::int32_t w = std::int32_t(lw.web);
-        if (!inReg(w))
+        if (!inReg(w) || !liveAcross(i, w))
             continue;
         if (isI32(w))
             a_.mov32(home(w), gpr(w));
@@ -155,7 +168,7 @@ void Baseline::restorePool(std::uint32_t i)
         return;
     for (const opt::LiveWeb& lw : plan_->liveBefore[i]) {
         const std::int32_t w = std::int32_t(lw.web);
-        if (!inReg(w))
+        if (!inReg(w) || !liveAcross(i, w))
             continue;
         if (isI32(w))
             a_.mov32(gpr(w), home(w));
@@ -287,6 +300,21 @@ bool Baseline::emitTyped(std::uint32_t i)
         return true;
     };
     switch (op) {
+    case Op::Ret: {
+        // A number: boxed straight into rax, not through the frame, and counted by no one.
+        if (uw.empty() || uw[0] < 0)
+            return false;
+        const std::int32_t w = uw[0];
+        if (isI32(w)) {
+            const Reg r = useI32(w, RAX);
+            a_.mov32(RAX, r);
+            a_.or_(RAX, R14);
+        } else {
+            boxDouble(operandF64(w, 0, RAX));
+        }
+        ret(i, in, true);
+        return true;
+    }
     case Op::LoadInt:
         if (dw < 0)
             return false;
@@ -1125,7 +1153,7 @@ Tier2Code* Baseline::compileOptimized()
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
     a_.mov(R13, RSI);
-    a_.mov(RBX, mem(R13, kFrameR));
+    a_.mov(RBX, RDI);  // the frame's registers, as every way in passes them
     for (const opt::LiveWeb& lw : plan_->liveBefore[0])
         loadFromFrame(lw.reg, std::int32_t(lw.web), entryFail_);
     for (std::uint32_t i = 0; i < n_;) {

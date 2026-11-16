@@ -61,13 +61,15 @@ struct Stubs
     void* osrEnter = nullptr;
 };
 
+/// A function's way in: the frame in rsi, its registers (the frame's `R`) in rdi, so that nothing waits on the frame's
+/// store of them.
 void emitPrologue(X64& a)
 {
     a.push(RBX);
     a.push(R13);
     a.aluI(5, RSP, 8);
     a.mov(R13, RSI);
-    a.mov(RBX, mem(R13, std::int32_t(offsetof(Frame, R))));
+    a.mov(RBX, RDI);
 }
 
 const Stubs& stubs()
@@ -85,6 +87,7 @@ const Stubs& stubs()
         a.movImm(R15, kNotCellMask);
         a.movImm(RBP, kDoubleOffset);
         a.mov(RAX, RCX);
+        a.mov(RDI, mem(RSI, std::int32_t(offsetof(Frame, R))));
         a.callReg(RAX);
         a.aluI(0, RSP, 8);
         a.pop(R15);
@@ -1055,6 +1058,7 @@ private:
     void loadTypedAfter(std::uint32_t i);
     void savePool(std::uint32_t i);
     void restorePool(std::uint32_t i);
+    bool liveAcross(std::uint32_t i, std::int32_t w) const;
     Label& exitLabel(std::uint32_t i, int kind);
     Label& exitBefore(std::uint32_t i) { return exitLabel(i, 0); }
     Label& exitAfter(std::uint32_t i) { return exitLabel(i, 1); }
@@ -1515,7 +1519,7 @@ private:
     void getSuperProp(std::uint32_t i, const Ins& in);
     void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
     void putElem(std::uint32_t i, const Ins& in);
-    void ret(std::uint32_t i, const Ins& in);
+    void ret(std::uint32_t i, const Ins& in, bool numberInRax = false);
     // R11 = the frame after the top one (R13), R10 = its index; read from the address so that nothing waits on the
     // last store of the count.
     void topFrameIndex()
@@ -2402,10 +2406,8 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
     a_.jcc(CNE, bad);
     a_.mov32(RSI, mem(RCX, kCbNregs));
     a_.lea(R9, mem(RBX, thisAt));
-    a_.lea(R10, mem(R9, RSI, 8, 64));
-    a_.alu(7, R10, mem(R12, kVmStackEnd));
-    a_.jcc(CA, bad);
-    a_.lea(R10, mem(R9, RSI, 8));
+    // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
+    a_.lea(R10, mem(R9, RSI, 8, 8));
     a_.alu(7, R10, mem(R12, kVmStackInit));
     a_.jcc(CA, bad);
     topFrameIndex();
@@ -2434,6 +2436,7 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
     a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
     a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
     a_.mov(RSI, R11);
+    a_.mov(RDI, R9);
     a_.mov(RDX, mem(RDX, kTierEntry));
     a_.callReg(RDX);
     a_.mov(mem(RBX, thisAt), std::int32_t(kUndefined));
@@ -2777,10 +2780,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CB, helper);
         a_.mov32(RSI, mem(RCX, kCbNregs));
         a_.lea(R9, R(base + 1));
-        a_.lea(R10, mem(R9, RSI, 8, 64));
-        a_.alu(7, R10, mem(R12, kVmStackEnd));
-        a_.jcc(CA, helper);
-        a_.lea(R10, mem(R9, RSI, 8));
+        // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
+        a_.lea(R10, mem(R9, RSI, 8, 8));
         a_.alu(7, R10, mem(R12, kVmStackInit));
         a_.jcc(CA, helper);
         topFrameIndex();
@@ -2833,6 +2834,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
         a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
         a_.mov(RSI, R11);
+        a_.mov(RDI, R9);
         a_.mov(RDX, mem(RDX, kTierEntry));
         a_.jmp(enter);
     }
@@ -2861,10 +2863,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CB, helper);
         a_.mov32(RSI, mem(RCX, kCbNregs));
         a_.lea(R9, R(base + 1));
-        a_.lea(R10, mem(R9, RSI, 8, 64));
-        a_.alu(7, R10, mem(R12, kVmStackEnd));
-        a_.jcc(CA, helper);
-        a_.lea(R10, mem(R9, RSI, 8));
+        // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
+        a_.lea(R10, mem(R9, RSI, 8, 8));
         a_.alu(7, R10, mem(R12, kVmStackInit));
         a_.jcc(CA, helper);
         topFrameIndex();
@@ -2944,6 +2944,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(mem(R11, kFrameNewTarget), RAX);
         a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
         a_.mov(RSI, R11);
+        a_.mov(RDI, R9);
         a_.mov(RDX, mem(RDX, kTierEntry));
         a_.jmp(enter);
     }
@@ -3114,6 +3115,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     a_.cmpI(RDX, 1);
     a_.jcc(CE, native);
     a_.mov(RSI, RAX);
+    a_.mov(RDI, mem(RAX, kFrameR));
     a_.bind(enter);
     a_.callReg(RDX);
     a_.bind(native);
@@ -3124,28 +3126,46 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     restorePool(i);
 }
 
-void Baseline::ret(std::uint32_t i, const Ins& in)
+void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax)
 {
     (void)i;
+    // `numberInRax`: the result is a number the optimized code has boxed in rax already, which needs no count.
     Label have;
-    a_.mov(RAX, R(in.a));
+    if (!numberInRax)
+        a_.mov(RAX, R(in.a));
     if (code_->constructor || (code_->flags & CodeBlock::kClassConstructor)) {
         // A constructor's result that is not an object is `this`.
         Label useThis;
         a_.cmpI8(mem(R13, kFrameConstruct), 0);
         a_.jcc(CE, have);
-        a_.test(RAX, R15);
-        a_.jcc(CNE, useThis);
-        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
-        a_.jcc(CE, have);
+        if (!numberInRax) {
+            a_.test(RAX, R15);
+            a_.jcc(CNE, useThis);
+            a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+            a_.jcc(CE, have);
+        }
         a_.bind(useThis);
         a_.mov(RAX, R(0));
+        if (numberInRax) {
+            Label counted;
+            retain(RAX);
+            a_.jmp(counted);
+            a_.bind(have);
+            a_.bind(counted);
+        }
     }
-    a_.bind(have);
-    retain(RAX);
-    a_.mov(mem(RSP, 0), RAX);
+    if (!numberInRax) {
+        a_.bind(have);
+        retain(RAX);
+    }
     // Registers a call put its arguments in belong to the caller; those the call did not fill and everything above the
-    // parameters are this frame's to clear.
+    // parameters are this frame's to clear. When none can hold a cell, nothing here calls out and rax stays.
+    const unsigned first = 1 + code_->nparams;
+    bool plain = code_->nregs <= first || code_->nregs - first <= 12;
+    for (unsigned r = 1; r < code_->nregs && plain; ++r)
+        plain = r < plainRegs_.size() && plainRegs_[r];
+    if (!plain)
+        a_.mov(mem(RSP, 0), RAX);
     for (unsigned p = 1; p <= code_->nparams; ++p) {
         Label skip;
         a_.cmpI32(mem(R13, kFrameArgc), std::int32_t(p));
@@ -3153,7 +3173,6 @@ void Baseline::ret(std::uint32_t i, const Ins& in)
         clearReg(p);
         a_.bind(skip);
     }
-    const unsigned first = 1 + code_->nparams;
     if (code_->nregs > first) {
         const unsigned count = code_->nregs - first;
         if (count <= 12) {
@@ -3170,7 +3189,8 @@ void Baseline::ret(std::uint32_t i, const Ins& in)
     a_.alu(5, RDX, mem(R12, kVmFrameBase));
     a_.shiftI(5, RDX, 6);
     a_.mov32(mem(R12, kVmFrameCount), RDX);
-    a_.mov(RAX, mem(RSP, 0));
+    if (!plain)
+        a_.mov(RAX, mem(RSP, 0));
     a_.jmp(exit_);
 }
 

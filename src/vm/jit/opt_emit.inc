@@ -1215,6 +1215,50 @@ void Baseline::emitOpt(std::uint32_t i)
     saveReadValue(i);
 }
 
+void Baseline::planTestReads()
+{
+    testReads_.clear();
+    quietDefs_.clear();
+    for (std::uint32_t k = 3; k < n_; k += length(k)) {
+        const Ins& in = code_->code[k];
+        if ((in.opcode() != Op::JStrictEq && in.opcode() != Op::JStrictNe) || plan_->isLeader[k])
+            continue;
+        const std::uint32_t j = k - 1;
+        const Op cop = code_->code[j].opcode();
+        if ((cop != Op::LoadNull && cop != Op::LoadUndef && cop != Op::LoadTrue && cop != Op::LoadFalse) ||
+            plan_->isLeader[j] || j < 2)
+            continue;
+        const unsigned y = code_->code[j].a;
+        if ((y == in.a) == (y == in.b))
+            continue;
+        const unsigned x = y == in.a ? in.b : in.a;
+        const std::uint32_t i = j - 2;
+        const Ins& g = code_->code[i];
+        if (g.opcode() != Op::GetProp || code_->code[i + 1].opcode() != Op::Cache || g.a != x || g.b == x || g.b == y ||
+            code_->code[i + 1].a == kNoCache || plan_->defWeb[i] >= 0 || plan_->defWeb[j] >= 0)
+            continue;
+        if ((i < skipDef_.size() && skipDef_[i]) || (i < chainRole_.size() && chainRole_[i]) || windowRead_.count(i) ||
+            (j < skipDef_.size() && skipDef_[j]) || reuseRead_.count(i) || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+            continue;
+        const auto& uw = plan_->useWebs[i];
+        if (uw.empty() || uw[0] >= 0)
+            continue;
+        const InlineCache& ic = code_->caches[code_->code[i + 1].a];
+        if (ic.shape == 0 || ic.holder || ic.next != 0 || ic.aux == 0 ||
+            (ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n))
+            continue;
+        if (!regDeadAfter(k, x) || !regDeadAfter(k, y))
+            continue;
+        testReads_[k] = i;
+        quietDefs_.insert(i);
+        quietDefs_.insert(j);
+        skipDef_[i] = 1;
+        skipDef_[j] = 1;
+        exitRedirect_[j] = std::int32_t(i);
+        exitRedirect_[k] = std::int32_t(i);
+    }
+}
+
 /// Which registers each instruction may find written since the frame began: a register only `LoadUndef` wrote counts too,
 /// as the optimized code may leave that out.
 void Baseline::planDirty()
@@ -1229,6 +1273,8 @@ void Baseline::planDirty()
         eff[j] = opt::effectsOf(*code_, j);
         if (!eff[j].ok)
             return;
+        if (quietDefs_.count(j))
+            eff[j].wr.clear();  // writes nothing (`planTestReads`)
     }
     for (bool changed = true; changed;) {
         changed = false;
@@ -1743,6 +1789,7 @@ Tier2Code* Baseline::compileOptimized()
     planReadReuse();
     movedOut_.clear();
     planChains();
+    planTestReads();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);
     factInl_.assign(code_->nregs + 1, 0);

@@ -1081,6 +1081,11 @@ private:
     };
     std::vector<Borrow> borrows_;
     std::set<std::uint32_t> slowNext_;  ///< instructions a slow path comes back to
+    /// `x = o.p; y = null; if (x !== y)` with both registers dead after the jump: the jump reads the property itself and
+    /// compares its bits (by jump: the read), and neither register is written (`quietDefs_`).
+    std::map<std::uint32_t, std::uint32_t> testReads_;
+    std::set<std::uint32_t> quietDefs_;
+    void planTestReads();
     void planBorrows();
     bool borrowed(std::uint32_t at, unsigned reg) const
     {
@@ -1271,7 +1276,8 @@ private:
     void inlineBoxed(const IVal& v);
     bool inlineCall(std::uint32_t i, bool decideOnly = false);
     bool inlineGetter(std::uint32_t i);
-    bool inlineNew(std::uint32_t i);
+    bool inlineNew(std::uint32_t i, bool decideOnly = false);
+    std::map<std::uint32_t, std::uint32_t> newCallee_;  ///< a `new` whose constructor's global read writes nothing: that read
     bool inlineTop(std::uint32_t i, CodeBlock* C, const IVal& callee, JSValue known, const std::vector<IVal>& args,
                    unsigned dst, bool decideOnly);
     // direct calls (opt_inline.inc)
@@ -2503,7 +2509,15 @@ void Baseline::strictJump(std::uint32_t i, const Ins& in)
         default: break;
         }
         if (k >= 0 && (p.a == in.a) != (p.a == in.b)) {
-            a_.mov(RAX, R(p.a == in.a ? in.b : in.a));
+            if (auto tr = testReads_.find(i); tr != testReads_.end()) {
+                // The property read here, into no register.
+                const Ins& g = code_->code[tr->second];
+                const InlineCache& ic = code_->caches[code_->code[tr->second + 1].a];
+                Label& bad = exitBefore(i);
+                a_.mov(RAX, provenSlotMem(g.b, ic.shape, ic.index, ic.aux, bad));
+            } else {
+                a_.mov(RAX, R(p.a == in.a ? in.b : in.a));
+            }
             a_.cmpI(RAX, std::int32_t(k));
             goIf(wantEqual ? CE : CNE, i, target);
             return;

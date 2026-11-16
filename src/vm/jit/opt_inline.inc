@@ -1540,7 +1540,7 @@ bool Baseline::regDeadAfter(std::uint32_t i, unsigned r)
 // with its final shape and the values written into its slots. Every check comes before the object is made; anything that
 // does not hold runs the baseline sequence instead.
 
-bool Baseline::inlineNew(std::uint32_t i)
+bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
 {
     const Ins& in = code_->code[i];
     const unsigned base = in.b, argc = in.c;
@@ -1636,13 +1636,24 @@ bool Baseline::inlineNew(std::uint32_t i)
         return false;
     if (!canAllocObject(aux))
         return false;
+    if (decideOnly)
+        return true;
+    // The window's registers unwritten (`planWindows`): a failed guard runs them again in the interpreter.
+    const bool windowed = windowVal_.count(i) != 0;
     Label slowPath, done;
     // The callee, its prototype and the chain the stores were learned on are as they were.
     holdValue(known);
-    a_.movImm(RCX, known.bits);
-    a_.cmp(RCX, R(base));
-    a_.jcc(CNE, slowPath);
-    a_.mov(RAX, R(base));
+    if (auto nc = newCallee_.find(i); nc != newCallee_.end()) {
+        emitReadInto(nc->second, false, slowPath);
+        a_.movImm(RCX, known.bits);
+        a_.cmp(RCX, RAX);
+        a_.jcc(CNE, slowPath);
+    } else {
+        a_.movImm(RCX, known.bits);
+        a_.cmp(RCX, R(base));
+        a_.jcc(CNE, slowPath);
+        a_.mov(RAX, R(base));
+    }
     a_.cmpI32(mem(RAX, 0), std::int32_t(f->h.shape));
     a_.jcc(CNE, slowPath);
     a_.mov(RDX, mem(RAX, kObjSlots));
@@ -1650,6 +1661,8 @@ bool Baseline::inlineNew(std::uint32_t i)
     a_.movImm(RCX, pv.bits);
     a_.cmp(RCX, mem(RDX, 16));
     a_.jcc(CNE, slowPath);
+    std::sort(cells.begin(), cells.end());
+    cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
     for (ValidityCell* c : cells) {
         hold(c);
         a_.movImm(RCX, reinterpret_cast<std::uint64_t>(c));
@@ -1670,6 +1683,28 @@ bool Baseline::inlineNew(std::uint32_t i)
     write(in.a, RAX);
     a_.jmp(done);
     a_.bind(slowPath);
+    if (windowed) {
+        // The registers as the instructions would have written them (the global read now), then the call the long way.
+        sideDoor();
+        if (auto nc = newCallee_.find(i); nc != newCallee_.end()) {
+            savePool(i);
+            a_.mov(RDI, R12);
+            a_.movImm(RSI, nc->second);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
+            a_.callReg(RAX);
+            a_.aluI32(7, RAX, 1);
+            a_.jcc(CNE, exception(i));
+            restorePool(i);
+        }
+        for (const auto& [k, v] : windowVal_.at(i)) {
+            if (k == 0)
+                continue;
+            inlineBoxed(v);
+            if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
+                retain(RAX);
+            write(base + unsigned(k), RAX);
+        }
+    }
     materializeReads(i);
     call(i, in);
     a_.bind(done);
@@ -1688,6 +1723,7 @@ void Baseline::planWindows()
 {
     windowVal_.clear();
     windowRead_.clear();
+    newCallee_.clear();
     if (!code_->handlers.empty() || inlineBase_ < 0)
         return;
     std::vector<std::uint32_t> starts;
@@ -1708,12 +1744,15 @@ void Baseline::planWindows()
     for (std::size_t k = 0; k < starts.size(); ++k) {
         const std::uint32_t i = starts[k];
         const Ins& in = code_->code[i];
-        if (in.opcode() != Op::Call || directCalls_.count(i) || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        const bool isNew = in.opcode() == Op::New;
+        if ((in.opcode() != Op::Call && !isNew) || directCalls_.count(i) ||
+            (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
             continue;
         const unsigned base = in.b, argc = in.c;
         const auto& uw = plan_->useWebs[i];
         if (uw.size() < 2u + argc)
             continue;
+        std::int64_t calleeRead = -1;
         std::map<std::size_t, IVal> vals;
         std::map<std::uint32_t, std::pair<std::int32_t, unsigned>> reads_;
         std::set<std::uint32_t> defs;
@@ -1750,6 +1789,17 @@ void Baseline::planWindows()
             case Op::LoadInt:
                 v.c = JSValue::int32(di.imm());
                 break;
+            case Op::GetGlobal: {
+                // The constructor of a `new`: the code reads the global itself, with the epoch, and compares.
+                if (!isNew || op != 0 || !chainable(std::uint32_t(d), false))
+                    continue;
+                const JSValue known = constantBefore(i, base);
+                if (!isFunction(known))
+                    continue;
+                v.c = known;
+                calleeRead = d;
+                break;
+            }
             case Op::Mov: {
                 if (plan_->useWebs[std::size_t(d)].empty() || plan_->useWebs[std::size_t(d)][0] >= 0)
                     continue;
@@ -1820,13 +1870,16 @@ void Baseline::planWindows()
         if (!pure)
             continue;
         windowVal_[i] = vals;
-        const bool ok = inlineCall(i, true);
+        if (calleeRead >= 0)
+            newCallee_[i] = std::uint32_t(calleeRead);
+        const bool ok = isNew ? inlineNew(i, true) : inlineCall(i, true);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (std::getenv("T2WIN"))
             std::fprintf(stderr, "window %s @%u from %u: %zu values, %s\n", codeName(code_).c_str(), i, first, vals.size(), ok ? "yes" : "no");
 #endif
         if (!ok) {
             windowVal_.erase(i);
+            newCallee_.erase(i);
             continue;
         }
         for (std::uint32_t d : defs)

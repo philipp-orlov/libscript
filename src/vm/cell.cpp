@@ -339,12 +339,57 @@ void VM::destroy(CellPtr cell) noexcept
         return;
     }
     destroying_ = true;
-    destroyNow(cell);
-    while (!pending_.empty()) {
-        CellPtr next = pending_.back();
+    // A plain object whose properties are all in its cell -- a tree's node, a record -- is freed here, its counters summed
+    // and set once at the end, and the first of its values it frees is freed next without going through `pending_`.
+    std::size_t bytesFreed = 0, cellsFreed = 0;
+    CellPtr next = cell;
+    for (;;) {
+        CellPtr follow = nullptr;
+        CellHeader* const hd = headerOf(next);
+        auto* o = reinterpret_cast<JSObject*>(next);
+        if (kindOf(next) == Kind::Object && !(hd->flags & cellflags::kHasRare) && o->cls() == ObjClass::Plain && !o->slots) {
+            const std::uint32_t count = shapeById(hd->shape)->count;
+            const std::uint32_t n = count < hd->aux ? count : hd->aux;
+            const JSValue* values = o->inl();
+            for (std::uint32_t i = 0; i < n; ++i) {
+                const JSValue v = values[i];
+                if (!v.isCell())
+                    continue;
+                CellPtr c = v.asCell();
+                if (--detail::cellCount(c) != 0)
+                    continue;
+                if (!isVmCell(c)) {
+                    detail::destroyUnreferenced(c);
+                } else if (!follow) {
+                    follow = c;
+                } else {
+                    try {
+                        pending_.push_back(c);
+                    } catch (...) {
+                        // Out of memory while freeing: the cell stays, as a leak and not a crash.
+                    }
+                }
+            }
+            const std::size_t bytes = JSObject::bytesFor(hd->aux);
+            heap.deallocate(next, bytes);
+            bytesFreed += bytes;
+            ++cellsFreed;
+        } else {
+            destroyNow(next);
+        }
+        if (follow) {
+            next = follow;
+            continue;
+        }
+        if (pending_.empty())
+            break;
+        next = pending_.back();
         pending_.pop_back();
-        destroyNow(next);
     }
+    ctx.heapBytes -= bytesFreed;
+    ownedBytes_ -= bytesFreed;
+    ctx.liveObjects -= cellsFreed;
+    liveCells -= cellsFreed;
     destroying_ = false;
 }
 

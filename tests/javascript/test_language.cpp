@@ -4159,3 +4159,43 @@ TEST(directCallsSetNewTargetOnlyForCalleesThatReadIt)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("3030001"));
     }
 }
+
+TEST(treesComparedFreedAndBuiltInPlace)
+{
+    // A property compared with null or undefined and then dead is read by the jump itself (a getter, other shapes, exits),
+    // trees and chains are freed without recursion (with strings, arrays and properties out of line among the values), and
+    // a `new` whose window registers are unwritten fills them when it takes the long way.
+    const char* program =
+        "var out = [];"
+        "function T(l, r) { this.l = l; this.r = r; }"
+        "function mk(d) { return d === 0 ? new T(null, null) : new T(mk(d - 1), mk(d - 1)); }"
+        "function chk(t) { return t.l === null ? 1 : 1 + chk(t.l) + chk(t.r); }"
+        "var s = 0; for (var i = 0; i < 200; i++) s += chk(mk(6));"
+        "out.push(s);"
+        "var odd = new T(null, null); Object.defineProperty(odd, 'l', { get: function () { return null; } });"
+        "out.push(chk(new T(new T(null, null), odd)));"
+        "function isU(o) { return o.v === undefined ? 'u' : o.v !== true ? 'n' : 't'; }"
+        "var marks = ''; var objs = [{ v: undefined }, { v: true }, { v: 3 }, { w: 1, v: true }];"
+        "for (var i = 0; i < 4000; i++) marks = isU(objs[i & 3]) + marks.slice(0, 7);"
+        "out.push(marks);"
+        "function N(a, b, c) { this.a = a; this.b = b; this.c = c; }"
+        "function mix(n) { var keep = null; for (var i = 0; i < n; i++) { var x = new N('s' + i, [i, i + 1], keep); if (i % 7 === 0) x.extra = { k: i }; keep = (i % 3) ? x : null; } return keep; }"
+        "var m = null; for (var r = 0; r < 200; r++) m = mix(500);"
+        "out.push(m.a, m.b[1], m.c === null ? 'null' : m.c.a);"
+        "function L(prev, v) { this.p = prev; this.v = v; }"
+        "function chain(n) { var t = null; for (var i = 0; i < n; i++) t = new L(t, i); return t; }"
+        "var sum = 0; for (var r = 0; r < 50; r++) { var c = chain(20000); while (c) { sum += c.v; c = c.p; } }"
+        "out.push(sum);"
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("25400,3,tntutntu,s499,500,null,9999500000"));
+    }
+}

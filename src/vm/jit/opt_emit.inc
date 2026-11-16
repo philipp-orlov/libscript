@@ -1076,6 +1076,10 @@ void Baseline::findPlainRegs()
         const Ins& in = code_->code[i];
         const Op op = in.opcode();
         const opt::Effects e = opt::effectsOf(*code_, i);
+        // An instruction this code skips writes nothing here (where its value is written, the code is leaving, or a
+        // direct call's long way lets it go after the call).
+        if (i < skipDef_.size() && skipDef_[i])
+            continue;
         const bool constant = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue || op == Op::LoadFalse ||
                               op == Op::LoadInt || op == Op::LoadHole || op == Op::LoadUninit ||
                               (op == Op::LoadK && !code_->consts[in.b].isCell());
@@ -1107,6 +1111,8 @@ void Baseline::findPlainRegs()
                 else
                     windowCleanup_[i].push_back(r);
             }
+            if (dc != directCalls_.end())
+                windowCleanup_[i].push_back(in.b);  // the long way reads the callee into it
         }
     }
 }

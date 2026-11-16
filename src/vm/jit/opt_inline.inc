@@ -938,11 +938,14 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.movImm(RAX, dc.fn.bits);
     a_.cmp(RAX, mem(RDX, 0));
     a_.jcc(CNE, slowPath);
-    // Its baseline code, room for its frame.
+    // Its baseline code (once made, it stays while the block lives), room for its frame (stack, initialised stack, a
+    // frame, native stack) and a tick.
     a_.movImm(RCX, reinterpret_cast<std::uint64_t>(C));
     a_.mov(RDX, mem(RCX, kCbTier1));
-    a_.test(RDX, RDX);
-    a_.jcc(CE, slowPath);
+    if (!C->tier1) {
+        a_.test(RDX, RDX);
+        a_.jcc(CE, slowPath);
+    }
     a_.lea(R9, R(base + 1));
     a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 64)));
     a_.alu(7, R10, mem(R12, kVmStackEnd));
@@ -951,19 +954,23 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.alu(7, R10, mem(R12, kVmStackInit));
     a_.jcc(CA, slowPath);
     a_.mov32(R10, mem(R12, kVmFrameCount));
-    a_.aluI32(0, R10, 2);
-    a_.alu32(7, R10, mem(R12, kVmFrameCapacity));
+    a_.lea(RDI, mem(R10, 2));
+    a_.alu32(7, RDI, mem(R12, kVmFrameCapacity));
     a_.jcc(CAE, slowPath);
-    a_.cmpI32(mem(R12, kVmTicks), 1);
-    a_.jcc(CBE, slowPath);
     a_.alu(7, RSP, mem(R12, kVmStackFloor));
     a_.jcc(CB, slowPath);
+    a_.cmpI32(mem(R12, kVmTicks), 1);
+    a_.jcc(CBE, slowPath);
+    a_.dec32(mem(R12, kVmTicks));
     // Caller registers the callee's frame covers past the arguments: plain values are overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     for (unsigned r = 1 + argc; r < window && r < C->nregs; ++r) {
-        a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
-        a_.test(RDI, R15);
-        a_.jcc(CE, slowPath);
+        const unsigned reg = base + 1 + r;
+        if (!(reg < plainRegs_.size() && plainRegs_[reg])) {
+            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
+            a_.test(RDI, R15);
+            a_.jcc(CE, slowPath);
+        }
         a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
     }
     if (!dc.thisSkipped && !(C->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) {
@@ -977,13 +984,12 @@ void Baseline::emitDirectCall(std::uint32_t i)
         a_.mov(R(base + 1), RDI);
         a_.bind(thisOk);
     }
-    a_.dec32(mem(R12, kVmTicks));
     a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
     a_.mov(mem(R13, kFramePc), RDI);
-    a_.mov32(R10, mem(R12, kVmFrameCount));
     a_.mov(R11, mem(R12, kVmFrameBase));
-    a_.imulI32(RDI, R10, std::int32_t(sizeof(Frame)));
-    a_.add(R11, RDI);
+    static_assert(sizeof(Frame) == 64, "a frame is found by a shift");
+    a_.shiftI(4, R10, 6);
+    a_.add(R11, R10);
     a_.inc32(mem(R12, kVmFrameCount));
     a_.mov(mem(R11, kFrameCode), RCX);
     a_.mov(mem(R11, kFrameFn), RAX);

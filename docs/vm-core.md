@@ -114,6 +114,22 @@ that instruction (an "exit"), and the next compile does not guess there. What it
   takes the first read's value from its home slot (`planReadReuse`).
 - Double arithmetic takes three operands with AVX (`vaddsd` and kin); a 32-bit load of the stack slot just stored from the
   same register is only a zero-extension.
+- Number reads: a double falls straight through (one subtraction of the offset tests that it is a number), an int32
+  converts out of line; the number test is left out where the slot is known to hold one. A double web that can only hold
+  the NaNs arithmetic makes from boxed numbers (`planTame`: not one read from a typed array or returned by a native) is
+  boxed without the NaN test, since neither the canonical NaN nor the processor's default one runs into the tags. An int32
+  counter is stepped in its own register, and stepped back out of line when it overflows.
+- An inner loop leaves out the checks an enclosing loop made before it (`guardsCovered`); a way in that did not come
+  through them (OSR, the return from an interrupt) goes through `preLoopFull_`, which makes them first. A number slot that a
+  hoisted read checks is not checked again, and two reads of one slot share one hoisted value.
+- Borrowed registers (`planBorrows`): in such a loop, a register set only to elements of arrays the loop does not change,
+  and read only as the object of a property, holds them without a count: the arrays keep them. It is let go of and set to
+  undefined before the loop (it is dead there), counted again after the loop's last jump, on every exit to the interpreter
+  (exits are kept apart by what they own), and before an interrupt throws; a loop inside one gets no OSR entry. This saves
+  two count updates per element, and the stall a decrement of the last element causes when the processor runs it ahead
+  of the increment of the same cell.
+- The object a property read or a number store leaves in rax serves the next access of the same register while only code
+  known to leave rax alone has been emitted (`raxObj_`).
 
 `SCRIPT_VM_CODEDUMP=dir` writes each function's code (`t2-N-name@address.bin`, for `objdump -b binary -mi386:x86-64`);
 `T2DBG`, `T2EXITS`, `T2INL`, `T2CHAIN`, `T2WIN`, `T2MATH`, `T2HOIST`, `T2CELLS`, `T2UNDEF` print what the compiler decided and
@@ -137,7 +153,7 @@ time (data entries only). Getters are not inline-cached in compiled code: they g
 
 - Counts, not a tracing collector. A cell of the new family has a 16-byte header with the count at offset 8; byte 7 has
   its high bit set, which is how `detail::destroyUnreferenced` and the public API tell the families apart. Every register of
-  a live frame owns its value.
+  a live frame owns its value, but for a borrowed register inside its loop (above), which the arrays it reads keep alive.
 - A cell is at most 8 KiB (larger storage is out of line), so `LocalHeap::ownerOf` finds the VM from any cell.
 - Cycles are found by a collector that runs when the context's heap budget is passed, and also when the cells alive pass
   a budget of their own (`VM::cellBudget_`: 131,072 to begin with, then a little more than what survived, or four times

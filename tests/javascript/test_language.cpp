@@ -4199,3 +4199,27 @@ TEST(treesComparedFreedAndBuiltInPlace)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("25400,3,tntutntu,s499,500,null,9999500000"));
     }
 }
+
+TEST(anInlinedNewTakesTheCountOfArgumentsThatDie)
+{
+    // An inlined `new` moves an argument's count into the object only when its register dies there: not for one passed
+    // twice, nor one still used after.
+    const char* program =
+        "function P(a, b) { this.a = a; this.b = b; }"
+        "function twice(n) { var r, s = 0; for (var i = 0; i < n; i++) { var x = { v: i }; r = new P(x, x); s += r.a.v + r.b.v; } return s; }"
+        "function after(n) { var s = 0; for (var i = 0; i < n; i++) { var x = { v: i }; var r = new P(x, null); x.v = -1; s += r.a.v; } return s; }"
+        "function chainP(n) { var t = null; for (var i = 0; i < n; i++) t = new P(t, i); var c = 0; while (t) { c += t.b; t = t.a; } return c; }"
+        "var out = 0; for (var k = 0; k < 50; k++) out += twice(200) + after(200) + chainP(300);"
+        "out;";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("4222500"));
+    }
+}

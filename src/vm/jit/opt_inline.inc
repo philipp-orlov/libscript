@@ -1117,7 +1117,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
     const unsigned base = in.b, argc = in.c;
     materializeReads(i);
     savePool(i);
-    Label slowPath, done;
+    Label& slowPath = coldLabels_.emplace_back();
+    Label& done = coldLabels_.emplace_back();
     throws_.emplace_back(i, Label{});
     Label& exc = throws_.back().second;
     // The global still holds the function (unless a self guard just saw that it does).
@@ -1206,16 +1207,23 @@ void Baseline::emitDirectCall(std::uint32_t i)
     restorePool(i);
     Label typedDone;
     const std::int32_t dw = plan_->defWeb[i];
-    if (dw >= 0 && in.a < plainRegs_.size() && plainRegs_[in.a]) {
+    const bool typedFast = dw >= 0 && in.a < plainRegs_.size() && plainRegs_[in.a];
+    if (typedFast) {
         // The result into its variable from rax (the write called nothing), as the frame has it.
         unboxRax(dw, exitAfter(i));
         dirty_[std::size_t(dw)] = 0;
         a_.jmp(typedDone);
-    } else {
-        a_.jmp(done);
     }
-    // The long way: the registers written as the instructions would have (the global read now), then the baseline call
-    // sequence.
+    // The long way, out of line: the registers written as the instructions would have (the global read now), then the
+    // baseline call sequence.
+    a_.bind(done);
+    if (plan_->defWeb[i] >= 0)
+        loadTypedAfter(i);
+    a_.bind(typedDone);
+    const Ins inCopy = in;
+    deferCold(i, [this, i, inCopy, base, &slowPath, &done]() {
+    const Ins& in = inCopy;
+    const DirectCall& dc = directCalls_.at(i);
     a_.bind(slowPath);
     restorePool(i);
     savePool(i);
@@ -1239,10 +1247,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
             release(RDX);
         }
     }
-    a_.bind(done);
-    if (plan_->defWeb[i] >= 0)
-        loadTypedAfter(i);
-    a_.bind(typedDone);
+    a_.jmp(done);
+    });
 }
 
 // ---- read chains ----
@@ -1640,7 +1646,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         return true;
     // The window's registers unwritten (`planWindows`): a failed guard runs them again in the interpreter.
     const bool windowed = windowVal_.count(i) != 0;
-    Label slowPath, done;
+    Label& slowPath = coldLabels_.emplace_back();
+    Label& done = coldLabels_.emplace_back();
     // The callee, its prototype and the chain the stores were learned on are as they were.
     holdValue(known);
     if (auto nc = newCallee_.find(i); nc != newCallee_.end()) {
@@ -1671,17 +1678,57 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     }
     allocObject(shape, aux, slowPath);
     a_.mov(inlineSlot(0), RAX);
+    std::set<int> movedFrom;
     for (std::size_t k = 0; k < stores.size(); ++k) {
         const IVal& v = stores[k].value;
-        inlineBoxed(v);
-        if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
-            retain(RAX);
+        int from = -1;
+        if (v.kind == IVal::Box && v.frameReg > int(code_->nparams) && v.slot > -2 && !movedFrom.count(v.frameReg) &&
+            regDeadAfter(i, unsigned(v.frameReg))) {
+            // The register dies here: the object takes its value with its count, and the register holds undefined.
+            bool twice = false;
+            for (std::size_t m = k + 1; m < stores.size(); ++m)
+                twice = twice || (stores[m].value.kind == IVal::Box && stores[m].value.frameReg == v.frameReg);
+            if (!twice)
+                from = v.frameReg;
+        }
+        if (from >= 0) {
+            a_.mov(RAX, R(unsigned(from)));
+            a_.mov(R(unsigned(from)), std::int32_t(kUndefined));
+            movedFrom.insert(from);
+        } else {
+            inlineBoxed(v);
+            if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
+                retain(RAX);
+        }
         a_.mov(RCX, inlineSlot(0));
         a_.mov(mem(RCX, kObjInline + std::int32_t(8 * stores[k].index)), RAX);
     }
+    // A clear of a register the object took the value of has nothing left to do.
+    for (int r : movedFrom) {
+        for (std::uint32_t j = i + length(i); j < n_ && !plan_->isLeader[j]; j += length(j)) {
+            const Ins& x = code_->code[j];
+            if (x.opcode() == Op::LoadUndef && x.a == unsigned(r)) {
+                movedOut_.insert(j);
+                break;
+            }
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            bool touches = !e.ok || opt::jumpTarget(*code_, j) >= 0;
+            for (std::uint16_t q : e.rd)
+                touches = touches || q == unsigned(r);
+            for (std::uint16_t q : e.wr)
+                touches = touches || q == unsigned(r);
+            if (touches)
+                break;
+        }
+    }
     a_.mov(RAX, inlineSlot(0));
     write(in.a, RAX);
-    a_.jmp(done);
+    a_.bind(done);
+    if (plan_->defWeb[i] >= 0)
+        loadTypedAfter(i);
+    const Ins inCopy = in;
+    deferCold(i, [this, i, inCopy, windowed, base, &slowPath, &done]() {
+    const Ins& in = inCopy;
     a_.bind(slowPath);
     if (windowed) {
         // The registers as the instructions would have written them (the global read now), then the call the long way.
@@ -1707,9 +1754,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     }
     materializeReads(i);
     call(i, in);
-    a_.bind(done);
-    if (plan_->defWeb[i] >= 0)
-        loadTypedAfter(i);
+    a_.jmp(done);  // where the typed result, if any, is loaded as on the way in place
+    });
     return true;
 }
 

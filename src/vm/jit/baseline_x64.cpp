@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <algorithm>
@@ -1081,6 +1082,23 @@ private:
     };
     std::vector<Borrow> borrows_;
     std::set<std::uint32_t> slowNext_;  ///< instructions a slow path comes back to
+    /// Code that seldom runs, emitted after the function's own (`emitTails`), so that the code that runs stays together.
+    /// Each block is made with the variables' state as it was where it is entered.
+    std::deque<std::function<void()>> cold_;
+    std::deque<Label> coldLabels_;
+    void deferCold(std::uint32_t i, std::function<void()> body)
+    {
+        sideDoor();  // counted where it is reached from, for the loops around it
+        std::vector<std::uint8_t> dirty = dirty_;
+        cold_.push_back([this, i, dirty, body = std::move(body)]() {
+            dirty_ = dirty;
+            factAt_ = i;
+            forgetFacts();
+            raxObj_ = -1;
+            raxHolds_ = carried_ = -1;
+            body();
+        });
+    }
     /// `x = o.p; y = null; if (x !== y)` with both registers dead after the jump: the jump reads the property itself and
     /// compares its bits (by jump: the read), and neither register is written (`quietDefs_`).
     std::map<std::uint32_t, std::uint32_t> testReads_;
@@ -1955,6 +1973,8 @@ private:
 
 void Baseline::emitTails()
 {
+    for (std::size_t k = 0; k < cold_.size(); ++k)
+        cold_[k]();
     // One stub per template that can give up: run the instruction in the interpreter, then go on after it.
     for (std::size_t k = 0; k < slows_.size(); ++k) {
         Slow& s = slows_[k];

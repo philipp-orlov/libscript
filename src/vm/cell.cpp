@@ -507,8 +507,31 @@ void VM::collectCycles(bool minor) noexcept
                 --h->gc;
         }
     }
+    // A plain object with its values all in its cell (no `Rare`): its values are its children, read in place.
+    auto plainValues = [&](CellPtr cell, std::uint32_t* count) -> const JSValue* {
+        if (kindOf(cell) != Kind::Object)
+            return nullptr;
+        CellHeader* h = headerOf(cell);
+        auto* o = reinterpret_cast<JSObject*>(cell);
+        if ((h->flags & cellflags::kHasRare) || o->cls() != ObjClass::Plain || o->slots)
+            return nullptr;
+        const std::uint32_t n = shapeById(h->shape)->count;
+        *count = n < h->aux ? n : h->aux;
+        return o->inl();
+    };
     detail::GcList kids;
     for (CellPtr cell : set) {
+        std::uint32_t n = 0;
+        if (const JSValue* values = plainValues(cell, &n)) {
+            for (std::uint32_t k = 0; k < n; ++k) {
+                if (!values[k].isCell() || !isVmCell(values[k].asCell()))
+                    continue;
+                CellHeader* kh = headerOf(values[k].asCell());
+                if ((kh->gc & kInSet) && (kh->gc & kCountMask))
+                    --kh->gc;
+            }
+            continue;
+        }
         kids.clear();
         children(cell, kids);
         for (detail::GCObject* kid : kids) {
@@ -540,11 +563,18 @@ void VM::collectCycles(bool minor) noexcept
     while (!work.empty()) {
         CellPtr cell = work.back();
         work.pop_back();
-        kids.clear();
-        children(cell, kids, true);
-        for (detail::GCObject* kid : kids)
-            if (kid && isVmCell(kid))
-                reach(kid);
+        std::uint32_t n = 0;
+        if (const JSValue* values = plainValues(cell, &n)) {
+            for (std::uint32_t k = 0; k < n; ++k)
+                if (values[k].isCell() && isVmCell(values[k].asCell()))
+                    reach(values[k].asCell());
+        } else {
+            kids.clear();
+            children(cell, kids, true);
+            for (detail::GCObject* kid : kids)
+                if (kid && isVmCell(kid))
+                    reach(kid);
+        }
         if (kindOf(cell) == Kind::Object) {
             auto* o = reinterpret_cast<JSObject*>(cell);
             if (JSObject* p = o->proto(*this))

@@ -4442,3 +4442,29 @@ TEST(aDoubleReadFromAFieldTellsAnInt32AndWhatIsNoNumber)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1525.5 150.5 10737418263 NaN NaN NaN"));
     }
 }
+
+TEST(aCounterBelowAnInt32StepsWithoutAnOverflowCheck)
+{
+    // A loop counter just found below an int32 steps by one with no overflow test; below or at the largest int32, below a
+    // double past it, or stepped in the body too, it still turns into a double.
+    const char* program =
+        "function f(n){var c=0;for(var j=2147483640;j<n;j++)c++;return c;}"
+        "function g(n){var c=0;for(var j=2147483640;j<=n;j++){c++;if(c>20)break;}return c+':'+j;}"
+        "function h(n){var c=0;for(var j=2147483640;j<n;j++){c++;if(c>20)break;}return c+':'+j;}"
+        "function w(n){var c=0;for(var j=2147483630;j<n;j++){c++;j+=3;if(c>20)break;}return c+':'+j;}"
+        "function z(n){var c=0,j=0;while(j<n){j++;c+=j&1;}return c+':'+j;}"
+        "var r=[]; for (var m=0;m<3000;m++){ r[0]=f(2147483647); r[1]=g(2147483647); r[2]=h(2147483648.5); r[3]=w(2147483647); r[4]=z(100); }"
+        "r.push(f(10), g(10), h(-5), w(2147483647.5), z(2147483647 > 1 ? 7 : 0));"
+        "r.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("7 8:2147483648 9:2147483649 5:2147483650 50:100 0 0:2147483640 0:2147483640 5:2147483650 4:7"));
+    }
+}

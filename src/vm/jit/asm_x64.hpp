@@ -353,6 +353,12 @@ public:
         opMem(false, 0xF7, 0, m);
         d32(imm);
     }
+    void cmpI16(const Mem& m, std::uint16_t imm)
+    {
+        opMem(false, 0x81, 7, m, -1, 0x66);
+        b(std::uint8_t(imm));
+        b(std::uint8_t(imm >> 8));
+    }
     void cmpI8(const Mem& m, std::uint8_t imm)
     {
         opMem(false, 0x80, 7, m);

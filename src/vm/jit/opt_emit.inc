@@ -536,6 +536,12 @@ bool Baseline::emitTyped(std::uint32_t i)
                 const std::int32_t step = op == Op::Inc ? 1 : op == Op::Dec ? -1 : op == Op::AddI ? k : -k;
                 const Reg r = gpr(dw);
                 a_.aluI32(0, r, step);
+                if (step == 1 && i < noOverflow_.size() && noOverflow_[i]) {
+                    // Below an int32 just before: one more is one still.
+                    dirty_[std::size_t(dw)] = 1;
+                    raxHolds_ = -1;
+                    return true;
+                }
                 coldUndos_.emplace_back();
                 ColdUndo& u = coldUndos_.back();
                 u.r = r;
@@ -1161,6 +1167,83 @@ void Baseline::typedJump(std::uint32_t i, const Ins& in)
     else
         a_.ucomisd(xa, xb);
     goIf(rel.dc, i, target);
+}
+
+void Baseline::planBoundedSteps()
+{
+    noOverflow_.assign(n_ + 1, 0);
+    if (!code_->handlers.empty())
+        return;
+    const std::size_t words = (code_->nregs + 63) / 64;
+    const std::vector<std::uint64_t> top(words, ~std::uint64_t(0));
+    std::vector<std::vector<std::uint64_t>> in(n_ + 1, top);
+    std::vector<std::uint8_t> reached(n_ + 1, 0);
+    in[0].assign(words, 0);
+    reached[0] = 1;
+    auto i32 = [&](std::uint32_t j, std::size_t k) {
+        const auto& uw = plan_->useWebs[j];
+        return k < uw.size() && uw[k] >= 0 && isI32(uw[k]);
+    };
+    // For a compare of int32s, the register found strictly below an int32 (or at most a 16-bit constant) on the way it jumps
+    // (taken) and on the way it falls through: -1 for none.
+    auto bounds = [&](std::uint32_t j, bool taken) -> int {
+        const Ins& x = code_->code[j];
+        const Op op = x.opcode();
+        const bool both = i32(j, 0) && i32(j, 1);
+        switch (op) {
+        case Op::JLt: case Op::JNotGe: return both && taken ? int(x.a) : -1;
+        case Op::JGe: case Op::JNotLt: return both && !taken ? int(x.a) : -1;
+        case Op::JGt: case Op::JNotLe: return both && taken ? int(x.b) : -1;
+        case Op::JLe: case Op::JNotGt: return both && !taken ? int(x.b) : -1;
+        case Op::JLtI: case Op::JLeI: case Op::JNotGeI: case Op::JNotGtI: return i32(j, 0) && taken ? int(x.a) : -1;
+        case Op::JGeI: case Op::JGtI: case Op::JNotLtI: case Op::JNotLeI: return i32(j, 0) && !taken ? int(x.a) : -1;
+        default: return -1;
+        }
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::uint32_t j = 0; j < n_; j += length(j)) {
+            if (!reached[j])
+                continue;
+            std::vector<std::uint64_t> out = in[j];
+            const opt::Effects e = opt::effectsOf(*code_, j);
+            if (!e.ok)
+                out.assign(words, 0);
+            for (std::uint16_t r : e.wr)
+                if (r < code_->nregs)
+                    out[r / 64] &= ~(std::uint64_t(1) << (r % 64));
+            auto flow = [&](std::uint32_t to, int bound) {
+                if (to > n_)
+                    return;
+                std::vector<std::uint64_t> st = out;
+                if (bound >= 0 && unsigned(bound) < code_->nregs)
+                    st[unsigned(bound) / 64] |= std::uint64_t(1) << (unsigned(bound) % 64);
+                if (!reached[to]) {
+                    reached[to] = 1;
+                    in[to] = st;
+                    changed = true;
+                    return;
+                }
+                for (std::size_t w = 0; w < words; ++w)
+                    if (in[to][w] & ~st[w]) {
+                        in[to][w] &= st[w];
+                        changed = true;
+                    }
+            };
+            const Op op = code_->code[j].opcode();
+            const std::int64_t t = opt::jumpTarget(*code_, j);
+            if (t >= 0)
+                flow(std::uint32_t(t), bounds(j, true));
+            if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+                flow(j + length(j), t >= 0 ? bounds(j, false) : -1);
+        }
+    }
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        const Ins& x = code_->code[j];
+        const bool one = x.opcode() == Op::Inc || (x.opcode() == Op::AddI && std::int16_t(x.c) == 1);
+        if (one && reached[j] && x.b < code_->nregs && (in[j][x.b / 64] >> (x.b % 64) & 1))
+            noOverflow_[j] = 1;
+    }
 }
 
 void Baseline::planSinglePreds()
@@ -2013,6 +2096,7 @@ Tier2Code* Baseline::compileOptimized()
     planBorrows();
     planFnBorrows();
     planSinglePreds();
+    planBoundedSteps();
     planDirty();
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("T2CODE"))

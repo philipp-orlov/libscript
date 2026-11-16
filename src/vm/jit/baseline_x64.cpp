@@ -991,6 +991,9 @@ private:
     std::map<std::uint32_t, FactSnap> factSnaps_;
     std::vector<std::int64_t> singlePred_;  ///< per leader: the one forward jump that reaches it, or -1
     void planSinglePreds();
+    /// Steps of an int32 by one that cannot overflow: on every way to them the variable was just found below an int32.
+    std::vector<std::uint8_t> noOverflow_;
+    void planBoundedSteps();
     struct LoopArr
     {
         std::uint32_t from, to;
@@ -1298,6 +1301,20 @@ private:
     /// As `provenSlot`, for a read: the slot as a memory operand (on rax or rdx) instead of its address.
     Mem provenSlotMem(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
+        static_assert(kHdrKind == kHdrAux + 1, "the inline slot count and the kind are one 16-bit word");
+        if (aux != 0 && factShape_[reg] != shape) {
+            // Not known yet: a cell, of the shape, and the kind and the inline slot count in one compare.
+            if (!raxHoldsObj(reg))
+                a_.mov(RAX, R(reg));
+            a_.test(RAX, R15);
+            a_.jcc(CNE, bad);
+            a_.cmpI32(mem(RAX, 0), std::int32_t(shape));
+            a_.jcc(CNE, bad);
+            a_.cmpI16(mem(RAX, kHdrAux), std::uint16_t((std::uint16_t(kObjectKind) << 8) | std::uint8_t(aux - 1)));
+            a_.jcc(CNE, bad);
+            factShape_[reg] = shape;
+            factAux_[reg] = std::int32_t(aux) - 1;
+        }
         provenShape(reg, shape, bad);
         if (aux == 0) {
             slotAddress(index);

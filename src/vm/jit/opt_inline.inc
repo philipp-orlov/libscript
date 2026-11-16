@@ -992,11 +992,110 @@ void Baseline::planDirectCalls()
     }
 }
 
+/// A `new` made in place after another of the same constructor, with nothing between that could change the global, the
+/// constructor or its prototype chain -- in a function that can change none of them (typed arithmetic, reads, jumps,
+/// calls of itself and such `new`s) -- need not check them again.
+void Baseline::planNewChecked()
+{
+    if (newInline_.empty() || !code_->handlers.empty() || !plan_->loopHeaders.empty())
+        return;
+    JSValue known = JSValue::undefined();
+    for (std::uint32_t j : newInline_) {
+        JSValue k = constantBefore(j, code_->code[j].b);
+        if (!isFunction(k))
+            k = guessBefore(j, code_->code[j].b);
+        if (known.isUndefined())
+            known = k;
+        else if (k != known)
+            return;
+    }
+    auto typedUses = [&](std::uint32_t j) {
+        for (std::int32_t w : plan_->useWebs[j])
+            if (w < 0)
+                return false;
+        return true;
+    };
+    for (std::uint32_t j = 0; j < n_; j += length(j)) {
+        const Ins& in = code_->code[j];
+        const Op op = in.opcode();
+        bool ok = false;
+        switch (op) {
+        case Op::Nop: case Op::Jmp: case Op::LoadUndef: case Op::LoadNull: case Op::LoadInt: case Op::LoadK:
+        case Op::LoadTrue: case Op::LoadFalse: case Op::Mov: case Op::Ret:
+            ok = true;
+            break;
+        case Op::GetProp:
+            ok = plan_->useWebs[j].size() >= 1 && plan_->useWebs[j][0] < 0 && plainReadable(j);
+            break;
+        case Op::GetGlobal: {
+            std::uint8_t attrs = 0;
+            ok = vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs) && !(attrs & attr::kAccessor);
+            break;
+        }
+        case Op::New:
+            ok = newInline_.count(j) != 0;
+            break;
+        case Op::JNotCallee:
+            ok = selfGuards_.count(j) != 0;
+            break;
+        case Op::Call: {
+            ok = fallbackOf(j);
+            if (auto dc = directCalls_.find(j); dc != directCalls_.end() && !selfGuards_.empty())
+                ok = ok || dc->second.fn == selfGuards_.begin()->second.fn;
+            break;
+        }
+        default:
+            ok = (opt::isConditionalJump(op) && (typedUses(j) || bitTestAt(j))) ||
+                 ((op == Op::Add || op == Op::Sub || op == Op::AddI || op == Op::SubI || op == Op::Inc || op == Op::Dec ||
+                   op == Op::Mul || op == Op::MulI) && plan_->defWeb[j] >= 0 && typedUses(j));
+            break;
+        }
+        if (!ok && (j < skipDef_.size() && skipDef_[j]))
+            ok = true;
+        if (!ok)
+            return;
+    }
+    // Forward, meeting by "and": 2 unreached, 1 checked, 0 not.
+    std::vector<std::uint8_t> in(n_ + 1, 2);
+    std::vector<std::uint32_t> work{0};
+    in[0] = 0;
+    auto flow = [&](std::uint32_t to, std::uint8_t v) {
+        if (to >= n_)
+            return;
+        const std::uint8_t nv = in[to] == 2 ? v : std::uint8_t(in[to] & v);
+        if (nv != in[to]) {
+            in[to] = nv;
+            work.push_back(to);
+        }
+    };
+    while (!work.empty()) {
+        const std::uint32_t j = work.back();
+        work.pop_back();
+        const Op op = code_->code[j].opcode();
+        if (op == Op::Call && fallbackOf(j))
+            continue;
+        const std::uint8_t out = op == Op::New ? 1 : in[j];
+        const std::int64_t t = opt::jumpTarget(*code_, j);
+        if (t >= 0 && !(op == Op::JNotCallee && selfGuards_.count(j)))
+            flow(std::uint32_t(t), out);
+        if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+            flow(j + length(j), out);
+    }
+    for (std::uint32_t j = 0; j < n_; ++j)
+        newChecked_[j] = code_->code[j].opcode() == Op::New && in[j] == 1;
+}
+
 void Baseline::planSelfChecked()
 {
     selfChecked_.assign(n_ + 1, 0);
+    newChecked_.assign(n_ + 1, 0);
+    newInline_.clear();
     selfFn_ = JSValue::undefined();
     fnAtEntry_ = false;
+    for (std::uint32_t j = 0; j < n_; j += length(j))
+        if (code_->code[j].opcode() == Op::New && inlineNew(j, true))
+            newInline_.insert(j);
+    planNewChecked();
     if (selfGuards_.empty())
         return;
     selfFn_ = selfGuards_.begin()->second.fn;
@@ -1023,11 +1122,13 @@ void Baseline::planSelfChecked()
             return true;
         case Op::GetProp:
             return plan_->useWebs[j].size() >= 1 && plan_->useWebs[j][0] < 0 && plainReadable(j);
+        case Op::New:
+            return newInline_.count(j) != 0;  // made in place, or the long way to the constructor it checked
         default:
             break;
         }
         if (opt::isConditionalJump(op))
-            return typedUses(j);
+            return typedUses(j) || bitTestAt(j);
         switch (op) {
         case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl:
         case Op::Shr: case Op::AddI: case Op::SubI: case Op::MulI: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
@@ -1574,7 +1675,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     const Ins& in = code_->code[i];
     const unsigned base = in.b, argc = in.c;
     const auto& uw = plan_->useWebs[i];
-    if (inlineBase_ < 0 || uw.size() < 2u + argc || uw[0] >= 0)
+    if (inlineBase_ < 0 || uw.size() < 2u + argc || uw[0] >= 0 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
         return false;
     // The callee is compared with what is known of it below: what the global read before held is guess enough.
     JSValue known = constantBefore(i, base);
@@ -1671,38 +1772,63 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     const bool windowed = windowVal_.count(i) != 0;
     Label& slowPath = coldLabels_.emplace_back();
     Label& done = coldLabels_.emplace_back();
-    // The callee, its prototype and the chain the stores were learned on are as they were.
+    // The callee, its prototype and the chain the stores were learned on are as they were; otherwise the code leaves (so
+    // that what comes after has them as they were). An earlier `new` of it with nothing between that could change them
+    // checked the same (`newChecked_`).
     holdValue(known);
-    if (auto nc = newCallee_.find(i); nc != newCallee_.end()) {
-        emitReadInto(nc->second, false, slowPath);
-        a_.movImm(RCX, known.bits);
-        a_.cmp(RCX, RAX);
-        a_.jcc(CNE, slowPath);
-    } else {
-        a_.movImm(RCX, known.bits);
-        a_.cmp(RCX, R(base));
-        a_.jcc(CNE, slowPath);
-        a_.mov(RAX, R(base));
-    }
-    a_.cmpI32(mem(RAX, 0), std::int32_t(f->h.shape));
-    a_.jcc(CNE, slowPath);
-    a_.mov(RDX, mem(RAX, kObjSlots));
     holdValue(pv);
-    a_.movImm(RCX, pv.bits);
-    a_.cmp(RCX, mem(RDX, 16));
-    a_.jcc(CNE, slowPath);
-    std::sort(cells.begin(), cells.end());
-    cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
-    for (ValidityCell* c : cells) {
-        hold(c);
-        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(c));
-        a_.cmpI32(mem(RCX, kValidityValid), 0);
-        a_.jcc(CE, slowPath);
+    if (!(i < newChecked_.size() && newChecked_[i])) {
+        Label& bad = exitBefore(i);
+        if (auto nc = newCallee_.find(i); nc != newCallee_.end()) {
+            emitReadInto(nc->second, false, bad);
+            a_.movImm(RCX, known.bits);
+            a_.cmp(RCX, RAX);
+            a_.jcc(CNE, bad);
+        } else {
+            a_.movImm(RCX, known.bits);
+            a_.cmp(RCX, R(base));
+            a_.jcc(CNE, bad);
+            a_.mov(RAX, R(base));
+        }
+        a_.cmpI32(mem(RAX, 0), std::int32_t(f->h.shape));
+        a_.jcc(CNE, bad);
+        a_.mov(RDX, mem(RAX, kObjSlots));
+        a_.movImm(RCX, pv.bits);
+        a_.cmp(RCX, mem(RDX, 16));
+        a_.jcc(CNE, bad);
+        std::sort(cells.begin(), cells.end());
+        cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+        for (ValidityCell* c : cells) {
+            hold(c);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(c));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+        }
+    } else {
+        for (ValidityCell* c : cells)
+            hold(c);
     }
+    // No room without a collection: the call the long way (to the constructor just checked).
     allocObject(shape, aux, slowPath);
-    a_.mov(inlineSlot(0), RAX);
+    // Constants that are no cell go straight into the object; the rest through rax, the object kept on the stack.
+    std::vector<std::uint8_t> inPlace(stores.size(), 0);
+    bool rest = false;
+    for (std::size_t k = 0; k < stores.size(); ++k) {
+        const IVal& v = stores[k].value;
+        const std::int64_t bits = std::int64_t(v.c.bits);
+        if (v.kind == IVal::Const && !v.c.isCell() && bits >= INT32_MIN && bits <= INT32_MAX) {
+            a_.mov(mem(RAX, kObjInline + std::int32_t(8 * stores[k].index)), std::int32_t(bits));
+            inPlace[k] = 1;
+        } else {
+            rest = true;
+        }
+    }
+    if (rest)
+        a_.mov(inlineSlot(0), RAX);
     std::set<int> movedFrom;
     for (std::size_t k = 0; k < stores.size(); ++k) {
+        if (inPlace[k])
+            continue;
         const IVal& v = stores[k].value;
         int from = -1;
         if (v.kind == IVal::Box && v.frameReg > int(code_->nparams) && v.slot > -2 && !movedFrom.count(v.frameReg) &&
@@ -1744,8 +1870,12 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                 break;
         }
     }
-    a_.mov(RAX, inlineSlot(0));
-    write(in.a, RAX);
+    if (rest)
+        a_.mov(RAX, inlineSlot(0));
+    if (plainAt(i, in.a))
+        a_.mov(R(in.a), RAX);  // over no cell
+    else
+        write(in.a, RAX);
     a_.bind(done);
     if (plan_->defWeb[i] >= 0)
         loadTypedAfter(i);

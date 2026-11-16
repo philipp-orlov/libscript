@@ -4292,3 +4292,34 @@ TEST(recursionThatChangesNoGlobalChecksItOnce)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("200,6765,2584,2584,987,1,35433480180"));
     }
 }
+
+TEST(newInPlaceChecksItsConstructorOncePerPath)
+{
+    // A `new` made in place after another of the same constructor in a function that can change neither does not check it
+    // again: a new prototype, a setter on it, a replaced constructor between calls are still seen.
+    const char* program =
+        "var out = [];"
+        "function T(l, r) { this.l = l; this.r = r; }"
+        "function mk(d) { return d === 0 ? new T(null, null) : new T(mk(d - 1), mk(d - 1)); }"
+        "function count(t) { return t === null ? 0 : 1 + count(t.l) + count(t.r); }"
+        "var s = 0; for (var i = 0; i < 300; i++) s += count(mk(5));"
+        "out.push(s);"
+        "T.prototype.kind = 'tree'; out.push(mk(3).l.r.kind, count(mk(6)));"
+        "T.prototype = { other: 1 }; var m = mk(4); out.push(m.other, m.l.other, Object.getPrototypeOf(m.r) === T.prototype);"
+        "var seen = 0; Object.defineProperty(T.prototype, 'r', { set: function (v) { seen++; }, configurable: true });"
+        "var m2 = mk(3); out.push(seen, m2.hasOwnProperty('r'), m2.hasOwnProperty('l'));"
+        "var Old = T; T = function (l, r) { this.z = 1; this.l = l; this.r = r; }; var m3 = mk(3); out.push(m3.z, m3.l.z, count(m3));"
+        "T = Old; delete T.prototype.r; out.push(count(mk(7)));"
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("18900,tree,127,1,1,true,15,false,true,1,1,15,255"));
+    }
+}

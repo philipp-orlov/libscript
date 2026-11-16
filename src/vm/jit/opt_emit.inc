@@ -1277,8 +1277,9 @@ void Baseline::emitOpt(std::uint32_t i)
     materializeReads(i);
     // A jump that may run the interpreter (a test of an object, a tick) leaves the frame as the interpreter wants it. A
     // forward `Jmp` runs nothing, and where it goes every variable's frame copy counts as stale.
+    // A strict test against null, undefined or a boolean loaded just before compares bits and runs nothing either.
     if (const std::int64_t t = opt::jumpTarget(*code_, i);
-        t >= 0 && !(code_->code[i].opcode() == Op::Jmp && t > std::int64_t(i)))
+        t >= 0 && !(code_->code[i].opcode() == Op::Jmp && t > std::int64_t(i)) && !(t > std::int64_t(i) && bitTestAt(i)))
         materializeLive(i);
     emit(i);
     if (plan_->defWeb[i] >= 0 && !delivered_)

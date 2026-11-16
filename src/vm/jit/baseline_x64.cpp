@@ -1359,6 +1359,20 @@ private:
     std::vector<std::uint8_t> selfChecked_;
     JSValue selfFn_ = JSValue::undefined();
     bool fnAtEntry_ = false;  ///< the frame's function is checked at the entry, not by each self guard
+    std::set<std::uint32_t> newInline_;     ///< `new` sites made in place
+    std::vector<std::uint8_t> newChecked_;  ///< per instruction: a `new` whose constructor an earlier one checked
+    void planNewChecked();
+    /// A strict test against null, undefined or a boolean loaded just before: it compares bits and runs nothing.
+    bool bitTestAt(std::uint32_t i) const
+    {
+        const Ins& in = code_->code[i];
+        if ((in.opcode() != Op::JStrictEq && in.opcode() != Op::JStrictNe) || i == 0 || plan_->isLeader[i])
+            return false;
+        const Ins& p = code_->code[i - 1];
+        const Op pop = p.opcode();
+        return (pop == Op::LoadNull || pop == Op::LoadUndef || pop == Op::LoadTrue || pop == Op::LoadFalse) &&
+               ((p.a == in.a) != (p.a == in.b));
+    }
     void planSelfChecked();
     /// Number reads of a property that an earlier read in the block made of the same object, with nothing between that
     /// may change it: the later read takes the earlier one's value from its home slot (`reuseRead_`: later -> earlier;

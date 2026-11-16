@@ -204,6 +204,14 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
     try {
         Frame* fr = vm->frameBase + vm->frameCount - 1;
         CodeBlock* code = fr->code;
+        if (kind == 2) {
+            // Sites this code knew nothing of have run long enough: a new compile will know them (not a failure: no try
+            // is used up).
+            retireTier2(*vm, code);
+            if (code->tier2Tries)
+                --code->tier2Tries;
+            return stepInstruction(*vm, index);
+        }
         if (index < code->prof.size())
             code->prof[index] |= opt::kProfFailed;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -282,6 +290,9 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
 #endif
             code->tier1->entry = t->entry;
             code->optExits = 0;
+            // The first optimized code of a function may have been made before parts of it had run; later ones stay.
+            code->tier2Budget = code->tier2Matured ? 0x7fffffff : 20000;
+            code->tier2Matured = true;
             SCRIPT_VM_CENSUS(Tier2Compiled);
         }
         code->tier2Counter = 0x40000000;
@@ -467,6 +478,7 @@ static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "a frame
 constexpr std::int32_t kVmTicks = std::int32_t(offsetof(VM, ticks));
 constexpr std::int32_t kVmFrameCount = std::int32_t(offsetof(VM, frameCount));
 constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, elems));
+constexpr std::int32_t kArrayCapacity = std::int32_t(offsetof(JSArray, capacity));
 constexpr std::int32_t kArrayLength = std::int32_t(offsetof(JSArray, length));
 #pragma GCC diagnostic pop
 constexpr std::int32_t kTypedData = std::int32_t(offsetof(JSTypedArray, data));
@@ -938,6 +950,16 @@ private:
     Label& exitLabel(std::uint32_t i, int kind);
     Label& exitBefore(std::uint32_t i) { return exitLabel(i, 0); }
     Label& exitAfter(std::uint32_t i) { return exitLabel(i, 1); }
+    /// A site that knew nothing when this code was made: after a while the code makes way for one made with what the
+    /// baseline code has learned since (exit kind 2: the instruction runs in the interpreter, nothing is marked failed).
+    void immature(std::uint32_t i)
+    {
+        if (!optimizing())
+            return;
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&code_->tier2Budget));
+        a_.dec32(mem(RAX, 0));
+        a_.jcc(CE, exitLabel(i, 2));
+    }
     void deliver(std::uint32_t i, unsigned dst);
     void deliverInt(std::uint32_t i, unsigned dst);
     void deliverDouble(std::uint32_t i, unsigned dst);
@@ -1943,13 +1965,21 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     }
     const bool stringPath = isLength || protoSlot;
     if (count == 0 && !stringPath) {
+        immature(i);
         helperOp(i, &helperThunk<jitGetProp>);
         return;
     }
     Label& bad = slow(i, &helperThunk<jitGetProp>);
     Label done, lengthPath, stringRecv;
     a_.mov(RAX, R(in.b));
-    if (count == 0) {
+    if (count == 0 && isLength) {
+        // No shape seen: an array's length, or a string's.
+        a_.test(RAX, R15);
+        a_.jcc(CNE, bad);
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CE, lengthPath);
+        a_.jmp(stringRecv);
+    } else if (count == 0) {
         a_.jmp(stringRecv);
     } else {
         a_.test(RAX, R15);
@@ -2387,6 +2417,8 @@ void Baseline::putGlobal(std::uint32_t i, const Ins& in)
 
 void Baseline::call(std::uint32_t i, const Ins& in)
 {
+    if (optimizing() && (i >= code_->callProf.size() || !code_->callProf[i]) && !isFunction(constantBefore(i, in.b)))
+        immature(i);
     Label& bad = slow(i, nullptr, true);
     throws_.emplace_back(i, Label{});
     Label& exc = throws_.back().second;
@@ -2596,6 +2628,58 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jmp(enter);
     }
     a_.bind(helper);
+    if (in.opcode() == Op::Call && argc <= 1) {
+        // `a.push(v)` with room for it, `a.pop()` of an element that is there: done here on a plain array.
+        Label generic;
+        a_.mov(RAX, R(base));
+        needObject(RAX, generic);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, generic);
+        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+        a_.jcc(CE, generic);
+        a_.mov(RCX, mem(RAX, kObjSlots));
+        a_.mov(RCX, mem(RCX, -16));
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(argc == 1 ? arrayPushNative() : arrayPopNative()));
+        a_.cmp(RDX, mem(RCX, kRareNative));
+        a_.jcc(CNE, generic);
+        a_.mov(RSI, R(base + 1));
+        needObject(RSI, generic);
+        a_.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, generic);
+        a_.testI8(mem(RSI, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
+        a_.jcc(CNE, generic);
+        a_.mov32(RCX, mem(RSI, kArrayLength));
+        a_.mov(RDX, mem(RSI, kArrayElems));
+        if (argc == 1) {
+            a_.alu32(7, RCX, mem(RSI, kArrayCapacity));
+            a_.jcc(CAE, generic);
+            a_.aluI32(7, RCX, 0x7ffffffe);
+            a_.jcc(CA, generic);
+            Label number;
+            a_.mov(RAX, R(base + 2));
+            retain(RAX);
+            a_.test(RAX, R14);
+            a_.jcc(CNE, number);
+            a_.andI8(mem(RSI, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+            a_.bind(number);
+            a_.mov(mem(RDX, RCX, 8), RAX);
+            a_.aluI32(0, RCX, 1);
+            a_.mov32(mem(RSI, kArrayLength), RCX);
+            a_.mov32(RAX, RCX);
+            a_.or_(RAX, R14);
+        } else {
+            a_.test32(RCX, RCX);
+            a_.jcc(CE, generic);
+            a_.aluI32(5, RCX, 1);
+            a_.mov(RAX, mem(RDX, RCX, 8));
+            a_.cmpI(RAX, std::int32_t(kHole));
+            a_.jcc(CE, generic);
+            a_.mov32(mem(RSI, kArrayLength), RCX);
+        }
+        write(in.a, RAX);
+        a_.jmp(afterCall);
+        a_.bind(generic);
+    }
     if (in.opcode() == Op::Call && argc == 1) {
         // `s.charCodeAt(i)`: the character read here.
         Label generic;

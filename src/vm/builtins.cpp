@@ -3598,6 +3598,16 @@ FastNative stringCharNative() noexcept
     return stringCharAt;
 }
 
+FastNative arrayPushNative() noexcept
+{
+    return arrayPush;
+}
+
+FastNative arrayPopNative() noexcept
+{
+    return arrayPop;
+}
+
 }  // namespace vm
 }  // namespace internal
 }  // namespace script

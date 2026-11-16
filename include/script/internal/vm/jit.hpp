@@ -44,6 +44,9 @@ struct Tier1Code
 FastNative mathUnaryNative() noexcept;
 /// `String.prototype.charAt`, and with data 1 `charCodeAt`: compiled code reads a character itself.
 FastNative stringCharNative() noexcept;
+/// `Array.prototype.push` and `pop`: compiled code does the usual case itself.
+FastNative arrayPushNative() noexcept;
+FastNative arrayPopNative() noexcept;
 /// Whether a `Math` native's data is `Math.sqrt`'s, which compiled code does with one instruction.
 bool mathUnaryIsSqrt(const void* data) noexcept;
 

@@ -173,7 +173,7 @@ Label& Baseline::exitLabel(std::uint32_t i, int kind)
         i = std::uint32_t(exitRedirect_[i]);
         kind = 0;
     }
-    const std::uint64_t key = (std::uint64_t(i) << 1) | std::uint64_t(kind);
+    const std::uint64_t key = (std::uint64_t(i) << 2) | std::uint64_t(kind);
     auto it = exitIndex_.find(key);
     if (it != exitIndex_.end())
         return *it->second;
@@ -1006,7 +1006,7 @@ void Baseline::emitExits()
         a_.aluI(0, RSP, spill_);
         a_.mov(RDI, R12);
         a_.movImm(RSI, e.index);
-        a_.movImm(RDX, after ? 1 : 0);
+        a_.movImm(RDX, std::uint64_t(e.kind));
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptExit));
         a_.callReg(RAX);
         Label notFall;

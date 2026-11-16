@@ -204,6 +204,9 @@ struct CodeBlock
     std::int32_t tier2Counter = 0;  ///< entries and back edges of the baseline code left before the optimizing compiler is asked
     std::uint32_t optExits = 0;     ///< guards of the optimizing code that failed
     std::uint8_t tier2Tries = 0;
+    /// Runs left of optimized-code sites that had learned nothing when it was made, before it makes way for a new compile.
+    std::int32_t tier2Budget = 0;
+    bool tier2Matured = false;  ///< its first optimized code has been made (later ones do not make way for that reason)
     /// Baseline machine code for this function, once it has run hot enough (jit.hpp); owned.
     struct Tier1Code* tier1 = nullptr;
     std::uint32_t hotness = 0;

@@ -3151,6 +3151,38 @@ TEST(inlinedCallsReadTheirArgumentsWhereTheyAre)
     }
 }
 
+TEST(pushAndPopFromCompiledCode)
+{
+    // `push` and `pop` on a plain array are done by compiled code; frozen and non-extensible arrays, holes, array-likes,
+    // a replaced `push` and arrays of objects behave as in the interpreter.
+    const char* program =
+        "var out=[];"
+        "function k(n){ var a=[]; for (var i=0;i<n;i++) a.push(i%3?i:\"s\"+i); var s=0; while (a.length){ var v=a.pop(); s+= typeof v===\"number\"? v : v.length; } return s; }"
+        "out.push(k(5000));"
+        "var fr=Object.freeze([1,2]); try { fr.push(3); } catch(e){ out.push(e.constructor.name); } try { fr.pop(); } catch(e){ out.push(e.constructor.name); }"
+        "var ne=[1,2]; Object.preventExtensions(ne); try { ne.push(3); } catch(e){ out.push(e.constructor.name); } out.push(ne.pop(), ne.length);"
+        "var h=[1,,3]; out.push(h.pop(), h.pop(), h.pop(), h.length);"
+        "Array.prototype[1]=\"P\"; var h2=[1,,3]; h2.pop(); out.push(h2.pop()); delete Array.prototype[1];"
+        "var al={length:2,0:\"a\",1:\"b\"}; out.push(Array.prototype.pop.call(al), al.length);"
+        "var nums=[]; for (var i=0;i<3000;i++) nums.push(i*0.5); out.push(nums.length, nums[2999]);"
+        "function p2(a,v){ return a.push(v); } var arr=[]; for (var i=0;i<3000;i++) p2(arr,i); out.push(p2(arr,\"x\"), arr.length);"
+        "var saved=Array.prototype.push; Array.prototype.push=function(){ return -1; }; out.push(p2([],1)); Array.prototype.push=saved;"
+        "var t=[]; for (var i=0;i<100;i++) t.push({i:i}); var c=0; while (t.length) c+=t.pop().i; out.push(c);"
+        "out.join(\" \")";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("8339630 TypeError TypeError TypeError 2 1 3  1 0  b 1 3000 1499.5 3001 3001 4950"));
+    }
+}
+
 TEST(storesIntoHolesAndTypedArraysFromCompiledCode)
 {
     // A store into a hole of a plain array skips the prototype chain only while no prototype has an index property; typed

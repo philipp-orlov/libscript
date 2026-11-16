@@ -1398,6 +1398,7 @@ Tier2Code* Baseline::compileOptimized()
     planMathCalls();
     findPlainRegs();
     findCells();
+    planSelfChecked();
     movedOut_.clear();
     planChains();
     factShape_.assign(code_->nregs + 1, 0u);

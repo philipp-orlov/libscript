@@ -1222,6 +1222,11 @@ private:
         std::int64_t thisAt;   ///< the skipped `LoadUndef`/`LoadNull` of `this` (-1: not skipped)
     };
     std::map<std::uint32_t, SelfGuard> selfGuards_;
+    /// For each instruction, whether every way to it passed a self guard with nothing since that may run script: the
+    /// global still holds the running function (`selfFn_`), so a guard or a direct call of it need not look again.
+    std::vector<std::uint8_t> selfChecked_;
+    JSValue selfFn_ = JSValue::undefined();
+    void planSelfChecked();
     void emitSelfGuard(std::uint32_t i);
     /// Whether the `Call` at `i` is the long way of a guarded call run in place, which this code never reaches.
     bool fallbackOf(std::uint32_t i) const

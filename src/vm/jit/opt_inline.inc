@@ -964,8 +964,83 @@ void Baseline::planDirectCalls()
     }
 }
 
+void Baseline::planSelfChecked()
+{
+    selfChecked_.assign(n_ + 1, 0);
+    selfFn_ = JSValue::undefined();
+    if (selfGuards_.empty())
+        return;
+    selfFn_ = selfGuards_.begin()->second.fn;
+    for (const auto& [g, sg] : selfGuards_)
+        if (sg.fn != selfFn_)
+            return;
+    auto typedUses = [&](std::uint32_t j) {
+        for (std::int32_t w : plan_->useWebs[j])
+            if (w < 0)
+                return false;
+        return true;
+    };
+    // Instructions that cannot run script or change a global.
+    auto quietHere = [&](std::uint32_t j) {
+        if (j < skipDef_.size() && skipDef_[j])
+            return true;
+        const Op op = code_->code[j].opcode();
+        switch (op) {
+        case Op::Nop: case Op::Jmp: case Op::LoadUndef: case Op::LoadNull: case Op::LoadInt: case Op::LoadK:
+        case Op::LoadTrue: case Op::LoadFalse: case Op::LoadHole: case Op::LoadUninit: case Op::Mov:
+            return true;
+        case Op::GetProp:
+            return plan_->useWebs[j].size() >= 1 && plan_->useWebs[j][0] < 0 && plainReadable(j);
+        default:
+            break;
+        }
+        if (opt::isConditionalJump(op))
+            return typedUses(j);
+        switch (op) {
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl:
+        case Op::Shr: case Op::AddI: case Op::SubI: case Op::MulI: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
+        case Op::ShlI: case Op::ShrI: case Op::Inc: case Op::Dec:
+            return plan_->defWeb[j] >= 0 && typedUses(j);
+        default:
+            return false;
+        }
+    };
+    // Forward, meeting by "and": 2 unreached, 1 checked, 0 not.
+    std::vector<std::uint8_t> in(n_ + 1, 2);
+    std::vector<std::uint32_t> work{0};
+    in[0] = 0;
+    auto flow = [&](std::uint32_t to, std::uint8_t v) {
+        if (to >= n_)
+            return;
+        const std::uint8_t nv = in[to] == 2 ? v : std::uint8_t(in[to] & v);
+        if (nv != in[to]) {
+            in[to] = nv;
+            work.push_back(to);
+        }
+    };
+    while (!work.empty()) {
+        const std::uint32_t j = work.back();
+        work.pop_back();
+        const Op op = code_->code[j].opcode();
+        const bool guard = op == Op::JNotCallee && selfGuards_.count(j);
+        const std::uint8_t out = guard ? 1 : quietHere(j) ? in[j] : 0;
+        // The long way of a call run in place: this code leaves before it.
+        if (op == Op::Call && fallbackOf(j))
+            continue;
+        const std::int64_t t = opt::jumpTarget(*code_, j);
+        if (t >= 0 && !guard)
+            flow(std::uint32_t(t), std::uint32_t(t) <= j ? 0 : out);
+        if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+            flow(j + length(j), out);
+    }
+    for (std::uint32_t j = 0; j < n_; ++j)
+        selfChecked_[j] = in[j] == 1;
+}
+
 void Baseline::emitSelfGuard(std::uint32_t i)
 {
+    if (selfChecked_[i])
+        return;  // a guard before it checked the same, and nothing since may have changed it
     const SelfGuard& sg = selfGuards_.at(i);
     const unsigned base = code_->code[i].a;
     Label cold, inPlace;
@@ -1017,13 +1092,17 @@ void Baseline::emitDirectCall(std::uint32_t i)
     Label slowPath, done;
     throws_.emplace_back(i, Label{});
     Label& exc = throws_.back().second;
-    // The global still holds the function.
-    a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
-    a_.jcc(CNE, slowPath);
-    globalSlot(dc.globalIndex);
-    a_.movImm(RAX, dc.fn.bits);
-    a_.cmp(RAX, mem(RDX, 0));
-    a_.jcc(CNE, slowPath);
+    // The global still holds the function (unless a self guard just saw that it does).
+    if (selfChecked_[i] && dc.fn == selfFn_) {
+        a_.movImm(RAX, dc.fn.bits);
+    } else {
+        a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+        a_.jcc(CNE, slowPath);
+        globalSlot(dc.globalIndex);
+        a_.movImm(RAX, dc.fn.bits);
+        a_.cmp(RAX, mem(RDX, 0));
+        a_.jcc(CNE, slowPath);
+    }
     // Its baseline code (once made, it stays while the block lives), room for its frame (stack, initialised stack, a
     // frame, native stack) and a tick.
     a_.movImm(RCX, reinterpret_cast<std::uint64_t>(C));

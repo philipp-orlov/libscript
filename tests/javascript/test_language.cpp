@@ -3718,3 +3718,16 @@ TEST(arrayCallbackMethodsReadAndWriteInPlaceAsTheSpecSays)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("[2,null,6,8,null,12] | [3,4,6] | [1,3,5,7,9] | 5 | [1,2,3,4] | true | [2,3,4] | [10,20,30,40] |  | false | 3 | [\"a!\",null,\"c!\"] | [1,3] | true | true | 1 | 2 | 2 | -1 | 3 | 16683300 | true | [{\"v\":2}] | true"));
     }
 }
+
+TEST(numbersOfAFewDecimalsPrintAsTheShortestFormSays)
+{
+    // Whole numbers and numbers of up to four decimals take a short way to their digits; the rest the general one. The
+    // expected text is JavaScriptCore's for the same program.
+    const char* program =
+        "var xs=[0.1,0.5,12.5,0.05,1.25,-3.75,100,1e15,123456789.0625,0.0001,0.00015,1.5e-5,0.3,0.30000000000000004,2.675,1/3,-0.0025,999999999999.9999,1099511.6277,4.35,0.07,7e-7,1e21,123e-20,5e-324,2**31+0.5,-1234.5678,0.1+0.2,1.0000000000000002,65.53500000000001]; "
+        "var out=[]; for (var i=0;i<xs.length;i++) out.push(String(xs[i])); "
+        "for (var i=0;i<20000;i++){ var v=(i*0.37-500)/((i%7)+1); out.push(String(v)); } "
+        "var s=out.join(','); var h=0; for (var i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))|0; out.slice(0,30).join(' ') + ' ' + h + ' ' + s.length ";
+    js::Context ctx;
+    CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("0.1 0.5 12.5 0.05 1.25 -3.75 100 1000000000000000 123456789.0625 0.0001 0.00015 0.000015 0.3 0.30000000000000004 2.675 0.3333333333333333 -0.0025 999999999999.9999 1099511.6277 4.35 0.07 7e-7 1e+21 1.23e-18 5e-324 2147483648.5 -1234.5678 0.30000000000000004 1.0000000000000002 65.53500000000001 1977904470 268958"));
+}

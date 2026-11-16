@@ -106,6 +106,38 @@ String numberToString(double d)
     if (std::isinf(d))
         return ascii(d < 0 ? "-Infinity" : "Infinity");
 
+    // A whole number, or one of up to four decimals, below 2^40 once scaled: k decimals that divide back to it exactly are
+    // its shortest form, since at that size decimals of k places lie thousands of doubles apart (only one rounds to it).
+    {
+        static constexpr double kTens[] = {1, 10, 100, 1000, 10000};
+        const double a = std::fabs(d);
+        for (int k = 0; k <= 4; ++k) {
+            const double scaled = a * kTens[k];
+            if (scaled >= 1099511627776.0)
+                break;
+            const double m = std::nearbyint(scaled);
+            if (m == 0 || m / kTens[k] != a)
+                continue;
+            char digits[24];
+            std::uint64_t whole = std::uint64_t(m);
+            const std::uint64_t unit = std::uint64_t(kTens[k]);
+            const std::uint64_t fraction = whole % unit;
+            whole /= unit;
+            String out;
+            if (d < 0)
+                out.push_back(u'-');
+            const auto end = std::to_chars(digits, digits + sizeof digits, whole);
+            for (const char* p = digits; p < end.ptr; ++p)
+                out.push_back(Char(*p));
+            if (k > 0) {
+                out.push_back(u'.');
+                for (std::uint64_t place = unit / 10; place > 0; place /= 10)
+                    out.push_back(Char(u'0' + (fraction / place) % 10));
+            }
+            return out;
+        }
+    }
+
     const base::ShortestDigits shortest = base::shortestDigits(std::fabs(d));
     const int n = shortest.pointPosition;
     const int k = shortest.count;

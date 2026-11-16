@@ -895,6 +895,59 @@ private:
         std::uint32_t index;
     };
     std::vector<LoopNum> loopNums_;
+    /// A frame register's object is an array (1), and one that may be stored to: neither frozen nor closed to growth (2).
+    std::vector<std::uint8_t> factArr_;
+    struct LoopArr
+    {
+        std::uint32_t from, to;
+        unsigned reg;
+        std::uint8_t bits;
+    };
+    std::vector<LoopArr> loopArrs_;
+    /// A global read at the head of a read chain, read once before the loop into a stack slot (and checked to be an array
+    /// when the chain indexes it); a `Math` call whose function is checked once before the loop.
+    struct LoopGlobal
+    {
+        std::uint32_t from, to, read;
+        std::int32_t slot;  ///< rsp-relative
+        bool array;
+    };
+    std::vector<LoopGlobal> loopGlobals_;
+    struct LoopMath
+    {
+        std::uint32_t from, to, call;
+    };
+    std::vector<LoopMath> loopMaths_;
+    std::int32_t hoistBase_ = -1;  ///< rsp-relative: the slots of `loopGlobals_`
+    const LoopGlobal* hoistedGlobal(std::uint32_t read) const
+    {
+        for (const LoopGlobal& g : loopGlobals_)
+            if (g.read == read && g.from <= factAt_ && factAt_ <= g.to)
+                return &g;
+        return nullptr;
+    }
+    bool hoistedMath(std::uint32_t call) const
+    {
+        for (const LoopMath& m : loopMaths_)
+            if (m.call == call && m.from <= factAt_ && factAt_ <= m.to)
+                return true;
+        return false;
+    }
+    /// The object in frame register `reg` (in RAX) is an array the way `bits` says, else `bad`; proved for the code after.
+    void provenArray(unsigned reg, std::uint8_t bits, Label& bad)
+    {
+        if (reg < factArr_.size() && (factArr_[reg] & bits) == bits)
+            return;
+        needObject(RAX, bad);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, bad);
+        if (bits & 2) {
+            a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
+            a_.jcc(CNE, bad);
+        }
+        if (reg < factArr_.size())
+            factArr_[reg] |= bits;
+    }
     /// A loop that nothing in calls out of the optimized code (`sideDoors_`) keeps every object's shape and every chain as
     /// they were at its start: the shapes of the objects in registers it does not write, and the chains its reads rely on,
     /// are checked before it and known inside it. Should a way out turn up in its code after all, the function is compiled
@@ -946,6 +999,10 @@ private:
         for (const LoopNum& ln : loopNums_)
             if (ln.from <= factAt_ && factAt_ <= ln.to)
                 factNum_.insert({ln.reg, ln.index});
+        std::fill(factArr_.begin(), factArr_.end(), std::uint8_t(0));
+        for (const LoopArr& la : loopArrs_)
+            if (la.from <= factAt_ && factAt_ <= la.to && la.reg < factArr_.size())
+                factArr_[la.reg] = la.bits;
         for (const LoopFact& lf : loopFacts_)
             if (lf.from <= factAt_ && factAt_ <= lf.to && lf.reg < factCode_.size())
                 factCode_[lf.reg] = lf.code;
@@ -966,6 +1023,7 @@ private:
             factInl_[r] = 0;
             factSet_[r] = {};
             factCode_[r] = nullptr;
+            factArr_[r] = 0;
             for (auto it = factNum_.lower_bound({r, 0}); it != factNum_.end() && it->first == r;)
                 it = factNum_.erase(it);
         }

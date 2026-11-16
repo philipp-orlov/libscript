@@ -277,6 +277,7 @@ namespace {
 constexpr std::uint32_t kInlineSlots = 32;
 /// Slots for method reads that feed an inlined call.
 constexpr std::uint32_t kWindowSlots = 4;
+constexpr std::uint32_t kHoistSlots = 4;
 
 std::uint64_t doubleBits(double d)
 {
@@ -716,14 +717,10 @@ bool Baseline::emitTyped(std::uint32_t i)
         Label done;
         a_.mov32(RCX, useI32(uw[1], RCX));
         a_.mov(RAX, R(put ? in.a : in.b));
-        needObject(RAX, bad);
+        if (ep != kArray)
+            needObject(RAX, bad);
         if (ep == kArray) {
-            a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
-            a_.jcc(CNE, bad);
-            if (put) {
-                a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
-                a_.jcc(CNE, bad);
-            }
+            provenArray(put ? in.a : in.b, put ? 3 : 1, bad);
             // Unsigned: a negative index is past any length (an array has fewer than 2^31 elements).
             a_.alu32(7, RCX, mem(RAX, kArrayLength));
             a_.jcc(CAE, bad);
@@ -865,7 +862,9 @@ bool Baseline::emitTyped(std::uint32_t i)
         void* const target = fn->rare()->nativeData;
         holdValue(callee);
         Label& bad = exitBefore(i);
-        if (auto mw = mathWin_.find(i); mw != mathWin_.end()) {
+        if (hoistedMath(i)) {
+            // Checked before the loop, which changes neither.
+        } else if (auto mw = mathWin_.find(i); mw != mathWin_.end()) {
             // `Math` and its method read here: their registers were never written.
             emitReadInto(mw->second.first, false, bad);
             emitReadInto(mw->second.second, true, bad);
@@ -1199,7 +1198,8 @@ Tier2Code* Baseline::compileOptimized()
     inlineBase_ = calls ? std::int32_t(8 + 8 * W) : -1;
     chainSlot_ = std::int32_t(8 + 8 * W + (calls ? 8 * kInlineSlots : 0));
     windowBase_ = chainSlot_ + 8;
-    spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 8 + 8 * kWindowSlots + 15) & ~15u);
+    hoistBase_ = windowBase_ + std::int32_t(8 * kWindowSlots);
+    spill_ = std::int32_t((8 * W + (calls ? 8 * kInlineSlots : 0) + 8 + 8 * kWindowSlots + 8 * kHoistSlots + 15) & ~15u);
     dirty_.assign(W, 1);
     planDirectCalls();
     planWindows();
@@ -1211,6 +1211,7 @@ Tier2Code* Baseline::compileOptimized()
     factInl_.assign(code_->nregs + 1, 0);
     factSet_.assign(code_->nregs + 1, std::array<std::uint32_t, 4>{});
     factCode_.assign(code_->nregs + 1, nullptr);
+    factArr_.assign(code_->nregs + 1, 0);
     planLoopFacts();
     a_.push(RBX);
     a_.push(R13);

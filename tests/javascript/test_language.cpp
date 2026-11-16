@@ -3614,3 +3614,40 @@ TEST(objectsReadFromPropertiesAndComparedWithLiteralsInCompiledCode)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2047 g 3 g 3 2001 11,8,14,2,10,10,10,10 object,string,object,object"));
     }
 }
+
+TEST(globalsAndMathFunctionsALoopReadAreReadBeforeItWhileNothingChangesThem)
+{
+    // A global array and Math.sqrt read once before loops that call nothing; a loop that replaces either through a call,
+    // through globalThis, or through a store to Math under another name.
+    const char* program =
+        "var out=[]; "
+        "var os=[{x:1},{y:0,x:2},{z:0,y:0,x:3},{w:0,z:0,y:0,x:4}]; "
+        "function k1(n){var s=0;for(var i=0;i<n;i++){s+=os[i&3].x;}return s;} "
+        "for (var r=0;r<20;r++) k1(1000); out.push(k1(20000)); "
+        "function swapOs(){ os=[{x:10},{x:20},{x:30},{x:40}]; } "
+        "function k2(n){var s=0;for(var i=0;i<n;i++){s+=os[i&3].x; if(i==5000) swapOs();}return s;} "
+        "for (var r=0;r<20;r++) { k2(100); os=[{x:1},{y:0,x:2},{z:0,y:0,x:3},{w:0,z:0,y:0,x:4}]; } out.push(k2(10000)); "
+        "function k3(n){var s=0;for(var i=0;i<n;i++){s+=os[i&3].x; if(i==3000) globalThis.os=[{x:7},{x:7},{x:7},{x:7}];}return s;} "
+        "for (var r=0;r<20;r++) { k3(100); } out.push(k3(10000)); "
+        "var M=Math; var realSqrt=Math.sqrt; "
+        "function k4(n){var s=0;for(var i=0;i<n;i++){ s+=Math.sqrt(i*1.0); if(i==4000) M.sqrt=function(x){return 1;}; }return Math.round(s);} "
+        "for (var r=0;r<20;r++) { k4(100); Math.sqrt=realSqrt; } out.push(k4(8000)); Math.sqrt=realSqrt; "
+        "var O={sqrt:Math.sqrt}; "
+        "function k5(n,o){var s=0;for(var i=0;i<n;i++){ s+=Math.sqrt(4.0); o.v=i; }return s;} "
+        "for (var r=0;r<20;r++) k5(100,{v:0}); out.push(k5(1000,{v:0})); "
+        "function k6(n){var s=0;for(var i=0;i<n;i++){ s+=Math.sqrt(9.0); if(i==500){ var m=Math; m.sqrt=4; } } return s;} "
+        "for (var r=0;r<20;r++) { try{ k6(100);}catch(e){} Math.sqrt=realSqrt; } "
+        "try { out.push(k6(1000)); } catch(e) { out.push(e instanceof TypeError); } Math.sqrt=realSqrt; "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("50000 137491 124003 172685 2000 true"));
+    }
+}

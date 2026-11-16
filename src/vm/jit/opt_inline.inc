@@ -1192,6 +1192,10 @@ void Baseline::emitChain(std::uint32_t i)
     };
     switch (in.opcode()) {
     case Op::GetGlobal: {
+        if (const LoopGlobal* lg = hoistedGlobal(i)) {
+            a_.mov(RAX, mem(RSP, lg->slot));  // read before the loop, which does not change it
+            break;
+        }
         JSObject* g = vm_.global;
         std::uint8_t attrs = 0;
         JSValue* slot = g->findOwn(vm_, code_->atoms[in.b], &attrs);
@@ -1207,9 +1211,18 @@ void Baseline::emitChain(std::uint32_t i)
     case Op::GetElem: {
         const auto& uw = plan_->useWebs[i];
         receiver(in.b);
-        needObject(RAX, bad);
-        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
-        a_.jcc(CNE, bad);
+        bool known = false;
+        for (const LoopGlobal& lg : loopGlobals_)
+            known = known || (lg.array && lg.read + length(lg.read) == i && lg.from <= factAt_ && factAt_ <= lg.to);
+        if (known) {
+            // A global checked to be an array before the loop.
+        } else if (role & 2) {
+            needObject(RAX, bad);
+            a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+            a_.jcc(CNE, bad);
+        } else {
+            provenArray(in.b, 1, bad);
+        }
         if (uw[1] >= 0) {
             a_.mov32(RCX, useI32(uw[1], RCX));
         } else {
@@ -1674,9 +1687,12 @@ void Baseline::planLoopFacts()
     loopShapes_.clear();
     loopValids_.clear();
     loopNums_.clear();
+    loopArrs_.clear();
+    loopGlobals_.clear();
+    loopMaths_.clear();
     hoistWatch_.clear();
     preLoop_.clear();
-    if (!code_->handlers.empty() || inlineBase_ < 0)
+    if (!code_->handlers.empty())
         return;
     std::vector<std::int64_t> prev(n_ + 1, -1);
     for (std::uint32_t j = 0; j < n_; j += length(j))
@@ -1720,7 +1736,7 @@ void Baseline::planLoopFacts()
         }
         std::map<unsigned, const CodeBlock*> want;
         std::set<unsigned> mixed;
-        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+        for (std::uint32_t j = h; std::int64_t(j) <= end && inlineBase_ >= 0; j += length(j)) {
             const Ins& in = code_->code[j];
             if (in.opcode() != Op::Call || (j < code_->prof.size() && (code_->prof[j] & opt::kProfFailed)))
                 continue;
@@ -1813,6 +1829,60 @@ void Baseline::planLoopFacts()
         }
         for (const auto& [r, k] : nums)
             loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k});
+        // Arrays in registers the loop does not write, which it reads or stores elements of.
+        std::map<unsigned, std::uint8_t> arrs;
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            const Ins& in = code_->code[j];
+            const Op op = in.opcode();
+            if (op != Op::GetElem && op != Op::PutElem)
+                continue;
+            const bool put = op == Op::PutElem;
+            const auto& uw = plan_->useWebs[j];
+            const unsigned r = put ? in.a : in.b;
+            const std::uint8_t ep = j < code_->elemProf.size() ? code_->elemProf[j] : 0;
+            if (uw.size() < 2 || uw[0] >= 0 || uw[1] < 0 || (ep != 0 && ep != elemprof::kArray) ||
+                (j < code_->prof.size() && (code_->prof[j] & opt::kProfFailed)) || r >= written.size() || written[r] ||
+                (j < chainRole_.size() && (chainRole_[j] & 2)))
+                continue;
+            arrs[r] |= put ? 3 : 1;
+        }
+        for (const auto& [r, bits] : arrs)
+            loopArrs_.push_back(LoopArr{h, std::uint32_t(end), r, bits});
+        any = any || !arrs.empty() || !nums.empty();
+        // Globals and `Math` functions the loop reads: the same all through it, unless it stores to the global object or
+        // to `Math` (a typed store would not call out).
+        std::set<std::uint32_t> readShapes{vm_.global->h.shape};
+        for (const auto& [c, reads] : mathWin_)
+            if (c >= h && std::int64_t(c) <= end && reads.second + 1 < n_ && code_->code[reads.second + 1].a != kNoCache)
+                readShapes.insert(code_->caches[code_->code[reads.second + 1].a].shape);
+        bool storesThere = false;
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j))
+            if (code_->code[j].opcode() == Op::PutProp && j + 1 < n_ && code_->code[j + 1].a != kNoCache &&
+                readShapes.count(code_->caches[code_->code[j + 1].a].shape))
+                storesThere = true;
+        if (!storesThere) {
+            for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+                const Ins& in = code_->code[j];
+                if (in.opcode() != Op::GetGlobal || j >= chainRole_.size() || !(chainRole_[j] & 1) || (chainRole_[j] & 2) ||
+                    loopGlobals_.size() >= kHoistSlots)
+                    continue;
+                std::uint8_t attrs = 0;
+                if (!vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs) || (attrs & attr::kAccessor))
+                    continue;
+                const std::uint32_t next = j + length(j);
+                const std::uint8_t ep = next < code_->elemProf.size() ? code_->elemProf[next] : 0;
+                const bool array = next < n_ && code_->code[next].opcode() == Op::GetElem && code_->code[next].b == in.a &&
+                                   (chainRole_[next] & 2) && (ep == 0 || ep == elemprof::kArray);
+                loopGlobals_.push_back(LoopGlobal{h, std::uint32_t(end), j,
+                                                  hoistBase_ + std::int32_t(8 * loopGlobals_.size()), array});
+                any = true;
+            }
+            for (const auto& [c, reads] : mathWin_)
+                if (c >= h && std::int64_t(c) <= end) {
+                    loopMaths_.push_back(LoopMath{h, std::uint32_t(end), c});
+                    any = true;
+                }
+        }
         for (ValidityCell* c : cells) {
             loopValids_.push_back(LoopValid{h, std::uint32_t(end), c});
             any = true;
@@ -1823,8 +1893,8 @@ void Baseline::planLoopFacts()
         }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (std::getenv("T2HOIST"))
-            std::fprintf(stderr, "hoist %s loop @%u..%lld: %zu shapes %zu chains\n", codeName(code_).c_str(), h,
-                         (long long)end, shapes.size() - mixedShape.size(), cells.size());
+            std::fprintf(stderr, "hoist %s loop @%u..%lld: %zu shapes %zu chains %zu arrays\n", codeName(code_).c_str(), h,
+                         (long long)end, shapes.size() - mixedShape.size(), cells.size(), arrs.size());
 #endif
     }
 }
@@ -1844,6 +1914,41 @@ void Baseline::emitLoopGuards(std::uint32_t h)
         a_.jcc(CNE, bad);
         if (ls.aux >= 0) {
             a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ls.aux));
+            a_.jcc(CNE, bad);
+        }
+    }
+    for (const LoopGlobal& lg : loopGlobals_) {
+        if (lg.from != h)
+            continue;
+        emitReadInto(lg.read, false, bad);
+        a_.mov(mem(RSP, lg.slot), RAX);
+        if (lg.array) {
+            needObject(RAX, bad);
+            a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+            a_.jcc(CNE, bad);
+        }
+    }
+    for (const LoopMath& lm : loopMaths_) {
+        if (lm.from != h)
+            continue;
+        const auto& reads = mathWin_.at(lm.call);
+        const JSValue callee = constantBefore(lm.call, code_->code[lm.call].b);
+        holdValue(callee);
+        emitReadInto(reads.first, false, bad);
+        emitReadInto(reads.second, true, bad);
+        a_.movImm(RCX, callee.bits);
+        a_.cmp(RCX, RAX);
+        a_.jcc(CNE, bad);
+    }
+    for (const LoopArr& la : loopArrs_) {
+        if (la.from != h)
+            continue;
+        a_.mov(RAX, R(la.reg));
+        needObject(RAX, bad);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, bad);
+        if (la.bits & 2) {
+            a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
             a_.jcc(CNE, bad);
         }
     }

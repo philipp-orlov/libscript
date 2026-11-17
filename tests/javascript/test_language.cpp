@@ -4327,6 +4327,37 @@ TEST(int32SlotsALoopKeepsInRegisters)
     }
 }
 
+TEST(looseEqualityInCompiledCode)
+{
+    // `==` and `!=` are decided in compiled code for int32s, numbers, null and undefined, booleans and two objects; a
+    // string, a symbol, a bigint or two kinds that convert go the long way. Every pair agrees in every tier.
+    const char* program =
+        "var o = {}, p = {}, s1 = 'ab', s2 = 'a' + 'b', sym = Symbol(), big = 10n;"
+        "var vals = [0, -0, 1, 1.5, NaN, Infinity, -1, null, undefined, true, false, o, p, s1, s2, '', '1', '0', sym, big,"
+        "            1n, [], [1], 2147483647, 4294967296];"
+        "function eq(a, b) { return a == b; } function ne(a, b) { return a != b; }"
+        "var first = '', last = '';"
+        "for (var rep = 0; rep < 300; rep++) {"
+        "  var s = '';"
+        "  for (var i = 0; i < vals.length; i++) for (var j = 0; j < vals.length; j++)"
+        "    s += (eq(vals[i], vals[j]) ? 1 : 0) + (ne(vals[i], vals[j]) ? 2 : 0);"
+        "  if (rep === 0) first = s; else last = s;"
+        "}"
+        "var ones = 0; for (var k = 0; k < first.length; k++) ones += first[k] === '1' ? 1 : 0;"
+        "(first === last) + ':' + ones + ':' + first.length";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("true:74:625"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

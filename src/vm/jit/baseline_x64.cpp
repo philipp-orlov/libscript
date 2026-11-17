@@ -2223,6 +2223,7 @@ private:
     void jumps(std::uint32_t i, const Ins& in);
     void strictCore(Label& eq, Label& neq, Label& bad);
     void strictJump(std::uint32_t i, const Ins& in);
+    void looseCore(Label& eq, Label& neq, Label& bad);
     void strictValue(std::uint32_t i, const Ins& in);
     void getProp(std::uint32_t i, const Ins& in);
     void putProp(std::uint32_t i, const Ins& in);
@@ -2822,6 +2823,70 @@ void Baseline::strictCore(Label& eq, Label& neq, Label& bad)
     a_.jmp(bad);
 }
 
+/// `rax == rcx` as the language has it, the two not both int32: to `eq` or `neq`, or to `bad` for what needs the runtime
+/// (a string, a symbol or a bigint against anything but itself, a boolean or a number against another kind, a double
+/// compared with itself). Clobbers rdx and xmm0-1.
+void Baseline::looseCore(Label& eq, Label& neq, Label& bad)
+{
+    Label differ, aNullish, notNullish, numbers, cells;
+    a_.cmp(RAX, RCX);
+    a_.jcc(CNE, differ);
+    // The same bits: equal, but for a double, which may be a NaN.
+    a_.cmp(RAX, RBP);
+    a_.jcc(CB, eq);
+    a_.cmp(RAX, R14);
+    a_.jcc(CAE, eq);
+    a_.jmp(bad);
+    a_.bind(differ);
+    // null and undefined are equal to each other and to nothing else.
+    a_.mov(RDX, RAX);
+    a_.aluI(4, RDX, -9);
+    a_.cmpI(RDX, std::int32_t(kNull));
+    a_.jcc(CE, aNullish);
+    a_.mov(RDX, RCX);
+    a_.aluI(4, RDX, -9);
+    a_.cmpI(RDX, std::int32_t(kNull));
+    a_.jcc(CE, neq);
+    // Two cells: two objects are equal only as the same one, which they are not.
+    a_.test(RAX, R15);
+    a_.jcc(CNE, notNullish);
+    a_.test(RCX, R15);
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
+    a_.jcc(CNE, bad);
+    a_.jmp(neq);
+    a_.bind(notNullish);
+    // Two numbers: compared as doubles. Two booleans that differ: not equal.
+    a_.cmp(RAX, RBP);
+    a_.jcc(CAE, numbers);
+    a_.mov(RDX, RAX);
+    a_.aluI(4, RDX, -2);
+    a_.cmpI(RDX, std::int32_t(kFalse));
+    a_.jcc(CNE, bad);
+    a_.mov(RDX, RCX);
+    a_.aluI(4, RDX, -2);
+    a_.cmpI(RDX, std::int32_t(kFalse));
+    a_.jcc(CE, neq);
+    a_.jmp(bad);
+    a_.bind(numbers);
+    a_.cmp(RCX, RBP);
+    a_.jcc(CB, bad);
+    loadNumber(0, RAX, RDX);
+    loadNumber(1, RCX, RDX);
+    a_.ucomisd(0, 1);
+    a_.jcc(CP, neq);
+    a_.jcc(CE, eq);
+    a_.jmp(neq);
+    a_.bind(aNullish);
+    a_.mov(RDX, RCX);
+    a_.aluI(4, RDX, -9);
+    a_.cmpI(RDX, std::int32_t(kNull));
+    a_.jcc(CE, eq);
+    a_.jmp(neq);
+}
+
 void Baseline::strictJump(std::uint32_t i, const Ins& in)
 {
     const Op op = in.opcode();
@@ -2905,6 +2970,26 @@ void Baseline::compare(std::uint32_t i, const Ins& in)
     Label dbl, done;
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
+    if (in.opcode() == Op::Eq || in.opcode() == Op::Ne) {
+        // `==` and `!=`: int32s here, and what looseCore decides; strings, symbols, bigints and mixed kinds the long way.
+        Label loose, eq, neq;
+        needInts(RAX, RCX, loose);
+        a_.alu32(7, RAX, RCX);
+        a_.jcc(CE, eq);
+        a_.jmp(neq);
+        a_.bind(loose);
+        looseCore(eq, neq, bad);
+        const bool wantEqual = in.opcode() == Op::Eq;
+        a_.bind(eq);
+        a_.movImm(RAX, wantEqual ? kTrue : kFalse);
+        write(in.a, RAX, false);
+        a_.jmp(done);
+        a_.bind(neq);
+        a_.movImm(RAX, wantEqual ? kFalse : kTrue);
+        write(in.a, RAX, false);
+        a_.bind(done);
+        return;
+    }
     needInts(RAX, RCX, rel.doubles ? dbl : bad);
     a_.alu32(7, RAX, RCX);
     a_.setcc(rel.ic, RAX);

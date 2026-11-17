@@ -2224,6 +2224,8 @@ private:
     void strictCore(Label& eq, Label& neq, Label& bad);
     void strictJump(std::uint32_t i, const Ins& in);
     void looseCore(Label& eq, Label& neq, Label& bad);
+    void truth(Reg v, Label& yes, Label& no, Label& bad);
+    void typeOf(std::uint32_t i, const Ins& in);
     void strictValue(std::uint32_t i, const Ins& in);
     void getProp(std::uint32_t i, const Ins& in);
     void putProp(std::uint32_t i, const Ins& in);
@@ -2468,6 +2470,33 @@ void Baseline::emit(std::uint32_t i)
         a_.mov(RAX, R(in.b));
         a_.mov(RAX, mem(RAX, kBoxValue));
         deliver(i, in.a);
+        return;
+    case Op::ToNumeric: {
+        // A number is itself; anything else converts in the interpreter.
+        Label& bad = slow(i);
+        a_.mov(RAX, R(in.b));
+        a_.cmp(RAX, RBP);
+        a_.jcc(CB, bad);
+        write(in.a, RAX, false);
+        return;
+    }
+    case Op::Not: {
+        Label& bad = slow(i);
+        Label yes, no, done;
+        a_.mov(RAX, R(in.b));
+        truth(RAX, yes, no, bad);
+        a_.bind(yes);
+        a_.movImm(RAX, kFalse);
+        write(in.a, RAX, false);
+        a_.jmp(done);
+        a_.bind(no);
+        a_.movImm(RAX, kTrue);
+        write(in.a, RAX, false);
+        a_.bind(done);
+        return;
+    }
+    case Op::TypeOf:
+        typeOf(i, in);
         return;
     case Op::PutBox:
         a_.mov(RAX, R(in.a));
@@ -2887,6 +2916,98 @@ void Baseline::looseCore(Label& eq, Label& neq, Label& bad)
     a_.jmp(neq);
 }
 
+/// The value in `v` as the language's `ToBoolean` has it: to `yes` or `no`, or `bad` for a bigint (clobbers rdx, xmm0-1;
+/// `v` may be rax).
+void Baseline::truth(Reg v, Label& yes, Label& no, Label& bad)
+{
+    Label notInt, cell, notString;
+    a_.cmpI(v, std::int32_t(kTrue));
+    a_.jcc(CE, yes);
+    a_.cmpI(v, std::int32_t(kFalse));
+    a_.jcc(CE, no);
+    a_.cmp(v, R14);
+    a_.jcc(CB, notInt);
+    a_.test32(v, v);
+    a_.jcc(CNE, yes);
+    a_.jmp(no);
+    a_.bind(notInt);
+    a_.test(v, R15);
+    a_.jcc(CE, cell);
+    a_.cmp(v, RBP);
+    a_.jcc(CB, no);  // null, undefined, a hole: neither number nor cell
+    // A double: true unless zero or NaN.
+    a_.mov(RDX, v);
+    a_.sub(RDX, RBP);
+    a_.movqToX(0, RDX);
+    a_.xorps(1, 1);
+    a_.ucomisd(0, 1);
+    a_.jcc(CP, no);
+    a_.jcc(CE, no);
+    a_.jmp(yes);
+    a_.bind(cell);
+    a_.cmpI8(mem(v, kHdrKind), kObjectKind);
+    a_.jcc(CE, yes);  // every object of this engine
+    a_.testI8(mem(v, 7), 0x80);
+    a_.jcc(CNE, yes);  // a box or the like of this engine: not a value a program sees
+    a_.cmpI8(mem(v, kGcKind), std::uint8_t(detail::CellKind::String));
+    a_.jcc(CNE, notString);
+    a_.cmpI32(mem(v, kStrLength), 0);
+    a_.jcc(CNE, yes);
+    a_.jmp(no);
+    a_.bind(notString);
+    a_.cmpI8(mem(v, kGcKind), std::uint8_t(detail::CellKind::BigInt));
+    a_.jcc(CE, bad);
+    a_.jmp(yes);  // a symbol
+}
+
+/// `typeof`: the VM's kept answer for numbers, undefined, null, booleans, objects and strings; the rest in the interpreter.
+void Baseline::typeOf(std::uint32_t i, const Ins& in)
+{
+    Label& bad = slow(i);
+    std::uint64_t names[8];
+    for (unsigned k = 0; k < 8; ++k) {
+        const JSValue n = vm_.typeofName(k);  // kept by the VM for its life: its address can be in the code
+        names[k] = n.bits;
+        vm::release(n);
+    }
+    Label number, undef, object, boolean, string, function, cell, done;
+    a_.mov(RAX, R(in.b));
+    a_.cmp(RAX, RBP);
+    a_.jcc(CAE, number);
+    a_.test(RAX, R15);
+    a_.jcc(CE, cell);
+    a_.cmpI(RAX, std::int32_t(kNull));
+    a_.jcc(CE, object);
+    a_.mov(RDX, RAX);
+    a_.aluI(4, RDX, -2);
+    a_.cmpI(RDX, std::int32_t(kFalse));
+    a_.jcc(CE, boolean);
+    a_.jmp(undef);  // undefined, a hole, uninitialised
+    a_.bind(cell);
+    a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+    Label notObject;
+    a_.jcc(CNE, notObject);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+    a_.jcc(CE, function);
+    a_.jmp(object);
+    a_.bind(notObject);
+    a_.testI8(mem(RAX, 7), 0x80);
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::String));
+    a_.jcc(CE, string);
+    a_.jmp(bad);
+    const std::pair<Label*, unsigned> cases[] = {{&undef, 0}, {&object, 1}, {&boolean, 2}, {&number, 3}, {&string, 4},
+                                                 {&function, 7}};
+    for (const auto& [l, k] : cases) {
+        a_.bind(*l);
+        a_.movImm(RAX, names[k]);
+        a_.jmp(done);
+    }
+    a_.bind(done);
+    retain(RAX);
+    write(in.a, RAX);
+}
+
 void Baseline::strictJump(std::uint32_t i, const Ins& in)
 {
     const Op op = in.opcode();
@@ -3032,14 +3153,10 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
         Label& bad = slow(i);
         Label taken, notTaken;
         a_.mov(RAX, R(in.a));
-        a_.cmpI(RAX, std::int32_t(kTrue));
-        a_.jcc(CE, op == Op::JTrue ? taken : notTaken);
-        a_.cmpI(RAX, std::int32_t(kFalse));
-        a_.jcc(CE, op == Op::JTrue ? notTaken : taken);
-        needInt(RAX, bad);
-        a_.test32(RAX, RAX);
-        a_.jcc(op == Op::JTrue ? CNE : CE, taken);
-        a_.jmp(notTaken);
+        if (op == Op::JTrue)
+            truth(RAX, taken, notTaken, bad);
+        else
+            truth(RAX, notTaken, taken, bad);
         a_.bind(taken);
         go(i, target);
         a_.bind(notTaken);

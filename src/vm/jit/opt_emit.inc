@@ -1182,18 +1182,10 @@ bool Baseline::emitTyped(std::uint32_t i)
             Label taken, notTaken;
             const bool jt = op == Op::JTrue;
             a_.mov(RAX, R(in.a));
-            a_.cmpI(RAX, std::int32_t(kTrue));
-            a_.jcc(CE, jt ? taken : notTaken);
-            a_.cmpI(RAX, std::int32_t(kFalse));
-            a_.jcc(CE, jt ? notTaken : taken);
-            a_.cmpI(RAX, std::int32_t(kUndefined));
-            a_.jcc(CE, jt ? notTaken : taken);
-            a_.cmpI(RAX, std::int32_t(kNull));
-            a_.jcc(CE, jt ? notTaken : taken);
-            needInt(RAX, bad);
-            a_.test32(RAX, RAX);
-            a_.jcc(jt ? CNE : CE, taken);
-            a_.jmp(notTaken);
+            if (jt)
+                truth(RAX, taken, notTaken, bad);
+            else
+                truth(RAX, notTaken, taken, bad);
             a_.bind(taken);
             go(i, target);
             a_.bind(notTaken);

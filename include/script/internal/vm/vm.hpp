@@ -303,6 +303,10 @@ struct VM : EngineRuntime
 
     // ---- shared names and prototypes ----
     Atoms atoms;
+    /// The strings `typeof` answers with, made on first use and held for the VM's life: undefined, object, boolean,
+    /// number, string, symbol, bigint, function.
+    JSValue typeofNames[8] = {};
+    JSValue typeofName(unsigned which);
     /// The property names of the first thousand non-negative integers, made when first asked for; each holds a count.
     static constexpr std::size_t kSmallIndexKeys = 1024;
     Key smallIndexKeys[kSmallIndexKeys] = {};

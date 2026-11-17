@@ -686,6 +686,11 @@ void VM::releaseRoots() noexcept
             detail::decRef(*k);
         *k = nullptr;
     }
+    for (JSValue& name : typeofNames) {
+        if (name.bits)
+            release(name);
+        name = JSValue::raw(0);
+    }
     for (const RegExpSlot& s : regexpSlots) {
         release(s.value);
         release(toJSValue(s.owner));

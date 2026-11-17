@@ -4358,6 +4358,39 @@ TEST(looseEqualityInCompiledCode)
     }
 }
 
+TEST(typeofNotAndTruthInCompiledCode)
+{
+    // `typeof`, `!`, a jump on any value and `x++` (ToNumeric) have templates in compiled code; every kind of value,
+    // proxies and bigints included, gives what the interpreter gives, in every tier.
+    const char* program =
+        "var vals = [0, -0, 1, 1.5, NaN, Infinity, -1, null, undefined, true, false, {}, [], function () {}, '', 'x', Symbol(), 0n, 1n, new Proxy(function () {}, {}), new Proxy({}, {}), 2147483647, 1e300, -1e-300]; "
+        "function t(v) { return typeof v; } "
+        "function n(v) { return !v; } "
+        "function j(v) { if (v) return 1; return 0; } "
+        "function k(v) { var x = v; x++; return x; } "
+        "var first = '', last = ''; "
+        "for (var rep = 0; rep < 2000; rep++) { "
+        "  var s = ''; "
+        "  for (var i = 0; i < vals.length; i++) { "
+        "    s += t(vals[i]) + (n(vals[i]) ? 'T' : 'F') + j(vals[i]); "
+        "    if (typeof vals[i] !== 'symbol' && typeof vals[i] !== 'bigint') { try { s += String(k(vals[i])); } catch (e) { s += 'E'; } } "
+        "  } "
+        "  if (rep === 0) first = s; else last = s; "
+        "} "
+        "'' + (first === last) + ' ' + first";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("true numberT01numberT01numberF12numberF12.5numberT0NaNnumberF1InfinitynumberF10objectT01undefinedT0NaNbooleanF12booleanT01objectF1NaNobjectF11functionF1NaNstringT01stringF1NaNsymbolF1bigintT0bigintF1functionF1NaNobjectF1NaNnumberF12147483648numberF11e+300numberF11"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

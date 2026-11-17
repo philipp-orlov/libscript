@@ -445,28 +445,40 @@ std::int32_t toInt32(double d) noexcept
     return std::int32_t(std::uint32_t(std::int64_t(m < 0 ? m + 4294967296.0 : m)));
 }
 
+JSValue VM::typeofName(unsigned which)
+{
+    static const char* const names[8] = {"undefined", "object", "boolean", "number", "string", "symbol", "bigint", "function"};
+    if (tearingDown)
+        return makeString(*this, std::string_view(names[which]));
+    JSValue& cached = typeofNames[which];
+    if (cached.bits == 0)
+        cached = makeString(*this, std::string_view(names[which]));
+    retain(cached);
+    return cached;
+}
+
 JSValue typeOf(VM& vm, JSValue v)
 {
-    const char* name;
+    unsigned which;
     if (v.isNumber())
-        name = "number";
+        which = 3;
     else if (v.isUndefined() || v.isHole() || v.isUninit())
-        name = "undefined";
+        which = 0;
     else if (v.isNull())
-        name = "object";
+        which = 1;
     else if (v.isBool())
-        name = "boolean";
+        which = 2;
     else if (isString(v))
-        name = "string";
+        which = 4;
     else if (isSymbol(v))
-        name = "symbol";
+        which = 5;
     else if (isBigInt(v))
-        name = "bigint";
+        which = 6;
     else if (isFunction(v))
-        name = "function";
+        which = 7;
     else
-        name = "object";
-    return makeString(vm, std::string_view(name));
+        which = 1;
+    return vm.typeofName(which);
 }
 
 // --------------------------------------------------------------- equality ---

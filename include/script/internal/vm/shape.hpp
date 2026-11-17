@@ -120,6 +120,8 @@ struct Dictionary
     Vec<Entry> entries;  ///< index = slot index; a null key is a hole
     IndexTable table;
     std::uint32_t live = 0;
+    std::uint16_t misses = 0;  ///< reads an inline cache could not take: a dictionary read often is worth caching
+    std::uint8_t changes = 0;  ///< times a cached shape had to be given up (a key moved or went)
 
     /// The slot index of `key`, or -1.
     std::int32_t find(Key key) const noexcept;
@@ -139,6 +141,9 @@ struct Shape
         /// Property 2 is `prototype`, a data property: `new` of a function of this shape reads it there. Shapes grown from
         /// one keep it (a property is never taken away from the middle of a shape).
         kProtoAt2 = 8,
+        /// A dictionary an inline cache may hold: its own keys keep their slots for as long as it has this id (a key that
+        /// goes, moves or changes its attributes gives the object a new one), and the id is never given out again.
+        kCachedDict = 16,
     };
 
     std::uint32_t id = 0;
@@ -150,6 +155,9 @@ struct Shape
     std::uint8_t attrs = 0;
     std::uint8_t flags = 0;
     std::uint8_t runtimeTransitions = 0;
+    /// A root's: the inline slots `new` gives an object of its tree, once one has grown past those it was made with (8, 16
+    /// or 24; 0 before).
+    std::uint8_t slotHint = 0;
     std::uint64_t keyBits = 0;  ///< a bit per key hash: a clear bit means absent
     Vec<Transition> transitions;
     IndexTable transitionIndex;

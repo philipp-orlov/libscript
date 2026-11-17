@@ -5021,3 +5021,50 @@ TEST(aMethodReadOfAnInlinedCallInAChainStillFillsItsReceiver)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9950 133 200"));
     }
 }
+
+TEST(dictionaryReadsStoresOfManyShapesAndObjectsGivenMoreSlotsKeepTheirMeaning)
+{
+    // A dictionary read and written through caches, then a key deleted, re-added, made an accessor or read-only, and its
+    // prototype replaced; a store site that sees many shapes, adding and writing, then a setter on a prototype; objects of
+    // one shape made with different numbers of slots in place (a base constructor that adds many fields).
+    const char* program =
+        "var out=[];"
+        "var d={}; for(var i=0;i<200;i++) d['k'+i]=i;"
+        "function rd(o){return o.k5+o.k150;}"
+        "var s=0; for(var i=0;i<300;i++) s+=rd(d);"
+        "out.push(s);"
+        "delete d.k5; out.push(rd(d));"
+        "d.k5=7; out.push(rd(d));"
+        "Object.defineProperty(d,'k150',{get:function(){return 1000;},configurable:true}); out.push(rd(d));"
+        "var p={k5:-1,k150:-2}; Object.setPrototypeOf(d,p); delete d.k5; out.push(rd(d));"
+        "for(var i=0;i<300;i++) s+=rd(d); out.push(s);"
+        "function wr(o,v){o.k7=v;return o.k7;}"
+        "for(var i=0;i<300;i++) wr(d,i); out.push(d.k7);"
+        "Object.defineProperty(d,'k7',{writable:false}); out.push(wr(d,5));"
+        "function P(){} function Q(){}"
+        "function put(o,v){o.x=v;return o;}"
+        "var objs=[]; for(var i=0;i<400;i++){var o=i%3==0?new P():i%3==1?new Q():{a:i}; if(i%5==0)o.y=1; objs.push(put(o,i));}"
+        "for(var i=0;i<400;i++) put(objs[i],objs[i].x+1);"
+        "var t=0; for(var i=0;i<400;i++) t+=objs[i].x; out.push(t);"
+        "var seen=0; Object.defineProperty(P.prototype,'x',{set:function(v){seen+=v;},configurable:true});"
+        "put(new P(),5); put(new P(),6); out.push(seen);"
+        "function Base(){this.a=1;this.b=2;this.c=3;this.d=4;this.e=5;this.f=6;this.g=7;this.h=8;this.i=9;this.j=10;}"
+        "function Sub(){Base.call(this);this.k=11;}"
+        "Sub.prototype=Object.create(Base.prototype);"
+        "function sum(o){return o.a+o.c+o.e+o.g+o.j+o.k;}"
+        "var u=0,early=[]; for(var i=0;i<5;i++) early.push(new Sub());"
+        "for(var i=0;i<3000;i++){var o=new Sub(); u+=sum(o)+sum(early[i%5]);}"
+        "out.push(u);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("46500 NaN 157 1007 999 346200 299 299 80200 11 222000"));
+    }
+}

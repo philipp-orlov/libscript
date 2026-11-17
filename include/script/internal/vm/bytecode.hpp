@@ -132,18 +132,21 @@ struct InlineCache
     JSObject* holder = nullptr;
     ValidityCell* validity = nullptr;  ///< holds a count
 };
-/// What a property read remembers beyond its one inline cache: up to four more shapes (a read site that sees several), and
-/// accessors. An entry is an own or inherited data property, or an own or inherited accessor; the inherited ones hold a count of
+/// What a property read or store remembers beyond its one inline cache: up to four more shapes (a site that sees several), and
+/// a read's accessors. An entry is an own or inherited data property, or an own or inherited accessor; the inherited ones hold a count of
 /// the validity cell of the chain. A site reaches its `PolyCache` by `InlineCache::pad` (index plus one; 0 for none).
 struct PolyEntry
 {
-    enum Kind : std::uint8_t { OwnData, ProtoData, OwnAccessor, ProtoAccessor };
+    /// A read site's kinds, then a store site's: a write to an own data property, and an add (from `shape` to `next`, with
+    /// the validity of the chain when one is held).
+    enum Kind : std::uint8_t { OwnData, ProtoData, OwnAccessor, ProtoAccessor, Write, Add };
     std::uint32_t shape = 0;
     std::uint32_t index = 0;
     JSObject* holder = nullptr;
-    ValidityCell* validity = nullptr;  ///< holds a count (inherited kinds)
+    ValidityCell* validity = nullptr;  ///< holds a count (inherited kinds, an add)
     Kind kind = OwnData;
     std::uint8_t aux = 0;  ///< the inline slot count of the receiver it learned on, + 1 (0: not known or not one)
+    std::uint32_t next = 0;  ///< the shape after an add
 };
 struct PolyCache
 {
@@ -263,6 +266,14 @@ inline std::uint8_t thisSlotsOf(CodeBlock* c) noexcept
     }
     c->thisSlots = n <= 3 ? 3 : 8;
     return c->thisSlots;
+}
+
+/// The inline slots for `this` of `new` of code `c` with prototype root `root`: what the code stores, or what objects of the
+/// tree have grown to.
+inline std::uint8_t newSlotsOf(CodeBlock* c, const Shape* root) noexcept
+{
+    const std::uint8_t own = thisSlotsOf(c);
+    return root && root->slotHint > own ? root->slotHint : own;
 }
 
 }  // namespace vm

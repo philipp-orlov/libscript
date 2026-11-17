@@ -285,8 +285,6 @@ JSValue forInKeys(VM& vm, JSValue value)
 
 // -------------------------------------------------------------- the caches ---
 
-/// Whether `o` may hand out the position of a property: in the shape tree, and not a function whose properties are not
-/// made yet.
 /// Whether a read of a hole of `a`, or past its end, is undefined without a look anywhere: a plain array (no properties
 /// of its own, which an index given attributes would be) whose prototypes are the usual ones, with no elements.
 inline bool plainHoleRead(VM& vm, JSArray* a)
@@ -294,10 +292,29 @@ inline bool plainHoleRead(VM& vm, JSArray* a)
     return a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 && vm.plainHoleStores();
 }
 
+/// Whether `o` may hand out the position of a property: in the shape tree, and not a function whose properties are not
+/// made yet.
 inline bool cacheable(VM& vm, JSObject* o) noexcept
 {
     return !o->isDictionary(vm) && !(o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)) &&
            !proxyOf(o);
+}
+
+/// The slot index of `o`'s own property `key` when a cache may hold it under `o`'s shape: in the tree, or a dictionary read
+/// often enough (its shape changes when the key would move). -1 otherwise.
+std::int32_t cachedOwnIndex(VM& vm, JSObject* o, Key key, std::uint8_t* attrs) noexcept
+{
+    if (cacheable(vm, o))
+        return o->shapeOf(vm)->indexOf(key, attrs);
+    if (!o->isDictionary(vm) || proxyOf(o) ||
+        (o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)))
+        return -1;
+    const Dictionary& d = *o->rare()->dict;
+    const std::int32_t i = d.find(key);
+    if (i < 0 || !o->cacheDictionary(vm))
+        return -1;
+    *attrs = d.entries[std::uint32_t(i)].attrs;
+    return i;
 }
 
 void clearValidity(VM& vm, InlineCache& ic) noexcept
@@ -311,10 +328,10 @@ void clearValidity(VM& vm, InlineCache& ic) noexcept
 /// A read found `key` as an own data property of `o`, or on a prototype: remember where.
 bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
 {
-    if (!cacheable(vm, o))
-        return false;
     std::uint8_t attrs = 0;
-    std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
+    std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
+    if (!cacheable(vm, o) && index < 0)
+        return false;  // a dictionary: only what it holds itself (a key it adds would hide one inherited)
     if (index >= 0) {
         if (attrs & attr::kAccessor)
             return false;
@@ -347,10 +364,38 @@ bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
     return false;
 }
 
+/// Put `entry` into the site's `PolyCache`, over the one of its shape or, when all four are taken, the oldest.
+void placePoly(VM& vm, CodeBlock* code, InlineCache& ic, PolyEntry entry)
+{
+    if (!ic.pad) {
+        code->poly.emplace_back();
+        ic.pad = std::uint16_t(code->poly.size());
+    }
+    PolyCache& pc = code->poly[ic.pad - 1];
+    std::uint8_t at = pc.n;
+    for (std::uint8_t i = 0; i < pc.n; ++i)
+        if (pc.e[i].shape == entry.shape)
+            at = i;
+    const bool known = at != pc.n;
+    if (!known) {
+        if (pc.n < 4) {
+            ++pc.n;
+        } else {
+            at = pc.next;
+            pc.next = std::uint8_t((pc.next + 1) & 3);
+        }
+    }
+    if (known && pc.e[at].aux != entry.aux)
+        entry.aux = 0;  // objects of this shape come with different inline slot counts
+    if (pc.e[at].validity)
+        vm.releaseValidity(pc.e[at].validity);
+    pc.e[at] = entry;
+}
+
 /// Remember where a read of `key` on `o` finds it in the site's `PolyCache`: a data property or an accessor, own or inherited.
 bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
 {
-    if (!cacheable(vm, o))
+    if (!cacheable(vm, o) && !(o->isDictionary(vm) && o->cls() != ObjClass::TypedArray))
         return false;
     // A typed array answers a canonical numeric name itself, whatever its prototypes have.
     double numeric;
@@ -359,10 +404,12 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
         return false;
     PolyEntry entry;
     std::uint8_t attrs = 0;
-    std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
+    std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
     bool inherited = false;
     JSObject* holder = nullptr;
     if (index < 0) {
+        if (!cacheable(vm, o))
+            return false;
         for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
             if (!cacheable(vm, p) || (numericKey && p->cls() == ObjClass::TypedArray))
                 return false;
@@ -386,30 +433,8 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
         entry.validity = vm.validityOf(o->proto(vm));
         vm.retainValidity(entry.validity);
     }
-    if (!ic.pad) {
-        code->poly.emplace_back();
-        ic.pad = std::uint16_t(code->poly.size());
-    }
-    PolyCache& pc = code->poly[ic.pad - 1];
-    std::uint8_t at = pc.n;
-    for (std::uint8_t i = 0; i < pc.n; ++i)
-        if (pc.e[i].shape == entry.shape)
-            at = i;
-    const bool known = at != pc.n;
-    if (!known) {
-        if (pc.n < 4) {
-            ++pc.n;
-        } else {
-            at = pc.next;
-            pc.next = std::uint8_t((pc.next + 1) & 3);
-        }
-    }
     entry.aux = std::uint8_t(o->h.aux + 1u);
-    if (known && pc.e[at].aux != entry.aux)
-        entry.aux = 0;  // objects of this shape come with different inline slot counts
-    if (pc.e[at].validity)
-        vm.releaseValidity(pc.e[at].validity);
-    pc.e[at] = entry;
+    placePoly(vm, code, ic, entry);
     return true;
 }
 
@@ -468,15 +493,55 @@ int readCachedSlow(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValu
     return 0;
 }
 
-/// A store to an own writable data property.
-void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key)
+/// A store through the site's `PolyCache`: true when an entry applied and the store is done.
+bool storePoly(CodeBlock* code, const InlineCache& ic, JSObject* o, JSValue v)
 {
-    if (!cacheable(vm, o) || hasElems(o))
+    if (!ic.pad)
+        return false;
+    const PolyCache& pc = code->poly[ic.pad - 1];
+    for (std::uint8_t i = 0; i < pc.n; ++i) {
+        const PolyEntry& e = pc.e[i];
+        if (e.shape != o->h.shape)
+            continue;
+        if (e.kind == PolyEntry::Write) {
+            JSValue* slot = o->slotAt(e.index);
+            const JSValue old = *slot;
+            *slot = v;
+            retain(v);
+            release(old);
+            return true;
+        }
+        if (e.kind == PolyEntry::Add && (!e.validity || e.validity->valid) &&
+            !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible)) && e.index < o->h.aux) {
+            o->inl()[e.index] = v;
+            retain(v);
+            o->h.shape = e.next;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/// A store to an own writable data property. A site whose inline cache holds another shape remembers it in its
+/// `PolyCache` (when `code` is given).
+void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key, CodeBlock* code = nullptr)
+{
+    if (hasElems(o))
         return;
     std::uint8_t attrs = 0;
-    const std::int32_t index = o->shapeOf(vm)->indexOf(key, &attrs);
+    const std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
     if (index < 0 || !(attrs & attr::kWritable) || (attrs & attr::kAccessor))
         return;
+    if (code && ic.shape != 0 && ic.shape != o->h.shape) {
+        PolyEntry e;
+        e.kind = PolyEntry::Write;
+        e.shape = o->h.shape;
+        e.index = std::uint32_t(index);
+        e.aux = std::uint8_t(o->h.aux + 1u);
+        placePoly(vm, code, ic, e);
+        return;
+    }
     clearValidity(vm, ic);
     ic.shape = o->h.shape;
     ic.index = std::uint32_t(index);
@@ -487,7 +552,7 @@ void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key)
 /// A store (or a literal's property) that added `key` to an object whose shape was `before`: remember the shape after.
 /// A store that goes through the prototypes also holds the validity of the chain, since a setter or a read-only property
 /// added to one of them would change what the store does.
-void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key key, bool throughChain)
+void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key key, bool throughChain, CodeBlock* code = nullptr)
 {
     if (o->h.shape == before || !cacheable(vm, o) || hasElems(o) || o->isProto())
         return;
@@ -495,14 +560,25 @@ void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key ke
     Shape* was = vm.shapeById(before);
     if (!was || now->parent != was || now->key != key || now->attrs != attr::kDefault || was->count >= o->h.aux)
         return;
-    clearValidity(vm, ic);
+    ValidityCell* cell = nullptr;
     if (throughChain) {
         if (JSObject* p = o->proto(vm)) {
-            ValidityCell* cell = vm.validityOf(p);
+            cell = vm.validityOf(p);
             vm.retainValidity(cell);
-            ic.validity = cell;
         }
     }
+    if (code && ic.shape != 0 && ic.shape != before) {
+        PolyEntry e;
+        e.kind = PolyEntry::Add;
+        e.shape = before;
+        e.next = o->h.shape;
+        e.index = was->count;
+        e.validity = cell;
+        placePoly(vm, code, ic, e);
+        return;
+    }
+    clearValidity(vm, ic);
+    ic.validity = cell;
     ic.shape = before;
     ic.next = o->h.shape;
     ic.index = was->count;
@@ -817,9 +893,11 @@ L_GetGlobalOrUndef: {
     std::uint8_t attrs = 0;
     JSValue* slot = g->findOwn(vm, key, &attrs);
     if (slot && !(attrs & attr::kAccessor)) {
-        if (cacheId != kNoCache && cacheable(vm, g)) {
-            ic.shape = g->h.shape;
-            ic.index = std::uint32_t(g->shapeOf(vm)->indexOf(key));
+        if (std::uint8_t at = 0; cacheId != kNoCache) {
+            if (const std::int32_t place = cachedOwnIndex(vm, g, key, &at); place >= 0) {
+                ic.shape = g->h.shape;
+                ic.index = std::uint32_t(place);
+            }
         }
         COPYP(ins->a, *slot);
         ++pc;
@@ -860,9 +938,11 @@ L_PutGlobal: {
     std::uint8_t attrs = 0;
     JSValue* slot = g->findOwn(vm, key, &attrs);
     if (slot && (attrs & attr::kWritable) && !(attrs & attr::kAccessor)) {
-        if (cacheId != kNoCache && cacheable(vm, g)) {
-            ic.shape = g->h.shape;
-            ic.index = std::uint32_t(g->shapeOf(vm)->indexOf(key));
+        if (std::uint8_t at = 0; cacheId != kNoCache) {
+            if (const std::int32_t place = cachedOwnIndex(vm, g, key, &at); place >= 0) {
+                ic.shape = g->h.shape;
+                ic.index = std::uint32_t(place);
+            }
         }
         const JSValue old = *slot;
         *slot = R[ins->b];
@@ -1603,6 +1683,10 @@ L_PutProp: {
                 NEXT();
             }
         }
+        if (storePoly(code, ic, o, R[ins->c])) {
+            ++pc;
+            NEXT();
+        }
         SCRIPT_VM_CENSUS(SlowPutProp);
         const std::uint32_t before = o->h.shape;
         fr->pc = pc;
@@ -1614,9 +1698,9 @@ L_PutProp: {
         }
         if (cacheId != kNoCache) {
             if (o->h.shape == before)
-                learnOwnWrite(vm, ic, o, key);
+                learnOwnWrite(vm, ic, o, key, code);
             else
-                learnAdd(vm, ic, o, before, key, true);
+                learnAdd(vm, ic, o, before, key, true, code);
         }
         ++pc;
         NEXT();
@@ -2452,14 +2536,14 @@ do_call: {
         if (vm.prototypeAt2(f)) [[likely]] {
             // Every ordinary function once its `prototype` is made, and every class: `length`, `name`, `prototype`, ...
             const JSValue pv = *f->slotAt(2);
-            made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object,
-                                (f->flags & JSFunction::kNative) ? 3 : thisSlotsOf(f->code));
+            Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
+            made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(f->code, root));
         } else {
             JSValue protoValue = getProperty(vm, callee, vm.atoms.prototype);
             if (protoValue.isException())
                 FAIL();
-            JSObject* proto = isObject(protoValue) ? asObject(protoValue) : vm.protos.object;
-            made = vm.newObject(proto, (f->flags & JSFunction::kNative) ? 3 : thisSlotsOf(f->code));
+            Shape* root = vm.rootShapeFor(isObject(protoValue) ? asObject(protoValue) : vm.protos.object);
+            made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(f->code, root));
             release(protoValue);
         }
         setReg(R[base + 1], toJSValue(made));
@@ -3064,9 +3148,11 @@ int jitGetGlobal(VM& vm, std::uint32_t index)
     std::uint8_t attrs = 0;
     JSValue* slot = g->findOwn(vm, key, &attrs);
     if (slot && !(attrs & attr::kAccessor)) {
-        if (c.cacheId != kNoCache && cacheable(vm, g)) {
-            ic.shape = g->h.shape;
-            ic.index = std::uint32_t(g->shapeOf(vm)->indexOf(key));
+        if (std::uint8_t at = 0; c.cacheId != kNoCache) {
+            if (const std::int32_t place = cachedOwnIndex(vm, g, key, &at); place >= 0) {
+                ic.shape = g->h.shape;
+                ic.index = std::uint32_t(place);
+            }
         }
         copyReg(c.R[ins->a], *slot);
         return 1;
@@ -3211,6 +3297,8 @@ int jitPutProp(VM& vm, std::uint32_t index)
                 return 1;
             }
         }
+        if (storePoly(c.code, ic, o, R[ins->c]))
+            return 1;
         const std::uint32_t before = o->h.shape;
         if (!setProperty(vm, base, key, R[ins->c], strict)) {
             if (!vm.exception.isUndefined())
@@ -3219,9 +3307,9 @@ int jitPutProp(VM& vm, std::uint32_t index)
         }
         if (c.cacheId != kNoCache) {
             if (o->h.shape == before)
-                learnOwnWrite(vm, ic, o, key);
+                learnOwnWrite(vm, ic, o, key, c.code);
             else
-                learnAdd(vm, ic, o, before, key, true);
+                learnAdd(vm, ic, o, before, key, true, c.code);
         }
         return 1;
     }

@@ -270,7 +270,8 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
             code->prof[index] |= opt::kProfFailed;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (std::getenv("T2EXITS"))
-            std::fprintf(stderr, "tier2 exit %s @%u kind %d\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind);
+            std::fprintf(stderr, "tier2 exit %s @%u kind %d (n=%zu tries %d)\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind,
+                         code->code.size(), int(code->tier2Tries));
 #endif
         SCRIPT_VM_CENSUS(Tier2Exit);
         // A guard that keeps failing in one place: the code was made for something that no longer happens there.
@@ -320,6 +321,12 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
     try {
         Frame* fr = vm->frameTop - 1;
         CodeBlock* code = fr->code;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2TRIG"))
+            std::fprintf(stderr, "tier2 trigger %s line %u n=%zu tries %d header %d\n",
+                         code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
+                         code->lines.empty() ? 0u : unsigned(code->lines[0]), code->code.size(), int(code->tier2Tries), int(header));
+#endif
         if (!code->tier1 || code->tier2Tries >= 5) {
             code->tier2Counter = 0x40000000;
             return nullptr;
@@ -448,7 +455,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     --vm.ticks;
     if (isNew) {
         const JSValue pv = *f->slotAt(2);
-        JSObject* made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object, thisSlotsOf(f->code));
+        Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
+        JSObject* made = vm.newObject(root, newSlotsOf(f->code, root));
         const JSValue old = R[base + 1];
         R[base + 1] = toJSValue(made);
         release(old);
@@ -492,7 +500,8 @@ extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
 {
     try {
         const JSValue pv = *f->slotAt(2);
-        return toJSValue(vm->newObject(isObject(pv) ? asObject(pv) : vm->protos.object, thisSlotsOf(f->code))).bits;
+        Shape* root = vm->rootShapeFor(isObject(pv) ? asObject(pv) : vm->protos.object);
+        return toJSValue(vm->newObject(root, newSlotsOf(f->code, root))).bits;
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -629,6 +638,7 @@ constexpr std::int32_t kStrInterned = std::int32_t(offsetof(StringCell, interned
 constexpr std::int32_t kStrChars = std::int32_t(sizeof(StringCell));
 constexpr std::int32_t kRareChildRoot = std::int32_t(offsetof(Rare, childRoot));
 constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
+constexpr std::int32_t kShapeSlotHint = std::int32_t(offsetof(Shape, slotHint));
 constexpr std::int32_t kShapeFlags = std::int32_t(offsetof(Shape, flags));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
 constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
@@ -1393,8 +1403,9 @@ private:
     Mem provenSlotMem(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
         static_assert(kHdrKind == kHdrAux + 1, "the inline slot count and the kind are one 16-bit word");
-        if (aux != 0 && factShape_[reg] != shape) {
-            // Not known yet: a cell, of the shape, and the kind and the inline slot count in one compare.
+        if (aux != 0 && factShape_[reg] != shape && std::int32_t(index) >= std::int32_t(aux) - 1) {
+            // Not known yet: a cell, of the shape, and the kind and the inline slot count in one compare (a slot out of
+            // place is where that count says).
             if (!raxHoldsObj(reg))
                 a_.mov(RAX, R(reg));
             a_.test(RAX, R15);
@@ -1412,15 +1423,28 @@ private:
             return mem(RDX, 0);
         }
         const std::int32_t inl = std::int32_t(aux) - 1;
+        if (std::int32_t(index) < inl) {
+            // An inline slot: any object with more inline slots than the index has it there (objects of one shape can be
+            // made with more).
+            inlineAtLeast(reg, index, bad);
+            return mem(RAX, kObjInline + std::int32_t(8 * index));
+        }
         if (factAux_[reg] != inl) {
             a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
             a_.jcc(CNE, bad);
             factAux_[reg] = inl;
         }
-        if (std::int32_t(index) < inl)
-            return mem(RAX, kObjInline + std::int32_t(8 * index));
         a_.mov(RDX, mem(RAX, kObjSlots));
         return mem(RDX, std::int32_t(8 * (std::int32_t(index) - inl)));
+    }
+    /// The object in rax (from frame register `reg`) has inline slot `index`: checked unless known.
+    void inlineAtLeast(unsigned reg, std::uint32_t index, Label& bad)
+    {
+        if (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index))
+            return;
+        a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(index));
+        a_.jcc(CBE, bad);
+        factInl_[reg] = std::int32_t(index) + 1;
     }
     void provenSlot(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
@@ -1430,14 +1454,17 @@ private:
             return;
         }
         const std::int32_t inl = std::int32_t(aux) - 1;
+        if (std::int32_t(index) < inl) {
+            inlineAtLeast(reg, index, bad);
+            a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
+            return;
+        }
         if (factAux_[reg] != inl) {
             a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
             a_.jcc(CNE, bad);
             factAux_[reg] = inl;
         }
-        if (std::int32_t(index) < inl) {
-            a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
-        } else {
+        {
             a_.mov(RDX, mem(RAX, kObjSlots));
             a_.lea(RDX, mem(RDX, std::int32_t(8 * (std::int32_t(index) - inl))));
         }
@@ -3994,15 +4021,33 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.test(RSI, RSI);
             a_.jcc(CE, viaRuntime);
             a_.mov32(R8, mem(RSI, kShapeId));
-            Label big;
+            // The tree's hint (8, 16 or 24) when objects of it have grown, else what the code stores (3 or 8).
+            Label big, hinted, h16, h24;
+            a_.cmpI8(mem(RSI, kShapeSlotHint), 0);
+            a_.jcc(CNE, hinted);
             a_.cmpI8(mem(RCX, kCbThisSlots), 3);
             a_.jcc(CNE, big);
             if (allocObject(0, 3, viaRuntime, true))
                 a_.jmp(made);
             else
                 a_.jmp(viaRuntime);
+            a_.bind(hinted);
+            a_.cmpI8(mem(RSI, kShapeSlotHint), 8);
+            a_.jcc(CNE, h16);
             a_.bind(big);
             if (allocObject(0, 8, viaRuntime, true))
+                a_.jmp(made);
+            else
+                a_.jmp(viaRuntime);
+            a_.bind(h16);
+            a_.cmpI8(mem(RSI, kShapeSlotHint), 16);
+            a_.jcc(CNE, h24);
+            if (allocObject(0, 16, viaRuntime, true))
+                a_.jmp(made);
+            else
+                a_.jmp(viaRuntime);
+            a_.bind(h24);
+            if (allocObject(0, 24, viaRuntime, true))
                 a_.jmp(made);
             a_.bind(viaRuntime);
             a_.mov(RAX, R(base));
@@ -4390,8 +4435,20 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
     }
 #endif
     opt::Plan plan = opt::analyse(*code);
-    if (!plan.ok)
+    if (!plan.ok) {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2REFUSED")) {
+            std::string why;
+            for (std::uint32_t i = 0; i < code->code.size() && why.empty(); i = opt::nextOf(*code, i))
+                if (!opt::effectsOf(*code, i).ok)
+                    why = "op " + std::to_string(int(code->code[i].opcode())) + " at " + std::to_string(i);
+            std::fprintf(stderr, "tier2 refused %s line %u: n=%zu nregs=%u %s\n",
+                         code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", code->lines.empty() ? 0u : unsigned(code->lines[0]),
+                         code->code.size(), unsigned(code->nregs), why.c_str());
+        }
+#endif
         return nullptr;
+    }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("T2DBG")) {
         std::fprintf(stderr, "tier2 compile: %s n=%u tries=%d webs=%zu prof:", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",

@@ -347,6 +347,39 @@ void JSObject::toDictionary(VM& vm)
     h.shape = ds->id;
 }
 
+void JSObject::dictionaryChanging(VM& vm)
+{
+    Shape* s = shapeOf(vm);
+    if (!(s->flags & Shape::kCachedDict))
+        return;
+    Shape* n = vm.newShape();
+    n->flags = Shape::kDictionary;
+    n->proto = s->proto;
+    h.shape = n->id;
+    vm.freeShape(s);
+    Dictionary& d = *rare()->dict;
+    d.misses = 0;
+    if (d.changes < 255)
+        ++d.changes;
+}
+
+bool JSObject::cacheDictionary(VM& vm) noexcept
+{
+    Shape* s = shapeOf(vm);
+    if (s->flags & Shape::kCachedDict)
+        return true;
+    // A dictionary used as a map, keys coming and going, would spend an id each time: after a few, it is read uncached.
+    constexpr std::uint32_t kBudget = 1u << 14;
+    Dictionary& d = *rare()->dict;
+    if (d.changes >= 4 || vm.cachedDictionaries >= kBudget)
+        return false;
+    if (++d.misses < 8)
+        return false;
+    ++vm.cachedDictionaries;
+    s->flags |= Shape::kCachedDict;
+    return true;
+}
+
 void JSObject::setProto(VM& vm, JSObject* next)
 {
     if (next == proto(vm))
@@ -359,6 +392,8 @@ void JSObject::setProto(VM& vm, JSObject* next)
     }
     if (s->isDictionary()) {
         vm.rootShapeFor(next);  // makes `next` a prototype that something holds a count of, for as long as the VM lives
+        dictionaryChanging(vm);
+        s = shapeOf(vm);
         s->proto = next;
     } else {
         Shape* t = vm.rootShapeFor(next);
@@ -424,6 +459,13 @@ void JSObject::addProperty(VM& vm, Key key, JSValue value, std::uint8_t attrs)
             addProperty(vm, key, value, attrs);
             return;
         }
+        if (s->count >= h.aux && !isProto() && cls() == ObjClass::Plain) {
+            // Past the slots in place: `new` gives the next objects of this tree more (an add then stays a cached one).
+            const std::uint32_t want = s->count + 1;
+            const std::uint8_t hint = want <= 8 ? 8 : want <= 16 ? 16 : 24;
+            if (s->root && s->root->slotHint < hint)
+                s->root->slotHint = hint;
+        }
         reserveSlot(vm, s->count);
         *slotAt(s->count) = value;
         h.shape = next->id;
@@ -456,11 +498,12 @@ bool JSObject::setAttrs(VM& vm, Key key, std::uint8_t attrs)
     materialize(vm);
     Shape* s = shapeOf(vm);
     if (s->isDictionary()) {
-        Dictionary& d = *rare()->dict;
-        const std::int32_t i = d.find(key);
+        const std::int32_t i = rare()->dict->find(key);
         if (i < 0)
             return false;
-        d.entries[i].attrs = attrs;
+        if (rare()->dict->entries[i].attrs != attrs)
+            dictionaryChanging(vm);
+        rare()->dict->entries[i].attrs = attrs;
     } else {
         const std::int32_t i = s->indexOf(key);
         if (i < 0)
@@ -514,6 +557,7 @@ bool JSObject::deleteOwn(VM& vm, Key key)
             return true;
         if (!(d.entries[i].attrs & attr::kConfigurable))
             return false;
+        dictionaryChanging(vm);
         removed = *slotAt(std::uint32_t(i));
         *slotAt(std::uint32_t(i)) = JSValue::undefined();
         d.erase(std::uint32_t(i));

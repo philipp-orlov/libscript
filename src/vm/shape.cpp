@@ -226,10 +226,14 @@ void VM::retireShapeTree(Shape* root) noexcept
 void VM::freeShape(Shape* shape) noexcept
 {
     shapeTable_[shape->id] = nullptr;
-    try {
-        freeShapeIds_.push_back(shape->id);
-    } catch (...) {
-        // The id is lost; there are a million of them.
+    if (shape->flags & Shape::kCachedDict) {
+        ++retiredShapes_;  // an inline cache may still name it
+    } else {
+        try {
+            freeShapeIds_.push_back(shape->id);
+        } catch (...) {
+            // The id is lost; there are a million of them.
+        }
     }
     // A dictionary's shape is private and holds nothing; a tree shape that fails to be made has no key yet.
     shape->~Shape();

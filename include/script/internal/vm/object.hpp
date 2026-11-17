@@ -98,6 +98,10 @@ struct JSObject
     /// Change the attributes of an own property: false when there is none.
     bool setAttrs(VM& vm, Key key, std::uint8_t attrs);
     void toDictionary(VM& vm);
+    /// A dictionary about to move, drop or change a key: a shape an inline cache holds is given up for a new one.
+    void dictionaryChanging(VM& vm);
+    /// Whether an inline cache may hold this dictionary's shape for a read of its own property: one read often enough.
+    bool cacheDictionary(VM& vm) noexcept;
     /// Every own property in the order they were added.
     template <class F>
     void forEachOwn(VM& vm, F&& visit)

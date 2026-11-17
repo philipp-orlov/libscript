@@ -1936,7 +1936,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     };
     std::vector<Store> stores;
     std::vector<ValidityCell*> cells;
-    const std::uint8_t aux = thisSlotsOf(C);
+    const std::uint8_t aux = newSlotsOf(C, vm_.rootShapeFor(proto));
     std::uint32_t shape = vm_.rootShapeFor(proto)->id;
     std::vector<std::int8_t> constReg(C->nregs, 0);
     std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
@@ -2581,8 +2581,13 @@ void Baseline::planLoopFacts()
             if (in.opcode() != Op::PutProp || j + 1 >= n_ || code_->code[j + 1].a == kNoCache)
                 continue;
             const auto& uw = plan_->useWebs[j];
-            if (uw.size() < 2 || uw[1] < 0 || !isI32(uw[1]))
-                notInt.insert(code_->caches[code_->code[j + 1].a].index);
+            if (uw.size() < 2 || uw[1] < 0 || !isI32(uw[1])) {
+                const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+                notInt.insert(ic.index);
+                if (ic.pad && ic.pad <= code_->poly.size())
+                    for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k)
+                        notInt.insert(code_->poly[ic.pad - 1].e[k].index);
+            }
         }
         for (const auto& [r, k] : nums)
             loopNums_.push_back(LoopNum{h, std::uint32_t(end), r, k, !notInt.count(k) && !readNotInt.count({r, k})});
@@ -2593,9 +2598,15 @@ void Baseline::planLoopFacts()
             if (code_->code[j].opcode() == Op::PutProp && j + 1 < n_ && code_->code[j + 1].a != kNoCache) {
                 const InlineCache& ic = code_->caches[code_->code[j + 1].a];
                 stored.insert({ic.shape, ic.index});
+                if (ic.next)
+                    stored.insert({ic.next, ic.index});  // an add: the slot of the shape after it
                 if (ic.pad && ic.pad <= code_->poly.size())
-                    for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k)
-                        stored.insert({code_->poly[ic.pad - 1].e[k].shape, code_->poly[ic.pad - 1].e[k].index});
+                    for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k) {
+                        const PolyEntry& e = code_->poly[ic.pad - 1].e[k];
+                        stored.insert({e.shape, e.index});
+                        if (e.kind == PolyEntry::Add)
+                            stored.insert({e.next, e.index});
+                    }
             }
         for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
             const Ins& in = code_->code[j];
@@ -2664,12 +2675,14 @@ void Baseline::planLoopFacts()
                         if ((op != Op::GetProp && op != Op::PutProp) || code_->code[j + 1].a == kNoCache)
                             continue;
                         const InlineCache& ic = code_->caches[code_->code[j + 1].a];
-                        bool touches = ic.shape == shape && ic.index == idx && !ic.holder;
+                        bool touches = (ic.shape == shape || (ic.next && ic.next == shape)) && ic.index == idx && !ic.holder;
                         const bool poly = ic.pad && ic.pad <= code_->poly.size() && code_->poly[ic.pad - 1].n;
                         if (poly)
-                            for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k)
-                                touches = touches || (code_->poly[ic.pad - 1].e[k].shape == shape &&
-                                                      code_->poly[ic.pad - 1].e[k].index == idx);
+                            for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k) {
+                                const PolyEntry& e = code_->poly[ic.pad - 1].e[k];
+                                touches = touches || ((e.shape == shape || (e.kind == PolyEntry::Add && e.next == shape)) &&
+                                                      e.index == idx);
+                            }
                         if (!touches)
                             continue;
                         const unsigned recv = op == Op::GetProp ? in.b : in.a;
@@ -2796,10 +2809,19 @@ void Baseline::planLoopFacts()
             if (c >= h && std::int64_t(c) <= end && reads.second + 1 < n_ && code_->code[reads.second + 1].a != kNoCache)
                 readShapes.insert(code_->caches[code_->code[reads.second + 1].a].shape);
         bool storesThere = false;
-        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j))
-            if (code_->code[j].opcode() == Op::PutProp && j + 1 < n_ && code_->code[j + 1].a != kNoCache &&
-                readShapes.count(code_->caches[code_->code[j + 1].a].shape))
+        for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
+            if (code_->code[j].opcode() != Op::PutProp || j + 1 >= n_ || code_->code[j + 1].a == kNoCache)
+                continue;
+            const InlineCache& ic = code_->caches[code_->code[j + 1].a];
+            if (readShapes.count(ic.shape) || (ic.next && readShapes.count(ic.next)))
                 storesThere = true;
+            if (ic.pad && ic.pad <= code_->poly.size())
+                for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k) {
+                    const PolyEntry& e = code_->poly[ic.pad - 1].e[k];
+                    if (readShapes.count(e.shape) || (e.kind == PolyEntry::Add && readShapes.count(e.next)))
+                        storesThere = true;
+                }
+        }
         if (!storesThere) {
             for (std::uint32_t j = h; std::int64_t(j) <= end; j += length(j)) {
                 const Ins& in = code_->code[j];

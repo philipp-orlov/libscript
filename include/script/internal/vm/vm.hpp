@@ -187,6 +187,8 @@ struct VM : EngineRuntime
     /// the prototype.
     Shape* rootShapeFor(JSObject* proto);
     std::uint32_t maxShapes = kDefaultMaxShapes;
+    /// Dictionary shapes inline caches were let hold: their ids are never reused, so there is a budget.
+    std::uint32_t cachedDictionaries = 0;
     std::uint32_t shapesAlive() const noexcept { return shapeCount_ - std::uint32_t(freeShapeIds_.size()) - retiredShapes_ - 1; }
     /// Free the shapes of a prototype that is gone and of everything inherited from it. Their ids stay taken: native code and
     /// inline caches may still name one, and must never meet another shape under it.

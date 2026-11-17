@@ -138,6 +138,32 @@ struct JSArray : JSObject
     std::uint32_t capacity;
     static constexpr std::uint32_t kSmall = 4;
     JSValue small[kSmall];  ///< the first elements of an array that has never had more
+    /// The elements below `packed` are numbers: no hole and no cell among them, so a store of a number over one of them
+    /// has nothing to look at or let go of, and nothing below it needs a look when the array is freed or traced. A
+    /// lower bound (zero is always right) and never above `length`; never above zero in a frozen array, whose elements
+    /// compiled code then leaves to the checks of the long way. Every writer of `elems` and `length` keeps it.
+    std::uint32_t packed;
+
+    /// After `elems[index] = v`, with `index < length`.
+    void noteStore(std::uint32_t index, JSValue v) noexcept
+    {
+        if (v.isNumber())
+            packed += index == packed && !(h.flags & cellflags::kFrozen);
+        else if (index < packed)
+            packed = index;
+    }
+    /// After elements from `from` on were moved or replaced: what follows the numbers still known is looked at.
+    void repack(std::uint32_t from = 0) noexcept
+    {
+        std::uint32_t p = packed < from ? packed : from;
+        if (h.flags & cellflags::kFrozen) {
+            packed = 0;
+            return;
+        }
+        while (p < length && elems[p].isNumber())
+            ++p;
+        packed = p;
+    }
 
     bool ownsElems() const noexcept { return elems && elems != small; }
 

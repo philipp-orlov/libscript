@@ -6,16 +6,18 @@
 
 using namespace vmtest;
 
-TEST(anArrayIsSeventyTwoBytesWithFourElementsInPlaceAndHoldsEightByteElements)
+TEST(anArrayIsEightyBytesWithFourElementsInPlaceAndHoldsEightByteElements)
 {
     Fixture f;
     JSArray* a = f.vm.newArray(nullptr);
     CHECK_EQ(cellBytesOf(reinterpret_cast<CellPtr>(a)), sizeof(JSArray));
-    CHECK_EQ(sizeof(JSArray), std::size_t(72));
+    CHECK_EQ(sizeof(JSArray), std::size_t(80));  // what the heap's slot for 72 bytes was already
+    CHECK_EQ(a->packed, 0u);
     CHECK(a->elems == a->small && !a->ownsElems() && a->capacity == JSArray::kSmall);
     CHECK(a->allNumbers());
     for (int i = 0; i < 100; ++i)
         a->append(f.vm, num(i));
+    CHECK_EQ(a->packed, 100u);  // numbers only, from the start
     CHECK(a->allNumbers());
     CHECK_EQ(a->length, std::uint32_t(100));
     CHECK(a->capacity >= 100);

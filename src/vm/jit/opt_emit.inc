@@ -894,6 +894,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             return false;
         using namespace elemprof;
         std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+        const bool notRun = ep == 0;
         if (ep == 0)
             ep = kArray;  // not run yet: the usual case, and a guard that fails says so
         if (ep != kArray && ep != kFloat64 && ep != kInt32 && ep != kUint8)
@@ -903,6 +904,10 @@ bool Baseline::emitTyped(std::uint32_t i)
             return false;
         Label& bad = exitBefore(i);
         Label done;
+        // A read that had not run when this code was made says nothing of what it yields: once it has run a while the
+        // function is compiled again, and what the read gives can live in a register.
+        if (notRun && !put && dw < 0)
+            immature(i);
         a_.mov32(RCX, useI32(uw[1], RCX));
         a_.mov(RAX, R(put ? in.a : in.b));
         if (ep != kArray)
@@ -910,6 +915,22 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (ep == kArray) {
             provenArray(put ? in.a : in.b, put ? 3 : 1, bad);
             // Unsigned: a negative index is past any length (an array has fewer than 2^31 elements).
+            if (put && vw >= 0) {
+                // A number over one of the array's packed numbers: nothing to look at there, nothing to let go of.
+                Label notPacked;
+                a_.alu32(7, RCX, mem(RAX, kArrayPacked));
+                a_.jcc(CAE, notPacked);
+                a_.mov(RDX, mem(RAX, kArrayElems));
+                if (isI32(vw)) {
+                    a_.mov32(RSI, useI32(vw, RSI));
+                    a_.or_(RSI, R14);
+                } else {
+                    boxDoubleTo(RSI, operandF64(vw, 0, RSI), tame(vw));
+                }
+                a_.mov(mem(RDX, RCX, 8), RSI);
+                a_.jmp(done);
+                a_.bind(notPacked);
+            }
             a_.alu32(7, RCX, mem(RAX, kArrayLength));
             a_.jcc(CAE, bad);
             a_.mov(RDX, mem(RAX, kArrayElems));
@@ -957,6 +978,7 @@ bool Baseline::emitTyped(std::uint32_t i)
                 a_.test(RSI, R14);
                 a_.jcc(CNE, number);
                 a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+                unpackAt(RAX, RCX);
                 a_.bind(number);
             }
             Label hole;
@@ -964,6 +986,8 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.cmpI(RDI, std::int32_t(kHole));
             a_.jcc(CE, hole);
             a_.mov(mem(RDX, 0), RSI);
+            if (vw >= 0)
+                packAt(RAX, RCX);
             release(RDI);
             a_.jmp(done);
             // A hole of a plain array whose prototype chain is as it was: nothing can intercept the store. Otherwise the
@@ -972,6 +996,8 @@ bool Baseline::emitTyped(std::uint32_t i)
             Label undo;
             if (plainHoleGuard(RDI, undo)) {
                 a_.mov(mem(RDX, 0), RSI);
+                if (vw >= 0)
+                    packAt(RAX, RCX);
                 a_.jmp(done);
             }
             a_.bind(undo);

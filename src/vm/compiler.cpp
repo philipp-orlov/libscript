@@ -1305,6 +1305,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
                 for (const String& item : items)
                     a->append(vm_, fromValue(vm_, ctx_.str(item)));
                 a->h.flags |= cellflags::kFrozen | cellflags::kNotExtensible;
+                a->packed = 0;
                 return handle;
             };
             JSValue cooked = frozenArray(n.extra().strs);

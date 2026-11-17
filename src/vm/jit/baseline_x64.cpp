@@ -591,6 +591,7 @@ constexpr std::int32_t kVmFrameLimit = std::int32_t(offsetof(VM, frameLimit));
 constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, elems));
 constexpr std::int32_t kArrayCapacity = std::int32_t(offsetof(JSArray, capacity));
 constexpr std::int32_t kArrayLength = std::int32_t(offsetof(JSArray, length));
+constexpr std::int32_t kArrayPacked = std::int32_t(offsetof(JSArray, packed));
 #pragma GCC diagnostic pop
 constexpr std::int32_t kTypedData = std::int32_t(offsetof(JSTypedArray, data));
 constexpr std::int32_t kTypedLength = std::int32_t(offsetof(JSTypedArray, length));
@@ -838,7 +839,28 @@ private:
         a_.mov(mem(RAX, kArrayElems), RDX);
         a_.movImm(RDX, std::uint64_t(JSArray::kSmall) << 32);
         a_.mov(mem(RAX, kArrayLength), RDX);
+        a_.mov32(mem(RAX, kArrayPacked), 0);
         return true;
+    }
+    /// `JSArray::noteStore` for a value that is no number, stored at the index in `index`: the numbers end there at the
+    /// latest.
+    void unpackAt(Reg array, Reg index)
+    {
+        Label keep;
+        a_.alu32(7, index, mem(array, kArrayPacked));
+        a_.jcc(CAE, keep);
+        a_.mov32(mem(array, kArrayPacked), index);
+        a_.bind(keep);
+    }
+    /// `JSArray::noteStore` for a number stored at the index in `index` of an array that is not frozen: one more number
+    /// when it comes right after those known.
+    void packAt(Reg array, Reg index)
+    {
+        Label keep;
+        a_.alu32(7, index, mem(array, kArrayPacked));
+        a_.jcc(CNE, keep);
+        a_.inc32(mem(array, kArrayPacked));
+        a_.bind(keep);
     }
     /// A cell of `bytes` with header `h` (its shape or-ed with r8 when `shapeInR8`) and a count of one, made here as
     /// `VM::allocCell` does, counters and all, when the heap's current block has room and no collection is due; else
@@ -2488,7 +2510,13 @@ void Baseline::emit(std::uint32_t i)
         a_.jcc(CNE, number);
         a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
         retain(RDX);
-        a_.bind(number);
+        {
+            Label stored;
+            a_.jmp(stored);
+            a_.bind(number);
+            packAt(RAX, RCX);
+            a_.bind(stored);
+        }
         a_.mov(RSI, mem(RAX, kArrayElems));
         a_.mov(mem(RSI, RCX, 8), RDX);
         a_.inc32(mem(RAX, kArrayLength));
@@ -3311,7 +3339,14 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.test(RSI, R14);
     a_.jcc(CNE, isNumber);
     a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
-    a_.bind(isNumber);
+    unpackAt(RAX, RCX);
+    {
+        Label stored;
+        a_.jmp(stored);
+        a_.bind(isNumber);
+        packAt(RAX, RCX);
+        a_.bind(stored);
+    }
     a_.mov(RDI, mem(RDX, 0));
     a_.mov(mem(RDX, 0), RSI);
     release(RDI);
@@ -3331,7 +3366,13 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
             a_.test(RSI, R14);
             a_.jcc(CNE, holeNumber);
             a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
-            a_.bind(holeNumber);
+            {
+                Label stored;
+                a_.jmp(stored);
+                a_.bind(holeNumber);
+                packAt(RAX, RCX);
+                a_.bind(stored);
+            }
             a_.mov(mem(RDX, 0), RSI);
             a_.jmp(done);
         }
@@ -3675,7 +3716,13 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.test(RAX, R14);
             a_.jcc(CNE, number);
             a_.andI8(mem(RSI, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
-            a_.bind(number);
+            {
+                Label stored;
+                a_.jmp(stored);
+                a_.bind(number);
+                packAt(RSI, RCX);
+                a_.bind(stored);
+            }
             a_.mov(mem(RDX, RCX, 8), RAX);
             a_.aluI32(0, RCX, 1);
             a_.mov32(mem(RSI, kArrayLength), RCX);
@@ -3689,6 +3736,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.cmpI(RAX, std::int32_t(kHole));
             a_.jcc(CE, generic);
             a_.mov32(mem(RSI, kArrayLength), RCX);
+            unpackAt(RSI, RCX);
         }
         write(in.a, RAX);
         a_.jmp(afterCall);

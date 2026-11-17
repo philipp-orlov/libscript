@@ -4200,6 +4200,47 @@ TEST(treesComparedFreedAndBuiltInPlace)
     }
 }
 
+TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
+{
+    // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number
+    // over one of them without a look at what was there. Everything that puts something else there, makes a hole,
+    // moves elements, shortens or freezes the array must be seen: objects and strings among the numbers, delete,
+    // length, push and pop, shift and unshift, splice, reverse, sort, copyWithin, an accessor at an index, and objects
+    // overwritten by numbers (which are let go of: the soak tests count them).
+    const char* program =
+        "var out = []; "
+        "function fill(a, n, v) { for (var i = 0; i < n; i++) a[i] = v; } "
+        "function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) { var x = a[i]; if (typeof x === 'number') s += x; else if (x) s += 1000; } return s; } "
+        "function bump(a, k) { for (var r = 0; r < k; r++) for (var i = 0; i < a.length; i++) a[i] = a[i] + 1; } "
+        "function put(a, i, v) { a[i] = v; } "
+        "var a = new Array(3000); fill(a, 3000, 1); bump(a, 3); out.push(sum(a)); "
+        "var o = { n: 7 }; for (var i = 0; i < 3000; i++) put(a, i % 3000, i % 7 === 0 ? o : i); "
+        "out.push(sum(a)); fill(a, 3000, 0.5); out.push(sum(a)); "
+        "for (var i = 0; i < 3000; i += 2) put(a, i, 'str' + i); fill(a, 3000, 2); out.push(sum(a)); "
+        "a[10] = o; delete a[20]; bump(a, 1); out.push(String(a[10]).slice(0, 15), a[20] !== a[20], a[21]); "
+        "fill(a, 3000, 3); a.length = 1000; a.push(o); a.pop(); a.pop(); fill(a, a.length, 4); out.push(sum(a), a.length); "
+        "a.shift(); a.unshift(o, 1); fill(a, a.length, 5); out.push(sum(a)); "
+        "a.splice(5, 2, o, o, o); bump(a, 1); fill(a, a.length, 6); a.reverse(); fill(a, a.length, 6); out.push(sum(a)); "
+        "var b = [3, 1, o, 2]; b.sort(function (x, y) { return (typeof x === 'number' ? x : 9) - (typeof y === 'number' ? y : 9); }); fill(b, 4, 1); out.push(sum(b)); "
+        "var f = [1, 2, 3, 4, 5, 6]; fill(f, 6, 9); Object.freeze(f); try { fill(f, 6, 7); } catch (e) { out.push('thrown'); } for (var r = 0; r < 3000; r++) put(f, r % 6, 7); out.push(f.join('')); "
+        "var g = []; for (var i = 0; i < 3000; i++) g.push(i); fill(g, 3000, 1.5); g.copyWithin(0, 10, 20); g[5] = [g.length]; fill(g, 3000, 2.5); out.push(sum(g)); "
+        "var h = [0, 1, 2, 3]; Object.defineProperty(h, 1, { get: function () { return 42; }, set: function (v) { out.push('set' + v); }, configurable: true }); fill(h, 4, 8); out.push(h[0], h[1], h[2]); "
+        "var keep = []; for (var r = 0; r < 200; r++) { var t = []; for (var i = 0; i < 50; i++) t.push({ k: i }); fill(t, 50, r); keep = t; } out.push(sum(keep)); "
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("12000,4284858,1500,6000,[object Object],true,3,3996,999,5000,6006,4,999999,7500,set8,8,42,8,9950"));
+    }
+}
+
 TEST(anInlinedNewTakesTheCountOfArgumentsThatDie)
 {
     // An inlined `new` moves an argument's count into the object only when its register dies there: not for one passed

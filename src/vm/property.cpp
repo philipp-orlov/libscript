@@ -392,6 +392,7 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
                         return refuse(vm, strict, "Cannot delete property of a frozen array");
                 const JSValue old = a->elems[index];
                 a->elems[index] = JSValue::hole();
+                a->noteStore(index, JSValue::hole());
                 a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
                 release(old);
                 return true;
@@ -413,6 +414,7 @@ bool makeIndexHole(VM& vm, JSArray* a, std::uint32_t index, Key key)
             return false;
         const JSValue old = a->elems[index];
         a->elems[index] = JSValue::hole();
+        a->noteStore(index, JSValue::hole());
         a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
         release(old);
         return true;

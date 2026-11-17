@@ -211,6 +211,23 @@ register holds; `JSON.parse` follows known shape transitions and reads short dec
 waits until the cells have grown fourfold; `String.fromCharCode`, `Array.prototype.map`/`filter`/`forEach` and short
 decimals in `Number.prototype.toString` have fast paths; `MulI` wraps when its result only reaches `ToInt32`.
 
+## Arrays of numbers
+
+An array knows how many of its first elements are numbers (`JSArray::packed`: no hole and no cell below it). It is a
+lower bound that every writer of `elems` and `length` keeps (`noteStore`, `repack`), zero is always right, and it is zero
+in a frozen array. The field fits in the eight bytes the heap's slot for an array had to spare.
+
+- The optimizing compiler stores a number over a packed element with one compare and the store: the old value is not
+  read (it is no hole, so nothing can intercept the store, and no cell, so there is nothing to let go of). A loop that
+  strides through a large array then waits on no load.
+- A number stored right after the packed ones adds to them, in the interpreter and in both compilers, so an array made
+  with `new Array(n)` and filled in order is packed when the fill ends.
+- Freeing an array, and the cycle collector's walk over one, skip the packed elements.
+
+An element read that had not run when optimized code was made (the first loop of a function entered at a back edge
+comes before the others) has that code make way for a new compile once it has run a while, so what it yields can be a
+typed variable.
+
 ## Property read caches
 
 A read site has one inline cache (own property, prototype property with a validity cell, in the word after the instruction) and,

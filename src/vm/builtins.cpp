@@ -723,6 +723,8 @@ NATIVE(objectFreeze)
     }
     o->materialize(vm);
     o->h.flags |= cellflags::kFrozen | cellflags::kNotExtensible;
+    if (hasElems(o))
+        static_cast<JSArray*>(o)->packed = 0;
     std::vector<Key> keys;
     o->forEachOwn(vm, [&](Key k, std::uint8_t, JSValue) {
         if (k->kind != detail::CellKind::Symbol || !static_cast<dyn::SymbolCell*>(k)->isPrivate)
@@ -1216,6 +1218,7 @@ NATIVE(arrayUnshiftImpl)
         retain(args[i]);
         a->elems[i] = args[i];
     }
+    a->repack();
     return JSValue::boxNumber(double(a->length));
 }
 
@@ -1319,6 +1322,7 @@ NATIVE(arraySpliceImpl)
         retain(args[2 + i]);
         a->elems[start + i] = args[2 + i];
     }
+    a->repack(std::uint32_t(start));
     return keep.take();
 }
 
@@ -1364,6 +1368,7 @@ NATIVE(arrayReverseImpl)
     if (!a)
         return JSValue::exception();
     std::reverse(a->elems, a->elems + a->length);
+    a->repack();
     retain(self);
     return self;
 }
@@ -1500,6 +1505,7 @@ NATIVE(arraySortImpl)
     }
     // Write back: sorted values, then undefined, then holes. Each slot gets the count the item carries.
     const std::uint32_t n = a->length;
+    a->packed = 0;
     for (std::uint32_t i = 0; i < n; ++i) {
         const JSValue old = a->elems[i];
         a->elems[i] = JSValue::undefined();
@@ -1512,6 +1518,7 @@ NATIVE(arraySortImpl)
         a->elems[at++] = JSValue::undefined();
     for (std::uint32_t i = 0; i < holes; ++i)
         a->elems[at++] = JSValue::hole();
+    a->repack();
     a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     retain(self);
     return self;
@@ -1628,8 +1635,10 @@ NATIVE(arrayCopyWithinImpl)
         for (std::int64_t i = 0; i < count && to + i < std::int64_t(a->length); ++i) {
             const JSValue old = a->elems[to + i];
             a->elems[to + i] = slice[std::size_t(i)];
+            a->noteStore(std::uint32_t(to + i), slice[std::size_t(i)]);
             release(old);
         }
+        a->repack(a->packed);
         a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     }
     retain(self);

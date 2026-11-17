@@ -123,6 +123,7 @@ JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capac
     a->slots = nullptr;
     a->elems = a->small;
     a->length = 0;
+    a->packed = 0;
     a->capacity = JSArray::kSmall;
     try {
         a->reserve(*this, capacity);
@@ -620,6 +621,7 @@ void JSArray::append(VM& vm, JSValue value)
     if (!value.isNumber())
         h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     elems[length++] = value;
+    noteStore(length - 1, value);
 }
 
 void JSArray::appendAll(VM& vm, const JSValue* values, std::uint32_t n)
@@ -632,6 +634,7 @@ void JSArray::appendAll(VM& vm, const JSValue* values, std::uint32_t n)
         elems[length + i] = values[i];
     }
     length += n;
+    repack(length - n);
 }
 
 bool JSArray::setAt(VM& vm, std::uint32_t index, JSValue value)
@@ -641,6 +644,7 @@ bool JSArray::setAt(VM& vm, std::uint32_t index, JSValue value)
         elems[index] = value;
         if (!value.isNumber())
             h.flags &= std::uint8_t(~cellflags::kAllNumbers);
+        noteStore(index, value);
         release(old);
         return true;
     }
@@ -657,6 +661,7 @@ bool JSArray::setAt(VM& vm, std::uint32_t index, JSValue value)
     elems[index] = value;
     if (!value.isNumber())
         h.flags &= std::uint8_t(~cellflags::kAllNumbers);
+    noteStore(index, value);
     return true;
 }
 
@@ -673,6 +678,8 @@ void JSArray::resize(VM& vm, std::uint32_t newLength)
     // Shorten first, then let go: a release can run a destructor that looks at this array.
     const std::uint32_t old = length;
     length = newLength;
+    if (packed > newLength)
+        packed = newLength;
     for (std::uint32_t i = newLength; i < old; ++i)
         release(elems[i]);
 }
@@ -690,6 +697,7 @@ void JSArray::removeRange(VM& vm, std::uint32_t from, std::uint32_t count)
     Vec<JSValue> removed(elems + from, elems + from + count);
     std::memmove(elems + from, elems + from + count, 8u * (length - from - count));
     length -= count;
+    repack(from);
     for (JSValue v : removed)
         release(v);
 }
@@ -705,6 +713,8 @@ void JSArray::insertGap(VM& vm, std::uint32_t at, std::uint32_t count)
     for (std::uint32_t i = 0; i < count; ++i)
         elems[at + i] = JSValue::hole();
     length += count;
+    if (packed > at)
+        packed = at;
     h.flags &= std::uint8_t(~cellflags::kAllNumbers);
 }
 
@@ -713,7 +723,10 @@ JSValue JSArray::pop(VM& vm)
     (void)vm;
     if (!length)
         return JSValue::undefined();
-    return elems[--length];
+    --length;
+    if (packed > length)
+        packed = length;
+    return elems[length];
 }
 
 }  // namespace vm

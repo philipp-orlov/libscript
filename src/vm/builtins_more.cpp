@@ -946,9 +946,9 @@ NATIVE(bigintAsNFn)
         } else if (prim.isBool()) {
             big = Handle::adopt(bigintFromDouble(vm, prim == JSValue::boolean(true) ? 1 : 0));
         } else if (isString(prim)) {
-            bool ok;
-            JSValue r = bigintFromText(vm, asString(prim)->text(), &ok);
-            if (!ok) {
+            bool bigOk;
+            JSValue r = bigintFromText(vm, asString(prim)->text(), &bigOk);
+            if (!bigOk) {
                 if (r.isException())
                     return r;
                 return vm.throwError(ErrorCode::SyntaxError, "Cannot convert " + toUtf8(asString(prim)->text()) + " to a BigInt");
@@ -1046,12 +1046,6 @@ void installMore(VM& vm)
     method(vm, reflect, "setPrototypeOf", reflectProto, 2, reinterpret_cast<void*>(1));
     method(vm, reflect, "isExtensible", objectExtensibility, 1, reinterpret_cast<void*>(4));
     method(vm, reflect, "preventExtensions", objectExtensibility, 1, reinterpret_cast<void*>(5));
-
-    // Array.
-    Key arrayKey = vm.internKey(std::string_view("Array"));
-    auto* arrayCtorFn = static_cast<JSFunction*>(asObject(*vm.global->findOwn(vm, arrayKey)));
-    detail::decRef(arrayKey);
-    JSObject* ap = vm.protos.array;
 
     // String.
     Key stringKey = vm.internKey(std::string_view("String"));

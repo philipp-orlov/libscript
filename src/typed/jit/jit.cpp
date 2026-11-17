@@ -77,7 +77,7 @@ void* CodeCache::reserve(std::size_t bytes)
     void* const base = sys::tryVmMap(size).base;
     if (!base)
         return nullptr;
-    blocks_.push_back({base, size, aligned, aligned});
+    blocks_.push_back({base, size, aligned, aligned, {}});
     used_ += size;
     return base;
 }

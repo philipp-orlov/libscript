@@ -46,19 +46,6 @@ bool outOfBounds(const JSTypedArray* t)
     return std::size_t(t->byteOffset) + std::size_t(t->fixedLength) * kElemSize[std::size_t(t->kind)] > b->size;
 }
 
-JSTypedArray* thisTyped(VM& vm, JSValue self)
-{
-    if (JSTypedArray* t = asTyped(self)) {
-        if (outOfBounds(t)) {
-            typeError(vm, "the typed array is out of bounds");
-            return nullptr;
-        }
-        return t;
-    }
-    typeError(vm, "not a typed array");
-    return nullptr;
-}
-
 /// ToIndex: false with a RangeError pending.
 bool toIndex(VM& vm, JSValue v, const char* what, double* out)
 {
@@ -267,19 +254,6 @@ NATIVE(arrayBufferIsView)
 }
 
 // ------------------------------------------------------------- typed arrays ---
-
-ElemKind kindOfConstructor(VM& vm, JSValue ctor)
-{
-    for (JSValue c = ctor; isFunction(c);) {
-        auto* f = static_cast<JSFunction*>(asObject(c));
-        if (f->flags & JSFunction::kNative)
-            if (Rare* r = f->rare(); r && r->nativeData)
-                return ElemKind(reinterpret_cast<std::intptr_t>(r->nativeData) - 1);
-        JSObject* p = f->proto(vm);
-        c = p ? toJSValue(p) : JSValue::undefined();
-    }
-    return ElemKind::Count;
-}
 
 NATIVE(typedCtor)
 {
@@ -504,6 +478,16 @@ NATIVE(dataViewGetter)
     return JSValue::boxNumber(which == 1 ? double(length) : double(v->offset));
 }
 
+/// Reverses `n` bytes in place: a DataView access in the other byte order.
+void reverseBytes(std::uint8_t* bytes, std::size_t n) noexcept
+{
+    for (std::size_t lo = 0, hi = n; lo + 1 < hi; ++lo, --hi) {
+        const std::uint8_t t = bytes[lo];
+        bytes[lo] = bytes[hi - 1];
+        bytes[hi - 1] = t;
+    }
+}
+
 NATIVE(dataViewAccess)
 {
     UNUSED();
@@ -550,13 +534,13 @@ NATIVE(dataViewAccess)
         else
             storeNumber(kind, tmp, number);
         if (!little)
-            std::reverse(tmp, tmp + size);
+            reverseBytes(tmp, size);
         std::memcpy(p, tmp, size);
         return JSValue::undefined();
     }
     std::memcpy(tmp, p, size);
     if (!little)
-        std::reverse(tmp, tmp + size);
+        reverseBytes(tmp, size);
     if (isBigKind(kind)) {
         std::int64_t raw;
         std::memcpy(&raw, tmp, 8);

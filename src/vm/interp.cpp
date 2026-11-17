@@ -20,6 +20,11 @@
 #include "script/internal/vm/typed.hpp"
 #include "builtins_util.hpp"
 
+#if defined(__GNUC__)
+// The interpreter dispatches through the address of a label (computed goto), a GNU extension.
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+
 namespace script {
 namespace internal {
 namespace vm {
@@ -636,7 +641,7 @@ JSValue runImpl(VM& vm, const Ins* stepFall)
 #undef OP
     };
 
-    Frame* fr = vm.frameTop - 1;
+Frame* fr = vm.frameTop - 1;
     [[maybe_unused]] Frame* const home = fr;
     CodeBlock* code;
     const Ins* codeStart;
@@ -1056,7 +1061,7 @@ L_SubI: {
     L_##NAME : {                                                                  \
         const JSValue a = R[ins->b], b = R[ins->c];                               \
         if (a.isInt32() && b.isInt32()) {                                         \
-            const std::int32_t x = a.asInt32(), y = b.asInt32();                  \
+            [[maybe_unused]] const std::int32_t x = a.asInt32(), y = b.asInt32();  \
             FAST                                                                  \
         }                                                                         \
         if (a.isNumber() && b.isNumber()) {                                       \
@@ -2032,8 +2037,8 @@ L_DefSetter: {
     JSObject* target = asObject(R[ins->a]);
     Key key = atoms[ins->b];
     JSValue fnv = R[ins->c];
-    auto* fn = static_cast<JSFunction*>(asObject(fnv));
-    Rare& rr = fn->rareOf(vm);
+    auto* method = static_cast<JSFunction*>(asObject(fnv));
+    Rare& rr = method->rareOf(vm);
     release(rr.home);
     rr.home = R[ins->a];
     retain(rr.home);
@@ -2058,9 +2063,9 @@ L_DefSetterElem: {
     if (!key)
         FAIL();
     JSValue fnv = R[ins->c];
-    auto* fn = static_cast<JSFunction*>(asObject(fnv));
+    auto* method = static_cast<JSFunction*>(asObject(fnv));
     setFunctionName(vm, fnv, key, ins->opcode() == Op::DefMethodElem ? "" : ins->opcode() == Op::DefGetterElem ? "get " : "set ");
-    Rare& rr = fn->rareOf(vm);
+    Rare& rr = method->rareOf(vm);
     release(rr.home);
     rr.home = R[ins->a];
     retain(rr.home);

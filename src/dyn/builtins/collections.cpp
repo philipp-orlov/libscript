@@ -411,18 +411,18 @@ void installPromise(Runtime& rt)
     rt.method(proto, "then", [](CallInfo& ci) {
         Runtime& rt2 = rtOf(ci);
         DynPromise* self = thisPromise(ci);
-        const Value ctor = speciesConstructor(rt2, ci.thisValue(), objectValue(rt2.promiseCtor.get()));
+        const Value species = speciesConstructor(rt2, ci.thisValue(), objectValue(rt2.promiseCtor.get()));
         self->handled = true;
         DynPromise::Reaction reaction;
         reaction.onFulfilled = asFunction(ci.arg(0)) ? ci.arg(0) : Value::undefined();
         reaction.onRejected = asFunction(ci.arg(1)) ? ci.arg(1) : Value::undefined();
-        if (asObject(ctor) == rt2.promiseCtor.get()) {
+        if (asObject(species) == rt2.promiseCtor.get()) {
             Value chained = makePromise(rt2);
             reaction.next.reset(static_cast<DynPromise*>(asObject(chained)));
             addReaction(rt2, self, std::move(reaction));
             return chained;
         }
-        const Capability cap = newCapability(rt2, ctor);
+        const Capability cap = newCapability(rt2, species);
         reaction.capResolve = cap.resolve;
         reaction.capReject = cap.reject;
         addReaction(rt2, self, std::move(reaction));
@@ -439,16 +439,16 @@ void installPromise(Runtime& rt)
         Runtime& rt2 = rtOf(ci);
         if (!ci.thisValue().isObject())
             ci.fail(ErrorCode::TypeError, "Promise.prototype.finally called on something not an object");
-        const Value ctor = speciesConstructor(rt2, ci.thisValue(), objectValue(rt2.promiseCtor.get()));
+        const Value species = speciesConstructor(rt2, ci.thisValue(), objectValue(rt2.promiseCtor.get()));
         const Value onFinally = ci.arg(0);
         if (!asFunction(onFinally))
             return invokeMethod(rt2, ci.thisValue(), rt2.atom.then.get(), {onFinally, onFinally});
-        const auto after = [ctor, onFinally](bool rejected) {
-            return [ctor, onFinally, rejected](CallInfo& inner) -> Value {
+        const auto after = [species, onFinally](bool rejected) {
+            return [species, onFinally, rejected](CallInfo& inner) -> Value {
                 Runtime& rtc = rtOf(inner);
                 const Value outcome = inner.arg(0);
                 const Value result = callValue(rtc, onFinally, Value::undefined(), {});
-                const Value waited = promiseResolve(rtc, ctor, result);
+                const Value waited = promiseResolve(rtc, species, result);
                 const Value pass = rtc.makeFunction(String(), [outcome, rejected](CallInfo& last) -> Value {
                     if (rejected)
                         throwValueOf(rtOf(last), outcome);

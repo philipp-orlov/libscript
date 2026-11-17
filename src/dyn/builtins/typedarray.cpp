@@ -440,20 +440,20 @@ void installTypedArrayPrototype(Runtime& rt, DynObject* proto)
             ci.fail(ErrorCode::TypeError, "not a typed array");
         return objectValue(ta->buffer.get());
     });
-    rt.getterFast(proto, "byteLength", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
-        DynTypedArray* ta = asTypedArray(self);
+    rt.getterFast(proto, "byteLength", [](Runtime& rt2, const Value& thisV, const Value*, std::size_t) -> Value {
+        DynTypedArray* ta = asTypedArray(thisV);
         if (!ta)
             throwError(rt2, ErrorCode::TypeError, "not a typed array");
         return Value(double(ta->length * sizeOf(ta->element)));
     });
-    rt.getterFast(proto, "byteOffset", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
-        DynTypedArray* ta = asTypedArray(self);
+    rt.getterFast(proto, "byteOffset", [](Runtime& rt2, const Value& thisV, const Value*, std::size_t) -> Value {
+        DynTypedArray* ta = asTypedArray(thisV);
         if (!ta)
             throwError(rt2, ErrorCode::TypeError, "not a typed array");
         return Value(ta->outOfBounds || ta->buffer->detached ? 0.0 : double(ta->byteOffset));
     });
-    rt.getterFast(proto, "length", [](Runtime& rt2, const Value& self, const Value*, std::size_t) -> Value {
-        DynTypedArray* ta = asTypedArray(self);
+    rt.getterFast(proto, "length", [](Runtime& rt2, const Value& thisV, const Value*, std::size_t) -> Value {
+        DynTypedArray* ta = asTypedArray(thisV);
         if (!ta)
             throwError(rt2, ErrorCode::TypeError, "not a typed array");
         return Value(double(ta->length));

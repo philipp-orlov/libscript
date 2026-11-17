@@ -71,21 +71,6 @@ JSValue newPromiseObject(VM& vm, JSObject* proto = nullptr)
     return keep.take();
 }
 
-/// The prototype of what `new C()` makes when `C` is a subclass of Promise: Promise's own when it is not one.
-JSObject* promiseProtoOf(VM& vm, JSValue ctor)
-{
-    if (!isFunction(ctor))
-        return vm.protos.promise;
-    JSValue p = getProperty(vm, ctor, vm.atoms.prototype);
-    if (p.isException()) {
-        vm.clearException();
-        return vm.protos.promise;
-    }
-    JSObject* out = isObject(p) ? asObject(p) : vm.protos.promise;
-    release(p);
-    return out;
-}
-
 /// An `AggregateError` for the reasons `results` holds, owned.
 JSValue makeAggregateError(VM& vm, JSValue results)
 {

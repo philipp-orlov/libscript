@@ -25,6 +25,11 @@
 #include "script/internal/dyn/runtime.hpp"
 #include "script/internal/dyn/vm.hpp"
 
+#if defined(__GNUC__)
+// The code generator bakes the offsets of fields of non-standard-layout cells into the code it emits.
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+
 namespace script {
 namespace internal {
 namespace dyn {

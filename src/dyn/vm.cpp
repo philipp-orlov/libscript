@@ -30,6 +30,11 @@
 #include "script/internal/dyn/typedarray.hpp"
 #include "script/internal/stack_guard.hpp"
 
+#if defined(__GNUC__)
+// The interpreter dispatches through the address of a label (computed goto), a GNU extension.
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+
 namespace script {
 namespace internal {
 namespace dyn {

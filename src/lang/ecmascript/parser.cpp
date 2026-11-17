@@ -2144,7 +2144,7 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
         if (at(Tok::LParen) || (typescript_ && at(Tok::Lt))) {
             const bool isConstructor = kind == PropKind::Method && !computed && !isStatic &&
                                        key->text == u"constructor";
-            const std::uint32_t evalBefore = evalCalls_;
+            const std::uint32_t memberEvalBefore = evalCalls_;
             NodePtr fn = makeNode(NK::FunctionExpr, line);
             if (!computed)
                 fn->text = key->text;
@@ -2161,10 +2161,10 @@ NodePtr Parser::classExpression(bool isDeclaration, bool isAbstract)
             if (memberAbstract || ambientMember || (typescript_ && !at(Tok::LBrace))) {
                 fn->declared = true;
                 semicolon();
-                fn->evalInside = evalCalls_ != evalBefore;
+                fn->evalInside = evalCalls_ != memberEvalBefore;
             } else {
                 fn->d = block();
-                fn->evalInside = evalCalls_ != evalBefore;
+                fn->evalInside = evalCalls_ != memberEvalBefore;
                 fn = withSource(std::move(fn), memberStart);
             }
 

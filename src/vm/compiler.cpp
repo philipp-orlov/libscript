@@ -911,7 +911,6 @@ private:
     std::uint16_t dest(int dst) { return dst >= 0 ? std::uint16_t(dst) : temp(); }
     /// For constructs that write their destination before they are done (a literal, a condition): through a temporary
     /// unless the caller gave a register that nothing else reads.
-    void exprVia(const Node& n, int dst, std::uint16_t result);
 
     std::uint16_t member(const Node& n, int dst);
     std::uint16_t call(const Node& n, int dst, bool isNew);
@@ -1051,14 +1050,6 @@ private:
 
 
 // ======================================================================= expressions ===
-
-void Compiler::exprVia(const Node& n, int dst, std::uint16_t result)
-{
-    checkNativeStack();
-    (void)n;
-    if (dst >= 0 && dst != result)
-        emit(Op::Mov, std::uint16_t(dst), result);
-}
 
 std::uint16_t Compiler::expr(const Node& n, int dst)
 {
@@ -1562,7 +1553,6 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
             unsupported(*m, "this class member name");
     }
 
-    const std::uint16_t mark = fn_->top;
     const std::uint16_t d = dest(dst);
     const std::uint16_t inner = fn_->top;
     const bool scoped = innerBinding && !cls.text.empty();
@@ -1626,7 +1616,7 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
     }
     if (ctorFn->isAsync || ctorFn->isGenerator)
         unsupported(*ctorFn, "this constructor");
-    pendingFlags_ = CodeBlock::kClassConstructor | (derived ? CodeBlock::kDerived : 0);
+    pendingFlags_ = std::uint32_t(CodeBlock::kClassConstructor) | (derived ? std::uint32_t(CodeBlock::kDerived) : 0u);
     CodeBlock* ctorCode = compileFunction(*ctorFn, name);
     if (cls.srcEnd) {
         // A class's text is its constructor's.
@@ -2592,8 +2582,8 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
         fn_->top = at;
     } else if (superCall && fn_->isArrow) {
         const std::uint16_t at = fn_->top;
-        const std::uint16_t callee = loadVar(String(u"%callee"), -1, n);
-        emit(Op::GetSuperCtorOf, base, callee);
+        const std::uint16_t calleeFn = loadVar(String(u"%callee"), -1, n);
+        emit(Op::GetSuperCtorOf, base, calleeFn);
         fn_->top = at;
         loadVar(String(u"this"), base + 1, n);
         const std::uint16_t target = loadVar(String(u"%newtarget"), -1, n);
@@ -2705,9 +2695,9 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
             fn_->top = at;
         }
         if (fn_->isArrow) {
-            const std::uint16_t callee = loadVar(String(u"%callee"), -1, n);
+            const std::uint16_t calleeFn = loadVar(String(u"%callee"), -1, n);
             const std::uint16_t self = loadVar(String(u"this"), -1, n);
-            emit(Op::InitFieldsOf, callee, self);
+            emit(Op::InitFieldsOf, calleeFn, self);
             fn_->top = at;
         } else {
             emit(Op::InitFields);

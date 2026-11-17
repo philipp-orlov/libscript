@@ -14,6 +14,11 @@
 #include "script/internal/dyn/builtins.hpp"
 #include "script/internal/dyn/vm.hpp"
 
+#if defined(__GNUC__)
+// Cell images are built by field offset, in cells that are not standard layout.
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+
 namespace script {
 namespace internal {
 namespace dyn {

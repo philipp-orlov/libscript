@@ -90,11 +90,6 @@ struct ArrayView
     }
 };
 
-bool numberArg(VM& vm, JSValue v, double* out)
-{
-    return toNumber(vm, v, out);
-}
-
 /// A relative index, as `slice` and friends clamp it.
 bool relativeIndex(VM& vm, JSValue v, std::int64_t length, std::int64_t fallback, std::int64_t* out)
 {
@@ -426,17 +421,6 @@ NATIVE(objectCreate)
         return r;
     release(r);
     return keep.take();
-}
-
-bool descriptorField(VM& vm, JSObject* d, const char* name, JSValue* out)
-{
-    Key key = vm.internKey(std::string_view(name));
-    const bool has = hasProperty(vm, toJSValue(d), key);
-    if (has) {
-        *out = getProperty(vm, toJSValue(d), key);
-    }
-    detail::decRef(key);
-    return has;
 }
 
 /// Define `key` on `o` as the descriptor object `d` says. Undefined, or the exception sentinel.
@@ -1384,40 +1368,6 @@ NATIVE(arrayReverseImpl)
     return self;
 }
 
-/// The element `i` of the array `a` that `self` is (or a copy of what it is): a hole of a real array is looked up on its
-/// prototype chain, as the specification's HasProperty and Get do. `*found` says whether there is one; false with an
-/// exception pending when a getter threw.
-bool elementOrInherited(VM& vm, JSValue self, JSArray* a, std::uint32_t i, JSValue* out, Handle* keep, bool* found)
-{
-    const JSValue e = a->at(i);
-    if (!e.isHole()) {
-        *out = e;
-        *found = true;
-        return true;
-    }
-    *found = false;
-    if (!hasElems(self))
-        return true;
-    Key k = toPropertyKey(vm, JSValue::boxNumber(double(i)));
-    if (!k)
-        return false;
-    // Only an object on the chain can have it: the own part of an array is what was just read.
-    JSObject* start = asObject(self)->proto(vm);
-    const bool anywhere = start && hasProperty(vm, toJSValue(start), k);
-    if (anywhere || asObject(self)->findOwn(vm, k)) {
-        JSValue v = getProperty(vm, self, k);
-        if (v.isException()) {
-            detail::decRef(k);
-            return false;
-        }
-        *keep = Handle::adopt(v);
-        *out = v;
-        *found = true;
-    }
-    detail::decRef(k);
-    return true;
-}
-
 NATIVE(arrayFillImpl)
 {
     UNUSED();
@@ -2333,7 +2283,7 @@ struct JsonWriter
         }
         ~ShapeKeys() { clear(); }
     };
-    ShapeKeys shapeKeys[4];
+    ShapeKeys shapeKeys[4]{};
     std::uint32_t nextShapeKeys = 0;
     ~JsonWriter()
     {

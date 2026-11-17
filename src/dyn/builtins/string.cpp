@@ -155,23 +155,6 @@ String caseMapped(const String& s, bool toUpper)
     return out;
 }
 
-Char upper(Char c) noexcept
-{
-    if (c >= u'a' && c <= u'z')
-        return Char(c - 32);
-    if (c >= 0xe0 && c <= 0xfe && c != 0xf7)
-        return Char(c - 32);
-    return c;
-}
-Char lower(Char c) noexcept
-{
-    if (c >= u'A' && c <= u'Z')
-        return Char(c + 32);
-    if (c >= 0xc0 && c <= 0xde && c != 0xd7)
-        return Char(c + 32);
-    return c;
-}
-
 }  // namespace
 
 void installString(Runtime& rt)

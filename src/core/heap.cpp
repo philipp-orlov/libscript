@@ -379,11 +379,11 @@ void ContextImpl::destroyCell(GCObject* cell) noexcept
         case CellKind::String: {
             auto* text = static_cast<StringCell*>(cell);
             if (Char* chars = text->takeBuffer()) {
-                const std::size_t bytes = std::size_t(text->length) * sizeof(Char);
-                if (bytes <= payload_cache::kMaxBytes)
-                    payload_cache::give(chars, bytes);
+                const std::size_t bufferBytes = std::size_t(text->length) * sizeof(Char);
+                if (bufferBytes <= payload_cache::kMaxBytes)
+                    payload_cache::give(chars, bufferBytes);
                 else
-                    payload_cache::giveLarge(chars, bytes);
+                    payload_cache::giveLarge(chars, bufferBytes);
             }
             cell->~GCObject();
             break;

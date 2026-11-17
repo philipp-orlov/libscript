@@ -688,7 +688,7 @@ private:
                 ++p_;
                 continue;
             }
-            const unsigned bit = c == 'i' ? kIgnoreCase : c == 'm' ? kMultiline : c == 's' ? kDotAll : 0;
+            const unsigned bit = c == 'i' ? unsigned(kIgnoreCase) : c == 'm' ? unsigned(kMultiline) : c == 's' ? unsigned(kDotAll) : 0u;
             if (!bit)
                 bad("invalid group");
             if ((on | off) & bit)
@@ -1857,7 +1857,7 @@ struct Run
             std::int32_t i = a;
             std::int32_t j = from;
             while (i < b) {
-                char32_t x, y;
+                char32_t x = 0, y = 0;
                 nextCode(i, x);
                 nextCode(j, y);
                 if (x != y && unicode::simpleFold(x) != unicode::simpleFold(y))

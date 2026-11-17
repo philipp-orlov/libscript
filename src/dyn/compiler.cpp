@@ -328,7 +328,7 @@ struct CaptureIndex
     void build(const Node& top)
     {
         built = true;
-        Walk walk{*this};
+        Walk walk{*this, 0, {}};
         walk.visit(top);
         parts.push_back({&top, 0, walk.next});
         std::sort(parts.begin(), parts.end());
@@ -1665,10 +1665,10 @@ private:
             if (!simple && node.d && hasUseStrict(*node.d))
                 fail(node.line, "'use strict' needs simple parameters");
             std::set<String> seen;
-            for (const String& name : paramNames) {
-                checkBindingName(name, node.line);
-                if (!seen.insert(name).second && (inStrictCode() || !simple || fs.isArrow || node.isMethod))
-                    fail(node.line, "a parameter is named twice: " + toUtf8(name));
+            for (const String& paramName : paramNames) {
+                checkBindingName(paramName, node.line);
+                if (!seen.insert(paramName).second && (inStrictCode() || !simple || fs.isArrow || node.isMethod))
+                    fail(node.line, "a parameter is named twice: " + toUtf8(paramName));
             }
             if (!node.text.empty() && node.kind == NK::FunctionExpr && !node.isMethod)
                 checkBindingName(node.text, node.line);
@@ -1696,21 +1696,21 @@ private:
                 bound.patternWrites(*p);
             bound.walk(*node.d, 0, false);
             bound.finish();
-            for (const auto& [name, site] : bound.site) {
-                if (bound.writesOf(name) != 1 || !bound.declared.count(name) || !site->d)
+            for (const auto& [bindName, site] : bound.site) {
+                if (bound.writesOf(bindName) != 1 || !bound.declared.count(bindName) || !site->d)
                     continue;
-                if (bound.inLoop.count(name) && !onlyCalled(*node.d, name))
+                if (bound.inLoop.count(bindName) && !onlyCalled(*node.d, bindName))
                     continue;
-                if (namedInNested(*site->d, name, false) || containsDirectEval(*site))
+                if (namedInNested(*site->d, bindName, false) || containsDirectEval(*site))
                     continue;
                 bool inParams = false;
                 for (const NodePtr& p : site->list) {
                     NameSet names;
                     collectNames(*p, names, false);
-                    inParams = inParams || names.count(name) != 0;
+                    inParams = inParams || names.count(bindName) != 0;
                 }
                 if (!inParams)
-                    selfNames_[site] = String(name);
+                    selfNames_[site] = String(bindName);
             }
         }
         if (fs.boxAll)

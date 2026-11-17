@@ -45,7 +45,6 @@ constexpr std::size_t kMaxCachedPrograms = 1024;
 RegExpState& stateOf(Runtime& rt) { return *rt.regexp; }
 
 Value objectValue(DynObject* o) { return detail::Access::make(Type::Object, o); }
-Value symbolValue(SymbolCell* s) { return detail::Access::make(Type::Symbol, s); }
 
 double toLength(Runtime& rt, const Value& v)
 {
@@ -596,7 +595,8 @@ Value symbolMatch(CallInfo& ci)
         double at = 0;
         std::size_t count = 0;
         while (at <= double(s.size()) && runMatch(rt, re, s, std::size_t(at))) {
-            checkLongLoop(rt, ++count, count * sizeof(Value));
+            ++count;
+            checkLongLoop(rt, count, count * sizeof(Value));
             const std::int32_t* regs = state.matcher.registers.data();
             const std::size_t begin = std::size_t(regs[0]);
             const std::size_t end = std::size_t(regs[1]);
@@ -1269,9 +1269,9 @@ void installRegExp(Runtime& rt)
             return iterResult(rt2, match, false);
         }
         if (toStringValue(rt2, getIndex(rt2, match, 0)).empty()) {
-            RegExpState& state = stateOf(rt2);
-            const double at = toLength(rt2, getProperty(rt2, it->regexp, state.lastIndex.get()));
-            setOrThrow(rt2, it->regexp, state.lastIndex.get(), Value(double(advanceIndex(asString(it->input)->text(), at, it->pairs))));
+            RegExpState& reState = stateOf(rt2);
+            const double at = toLength(rt2, getProperty(rt2, it->regexp, reState.lastIndex.get()));
+            setOrThrow(rt2, it->regexp, reState.lastIndex.get(), Value(double(advanceIndex(asString(it->input)->text(), at, it->pairs))));
         }
         return iterResult(rt2, match, false);
     }, 0);

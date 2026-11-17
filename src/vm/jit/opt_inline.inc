@@ -23,7 +23,7 @@ bool readsThis(const CodeBlock& c)
     return false;
 }
 
-std::string codeName(const CodeBlock* c)
+[[maybe_unused]] std::string codeName(const CodeBlock* c)
 {
     return c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string("anon");
 }
@@ -1552,17 +1552,15 @@ void Baseline::emitDirectCall(std::uint32_t i)
     if (plan_->defWeb[i] >= 0)
         loadTypedAfter(i);
     a_.bind(typedDone);
-    const Ins inCopy = in;
-    deferCold(i, [this, i, inCopy, base, borrowing, &slowPath, &done, &retry, &tickStub, &fillStub, &exc]() {
-    const Ins& in = inCopy;
-    const DirectCall& dc = directCalls_.at(i);
+    // `in` and `dc` go into the code emitted later by value: the instruction and the call's record as they are now.
+    deferCold(i, [this, i, in, dc, base, borrowing, &slowPath, &done, &retry, &tickStub, &fillStub, &exc]() {
     if (borrowing) {
         // The stack made ready, which runs no script: the code stays.
         a_.bind(fillStub);
         a_.mov(RDI, R12);
         a_.mov(RSI, R10);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFillStack));
-        a_.callReg(RAX);
+        a_.callC(RAX);
         a_.test32(RAX, RAX);
         a_.jcc(CE, slowPath);
         a_.jmp(retry);
@@ -1581,7 +1579,7 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.mov(RDI, R12);
     a_.movImm(RSI, dc.read);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
-    a_.callReg(RAX);
+    a_.callC(RAX);
     a_.aluI32(7, RAX, 1);
     a_.jcc(CNE, exception(i));
     restorePool(i);
@@ -2112,23 +2110,22 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     a_.bind(done);
     if (plan_->defWeb[i] >= 0)
         loadTypedAfter(i);
-    const Ins inCopy = in;
-    deferCold(i, [this, i, inCopy, windowed, base, &slowPath, &done]() {
-    const Ins& in = inCopy;
+    deferCold(i, [this, i, in, windowed, base, &slowPath, &done]() {
     a_.bind(slowPath);
     const bool calleeRead = newCallee_.count(i) != 0;
     if (windowed || calleeRead) {
         // The registers as the instructions would have written them (the global read now), then the call the long way.
         sideDoor();
         if (auto nc = newCallee_.find(i); nc != newCallee_.end()) {
-            savePool(i);
+            // The window is filled after this call from variables that may end at this instruction: all are kept.
+            savePool(i, true);
             a_.mov(RDI, R12);
             a_.movImm(RSI, nc->second);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
-            a_.callReg(RAX);
+            a_.callC(RAX);
             a_.aluI32(7, RAX, 1);
             a_.jcc(CNE, exception(i));
-            restorePool(i);
+            restorePool(i, true);
         }
         for (const auto& [k, v] : windowed ? windowVal_.at(i) : std::map<std::size_t, IVal>{}) {
             if (k == 0)

@@ -36,8 +36,18 @@
 #include "script/internal/vm/object.hpp"
 #include "opt_analysis.hpp"
 
+#if defined(__GNUC__)
+// The compilers bake the offsets of fields of cells, which are not standard layout, into the code they emit.
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+
 #if defined(__x86_64__) && defined(__linux__)
 #include "asm_x64.hpp"
+#include "code_region.hpp"
+#define SCRIPT_VM_BASELINE 1
+#elif defined(__aarch64__) && defined(__linux__)
+// The same templates, through an assembler with the same interface: see asm_a64.hpp for what the register names mean there.
+#include "asm_a64.hpp"
 #include "code_region.hpp"
 #define SCRIPT_VM_BASELINE 1
 #endif
@@ -64,7 +74,7 @@ struct Stubs
 
 /// A function's way in: the frame in rsi, its registers (the frame's `R`) in rdi, so that nothing waits on the frame's
 /// store of them.
-void emitPrologue(X64& a)
+void emitPrologue(Asm& a)
 {
     a.push(RBX);
     a.push(R13);
@@ -77,7 +87,8 @@ const Stubs& stubs()
 {
     static Stubs result = [] {
         Stubs st;
-        X64 a;
+        Asm a;
+        a.abiEnter();
         a.push(RBP);
         a.push(R12);
         a.push(R14);
@@ -95,6 +106,7 @@ const Stubs& stubs()
         a.pop(R14);
         a.pop(R12);
         a.pop(RBP);
+        a.abiLeave();
         a.ret();
         a.align(16);
         const std::int32_t osr = a.here();
@@ -103,7 +115,7 @@ const Stubs& stubs()
         CodeSpan span = allocateCode(a.buf.size());
         if (!span)
             return st;
-        std::memcpy(span.rw, a.buf.data(), a.buf.size());
+        commitCode(span, a.buf.data(), a.buf.size());
         st.run = reinterpret_cast<Stub>(span.rx);
         st.osrEnter = span.rx + osr;
         return st;
@@ -649,13 +661,13 @@ public:
         a_.bind(at_[n_]);
         a_.int3();  // the code never falls off its end
         emitTails();
-        CodeSpan span = allocateCode(a_.buf.size());
+        CodeSpan span = a_.failed() ? CodeSpan{} : allocateCode(a_.buf.size());
         if (!span) {
             for (ValidityCell* v : validities_)
                 vm_.releaseValidity(v);
             return nullptr;
         }
-        std::memcpy(span.rw, a_.buf.data(), a_.buf.size());
+        commitCode(span, a_.buf.data(), a_.buf.size());
         auto* t = new Tier1Code;
         t->rx = span.rx;
         t->bytes = span.bytes;
@@ -669,7 +681,7 @@ private:
     VM& vm_;
     CodeBlock* code_;
     std::uint32_t n_;
-    X64 a_;
+    Asm a_;
     std::vector<Label> at_;
     std::vector<std::uint32_t> offsets_;
     std::vector<ValidityCell*> validities_;
@@ -1556,8 +1568,10 @@ private:
     void loadFromFrame(unsigned reg, std::int32_t w, Label& fail);
     void unboxRax(std::int32_t w, Label& fail, bool number = false);
     void loadTypedAfter(std::uint32_t i);
-    void savePool(std::uint32_t i);
-    void restorePool(std::uint32_t i);
+    /// Typed variables in registers a call does not keep go to their slots and come back. Only those wanted after
+    /// instruction `i`, unless `all`: for a call made part way through the instruction, before it has read its operands.
+    void savePool(std::uint32_t i, bool all = false);
+    void restorePool(std::uint32_t i, bool all = false);
     bool liveAcross(std::uint32_t i, std::int32_t w) const;
     bool plainReadable(std::uint32_t i) const;
     Label& exitLabel(std::uint32_t i, int kind);
@@ -1581,7 +1595,7 @@ private:
         a_.movImm(RDX, reinterpret_cast<std::uint64_t>(borrowInfo_));
         a_.movImm(RCX, self ? 1 : 0);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmBorrowGate));
-        a_.callReg(RAX);
+        a_.callC(RAX);
     }
     BorrowInfo* borrowInfo_ = nullptr;
     Label selfEntry_;  ///< the optimized code's entry, which its calls of itself call directly (`borrowInfo_`)
@@ -1629,7 +1643,7 @@ private:
         a_.mov(RDI, R12);
         a_.movImm(RSI, i);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(fn));
-        a_.callReg(RAX);
+        a_.callC(RAX);
         a_.aluI32(7, RAX, 1);
         a_.jcc(CNE, exception(i));
         restorePool(i);
@@ -1997,10 +2011,15 @@ private:
     }
     /// xmm0 as a boxed double in rax; every NaN becomes the canonical one.
     void boxDouble0() { boxDouble(0); }
+    /// Whether double arithmetic takes three operands.
     static bool hasAvx()
     {
+#if defined(__x86_64__)
         static const bool avx = __builtin_cpu_supports("avx");
         return avx;
+#else
+        return true;
+#endif
     }
     /// xmm`x` as a boxed double in rax; every NaN becomes the canonical one.
     void boxDouble(int x) { boxDoubleTo(RAX, x); }
@@ -2172,7 +2191,7 @@ void Baseline::emitTails()
             a_.mov(RDI, R12);
             a_.movImm(RSI, s.index);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(s.helper));
-            a_.callReg(RAX);
+            a_.callC(RAX);
             a_.aluI32(7, RAX, 1);
             a_.jcc(CNE, exception(s.index));
         } else {
@@ -2230,19 +2249,19 @@ void Baseline::emitTails()
     }
     a_.bind(step_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitStep));
-    a_.jmp(RAX);
+    a_.jmpC(RAX);
     a_.bind(call_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitCall));
-    a_.jmp(RAX);
+    a_.jmpC(RAX);
     a_.bind(throw_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitThrow));
-    a_.jmp(RAX);
+    a_.jmpC(RAX);
     a_.bind(tier2_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitTier2));
-    a_.jmp(RAX);
+    a_.jmpC(RAX);
     a_.bind(tick_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitTick));
-    a_.jmp(RAX);
+    a_.jmpC(RAX);
     if (optimizing()) {
         // A cell let go of in optimized code: the variables in caller-saved registers survive the call.
         a_.bind(free_);
@@ -2254,7 +2273,7 @@ void Baseline::emitTails()
         for (int k = 0; k < 14; ++k)
             a_.movsdStore(mem(RSP, 8 * k), 2 + k);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFree));
-        a_.callReg(RAX);
+        a_.callC(RAX);
         for (int k = 0; k < 14; ++k)
             a_.movsdLoad(2 + k, mem(RSP, 8 * k));
         a_.aluI(0, RSP, 120);
@@ -2287,7 +2306,7 @@ void Baseline::emitTails()
     }
     a_.bind(free_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFree));
-    a_.jmp(RAX);
+    a_.jmpC(RAX);
     a_.bind(tail_);
     a_.cmpI(RAX, std::int32_t(kStepJump));
     a_.jcc(CE, dispatch_);
@@ -3592,7 +3611,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.mov(RDI, R12);
             a_.mov(RSI, RAX);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitNewThis));
-            a_.callReg(RAX);
+            a_.callC(RAX);
             a_.test(RAX, RAX);
             a_.jcc(CE, exc);
             a_.bind(made);
@@ -3751,7 +3770,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         needNumber(RSI, generic);
         a_.mov(RAX, mem(RCX, kRareData));
         loadNumber(0, RSI, RDX);
-        a_.callReg(RAX);
+        a_.callC(RAX);
         boxNumber0();
         write(in.a, RAX);
         a_.jmp(afterCall);
@@ -3777,7 +3796,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.lea(RDX, R(base + 1));
         a_.movImm(RCX, argc);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitNative));
-        a_.callReg(RAX);
+        a_.callC(RAX);
         a_.jmp(native);
         a_.bind(notNative);
     }
@@ -4030,8 +4049,14 @@ void compileTier1(VM& vm, CodeBlock* code)
     const std::size_t limit = vm.ctx.options.jit.codeCacheLimit;
     if (code->code.size() > 20000 || !entryStub() || (limit && codeInUse() > limit))
         return;
-    Baseline compiler(vm, code);
-    Tier1Code* t = compiler.compile();
+    Asm::reachFailed() = false;
+    Tier1Code* t = Baseline(vm, code).compile();
+    if (!t && Asm::reachFailed()) {
+        // A conditional branch did not reach (a very large function): once more, with the long form of each.
+        Asm::longBranchDefault() = true;
+        t = Baseline(vm, code).compile();
+        Asm::longBranchDefault() = false;
+    }
     if (!t)
         return;
     code->tier1 = t;

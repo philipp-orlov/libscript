@@ -4,10 +4,11 @@
 #include "code_region.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #include <sys/mman.h>
 #include <unistd.h>
 #define SCRIPT_VM_CODE_REGION 1
@@ -147,6 +148,17 @@ void releaseCode(const CodeSpan& span) noexcept
     }
 }
 
+void commitCode(const CodeSpan& span, const void* code, std::size_t bytes) noexcept
+{
+    std::memcpy(span.rw, code, bytes);
+#if defined(__aarch64__)
+    // Both views: the data cache is written back through the one the bytes went in by, and the instruction cache
+    // forgets what it had for the one they run from.
+    __builtin___clear_cache(reinterpret_cast<char*>(span.rw), reinterpret_cast<char*>(span.rw) + bytes);
+    __builtin___clear_cache(reinterpret_cast<char*>(span.rx), reinterpret_cast<char*>(span.rx) + bytes);
+#endif
+}
+
 std::size_t codeInUse() noexcept
 {
     Region& r = region();
@@ -158,6 +170,7 @@ std::size_t codeInUse() noexcept
 
 CodeSpan allocateCode(std::size_t) noexcept { return {}; }
 void releaseCode(const CodeSpan&) noexcept {}
+void commitCode(const CodeSpan&, const void*, std::size_t) noexcept {}
 std::size_t codeInUse() noexcept { return 0; }
 
 #endif

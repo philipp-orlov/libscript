@@ -31,7 +31,7 @@ core's natives (`src/vm/python.cpp`). `Context::core()` says which core a contex
 | `operators.hpp`, `convert.hpp`, `host.hpp` | the language's operators; `Value` conversion; what the public `Value` API does with a new-core object |
 | `src/vm/compiler.cpp` | AST to bytecode |
 | `src/vm/interp.cpp` | the interpreter: computed-goto dispatch, calls without C++ recursion, inline caches |
-| `src/vm/jit/`, `include/script/internal/vm/jit.hpp` | the baseline compiler (x86-64, Linux): `asm_x64.hpp` (macro assembler), `code_region.cpp` (dual-mapped code memory), `baseline_x64.cpp` (templates, calls, entry stubs) |
+| `src/vm/jit/`, `include/script/internal/vm/jit.hpp` | the compilers (x86-64 and arm64, Linux): `asm_x64.hpp` and `asm_a64.hpp` (two macro assemblers with one interface), `code_region.cpp` (dual-mapped code memory), `baseline_x64.cpp` (templates, calls, entry stubs, written once for both) |
 | `src/vm/builtins.cpp`, `builtins_*.cpp` | the built-in objects: Object/Function/Array/String/Number/Math/Error/JSON (`builtins.cpp`), Symbol, iterator families and generator prototypes (`_symbol`), the rest of Object, Reflect, Array/String/Number/Math and BigInt (`_more`), the Array methods that call back (`_array`), Map/Set/Weak\*/WeakRef/FinalizationRegistry (`_collections`), RegExp (`_regexp`: the spec's `exec`/species paths, a fast path for an untouched RegExp, the legacy `RegExp.$1` statics, `RegExp.escape`), Promise with capabilities and the combinators, async functions and generators (`_promise`), Date (`_date`), ArrayBuffer (resizable, shared), typed arrays and DataView (`_typed`, `_typedarray`), Atomics, iterator helpers, Proxy (`_proxy`: callable proxies) |
 | `src/vm/objmodel.cpp` | the internal methods of an object -- [[GetOwnProperty]], [[DefineOwnProperty]], [[Set]], [[GetPrototypeOf]], [[OwnPropertyKeys]] and the rest -- for ordinary objects and proxies, with every invariant check a proxy's traps are held to; `Object` and `Reflect` are built on them |
 | `src/vm/python.cpp`, `src/vm/language.cpp` | Python and TypeScript on the new core |
@@ -64,6 +64,30 @@ includes what it calls), and an exception handler is entered by looking its labe
   interpreter, `=2` adds the sites.
 - Tests: `everySnippetAgreesInCompiledCode` runs every snippet and `snippets_jit.inc` Eager and Tiered; `FUZZ_TIER1=1
   tools/vm_fuzz.py` fuzzes compiled code; the suites run with `SCRIPT_VM_TIER1=1`.
+
+## arm64
+
+Both compilers are written against the interface of `asm_x64.hpp`. On arm64 the same templates are assembled by
+`asm_a64.hpp`, which has that interface operation for operation:
+
+- A register name of the interface stands for a fixed arm64 register (the table is at the top of the file). The
+  argument registers of the two calling conventions line up, so a call into the runtime needs no moves before it;
+  `callC` moves the result into place after it, and `jmpC` is the form for a stub that ends in the runtime's function.
+- An operation with a memory operand is a load, the operation and a store. Addresses the instruction cannot encode go
+  through a scratch register.
+- A conditional jump is encoded from the condition and from what set the flags last (a subtraction, an addition, a
+  logical operation, a multiplication, a floating-point comparison): the carry after a subtraction is the other way
+  round, and an unordered comparison reads as equal on x86-64. Operations that set flags there and not here (`or`, `xor`,
+  shifts) are followed by a test only when the next thing emitted reads the flags. A jump on flags that nothing left
+  fails the compile, and the function stays where it was.
+- The templates push single 8-byte values, which arm64's stack pointer does not allow. The stack they see is `x28`;
+  `sp` moves with it, so nothing below it is live when a signal arrives, and is never the base of an access. A call
+  keeps the caller's return address in the slot where x86-64 has the callee's, so the layout and the alignment at each
+  call are the ones the templates were written for.
+- `cvttsd2si` gives the smallest integer for a NaN or a value out of range, as x86-64 does: guards compare with it.
+- A conditional branch reaches one megabyte: a function whose code is larger is compiled again with each such branch
+  as a branch over a jump.
+- `commitCode` copies code into the region and tells the instruction cache.
 
 ## The optimizing compiler
 
@@ -251,7 +275,7 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 
 - Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in
   registers) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in builds with
-  `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). aarch64 has no compiler yet and interprets (no aarch64 hardware was available).
+  `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). Both tiers run on x86-64 and on arm64 (Linux).
 - Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` take 0.89x its time in
   geometric mean (Xeon Gold 5420+, median of eleven runs of each engine in turn on one core): `sort_cmp` 0.49,
   `float_mandel` 0.70, `alloc_small` 0.71, `string_ops` 0.86, `int_loop` 0.87, `map_dict` 0.91, `array_push_hof` 0.93,

@@ -109,8 +109,8 @@ bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
 | **C++** | typed engine + JIT | classes, virtual dispatch, exceptions, the standard containers | [cpp.md](docs/languages/cpp.md) |
 
 Every language is a CMake option. Turn off what you don't ship, and its front end, tests and examples go with it; an
-engine goes once no language needs it. The vm core's compilers generate x86-64 code on Linux; elsewhere it interprets
-(an arm64 back end for it is not written yet).
+engine goes once no language needs it. The vm core's compilers generate x86-64 and arm64 code on Linux; elsewhere it
+interprets.
 
 ## 🏁 Against JavaScriptCore
 

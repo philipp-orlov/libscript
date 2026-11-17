@@ -145,13 +145,13 @@ bool Baseline::liveAcross(std::uint32_t i, std::int32_t w) const
     return false;
 }
 
-void Baseline::savePool(std::uint32_t i)
+void Baseline::savePool(std::uint32_t i, bool all)
 {
     if (!optimizing())
         return;
     for (const opt::LiveWeb& lw : plan_->liveBefore[i]) {
         const std::int32_t w = std::int32_t(lw.web);
-        if (!inReg(w) || !liveAcross(i, w))
+        if (!inReg(w) || (!all && !liveAcross(i, w)))
             continue;
         if (isI32(w))
             a_.mov32(home(w), gpr(w));
@@ -160,13 +160,13 @@ void Baseline::savePool(std::uint32_t i)
     }
 }
 
-void Baseline::restorePool(std::uint32_t i)
+void Baseline::restorePool(std::uint32_t i, bool all)
 {
     if (!optimizing())
         return;
     for (const opt::LiveWeb& lw : plan_->liveBefore[i]) {
         const std::int32_t w = std::int32_t(lw.web);
-        if (!inReg(w) || !liveAcross(i, w))
+        if (!inReg(w) || (!all && !liveAcross(i, w)))
             continue;
         if (isI32(w))
             a_.mov32(gpr(w), home(w));
@@ -965,8 +965,8 @@ bool Baseline::emitTyped(std::uint32_t i)
             release(RSI);
         }
         if (!isI32(vw))
-            for (auto& [slot, kind] : factNum_)
-                if (slot.second == ic.index && kind == 2)
+            for (auto& [numSlot, kind] : factNum_)
+                if (numSlot.second == ic.index && kind == 2)
                     kind = 1;  // the same object may be under another name
         factNum_[{in.a, ic.index}] = isI32(vw) ? 2 : 1;
         return true;
@@ -1021,7 +1021,7 @@ bool Baseline::emitTyped(std::uint32_t i)
         } else {
             savePool(i);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(target));
-            a_.callReg(RAX);
+            a_.callC(RAX);
             restorePool(i);
         }
         if (isI32(dw)) {
@@ -1659,7 +1659,7 @@ void Baseline::emitExits()
                 a_.mov(RDI, R12);
                 a_.movImm(RSI, d);
                 a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
-                a_.callReg(RAX);
+                a_.callC(RAX);
                 a_.aluI32(7, RAX, 1);
                 a_.jcc(CNE, exception(e.index));
             }
@@ -1670,7 +1670,7 @@ void Baseline::emitExits()
         a_.movImm(RSI, e.index);
         a_.movImm(RDX, std::uint64_t(e.kind));
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptExit));
-        a_.callReg(RAX);
+        a_.callC(RAX);
         Label notFall;
         a_.cmpI(RAX, std::int32_t(kStepFall));
         a_.jcc(CNE, notFall);
@@ -2203,7 +2203,7 @@ Tier2Code* Baseline::compileOptimized()
         a_.jmp(preLoop_.at(h));
     }
     emitTails();
-    CodeSpan span = hoistBroken_.empty() ? allocateCode(a_.buf.size()) : CodeSpan{};
+    CodeSpan span = hoistBroken_.empty() && !a_.failed() ? allocateCode(a_.buf.size()) : CodeSpan{};
     if (!span) {
         for (ValidityCell* v : validities_)
             vm_.releaseValidity(v);
@@ -2213,7 +2213,7 @@ Tier2Code* Baseline::compileOptimized()
         borrowInfo_ = nullptr;
         return nullptr;
     }
-    std::memcpy(span.rw, a_.buf.data(), a_.buf.size());
+    commitCode(span, a_.buf.data(), a_.buf.size());
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* dumpFile = std::getenv("T2DUMP")) {
         if (std::FILE* f = std::fopen(dumpFile, "wb")) {

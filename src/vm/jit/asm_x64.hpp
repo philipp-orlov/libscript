@@ -431,6 +431,25 @@ public:
         b(std::uint8_t(0x58 | (r & 7)));
     }
     void int3() { b(0xCC); }
+    /// A call into the runtime, as against one of compiled code: the same instruction here.
+    void callC(Reg r) { callReg(r); }
+    /// A jump to a function of the runtime that returns to whoever called the code this ends.
+    void jmpC(Reg r) { jmp(r); }
+    /// What a function called from C++ does first and last beyond its pushes: nothing here.
+    void abiEnter() {}
+    void abiLeave() {}
+    /// Whether the code cannot be used; never, here.
+    bool failed() const noexcept { return false; }
+    static bool& longBranchDefault() noexcept
+    {
+        static thread_local bool on = false;
+        return on;
+    }
+    static bool& reachFailed() noexcept
+    {
+        static thread_local bool on = false;
+        return on;
+    }
     /// A call to an absolute address through rax.
     void callAbs(const void* fn)
     {
@@ -490,6 +509,8 @@ public:
     void movsx8(Reg d, const Mem& m) { opMem(false, 0x0F, d, m, 0xBE); }
     void movsx16(Reg d, const Mem& m) { opMem(false, 0x0F, d, m, 0xBF); }
 };
+
+using Asm = X64;
 
 }  // namespace jit
 }  // namespace vm

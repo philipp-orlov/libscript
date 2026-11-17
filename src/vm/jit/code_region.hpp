@@ -25,6 +25,9 @@ struct CodeSpan
 /// Space for `bytes` of code, or an empty span when the region is full or this host cannot make one.
 CodeSpan allocateCode(std::size_t bytes) noexcept;
 void releaseCode(const CodeSpan& span) noexcept;
+/// Put `bytes` of code into `span` and make it ready to run (where instructions are cached apart from data, the cache
+/// is told).
+void commitCode(const CodeSpan& span, const void* code, std::size_t bytes) noexcept;
 /// Bytes of code space in use.
 std::size_t codeInUse() noexcept;
 

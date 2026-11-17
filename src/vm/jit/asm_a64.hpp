@@ -114,6 +114,7 @@ private:
     // operation next that both reads and overwrites its destination takes the move's source instead, and the move goes
     // (the interface's two operands become arm64's three).
     mutable std::size_t movedAt_ = ~std::size_t(0);
+    mutable std::size_t valAt_ = ~std::size_t(0);
     int movedTo_ = 0, movedFrom_ = 0;
     bool movedWide_ = false, movedFp_ = false;
     void noteMove(int to, int from, bool wide, bool fp = false) noexcept
@@ -349,6 +350,21 @@ private:
     };
     void access(std::uint32_t unscaled, int size, int rt, const Mem& m) { access(unscaled, size, rt, ea(m, size)); }
 
+    // What x17 holds when the last thing emitted was a comparison of a value loaded from memory (and the branches on
+    // it): a comparison of the same place next reads the register, not memory again (a chain of guards on one field).
+    std::uint32_t valOp_ = 0;
+    Mem valMem_{RAX, 0, -1, 1};
+    void loadVal(std::uint32_t unscaled, int size, const Mem& m)
+    {
+        const bool same = valAt_ == buf.size() && valOp_ == unscaled && valMem_.base == m.base && valMem_.disp == m.disp &&
+                          valMem_.index == m.index && valMem_.scale == m.scale;
+        if (!same)
+            access(unscaled, size, kVal, m);
+        valOp_ = unscaled;
+        valMem_ = m;
+    }
+    void keepVal() noexcept { valAt_ = buf.size(); }
+
     // ---- flags ----
     void setFlags(Flags f) noexcept
     {
@@ -407,14 +423,22 @@ private:
 
     void branch(std::uint32_t op, Label& l)
     {
+        const std::int32_t at = std::int32_t(buf.size());
         if (l.bound()) {
-            ins(op | ((std::uint32_t(l.pos - here()) >> 2) & 0x03FFFFFFu));
+            ins(op | ((std::uint32_t(l.pos - at) >> 2) & 0x03FFFFFFu));
         } else {
-            l.uses.push_back(here());
+            l.uses.push_back(at);
             ins(op);
         }
     }
     void branchCond(int cond, Label& l)
+    {
+        const bool keep = valAt_ == buf.size();
+        branchCondOnly(cond, l);
+        if (keep)
+            valAt_ = buf.size();
+    }
+    void branchCondOnly(int cond, Label& l)
     {
         if (cond == kNever)
             return;
@@ -422,14 +446,15 @@ private:
             branch(0x14000000u, l);
             return;
         }
-        const bool near = l.bound() ? (here() - l.pos) < (1 << 20) - 8 : !longBranches;
+        const std::int32_t at = std::int32_t(buf.size());
+        const bool near = l.bound() ? (at - l.pos) < (1 << 20) - 8 : !longBranches;
         if (!near) {
             ins(0x54000040u | std::uint32_t(cond ^ 1));  // over the jump
             branch(0x14000000u, l);
         } else if (l.bound()) {
-            ins(0x54000000u | (((std::uint32_t(l.pos - here()) >> 2) & 0x7FFFFu) << 5) | std::uint32_t(cond));
+            ins(0x54000000u | (((std::uint32_t(l.pos - at) >> 2) & 0x7FFFFu) << 5) | std::uint32_t(cond));
         } else {
-            l.uses.push_back(here());
+            l.uses.push_back(at);
             ins(0x54000000u | std::uint32_t(cond));
         }
     }
@@ -560,6 +585,7 @@ public:
     {
         movedAt_ = ~std::size_t(0);
         zext_ = 0;  // the position may be entered from elsewhere
+        valAt_ = ~std::size_t(0);
         return std::int32_t(buf.size());
     }
 
@@ -719,11 +745,23 @@ public:
     void alu32(int op, Reg d, Reg s) { aluRRR(op, false, X(d), X(d), X(s)); }
     void alu(int op, Reg d, const Mem& m)
     {
+        if (op == 7) {
+            loadVal(kLdrX, 3, m);
+            aluRRR(op, true, X(d), X(d), kVal);
+            keepVal();
+            return;
+        }
         access(kLdrX, 3, kVal, m);
         aluRRR(op, true, X(d), X(d), kVal);
     }
     void alu32(int op, Reg d, const Mem& m)
     {
+        if (op == 7) {
+            loadVal(kLdrW, 2, m);
+            aluRRR(op, false, X(d), X(d), kVal);
+            keepVal();
+            return;
+        }
         access(kLdrW, 2, kVal, m);
         aluRRR(op, false, X(d), X(d), kVal);
     }
@@ -759,6 +797,12 @@ public:
     void aluI32(int op, Reg d, std::int32_t v) { aluRRI(op, false, X(d), X(d), v); }
     void aluI(int op, const Mem& m, std::int32_t v)
     {
+        if (op == 7) {
+            loadVal(kLdrX, 3, m);
+            aluRRI(7, true, kZr, kVal, v);
+            keepVal();
+            return;
+        }
         const Ea a = ea(m, 3);
         access(kLdrX, 3, kVal, a);
         aluRRI(op, true, kVal, kVal, v);
@@ -767,6 +811,12 @@ public:
     }
     void aluI32(int op, const Mem& m, std::int32_t v)
     {
+        if (op == 7) {
+            loadVal(kLdrW, 2, m);
+            aluRRI(7, false, kZr, kVal, v);
+            keepVal();
+            return;
+        }
         const Ea a = ea(m, 2);
         access(kLdrW, 2, kVal, a);
         aluRRI(op, false, kVal, kVal, v);
@@ -812,23 +862,27 @@ public:
     void testI(Reg a, std::int32_t v) { aluRRI(4, true, kZr, X(a), v); }
     void testI32(const Mem& m, std::uint32_t v)
     {
-        access(kLdrW, 2, kVal, m);
+        loadVal(kLdrW, 2, m);
         aluRRI(4, false, kZr, kVal, std::int32_t(v));
+        keepVal();
     }
     void cmpI16(const Mem& m, std::uint16_t v)
     {
-        access(kLdrH, 1, kVal, m);
+        loadVal(kLdrH, 1, m);
         aluRRI(7, false, kZr, kVal, std::int32_t(v));
+        keepVal();
     }
     void cmpI8(const Mem& m, std::uint8_t v)
     {
-        access(kLdrB, 0, kVal, m);
+        loadVal(kLdrB, 0, m);
         aluRRI(7, false, kZr, kVal, std::int32_t(v));
+        keepVal();
     }
     void testI8(const Mem& m, std::uint8_t v)
     {
-        access(kLdrB, 0, kVal, m);
+        loadVal(kLdrB, 0, m);
         aluRRI(4, false, kZr, kVal, std::int32_t(v));
+        keepVal();
     }
     void orI8(const Mem& m, std::uint8_t v)
     {

@@ -92,6 +92,7 @@ std::size_t cellBytesOf(const detail::GCObject* cell) noexcept
                 case ObjClass::Arguments: return sizeof(JSArray);
                 case ObjClass::TypedArray: return sizeof(JSTypedArray);
                 case ObjClass::Function: return JSFunction::bytesFor(static_cast<const JSFunction*>(o)->nUpvals);
+                case ObjClass::Promise: return JSObject::bytesFor(o->h.aux) + JSObject::kPromiseStateBytes;
                 default: return JSObject::bytesFor(o->h.aux);
             }
         }
@@ -157,6 +158,12 @@ void children(const detail::GCObject* cell, detail::GcList& out, bool tracing)
                 for (JSValue v : held)
                     appendIfCell(out, v);
             }
+            if (NativeState* st = o->embeddedState()) {
+                Vec<JSValue> held;
+                st->values(held);
+                for (JSValue v : held)
+                    appendIfCell(out, v);
+            }
             if (o->cls() == ObjClass::Function) {
                 auto* f = static_cast<JSFunction*>(o);
                 for (std::uint32_t i = 0; i < f->nUpvals; ++i)
@@ -186,6 +193,8 @@ void children(const detail::GCObject* cell, detail::GcList& out, bool tracing)
 
 void destroyObjectStorage(VM& vm, JSObject* o) noexcept
 {
+    if (NativeState* st = o->embeddedState())
+        st->~NativeState();  // lets go of what it holds (already done at teardown)
     // At teardown the values are already let go of (`clearReferences`), and the shapes may be gone.
     if (!vm.tearingDown) {
         const std::uint32_t n = usedSlots(vm, o);
@@ -408,6 +417,8 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
             }
             if (Rare* r = o->rare(); r && r->ext)
                 r->ext->clear(vm);
+            if (NativeState* st = o->embeddedState())
+                st->clear(vm);
             if (o->cls() == ObjClass::TypedArray) {
                 auto* t = static_cast<JSTypedArray*>(o);
                 forgetView(t);

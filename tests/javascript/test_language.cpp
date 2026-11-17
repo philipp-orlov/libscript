@@ -5140,3 +5140,39 @@ TEST(nestedLoopsOverObjectsOfOneShapeWithDifferentSlotsInPlace)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("160000"));
     }
 }
+
+TEST(promisesKeepTheirStateInTheirCellSubclassedAndInCycles)
+{
+    // A promise's state lives in its own cell: a subclass's constructor gets one through super(), with its own fields; a
+    // promise with properties of its own; a promise held by its own reaction (a cycle the collector breaks); chains, all.
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        script::Context ctx(options);
+        ctx.eval(
+            "var out=[];"
+            "class P extends Promise { constructor(e){ super(e); this.tag='p'; } get kind(){ return this.tag + '!'; } }"
+            "var p=new P(function(res){ res(5); });"
+            "out.push(p instanceof P, p instanceof Promise, p.kind, Object.getPrototypeOf(p)===P.prototype);"
+            "var q=p.then(function(v){ return v*2; });"
+            "out.push(q instanceof P, q.tag);"
+            "var plain=new Promise(function(){}); plain.a=1; plain.b=2; plain.c=3; plain.d=4; plain.e=5; out.push(Object.keys(plain).join(''));"
+            "try { Promise.call({}, function(){}); } catch(e){ out.push(e.constructor.name); }"
+            "var held=[]; for(var i=0;i<2000;i++){ var a=new Promise(function(){}); a.self=a; a.then(function(){ return a; }); held.push(i); }"
+            "var sum=0, chain=Promise.resolve(0);"
+            "for(var i=1;i<=200;i++){ (function(k){ chain=chain.then(function(v){ return new Promise(function(r){ r(v+k); }); }); })(i); }"
+            "chain.then(function(v){ sum=v; });"
+            "Promise.all([P.resolve(1), new P(function(r){ r(2); }), 3]).then(function(v){ out.push(v.join(',')); });"
+            "var log=[]; var rej=new Promise(function(_, r){ r(new Error('x')); }); rej.catch(function(e){ log.push(e.message); });"
+            "globalThis.__done=function(){ return out.concat([sum, log.join('')]).join(' '); };",
+            "<t>.js", script::Language::JavaScript);
+        ctx.runJobs();
+        CHECK_EQ(ctx.eval("__done()", "<t>.js", script::Language::JavaScript).toString(),
+                 std::string("true true p! true true p abcde TypeError 1,2,3 20100 x"));
+    }
+}

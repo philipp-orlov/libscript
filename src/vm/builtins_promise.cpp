@@ -54,21 +54,26 @@ struct PromiseData : NativeState
     }
 };
 
+static_assert(sizeof(PromiseData) <= JSObject::kPromiseStateBytes && alignof(PromiseData) <= 8,
+              "a promise's state fits in its cell");
+
+/// A promise's state, in its own cell after its slots in place: no allocation of its own, and no load to find it.
 PromiseData* dataOf(JSValue v)
 {
     if (isObject(v) && asObject(v)->cls() == ObjClass::Promise)
-        if (Rare* r = asObject(v)->rare())
-            return static_cast<PromiseData*>(r->ext);
+        return static_cast<PromiseData*>(asObject(v)->embeddedState());
     return nullptr;
 }
 
 JSValue newPromiseObject(VM& vm, JSObject* proto = nullptr)
 {
-    JSObject* o = vm.newObject(proto ? proto : vm.protos.promise);
-    Handle keep = Handle::adopt(toJSValue(o));
-    o->h.cls = std::uint8_t(ObjClass::Promise);
-    o->rareOf(vm).ext = new PromiseData();
-    return keep.take();
+    constexpr std::uint8_t aux = 3;
+    auto* o = static_cast<JSObject*>(
+        vm.allocCell(JSObject::bytesFor(aux) + JSObject::kPromiseStateBytes, Kind::Object, ObjClass::Promise, aux));
+    o->h.shape = vm.rootShapeFor(proto ? proto : vm.protos.promise)->id;
+    o->slots = nullptr;
+    ::new (static_cast<void*>(o->embeddedState())) PromiseData();
+    return toJSValue(o);
 }
 
 /// An `AggregateError` for the reasons `results` holds, owned.
@@ -533,12 +538,11 @@ NATIVE(promiseCtor)
     const JSValue executor = arg(args, argc, 0);
     if (!isFunction(executor))
         return typeError(vm, "Promise resolver " + describe(vm, executor) + " is not a function");
-    JSObject* o = asObject(self);
-    o->h.cls = std::uint8_t(ObjClass::Promise);
-    delete o->rareOf(vm).ext;
-    o->rareOf(vm).ext = new PromiseData();
+    // A promise of its own (its state in its cell), inheriting what `this` was made to (a subclass's prototype).
+    Handle made = Handle::adopt(newPromiseObject(vm, asObject(self)->proto(vm)));
+    const JSValue promise = made.get();
     Handle resolve, reject;
-    makeResolvers(vm, self, &resolve, &reject);
+    makeResolvers(vm, promise, &resolve, &reject);
     JSValue callArgs[2] = {resolve.get(), reject.get()};
     JSValue r = vm.call(executor, JSValue::undefined(), callArgs, 2);
     if (r.isException()) {
@@ -549,8 +553,7 @@ NATIVE(promiseCtor)
     } else {
         release(r);
     }
-    retain(self);
-    return self;
+    return made.take();
 }
 
 // ----------------------------------------------------------------- the combinators ---

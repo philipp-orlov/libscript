@@ -68,6 +68,14 @@ struct JSObject
 
     static constexpr std::size_t kHeaderBytes = 24;
     static std::size_t bytesFor(std::uint8_t inlineSlots) noexcept { return kHeaderBytes + 8u * inlineSlots; }
+    /// Bytes after the slots in place of a promise, for its state (`embeddedState`).
+    static constexpr std::size_t kPromiseStateBytes = 96;
+    /// The native state an object keeps in its own cell, after its slots in place (a promise's), or null.
+    NativeState* embeddedState() noexcept
+    {
+        return cls() == ObjClass::Promise ? reinterpret_cast<NativeState*>(reinterpret_cast<char*>(this) + bytesFor(h.aux))
+                                          : nullptr;
+    }
 
     JSValue* inl() noexcept { return reinterpret_cast<JSValue*>(reinterpret_cast<char*>(this) + kHeaderBytes); }
     JSValue* slotAt(std::uint32_t index) noexcept { return index < h.aux ? &inl()[index] : &slots[index - h.aux]; }

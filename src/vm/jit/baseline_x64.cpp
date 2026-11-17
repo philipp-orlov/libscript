@@ -621,6 +621,7 @@ constexpr std::int32_t kRareFieldInit = std::int32_t(offsetof(Rare, fieldInit));
 constexpr std::int32_t kGcKind = std::int32_t(offsetof(detail::GCObject, kind));
 constexpr std::int32_t kStrBits = std::int32_t(offsetof(StringCell, bits));
 constexpr std::int32_t kStrLength = std::int32_t(offsetof(StringCell, length));
+constexpr std::int32_t kStrInterned = std::int32_t(offsetof(StringCell, interned));
 constexpr std::int32_t kStrChars = std::int32_t(sizeof(StringCell));
 constexpr std::int32_t kRareChildRoot = std::int32_t(offsetof(Rare, childRoot));
 constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
@@ -2854,16 +2855,23 @@ Relation relationOf(Op op)
 }  // namespace
 
 /// rax === rcx: go to `eq` or `neq`, or to `bad` when only the interpreter can tell (strings, doubles).
+/// `rax === rcx`: to `eq` or `neq`, or to `bad` for two strings of one length not both interned, or a bigint. Clobbers rdx
+/// and xmm0-1.
 void Baseline::strictCore(Label& eq, Label& neq, Label& bad)
 {
-    Label differ, aNumber;
+    Label differ, aNumber, cells, notString, numbers;
     a_.cmp(RAX, RCX);
     a_.jcc(CNE, differ);
     a_.cmp(RAX, RBP);  // the same bits are equal, unless a double is not a number
     a_.jcc(CB, eq);
     a_.cmp(RAX, R14);
     a_.jcc(CAE, eq);
-    a_.jmp(bad);
+    a_.mov(RDX, RAX);
+    a_.sub(RDX, RBP);
+    a_.movqToX(0, RDX);
+    a_.ucomisd(0, 0);
+    a_.jcc(CP, neq);
+    a_.jmp(eq);
     a_.bind(differ);
     a_.cmp(RAX, RBP);
     a_.jcc(CAE, aNumber);
@@ -2873,7 +2881,33 @@ void Baseline::strictCore(Label& eq, Label& neq, Label& bad)
     a_.jcc(CAE, neq);
     a_.testI(RCX, 2);
     a_.jcc(CNE, neq);
-    a_.jmp(bad);  // two cells: strings and bigints can still be equal
+    // Two cells, not the same one: objects and symbols are equal only to themselves; strings by their characters.
+    a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+    a_.jcc(CE, neq);
+    a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
+    a_.jcc(CE, neq);
+    a_.testI8(mem(RAX, 7), 0x80);
+    a_.jcc(CNE, bad);
+    a_.testI8(mem(RCX, 7), 0x80);
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::String));
+    a_.jcc(CNE, notString);
+    a_.cmpI8(mem(RCX, kGcKind), std::uint8_t(detail::CellKind::String));
+    a_.jcc(CNE, neq);
+    a_.mov32(RDX, mem(RAX, kStrLength));
+    a_.alu32(7, RDX, mem(RCX, kStrLength));
+    a_.jcc(CNE, neq);
+    a_.cmpI8(mem(RAX, kStrInterned), 0);
+    a_.jcc(CE, bad);
+    a_.cmpI8(mem(RCX, kStrInterned), 0);
+    a_.jcc(CE, bad);
+    a_.jmp(neq);  // two strings in the table are the same cell when they are equal
+    a_.bind(notString);
+    a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::BigInt));
+    a_.jcc(CE, bad);
+    a_.cmpI8(mem(RCX, kGcKind), std::uint8_t(detail::CellKind::BigInt));
+    a_.jcc(CE, bad);
+    a_.jmp(neq);
     a_.bind(aNumber);
     a_.cmp(RCX, RBP);
     a_.jcc(CB, neq);
@@ -2881,7 +2915,12 @@ void Baseline::strictCore(Label& eq, Label& neq, Label& bad)
     a_.and_(RDX, RCX);
     a_.cmp(RDX, R14);
     a_.jcc(CAE, neq);  // two int32 that differ
-    a_.jmp(bad);
+    loadNumber(0, RAX, RDX);
+    loadNumber(1, RCX, RDX);
+    a_.ucomisd(0, 1);
+    a_.jcc(CP, neq);
+    a_.jcc(CE, eq);
+    a_.jmp(neq);
 }
 
 /// `rax == rcx` as the language has it, the two not both int32: to `eq` or `neq`, or to `bad` for what needs the runtime

@@ -4573,6 +4573,38 @@ TEST(callsOverDeadTemporariesKeepCounts)
     }
 }
 
+TEST(strictEqualityOfCellsAndDoublesInCompiledCode)
+{
+    // `===` decides two objects, two symbols, a string against a string of another length or another interned one, and
+    // doubles (NaN, -0) in compiled code; strings of one length not both interned, and bigints, go the long way.
+    const char* program =
+        "var strs = ['abc', 'ab' + 'c', String.fromCharCode(97, 98, 99), 'abd', 'ab', '', 'x'.repeat(100),"
+        "            'x'.repeat(99) + 'x', Symbol.iterator, Symbol('s'), 1n, 2n - 1n, {}, [], 1.5, 3 / 2, NaN, 0, -0, null];"
+        "function js(a, b) { if (a === b) return 1; return 0; }"
+        "function jv(a, b) { return a !== b; }"
+        "var r = '';"
+        "for (var rep = 0; rep < 300; rep++) { r = '';"
+        "  for (var i = 0; i < strs.length; i++) for (var j = 0; j < strs.length; j++) r += js(strs[i], strs[j]) + (jv(strs[i], strs[j]) ? 2 : 0); }"
+        "r";
+    std::string want;
+    {
+        script::Context::Options options;
+        options.jit.mode = script::JitOptions::Mode::Off;
+        js::Context ctx(options);
+        want = ctx.eval(program, "<test>").toString();
+    }
+    CHECK_EQ(want.size(), std::size_t(400));
+    for (int mode = 1; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), want);
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

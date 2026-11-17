@@ -5112,3 +5112,31 @@ TEST(privateMembersThroughSiteCachesAndFieldInitialisersCalledAsFunctions)
                  std::string("9009000 9000 20 false true TypeError t TypeError TypeError 30000 RangeError 5 20000"));
     }
 }
+
+TEST(nestedLoopsOverObjectsOfOneShapeWithDifferentSlotsInPlace)
+{
+    // Objects of one shape, some made before the tree grew past its slots in place and some after: a loop over them whose
+    // inner loop's bound is a property of each. A way into the inner loop (from the baseline code) checks the object's
+    // shape and slots before it reads a property the loop's own checks read.
+    const char* program =
+        "function C(){ this.m=0; this.src=0; this.k=0; }"
+        "var olds=[]; for(var i=0;i<40;i++) olds.push(new C());"
+        "function fill(c,n){ c.m={pts:[]}; c.src=[]; c.count=n; for(var j=0;j<n;j++){ c.m.pts.push({x:0,y:0}); c.src.push({x:j,y:2*j}); } return c; }"
+        "for(var i=0;i<olds.length;i++) fill(olds[i],5);"
+        "var news=[]; for(var i=0;i<40;i++) news.push(fill(new C(),5));"
+        "function step(list){ var s=0; for(var i=0;i<list.length;i++){ var c=list[i]; var m=c.m; for(var j=0;j<c.count;j++){ var a=m.pts[j]; var b=c.src[j]; a.x=b.x; a.y=b.y; s+=a.y; } } return s; }"
+        "var all=[]; for(var r=0;r<200;r++){ all.push(olds[r%40]); } for(var r=0;r<200;r++){ all.push(r%2?news[r%40]:olds[r%40]); }"
+        "var t=0; for(var k=0;k<20;k++) t+=step(all);"
+        "t";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("160000"));
+    }
+}

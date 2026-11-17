@@ -1259,6 +1259,7 @@ private:
     void planLoopFacts();
     void emitLoopGuards(std::uint32_t h, bool covered = false);
     bool encloses(std::uint32_t from, std::uint32_t to, std::uint32_t h) const;
+    bool numCheckedHere(std::uint32_t h, const LoopNum& x) const;
     bool coveredShape(std::uint32_t h, const LoopShape& x) const;
     bool coveredMath(std::uint32_t h, const LoopMath& x) const;
     bool coveredArr(std::uint32_t h, const LoopArr& x) const;

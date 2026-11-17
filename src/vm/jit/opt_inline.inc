@@ -2857,9 +2857,16 @@ void Baseline::planLoopFacts()
             hoistWatch_[h] = std::make_pair(std::uint32_t(end), std::uint64_t(0));
         }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
-        if (std::getenv("T2HOIST"))
+        if (std::getenv("T2HOIST")) {
             std::fprintf(stderr, "hoist %s loop @%u..%lld: %zu shapes %zu chains %zu arrays\n", codeName(code_).c_str(), h,
                          (long long)end, shapes.size() - mixedShape.size(), cells.size(), arrs.size());
+            for (const LoopShape& ls : loopShapes_)
+                if (ls.from == h)
+                    std::fprintf(stderr, "  shape r%u %u aux %d\n", ls.reg, ls.shape, ls.aux);
+            for (const LoopRead& lr : loopReads_)
+                if (lr.from == h)
+                    std::fprintf(stderr, "  read @%u dup %d\n", lr.read, int(lr.dup));
+        }
 #endif
     }
 }
@@ -3011,12 +3018,19 @@ bool Baseline::coveredArr(std::uint32_t h, const LoopArr& x) const
 }
 bool Baseline::coveredNum(std::uint32_t h, const LoopNum& x) const
 {
+    if (numCheckedHere(h, x))
+        return true;
+    for (const LoopNum& o : loopNums_)
+        if (encloses(o.from, o.to, h) && o.reg == x.reg && o.index == x.index && (o.int32 || !x.int32))
+            return true;
+    return false;
+}
+/// Whether loop `h`'s own checks (after its shapes) read the slot of `x` and check it: a promotion or a hoisted read of it.
+bool Baseline::numCheckedHere(std::uint32_t h, const LoopNum& x) const
+{
     // A promoted slot is loaded, and so checked, before the loop.
     for (const LoopPromo& lp : loopPromos_)
         if (lp.from == h && lp.reg == x.reg && lp.index == x.index && !x.int32)
-            return true;
-    for (const LoopNum& o : loopNums_)
-        if (encloses(o.from, o.to, h) && o.reg == x.reg && o.index == x.index && (o.int32 || !x.int32))
             return true;
     // A read of the slot hoisted before this loop checks it (as an int32 when its variable is one).
     for (const LoopRead& lr : loopReads_)
@@ -3142,7 +3156,9 @@ void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
         }
     }
     for (const LoopNum& ln : loopNums_) {
-        if (ln.from != h || coveredNum(h, ln) != covered)
+        // One the loop's own read checks is checked there, after the shapes (never in the pass for other ways in, which
+        // runs before them).
+        if (ln.from != h || numCheckedHere(h, ln) || coveredNum(h, ln) != covered)
             continue;
         std::int32_t aux = -1;
         for (const LoopShape& ls : loopShapes_)

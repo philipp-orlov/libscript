@@ -1706,7 +1706,7 @@ L_GetElem: {
     }
     fr->pc = pc;
     if (base.isNullish()) {
-        vm.throwError(ErrorCode::TypeError, "Cannot read properties of " + std::string(base.isNull() ? "null" : "undefined"));
+        vm.throwError(ErrorCode::TypeError, nullishReadMessage(base, k));
         FAIL();
     }
     if (isPrivateKey(k)) [[unlikely]] {
@@ -2527,8 +2527,10 @@ do_call: {
     if (newR + c->nregs + 1 > vm.stackInit) [[unlikely]]
         vm.fillStack(newR + c->nregs + 1);  // one past: compiled code's test of the stack wants it
     {
+        // All of the caller's registers above the arguments, not only those the callee's frame covers: a call this frame
+        // makes in turn may reach past its end, and must find undefined there, not a dead temporary of this caller.
         JSValue* callerEnd = R + code->nregs;
-        const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(std::min<std::ptrdiff_t>(callerEnd - newR, c->nregs)) : 0;
+        const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
         for (std::uint32_t i = keep; i < overlap; ++i) {
             const JSValue v = newR[i];
             newR[i] = JSValue::undefined();
@@ -3392,7 +3394,7 @@ int jitGetElem(VM& vm, std::uint32_t index)
         }
     }
     if (base.isNullish()) {
-        vm.throwError(ErrorCode::TypeError, "Cannot read properties of " + std::string(base.isNull() ? "null" : "undefined"));
+        vm.throwError(ErrorCode::TypeError, nullishReadMessage(base, k));
         return 0;
     }
     if (isPrivateKey(k)) {

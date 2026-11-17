@@ -3,6 +3,7 @@
 
 // Property access through the prototype chain: the slow paths every inline cache falls back on.
 #include "script/internal/dyn/numconv.hpp"
+#include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
@@ -166,12 +167,26 @@ JSValue getPropertyFrom(VM& vm, JSObject* start, JSValue receiver, Key key)
     return JSValue::undefined();
 }
 
+std::string nullishReadMessage(JSValue base, JSValue key)
+{
+    std::string what;
+    if (key.isInt32())
+        what = std::to_string(key.asInt32());
+    else if (key.isNumber())
+        what = toUtf8(numberToString(key.asNumber()));
+    else if (key.isCell() && !isVmCell(key.asCell()) && key.asCell()->kind == detail::CellKind::String)
+        what = toUtf8(static_cast<StringCell*>(key.asCell())->text());
+    else if (key.isCell() && !isVmCell(key.asCell()) && key.asCell()->kind == detail::CellKind::Symbol)
+        what = "Symbol(" + toUtf8(static_cast<const dyn::SymbolCell*>(key.asCell())->description) + ")";
+    return "Cannot read properties of " + std::string(base.isNull() ? "null" : "undefined") +
+           (what.empty() ? std::string() : " (reading '" + what + "')");
+}
+
 JSValue getProperty(VM& vm, JSValue base, Key key)
 {
     if (base.isNullish()) {
         SCRIPT_VM_CENSUS(ThrowCount);
-        return vm.throwError(ErrorCode::TypeError, "Cannot read properties of " +
-                                                       std::string(base.isNull() ? "null" : "undefined"));
+        return vm.throwError(ErrorCode::TypeError, nullishReadMessage(base, JSValue::cell(key)));
     }
     JSObject* o;
     JSValue direct = JSValue::undefined();

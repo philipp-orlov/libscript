@@ -461,9 +461,10 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         vm.fillStack(newR + c->nregs + 1);  // one past: compiled code's test of the stack wants it
     {
         // What the frame sits on may be the caller's dead temporaries, or arguments the callee has no parameter for.
+        // All of the caller's registers above the arguments (as the compiled call sequence clears them): a call the new
+        // frame makes in turn may reach past its end into them.
         JSValue* callerEnd = R + code->nregs;
-        const std::uint32_t overlap =
-            callerEnd > newR ? std::uint32_t(std::min<std::ptrdiff_t>(callerEnd - newR, c->nregs)) : 0;
+        const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
         for (std::uint32_t i = keep; i < overlap; ++i) {
             const JSValue v = newR[i];
             newR[i] = JSValue::undefined();

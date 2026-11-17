@@ -4659,6 +4659,32 @@ TEST(aFunctionWithMoreThan65535NamesAndConstants)
     }
 }
 
+TEST(aCallFindsUndefinedPastItsCallersEnd)
+{
+    // A frame sits on the caller's registers above its arguments, and a call it makes in turn can reach past its end into
+    // the registers of the caller's caller. Those must be undefined there: a parameter given no argument read a dead
+    // temporary of a frame further down (Babel's _arrayLikeToArray, `function n(l, n)`, called with one argument from an
+    // inner function, made an array of a function).
+    const char* program =
+        "var mods = { 966: function (l) { function n(l, n) { (null == n || n > l.length) && (n = l.length);"
+        "  for (var u = 0, e = Array(n); u < n; u++) e[u] = l[u]; return e }"
+        "  var u, e = [{ a: 1 }].concat(function (l) { if (Array.isArray(l)) return n(l) }"
+        "    (u = Array.from({ length: 3 }, function (l, n) { return { i: n } })) || function () { throw new TypeError('x') }());"
+        "  l.exports = { W: e } } };"
+        "var m = { exports: {} }; mods[966](m); JSON.stringify(m.exports.W)";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("[{\"a\":1},{\"i\":0},{\"i\":1},{\"i\":2}]"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

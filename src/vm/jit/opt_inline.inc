@@ -2425,6 +2425,7 @@ void Baseline::planLoopFacts()
     loopGlobals_.clear();
     loopMaths_.clear();
     loopReads_.clear();
+    keptLoopRegs_ = 0;
     loopPromos_.clear();
     intPromos = doublePromos = 0;
     promoAccess_.clear();
@@ -2612,10 +2613,14 @@ void Baseline::planLoopFacts()
                     code_->caches[code_->code[lr.read + 1].a].index == ic.index &&
                     isI32(plan_->defWeb[lr.read]) == isI32(plan_->defWeb[j]))
                     same = &lr;
-            if (same)
+            if (same) {
                 loopReads_.push_back(LoopRead{h, std::uint32_t(end), j, same->slot, true});
-            else
+                loopReads_.back().xreg = same->xreg;
+            } else {
                 loopReads_.push_back(LoopRead{h, std::uint32_t(end), j, hoistBase_ + std::int32_t(8 * hoistSlots_++)});
+                if (!isI32(plan_->defWeb[j]) && keptLoopRegs_ < kKeptForLoops)
+                    loopReads_.back().xreg = kKeptFirst + keptLoopRegs_++;
+            }
             any = true;
         }
         // Number slots of those objects that the loop both reads and stores through the register: kept as a double in a
@@ -3052,6 +3057,8 @@ void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
         if (isI32(plan_->defWeb[lr.read])) {
             needInt(RAX, bad);
             a_.mov32(mem(RSP, lr.slot), RAX);
+        } else if (lr.xreg >= 0) {
+            unboxDouble(lr.xreg, RAX, RDX, &bad);
         } else {
             unboxDouble(0, RAX, RDX, &bad);
             a_.movsdStore(mem(RSP, lr.slot), 0);

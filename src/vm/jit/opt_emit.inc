@@ -815,6 +815,9 @@ bool Baseline::emitTyped(std::uint32_t i)
                 const Reg r = inReg(dw) ? gpr(dw) : RAX;
                 a_.mov32(r, mem(RSP, lr->slot));
                 defI32(dw, r);
+            } else if (lr->xreg >= 0) {
+                defF64(dw, lr->xreg);
+                passRax(start);
             } else {
                 const int x = inReg(dw) ? xmmOf(dw) : 0;
                 a_.movsdLoad(x, mem(RSP, lr->slot));
@@ -1515,7 +1518,12 @@ void Baseline::emitOpt(std::uint32_t i)
         const LoopRead* lr = hoistedRead(ru->second);
         const Mem src = lr ? mem(RSP, lr->slot) : home(from);
         const std::int32_t start = a_.here();
-        if (isI32(dw)) {
+        const auto sx = savedXmm_.find(ru->second);
+        if (!isI32(dw) && lr && lr->xreg >= 0) {
+            defF64(dw, lr->xreg);
+        } else if (!isI32(dw) && !lr && sx != savedXmm_.end()) {
+            defF64(dw, sx->second);
+        } else if (isI32(dw)) {
             const Reg r = inReg(dw) ? gpr(dw) : RCX;
             a_.mov32(r, src);
             defI32(dw, r);
@@ -1762,6 +1770,8 @@ void Baseline::saveReadValue(std::uint32_t i)
         return;  // there already
     if (isI32(w))
         a_.mov32(home(w), gpr(w));
+    else if (auto sx = savedXmm_.find(i); sx != savedXmm_.end())
+        a_.movaps(sx->second, xmmOf(w));
     else
         a_.movsdStore(home(w), xmmOf(w));
 }
@@ -2039,6 +2049,24 @@ void Baseline::planReadReuse()
         // A register written here is no longer the object the reads were of.
         for (std::uint16_t r : opt::effectsOf(*code_, j).wr)
             seen.erase(std::remove_if(seen.begin(), seen.end(), [&](const Seen& x) { return x.obj == r; }), seen.end());
+    }
+    // Doubles whose reads are used again keep their value in a register a call keeps, where one is free from the read to
+    // its last reuse.
+    savedXmm_.clear();
+    std::vector<std::uint32_t> until(Asm::kKeptXmm - kKeptForLoops, 0);
+    std::map<std::uint32_t, std::uint32_t> last;
+    for (const auto& [later, earlier] : reuseRead_)
+        last[earlier] = std::max(last[earlier], later);
+    for (const auto& [first, end] : last) {
+        const std::int32_t w = plan_->defWeb[first];
+        if (w < 0 || isI32(w) || !inReg(w))
+            continue;
+        for (std::size_t k = 0; k < until.size(); ++k)
+            if (until[k] <= first) {
+                until[k] = end + 1;
+                savedXmm_[first] = kKeptFirst + kKeptForLoops + int(k);
+                break;
+            }
     }
 }
 

@@ -434,6 +434,7 @@ public:
     /// The three-operand forms the optimizing compiler uses where the assembler has them; it does not ask here.
     static constexpr bool kThreeOperand = false;
     static constexpr int kExtraXmm = 0;
+    static constexpr int kKeptXmm = 0;
     static constexpr int kExtraGpr = 0;
     void op32(int, Reg, Reg, Reg) {}
     void op32I(int, Reg, Reg, std::int32_t) {}

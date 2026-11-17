@@ -11,6 +11,8 @@
 //   rdi x0   rsi x1   rdx x2   rcx x3   r8 x4   r9 x5   rax x8   r10 x9   r11 x10         (not kept by a call)
 //   rbx x19  rbp x20  r12 x21  r13 x22  r14 x23  r15 x24                                  (kept by a call)
 //   xmm0-7 v0-v7, xmm8-15 v16-v23 (none kept by a call, as the templates expect)
+//   xmm23-30 v8-v15: kept by a call into the runtime (whose convention keeps their low halves, all a double has); values
+//   the optimizing compiler reads once and keeps (`kKeptXmm`), saved around compiled code by `abiEnter`
 //   r16-r20 x6 x7 x11 x12 x13 (not kept by a call), r21 r22 x25 x26 (kept), xmm16-22 v24-v30 (not kept): registers
 //   past the interface's, for the optimizing compiler's variables.
 //   x14-x17 and v31 are the assembler's own, within one operation.
@@ -150,7 +152,7 @@ private:
                                                  6, 7, 11, 12, 13, 25, 26};
         return map[r];
     }
-    static int V(int x) noexcept { return x < 8 ? x : x + 8; }
+    static int V(int x) noexcept { return x < 8 ? x : x < 23 ? x + 8 : x - 15; }
 
     /// The registers whose upper half is known to be zero: written last by a 32-bit operation, with no label and no
     /// call since. A 64-bit use of one reads what its 32 bits say.
@@ -952,6 +954,8 @@ public:
     static constexpr bool kThreeOperand = true;
     /// Double registers past the interface's sixteen (16 and up), which no template uses and a call does not keep.
     static constexpr int kExtraXmm = 7;
+    /// Double registers a call into the runtime keeps (23 and up), for values read once and used again.
+    static constexpr int kKeptXmm = 8;
     /// Integer registers past the interface's sixteen (16 and up).
     static constexpr int kExtraGpr = 7;
     /// `d = a op b` on 32 bits, with the flags of the two-operand form.
@@ -1106,6 +1110,10 @@ public:
         ins(0xA9BF7BFDu);  // stp x29, x30, [sp, #-16]!
         ins(0xA9BF73FBu);  // stp x27, x28, [sp, #-16]!
         ins(0xA9BF6BF9u);  // stp x25, x26, [sp, #-16]!
+        ins(0x6DBF27E8u);  // stp d8, d9, [sp, #-16]!
+        ins(0x6DBF2FEAu);  // stp d10, d11, [sp, #-16]!
+        ins(0x6DBF37ECu);  // stp d12, d13, [sp, #-16]!
+        ins(0x6DBF3FEEu);  // stp d14, d15, [sp, #-16]!
         ins(0x910003FCu);  // mov x28, sp
         moveStack(true, 8);
     }
@@ -1113,6 +1121,10 @@ public:
     {
         ins(0xAA0803E0u);  // mov x0, x8: the result, where C++ looks for it
         moveStack(false, 8);
+        ins(0x6CC13FEEu);  // ldp d14, d15, [sp], #16
+        ins(0x6CC137ECu);  // ldp d12, d13, [sp], #16
+        ins(0x6CC12FEAu);  // ldp d10, d11, [sp], #16
+        ins(0x6CC127E8u);  // ldp d8, d9, [sp], #16
         ins(0xA8C16BF9u);  // ldp x25, x26, [sp], #16
         ins(0xA8C173FBu);  // ldp x27, x28, [sp], #16
         ins(0xA8C17BFDu);  // ldp x29, x30, [sp], #16

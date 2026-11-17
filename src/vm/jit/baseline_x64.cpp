@@ -1075,7 +1075,13 @@ private:
         std::uint32_t from, to, read;
         std::int32_t slot;  ///< rsp-relative
         bool dup = false;   ///< another read of the loop fills the slot
+        int xreg = -1;      ///< a double kept in a register a call keeps, instead of the slot (`Asm::kKeptXmm`)
     };
+    /// Of the registers a call keeps, the first half hold hoisted reads, the second half the values of reads used again
+    /// in their block (`savedXmm_`).
+    static constexpr int kKeptFirst = 23, kKeptForLoops = Asm::kKeptXmm / 2;
+    int keptLoopRegs_ = 0;
+    std::map<std::uint32_t, int> savedXmm_;  ///< read -> the register its value is kept in for the reads that reuse it
     std::vector<LoopRead> loopReads_;
     /// A number slot of an object in a register the loop does not write, read and stored by the loop through that register:
     /// kept as a double in a stack slot (`slot`), loaded before the loop and written back on every way out of it. Other

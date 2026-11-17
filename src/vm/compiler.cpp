@@ -120,7 +120,7 @@ struct Fn
     std::vector<TryCtx> tries;
     std::map<String, std::uint16_t> upvalIndex;
     std::map<Key, std::uint16_t> atomIndex;
-    std::map<std::uint64_t, std::uint16_t> constIndex;
+    std::map<std::uint64_t, std::uint32_t> constIndex;
 };
 
 bool isFunctionNode(const Node& n) noexcept
@@ -608,6 +608,16 @@ private:
         return first;
     }
 
+    /// Whether `atom(name)` has an index to give.
+    bool roomForName(const String& name)
+    {
+        if (fn_->block->atoms.size() < 0xFFFF)
+            return true;
+        Key key = vm_.internKey(name);
+        const bool known = fn_->atomIndex.count(key) != 0;
+        detail::decRef(key);
+        return known;
+    }
     std::uint16_t atom(const String& name)
     {
         Key key = vm_.internKey(name);  // a count the block keeps
@@ -627,7 +637,9 @@ private:
         fn_->atomIndex[key] = std::uint16_t(index);
         return std::uint16_t(index);
     }
-    std::uint16_t constant(JSValue owned)
+    /// The index of a constant in the block's table: up to 2^32 for LoadK (`emitLoadK`), up to 65535 for the
+    /// instructions that name a constant in one operand (`constant`).
+    std::uint32_t constantIndex(JSValue owned)
     {
         auto it = fn_->constIndex.find(owned.bits);
         if (it != fn_->constIndex.end()) {
@@ -635,11 +647,24 @@ private:
             return it->second;
         }
         const std::size_t index = fn_->block->consts.size();
-        if (index > 0xFFFF)
+        if (index > 0xFFFFFFFEu)
             throw Error(ErrorCode::NotSupported, "vm core: too many constants in one function");
         fn_->block->consts.push_back(owned);
-        fn_->constIndex[owned.bits] = std::uint16_t(index);
+        fn_->constIndex[owned.bits] = std::uint32_t(index);
+        return std::uint32_t(index);
+    }
+    std::uint16_t constant(JSValue owned)
+    {
+        const std::uint32_t index = constantIndex(owned);
+        if (index > 0xFFFF)
+            throw Error(ErrorCode::NotSupported, "vm core: too many constants in one function");
         return std::uint16_t(index);
+    }
+    /// LoadK names its constant with two operands, low half first.
+    void emitLoadK(std::uint32_t dst, JSValue owned)
+    {
+        const std::uint32_t index = constantIndex(owned);
+        emit(Op::LoadK, dst, index & 0xFFFF, index >> 16);
     }
 
     void loadNumber(std::uint16_t dst, double d)
@@ -647,11 +672,11 @@ private:
         if (d == double(std::int16_t(d)) && !(d == 0 && std::signbit(d)))
             emit(Op::LoadInt, dst, std::uint16_t(std::int16_t(d)));
         else
-            emit(Op::LoadK, dst, constant(JSValue::boxNumber(d)));
+            emitLoadK(dst, (JSValue::boxNumber(d)));
     }
     void loadString(std::uint16_t dst, const String& text)
     {
-        emit(Op::LoadK, dst, constant(fromValue(vm_, ctx_.str(text))));
+        emitLoadK(dst, (fromValue(vm_, ctx_.str(text))));
     }
 
     // ---------------------------------------------------------------- scopes ---
@@ -1279,7 +1304,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             if (!ok)
                 syntaxError(n, "Invalid BigInt literal");
             const std::uint16_t d = dest(dst);
-            emit(Op::LoadK, d, constant(v));
+            emitLoadK(d, (v));
             return d;
         }
         case NK::RegExpLit: {
@@ -1320,7 +1345,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
                 detail::decRef(rawKey);
             }
             const std::uint16_t d = dest(dst);
-            emit(Op::LoadK, d, constant(cooked));
+            emitLoadK(d, (cooked));
             return d;
         }
         default: unsupported(n, "this expression");
@@ -1443,6 +1468,15 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
                 function(*p->b, (p->propKind == PropKind::Getter ? u"get " : u"set ") + name, f, true);
                 homeFor(*p->b, f, t);
                 emit(p->propKind == PropKind::Getter ? Op::InitGetter : Op::InitSetter, t, atom(name), f);
+            } else if (!roomForName(name)) {
+                // The function's names are used up (an object literal of tens of thousands of keys): the key as a
+                // constant in a register.
+                const std::uint16_t k = temp();
+                loadString(k, name);
+                const std::uint16_t v = temp();
+                exprNamed(*p->b, v, name);
+                homeFor(*p->b, v, t);
+                emit(Op::InitElem, t, k, v);
             } else {
                 const std::uint16_t v = temp();
                 exprNamed(*p->b, v, name);

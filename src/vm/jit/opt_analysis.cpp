@@ -529,7 +529,7 @@ Plan analyse(const CodeBlock& code)
         case Op::LoadInt:
             return Rep::I32;
         case Op::LoadK: {
-            const JSValue k = code.consts[ins.b];
+            const JSValue k = code.consts[ins.kIndex()];
             return k.isInt32() ? Rep::I32 : k.isDouble() ? Rep::F64 : Rep::Mem;
         }
         case Op::Mov:

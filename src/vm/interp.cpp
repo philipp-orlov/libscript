@@ -771,7 +771,7 @@ L_Mov:
     COPY(ins->a, R[ins->b]);
     NEXT();
 L_LoadK:
-    COPY(ins->a, K[ins->b]);
+    COPY(ins->a, K[ins->kIndex()]);
     NEXT();
 L_LoadInt:
     SET(ins->a, JSValue::int32(ins->imm()));

@@ -403,7 +403,7 @@ bool Baseline::emitTyped(std::uint32_t i)
     case Op::LoadK: {
         if (dw < 0)
             return false;
-        const JSValue k = code_->consts[in.b];
+        const JSValue k = code_->consts[in.kIndex()];
         if (!k.isNumber())
             return false;
         if (isI32(dw)) {
@@ -1918,7 +1918,7 @@ void Baseline::findPlainRegs()
             continue;  // the long way of a call run in place: this code leaves before it
         const bool constant = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue || op == Op::LoadFalse ||
                               op == Op::LoadInt || op == Op::LoadHole || op == Op::LoadUninit ||
-                              (op == Op::LoadK && !code_->consts[in.b].isCell());
+                              (op == Op::LoadK && !code_->consts[in.kIndex()].isCell());
         for (std::size_t k = 0; k < e.wr.size(); ++k) {
             const bool typed = k == 0 && plan_->defWeb[i] >= 0;
             if (!typed && !constant && e.wr[k] < plainRegs_.size())
@@ -2222,7 +2222,7 @@ void Baseline::findCells()
             } else {
                 const bool constant = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue ||
                                       op == Op::LoadFalse || op == Op::LoadInt || op == Op::LoadHole ||
-                                      op == Op::LoadUninit || (op == Op::LoadK && !code_->consts[in.b].isCell());
+                                      op == Op::LoadUninit || (op == Op::LoadK && !code_->consts[in.kIndex()].isCell());
                 const bool fromPlain = op == Op::Mov && in.b < R && !s[in.b];
                 // A typed result stays in its variable: the frame register keeps what it held.
                 for (std::size_t k = 0; k < e.wr.size(); ++k)

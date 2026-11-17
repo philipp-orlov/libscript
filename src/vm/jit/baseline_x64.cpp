@@ -2432,7 +2432,7 @@ void Baseline::emit(std::uint32_t i)
         write(in.a, RAX);
         return;
     case Op::LoadK: {
-        const JSValue k = code_->consts[in.b];
+        const JSValue k = code_->consts[in.kIndex()];
         a_.movImm(RAX, k.bits);
         if (k.isCell())
             a_.inc32(mem(RAX, kHdrRc));

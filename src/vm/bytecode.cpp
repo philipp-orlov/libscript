@@ -47,7 +47,9 @@ std::string dump(const CodeBlock& block)
         for (int i = 0; i < 3 && n < int(sizeof line) - 24; ++i) {
             switch (kinds[i]) {
                 case 'R': n += std::snprintf(line + n, sizeof line - n, " r%u", operands[i]); break;
-                case 'K': n += std::snprintf(line + n, sizeof line - n, " k%u", operands[i]); break;
+                case 'K':
+                    n += std::snprintf(line + n, sizeof line - n, " k%u", ins.opcode() == Op::LoadK ? ins.kIndex() : operands[i]);
+                    break;
                 case 'A': n += std::snprintf(line + n, sizeof line - n, " @%u", operands[i]); break;
                 case 'N': n += std::snprintf(line + n, sizeof line - n, " #%u", operands[i]); break;
                 case 'I': n += std::snprintf(line + n, sizeof line - n, " %d", int(std::int16_t(operands[i]))); break;

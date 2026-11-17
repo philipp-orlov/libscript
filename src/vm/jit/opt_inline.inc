@@ -505,7 +505,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             break;
         case Op::LoadK:
             regs[ci.a] = IVal{};
-            regs[ci.a].c = C->consts[ci.b];
+            regs[ci.a].c = C->consts[ci.kIndex()];
             break;
         case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse:
             regs[ci.a] = IVal{};
@@ -1158,7 +1158,7 @@ void Baseline::planFnBorrows()
             continue;
         const bool skipped = (j < skipDef_.size() && skipDef_[j]);
         const bool neutral = op == Op::LoadUndef || op == Op::LoadNull || op == Op::LoadTrue || op == Op::LoadFalse ||
-                             op == Op::LoadInt || (op == Op::LoadK && !code_->consts[in.b].isCell()) ||
+                             op == Op::LoadInt || (op == Op::LoadK && !code_->consts[in.kIndex()].isCell()) ||
                              plan_->defWeb[j] >= 0;
         std::uint8_t attrs = 0;
         const bool source = !skipped && plan_->defWeb[j] < 0 &&

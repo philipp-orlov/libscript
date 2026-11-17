@@ -4636,6 +4636,29 @@ TEST(anAddedPropertyGoesInPlaceOnlyWhereTheObjectHasRoom)
     }
 }
 
+TEST(aFunctionWithMoreThan65535NamesAndConstants)
+{
+    // LoadK names its constant with 32 bits, and an object literal whose function has used up its 65535 names stores the
+    // rest by a key held in a register: a literal of 70,000 properties with 70,000 different double values compiles and
+    // runs, in every tier.
+    std::string program = "function make() { return {";
+    for (int i = 0; i < 70000; ++i)
+        program += "k" + std::to_string(i) + ": " + std::to_string(i) + ".5,";
+    program += "}; } var o = make(); var s = 0; for (var k in o) s += o[k];"
+               "Object.keys(o).length + ',' + o.k0 + ',' + o.k65534 + ',' + o.k65535 + ',' + o.k69999 + ',' + s";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("70000,0.5,65534.5,65535.5,69999.5,2450000000"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

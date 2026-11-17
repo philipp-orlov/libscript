@@ -45,6 +45,8 @@ struct Ins
     /// The offset of a fused compare-and-jump, which has two registers and so only 16 bits for the distance.
     std::int16_t jump16() const noexcept { return std::int16_t(c); }
     std::int16_t imm() const noexcept { return std::int16_t(b); }
+    /// LoadK's constant: its index in two operands, low half first.
+    std::uint32_t kIndex() const noexcept { return std::uint32_t(b) | (std::uint32_t(c) << 16); }
     static Ins make(Op op, std::uint16_t a = 0, std::uint16_t b = 0, std::uint16_t c = 0) noexcept
     {
         return Ins{std::uint16_t(op), a, b, c};

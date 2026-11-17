@@ -657,6 +657,10 @@ constexpr std::int32_t kShapeFlags = std::int32_t(offsetof(Shape, flags));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
 constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
 constexpr std::int32_t kSuperSlot = std::int32_t(offsetof(SuperCache, slot));
+constexpr std::int32_t kIcShape = std::int32_t(offsetof(InlineCache, shape));
+constexpr std::int32_t kIcIndex = std::int32_t(offsetof(InlineCache, index));
+constexpr std::int32_t kIcNext = std::int32_t(offsetof(InlineCache, next));
+constexpr std::int32_t kIcHolder = std::int32_t(offsetof(InlineCache, holder));
 constexpr std::int32_t kPrivKey = std::int32_t(offsetof(PrivateCache, key));
 constexpr std::int32_t kPrivShape = std::int32_t(offsetof(PrivateCache, shape));
 constexpr std::int32_t kPrivIndex = std::int32_t(offsetof(PrivateCache, index));
@@ -2308,6 +2312,9 @@ private:
     void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
     void putElem(std::uint32_t i, const Ins& in);
     void defPrivate(std::uint32_t i, const Ins& in);
+    void cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
+    void cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
+    void putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
     /// Per instruction: the registers that may have been written since the frame began (one bit each), or empty when
     /// that is not known (`planDirty`). Those that were not are undefined still, and a return leaves them be.
@@ -3453,11 +3460,21 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     const bool stringPath = isLength || protoSlot;
     if (count == 0 && !stringPath) {
         immature(i);
-        helperOp(i, &helperThunk<jitGetProp>);
+        if (!ic || optimizing()) {
+            helperOp(i, &helperThunk<jitGetProp>);
+            return;
+        }
+        // Nothing seen yet when this code was made: what the site's cache holds when it runs.
+        Label& bad = slow(i, &helperThunk<jitGetProp>);
+        a_.mov(RAX, R(in.b));
+        needObject(RAX, bad);
+        cachedRead(i, in, ic, bad);
         return;
     }
     Label& bad = slow(i, &helperThunk<jitGetProp>);
-    Label done, lengthPath, stringRecv;
+    Label done, lengthPath, stringRecv, cached;
+    // A shape none of those: the one the site's cache holds now (objects that changed, such as one become a dictionary).
+    const bool probe = ic && !isLength && !optimizing();
     a_.mov(RAX, R(in.b));
     if (count == 0 && isLength) {
         // No shape seen: an array's length, or a string's.
@@ -3479,7 +3496,7 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         const bool last = k == count - 1;
         // The last entry that does not match goes where a miss goes; a hit falls through to the end.
         a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
-        a_.jcc(CNE, last ? (isLength ? lengthPath : bad) : next);
+        a_.jcc(CNE, last ? (isLength ? lengthPath : probe ? cached : bad) : next);
         if (seen[k].holder) {
             hold(seen[k].validity);
             a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
@@ -3494,6 +3511,11 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
             a_.jmp(done);
         if (!last)
             a_.bind(next);
+    }
+    if (probe && count > 0) {
+        a_.jmp(done);
+        a_.bind(cached);
+        cachedRead(i, in, ic, bad);
     }
     if (isLength) {
         a_.bind(lengthPath);
@@ -3524,6 +3546,34 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         }
     }
     a_.bind(done);
+}
+
+void Baseline::cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad)
+{
+    // The object in rax: an own data property where the site's cache says, read from the cache as it is now.
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic));
+    a_.mov32(RSI, mem(RCX, kIcShape));
+    a_.alu32(7, RSI, mem(RAX, 0));
+    a_.jcc(CNE, bad);
+    a_.mov(RSI, mem(RCX, kIcHolder));
+    a_.test(RSI, RSI);
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RCX, kIcNext));
+    a_.test32(RSI, RSI);
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RCX, kIcIndex));
+    Label out, have;
+    a_.movzx8(RDI, mem(RAX, kHdrAux));
+    a_.alu32(7, RSI, RDI);
+    a_.jcc(CAE, out);
+    a_.mov(RAX, mem(RAX, RSI, 8, kObjInline));
+    a_.jmp(have);
+    a_.bind(out);
+    a_.alu32(5, RSI, RDI);
+    a_.mov(RDX, mem(RAX, kObjSlots));
+    a_.mov(RAX, mem(RDX, RSI, 8));
+    a_.bind(have);
+    deliver(i, in.a);
 }
 
 void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
@@ -3608,14 +3658,68 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
     const std::uint16_t cacheId = code_->code[i + 1].a;
     const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
     if (!ic || ic->shape == 0 || ic->holder) {
-        helperOp(i, &helperThunk<jitPutProp>);
+        if (!ic || optimizing()) {
+            helperOp(i, &helperThunk<jitPutProp>);
+            return;
+        }
+        // Nothing seen yet when this code was made: a write where the site's cache says when it runs.
+        Label& bad = slow(i, &helperThunk<jitPutProp>);
+        a_.mov(RAX, R(in.a));
+        needObject(RAX, bad);
+        cachedWrite(i, in, ic, bad);
         return;
     }
     Label& bad = slow(i, &helperThunk<jitPutProp>);
+    Label other, done;
+    const bool probe = !optimizing();
     a_.mov(RAX, R(in.a));
     needObject(RAX, bad);
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
+    a_.jcc(CNE, probe ? other : bad);
+    if (probe) {
+        putPropKnown(i, in, ic, bad);
+        a_.jmp(done);
+        a_.bind(other);
+        cachedWrite(i, in, ic, bad);
+        a_.bind(done);
+        return;
+    }
+    putPropKnown(i, in, ic, bad);
+}
+
+void Baseline::cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad)
+{
+    // The object in rax: an own writable data property where the site's cache says, as the cache is now.
+    (void)i;
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic));
+    a_.mov32(RSI, mem(RCX, kIcShape));
+    a_.alu32(7, RSI, mem(RAX, 0));
     a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RCX, kIcNext));
+    a_.test32(RSI, RSI);
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RCX, kIcIndex));
+    Label out, have;
+    a_.movzx8(RDI, mem(RAX, kHdrAux));
+    a_.alu32(7, RSI, RDI);
+    a_.jcc(CAE, out);
+    a_.lea(RDX, mem(RAX, RSI, 8, kObjInline));
+    a_.jmp(have);
+    a_.bind(out);
+    a_.alu32(5, RSI, RDI);
+    a_.mov(RDX, mem(RAX, kObjSlots));
+    a_.lea(RDX, mem(RDX, RSI, 8));
+    a_.bind(have);
+    a_.mov(RCX, R(in.c));
+    retain(RCX);
+    a_.mov(RSI, mem(RDX, 0));
+    a_.mov(mem(RDX, 0), RCX);
+    release(RSI);
+}
+
+void Baseline::putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad)
+{
+    (void)i;
     if (ic->next == 0) {
         slotAddress(ic->index);
         a_.mov(RCX, R(in.c));

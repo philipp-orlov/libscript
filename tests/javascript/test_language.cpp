@@ -5176,3 +5176,38 @@ TEST(promisesKeepTheirStateInTheirCellSubclassedAndInCycles)
                  std::string("true true p! true true p abcde TypeError 1,2,3 20100 x"));
     }
 }
+
+TEST(readsAndStoresFollowWhatTheirSiteCacheHoldsAsTheCodeRuns)
+{
+    // Baseline code made before a site ran, or for shapes its objects left (one become a dictionary), reads the site's cache
+    // as it runs; a shape found in the PolyCache takes the inline cache's place. Deletes, read-only and accessor properties
+    // and a property moved to a prototype under such a site.
+    const char* program =
+        "var out=[];"
+        "function get(o){ return o.v; } function set(o,x){ o.v=x; return o; }"
+        "function warm(){ var s=0; for(var i=0;i<50;i++) s+=i; return s; }"
+        "for(var i=0;i<5;i++) warm();"
+        "var a={v:1}, b={w:0,v:2}, c={x:0,y:0,v:3};"
+        "var t=0; for(var i=0;i<3000;i++){ t+=get(i%3==0?a:i%3==1?b:c); set(i%2?a:b, i); } out.push(t, a.v, b.v);"
+        "var big={v:0}; for(var i=0;i<1000;i++){ big.v=i; t+=get(big); }"
+        "for(var k=0;k<300;k++) big['p'+k]=k;"
+        "for(var i=0;i<1000;i++){ set(big,i); t+=get(big); } out.push(t, big.v);"
+        "delete big.v; out.push(get(big)); big.v=9; out.push(get(big));"
+        "Object.defineProperty(big,'v',{writable:false}); set(big,100); out.push(big.v);"
+        "Object.defineProperty(big,'v',{get:function(){return 'g';},configurable:true}); out.push(get(big));"
+        "var p1={v:'own'}, proto={v:'inh'}, p2=Object.create(proto);"
+        "var u=''; for(var i=0;i<400;i++){ u=get(i%2?p1:p2); } out.push(u, get(p1));"
+        "delete p1.v; Object.setPrototypeOf(p1, proto); out.push(get(p1));"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2998002 2999 2998 3997002 999  9 9 g own own inh"));
+    }
+}

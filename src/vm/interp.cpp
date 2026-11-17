@@ -507,9 +507,44 @@ int readPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValue base
 
 /// The slow part of a cached property read once the site's one entry did not apply: the `PolyCache`, then learning (the first
 /// shape goes into the inline cache itself, the others and accessors into the `PolyCache`). Same results as `readPoly`.
+/// A data entry of the site's `PolyCache` for `shape` takes the place of its inline cache (which takes the entry's): what
+/// compiled code reads from the cache as it runs is then the shape the site sees now.
+void promotePoly(CodeBlock* code, InlineCache& ic, std::uint32_t shape) noexcept
+{
+    if (!ic.pad || ic.shape == shape || ic.next != 0)
+        return;
+    PolyCache& pc = code->poly[ic.pad - 1];
+    for (std::uint8_t k = 0; k < pc.n; ++k) {
+        PolyEntry& e = pc.e[k];
+        if (e.shape != shape || (e.kind != PolyEntry::OwnData && e.kind != PolyEntry::ProtoData))
+            continue;
+        const PolyEntry was = e;
+        if (ic.shape != 0) {
+            e.shape = ic.shape;
+            e.index = ic.index;
+            e.holder = ic.holder;
+            e.validity = ic.validity;
+            e.kind = ic.holder ? PolyEntry::ProtoData : PolyEntry::OwnData;
+            e.aux = ic.aux;
+        } else {
+            pc.e[k] = pc.e[pc.n - 1];
+            pc.e[pc.n - 1] = PolyEntry{};
+            --pc.n;
+        }
+        ic.shape = was.shape;
+        ic.index = was.index;
+        ic.holder = was.holder;
+        ic.validity = was.validity;
+        ic.aux = was.aux;
+        return;
+    }
+}
+
 int readCachedSlow(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValue base, Key key, JSValue* out)
 {
     int r = readPoly(vm, code, ic, o, base, out);
+    if (r == 1)
+        promotePoly(code, ic, o->h.shape);
     if (r)
         return r;
     if ((ic.shape == 0 || ic.shape == o->h.shape) && learnRead(vm, ic, o, key)) {
@@ -551,6 +586,40 @@ bool storePoly(CodeBlock* code, const InlineCache& ic, JSObject* o, JSValue v)
         return false;
     }
     return false;
+}
+
+/// The store entry of the site's `PolyCache` for objects of shape `shape` takes the place of its inline cache (which takes
+/// the entry's): compiled code that reads the cache as it runs then finds the shape the site sees now.
+void promoteStore(CodeBlock* code, InlineCache& ic, std::uint32_t shape) noexcept
+{
+    if (!ic.pad || ic.shape == shape || ic.holder)
+        return;
+    PolyCache& pc = code->poly[ic.pad - 1];
+    for (std::uint8_t k = 0; k < pc.n; ++k) {
+        PolyEntry& e = pc.e[k];
+        if (e.shape != shape || (e.kind != PolyEntry::Write && e.kind != PolyEntry::Add))
+            continue;
+        const PolyEntry was = e;
+        if (ic.shape != 0) {
+            e = PolyEntry{};
+            e.shape = ic.shape;
+            e.index = ic.index;
+            e.next = ic.next;
+            e.validity = ic.validity;
+            e.kind = ic.next ? PolyEntry::Add : PolyEntry::Write;
+            e.aux = ic.aux;
+        } else {
+            pc.e[k] = pc.e[pc.n - 1];
+            pc.e[pc.n - 1] = PolyEntry{};
+            --pc.n;
+        }
+        ic.shape = was.shape;
+        ic.index = was.index;
+        ic.next = was.kind == PolyEntry::Add ? was.next : 0;
+        ic.validity = was.validity;
+        ic.aux = was.aux;
+        return;
+    }
 }
 
 /// A store to an own writable data property. A site whose inline cache holds another shape remembers it in its
@@ -3333,8 +3402,10 @@ int jitPutProp(VM& vm, std::uint32_t index)
                 return 1;
             }
         }
-        if (storePoly(c.code, ic, o, R[ins->c]))
+        if (const std::uint32_t was = o->h.shape; storePoly(c.code, ic, o, R[ins->c])) {
+            promoteStore(c.code, ic, was);
             return 1;
+        }
         const std::uint32_t before = o->h.shape;
         if (!setProperty(vm, base, key, R[ins->c], strict)) {
             if (!vm.exception.isUndefined())

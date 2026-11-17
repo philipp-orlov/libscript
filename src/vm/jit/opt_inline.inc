@@ -1914,7 +1914,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     if (!isFunction(known))
         return false;
     auto* f = static_cast<JSFunction*>(asObject(known));
-    if ((f->flags & JSFunction::kNative) || f->h.shape != vm_.fnProtoShape || f->isDictionary(vm_))
+    if ((f->flags & JSFunction::kNative) || !vm_.prototypeAt2(f))
         return false;
     CodeBlock* C = f->code;
     if (!C || !C->constructor || (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |

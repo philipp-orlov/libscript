@@ -410,7 +410,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     if (!isFunction(callee))
         return {0, 0};
     auto* f = static_cast<JSFunction*>(asObject(callee));
-    if (isNew && ((f->flags & JSFunction::kNative) || !f->code->constructor || f->h.shape != vm.fnProtoShape))
+    if (isNew && ((f->flags & JSFunction::kNative) || !f->code->constructor || !vm.prototypeAt2(f) ||
+                  (f->code->flags & CodeBlock::kDerived)))
         return {0, 0};
     if (!(f->flags & JSFunction::kNative) && index < code->callProf.size())
         code->callProf[index] = f->code->uid;
@@ -593,7 +594,6 @@ constexpr std::int32_t kCbTier1 = std::int32_t(offsetof(CodeBlock, tier1));
 constexpr std::int32_t kCbUid = std::int32_t(offsetof(CodeBlock, uid));
 constexpr std::int32_t kCbConstructor = std::int32_t(offsetof(CodeBlock, constructor));
 constexpr std::int32_t kCbThisSlots = std::int32_t(offsetof(CodeBlock, thisSlots));
-constexpr std::int32_t kVmFnProtoShape = std::int32_t(offsetof(VM, fnProtoShape));
 constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
 constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
 constexpr std::int32_t kCbNregs = std::int32_t(offsetof(CodeBlock, nregs));
@@ -617,12 +617,14 @@ constexpr std::int32_t kTypedKind = std::int32_t(offsetof(JSTypedArray, kind));
 constexpr std::int32_t kRareNative = std::int32_t(offsetof(Rare, native));
 constexpr std::int32_t kRareData = std::int32_t(offsetof(Rare, nativeData));
 constexpr std::int32_t kRareHome = std::int32_t(offsetof(Rare, home));
+constexpr std::int32_t kRareFieldInit = std::int32_t(offsetof(Rare, fieldInit));
 constexpr std::int32_t kGcKind = std::int32_t(offsetof(detail::GCObject, kind));
 constexpr std::int32_t kStrBits = std::int32_t(offsetof(StringCell, bits));
 constexpr std::int32_t kStrLength = std::int32_t(offsetof(StringCell, length));
 constexpr std::int32_t kStrChars = std::int32_t(sizeof(StringCell));
 constexpr std::int32_t kRareChildRoot = std::int32_t(offsetof(Rare, childRoot));
 constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
+constexpr std::int32_t kShapeFlags = std::int32_t(offsetof(Shape, flags));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
 constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
 constexpr std::int32_t kSuperSlot = std::int32_t(offsetof(SuperCache, slot));
@@ -2498,6 +2500,26 @@ void Baseline::emit(std::uint32_t i)
     case Op::TypeOf:
         typeOf(i, in);
         return;
+    case Op::InitFields: {
+        // A class whose constructor this is with no field initialiser (a `Rare` whose `fieldInit` is no function):
+        // nothing to do. One with fields runs them in the interpreter.
+        Label& bad = slow(i);
+        Label done;
+        a_.mov(RAX, mem(R13, kFrameFn));
+        a_.testI8(mem(RAX, kHdrFlags), cellflags::kHasRare);
+        a_.jcc(CE, done);
+        a_.mov(RAX, mem(RAX, kObjSlots));
+        a_.mov(RAX, mem(RAX, -16));
+        a_.mov(RAX, mem(RAX, kRareFieldInit));
+        a_.test(RAX, R15);
+        a_.jcc(CNE, done);
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CNE, done);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CE, bad);
+        a_.bind(done);
+        return;
+    }
     case Op::PutBox:
         a_.mov(RAX, R(in.a));
         a_.mov(RCX, R(in.b));
@@ -3850,8 +3872,13 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CNE, helper);
         a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
         a_.jcc(CNE, helper);
-        a_.mov32(RSI, mem(R12, kVmFnProtoShape));
-        a_.alu32(7, RSI, mem(RAX, 0));
+        // `prototype` in slot 2 (an ordinary function, or a class whatever its statics), by the shape's flag.
+        a_.mov32(RSI, mem(RAX, 0));
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.shapeTable()));
+        a_.mov(RSI, mem(RDI, RSI, 8));
+        a_.testI8(mem(RSI, kShapeFlags), Shape::kProtoAt2);
+        a_.jcc(CE, helper);
+        a_.testI8(mem(RSI, kShapeFlags), Shape::kDictionary);
         a_.jcc(CNE, helper);
         a_.mov(RCX, mem(RAX, kFnCode));
         a_.cmpI8(mem(RCX, kCbConstructor), 0);
@@ -3859,8 +3886,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.test(RDX, RDX);
         a_.jcc(CE, helper);
+        // A derived class's constructor makes no `this` of its own: the long way.
         a_.testI32(mem(RCX, kCbFlags), CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                                           CodeBlock::kNeedsArgs);
+                                           CodeBlock::kNeedsArgs | CodeBlock::kDerived);
         a_.jcc(CNE, helper);
         a_.movzx16(RSI, mem(RCX, kCbNparams));
         a_.aluI32(7, RSI, std::int32_t(argc));

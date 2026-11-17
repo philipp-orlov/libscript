@@ -128,6 +128,8 @@ Shape* Shape::after(VM& vm, Key k, std::uint8_t a)
     n->key = k;
     n->attrs = a;
     n->keyBits = keyBits | keyBit(k);
+    if ((count == 2 && k == vm.atoms.prototype && !(a & attr::kAccessor)) || (count > 2 && (flags & kProtoAt2)))
+        n->flags |= kProtoAt2;
     detail::incRef(k);
 
     try {
@@ -148,6 +150,11 @@ Shape* Shape::after(VM& vm, Key k, std::uint8_t a)
     if (runtimeName)
         ++runtimeTransitions;
     return n;
+}
+
+bool VM::prototypeAt2(const JSObject* f) const noexcept
+{
+    return (shapeById(f->h.shape)->flags & (Shape::kProtoAt2 | Shape::kDictionary)) == Shape::kProtoAt2;
 }
 
 Shape* Shape::withLastAttrs(VM& vm, std::uint8_t newAttrs)

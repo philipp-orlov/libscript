@@ -136,6 +136,9 @@ struct Shape
         kDictionary = 1,  ///< private to one object; inline caches never cache it
         kHasTable = 2,    ///< `table` and `lookup` are built
         kRoot = 4,
+        /// Property 2 is `prototype`, a data property: `new` of a function of this shape reads it there. Shapes grown from
+        /// one keep it (a property is never taken away from the middle of a shape).
+        kProtoAt2 = 8,
     };
 
     std::uint32_t id = 0;

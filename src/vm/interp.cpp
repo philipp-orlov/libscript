@@ -2436,8 +2436,8 @@ do_call: {
             FAIL();
         }
         JSObject* made;
-        if (f->h.shape == vm.fnProtoShape) [[likely]] {
-            // The shape every ordinary function has once its `prototype` is made: `length`, `name`, `prototype`.
+        if (vm.prototypeAt2(f)) [[likely]] {
+            // Every ordinary function once its `prototype` is made, and every class: `length`, `name`, `prototype`, ...
             const JSValue pv = *f->slotAt(2);
             made = vm.newObject(isObject(pv) ? asObject(pv) : vm.protos.object,
                                 (f->flags & JSFunction::kNative) ? 3 : thisSlotsOf(f->code));
@@ -2448,8 +2448,6 @@ do_call: {
             JSObject* proto = isObject(protoValue) ? asObject(protoValue) : vm.protos.object;
             made = vm.newObject(proto, (f->flags & JSFunction::kNative) ? 3 : thisSlotsOf(f->code));
             release(protoValue);
-            if (!(f->flags & JSFunction::kNative) && !f->isDictionary(vm) && f->shapeOf(vm)->indexOf(vm.atoms.prototype) == 2)
-                vm.fnProtoShape = f->h.shape;
         }
         setReg(R[base + 1], toJSValue(made));
     }

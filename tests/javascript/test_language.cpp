@@ -4391,6 +4391,54 @@ TEST(typeofNotAndTruthInCompiledCode)
     }
 }
 
+TEST(newOfClassesAndFunctionsInCompiledCode)
+{
+    // `new` finds `prototype` in slot 2 of any function whose shape says so (classes with statics, fields, derived
+    // classes, a constructor returning an object, new.target, a primitive or read-only `prototype`), and a class with no
+    // field initialiser starts without the interpreter. Every tier gives node's answers.
+    const char* program =
+        "var out = []; "
+        "class V { static add(a, b) { return new V(a.x + b.x); } constructor(x) { this.x = x; } get twice() { return this.x * 2; } } "
+        "class F { y = 7; static s = 1; constructor(x) { this.x = x; } } "
+        "class B { constructor(x) { this.b = x; } } "
+        "class D extends B { z = 3; constructor(x) { super(x + 1); this.d = x; } } "
+        "class R { constructor() { return { made: 'other' }; } } "
+        "class T { constructor() { this.t = new.target === T; } } "
+        "function P(a) { this.a = a; } "
+        "function Q(a) { this.q = a; } Q.prototype = 5; "
+        "function W(a) { this.w = a; } Object.defineProperty(W, 'prototype', { writable: false }); "
+        "function mk(n) { "
+        "  var s = 0, t = ''; "
+        "  for (var i = 0; i < n; i++) { "
+        "    var v = V.add(new V(i), new V(1)); s += v.x + v.twice; "
+        "    var f = new F(i); s += f.x + f.y; "
+        "    var d = new D(i); s += d.b + d.d + d.z; "
+        "    var r = new R(); t = r.made; "
+        "    var tt = new T(); if (!tt.t) t = 'bad'; "
+        "    var p = new P(i); s += p.a; "
+        "    var q = new Q(i); s += q.q + (Object.getPrototypeOf(q) === Object.prototype ? 1 : 100); "
+        "    var w = new W(i); s += w.w + (Object.getPrototypeOf(w) === W.prototype ? 1 : 100); "
+        "  } "
+        "  return s + t; "
+        "} "
+        "out.push(mk(3000), mk(5)); "
+        "V.prototype.extra = function () { return 1; }; out.push(new V(2).extra()); "
+        "F.prototype = null; out.push(Object.getPrototypeOf(new F(1)) === F.prototype); "
+        "try { V(1); } catch (e) { out.push(e.name); } "
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("40534500other,170other,1,true,TypeError"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

@@ -177,6 +177,10 @@ struct VM : EngineRuntime
     // ---- shapes ----
     /// Shape ids index this table, which is reserved once so that its address never changes.
     Shape* shapeById(std::uint32_t id) const noexcept { return shapeTable_[id]; }
+    /// The table of shapes by id; it never moves, so compiled code can name it.
+    Shape* const* shapeTable() const noexcept { return shapeTable_; }
+    /// Whether `new` of `f` finds `prototype` as a data property in slot 2 (`Shape::kProtoAt2`).
+    bool prototypeAt2(const JSObject* f) const noexcept;
     Shape* newShape();
     void freeShape(Shape* shape) noexcept;
     /// The root of the tree for objects with this prototype (null for none); made on first use, and it holds a count of
@@ -311,8 +315,6 @@ struct VM : EngineRuntime
     static constexpr std::size_t kSmallIndexKeys = 1024;
     Key smallIndexKeys[kSmallIndexKeys] = {};
     Intrinsics protos;
-    /// The shape of an ordinary function whose `prototype` is its third property (0 until one is seen).
-    std::uint32_t fnProtoShape = 0;
     /// Install a prototype into one of `protos`'s fields, counting it and letting go of the one it replaces.
     void setIntrinsic(JSObject** slot, JSObject* object) noexcept;
     /// `intern` for the text of a name; the cell is the table's and the caller's (a count is added).

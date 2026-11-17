@@ -96,8 +96,31 @@ void Baseline::materializeLive(std::uint32_t i)
 void Baseline::unboxRax(std::int32_t w, Label& fail, bool number)
 {
     if (isI32(w)) {
-        needInt(RAX, fail);
+        // An int32, or a double that holds one exactly (what a double variable stored, boxed as a double): anything else
+        // leaves. Clobbers rdx and xmm0-1 on the way for a double.
+        Label isDouble, back, over;
+        a_.cmp(RAX, R14);
+        a_.jcc(CB, isDouble);
+        a_.bind(back);
         defI32(w, RAX);
+        a_.jmp(over);
+        a_.bind(isDouble);
+        a_.cmp(RAX, RBP);
+        a_.jcc(CB, fail);
+        a_.mov(RDX, RAX);
+        a_.sub(RDX, RBP);
+        a_.movqToX(0, RDX);
+        a_.cvttsd2si32(RAX, 0);
+        a_.cvtsi2sd32(1, RAX);
+        a_.ucomisd(0, 1);
+        a_.jcc(CNE, fail);
+        a_.jcc(CP, fail);
+        a_.test32(RAX, RAX);
+        a_.jcc(CNE, back);
+        a_.test(RDX, RDX);
+        a_.jcc(CS, fail);  // -0
+        a_.jmp(back);
+        a_.bind(over);
     } else if (inReg(w)) {
         unboxDouble(xmmOf(w), RAX, RDX, number ? nullptr : &fail);
         dirty_[std::size_t(w)] = 1;
@@ -395,6 +418,7 @@ bool Baseline::emitTyped(std::uint32_t i)
         return true;
     }
     case Op::Mov:
+    case Op::ToNumeric:
         if (dw < 0 || !allTyped())
             return false;
         if (web(uw[0]).slot == web(dw).slot && isI32(uw[0]) == isI32(dw)) {

@@ -4511,6 +4511,37 @@ TEST(holeReadsOfPlainArraysAreUndefined)
     }
 }
 
+TEST(int32VariablesTakeDoublesThatHoldInt32s)
+{
+    // `x++` (ToNumeric) keeps an int32 variable an int32; a read into an int32 variable takes a double that holds an int32
+    // exactly (optimized code boxes what a double variable holds as a double) and leaves for -0, a fraction or a value
+    // past 32 bits. In every tier, node's answers.
+    const char* program =
+        "var out = []; "
+        "function fill(a, n, k) { for (var i = 0; i < n; i++) a[i] = (i * k) / 2; return a; } "
+        "function sum(a, w, n) { var c = 0, j = 0; for (var i = 0; i < n; ) { var l = a[i++] & 0x3fff; c = (c + l + (w[j++] | 0)) | 0; } return c; } "
+        "function mix(a, n) { var s = 0; for (var i = 0; i < n; i++) { var x = a[i]; s += x; } return s; } "
+        "var a = fill([], 1000, 2), w = fill([], 1000, 4); "
+        "var r = 0; for (var k = 0; k < 50; k++) r = sum(a, w, 1000); "
+        "out.push(r, mix(a, 1000)); "
+        "a[3] = -0; a[4] = 0.5; a[5] = 1e10; a[6] = -7; "
+        "out.push(sum(a, w, 1000), mix(a, 1000), 1 / mix([-0], 1)); "
+        "for (var k = 0; k < 50; k++) r = sum(a, w, 1000); "
+        "out.push(r, mix(fill([], 1000, 3), 1000)); "
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1498500,499500,1524075,10000499475.5,Infinity,1524075,749250"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

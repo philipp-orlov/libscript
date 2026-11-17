@@ -518,8 +518,8 @@ Plan analyse(const CodeBlock& code)
             // A guard failed here. Where what it made can be said by what the interpreter then saw (arithmetic that
             // overflowed made a double), the profile has it; elsewhere the instruction goes back to the frame.
             switch (ins.opcode()) {
-            case Op::LoadInt: case Op::LoadK: case Op::Mov: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div:
-            case Op::AddI: case Op::SubI: case Op::MulI: case Op::Inc: case Op::Dec: case Op::Neg:
+            case Op::LoadInt: case Op::LoadK: case Op::Mov: case Op::ToNumeric: case Op::Add: case Op::Sub: case Op::Mul:
+            case Op::Div: case Op::AddI: case Op::SubI: case Op::MulI: case Op::Inc: case Op::Dec: case Op::Neg:
                 break;
             default:
                 return Rep::Mem;
@@ -533,6 +533,7 @@ Plan analyse(const CodeBlock& code)
             return k.isInt32() ? Rep::I32 : k.isDouble() ? Rep::F64 : Rep::Mem;
         }
         case Op::Mov:
+        case Op::ToNumeric:  // (`x++` keeps the old value of x so): a number is itself
             return one();
         case Op::Add: case Op::Sub: case Op::Mul: {
             const Rep t = two();

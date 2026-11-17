@@ -270,8 +270,22 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
             code->prof[index] |= opt::kProfFailed;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (std::getenv("T2EXITS"))
-            std::fprintf(stderr, "tier2 exit %s @%u kind %d (n=%zu tries %d)\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind,
-                         code->code.size(), int(code->tier2Tries));
+        {
+            std::string what;
+            const Ins& at = code->code[index];
+            if (at.opcode() == Op::GetProp && index + 1 < code->code.size() && code->code[index + 1].a != kNoCache) {
+                const JSValue o = fr->R[at.b];
+                const InlineCache& ic = code->caches[code->code[index + 1].a];
+                char buf[160];
+                std::snprintf(buf, sizeof buf, " recv %s shape %u aux %d; ic shape %u aux %d holder %d poly %d",
+                              isObject(o) ? "obj" : "other", isObject(o) ? asObject(o)->h.shape : 0u,
+                              isObject(o) ? int(asObject(o)->h.aux) : -1, ic.shape, int(ic.aux) - 1, ic.holder != nullptr,
+                              ic.pad ? int(code->poly[ic.pad - 1].n) : 0);
+                what = buf;
+            }
+            std::fprintf(stderr, "tier2 exit %s @%u kind %d (n=%zu tries %d)%s\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind,
+                         code->code.size(), int(code->tier2Tries), what.c_str());
+        }
 #endif
         SCRIPT_VM_CENSUS(Tier2Exit);
         // A guard that keeps failing in one place: the code was made for something that no longer happens there.
@@ -1229,6 +1243,9 @@ private:
         unsigned reg;
         std::uint32_t shape;
         std::int32_t aux;  ///< its inline slot count (-1: not checked)
+        /// When the loop's hoisted reads of it are all of slots in place: at least this many slots in place is what is
+        /// checked (objects of one shape can be made with more), not `aux` itself (-1: `aux` is).
+        std::int32_t atLeast = -1;
     };
     std::vector<LoopShape> loopShapes_;
     struct LoopValid
@@ -1354,7 +1371,12 @@ private:
         for (const LoopShape& ls : loopShapes_)
             if (ls.from <= factAt_ && factAt_ <= ls.to && ls.reg < factShape_.size()) {
                 factShape_[ls.reg] = ls.shape;
-                factAux_[ls.reg] = ls.aux;
+                if (ls.atLeast >= 0) {
+                    factAux_[ls.reg] = -1;
+                    factInl_[ls.reg] = ls.atLeast;
+                } else {
+                    factAux_[ls.reg] = ls.aux;
+                }
             }
         for (const LoopValid& lv : loopValids_)
             if (lv.from <= factAt_ && factAt_ <= lv.to)
@@ -1407,21 +1429,6 @@ private:
     /// As `provenSlot`, for a read: the slot as a memory operand (on rax or rdx) instead of its address.
     Mem provenSlotMem(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
-        static_assert(kHdrKind == kHdrAux + 1, "the inline slot count and the kind are one 16-bit word");
-        if (aux != 0 && factShape_[reg] != shape && std::int32_t(index) >= std::int32_t(aux) - 1) {
-            // Not known yet: a cell, of the shape, and the kind and the inline slot count in one compare (a slot out of
-            // place is where that count says).
-            if (!raxHoldsObj(reg))
-                a_.mov(RAX, R(reg));
-            a_.test(RAX, R15);
-            a_.jcc(CNE, bad);
-            a_.cmpI32(mem(RAX, 0), std::int32_t(shape));
-            a_.jcc(CNE, bad);
-            a_.cmpI16(mem(RAX, kHdrAux), std::uint16_t((std::uint16_t(kObjectKind) << 8) | std::uint8_t(aux - 1)));
-            a_.jcc(CNE, bad);
-            factShape_[reg] = shape;
-            factAux_[reg] = std::int32_t(aux) - 1;
-        }
         provenShape(reg, shape, bad);
         if (aux == 0) {
             slotAddress(index);
@@ -1429,27 +1436,21 @@ private:
         }
         const std::int32_t inl = std::int32_t(aux) - 1;
         if (std::int32_t(index) < inl) {
-            // An inline slot: any object with more inline slots than the index has it there (objects of one shape can be
-            // made with more).
-            inlineAtLeast(reg, index, bad);
-            return mem(RAX, kObjInline + std::int32_t(8 * index));
+            // In place in the objects the site learned on. Objects of one shape can be made with more slots in place, or
+            // fewer: unless enough are known to be there, found from the object's own count.
+            if (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index))
+                return mem(RAX, kObjInline + std::int32_t(8 * index));
+            slotAddress(index);
+            return mem(RDX, 0);
         }
         if (factAux_[reg] != inl) {
-            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
-            a_.jcc(CNE, bad);
-            factAux_[reg] = inl;
+            // Out of place in the objects the site learned on; objects of the shape made with more slots in place have
+            // it there: found from the object's own count.
+            slotAddress(index);
+            return mem(RDX, 0);
         }
         a_.mov(RDX, mem(RAX, kObjSlots));
         return mem(RDX, std::int32_t(8 * (std::int32_t(index) - inl)));
-    }
-    /// The object in rax (from frame register `reg`) has inline slot `index`: checked unless known.
-    void inlineAtLeast(unsigned reg, std::uint32_t index, Label& bad)
-    {
-        if (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index))
-            return;
-        a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(index));
-        a_.jcc(CBE, bad);
-        factInl_[reg] = std::int32_t(index) + 1;
     }
     void provenSlot(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
@@ -1460,14 +1461,15 @@ private:
         }
         const std::int32_t inl = std::int32_t(aux) - 1;
         if (std::int32_t(index) < inl) {
-            inlineAtLeast(reg, index, bad);
-            a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
+            if (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index))
+                a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
+            else
+                slotAddress(index);
             return;
         }
         if (factAux_[reg] != inl) {
-            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
-            a_.jcc(CNE, bad);
-            factAux_[reg] = inl;
+            slotAddress(index);
+            return;
         }
         {
             a_.mov(RDX, mem(RAX, kObjSlots));
@@ -1904,21 +1906,21 @@ private:
         const std::int32_t inl = std::int32_t(s.aux) - 1;
         const bool knownAux = factReg >= 0 && factAux_[unsigned(factReg)] == inl;
         if (std::int32_t(s.index) < inl) {
-            // An inline slot: any object with more inline slots than the index has it there.
+            // An inline slot: any object with more inline slots than the index has it there. One of the shape made with
+            // fewer has it out of place: found from its own count.
             if (!knownAux && !(factReg >= 0 && std::int32_t(s.index) < factInl_[unsigned(factReg)])) {
-                a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(s.index));
-                a_.jcc(CBE, bad);
-                if (factReg >= 0)
-                    factInl_[unsigned(factReg)] = std::int32_t(s.index) + 1;
+                slotAddress(s.index);
+                a_.mov(RAX, mem(RDX, 0));
+                return;
             }
             a_.mov(RAX, mem(RAX, kObjInline + std::int32_t(8 * s.index)));
             return;
         }
         if (!knownAux) {
-            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
-            a_.jcc(CNE, bad);
-            if (factReg >= 0)
-                factAux_[unsigned(factReg)] = inl;
+            // Out of place in the objects the site learned on: found from the object's own count.
+            slotAddress(s.index);
+            a_.mov(RAX, mem(RDX, 0));
+            return;
         }
         a_.mov(RDX, mem(RAX, kObjSlots));
         a_.mov(RAX, mem(RDX, std::int32_t(8 * (std::int32_t(s.index) - inl))));

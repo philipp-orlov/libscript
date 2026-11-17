@@ -2869,6 +2869,29 @@ void Baseline::planLoopFacts()
         }
 #endif
     }
+    // A loop that reads only slots in place of an object before it needs only that many in place, not the exact count the
+    // sites learned on (objects of one shape can be made with more).
+    for (LoopShape& ls : loopShapes_) {
+        if (ls.aux < 0)
+            continue;
+        std::int32_t need = 0;
+        bool inPlace = true;
+        auto use = [&](std::uint32_t index) {
+            inPlace = inPlace && std::int32_t(index) < ls.aux;
+            need = std::max(need, std::int32_t(index) + 1);
+        };
+        for (const LoopRead& lr : loopReads_)
+            if (lr.from == ls.from && code_->code[lr.read].b == ls.reg)
+                use(code_->caches[code_->code[lr.read + 1].a].index);
+        for (const LoopNum& ln : loopNums_)
+            if (ln.from == ls.from && ln.reg == ls.reg)
+                use(ln.index);
+        for (const LoopPromo& lp : loopPromos_)
+            if (lp.from == ls.from && lp.reg == ls.reg)
+                use(lp.index);
+        if (inPlace)
+            ls.atLeast = need;
+    }
 }
 
 void Baseline::planBorrows()
@@ -2998,7 +3021,8 @@ bool Baseline::encloses(std::uint32_t from, std::uint32_t to, std::uint32_t h) c
 bool Baseline::coveredShape(std::uint32_t h, const LoopShape& x) const
 {
     for (const LoopShape& o : loopShapes_)
-        if (encloses(o.from, o.to, h) && o.reg == x.reg && o.shape == x.shape && (x.aux < 0 || o.aux == x.aux))
+        if (encloses(o.from, o.to, h) && o.reg == x.reg && o.shape == x.shape &&
+            (x.aux < 0 || (o.aux == x.aux && (x.atLeast < 0 ? o.atLeast < 0 : o.atLeast < 0 || o.atLeast >= x.atLeast))))
             return true;
     return false;
 }
@@ -3071,7 +3095,10 @@ void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
         needObject(RAX, bad);
         a_.cmpI32(mem(RAX, 0), std::int32_t(ls.shape));
         a_.jcc(CNE, bad);
-        if (ls.aux >= 0) {
+        if (ls.atLeast > 0) {
+            a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ls.atLeast - 1));
+            a_.jcc(CBE, bad);
+        } else if (ls.aux >= 0 && ls.atLeast < 0) {
             a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ls.aux));
             a_.jcc(CNE, bad);
         }

@@ -16,6 +16,7 @@
 
 #include "mem/local_heap.hpp"
 #include "mem/pool_allocator.hpp"
+#include "sys/vm.hpp"
 #include "script/context.hpp"
 #include "script/value.hpp"
 
@@ -43,8 +44,28 @@ struct ValueLayout
 /// Requests above the small classes are mappings whose idle pages go back to
 /// the OS.
 mem::SizeClassPool& payloadPool();
+/// The vm core keeps a cell's address in a value as it stands, so cells must sit below 2^47 (`kAddressLimit`), which
+/// the kernel's own placement does not promise (aarch64 Linux maps from 2^48 down). The first heap of the process asks
+/// libcore to place its mappings below that limit (LC-1); every heap is made from these options. Only when needed: a
+/// machine whose kernel already places mappings below the limit (x86-64 Linux, Windows) is left exactly as it was, so
+/// what passes there is unchanged. The probe is one page, mapped and unmapped.
+inline bool reserveLowAddressSpace() noexcept
+{
+    static const bool needed = [] {
+        const sys::VmRegion probe = sys::tryVmMap(1);
+        if (!probe.base)
+            return false;
+        const bool high = reinterpret_cast<std::uintptr_t>(probe.base) + probe.bytes > (std::uint64_t(1) << 47);
+        sys::vmUnmap(probe);
+        if (high)
+            sys::vmSetAddressCeiling(std::uint64_t(1) << 47);
+        return high;
+    }();
+    return needed;
+}
 inline mem::LocalHeap::Options payloadHeapOptions()
 {
+    reserveLowAddressSpace();
     mem::LocalHeap::Options options;
     options.large = &payloadPool();
     return options;

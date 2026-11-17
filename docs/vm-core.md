@@ -212,8 +212,9 @@ time (data entries only). Getters are not inline-cached in compiled code: they g
   makes no call to the general allocator (`core.steady_state`).
 - A proxy is an object in dictionary mode whose class is `Proxy` (or a function, for a callable target): no inline cache
   can match it, so every read and write of one reaches its traps. The caches also refuse a prototype chain with a proxy in it.
-- Cells are below 2^47. On a machine whose allocator may return higher addresses this aborts with a message; the address
-  hint (LC-1) is still to do.
+- Cells are below 2^47. The first heap of the process asks libcore (`sys::vmSetAddressCeiling`) to map below that limit
+  (LC-1), from a window the kernel's own placement leaves alone, so it holds on aarch64 Linux too. If the window is full
+  the kernel chooses and a cell above the limit aborts with a message.
 - Property instructions carry their inline cache in the word after them: own property, prototype property (with a validity
   cell that any change to the chain clears), add-a-property (shape before and after), global.
 

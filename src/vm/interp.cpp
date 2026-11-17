@@ -2009,16 +2009,20 @@ L_NewClass: {
     Handle fKeep = Handle::adopt(toJSValue(f));
     f->materialize(vm);  // length and name now, so that they come before `prototype`
     f->flags |= JSFunction::kConstructor;
-    JSObject* proto = vm.newObject(parentProto);
-    Handle protoKeep = Handle::adopt(toJSValue(proto));
-    retain(toJSValue(proto));
-    f->putOwn(vm, vm.atoms.prototype, toJSValue(proto), 0);
-    retain(toJSValue(f));
-    proto->putOwn(vm, vm.atoms.constructor, toJSValue(f), attr::kWritable | attr::kConfigurable);
-    // The constructor is its own home: `super.x` in a static method looks at the class's prototype.
-    Rare& rare = f->rareOf(vm);
-    rare.home = toJSValue(proto);
-    retain(rare.home);
+    {
+        // Its own scope: NEXT() leaves by a computed goto, which does not run the destructors of the scopes it leaves,
+        // so a Handle still alive there would keep its count for good.
+        JSObject* proto = vm.newObject(parentProto);
+        Handle protoKeep = Handle::adopt(toJSValue(proto));
+        retain(toJSValue(proto));
+        f->putOwn(vm, vm.atoms.prototype, toJSValue(proto), 0);
+        retain(toJSValue(f));
+        proto->putOwn(vm, vm.atoms.constructor, toJSValue(f), attr::kWritable | attr::kConfigurable);
+        // The constructor is its own home: `super.x` in a static method looks at the class's prototype.
+        Rare& rare = f->rareOf(vm);
+        rare.home = toJSValue(proto);
+        retain(rare.home);
+    }
     SET(ins->a, fKeep.take());
     NEXT();
 }

@@ -661,6 +661,7 @@ constexpr std::int32_t kIcShape = std::int32_t(offsetof(InlineCache, shape));
 constexpr std::int32_t kIcIndex = std::int32_t(offsetof(InlineCache, index));
 constexpr std::int32_t kIcNext = std::int32_t(offsetof(InlineCache, next));
 constexpr std::int32_t kIcHolder = std::int32_t(offsetof(InlineCache, holder));
+constexpr std::int32_t kIcFlags = std::int32_t(offsetof(InlineCache, flags));
 constexpr std::int32_t kPrivKey = std::int32_t(offsetof(PrivateCache, key));
 constexpr std::int32_t kPrivShape = std::int32_t(offsetof(PrivateCache, shape));
 constexpr std::int32_t kPrivIndex = std::int32_t(offsetof(PrivateCache, index));
@@ -2313,6 +2314,7 @@ private:
     void putElem(std::uint32_t i, const Ins& in);
     void defPrivate(std::uint32_t i, const Ins& in);
     void cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
+    void megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad);
     void cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
@@ -3459,22 +3461,38 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     }
     const bool stringPath = isLength || protoSlot;
     if (count == 0 && !stringPath) {
-        immature(i);
-        if (!ic || optimizing()) {
+        if (!ic) {
+            immature(i);
             helperOp(i, &helperThunk<jitGetProp>);
             return;
         }
-        // Nothing seen yet when this code was made: what the site's cache holds when it runs.
+        // Nothing seen yet when this code was made: what the site's cache holds when it runs, or the table. Only a read
+        // neither has counts as one the code knew nothing of (a site the table serves never learns more).
         Label& bad = slow(i, &helperThunk<jitGetProp>);
+        Label mega, fin;
+        if (optimizing()) {
+            // A site that has learned since makes the code give way to a compile that knows it; one marked for the
+            // table never learns more, and does not.
+            Label marked;
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic));
+            a_.testI8(mem(RCX, kIcFlags), InlineCache::kMegaSite);
+            a_.jcc(CNE, marked);
+            immature(i);
+            a_.bind(marked);
+        }
         a_.mov(RAX, R(in.b));
         needObject(RAX, bad);
-        cachedRead(i, in, ic, bad);
+        cachedRead(i, in, ic, mega);
+        a_.jmp(fin);
+        a_.bind(mega);
+        megaProbe(i, in, ic, key, bad);
+        a_.bind(fin);
         return;
     }
     Label& bad = slow(i, &helperThunk<jitGetProp>);
     Label done, lengthPath, stringRecv, cached;
     // A shape none of those: the one the site's cache holds now (objects that changed, such as one become a dictionary).
-    const bool probe = ic && !isLength && !optimizing();
+    const bool probe = ic && !isLength;
     a_.mov(RAX, R(in.b));
     if (count == 0 && isLength) {
         // No shape seen: an array's length, or a string's.
@@ -3515,13 +3533,28 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     if (probe && count > 0) {
         a_.jmp(done);
         a_.bind(cached);
-        cachedRead(i, in, ic, bad);
+        {
+            Label mega, fin;
+            cachedRead(i, in, ic, mega);
+            a_.jmp(fin);
+            a_.bind(mega);
+            megaProbe(i, in, ic, key, bad);
+            a_.bind(fin);
+        }
     }
     if (isLength) {
         a_.bind(lengthPath);
+        Label typedLength, intLength;
         a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
-        a_.jcc(CNE, bad);
+        a_.jcc(CNE, typedLength);
         a_.mov32(RAX, mem(RAX, kArrayLength));
+        a_.jmp(intLength);
+        // A typed array's length, as the runtime gives it.
+        a_.bind(typedLength);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
+        a_.jcc(CNE, bad);
+        a_.mov32(RAX, mem(RAX, kTypedLength));
+        a_.bind(intLength);
         a_.test32(RAX, RAX);
         a_.jcc(CS, bad);
         deliverInt(i, in.a);
@@ -3546,6 +3579,70 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         }
     }
     a_.bind(done);
+}
+
+void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad)
+{
+    // The object in rax: where the megamorphic table says objects of its shape find `key`, an own slot or a prototype's.
+    if (!vm_.megaRead) {
+        vm_.megaRead = static_cast<MegaEntry*>(std::calloc(std::size_t(1) << VM::kMegaBits, sizeof(MegaEntry)));
+        if (!vm_.megaRead) {
+            a_.jmp(bad);
+            return;
+        }
+    }
+    static_assert(sizeof(MegaEntry) == 64, "an entry is 64 bytes");
+    // Only a site the runtime marked: elsewhere a miss goes to the runtime, which teaches the site's own cache.
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic));
+    a_.testI8(mem(RCX, kIcFlags), InlineCache::kMegaSite);
+    a_.jcc(CE, bad);
+    constexpr std::int32_t kShape = std::int32_t(offsetof(MegaEntry, shape)), kIndex = std::int32_t(offsetof(MegaEntry, index)),
+                           kKey = std::int32_t(offsetof(MegaEntry, key)), kHolder = std::int32_t(offsetof(MegaEntry, holder)),
+                           kValid = std::int32_t(offsetof(MegaEntry, validity)),
+                           kAbsent = std::int32_t(offsetof(MegaEntry, absent));
+    a_.mov32(RSI, mem(RAX, 0));
+    a_.imulI32(RCX, RSI, std::int32_t(0x9E3779B1u));
+    a_.aluI32(6, RCX, std::int32_t(VM::megaKeyMix(key)));
+    a_.shiftI32(5, RCX, 32 - int(VM::kMegaBits));
+    a_.shiftI(4, RCX, 6);
+    a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.megaRead));
+    a_.alu(0, RDX, RCX);
+    a_.alu32(7, RSI, mem(RDX, kShape));
+    a_.jcc(CNE, bad);
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(key));
+    a_.cmp(RCX, mem(RDX, kKey));
+    a_.jcc(CNE, bad);
+    Label own;
+    a_.mov(RCX, mem(RDX, kHolder));
+    a_.test(RCX, RCX);
+    a_.jcc(CE, own);
+    a_.mov(RDI, mem(RDX, kValid));
+    a_.cmpI32(mem(RDI, kValidityValid), 0);
+    a_.jcc(CE, bad);
+    {
+        Label tree;
+        a_.mov(RDI, mem(RDX, kAbsent));
+        a_.test(RDI, RDI);
+        a_.jcc(CE, tree);
+        a_.cmpI32(mem(RDI, kValidityValid), 0);
+        a_.jcc(CE, bad);
+        a_.bind(tree);
+    }
+    a_.mov(RAX, RCX);
+    a_.bind(own);
+    a_.mov32(RSI, mem(RDX, kIndex));
+    Label out, have;
+    a_.movzx8(RDI, mem(RAX, kHdrAux));
+    a_.alu32(7, RSI, RDI);
+    a_.jcc(CAE, out);
+    a_.mov(RAX, mem(RAX, RSI, 8, kObjInline));
+    a_.jmp(have);
+    a_.bind(out);
+    a_.alu32(5, RSI, RDI);
+    a_.mov(RDX, mem(RAX, kObjSlots));
+    a_.mov(RAX, mem(RDX, RSI, 8));
+    a_.bind(have);
+    deliver(i, in.a);
 }
 
 void Baseline::cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad)
@@ -3658,7 +3755,7 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
     const std::uint16_t cacheId = code_->code[i + 1].a;
     const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
     if (!ic || ic->shape == 0 || ic->holder) {
-        if (!ic || optimizing()) {
+        if (!ic) {
             helperOp(i, &helperThunk<jitPutProp>);
             return;
         }
@@ -3671,7 +3768,7 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
     }
     Label& bad = slow(i, &helperThunk<jitPutProp>);
     Label other, done;
-    const bool probe = !optimizing();
+    const bool probe = true;
     a_.mov(RAX, R(in.a));
     needObject(RAX, bad);
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));

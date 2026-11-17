@@ -113,6 +113,22 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     installBuiltins();
 }
 
+void VM::megaClear() noexcept
+{
+    if (!megaRead)
+        return;
+    for (std::uint32_t i = 0; i < (1u << kMegaBits); ++i) {
+        MegaEntry& e = megaRead[i];
+        if (e.validity)
+            releaseValidity(e.validity);
+        if (e.absent)
+            releaseValidity(e.absent);
+        if (e.key)
+            detail::decRef(e.key);
+        e = MegaEntry{};
+    }
+}
+
 VM::~VM()
 {
     // `releaseRoots` ran before the context's cells went; what is left is the memory the VM itself reserved.
@@ -126,6 +142,7 @@ VM::~VM()
         sys::vmUnmap(stackRegionBase_, stackRegionBytes_);
     if (frameBase)
         freePayload(frameBase, sizeof(Frame) * frameCapacity);
+    std::free(megaRead);
 }
 
 void VM::afterCollect() noexcept {}

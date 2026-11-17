@@ -3319,6 +3319,85 @@ int jitGetSuperProp(VM& vm, std::uint32_t index)
     return 1;
 }
 
+/// After a read of `key` on `o` found a data property where a cache may say so: remember it in the megamorphic table.
+void megaLearnRead(VM& vm, JSObject* o, Key key) noexcept
+{
+    if (!vm.megaRead || key == vm.atoms.length || hasElems(o))
+        return;
+    if (const MegaEntry& was = vm.megaRead[VM::megaSlot(o->h.shape, key)];
+        was.shape == o->h.shape && was.key == key && (!was.validity || was.validity->valid) && (!was.absent || was.absent->valid))
+        return;  // there already
+    double numeric;
+    if (o->cls() == ObjClass::TypedArray && canonicalNumericIndex(key, &numeric))
+        return;
+    // A dictionary only once a site's cache took it (the table does not count its reads: a dictionary marked cached gives
+    // up its shape for a new one on every delete).
+    if (o->isDictionary(vm) && !(o->shapeOf(vm)->flags & Shape::kCachedDict))
+        return;
+    std::uint8_t attrs = 0;
+    std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
+    JSObject* holder = nullptr;
+    ValidityCell* cell = nullptr;
+    ValidityCell* absent = nullptr;
+    if (index < 0) {
+        // A dictionary receiver (one a site's cache took) that lacks the key: while it gains none, the prototypes answer.
+        const bool dict = o->isDictionary(vm);
+        if (!cacheable(vm, o) && !dict)
+            return;
+        for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
+            // A prototype that is a dictionary (one with very many methods) keeps a key's slot while the chain's
+            // validity holds: its changes invalidate it.
+            const bool dictProto = p->isDictionary(vm) && !proxyOf(p) &&
+                                   !(p->cls() == ObjClass::Function && (static_cast<JSFunction*>(p)->flags & JSFunction::kLazyProps));
+            if ((!cacheable(vm, p) && !dictProto) || (p->cls() == ObjClass::TypedArray && canonicalNumericIndex(key, &numeric)))
+                return;
+            if (dictProto) {
+                const Dictionary& d = *p->rare()->dict;
+                index = d.find(key);
+                if (index >= 0)
+                    attrs = d.entries[std::uint32_t(index)].attrs;
+            } else {
+                index = p->shapeOf(vm)->indexOf(key, &attrs);
+            }
+            if (index >= 0) {
+                holder = p;
+                break;
+            }
+        }
+        if (!holder)
+            return;
+        try {
+            cell = vm.validityOf(o->proto(vm));
+        } catch (...) {
+            return;
+        }
+        if (!cell->valid)
+            return;
+        if (dict) {
+            try {
+                absent = vm.absenceOf(o);
+            } catch (...) {
+                return;
+            }
+        }
+    }
+    if (attrs & attr::kAccessor)
+        return;
+    MegaEntry& e = vm.megaRead[VM::megaSlot(o->h.shape, key)];
+    if (cell)
+        vm.retainValidity(cell);
+    if (absent)
+        vm.retainValidity(absent);
+    if (e.validity)
+        vm.releaseValidity(e.validity);
+    if (e.absent)
+        vm.releaseValidity(e.absent);
+    detail::incRef(key);
+    if (e.key)
+        detail::decRef(e.key);
+    e = MegaEntry{o->h.shape, std::uint32_t(index), key, holder, cell, absent, {}};
+}
+
 int jitGetProp(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, true);
@@ -3350,6 +3429,15 @@ int jitGetProp(VM& vm, std::uint32_t index)
             setReg(R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             return 1;
         }
+        // A getter may let go of the object (writing the register it came from): it is held until it is learned from.
+        retain(base);
+        struct Hold
+        {
+            JSValue v;
+            ~Hold() { release(v); }
+        } hold{base};
+        // A site whose cache cannot hold the read, or has every entry taken: it reads through the megamorphic table.
+        const bool full = ic.pad && c.code->poly[ic.pad - 1].n == 4;
         if (c.cacheId != kNoCache) {
             JSValue got;
             const int r = readCachedSlow(vm, c.code, ic, o, base, key, &got);
@@ -3357,9 +3445,21 @@ int jitGetProp(VM& vm, std::uint32_t index)
                 return 0;
             if (r > 0) {
                 setReg(R[ins->a], got);
+                if (full) {
+                    ic.flags |= InlineCache::kMegaSite;
+                    megaLearnRead(vm, o, key);
+                }
                 return 1;
             }
+            ic.flags |= InlineCache::kMegaSite;
         }
+        const JSValue v = getProperty(vm, base, key);
+        if (v.isException())
+            return 0;
+        setReg(R[ins->a], v);
+        if (ic.flags & InlineCache::kMegaSite)
+            megaLearnRead(vm, o, key);
+        return 1;
     } else if (isString(base) && key == vm.atoms.length) {
         setReg(R[ins->a], JSValue::int32(std::int32_t(asString(base)->length)));
         return 1;

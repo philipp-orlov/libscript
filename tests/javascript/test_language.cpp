@@ -5211,3 +5211,39 @@ TEST(readsAndStoresFollowWhatTheirSiteCacheHoldsAsTheCodeRuns)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("2998002 2999 2998 3997002 999  9 9 g own own inh"));
     }
 }
+
+TEST(theMegamorphicReadCacheFollowsPrototypesDictionariesAndGetters)
+{
+    // Reads compiled code finds in the VM's table by shape and key: methods of a prototype that is a dictionary (replaced,
+    // deleted and added again, hidden by a receiver's own), a dictionary receiver that gains the key itself and loses it,
+    // a site of many shapes, a getter on a prototype, and typed arrays' length beside arrays' and strings'.
+    const char* program =
+        "var out=[];"
+        "function Core(){ this.a=1; } for(var i=0;i<200;i++) Core.prototype['m'+i]=(function(k){ return function(){ return k+this.a; }; })(i);"
+        "function call(o){ return o.m7() + o.m150(); }"
+        "var objs=[]; for(var i=0;i<12;i++){ var o=new Core(); o['x'+i]=i; objs.push(o); }"
+        "var t=0; for(var r=0;r<3000;r++) t+=call(objs[r%12]); out.push(t);"
+        "Core.prototype.m7=function(){ return 1000; }; out.push(call(objs[0]));"
+        "delete Core.prototype.m150; Core.prototype.m150=function(){ return -1; }; out.push(call(objs[1]));"
+        "objs[2].m7=function(){ return 5; }; out.push(call(objs[2]), call(objs[3]));"
+        "var proto={ f:function(){ return 'proto'; } }; var d=Object.create(proto); for(var i=0;i<300;i++) d['k'+i]=i;"
+        "function cf(o){ return o.f(); } var u=''; for(var r=0;r<3000;r++) u=cf(d); out.push(u);"
+        "d.f=function(){ return 'own'; }; out.push(cf(d)); delete d.f; out.push(cf(d));"
+        "function px(o){ return o.p; } var many=[]; for(var i=0;i<40;i++){ var o={}; o['q'+i]=0; o.p=i; many.push(o); }"
+        "var w=0; for(var r=0;r<4000;r++) w+=px(many[r%40]); out.push(w);"
+        "var base={}; Object.defineProperty(base,'p',{get:function(){ return 7; }}); var g=Object.create(base); g.z=1;"
+        "for(var r=0;r<100;r++) w+=px(g); out.push(w);"
+        "function len(x){ return x.length; } var ta=new Float64Array(9), l=0; for(var r=0;r<3000;r++) l+=len(r%3==0?ta:r%3==1?[1,2]:'abcd'); out.push(l);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("477000 1151 999 4 999 proto own proto 78000 78700 15000"));
+    }
+}

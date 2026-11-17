@@ -41,6 +41,19 @@ struct ValidityCell
     std::uint32_t valid;
 };
 
+/// An entry of the megamorphic read cache (`VM::megaRead`): objects of shape `shape` read `key` from slot `index` of
+/// themselves, or (`holder`) of a prototype while `validity` holds. Holds a count of `key` and of `validity`.
+struct MegaEntry
+{
+    std::uint32_t shape;
+    std::uint32_t index;
+    Key key;
+    JSObject* holder;
+    ValidityCell* validity;
+    ValidityCell* absent;  ///< a dictionary receiver's (`Dictionary::absent`): it has not gained a key since
+    std::uint64_t spare[3];
+};
+
 /// A call into script from the runtime: the interpreter installs it; accessors and native callbacks go through it.
 /// Returns an owned value, or the exception sentinel with `VM::exception` set.
 using CallHook = JSValue (*)(struct VM&, JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc,
@@ -229,6 +242,23 @@ struct VM : EngineRuntime
     /// `holeStoreCell` and an `Array.prototype` with no elements: whether a hole store into a plain array is plain now.
     bool plainHoleStores();
     void retainValidity(ValidityCell* cell) noexcept { ++cell->refs; }
+    /// The megamorphic read cache: one table for every read site, by shape and key, that compiled code probes when the
+    /// shapes it was made for do not match (`megaSlot` places an entry). Filled by the runtime after a read it could cache.
+    static constexpr unsigned kMegaBits = 11;
+    MegaEntry* megaRead = nullptr;
+    static std::uint32_t megaKeyMix(const void* key) noexcept
+    {
+        return std::uint32_t((reinterpret_cast<std::uintptr_t>(key) >> 4) * 0x85EBCA6Bu);
+    }
+    static std::uint32_t megaSlot(std::uint32_t shape, const void* key) noexcept
+    {
+        return ((shape * 0x9E3779B1u) ^ megaKeyMix(key)) >> (32 - kMegaBits);
+    }
+    void megaClear() noexcept;
+    /// The cell dictionary object `o` clears when it gains a key (made on first use; the dictionary holds a count).
+    ValidityCell* absenceOf(JSObject* o);
+    /// Dictionary `d` gains a key, or goes: what read through it a prototype's property no longer holds.
+    void dictionaryGains(Dictionary& d) noexcept;
     void releaseValidity(ValidityCell* cell) noexcept;
     /// `proto` or something above it changed what it has: every cell that depended on it goes invalid. Does nothing for
     /// an object that is nobody's prototype.

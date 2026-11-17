@@ -251,6 +251,7 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
             r->ext = nullptr;
         }
         if (r->dict) {
+            vm.dictionaryGains(*r->dict);
             for (const Entry& e : r->dict->entries)
                 if (e.key)
                     detail::decRef(e.key);
@@ -674,6 +675,7 @@ void VM::collectCycles(bool minor) noexcept
 
 void VM::releaseRoots() noexcept
 {
+    megaClear();
     for (JSValue& v : smallStrings) {
         release(v);
         v = JSValue::undefined();

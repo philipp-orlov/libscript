@@ -120,6 +120,8 @@ struct Dictionary
     Vec<Entry> entries;  ///< index = slot index; a null key is a hole
     IndexTable table;
     std::uint32_t live = 0;
+    /// Cleared when it gains a key: the megamorphic table's entries that read a prototype's property through it hold it.
+    struct ValidityCell* absent = nullptr;
     std::uint16_t misses = 0;  ///< reads an inline cache could not take: a dictionary read often is worth caching
     std::uint8_t changes = 0;  ///< times a cached shape had to be given up (a key moved or went)
 

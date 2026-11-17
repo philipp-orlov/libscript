@@ -392,6 +392,7 @@ void JSObject::setProto(VM& vm, JSObject* next)
     }
     if (s->isDictionary()) {
         vm.rootShapeFor(next);  // makes `next` a prototype that something holds a count of, for as long as the VM lives
+        vm.dictionaryGains(*rare()->dict);
         dictionaryChanging(vm);
         s = shapeOf(vm);
         s->proto = next;
@@ -445,6 +446,7 @@ void JSObject::addProperty(VM& vm, Key key, JSValue value, std::uint8_t attrs)
     Shape* s = shapeOf(vm);
     if (s->isDictionary()) {
         Dictionary& d = *rare()->dict;
+        vm.dictionaryGains(d);
         if (key == vm.atoms.symHasInstance)
             vm.hasInstanceSeen = true;
         const std::uint32_t index = std::uint32_t(d.entries.size());

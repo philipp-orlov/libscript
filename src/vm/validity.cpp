@@ -49,6 +49,26 @@ void VM::releaseValidity(ValidityCell* cell) noexcept
         freeValidity(cell);
 }
 
+ValidityCell* VM::absenceOf(JSObject* o)
+{
+    Dictionary& d = *o->rare()->dict;
+    if (!d.absent) {
+        d.absent = allocValidity();
+        d.absent->refs = 1;
+        d.absent->valid = 1;
+    }
+    return d.absent;
+}
+
+void VM::dictionaryGains(Dictionary& d) noexcept
+{
+    if (!d.absent)
+        return;
+    d.absent->valid = 0;
+    releaseValidity(d.absent);
+    d.absent = nullptr;
+}
+
 ValidityCell* VM::validityOf(JSObject* proto)
 {
     Rare& own = proto->rareOf(*this);

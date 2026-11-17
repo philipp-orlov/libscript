@@ -139,6 +139,10 @@ bool Baseline::liveAcross(std::uint32_t i, std::int32_t w) const
     const std::uint32_t next = i + length(i);
     if (!code_->handlers.empty() || next >= n_ || opt::jumpTarget(*code_, i) >= 0)
         return true;  // (after a jump, what is wanted is what its target wants)
+    // An exit here goes back to where a stretch without effects began and runs it again: what that reads is wanted.
+    if ((i < chainHead_.size() && chainHead_[i] >= 0 && std::uint32_t(chainHead_[i]) != i) ||
+        (i < exitRedirect_.size() && exitRedirect_[i] >= 0))
+        return true;
     for (const opt::LiveWeb& lw : plan_->liveBefore[next])
         if (std::int32_t(lw.web) == w)
             return true;
@@ -1129,10 +1133,13 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (mathUnaryIsSqrt(target)) {
             a_.sqrtsd(0, 0);
         } else {
-            savePool(i);
+            // A result of another kind leaves the code, and where `Math` and its method were never written that is from
+            // before the reads, which runs the call again: its argument is wanted then, whether or not anything after
+            // the call reads it. Every variable in a register is kept.
+            savePool(i, true);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(target));
             a_.callC(RAX);
-            restorePool(i);
+            restorePool(i, true);
         }
         if (isI32(dw)) {
             // An int32 web for the result: only if it is one; otherwise the number goes to the frame and the code leaves.

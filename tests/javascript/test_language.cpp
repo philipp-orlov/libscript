@@ -4200,6 +4200,35 @@ TEST(treesComparedFreedAndBuiltInPlace)
     }
 }
 
+TEST(aMathCallRunAgainAfterItsResultChangedKindHasItsArgument)
+{
+    // `Math.round(a)` whose results were all int32s is compiled with an int32 result and, `Math` being a global nothing
+    // else reads, without writing the registers of `Math` and its method. A result of another kind (-0) leaves the code
+    // from before those reads and runs the call again: with the argument it was given, which no one reads after the call.
+    const char* program =
+        "function r(a) { return Math.round(a); }"
+        "var out = [];"
+        "for (var k = 0; k < 6; k++) {"
+        "  for (var i = 0; i < 4000; i++) r(i * 0.25);"
+        "  out.push(1 / r(-0), 1 / r(-0.2), 1 / r(0.4), 1 / r(-0.5), r(2.5), r(-7.5));"
+        "}"
+        "out.join(',')";
+    std::string want;
+    for (int k = 0; k < 6; ++k)
+        want += std::string(k ? "," : "") + "-Infinity,-Infinity,Infinity,-Infinity,3,-7";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), want);
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

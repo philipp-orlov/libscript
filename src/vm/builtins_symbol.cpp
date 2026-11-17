@@ -128,7 +128,7 @@ struct ArrayIter : IteratorState
         std::uint32_t length;
         if (JSTypedArray* ta = typedArrayOf(target)) {
             if (typedArrayOutOfBounds(ta)) {
-                vm.throwError(ErrorCode::TypeError, "the typed array is out of bounds");
+                vm.throwError(ErrorCode::TypeError, "the typed array's buffer is detached or too short for it");
                 return -1;
             }
             length = ta->length;

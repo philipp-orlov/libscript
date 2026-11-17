@@ -4994,3 +4994,30 @@ TEST(aCounterBelowAnInt32StepsWithoutAnOverflowCheck)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("7 8:2147483648 9:2147483649 5:2147483650 50:100 0 0:2147483640 0:2147483640 5:2147483650 4:7"));
     }
 }
+
+TEST(aMethodReadOfAnInlinedCallInAChainStillFillsItsReceiver)
+{
+    // `this.a.b.get()` after a join: the read of the receiver both ends a chain of reads and fills the inlined call's
+    // `this`; it must still put the receiver where the inlined body reads it.
+    const char* program =
+        "function Rep(n){this.captured=[];for(var i=0;i<n;i++)this.captured.push(i);}"
+        "Rep.prototype.get=function(){return this.captured;};"
+        "function St(c){this.checker=c;this.h=false;}"
+        "St.prototype.f=function(tc){this.h=this.h||(tc.p&&(this.checker.rep.get().length));"
+        "return this.checker.rep.captured.length;};"
+        "var s=0,t=0,sts=[];"
+        "for(var r=0;r<200;r++){var st=new St({rep:new Rep(r%3)});sts.push(st);"
+        "for(var k=0;k<50;k++)s+=st.f({p:k&1});t+=st.h?1:0;}"
+        "s+' '+t+' '+sts.length";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("9950 133 200"));
+    }
+}

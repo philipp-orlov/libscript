@@ -1698,7 +1698,8 @@ void Baseline::planChains()
     std::vector<std::int32_t> headOf(n_ + 1, -1);
     for (std::size_t k = 0; k < starts.size(); ++k) {
         const std::uint32_t i = starts[k];
-        if (plan_->defWeb[i] >= 0 || !chainable(i, false))
+        // A read or definition a call window took writes its value elsewhere (or not at all): no link of a chain.
+        if (plan_->defWeb[i] >= 0 || !chainable(i, false) || windowRead_.count(i) || (i < skipDef_.size() && skipDef_[i]))
             continue;
         const Ins& in = code_->code[i];
         const unsigned r = in.a;
@@ -1717,7 +1718,8 @@ void Baseline::planChains()
         const std::uint32_t c = starts[m];
         const Ins& cn = code_->code[c];
         const Op cop = cn.opcode();
-        if ((cop != Op::GetProp && cop != Op::GetElem) || cn.b != r || plan_->isLeader[c] || !chainable(c, true))
+        if ((cop != Op::GetProp && cop != Op::GetElem) || cn.b != r || plan_->isLeader[c] || !chainable(c, true) ||
+            windowRead_.count(c) || (c < skipDef_.size() && skipDef_[c]))
             continue;
         if (cop == Op::GetElem && cn.c == r)
             continue;

@@ -24,7 +24,7 @@ JSTypedArray* validate(VM& vm, JSValue v)
         return nullptr;
     }
     if (typedArrayOutOfBounds(t)) {
-        typeError(vm, "the typed array is out of bounds");
+        typeError(vm, "the typed array's buffer is detached or too short for it");
         return nullptr;
     }
     return t;
@@ -233,7 +233,7 @@ NATIVE(typedFill)
     if (!relativeTo(vm, arg(args, argc, 1), len, 0, &from) || !relativeTo(vm, arg(args, argc, 2), len, len, &to))
         return JSValue::exception();
     if (typedArrayOutOfBounds(t))
-        return typeError(vm, "the typed array is out of bounds");
+        return typeError(vm, "the typed array's buffer is detached or too short for it");
     to = std::min(to, double(t->length));
     for (double k = from; k < to; ++k)
         if (!typedSet(vm, t, k, value.get()))
@@ -256,7 +256,7 @@ NATIVE(typedCopyWithin)
     double count = std::min(last - from, len - to);
     if (count > 0) {
         if (typedArrayOutOfBounds(t))
-            return typeError(vm, "the typed array is out of bounds");
+            return typeError(vm, "the typed array's buffer is detached or too short for it");
         const double now = t->length;
         count = std::min(count, std::min(now - to, now - from));
         if (count > 0) {
@@ -305,7 +305,7 @@ NATIVE(typedSlice)
         return out.get();
     if (count > 0) {
         if (typedArrayOutOfBounds(t))
-            return typeError(vm, "the typed array is out of bounds");
+            return typeError(vm, "the typed array's buffer is detached or too short for it");
         auto* o = static_cast<JSTypedArray*>(asObject(out.get()));
         const double now = t->length;
         const double end = std::min(to, now);
@@ -620,7 +620,7 @@ NATIVE(typedSet_)
         return vm.throwError(ErrorCode::RangeError, "offset is out of bounds");
     const JSValue source = arg(args, argc, 0);
     if (typedArrayOutOfBounds(target))
-        return typeError(vm, "the typed array is out of bounds");
+        return typeError(vm, "the typed array's buffer is detached or too short for it");
     const double targetLength = target->length;
     if (JSTypedArray* src = typedArrayOf(source)) {
         if (typedArrayOutOfBounds(src))

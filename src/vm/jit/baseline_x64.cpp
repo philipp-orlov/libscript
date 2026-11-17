@@ -349,6 +349,9 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             t->older = code->tier2;
             code->tier2 = t;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            ++compiles;
+            if (std::getenv("T2MAX") && std::getenv("T2DBG"))
+                std::fprintf(stderr, "tier2 compiled #%d\n", compiles);
             if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
                 static int serial2 = 0;
                 const std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");

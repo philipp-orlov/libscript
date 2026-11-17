@@ -106,6 +106,36 @@ private:
     bool storedWide_ = false;
     std::size_t zeroed_ = ~std::size_t(0);  ///< where the last instruction, a 32-bit write of `zeroedReg_`, ends
     Reg zeroedReg_ = RAX;
+    // The last instruction, when it is a move between registers that nothing has looked at the position after: an
+    // operation next that both reads and overwrites its destination takes the move's source instead, and the move goes
+    // (the interface's two operands become arm64's three).
+    mutable std::size_t movedAt_ = ~std::size_t(0);
+    int movedTo_ = 0, movedFrom_ = 0;
+    bool movedWide_ = false, movedFp_ = false;
+    void noteMove(int to, int from, bool wide, bool fp = false) noexcept
+    {
+        movedAt_ = buf.size();
+        movedTo_ = to;
+        movedFrom_ = from;
+        movedWide_ = wide;
+        movedFp_ = fp;
+    }
+    /// For an operation about to be emitted that writes `rd` and reads it as `*rn` (and perhaps `*rm`): take the source of
+    /// the move just before in their place, and take the move back. A 32-bit move followed by a 64-bit read is left
+    /// alone (the move cleared the upper half).
+    void fold(int rd, int* rn, int* rm, bool wide, bool fp = false)
+    {
+        if (movedAt_ != buf.size() || movedFp_ != fp || movedTo_ != rd || *rn != rd || (wide && !movedWide_) ||
+            movedFrom_ == rd)
+            return;
+        buf.resize(buf.size() - 4);
+        *rn = movedFrom_;
+        if (rm && *rm == rd)
+            *rm = movedFrom_;
+        if (zeroed_ == movedAt_)
+            zeroed_ = ~std::size_t(0);
+        movedAt_ = ~std::size_t(0);
+    }
 
     static int X(Reg r) noexcept
     {
@@ -376,6 +406,8 @@ private:
     /// `rd = rn op rm` for the interface's ALU numbering (0 add, 1 or, 4 and, 5 sub, 6 xor, 7 cmp), with its flags.
     void aluRRR(int op, bool wide, int rd, int rn, int rm)
     {
+        if (op != 7)
+            fold(rd, &rn, &rm, wide);
         const std::uint32_t w = wide ? 0x80000000u : 0u;
         const std::uint32_t regs = (std::uint32_t(rm) << 16) | (std::uint32_t(rn) << 5);
         switch (op) {
@@ -409,6 +441,8 @@ private:
     /// `rd = rn op v`; `v` is what x86-64 would have sign-extended from 32 bits.
     void aluRRI(int op, bool wide, int rd, int rn, std::int32_t v)
     {
+        if (op != 7 && rd != kZr)
+            fold(rd, &rn, nullptr, wide);
         const std::uint32_t w = wide ? 0x80000000u : 0u;
         const std::uint32_t d = std::uint32_t(op == 7 ? kZr : rd), n = std::uint32_t(rn) << 5;
         if (op == 0 || op == 5 || op == 7) {
@@ -467,9 +501,21 @@ private:
     {
         ins(op | (std::uint32_t(V(m)) << 16) | (std::uint32_t(V(n)) << 5) | std::uint32_t(V(d)));
     }
+    /// `x = x op y`, or with a move into `x` just before, of that move's source.
+    void fp2(std::uint32_t op, int x, int y)
+    {
+        int d = V(x), n = d, m = V(y);
+        fold(d, &n, &m, true, true);
+        ins(op | (std::uint32_t(m) << 16) | (std::uint32_t(n) << 5) | std::uint32_t(d));
+    }
 
 public:
-    std::int32_t here() const noexcept { return std::int32_t(buf.size()); }
+    /// The position, for a label or a note of where code is; a move just emitted stays as it is from here on.
+    std::int32_t here() const noexcept
+    {
+        movedAt_ = ~std::size_t(0);
+        return std::int32_t(buf.size());
+    }
 
     void align(int n)
     {
@@ -536,7 +582,11 @@ public:
     }
 
     // ---- moves ----
-    void mov(Reg d, Reg s) { ins(0xAA0003E0u | (std::uint32_t(X(s)) << 16) | std::uint32_t(X(d))); }
+    void mov(Reg d, Reg s)
+    {
+        ins(0xAA0003E0u | (std::uint32_t(X(s)) << 16) | std::uint32_t(X(d)));
+        noteMove(X(d), X(s), true);
+    }
     void mov32(Reg d, Reg s)
     {
         // A register the instruction just before wrote as 32 bits is zero-extended already.
@@ -545,6 +595,8 @@ public:
         ins(0x2A0003E0u | (std::uint32_t(X(s)) << 16) | std::uint32_t(X(d)));
         zeroed_ = buf.size();
         zeroedReg_ = d;
+        if (d != s)
+            noteMove(X(d), X(s), false);
     }
     // A load of the stack slot the instruction just before stored from the same register reads what the register holds:
     // a 64-bit one is dropped, a 32-bit one only zero-extends. A label between ends this (`bind`).
@@ -758,7 +810,9 @@ public:
     }
     void imul32(Reg d, Reg s)
     {
-        ins(0x9B207C00u | (std::uint32_t(X(s)) << 16) | (std::uint32_t(X(d)) << 5) | kTmp);
+        int n = X(d), m = X(s);
+        fold(X(d), &n, &m, false);
+        ins(0x9B207C00u | (std::uint32_t(m) << 16) | (std::uint32_t(n) << 5) | kTmp);
         ins(0x2A0003E0u | (std::uint32_t(kTmp) << 16) | std::uint32_t(X(d)));
         pendingTest(kTmp, true);
         pendingMul_ = 1;
@@ -772,7 +826,9 @@ public:
     }
     void neg32(Reg r)
     {
-        ins(0x6B0003E0u | (std::uint32_t(X(r)) << 16) | std::uint32_t(X(r)));
+        int from = X(r);
+        fold(X(r), &from, nullptr, false);
+        ins(0x6B0003E0u | (std::uint32_t(from) << 16) | std::uint32_t(X(r)));
         setFlags(Flags::Sub);
     }
     void not32(Reg r) { ins(0x2A2003E0u | (std::uint32_t(X(r)) << 16) | std::uint32_t(X(r))); }
@@ -792,23 +848,62 @@ public:
         access(kStrW, 2, kVal, a);
         setFlags(Flags::Sub);
     }
+    // ---- three operands: what the optimizing compiler uses for its typed variables where the assembler has them ----
+    static constexpr bool kThreeOperand = true;
+    /// `d = a op b` on 32 bits, with the flags of the two-operand form.
+    void op32(int op, Reg d, Reg a, Reg b) { aluRRR(op, false, X(d), X(a), X(b)); }
+    void op32I(int op, Reg d, Reg a, std::int32_t v) { aluRRI(op, false, X(d), X(a), v); }
+    void shift32I(int kind, Reg d, Reg a, int n)
+    {
+        const std::uint32_t x = std::uint32_t(X(d)), f = std::uint32_t(X(a)), s = std::uint32_t(n) & 31;
+        if (kind == 4)
+            ins(0x53000000u | (((32 - s) & 31) << 16) | ((31 - s) << 10) | (f << 5) | x);
+        else
+            ins((kind == 5 ? 0x53000000u : 0x13000000u) | (s << 16) | (31u << 10) | (f << 5) | x);
+        pendingTest(int(x), false);
+    }
+    /// `d = a shifted by the low five bits of count`.
+    void shift32(int kind, Reg d, Reg a, Reg count)
+    {
+        const std::uint32_t op = kind == 4 ? 0x1AC02000u : kind == 5 ? 0x1AC02400u : 0x1AC02800u;
+        ins(op | (std::uint32_t(X(count)) << 16) | (std::uint32_t(X(a)) << 5) | std::uint32_t(X(d)));
+        pendingTest(X(d), false);
+    }
+    /// `d = a * b`; the flags, if asked for next, say whether the product left 32 bits.
+    void mul32(Reg d, Reg a, Reg b)
+    {
+        ins(0x9B207C00u | (std::uint32_t(X(b)) << 16) | (std::uint32_t(X(a)) << 5) | kTmp);
+        ins(0x2A0003E0u | (std::uint32_t(kTmp) << 16) | std::uint32_t(X(d)));
+        pendingTest(kTmp, true);
+        pendingMul_ = 1;
+    }
+    void neg32r(Reg d, Reg a)
+    {
+        ins(0x6B0003E0u | (std::uint32_t(X(a)) << 16) | std::uint32_t(X(d)));
+        setFlags(Flags::Sub);
+    }
+
     // shifts: kind 4 shl, 5 shr, 7 sar
     void shiftI(int kind, Reg r, int n)
     {
-        const std::uint32_t x = std::uint32_t(X(r)), s = std::uint32_t(n) & 63;
+        int from = X(r);
+        fold(X(r), &from, nullptr, true);
+        const std::uint32_t x = std::uint32_t(X(r)), f = std::uint32_t(from), s = std::uint32_t(n) & 63;
         if (kind == 4)
-            ins(0xD3400000u | (((64 - s) & 63) << 16) | ((63 - s) << 10) | (x << 5) | x);
+            ins(0xD3400000u | (((64 - s) & 63) << 16) | ((63 - s) << 10) | (f << 5) | x);
         else
-            ins((kind == 5 ? 0xD3400000u : 0x93400000u) | (s << 16) | (63u << 10) | (x << 5) | x);
+            ins((kind == 5 ? 0xD3400000u : 0x93400000u) | (s << 16) | (63u << 10) | (f << 5) | x);
         pendingTest(int(x), true);
     }
     void shiftI32(int kind, Reg r, int n)
     {
-        const std::uint32_t x = std::uint32_t(X(r)), s = std::uint32_t(n) & 31;
+        int from = X(r);
+        fold(X(r), &from, nullptr, false);
+        const std::uint32_t x = std::uint32_t(X(r)), f = std::uint32_t(from), s = std::uint32_t(n) & 31;
         if (kind == 4)
-            ins(0x53000000u | (((32 - s) & 31) << 16) | ((31 - s) << 10) | (x << 5) | x);
+            ins(0x53000000u | (((32 - s) & 31) << 16) | ((31 - s) << 10) | (f << 5) | x);
         else
-            ins((kind == 5 ? 0x53000000u : 0x13000000u) | (s << 16) | (31u << 10) | (x << 5) | x);
+            ins((kind == 5 ? 0x53000000u : 0x13000000u) | (s << 16) | (31u << 10) | (f << 5) | x);
         pendingTest(int(x), false);
     }
     void shiftCl32(int kind, Reg r)
@@ -932,10 +1027,10 @@ public:
     // ---- scalar double; the interface's xmm registers are 0..15 ----
     void movqToX(int x, Reg r) { ins(0x9E670000u | (std::uint32_t(X(r)) << 5) | std::uint32_t(V(x))); }
     void movqFromX(Reg r, int x) { ins(0x9E660000u | (std::uint32_t(V(x)) << 5) | std::uint32_t(X(r))); }
-    void addsd(int x, int y) { fp3(0x1E602800u, x, x, y); }
-    void subsd(int x, int y) { fp3(0x1E603800u, x, x, y); }
-    void mulsd(int x, int y) { fp3(0x1E600800u, x, x, y); }
-    void divsd(int x, int y) { fp3(0x1E601800u, x, x, y); }
+    void addsd(int x, int y) { fp2(0x1E602800u, x, y); }
+    void subsd(int x, int y) { fp2(0x1E603800u, x, y); }
+    void mulsd(int x, int y) { fp2(0x1E600800u, x, y); }
+    void divsd(int x, int y) { fp2(0x1E601800u, x, y); }
     void ucomisd(int x, int y)
     {
         ins(0x1E602000u | (std::uint32_t(V(y)) << 16) | (std::uint32_t(V(x)) << 5));
@@ -974,7 +1069,12 @@ public:
         else
             ins(0x6E201C00u | (std::uint32_t(V(y)) << 16) | (std::uint32_t(V(x)) << 5) | std::uint32_t(V(x)));
     }
-    void movaps(int x, int y) { ins(0x4EA01C00u | (std::uint32_t(V(y)) << 16) | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
+    void movaps(int x, int y)
+    {
+        ins(0x4EA01C00u | (std::uint32_t(V(y)) << 16) | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x)));
+        if (x != y)
+            noteMove(V(x), V(y), true, true);
+    }
     void sqrtsd(int x, int y) { ins(0x1E61C000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
     /// `d = a op b` (op: 0x58 add, 0x5C sub, 0x59 mul, 0x5E div), and with 0x51 `d = sqrt(b)`.
     void vsd(std::uint8_t op, int d, int a, int bx)

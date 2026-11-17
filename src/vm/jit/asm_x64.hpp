@@ -431,6 +431,14 @@ public:
         b(std::uint8_t(0x58 | (r & 7)));
     }
     void int3() { b(0xCC); }
+    /// The three-operand forms the optimizing compiler uses where the assembler has them; it does not ask here.
+    static constexpr bool kThreeOperand = false;
+    void op32(int, Reg, Reg, Reg) {}
+    void op32I(int, Reg, Reg, std::int32_t) {}
+    void shift32I(int, Reg, Reg, int) {}
+    void shift32(int, Reg, Reg, Reg) {}
+    void mul32(Reg, Reg, Reg) {}
+    void neg32r(Reg, Reg) {}
     /// A call into the runtime, as against one of compiled code: the same instruction here.
     void callC(Reg r) { callReg(r); }
     /// A jump to a function of the runtime that returns to whoever called the code this ends.

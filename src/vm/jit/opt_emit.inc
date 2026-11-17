@@ -428,6 +428,90 @@ bool Baseline::emitTyped(std::uint32_t i)
                              op == Op::UShr || op == Op::BitAndI || op == Op::BitOrI || op == Op::BitXorI ||
                              op == Op::ShlI || op == Op::ShrI || op == Op::UShrI;
         Label& bad = exitBefore(i);
+        if (Asm::kThreeOperand && isI32(dw) && isI32(uw[0]) && (imm || unary || isI32(uw[1])) && op != Op::UShr &&
+            op != Op::UShrI && op != Op::Mod && op != Op::ModI && op != Op::Div) {
+            // Straight from the operands' registers into the result's. An instruction that may leave before it is done
+            // (an overflow) must leave its operands as they were: when the result is one of them, the way below, through
+            // rax, is taken (but for the counter stepped in place, which undoes its step).
+            const bool same = uw[0] == dw || (!imm && !unary && uw[1] == dw);
+            const bool checked = !bitwise && !plan_->wraps[i];
+            const bool counter = (op == Op::Inc || op == Op::Dec || op == Op::AddI || op == Op::SubI) && uw[0] == dw && inReg(dw);
+            if (!(same && checked) && !counter && !(op == Op::MulI && k == 0)) {
+                const Reg ra = useI32(uw[0], RAX);
+                const Reg rb = imm || unary ? RCX : useI32(uw[1], RCX);
+                const Reg rd = inReg(dw) ? gpr(dw) : RAX;
+                switch (op) {
+                case Op::BitAnd: a_.op32(4, rd, ra, rb); break;
+                case Op::BitOr: a_.op32(1, rd, ra, rb); break;
+                case Op::BitXor: a_.op32(6, rd, ra, rb); break;
+                case Op::Shl: a_.shift32(4, rd, ra, rb); break;
+                case Op::Shr: a_.shift32(7, rd, ra, rb); break;
+                case Op::BitAndI: a_.op32I(4, rd, ra, k); break;
+                case Op::BitOrI:
+                    if (k != 0)
+                        a_.op32I(1, rd, ra, k);
+                    else if (rd != ra)
+                        a_.mov32(rd, ra);
+                    break;
+                case Op::BitXorI:
+                    if (k != 0)
+                        a_.op32I(6, rd, ra, k);
+                    else if (rd != ra)
+                        a_.mov32(rd, ra);
+                    break;
+                case Op::ShlI: a_.shift32I(4, rd, ra, k & 31); break;
+                case Op::ShrI: a_.shift32I(7, rd, ra, k & 31); break;
+                case Op::Add: a_.op32(0, rd, ra, rb); break;
+                case Op::Sub: a_.op32(5, rd, ra, rb); break;
+                case Op::AddI: a_.op32I(0, rd, ra, k); break;
+                case Op::SubI: a_.op32I(5, rd, ra, k); break;
+                case Op::Inc: a_.op32I(0, rd, ra, 1); break;
+                case Op::Dec: a_.op32I(0, rd, ra, -1); break;
+                case Op::Neg:
+                    a_.test32(ra, ra);
+                    a_.jcc(CE, bad);  // -0
+                    a_.aluI32(7, ra, INT32_MIN);
+                    a_.jcc(CE, bad);
+                    a_.neg32r(rd, ra);
+                    break;
+                case Op::Mul:
+                case Op::MulI: {
+                    Reg rk = rb;
+                    if (op == Op::MulI) {
+                        a_.movImm(RCX, std::uint32_t(k));
+                        rk = RCX;
+                    }
+                    a_.mul32(rd, ra, rk);
+                    if (!checked)
+                        break;
+                    a_.jcc(CO, bad);
+                    Label ok;
+                    a_.test32(rd, rd);
+                    a_.jcc(CNE, ok);
+                    // A zero that is not +0: a negative operand makes it -0.
+                    if (op == Op::Mul) {
+                        a_.mov32(RDX, useI32(uw[0], RDX));
+                        a_.alu32(1, RDX, useI32(uw[1], RCX));
+                        a_.jcc(CS, bad);
+                    } else if (k < 0) {
+                        a_.jmp(bad);
+                    }
+                    a_.bind(ok);
+                    break;
+                }
+                default: break;
+                }
+                if (checked && op != Op::Mul && op != Op::MulI && op != Op::Neg)
+                    a_.jcc(CO, bad);
+                if (rd == RAX) {
+                    defI32(dw, RAX);
+                } else {
+                    dirty_[std::size_t(dw)] = 1;
+                    raxHolds_ = -1;
+                }
+                return true;
+            }
+        }
         if (bitwise) {
             int32OfWeb(uw[0], RAX, i);
             if (!imm)

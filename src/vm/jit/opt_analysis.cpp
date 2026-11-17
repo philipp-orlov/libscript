@@ -751,8 +751,14 @@ Plan analyse(const CodeBlock& code)
     {
         std::uint32_t first, last;
     };
-    std::vector<Interval> gpr[16], xmm[16];
+    std::vector<Interval> gpr[32], xmm[16];
+#if defined(__aarch64__)
+    // r8-r11 as on x86-64, and three of the registers the arm64 assembler has past the interface's (asm_a64.hpp); the
+    // others of those hold what loops promote.
+    constexpr std::uint8_t kGprPool[] = {8, 9, 10, 11, 16, 17, 18};
+#else
     constexpr std::uint8_t kGprPool[] = {8, 9, 10, 11};
+#endif
     for (std::uint32_t wi : order) {
         Web& w = span[wi];
         std::vector<Interval>* regs = w.rep == Rep::I32 ? gpr : xmm;

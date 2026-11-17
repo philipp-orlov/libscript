@@ -1484,14 +1484,24 @@ void Baseline::emitOpt(std::uint32_t i)
         const LoopPromo& lp = loopPromos_[pa->second];
         const Ins& in = code_->code[i];
         const std::int32_t start = a_.here();
-        if (in.opcode() == Op::GetProp) {
+        if (lp.i32 && in.opcode() == Op::GetProp) {
+            defI32(plan_->defWeb[i], Reg(lp.xreg));
+            raxHolds_ = -1;
+        } else if (lp.i32) {
+            const Reg v = useI32(plan_->useWebs[i][1], RCX);
+            a_.mov32(Reg(lp.xreg), v);
+        } else if (in.opcode() == Op::GetProp) {
             const std::int32_t dw = plan_->defWeb[i];
-            const int x = inReg(dw) ? xmmOf(dw) : 0;
-            a_.movsdLoad(x, mem(RSP, lp.slot));
-            defF64(dw, x);
+            if (lp.xreg >= 0 && !inReg(dw)) {
+                defF64(dw, lp.xreg);
+            } else {
+                const int x = inReg(dw) ? xmmOf(dw) : 0;
+                promoLoad(x, lp);
+                defF64(dw, x);
+            }
         } else {
             const std::int32_t vw = plan_->useWebs[i][1];
-            a_.movsdStore(mem(RSP, lp.slot), operandF64(vw, 0, RCX));
+            promoStore(lp, operandF64(vw, lp.xreg >= 0 ? lp.xreg : 0, RCX));
         }
         passRax(start);
         for (std::uint16_t r : opt::effectsOf(*code_, i).wr)

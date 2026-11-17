@@ -4258,6 +4258,43 @@ TEST(aFrameEnteredFromANativeStartsWithUndefinedRegisters)
     }
 }
 
+TEST(int32SlotsALoopKeepsInRegisters)
+{
+    // A loop that reads and stores int32 properties of an object it holds keeps them in registers where the assembler
+    // has spare ones, loads them before the loop and writes them back on every way out: at its end, an early return,
+    // an overflow into a double, a store of a fraction, another name for the same object (an element read), an
+    // accessor or a string in the slot.
+    const char* program =
+        "var out = []; "
+        "function P() { this.a = 1; this.b = 2; this.c = 3; this.d = 4; } "
+        "function spin(o, n) { for (var i = 0; i < n; i++) { o.a = o.b + 1; o.b = o.c + 1; o.c = o.d - 1; o.d = o.a - 1; } return o.a + o.b + o.c + o.d; } "
+        "out.push(spin(new P(), 30000)); "
+        "function grow(o, n) { for (var i = 0; i < n; i++) { o.a = o.a + o.b; o.b = o.b + 1; } return o.a; } "
+        "var g = new P(); out.push(grow(g, 20000), grow(g, 70000), g.b); "
+        "function alias(o, os, n) { var s = 0; for (var i = 0; i < n; i++) { o.a = o.a + 1; var q = os[i & 1]; q.b = q.b + 2; s += o.b; } return s + o.a; } "
+        "var x = new P(), y = new P(); out.push(alias(x, [y, y], 20000), alias(x, [y, x], 20000), x.a, x.b, y.b); "
+        "function early(o, n) { for (var i = 0; i < n; i++) { o.c = o.c + 3; if (o.c > 50000) return i; } return -1; } "
+        "var e = new P(); out.push(early(e, 100000), e.c); "
+        "function frac(o, n) { for (var i = 0; i < n; i++) { o.d = o.d + 1; if (i === n - 5) o.d = 0.5; } return o.d; } "
+        "out.push(frac(new P(), 20000), frac(new P(), 20000)); "
+        "function acc(o, n) { for (var i = 0; i < n; i++) o.a = o.a + 1; return o.a; } "
+        "var h = new P(); acc(h, 20000); Object.defineProperty(h, 'a', { get: function () { return 7; }, set: function (v) { out.push('set'); }, configurable: true }); out.push(acc(h, 2)); "
+        "var z = new P(); z.a = 'x'; out.push(acc(z, 3), acc(new P(), 20000)); "
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("14,200030001,4050135001,90002,60001,200080001,40001,20002,60002,16665,50001,4.5,4.5,set,set,7,x111,20001"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

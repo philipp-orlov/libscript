@@ -1070,8 +1070,29 @@ private:
         std::uint32_t index;
         std::int32_t slot;
         std::vector<unsigned> fixed;
+        int xreg = -1;  ///< a register of its own instead of the stack slot, where the assembler has spare ones
+        bool i32 = false;  ///< an int32 in integer register `xreg` (the loop reads and stores int32 variables there)
     };
     std::vector<LoopPromo> loopPromos_;
+    /// The assembler's spare registers given to promotions so far; the last four spare integer registers are theirs
+    /// (the first ones are in the pool of the typed variables, opt_analysis.cpp).
+    int intPromos = 0, doublePromos = 0;
+    static constexpr int kIntPromoRegs = Asm::kExtraGpr >= 4 ? 4 : 0;
+    /// The promoted value into xmm`x`, and from it.
+    void promoLoad(int x, const LoopPromo& lp)
+    {
+        if (lp.xreg < 0)
+            a_.movsdLoad(x, mem(RSP, lp.slot));
+        else if (x != lp.xreg)
+            a_.movaps(x, lp.xreg);
+    }
+    void promoStore(const LoopPromo& lp, int x)
+    {
+        if (lp.xreg < 0)
+            a_.movsdStore(mem(RSP, lp.slot), x);
+        else if (x != lp.xreg)
+            a_.movaps(lp.xreg, x);
+    }
     std::int64_t emittingGuards_ = -1;  ///< the loop whose checks are being made: its promoted slots are not loaded yet
     std::map<std::uint32_t, std::size_t> promoAccess_;               ///< read or store -> its promotion
     std::map<std::uint32_t, std::vector<std::size_t>> promoGuards_;  ///< element read -> promotions to compare with
@@ -1087,8 +1108,13 @@ private:
     {
         for (std::size_t k : promos) {
             const LoopPromo& lp = loopPromos_[k];
-            a_.movsdLoad(0, mem(RSP, lp.slot));
-            boxDoubleTo(RDX, 0);
+            if (lp.i32) {
+                a_.mov32(RDX, Reg(lp.xreg));
+                a_.or_(RDX, R14);
+            } else {
+                promoLoad(0, lp);
+                boxDoubleTo(RDX, 0);
+            }
             a_.mov(RAX, R(lp.reg));
             a_.mov(mem(RAX, kObjInline + std::int32_t(8 * lp.index)), RDX);
         }
@@ -2291,14 +2317,21 @@ void Baseline::emitTails()
         a_.push(R9);
         a_.push(R10);
         a_.push(R11);
-        a_.aluI(5, RSP, 120);
-        for (int k = 0; k < 14; ++k)
+        for (int k = 0; k < Asm::kExtraGpr; ++k)
+            a_.push(Reg(16 + k));
+        // (With the pushes and the return address, a multiple of sixteen bytes.)
+        const int doubles = 14 + Asm::kExtraXmm;
+        const std::int32_t room = 8 * doubles + (((doubles + 5 + Asm::kExtraGpr) & 1) ? 8 : 0);
+        a_.aluI(5, RSP, room);
+        for (int k = 0; k < doubles; ++k)
             a_.movsdStore(mem(RSP, 8 * k), 2 + k);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitFree));
         a_.callC(RAX);
-        for (int k = 0; k < 14; ++k)
+        for (int k = 0; k < doubles; ++k)
             a_.movsdLoad(2 + k, mem(RSP, 8 * k));
-        a_.aluI(0, RSP, 120);
+        a_.aluI(0, RSP, room);
+        for (int k = Asm::kExtraGpr; k-- > 0;)
+            a_.pop(Reg(16 + k));
         a_.pop(R11);
         a_.pop(R10);
         a_.pop(R9);

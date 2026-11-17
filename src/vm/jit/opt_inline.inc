@@ -2426,6 +2426,7 @@ void Baseline::planLoopFacts()
     loopMaths_.clear();
     loopReads_.clear();
     loopPromos_.clear();
+    intPromos = doublePromos = 0;
     promoAccess_.clear();
     promoGuards_.clear();
     hoistSlots_ = 0;
@@ -2647,6 +2648,7 @@ void Baseline::planLoopFacts()
                 }
                 for (std::uint32_t idx : idxs) {
                     bool ok = hoistSlots_ < kHoistSlots;
+                    bool ints = false, doubles = false;  // what the loop's variables for this slot are
                     std::vector<std::uint32_t> own;
                     std::set<unsigned> others;
                     for (std::uint32_t j = h; std::int64_t(j) <= end && ok; j += length(j)) {
@@ -2673,10 +2675,17 @@ void Baseline::planLoopFacts()
                         if (poly || ic.holder || failed || (j < chainRole_.size() && chainRole_[j]) || windowRead_.count(j) ||
                             (j < skipDef_.size() && skipDef_[j]))
                             ok = false;
-                        else if (op == Op::GetProp)
-                            ok = plan_->defWeb[j] >= 0 && !isI32(plan_->defWeb[j]) && in.a != r;
-                        else
-                            ok = uw.size() >= 2 && uw[0] < 0 && uw[1] >= 0 && !isI32(uw[1]) && ic.next == 0;
+                        else if (op == Op::GetProp) {
+                            ok = plan_->defWeb[j] >= 0 && in.a != r;
+                            if (ok)
+                                (isI32(plan_->defWeb[j]) ? ints : doubles) = true;
+                        } else {
+                            ok = uw.size() >= 2 && uw[0] < 0 && uw[1] >= 0 && ic.next == 0;
+                            if (ok)
+                                (isI32(uw[1]) ? ints : doubles) = true;
+                        }
+                        // All int32 (kept in an integer register, where there is a spare one) or all doubles.
+                        ok = ok && !(ints && doubles) && !(ints && intPromos >= kIntPromoRegs);
                         if (ok)
                             own.push_back(j);
                     }
@@ -2718,6 +2727,12 @@ void Baseline::planLoopFacts()
                     for (std::uint32_t j : own)
                         promoAccess_[j] = loopPromos_.size();
                     loopPromos_.push_back(LoopPromo{h, std::uint32_t(end), r, idx, hoistBase_ + std::int32_t(8 * hoistSlots_++), fixed});
+                    if (ints) {
+                        loopPromos_.back().i32 = true;
+                        loopPromos_.back().xreg = 16 + Asm::kExtraGpr - kIntPromoRegs + intPromos++;
+                    } else if (doublePromos < Asm::kExtraXmm) {
+                        loopPromos_.back().xreg = 16 + doublePromos++;
+                    }
                     any = true;
                 }
             }
@@ -3052,8 +3067,13 @@ void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
         }
         a_.mov(RAX, R(lp.reg));
         a_.mov(RCX, mem(RAX, kObjInline + std::int32_t(8 * lp.index)));
+        if (lp.i32) {
+            needInt(RCX, bad);
+            a_.mov32(Reg(lp.xreg), RCX);
+            continue;
+        }
         unboxDouble(0, RCX, RDX, &bad);
-        a_.movsdStore(mem(RSP, lp.slot), 0);
+        promoStore(lp, 0);
     }
     for (const LoopGlobal& lg : loopGlobals_) {
         if (lg.from != h || covered)

@@ -88,6 +88,13 @@ Both compilers are written against the interface of `asm_x64.hpp`. On arm64 the 
 - A conditional branch reaches one megabyte: a function whose code is larger is compiled again with each such branch
   as a branch over a jump.
 - `commitCode` copies code into the region and tells the instruction cache.
+- A register move is taken back when the operation after it reads and overwrites the move's destination: the operation
+  is emitted on the move's source (the interface's two operands become three). The assembler also knows which
+  registers are zero-extended, so boxing an int32 is one instruction.
+- arm64 has registers the interface does not: seven integer ones (`r16`-`r22`) and seven for doubles (`xmm16`-`22`).
+  The optimizing compiler's int32 variables have three of them besides `r8`-`r11`; a loop's promoted slots (below)
+  live in the others instead of stack slots, which also lets a loop promote int32 slots, each in an integer register.
+  Its int32 arithmetic goes from the operands' registers into the result's (`kThreeOperand`).
 
 ## The optimizing compiler
 

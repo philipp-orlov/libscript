@@ -611,6 +611,10 @@ private:
     std::uint16_t atom(const String& name)
     {
         Key key = vm_.internKey(name);  // a count the block keeps
+        // A name the source spells: there are only as many as the source has, so objects keyed by it may grow shapes
+        // freely (Shape::after limits the transitions of names made at run time).
+        if (key->kind == detail::CellKind::String)
+            static_cast<StringCell*>(key)->markInSource();
         auto it = fn_->atomIndex.find(key);
         if (it != fn_->atomIndex.end()) {
             detail::decRef(key);

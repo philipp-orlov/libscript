@@ -114,6 +114,7 @@ int jitGetGlobal(VM& vm, std::uint32_t index);
 int jitGetProp(VM& vm, std::uint32_t index);
 int jitPutProp(VM& vm, std::uint32_t index);
 int jitInitProp(VM& vm, std::uint32_t index);
+int jitDefPrivate(VM& vm, std::uint32_t index);
 int jitNewObject(VM& vm, std::uint32_t index);
 int jitNewArray(VM& vm, std::uint32_t index);
 int jitArrayPush(VM& vm, std::uint32_t index);

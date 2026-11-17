@@ -643,6 +643,10 @@ constexpr std::int32_t kShapeFlags = std::int32_t(offsetof(Shape, flags));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
 constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
 constexpr std::int32_t kSuperSlot = std::int32_t(offsetof(SuperCache, slot));
+constexpr std::int32_t kPrivKey = std::int32_t(offsetof(PrivateCache, key));
+constexpr std::int32_t kPrivShape = std::int32_t(offsetof(PrivateCache, shape));
+constexpr std::int32_t kPrivIndex = std::int32_t(offsetof(PrivateCache, index));
+constexpr std::int32_t kPrivNext = std::int32_t(offsetof(PrivateCache, next));
 constexpr std::int32_t kSuperValidity = std::int32_t(offsetof(SuperCache, validity));
 constexpr std::int32_t kObjSlots = 16;
 constexpr std::int32_t kObjInline = 24;
@@ -1793,6 +1797,33 @@ private:
     }
 
     // ---- value tests; a failed test jumps to `bad` ----
+    /// Whether the element sites of this function keep a `PrivateCache` (it names `#x`); made here the first time.
+    bool privateSites()
+    {
+        if (!(code_->flags & CodeBlock::kPrivate))
+            return false;
+        if (code_->privCaches.empty())
+            code_->privCaches.assign(code_->code.size(), PrivateCache{});
+        return true;
+    }
+    /// `base[#name]` as site `i` last found it: the object in rax, the key in rcx; the slot's address in rdx, else `bad`.
+    /// Clobbers rsi, rdi.
+    void privateSlot(std::uint32_t i, Label& bad)
+    {
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&code_->privCaches[i]));
+        a_.cmp(RCX, mem(RDX, kPrivKey));
+        a_.jcc(CNE, bad);
+        needObject(RAX, bad);
+        a_.mov32(RSI, mem(RDX, kPrivShape));
+        a_.alu32(7, RSI, mem(RAX, 0));
+        a_.jcc(CNE, bad);
+        // A slot in place (objects of one shape can have fewer of those).
+        a_.mov32(RSI, mem(RDX, kPrivIndex));
+        a_.movzx8(RDI, mem(RAX, kHdrAux));
+        a_.alu32(7, RSI, RDI);
+        a_.jcc(CAE, bad);
+        a_.lea(RDX, mem(RAX, RSI, 8, kObjInline));
+    }
     void needInt(Reg v, Label& bad)
     {
         a_.cmp(v, R14);
@@ -2273,6 +2304,7 @@ private:
     void getSuperProp(std::uint32_t i, const Ins& in);
     void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
     void putElem(std::uint32_t i, const Ins& in);
+    void defPrivate(std::uint32_t i, const Ins& in);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
     /// Per instruction: the registers that may have been written since the frame began (one bit each), or empty when
     /// that is not known (`planDirty`). Those that were not are undefined still, and a return leaves them be.
@@ -2542,6 +2574,29 @@ void Baseline::emit(std::uint32_t i)
         // Straight to the runtime: no stepping through the interpreter.
         helperOp(i, &helperThunk<jitInstanceOf>);
         return;
+    case Op::FieldInit: {
+        // The class's field initialiser, a function in the `Rare` of the function running; else undefined.
+        Label none, done;
+        a_.mov(RAX, mem(R13, kFrameFn));
+        a_.testI8(mem(RAX, kHdrFlags), cellflags::kHasRare);
+        a_.jcc(CE, none);
+        a_.mov(RAX, mem(RAX, kObjSlots));
+        a_.mov(RAX, mem(RAX, -16));
+        a_.mov(RAX, mem(RAX, kRareFieldInit));
+        a_.test(RAX, R15);
+        a_.jcc(CNE, none);
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CNE, none);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, none);
+        deliver(i, in.a);
+        a_.jmp(done);
+        a_.bind(none);
+        a_.movImm(RAX, kUndefined);
+        deliver(i, in.a);
+        a_.bind(done);
+        return;
+    }
     case Op::InitFields: {
         // A class whose constructor this is with no field initialiser (a `Rare` whose `fieldInit` is no function):
         // nothing to do. One with fields runs them in the interpreter.
@@ -2622,6 +2677,9 @@ void Baseline::emit(std::uint32_t i)
         return;
     case Op::InitProp:
         initProp(i, in);
+        return;
+    case Op::DefPrivate:
+        defPrivate(i, in);
         return;
     case Op::Closure:
         helperOp(i, &helperThunk<jitClosure>);
@@ -3611,10 +3669,11 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
 {
     using E = ElemKind;
     Label& bad = slow(i, &helperThunk<jitGetElem>);
-    Label typed, done;
+    Label typed, done, notInt;
+    const bool priv = privateSites();
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
-    needInt(RCX, bad);
+    needInt(RCX, priv ? notInt : bad);
     a_.test32(RCX, RCX);
     a_.jcc(CS, bad);
     needObject(RAX, bad);
@@ -3682,17 +3741,58 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.movzx16(RAX, mem(RSI, RCX, 2));
     a_.bind(intResult);
     deliverInt(i, in.a);
+    if (priv) {
+        a_.jmp(done);
+        a_.bind(notInt);
+        privateSlot(i, bad);
+        a_.mov(RAX, mem(RDX, 0));
+        deliver(i, in.a);
+    }
     a_.bind(done);
+}
+
+void Baseline::defPrivate(std::uint32_t i, const Ins& in)
+{
+    // `#x = v` of a class body: the field added the way the site added it last, to an object of that shape.
+    if (!privateSites()) {
+        emitStep(i);
+        return;
+    }
+    Label& bad = slow(i, &helperThunk<jitDefPrivate>);
+    a_.mov(RAX, R(in.a));
+    a_.mov(RCX, R(in.b));
+    a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&code_->privCaches[i]));
+    a_.cmp(RCX, mem(RDX, kPrivKey));
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RDX, kPrivNext));
+    a_.test32(RSI, RSI);
+    a_.jcc(CE, bad);
+    needObject(RAX, bad);
+    a_.mov32(RSI, mem(RDX, kPrivShape));
+    a_.alu32(7, RSI, mem(RAX, 0));
+    a_.jcc(CNE, bad);
+    a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto));
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RDX, kPrivIndex));
+    a_.movzx8(RDI, mem(RAX, kHdrAux));
+    a_.alu32(7, RSI, RDI);
+    a_.jcc(CAE, bad);
+    a_.mov(RCX, R(in.c));
+    retain(RCX);
+    a_.mov(mem(RAX, RSI, 8, kObjInline), RCX);
+    a_.mov32(RSI, mem(RDX, kPrivNext));
+    a_.mov32(mem(RAX, 0), RSI);
 }
 
 void Baseline::putElem(std::uint32_t i, const Ins& in)
 {
     using E = ElemKind;
     Label& bad = slow(i, &helperThunk<jitPutElem>);
-    Label isNumber, typed, done;
+    Label isNumber, typed, done, notInt;
+    const bool priv = privateSites();
     a_.mov(RAX, R(in.a));
     a_.mov(RCX, R(in.b));
-    needInt(RCX, bad);
+    needInt(RCX, priv ? notInt : bad);
     a_.test32(RCX, RCX);
     a_.jcc(CS, bad);
     needObject(RAX, bad);
@@ -3791,6 +3891,16 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.bind(i16);
     int32From(RAX, RDI, bad);
     a_.mov16(mem(RSI, RCX, 2), RAX);
+    if (priv) {
+        a_.jmp(done);
+        a_.bind(notInt);
+        privateSlot(i, bad);
+        a_.mov(RCX, R(in.c));
+        retain(RCX);
+        a_.mov(RSI, mem(RDX, 0));
+        a_.mov(mem(RDX, 0), RCX);
+        release(RSI);
+    }
     a_.bind(done);
 }
 

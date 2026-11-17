@@ -569,6 +569,22 @@ private:
         fn_->block->code[at].c = std::uint16_t(std::int16_t(offset));
     }
 
+    /// The class's field initialisers run on `self`: a call of the function that holds them, when there is one (an ordinary
+    /// call, which compiled code makes and can inline).
+    void fieldInit(std::uint16_t self)
+    {
+        const std::uint16_t at = fn_->top;
+        const std::uint16_t f = temp();
+        temp();
+        Label none;
+        emit(Op::FieldInit, f);
+        emitJump(Op::JUndefined, f, none);
+        emit(Op::Mov, f + 1u, self);
+        emit(Op::Call, f, f, 0);
+        bind(none);
+        fn_->top = at;
+    }
+
     std::uint32_t emitJump(Op op, std::uint32_t reg, Label& label)
     {
         const std::uint32_t at = pc();
@@ -1133,6 +1149,8 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             }
             if (n.isPrivate && resolve(n.text).kind == Ref::Global)
                 syntaxError(n, "Private field '" + toUtf8(n.text) + "' must be declared in an enclosing class");
+            if (n.isPrivate)
+                fn_->block->flags |= CodeBlock::kPrivate;
             if (fn_->strict && !n.isPrivate)
                 for (const char* word : {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"})
                     if (n.text == fromUtf8(word))
@@ -1879,6 +1897,7 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
                 else
                     emit(Op::LoadUndef, v);
                 emit(Op::DefPrivate, 0, sym, v);
+                fn_->block->flags |= CodeBlock::kPrivate;
             } else if (item->computed) {
                 const std::uint16_t key = temp();
                 loadVar(computedKeyName(*item), key, *item);
@@ -2739,7 +2758,7 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
             emit(Op::InitFieldsOf, calleeFn, self);
             fn_->top = at;
         } else {
-            emit(Op::InitFields);
+            fieldInit(d);
         }
     }
     fn_->top = mark;
@@ -3786,7 +3805,7 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
             emit(Op::NewBox, b.reg);
     }
     if ((block->flags & CodeBlock::kClassConstructor) && !(block->flags & CodeBlock::kDerived))
-        emit(Op::InitFields);
+        fieldInit(0);
     // Parameters: the first registers after `this`.
     std::vector<Binding*> simple;
     for (std::size_t i = 0; i < fixed; ++i) {

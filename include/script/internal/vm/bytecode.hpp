@@ -154,6 +154,16 @@ struct PolyCache
     std::uint8_t n = 0;
     std::uint8_t next = 0;  ///< the entry replaced when all four are taken
 };
+/// What a `base[#name]` site found last: an own data property (writable, at a store site) of objects of one shape in the
+/// tree, under one private name; or, where a field is defined, the shape it moves objects of one shape to. The name is compared, not counted: the shape holds a count of it while it lives, and a
+/// tree shape's id is never given to another.
+struct PrivateCache
+{
+    const void* key = nullptr;
+    std::uint32_t shape = 0;
+    std::uint32_t index = 0;
+    std::uint32_t next = 0;  ///< a definition's (`#x = v` in a class body): the shape after it adds the field at `index`
+};
 /// What a `super.name` read found: the slot of a data property on the chain above `home`, good while `validity` (of
 /// `home`'s chain) is valid. `home` is compared, not counted: a dead home object was a prototype, so its cell is cleared.
 struct SuperCache
@@ -180,6 +190,7 @@ struct CodeBlock
         kGenerator = 128,        ///< a call makes a generator object instead of running
         kNeedsArgs = 16,  ///< the call keeps every argument in an array, in the register after the parameters
         kNoThis = 1024,   ///< never reads `this` (found when the baseline code is made): a call need not make one
+        kPrivate = 2048,  ///< names a private member: its element sites keep a `PrivateCache` each
     };
 
     std::uint32_t refs = 1;
@@ -202,6 +213,7 @@ struct CodeBlock
     Vec<InlineCache> caches;
     Vec<PolyCache> poly;
     Vec<SuperCache> superCaches;
+    Vec<PrivateCache> privCaches;  ///< one per instruction, made with the baseline code of a function that names `#x`
     /// The `uid` of the function the baseline code last called from each `Call` (0 for none): the optimizing compiler's hint
     /// for what to inline. One per instruction once the baseline code is made.
     Vec<std::uint64_t> callProf;

@@ -160,6 +160,36 @@ std::string privateName(JSValue symbol)
     return toUtf8(static_cast<dyn::SymbolCell*>(symbol.asCell())->description);
 }
 
+/// The site's `PrivateCache`, or null when the function has none.
+inline PrivateCache* privateCacheAt(CodeBlock* code, std::uint32_t index) noexcept
+{
+    return index < code->privCaches.size() ? &code->privCaches[index] : nullptr;
+}
+
+/// Remember where `base[symbol]` found an own data property (writable, for a store).
+void learnPrivate(VM& vm, PrivateCache* pc, JSValue base, JSValue symbol, bool store) noexcept
+{
+    if (!pc || !isObject(base))
+        return;
+    JSObject* o = asObject(base);
+    if (o->isDictionary(vm) || proxyOf(o) ||
+        (o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)))
+        return;
+    std::uint8_t attrs = 0;
+    const std::int32_t index = o->shapeOf(vm)->indexOf(symbol.asCell(), &attrs);
+    if (index < 0 || (attrs & attr::kAccessor) || (store && !(attrs & attr::kWritable)))
+        return;
+    *pc = PrivateCache{symbol.asCell(), o->h.shape, std::uint32_t(index)};
+}
+
+/// The slot `pc` names for `base[symbol]`, or null when it does not apply.
+inline JSValue* privateCached(const PrivateCache* pc, JSValue base, JSValue symbol) noexcept
+{
+    if (!pc || pc->key != symbol.asCell() || !isObject(base) || asObject(base)->h.shape != pc->shape)
+        return nullptr;
+    return asObject(base)->slotAt(pc->index);
+}
+
 /// `base.#name`: the property must be the object's own.
 JSValue privateGet(VM& vm, JSValue base, JSValue symbol)
 {
@@ -2196,6 +2226,12 @@ L_InitFields: {
     }
     NEXT();
 }
+L_FieldInit: {
+    // The field initialiser of the class whose constructor this is (undefined for none): the code calls it on `this`.
+    Rare* rr = fn->rare();
+    COPY(ins->a, rr && isFunction(rr->fieldInit) ? rr->fieldInit : JSValue::undefined());
+    NEXT();
+}
 L_GetSuperCtor: {
     JSObject* p = fn->proto(vm);
     if (!p || !isFunction(toJSValue(p)) || !isConstructorFn(static_cast<JSFunction*>(p))) {
@@ -3318,6 +3354,30 @@ int jitPutProp(VM& vm, std::uint32_t index)
     return 1;
 }
 
+int jitDefPrivate(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    JSObject* target = asObject(R[ins->a]);
+    const JSValue key = R[ins->b];
+    if (target->findOwn(vm, key.asCell())) {
+        vm.throwError(ErrorCode::TypeError, "Cannot initialize " + privateName(key) + " twice on the same object");
+        return 0;
+    }
+    const std::uint32_t before = target->h.shape;
+    retain(R[ins->c]);
+    target->putOwn(vm, key.asCell(), R[ins->c], attr::kWritable);
+    // The add, for the compiled code: from a shape in the tree, into a slot in place, of an object nothing inherits from.
+    if (PrivateCache* pc = privateCacheAt(c.code, index); pc && !target->isProto() && !target->isDictionary(vm) && !proxyOf(target)) {
+        Shape* now = target->shapeOf(vm);
+        Shape* was = vm.shapeById(before);
+        if (was && now->parent == was && now->key == key.asCell() && now->attrs == attr::kWritable && was->count < target->h.aux)
+            *pc = PrivateCache{key.asCell(), before, was->count, target->h.shape};
+    }
+    return 1;
+}
+
 int jitInitProp(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, true);
@@ -3486,10 +3546,16 @@ int jitGetElem(VM& vm, std::uint32_t index)
         return 0;
     }
     if (isPrivateKey(k)) {
+        PrivateCache* pc = privateCacheAt(c.code, index);
+        if (JSValue* slot = privateCached(pc, base, k)) {
+            copyReg(R[ins->a], *slot);
+            return 1;
+        }
         const JSValue v = privateGet(vm, base, k);
         if (v.isException())
             return 0;
         setReg(R[ins->a], v);
+        learnPrivate(vm, pc, base, k, false);
         return 1;
     }
     JSValue prim = toPrimitive(vm, k, true);
@@ -3563,7 +3629,18 @@ int jitPutElem(VM& vm, std::uint32_t index)
         return 0;
     }
     if (isPrivateKey(k)) {
-        return privatePut(vm, base, k, R[ins->c]) ? 1 : 0;
+        PrivateCache* pc = privateCacheAt(c.code, index);
+        if (JSValue* slot = privateCached(pc, base, k)) {
+            const JSValue old = *slot;
+            *slot = R[ins->c];
+            retain(*slot);
+            release(old);
+            return 1;
+        }
+        if (!privatePut(vm, base, k, R[ins->c]))
+            return 0;
+        learnPrivate(vm, pc, base, k, true);
+        return 1;
     }
     JSValue prim = toPrimitive(vm, k, true);
     if (prim.isException())

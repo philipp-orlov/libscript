@@ -60,7 +60,7 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
         break;
     case Op::LoadK: case Op::LoadInt: case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse:
     case Op::LoadHole: case Op::LoadUninit: case Op::GetGlobal: case Op::GetGlobalOrUndef: case Op::GetUpval:
-    case Op::LoadCallee: case Op::NewObject: case Op::NewArray: case Op::NewRegExp:
+    case Op::LoadCallee: case Op::NewObject: case Op::NewArray: case Op::NewRegExp: case Op::FieldInit:
         wr(in.a);
         break;
     case Op::CheckInit:
@@ -108,7 +108,7 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
     case Op::PutProp: case Op::InitProp: case Op::InitGetter: case Op::InitSetter:
         rd(in.a); rd(in.c);
         break;
-    case Op::PutElem: case Op::InitElem: case Op::InitGetterElem: case Op::InitSetterElem:
+    case Op::PutElem: case Op::InitElem: case Op::InitGetterElem: case Op::InitSetterElem: case Op::DefPrivate:
         rd(in.a); rd(in.b); rd(in.c);
         break;
     case Op::ArrayPush: case Op::SetProto:

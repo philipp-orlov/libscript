@@ -5068,3 +5068,47 @@ TEST(dictionaryReadsStoresOfManyShapesAndObjectsGivenMoreSlotsKeepTheirMeaning)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("46500 NaN 157 1007 999 346200 299 299 80200 11 222000"));
     }
 }
+
+TEST(privateMembersThroughSiteCachesAndFieldInitialisersCalledAsFunctions)
+{
+    // Private reads, writes and definitions cached by site (one shape, then many; an object without the field; a field
+    // defined twice; a private method written to); field initialisers run as an ordinary call of the class's initialiser,
+    // in base and derived classes, from an arrow that calls super, and one that throws.
+    const char* program =
+        "var out=[];"
+        "class V { #x; #y=2; static #n=0; constructor(x){ this.#x=x; V.#n++; } get x(){return this.#x;} set x(v){this.#x=v;}"
+        "  add(o){ return new V(this.#x+o.#x); } sum(){ return this.#x+this.#y; } static count(){ return V.#n; }"
+        "  #secret(){ return this.#y*10; } reveal(){ return this.#secret(); } has(o){ return #x in o; } }"
+        "var s=0; for(var i=0;i<3000;i++){ var a=new V(i), b=new V(1); s+=a.add(b).sum(); a.x=a.x+1; s+=a.x; }"
+        "out.push(s, V.count(), new V(3).reveal(), new V(1).has({}), new V(1).has(new V(2)));"
+        "function rd(o){ return o.sum(); }"
+        "try { rd.call(null, Object.create(V.prototype)); } catch(e){ out.push(e.constructor.name); }"
+        "class Base { constructor(o){ return o; } }"
+        "class Stamp extends Base { #tag='t'; static tag(o){ return o.#tag; } }"
+        "var obj={}; new Stamp(obj); out.push(Stamp.tag(obj));"
+        "try { new Stamp(obj); } catch(e){ out.push(e.constructor.name); }"
+        "class M { #m(){} tryWrite(){ try { this.#m = 1; return 'no'; } catch(e){ return e.constructor.name; } } }"
+        "out.push(new M().tryWrite());"
+        "class P { a=1; b=this.a+1; constructor(){ this.c=this.b+1; } }"
+        "class Q extends P { #d=this.c+1; e=this.#d+1; constructor(){ var f=()=>super(); f(); } get d(){return this.#d;} }"
+        "var t=0; for(var i=0;i<2000;i++){ var q=new Q(); t+=q.a+q.b+q.c+q.d+q.e; } out.push(t);"
+        "class R { x=(()=>{ throw new RangeError('no'); })(); }"
+        "try { new R(); } catch(e){ out.push(e.constructor.name); }"
+        "class F extends Base { #f=5; static get(o){ return o.#f; } }"
+        "var fr=Object.freeze({}); new F(fr); out.push(F.get(fr));"
+        "var many=[]; for(var i=0;i<20;i++){ var o={}; o['p'+i]=i; new F(o); many.push(o); }"
+        "var u=0; for(var k=0;k<200;k++) for(var i=0;i<20;i++) u+=F.get(many[i]); out.push(u);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("9009000 9000 20 false true TypeError t TypeError TypeError 30000 RangeError 5 20000"));
+    }
+}

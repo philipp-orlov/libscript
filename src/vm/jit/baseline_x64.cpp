@@ -2196,12 +2196,18 @@ private:
                 a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
                 continue;
             }
-            Label skip;
+            // A cell there (a dead temporary of the caller) is let go of here unless this is its last count, which the long
+            // way frees.
+            Label skip, plain;
             a_.aluI32(7, RSI, std::int32_t(r));
             a_.jcc(CBE, skip);
             a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
             a_.test(RDI, R15);
-            a_.jcc(CE, helper);
+            a_.jcc(CNE, plain);
+            a_.cmpI32(mem(RDI, kHdrRc), 1);
+            a_.jcc(CBE, helper);
+            a_.dec32(mem(RDI, kHdrRc));
+            a_.bind(plain);
             a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
             a_.bind(skip);
         }

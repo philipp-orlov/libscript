@@ -4542,6 +4542,37 @@ TEST(int32VariablesTakeDoublesThatHoldInt32s)
     }
 }
 
+TEST(callsOverDeadTemporariesKeepCounts)
+{
+    // A call's frame sits on the caller's registers above its arguments; dead temporaries there that hold objects are let
+    // go of by compiled code (or the long way, for a last count). Nothing leaks and nothing is freed early, in every tier.
+    const char* program =
+        "function P(v) { this.v = v; } P.prototype.get = function () { return this.v; };"
+        "P.prototype.add = function (o) { return new P(this.v + o.get()); };"
+        "function id(x) { return x; }"
+        "function round(n) { var s = 0, acc = new P(0); for (var i = 0; i < n; i++) {"
+        "  var a = new P(i), b = { w: a }, c = [b, a];"
+        "  acc = acc.add(id(c[1])); s += b.w.get() + id(a).get(); } return s + acc.get(); }";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        ctx.eval(program, "<test>");
+        CHECK_EQ(ctx.eval("round(5000)").toString(), std::string("37492500"));
+        ctx.collectGarbage();
+        const auto before = ctx.stats().liveObjects;
+        for (int k = 0; k < 5; ++k)
+            CHECK_EQ(ctx.eval("round(5000)").toString(), std::string("37492500"));
+        ctx.collectGarbage();
+        CHECK(ctx.stats().liveObjects <= before + 16);
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

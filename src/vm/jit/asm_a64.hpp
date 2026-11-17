@@ -125,8 +125,10 @@ private:
     /// alone (the move cleared the upper half).
     void fold(int rd, int* rn, int* rm, bool wide, bool fp = false)
     {
-        if (movedAt_ != buf.size() || movedFp_ != fp || movedTo_ != rd || *rn != rd || (wide && !movedWide_) ||
-            movedFrom_ == rd)
+        if (movedAt_ != buf.size() || movedFp_ != fp || movedTo_ != rd || *rn != rd || movedFrom_ == rd)
+            return;
+        // A 32-bit move cleared the upper half: a 64-bit reader may take the source only if its upper half is clear too.
+        if (wide && !movedWide_ && !(zext_ >> movedFrom_ & 1))
             return;
         buf.resize(buf.size() - 4);
         *rn = movedFrom_;
@@ -144,8 +146,46 @@ private:
     }
     static int V(int x) noexcept { return x < 8 ? x : x + 8; }
 
+    /// The registers whose upper half is known to be zero: written last by a 32-bit operation, with no label and no
+    /// call since. A 64-bit use of one reads what its 32 bits say.
+    mutable std::uint32_t zext_ = 0;
+    /// Keeps `zext_` through instruction `v`. Whatever is not known to leave a register zero-extended takes it off.
+    void track(std::uint32_t v) noexcept
+    {
+        if ((v & 0xFC000000u) == 0x94000000u || (v & 0xFFFFFC1Fu) == 0xD63F0000u) {  // bl, blr
+            zext_ = 0;
+            return;
+        }
+        const std::uint32_t rd = v & 31, rn = (v >> 5) & 31;
+        const bool dpImm = ((v >> 26) & 7) == 4 && ((v >> 24) & 3) != 0;  // not adr/adrp
+        const bool dpReg = ((v >> 25) & 7) == 5;
+        const bool condCompare = (v & 0x1FE00000u) == 0x1A400000u;  // its low bits are flags, not a register
+        if ((dpImm || dpReg) && !condCompare) {
+            if (v >> 31)
+                zext_ &= ~(1u << rd);
+            else
+                zext_ |= 1u << rd;
+        } else if (((v >> 27) & 7) == 7 && ((v >> 25) & 1) == 0) {  // load or store of one register
+            const std::uint32_t opc = (v >> 22) & 3, size = v >> 30;
+            const bool fp = (v >> 26) & 1;
+            if (((v >> 24) & 1) == 0)
+                zext_ &= ~(1u << rn);  // perhaps written back
+            if (!fp && opc != 0) {
+                if ((size < 3 && opc == 1) || (size < 2 && opc == 3))
+                    zext_ |= 1u << rd;
+                else
+                    zext_ &= ~(1u << rd);
+            }
+        } else if (((v >> 27) & 7) == 5 && ((v >> 25) & 1) == 0) {  // a pair
+            zext_ &= ~((1u << rd) | (1u << rn) | (1u << ((v >> 10) & 31)));
+        } else {
+            zext_ &= ~(1u << rd);
+        }
+        zext_ &= 0x7FFFFFFFu;  // 31 is the zero register or sp
+    }
     void ins(std::uint32_t v)
     {
+        track(v);
         const std::size_t at = buf.size();
         buf.resize(at + 4);
         std::memcpy(&buf[at], &v, 4);
@@ -514,6 +554,7 @@ public:
     std::int32_t here() const noexcept
     {
         movedAt_ = ~std::size_t(0);
+        zext_ = 0;  // the position may be entered from elsewhere
         return std::int32_t(buf.size());
     }
 

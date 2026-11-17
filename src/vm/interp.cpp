@@ -1592,7 +1592,9 @@ L_PutProp: {
                 NEXT();
             }
             // A store that adds the property, where the prototypes still have nothing to say about it.
-            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
+            // The new property's slot must be among the object's inline ones: objects of one shape can have fewer.
+            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible)) &&
+                ic.index < o->h.aux) {
                 JSValue* slot = &o->inl()[ic.index];
                 *slot = R[ins->c];
                 retain(*slot);
@@ -1846,8 +1848,8 @@ L_InitProp: {
     InlineCache scratch;
     const std::uint16_t cacheId = pc->a;
     InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
-    if (o->h.shape == ic.shape) [[likely]] {
-        // The literal's next property: the shape it had and the shape it gets.
+    if (o->h.shape == ic.shape && ic.index < o->h.aux) [[likely]] {
+        // The literal's next property: the shape it had and the shape it gets (in a slot the object has in place).
         JSValue* slot = &o->inl()[ic.index];
         *slot = R[ins->c];
         retain(*slot);
@@ -3197,7 +3199,9 @@ int jitPutProp(VM& vm, std::uint32_t index)
                 release(old);
                 return 1;
             }
-            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
+            // The new property's slot must be among the object's inline ones: objects of one shape can have fewer.
+            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible)) &&
+                ic.index < o->h.aux) {
                 JSValue* slot = &o->inl()[ic.index];
                 *slot = R[ins->c];
                 retain(*slot);
@@ -3232,7 +3236,7 @@ int jitInitProp(VM& vm, std::uint32_t index)
     JSObject* o = asObject(R[ins->a]);
     InlineCache scratch;
     InlineCache& ic = *c.ic(scratch);
-    if (o->h.shape == ic.shape) {
+    if (o->h.shape == ic.shape && ic.index < o->h.aux) {
         JSValue* slot = &o->inl()[ic.index];
         *slot = R[ins->c];
         retain(*slot);

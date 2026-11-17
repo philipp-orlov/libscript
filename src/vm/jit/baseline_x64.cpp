@@ -3541,6 +3541,9 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
     }
     a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto | cellflags::kNotExtensible));
     a_.jcc(CNE, bad);
+    // The slot in place: objects of one shape can have fewer inline slots than the one the cache learned from.
+    a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic->index));
+    a_.jcc(CBE, bad);
     a_.mov(RCX, R(in.c));
     retain(RCX);
     a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic->index)), RCX);
@@ -3772,6 +3775,8 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
     a_.mov(RAX, R(in.a));
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
     a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic->index));
+    a_.jcc(CBE, bad);
     a_.mov(RCX, R(in.c));
     retain(RCX);
     a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic->index)), RCX);

@@ -4605,6 +4605,37 @@ TEST(strictEqualityOfCellsAndDoublesInCompiledCode)
     }
 }
 
+TEST(anAddedPropertyGoesInPlaceOnlyWhereTheObjectHasRoom)
+{
+    // Objects of one shape can have different numbers of inline slots: `new G` (a constructor that stores four or more
+    // properties on `this`) has eight, Object.create three. A store site that learned to add a property in place on
+    // one must not write past the end of the other: it takes the long way there, in every tier.
+    const char* program =
+        "function G() { this.a = 1; this.b = 2; this.c = 3; this.d = 4; } "
+        "function abcd(o) { o.a = 1; o.b = 2; o.c = 3; o.d = 4; return o; } "
+        "function grow(o, n) { o.e = n; o.f = n + 1; o.g = n + 2; return o; } "
+        "var out = [], s = 0, keep = []; "
+        "for (var i = 0; i < 3000; i++) { "
+        "  var y = grow(new G(), i), x = grow(abcd(Object.create(G.prototype)), i); "
+        "  s += x.e + x.f + x.g + y.g + x.a + x.d; "
+        "  if (i % 100 === 0) keep.push(x, y, { pad: i, q: [i] }); "
+        "} "
+        "var t = 0; for (var i = 0; i < keep.length; i++) t += (keep[i].g | 0) + (keep[i].pad | 0) + (keep[i].q ? keep[i].q[0] : 0); "
+        "out.push(s, t, JSON.stringify(keep[0]), Object.keys(keep[1]).join('')); "
+        "out.join(' ');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("18024000 174120 {\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":0,\"f\":1,\"g\":2} abcdefg"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

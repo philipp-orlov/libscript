@@ -3870,7 +3870,11 @@ void Baseline::call(std::uint32_t i, const Ins& in)
 void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::vector<std::uint64_t>* dirty)
 {
     // Registers no path to here has written are undefined still: nothing to clear.
-    auto needs = [&](unsigned r) { return !dirty || (r / 64 < dirty->size() && ((*dirty)[r / 64] >> (r % 64) & 1)); };
+    // (The arguments object is put in its register by the call, not by an instruction.)
+    const unsigned argsReg = (code_->flags & CodeBlock::kNeedsArgs) ? 1u + code_->nparams : ~0u;
+    auto needs = [&](unsigned r) {
+        return !dirty || r == argsReg || (r / 64 < dirty->size() && ((*dirty)[r / 64] >> (r % 64) & 1));
+    };
     // `numberInRax`: the result is a number the optimized code has boxed in rax already, which needs no count.
     const unsigned first = 1 + code_->nparams;
     // A result in a register this frame clears on its way out goes with that register's count (optimized code).

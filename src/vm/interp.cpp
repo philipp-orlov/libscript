@@ -3532,8 +3532,10 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     if (!construct && c->tier1 &&
         !(c->flags & (CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
                       CodeBlock::kNeedsArgs))) {
-        // A compiled ordinary function, the usual callback: `this` and the arguments it has parameters for go in, the rest
-        // of the window being undefined already.
+        // A compiled ordinary function, the usual callback: `this` and the arguments it has parameters for go in. The rest
+        // of its registers are undefined unless the frame sits on dead temporaries of a frame below (a native called
+        // from a function whose own frame began inside its caller's): those are let go of, as a call between two
+        // script functions does.
         JSValue* R = stackTop;
         if (frameTop < frameLimit && R + c->nregs + 8 <= stackEnd) {
             if (R + c->nregs + 1 > stackInit) [[unlikely]]
@@ -3548,6 +3550,12 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
                 retain(args[i]);
                 R[1 + i] = args[i];
             }
+            for (std::uint32_t i = 1 + n; i < c->nregs; ++i)
+                if (!R[i].isUndefined()) [[unlikely]] {
+                    const JSValue v = R[i];
+                    R[i] = JSValue::undefined();
+                    release(v);
+                }
             *frameTop++ = Frame{c, f, nullptr, R, 0, 0, n, false, true, JSValue::undefined()};
             const JSValue result = enterTier1(*this, c->tier1, 0);
             stackTop = R;
@@ -3576,13 +3584,15 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
     JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArguments(*this, R + 1, argc) : nullptr;
-    // Above `this` and the arguments the stack holds undefined (a frame lets go of its registers when it ends); an argument
-    // past the parameters is the one thing in the window that is not a register of the callee.
-    for (std::uint32_t i = keep, end = std::min<std::uint32_t>(c->nregs, 1 + argc); i < end; ++i) {
-        const JSValue v = R[i];
-        R[i] = JSValue::undefined();
-        release(v);
-    }
+    // The callee's registers above its parameters start undefined. What can be there instead: an argument past the
+    // parameters, and dead temporaries of a frame below when this one sits on them (a native called from a function
+    // whose own frame began inside its caller's).
+    for (std::uint32_t i = keep; i < c->nregs; ++i)
+        if (!R[i].isUndefined()) {
+            const JSValue v = R[i];
+            R[i] = JSValue::undefined();
+            release(v);
+        }
     if (argsArray)
         setReg(R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;

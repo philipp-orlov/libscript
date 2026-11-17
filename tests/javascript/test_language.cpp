@@ -4229,6 +4229,35 @@ TEST(aMathCallRunAgainAfterItsResultChangedKindHasItsArgument)
     }
 }
 
+TEST(aFrameEnteredFromANativeStartsWithUndefinedRegisters)
+{
+    // `f.call(undefined)` from a function whose frame began inside its caller's: the frame of `f` sits where that caller
+    // had temporaries (an object literal's values). Its parameters given no argument are undefined all the same, in
+    // optimized code too, which reads them without a look; and its arguments object is let go of when it returns.
+    const char* program =
+        "var out = [];"
+        "function run(a, b) {"
+        "  var v5 = [1, String([({x: 1, y: b}), a, ({x: ({x: a, y: 1}), y: ({x: b, y: b})})].reduce(function (p, x, i) { return p + b; }, b)), 3];"
+        "  var v6 = function (a, b) { return String(a) + String(b) + arguments.length; }, v8 = 0;"
+        "  var cv6 = function () { return v6.call(undefined); };"
+        "  for (var v7 = 0; v7 < 300; v7++) v8 = String(cv6());"
+        "  out.push(v8); v6 = {}; try { out.push(String(cv6())); } catch (e) { out.push(e.name); }"
+        "}"
+        "for (var i = 0; i < 40; i++) run(i, i * 2);"
+        "out.filter(function (x) { return x !== 'undefinedundefined0' && x !== 'TypeError'; }).length + ':' + out.length";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("0:80"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

@@ -2418,7 +2418,7 @@ OpPairTable& opPairCounts()
     static OpPairTable table = {};
     return table;
 }
-bool opPairs()
+[[maybe_unused]] bool opPairs()
 {
     static const bool on = [] {
         if (!std::getenv("SCRIPT_OP_PAIRS"))

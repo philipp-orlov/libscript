@@ -1778,8 +1778,8 @@ bool compileNative(Runtime& rt, const FunctionCode& code)
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* skip = std::getenv("SCRIPT_JIT_SKIP"); skip && (std::string(",") + skip + ",").find("," + code.name + ",") != std::string::npos) {
         code.jitRefused = true;
-        const std::string why = "SCRIPT_JIT_SKIP";
-        censusCompileOutcome(code, &why);
+        const std::string skipped = "SCRIPT_JIT_SKIP";
+        censusCompileOutcome(code, &skipped);
         return false;
     }
     const auto started = std::chrono::steady_clock::now();

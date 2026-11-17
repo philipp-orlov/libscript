@@ -296,6 +296,23 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
 
 Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code);
 
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+/// SCRIPT_VM_PERFMAP=1: name the code for `perf report` in /tmp/perf-<pid>.map (`tier` is js for the baseline code,
+/// js2 for the optimized code).
+void perfMapNote(const void* rx, std::size_t bytes, const CodeBlock* code, const char* tier)
+{
+    static std::FILE* map = std::getenv("SCRIPT_VM_PERFMAP")
+                                ? std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "w")
+                                : nullptr;
+    if (!map)
+        return;
+    std::fprintf(map, "%llx %zx %s:%s:%u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(rx)), bytes,
+                 tier, code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
+                 code->lines.empty() ? 0u : code->lines[0]);
+    std::fflush(map);
+}
+#endif
+
 /// The baseline code's counter ran out at the function's entry (`header` is ~0u) or a loop's back edge: compile the
 /// optimizing tier if it is not there, and return the way into it from the loop, if there is one.
 extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
@@ -586,6 +603,7 @@ constexpr std::int32_t kFrameArgc = std::int32_t(offsetof(Frame, argc));
 constexpr std::int32_t kFrameConstruct = std::int32_t(offsetof(Frame, construct));
 static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "a frame push writes both flags in one store");
 constexpr std::int32_t kVmTicks = std::int32_t(offsetof(VM, ticks));
+constexpr std::int32_t kVmInterruptSet = std::int32_t(offsetof(VM, interruptSet));
 constexpr std::int32_t kVmFrameTop = std::int32_t(offsetof(VM, frameTop));
 constexpr std::int32_t kVmFrameLimit = std::int32_t(offsetof(VM, frameLimit));
 constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, elems));
@@ -2108,12 +2126,13 @@ private:
         if (optimizing()) {
             // The optimizing code may not leave for the interpreter here (its variables are in registers): a stub makes the
             // call that looks at the flag, sets the count again and comes back.
+            // Only while the host has an interrupt handler is there anything to count down to: one word says whether
+            // it has, and the stub counts.
             tickStubs_.emplace_back(i, Label{});
             Label& stub = tickStubs_.back().second;
-            a_.mov32(RDX, mem(R12, kVmTicks));
-            a_.aluI32(5, RDX, 1);
-            a_.jcc(CE, stub);
-            a_.mov32(mem(R12, kVmTicks), RDX);
+            a_.mov(RDX, mem(R12, kVmInterruptSet));
+            a_.cmpI32(mem(RDX, 0), 0);
+            a_.jcc(CNE, stub);
             tickBack_.emplace_back(Label{});
             a_.bind(tickBack_.back());
             return;
@@ -4161,10 +4180,6 @@ void compileTier1(VM& vm, CodeBlock* code)
     code->tier2Counter = vm.tier2Threshold > 0 ? vm.tier2Threshold : 0x40000000;
     SCRIPT_VM_CENSUS(Tier1Compiled);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
-    // SCRIPT_VM_PERFMAP=1: name the code for `perf report` in /tmp/perf-<pid>.map.
-    static std::FILE* map = std::getenv("SCRIPT_VM_PERFMAP")
-                                ? std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "w")
-                                : nullptr;
     if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
         // Raw code for `objdump -D -b binary -mi386:x86-64 --adjust-vma=<rx>`.
         static int serial = 0;
@@ -4175,12 +4190,7 @@ void compileTier1(VM& vm, CodeBlock* code)
             std::fclose(f);
         }
     }
-    if (map) {
-        std::fprintf(map, "%llx %zx js:%s:%u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(t->rx)),
-                     t->bytes, code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
-                     code->lines.empty() ? 0u : code->lines[0]);
-        std::fflush(map);
-    }
+    perfMapNote(t->rx, t->bytes, code, "js");
 #endif
 }
 

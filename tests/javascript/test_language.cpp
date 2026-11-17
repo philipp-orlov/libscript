@@ -312,6 +312,38 @@ TEST(interruptHandlerStopsRunawayLoops)
     CHECK(caught);
 }
 
+TEST(anInterruptHandlerSetAfterALoopWasCompiledStopsIt)
+{
+    // Optimized loops look at whether a handler is set, not at a count, while there is none: one set afterwards (or
+    // taken away and set again) must still stop the same code, in every tier.
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        ctx.eval("function spin(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + i) | 0; return s; }"
+                 "for (var k = 0; k < 50; k++) spin(100000);");
+        for (int round = 0; round < 2; ++round) {
+            int asked = 0;
+            ctx.setInterruptHandler([&asked] { return ++asked > 3; });
+            bool caught = false;
+            try {
+                ctx.eval("spin(1e15)");
+            } catch (const js::Exception&) {
+                caught = true;
+            }
+            CHECK(caught);
+            CHECK(asked > 3);
+            ctx.setInterruptHandler(nullptr);
+            CHECK_EQ(ctx.eval("spin(1000)").toString(), std::string("499500"));
+        }
+    }
+}
+
 TEST(evalKeepsGlobalStateBetweenCalls)
 {
     js::Context ctx;

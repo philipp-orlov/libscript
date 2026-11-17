@@ -249,6 +249,9 @@ struct ContextImpl
     EngineKind lastEngine = EngineKind::None;
 
     std::function<bool()> interrupt;
+    /// Nonzero while `interrupt` is set: what optimized loops look at on every back edge (a load, where counting down to
+    /// the next look at the handler would be a load and a store each time round).
+    std::uint32_t interruptSet = 0;
     /// Whether the handler says to stop. So does its having come into the context for anything but a look: running code has
     /// what it knows about its objects in registers, and cannot go on from a change made under it.
     bool interruptAsked()

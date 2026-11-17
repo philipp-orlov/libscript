@@ -1813,6 +1813,16 @@ void Baseline::emitOptTails()
     for (std::size_t k = 0; k < tickStubs_.size(); ++k) {
         auto& t = tickStubs_[k];
         a_.bind(t.second);
+        {
+            // An interrupt handler is set: count down to the next look at it.
+            Label due;
+            a_.mov32(RDX, mem(R12, kVmTicks));
+            a_.aluI32(5, RDX, 1);
+            a_.jcc(CE, due);
+            a_.mov32(mem(R12, kVmTicks), RDX);
+            a_.jmp(tickBack_[k]);
+            a_.bind(due);
+        }
         writeBack(promosAt(t.first));  // what the interrupt may see; the loop's way in loads it again
         savePool(t.first);
         a_.mov(RDI, R12);
@@ -2358,6 +2368,9 @@ Tier2Code* Baseline::compileOptimized()
     t->held = std::move(held_);
     t->borrow = borrowInfo_;
     borrowInfo_ = nullptr;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    perfMapNote(t->rx, t->bytes, code_, "js2");
+#endif
     return t;
 }
 

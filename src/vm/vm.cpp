@@ -30,6 +30,7 @@ mem::LocalHeap::Options heapOptionsFor(VM* owner)
 
 VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
 {
+    interruptSet = &ctx.interruptSet;
     for (JSValue& v : smallStrings)
         v = JSValue::undefined();
     // 2^20 ids, eight bytes each, reserved once so that the table never moves.

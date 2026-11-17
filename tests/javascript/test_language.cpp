@@ -4479,6 +4479,38 @@ TEST(instanceofWithoutALookForHasInstance)
     }
 }
 
+TEST(holeReadsOfPlainArraysAreUndefined)
+{
+    // A read of a hole, or past the end, of an array with no properties of its own and the usual prototypes, which have
+    // no elements, is undefined without a look; elements put on Array.prototype or Object.prototype, an accessor at an
+    // index, a named property, a subclass and another prototype are still seen, in every tier.
+    const char* program =
+        "var out = []; "
+        "function rd(a, n) { var s = ''; for (var r = 0; r < n; r++) { s = ''; for (var i = 0; i < 6; i++) s += String(a[i]) + '|'; } return s; } "
+        "var a = new Array(5); a[1] = 1; a[3] = null; "
+        "out.push(rd(a, 3000)); "
+        "var b = [0, 1, 2, 3]; delete b[2]; out.push(rd(b, 3000)); "
+        "var c = new Array(4); c.foo = 1; out.push(rd(c, 3000)); "
+        "var d = new Array(4); Object.defineProperty(d, 2, { get: function () { return 'got'; }, configurable: true }); out.push(rd(d, 3000)); "
+        "class MyArr extends Array {} var e = new MyArr(4); out.push(rd(e, 3000)); "
+        "Array.prototype[2] = 'ap'; out.push(rd(a, 3000), rd(b, 10)); "
+        "delete Array.prototype[2]; Object.prototype[4] = 'op'; out.push(rd(a, 3000)); "
+        "delete Object.prototype[4]; out.push(rd(a, 3000)); "
+        "var f = new Array(3); Object.setPrototypeOf(f, { 1: 'own proto' }); out.push(rd(f, 3000)); "
+        "out.join(' ');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("undefined|1|undefined|null|undefined|undefined| 0|1|undefined|3|undefined|undefined| undefined|undefined|undefined|undefined|undefined|undefined| undefined|undefined|got|undefined|undefined|undefined| undefined|undefined|undefined|undefined|undefined|undefined| undefined|1|ap|null|undefined|undefined| 0|1|ap|3|undefined|undefined| undefined|1|undefined|null|op|undefined| undefined|1|undefined|null|undefined|undefined| undefined|own proto|undefined|undefined|undefined|undefined|"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

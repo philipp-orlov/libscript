@@ -938,13 +938,16 @@ bool Baseline::emitTyped(std::uint32_t i)
                 a_.jmp(done);
                 a_.bind(notPacked);
             }
+            // A read of a hole, or past the end, of a plain array: undefined, where its register is no typed variable.
+            const bool holeReads = !put && plan_->defWeb[i] < 0 && !borrowed(i, in.a);
+            Label holeRead;
             a_.alu32(7, RCX, mem(RAX, kArrayLength));
-            a_.jcc(CAE, bad);
+            a_.jcc(CAE, holeReads ? holeRead : bad);
             a_.mov(RDX, mem(RAX, kArrayElems));
             if (!put) {
                 a_.mov(RAX, mem(RDX, RCX, 8));
                 a_.cmpI(RAX, std::int32_t(kHole));
-                a_.jcc(CE, bad);
+                a_.jcc(CE, holeReads ? holeRead : bad);
                 if (auto pg = promoGuards_.find(i); pg != promoGuards_.end()) {
                     std::set<unsigned> seen;
                     for (std::size_t k : pg->second) {
@@ -961,6 +964,19 @@ bool Baseline::emitTyped(std::uint32_t i)
                     return true;
                 }
                 deliver(i, in.a);
+                if (holeReads) {
+                    Label got;
+                    a_.jmp(got);
+                    a_.bind(holeRead);
+                    a_.mov(RAX, R(in.b));
+                    if (plainHoleGuard(RDX, bad)) {
+                        a_.movImm(RAX, kUndefined);
+                        deliver(i, in.a);
+                    } else {
+                        a_.jmp(bad);
+                    }
+                    a_.bind(got);
+                }
                 return true;
             }
             a_.lea(RDX, mem(RDX, RCX, 8));

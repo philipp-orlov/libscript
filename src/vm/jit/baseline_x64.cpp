@@ -3542,15 +3542,26 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
     a_.jcc(CNE, typed);
     a_.mov32(RCX, RCX);
+    Label holeRead;
     a_.alu32(7, RCX, mem(RAX, kArrayLength));
-    a_.jcc(CAE, bad);
+    a_.jcc(CAE, holeRead);
     a_.mov(RDX, mem(RAX, kArrayElems));
     a_.mov(RAX, mem(RDX, RCX, 8));
     a_.cmpI(RAX, std::int32_t(kHole));
-    a_.jcc(CE, bad);
+    a_.jcc(CE, holeRead);
     noteElem(i, elemprof::kArray, RDX);
     deliver(i, in.a);
     a_.jmp(done);
+    // A hole, or past the end, of a plain array whose prototypes have no elements: undefined.
+    a_.bind(holeRead);
+    a_.mov(RAX, R(in.b));
+    if (plainHoleGuard(RDX, bad)) {
+        a_.movImm(RAX, kUndefined);
+        deliver(i, in.a);
+        a_.jmp(done);
+    } else {
+        a_.jmp(bad);
+    }
 
     a_.bind(typed);
     a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));

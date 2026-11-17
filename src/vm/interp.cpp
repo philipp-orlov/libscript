@@ -287,6 +287,13 @@ JSValue forInKeys(VM& vm, JSValue value)
 
 /// Whether `o` may hand out the position of a property: in the shape tree, and not a function whose properties are not
 /// made yet.
+/// Whether a read of a hole of `a`, or past its end, is undefined without a look anywhere: a plain array (no properties
+/// of its own, which an index given attributes would be) whose prototypes are the usual ones, with no elements.
+inline bool plainHoleRead(VM& vm, JSArray* a)
+{
+    return a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 && vm.plainHoleStores();
+}
+
 inline bool cacheable(VM& vm, JSObject* o) noexcept
 {
     return !o->isDictionary(vm) && !(o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)) &&
@@ -1671,6 +1678,10 @@ L_GetElem: {
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < a->length && !a->elems[i].isHole()) {
                 COPYP(ins->a, a->elems[i]);
+                NEXT();
+            }
+            if (plainHoleRead(vm, a)) {
+                SET(ins->a, JSValue::undefined());
                 NEXT();
             }
         } else if (isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
@@ -3353,6 +3364,10 @@ int jitGetElem(VM& vm, std::uint32_t index)
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < a->length && !a->elems[i].isHole()) {
                 copyReg(R[ins->a], a->elems[i]);
+                return 1;
+            }
+            if (plainHoleRead(vm, a)) {
+                setReg(R[ins->a], JSValue::undefined());
                 return 1;
             }
         } else if (isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {

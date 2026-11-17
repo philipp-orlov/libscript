@@ -4439,6 +4439,46 @@ TEST(newOfClassesAndFunctionsInCompiledCode)
     }
 }
 
+TEST(instanceofWithoutALookForHasInstance)
+{
+    // `instanceof` skips the look for `Symbol.hasInstance` while no object has had one and no proxy is on the right
+    // side's chain; one defined later (a static method, defineProperty), a proxy's trap, a bound function, a primitive
+    // and a non-object `prototype` still behave, in every tier.
+    const char* program =
+        "var out = []; "
+        "class A {} class B extends A {} function F() {} var bound = F.bind(null); "
+        "var pf = new Proxy(function () {}, { get: function (t, k) { return k === Symbol.hasInstance ? function () { return true; } : t[k]; } }); "
+        "function chk(n) { "
+        "  var s = ''; "
+        "  for (var i = 0; i < n; i++) { "
+        "    var b = new B(), f = new F(); "
+        "    s = '' + (b instanceof A) + (b instanceof B) + (f instanceof A) + (f instanceof F) + (f instanceof bound) + (1 instanceof F) + "
+        "        (null instanceof Object) + ([] instanceof Array) + ({} instanceof pf) + (b instanceof Object); "
+        "  } "
+        "  return s; "
+        "} "
+        "out.push(chk(3000)); "
+        "function G() {} G.prototype = 3; "
+        "try { ({}) instanceof G; out.push('no'); } catch (e) { out.push(e.name); } "
+        "try { ({}) instanceof {}; out.push('no'); } catch (e) { out.push(e.name); } "
+        "class Even { static [Symbol.hasInstance](x) { return x % 2 === 0; } } "
+        "out.push(chk(3000), 2 instanceof Even, 3 instanceof Even); "
+        "Object.defineProperty(A, Symbol.hasInstance, { value: function () { return false; } }); "
+        "out.push(chk(10)); "
+        "out.join(',');";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("truetruefalsetruetruefalsefalsetruetruetrue,TypeError,TypeError,truetruefalsetruetruefalsefalsetruetruetrue,true,false,falsefalsefalsetruetruefalsefalsetruetruetrue"));
+    }
+}
+
 TEST(numbersPackedAtTheStartOfAnArrayStayKnown)
 {
     // An array knows how many of its first elements are numbers (`JSArray::packed`), and compiled code stores a number

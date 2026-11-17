@@ -410,6 +410,8 @@ void JSObject::addProperty(VM& vm, Key key, JSValue value, std::uint8_t attrs)
     Shape* s = shapeOf(vm);
     if (s->isDictionary()) {
         Dictionary& d = *rare()->dict;
+        if (key == vm.atoms.symHasInstance)
+            vm.hasInstanceSeen = true;
         const std::uint32_t index = std::uint32_t(d.entries.size());
         reserveSlot(vm, index);
         d.add(key, attrs);

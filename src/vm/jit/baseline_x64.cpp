@@ -2500,6 +2500,10 @@ void Baseline::emit(std::uint32_t i)
     case Op::TypeOf:
         typeOf(i, in);
         return;
+    case Op::InstanceOf:
+        // Straight to the runtime: no stepping through the interpreter.
+        helperOp(i, &helperThunk<jitInstanceOf>);
+        return;
     case Op::InitFields: {
         // A class whose constructor this is with no field initialiser (a `Rare` whose `fieldInit` is no function):
         // nothing to do. One with fields runs them in the interpreter.

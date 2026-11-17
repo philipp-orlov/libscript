@@ -823,6 +823,14 @@ int instanceOf(VM& vm, JSValue a, JSValue b)
         vm.throwError(ErrorCode::TypeError, "Right-hand side of 'instanceof' is not an object");
         return -1;
     }
+    if (!vm.hasInstanceSeen && isFunction(b)) {
+        // No object has a `Symbol.hasInstance`, so the lookup finds none unless a proxy's trap makes one up.
+        bool proxied = false;
+        for (JSObject* o = asObject(b); o && !proxied; o = o->proto(vm))
+            proxied = proxyOf(o) != nullptr;
+        if (!proxied)
+            return ordinaryHasInstance(vm, b, a);
+    }
     JSValue handler = getProperty(vm, b, vm.atoms.symHasInstance);
     if (handler.isException())
         return -1;

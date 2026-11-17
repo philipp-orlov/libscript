@@ -119,6 +119,7 @@ int jitNewArray(VM& vm, std::uint32_t index);
 int jitArrayPush(VM& vm, std::uint32_t index);
 int jitBinary(VM& vm, std::uint32_t index);
 int jitBinaryImm(VM& vm, std::uint32_t index);
+int jitInstanceOf(VM& vm, std::uint32_t index);
 int jitGetElem(VM& vm, std::uint32_t index);
 int jitGetSuperProp(VM& vm, std::uint32_t index);
 int jitPutElem(VM& vm, std::uint32_t index);

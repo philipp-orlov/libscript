@@ -128,6 +128,8 @@ Shape* Shape::after(VM& vm, Key k, std::uint8_t a)
     n->key = k;
     n->attrs = a;
     n->keyBits = keyBits | keyBit(k);
+    if (k == vm.atoms.symHasInstance)
+        vm.hasInstanceSeen = true;
     if ((count == 2 && k == vm.atoms.prototype && !(a & attr::kAccessor)) || (count > 2 && (flags & kProtoAt2)))
         n->flags |= kProtoAt2;
     detail::incRef(k);

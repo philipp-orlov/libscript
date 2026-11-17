@@ -310,6 +310,8 @@ struct VM : EngineRuntime
     /// The strings `typeof` answers with, made on first use and held for the VM's life: undefined, object, boolean,
     /// number, string, symbol, bigint, function.
     JSValue typeofNames[8] = {};
+    /// Set once any object has had a `Symbol.hasInstance` property: until then `instanceof` needs no look for one.
+    bool hasInstanceSeen = false;
     JSValue typeofName(unsigned which);
     /// The property names of the first thousand non-negative integers, made when first asked for; each holds a count.
     static constexpr std::size_t kSmallIndexKeys = 1024;

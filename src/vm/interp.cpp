@@ -3306,6 +3306,16 @@ int jitBinary(VM& vm, std::uint32_t index)
     return 1;
 }
 
+int jitInstanceOf(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const int r = instanceOf(vm, c.R[c.ins->b], c.R[c.ins->c]);
+    if (r < 0)
+        return 0;
+    setReg(c.R[c.ins->a], JSValue::boolean(r != 0));
+    return 1;
+}
+
 int jitBinaryImm(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);

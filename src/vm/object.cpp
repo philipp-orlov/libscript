@@ -431,7 +431,13 @@ std::uint32_t JSObject::propertyCount(VM& vm) noexcept
 
 JSValue* JSObject::findOwn(VM& vm, Key key, std::uint8_t* attrs)
 {
-    materialize(vm);
+    if (h.cls == std::uint8_t(ObjClass::Function) && (static_cast<JSFunction*>(this)->flags & JSFunction::kLazyProps)) {
+        // While the properties are not made, the own ones are exactly these three: another name finds nothing, and asking
+        // for it must not make a slot buffer, a `prototype` object and the cycle between it and the function.
+        if (key != vm.atoms.length && key != vm.atoms.name && key != vm.atoms.prototype)
+            return nullptr;
+        materialize(vm);
+    }
     Shape* s = shapeOf(vm);
     if (s->isDictionary()) {
         const Dictionary& d = *rare()->dict;

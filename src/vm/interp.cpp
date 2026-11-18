@@ -330,6 +330,17 @@ inline bool cacheable(VM& vm, JSObject* o) noexcept
            !proxyOf(o);
 }
 
+/// Whether the properties `o` has for `key` are those its shape says: also a function whose own properties are not made yet,
+/// for a name other than the three it would make (`length`, `name`, `prototype`). Its shape is then that of every such
+/// function, and making them changes it.
+inline bool cacheableKey(VM& vm, JSObject* o, Key key) noexcept
+{
+    if (cacheable(vm, o))
+        return true;
+    return o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps) && !proxyOf(o) &&
+           key != vm.atoms.length && key != vm.atoms.name && key != vm.atoms.prototype;
+}
+
 /// The slot index of `o`'s own property `key` when a cache may hold it under `o`'s shape: in the tree, or a dictionary read
 /// often enough (its shape changes when the key would move). -1 otherwise.
 std::int32_t cachedOwnIndex(VM& vm, JSObject* o, Key key, std::uint8_t* attrs) noexcept
@@ -360,7 +371,7 @@ bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
 {
     std::uint8_t attrs = 0;
     std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
-    if (!cacheable(vm, o) && index < 0)
+    if (!cacheableKey(vm, o, key) && index < 0)
         return false;  // a dictionary: only what it holds itself (a key it adds would hide one inherited)
     if (index >= 0) {
         if (attrs & attr::kAccessor)
@@ -374,7 +385,7 @@ bool learnRead(VM& vm, InlineCache& ic, JSObject* o, Key key)
     }
     // A property of a prototype: the cache holds the holder and a cell that says the chain has not changed.
     for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
-        if (!cacheable(vm, p))
+        if (!cacheableKey(vm, p, key))
             return false;
         index = p->shapeOf(vm)->indexOf(key, &attrs);
         if (index < 0)
@@ -433,10 +444,10 @@ inline bool answersForKeys(JSObject* o) noexcept
 /// that gains the key invalidates the chain (`invalidateChain`), and the receiver's shape fixes its own keys and its prototype.
 bool learnAbsent(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key, bool numericKey)
 {
-    if (numericKey || !cacheable(vm, o))
+    if (numericKey || !cacheableKey(vm, o, key))
         return false;
     for (JSObject* p = o; p; p = p->proto(vm)) {
-        if (!cacheable(vm, p) || answersForKeys(p))
+        if (!cacheableKey(vm, p, key) || answersForKeys(p))
             return false;
     }
     PolyEntry entry;
@@ -454,7 +465,7 @@ bool learnAbsent(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key,
 /// Remember where a read of `key` on `o` finds it in the site's `PolyCache`: a data property or an accessor, own or inherited.
 bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
 {
-    if (!cacheable(vm, o) && !(o->isDictionary(vm) && o->cls() != ObjClass::TypedArray))
+    if (!cacheableKey(vm, o, key) && !(o->isDictionary(vm) && o->cls() != ObjClass::TypedArray))
         return false;
     // A typed array answers a canonical numeric name itself, whatever its prototypes have.
     double numeric;
@@ -467,10 +478,10 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
     bool inherited = false;
     JSObject* holder = nullptr;
     if (index < 0) {
-        if (!cacheable(vm, o))
+        if (!cacheableKey(vm, o, key))
             return false;
         for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
-            if (!cacheable(vm, p) || (numericKey && p->cls() == ObjClass::TypedArray))
+            if (!cacheableKey(vm, p, key) || (numericKey && p->cls() == ObjClass::TypedArray))
                 return false;
             index = p->shapeOf(vm)->indexOf(key, &attrs);
             if (index >= 0) {

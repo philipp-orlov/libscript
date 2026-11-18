@@ -798,6 +798,17 @@ static int ordinaryHasInstance(VM& vm, JSValue b, JSValue a)
         return instanceOf(vm, a, r->boundTarget);
     if (!isObject(a))
         return 0;
+    if (vm.prototypeAt2(asObject(b)) && isObject(*asObject(b)->slotAt(2))) {
+        // `prototype` is a data property in its usual slot: the walk reads shapes only (a proxy anywhere takes the long way).
+        JSObject* want = asObject(*asObject(b)->slotAt(2));
+        for (JSObject* o = asObject(a); !proxyOf(o);) {
+            o = o->proto(vm);
+            if (!o)
+                return 0;
+            if (o == want)
+                return 1;
+        }
+    }
     JSValue proto = getProperty(vm, b, vm.atoms.prototype);
     if (proto.isException())
         return -1;

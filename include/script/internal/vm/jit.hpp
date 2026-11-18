@@ -137,6 +137,7 @@ int jitLoadCallee(VM& vm, std::uint32_t index);
 int jitNewTarget(VM& vm, std::uint32_t index);
 int jitGetSuperCtor(VM& vm, std::uint32_t index);
 int jitFreshThisIfBound(VM& vm, std::uint32_t index);
+int jitCallSpread(VM& vm, std::uint32_t index);
 int jitIterInit(VM& vm, std::uint32_t index);
 int jitIterNext(VM& vm, std::uint32_t index);
 int jitIterClose(VM& vm, std::uint32_t index);

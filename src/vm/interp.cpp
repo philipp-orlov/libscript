@@ -728,6 +728,22 @@ void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key ke
 }
 
 
+/// The elements of `list` (holes as undefined) over the registers from `window` on, where the list itself is the first of them.
+void spreadOverWindow(VM& vm, JSValue* window, JSArray* list, std::uint32_t n)
+{
+    const JSValue keep = toJSValue(list);
+    retain(keep);  // the first element's register is the list's own
+    vm.fillStack(window + n + 1);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        JSValue v = list->elems[i];
+        if (v.isHole())
+            v = JSValue::undefined();
+        retain(v);
+        setReg(window[i], v);
+    }
+    release(keep);
+}
+
 /// The call's arguments, copied into an array for `arguments` and rest parameters.
 JSArray* captureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
 {
@@ -2640,15 +2656,7 @@ L_SuperSpread: {
         vm.throwError(ErrorCode::RangeError, "Too many arguments");
         FAIL();
     }
-    std::vector<JSValue> items(list->elems, list->elems + n);
-    for (JSValue& v : items) {
-        if (v.isHole())
-            v = JSValue::undefined();
-        retain(v);
-    }
-    vm.fillStack(window + n + 1);
-    for (std::uint32_t i = 0; i < n; ++i)
-        setReg(window[i], items[i]);
+    spreadOverWindow(vm, window, list, n);
     callBase = at;
     callArgc = n;
     callMode = ins->opcode() == Op::NewSpread ? 1 : ins->opcode() == Op::SuperSpread ? 2 : 0;
@@ -3828,6 +3836,31 @@ int jitFreshThisIfBound(VM& vm, std::uint32_t index)
     JitCtx c = jitCtx(vm, index, false);
     if (c.R[c.ins->b] == JSValue::boolean(true))
         setReg(c.R[c.ins->a], toJSValue(vm.newObject(vm.protos.object)));
+    return 1;
+}
+
+int jitCallSpread(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    if (ins->opcode() != Op::CallSpread)
+        return 2;
+    JSValue* R = c.R;
+    const std::uint32_t at = ins->b;
+    auto* list = static_cast<JSArray*>(asObject(R[at + 2]));
+    const std::uint32_t n = list->length;
+    JSValue* window = R + at + 2;
+    if (window + n + 8 > vm.stackEnd || n > (1u << 20))
+        return 2;
+    const JSValue callee = R[at];
+    if (!isFunction(callee))
+        return 2;
+    spreadOverWindow(vm, window, list, n);
+    vm.stackTop = std::max(vm.stackTop, window + n);
+    const JSValue res = vm.call(callee, R[at + 1], window, n);
+    if (res.isException())
+        return 0;
+    setReg(R[ins->a], res);
     return 1;
 }
 

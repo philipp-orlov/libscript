@@ -2637,6 +2637,7 @@ void Baseline::emit(std::uint32_t i)
     case Op::KeysOf: helperOp(i, &helperThunk<jitKeysOf>); return;
     case Op::LoadCallee: helperOp(i, &helperThunk<jitLoadCallee>); return;
     case Op::NewTarget: helperOp(i, &helperThunk<jitNewTarget>); return;
+    case Op::CallSpread: helperOrStep(i, &helperThunk<jitCallSpread>); return;
     case Op::IterNext: helperOp(i, &helperThunk<jitIterNext>); return;
     case Op::IterInit: helperOrStep(i, &helperThunk<jitIterInit>); return;
     case Op::IterClose: helperOrStep(i, &helperThunk<jitIterClose>); return;

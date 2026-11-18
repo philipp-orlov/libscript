@@ -5049,14 +5049,30 @@ void compileTier1(VM& vm, CodeBlock* code)
     const std::size_t limit = vm.ctx.options.jit.codeCacheLimit;
     if (code->code.size() > 20000 || !entryStub() || (limit && codeInUse() > limit))
         return;
-    Asm::reachFailed() = false;
-    Tier1Code* t = Baseline(vm, code).compile();
-    if (!t && Asm::reachFailed()) {
-        // A conditional branch did not reach (a very large function): once more, with the long form of each.
-        Asm::longBranchDefault() = true;
+    // A conditional branch that did not reach (a very large function) is made long, and only that one: the compile goes again
+    // until none is out of reach. If a round finds none to name, every branch is made long.
+    Tier1Code* t = nullptr;
+    Asm::longSet().clear();
+    for (int round = 0;; ++round) {
+        Asm::reachFailed() = false;
+        Asm::newLong().clear();
         t = Baseline(vm, code).compile();
-        Asm::longBranchDefault() = false;
+        if (t || !Asm::reachFailed())
+            break;
+        if (round >= 16 || Asm::newLong().empty()) {
+            Asm::longBranchDefault() = true;
+            t = Baseline(vm, code).compile();
+            Asm::longBranchDefault() = false;
+            break;
+        }
+        std::vector<bool>& set = Asm::longSet();
+        for (std::uint32_t n : Asm::newLong()) {
+            if (set.size() <= n)
+                set.resize(n + 1, false);
+            set[n] = true;
+        }
     }
+    Asm::longSet().clear();
     if (!t)
         return;
     code->tier1 = t;

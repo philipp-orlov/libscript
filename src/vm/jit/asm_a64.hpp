@@ -25,9 +25,11 @@
 // waits in x27 instead.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace script {
@@ -84,6 +86,19 @@ public:
         static thread_local bool on = false;
         return on;
     }
+    /// The forward conditional branches (numbered in the order they are emitted) to make long, which a compile that found
+    /// some out of reach adds to (`newLong`) and the next one reads (`longSet`). Emission being the same each time, the
+    /// numbers mean the same branch.
+    static std::vector<bool>& longSet() noexcept
+    {
+        static thread_local std::vector<bool> set;
+        return set;
+    }
+    static std::vector<std::uint32_t>& newLong() noexcept
+    {
+        static thread_local std::vector<std::uint32_t> set;
+        return set;
+    }
 
     /// Whether the code cannot be used: a branch out of reach, or a jump on flags no instruction before it left.
     bool failed() const noexcept { return failed_; }
@@ -98,6 +113,8 @@ private:
 
     bool failed_ = false;
     bool outOfReach_ = false;
+    std::uint32_t condOrdinal_ = 0;  ///< forward conditional branches so far
+    std::vector<std::pair<std::int32_t, std::uint32_t>> forward_;  ///< offset and ordinal of those left short
     Flags flags_ = Flags::None;
     // An instruction that leaves its result's zero and sign in the flags on x86-64 and sets none here: the test is made
     // only if the next thing emitted reads them.
@@ -449,7 +466,15 @@ private:
             return;
         }
         const std::int32_t at = std::int32_t(buf.size());
-        const bool near = l.bound() ? (at - l.pos) < (1 << 20) - 8 : !longBranches;
+        std::uint32_t ordinal = 0;
+        bool near;
+        if (l.bound()) {
+            near = (at - l.pos) < (1 << 20) - 8;
+        } else {
+            ordinal = condOrdinal_++;
+            const std::vector<bool>& longs = longSet();
+            near = !longBranches && !(ordinal < longs.size() && longs[ordinal]);
+        }
         if (!near) {
             ins(0x54000040u | std::uint32_t(cond ^ 1));  // over the jump
             branch(0x14000000u, l);
@@ -457,6 +482,7 @@ private:
             ins(0x54000000u | (((std::uint32_t(l.pos - at) >> 2) & 0x7FFFFu) << 5) | std::uint32_t(cond));
         } else {
             l.uses.push_back(at);
+            forward_.emplace_back(at, ordinal);
             ins(0x54000000u | std::uint32_t(cond));
         }
     }
@@ -622,6 +648,10 @@ public:
                     outOfReach_ = true;
                     failed_ = true;
                     reachFailed() = true;
+                    // `forward_` is in order of offset.
+                    const auto f = std::lower_bound(forward_.begin(), forward_.end(), std::make_pair(at, std::uint32_t(0)));
+                    if (f != forward_.end() && f->first == at)
+                        newLong().push_back(f->second);
                 }
                 v |= (std::uint32_t(delta) & 0x7FFFFu) << 5;
             }

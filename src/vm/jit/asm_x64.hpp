@@ -461,6 +461,16 @@ public:
         static thread_local bool on = false;
         return on;
     }
+    static std::vector<bool>& longSet() noexcept
+    {
+        static thread_local std::vector<bool> set;
+        return set;
+    }
+    static std::vector<std::uint32_t>& newLong() noexcept
+    {
+        static thread_local std::vector<std::uint32_t> set;
+        return set;
+    }
     /// A call to an absolute address through rax.
     void callAbs(const void* fn)
     {

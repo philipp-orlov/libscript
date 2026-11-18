@@ -1812,7 +1812,7 @@ NATIVE(stringSlice)
     }
     if (to < from)
         to = from;
-    return makeString(vm, text.substr(std::size_t(from), std::size_t(to - from)));
+    return makeSubstring(vm, s.get(), std::size_t(from), std::size_t(to - from));
 }
 
 NATIVE(stringCase)

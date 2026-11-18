@@ -5269,3 +5269,27 @@ TEST(aScopeOfManyNamesFindsEachAndChecksReadsBeforeTheirDeclaration)
         "out.join(' ')";
     CHECK_EQ(run(program.c_str()), std::string("ReferenceError 780 43 39 105 ReferenceError 1"));
 }
+
+TEST(aPlainRegExpSkipsItsFlagGettersUntilOneChangesAndALongSliceSharesItsText)
+{
+    // A match of a plain RegExp reads its flags and exec without the property protocol; a changed getter, a changed exec, a
+    // property of the RegExp's own or a subclass are each heard again. A long piece cut off a long text shares its characters,
+    // and the text and piece read as they should after the original goes.
+    const char* program =
+        "var out=[];"
+        "var re=/a(b)?/g; out.push('abab'.match(re).length, re.flags);"
+        "var desc=Object.getOwnPropertyDescriptor(RegExp.prototype,'global');"
+        "Object.defineProperty(RegExp.prototype,'global',{get:function(){ return false; },configurable:true});"
+        "out.push(typeof 'abab'.match(/a/g)[0], 'abab'.match(/a/g).index);"
+        "Object.defineProperty(RegExp.prototype,'global',desc); out.push('abab'.match(/a/g).length);"
+        "var saved=RegExp.prototype.exec; RegExp.prototype.exec=function(s){ return null; };"
+        "out.push(String('abc'.match(/b/)), /b/.test('abc')); RegExp.prototype.exec=saved; out.push(/b/.test('abc'));"
+        "var own=/x/g; Object.defineProperty(own,'flags',{value:''}); out.push('xx'.replace(own,'y'));"
+        "class R extends RegExp { get flags(){ return ''; } } out.push('xx'.replace(new R('x','g'),'z'));"
+        "var text=''; for(var i=0;i<500;i++) text+=String.fromCharCode(97+i%26);"
+        "var rest=text, n=0; while(rest.length){ var m=/^[a-m]+|^[n-z]+/.exec(rest); n++; rest=rest.slice(m[0].length); }"
+        "var tail=text.slice(100); text=null; out.push(n, tail.length, tail.charCodeAt(0), tail.slice(300,305), tail.substring(390)+'|', tail.substr(-3));"
+        "out.join(' ')";
+    CHECK_EQ(run(program),
+             std::string("2 g string 0 2 null false true yx zx 39 400 119 klmno wxyzabcdef| def"));
+}

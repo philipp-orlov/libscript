@@ -167,6 +167,15 @@ JSValue makeString(VM& vm, StringView text)
     return fromValue(vm, vm.ctx.str(text));
 }
 
+JSValue makeSubstring(VM& vm, JSValue whole, std::size_t start, std::size_t count)
+{
+    StringCell* cell = asString(whole);
+    const std::size_t length = cell->length;
+    if (count <= ContextImpl::kInternedLength || count < ContextImpl::kSliceLength || count * 4 < length)
+        return makeString(vm, cell->text().substr(start, count));
+    return fromValue(vm, vm.ctx.substring(cell, start, count));
+}
+
 JSValue makeString(VM& vm, std::string_view utf8)
 {
     return makeString(vm, fromUtf8(utf8));

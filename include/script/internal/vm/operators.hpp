@@ -36,6 +36,9 @@ inline std::uint32_t toUint32(double d) noexcept
 /// A string made from text; owned.
 JSValue makeString(VM& vm, StringView text);
 JSValue makeString(VM& vm, std::string_view utf8);
+/// `count` characters of the string `whole` from `start`: a long piece that is a good part of it points into its characters
+/// (`ContextImpl::substring`), so cutting the front off a text over and over copies nothing.
+JSValue makeSubstring(VM& vm, JSValue whole, std::size_t start, std::size_t count);
 JSValue typeOf(VM& vm, JSValue v);
 
 bool strictEquals(JSValue a, JSValue b) noexcept;

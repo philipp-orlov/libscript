@@ -15,6 +15,7 @@
 #include "script/internal/stack_guard.hpp"
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
+#include "script/internal/vm/compiler.hpp"
 #include "script/internal/vm/jit.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
@@ -2878,6 +2879,10 @@ do_call: {
         FAIL();
     }
     auto* f = static_cast<JSFunction*>(asObject(callee));
+    if (!(f->flags & JSFunction::kNative) && (f->code->flags & CodeBlock::kLazy)) [[unlikely]] {
+        if (!vm.ensureCompiled(f->code))
+            FAIL();
+    }
     if (isNew) {
         const bool canConstruct = (f->flags & JSFunction::kNative) ? (f->flags & JSFunction::kConstructor) != 0
                                                                      : f->code->constructor;
@@ -4458,6 +4463,8 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
         return result;
     }
     CodeBlock* c = f->code;
+    if (!ensureCompiled(c)) [[unlikely]]
+        return JSValue::exception();
     if (!construct && c->tier1 &&
         !(c->flags & (CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
                       CodeBlock::kNeedsArgs))) {
@@ -4534,6 +4541,19 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     // The frame let go of its own registers; `this` and the arguments are ours.
     clearRegs(R, 0, 1 + argc);
     return result;
+}
+
+bool VM::ensureCompiled(CodeBlock* c)
+{
+    if (!(c->flags & CodeBlock::kLazy)) [[likely]]
+        return true;
+    try {
+        compileLazy(*this, c);
+    } catch (const Error& e) {
+        throwError(e.code() == ErrorCode::CompileError ? ErrorCode::SyntaxError : e.code(), e.what());
+        return false;
+    }
+    return true;
 }
 
 JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args, std::uint32_t argc)

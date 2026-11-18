@@ -37,7 +37,7 @@ Mem Baseline::inlineSlot(std::int32_t s) const
 
 bool Baseline::inlinable(const CodeBlock* C) const
 {
-    if (!C || C == code_ || C->prof.size() < C->code.size() + C->nparams || C->code.size() > kInlineMaxCode)
+    if (!C || C == code_ || (C->flags & CodeBlock::kLazy) || C->prof.size() < C->code.size() + C->nparams || C->code.size() > kInlineMaxCode)
         return false;
     if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
                     CodeBlock::kClassConstructor))
@@ -980,7 +980,7 @@ void Baseline::planDirectCalls()
             continue;
         CodeBlock* C = fn->code;
         if (!C || argc > C->nparams ||
-            (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+            (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
                          CodeBlock::kClassConstructor)))
             continue;
         if (inlineCall(i, true))
@@ -2000,7 +2000,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     if ((f->flags & JSFunction::kNative) || !vm_.prototypeAt2(f))
         return false;
     CodeBlock* C = f->code;
-    if (!C || !C->constructor || (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
+    if (!C || !C->constructor || (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
                                               CodeBlock::kNeedsArgs | CodeBlock::kClassConstructor | CodeBlock::kDerived)))
         return false;
     const JSValue pv = *f->slotAt(2);

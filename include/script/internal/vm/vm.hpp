@@ -367,6 +367,8 @@ struct VM : EngineRuntime
 
     // ---- generators (interp.cpp) ----
     /// What a generator function's call makes: an object holding the registers of the call. Owned.
+    /// Compile the body of a stub (`CodeBlock::kLazy`) if `c` is one; false, with the exception thrown, when that fails.
+    bool ensureCompiled(CodeBlock* c);
     JSValue makeGenerator(JSFunction* fn, JSValue thisValue, const JSValue* args, std::uint32_t argc);
     /// `next`, `throw` and `return` (mode 0, 1, 2) of a generator: an owned iterator result, or the exception sentinel.
     JSValue resumeGenerator(JSValue generator, int mode, JSValue sent);

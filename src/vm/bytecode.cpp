@@ -38,6 +38,8 @@ const char* opKinds(Op op) noexcept
 std::string dump(const CodeBlock& block)
 {
     std::string out;
+    if (block.flags & CodeBlock::kLazy)
+        return "  (lazy: compiled when first called)\n";
     char line[160];
     for (std::size_t pc = 0; pc < block.code.size(); ++pc) {
         const Ins& ins = block.code[pc];

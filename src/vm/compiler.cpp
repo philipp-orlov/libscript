@@ -8,10 +8,12 @@
 // Not compiled yet, and refused with `NotSupported`: async generators and `for await`, BigInt literals, `with`, `super()`
 // and `new.target` inside arrows, and computed names of `super[...]` reads.
 #include "script/internal/stack_guard.hpp"
+#include "script/internal/dyn/parser.hpp"
 #include "script/internal/vm/compiler.hpp"
 #include "script/internal/vm/operators.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string_view>
@@ -619,10 +621,13 @@ bool isPure(const Node& n) noexcept
 class Compiler
 {
 public:
-    Compiler(VM& vm, std::string_view file, std::shared_ptr<const std::string> source)
-        : vm_(vm), ctx_(vm.ctx), file_(fromUtf8(file)), source_(std::move(source))
+    Compiler(VM& vm, std::string_view file, std::shared_ptr<const std::string> source, bool lazy = false)
+        : vm_(vm), ctx_(vm.ctx), file_(fromUtf8(file)), source_(std::move(source)), lazy_(lazy)
     {
     }
+
+    /// Fill `stub` from `n`, the function parsed again from its text.
+    void resume(const Node& n, CodeBlock* stub);
 
     CodeBlock* program(const Node& program);
     CodeBlock* evalProgram(const Node& program, const std::vector<String>& names, bool strict, bool home)
@@ -641,6 +646,8 @@ private:
     Label* chain_ = nullptr;
     bool chainUsed_ = false;
     bool noFuse_ = false;
+    bool lazy_ = false;                ///< functions that qualify are left as stubs (`lazyStub`)
+    std::unordered_set<const Node*> calledAtOnce_;  ///< function expressions called where they stand: compiled at once
     bool discard_ = false;  ///< the expression about to be compiled has its value thrown away
     CaptureCache captures_;  ///< what each nested function captures, by node, for the whole tree being compiled
 
@@ -1138,6 +1145,10 @@ private:
 
     CodeBlock* compileFunction(const Node& n, const String& name);
     CodeBlock* compileFunctionOnce(const Node& n, const String& name, std::uint32_t extraFlags);
+    CodeBlock* functionHeader(const Node& n, const String& name, std::uint32_t extraFlags);
+    void functionCode(const Node& n, CodeBlock* block, std::uint32_t extraFlags, const LazyInfo* resuming = nullptr);
+    bool lazyEligible(const Node& n, const NameViews& names) const;
+    CodeBlock* lazyStub(const Node& n, const String& name);
     std::uint32_t pendingFlags_ = 0;  ///< flags for the next function compiled: a class constructor's
     std::uint16_t classExpr(const Node& cls, int dst, const String& inferredName, bool innerBinding = true);
     CodeBlock* compileInitFunction(const std::vector<const Node*>& items, bool isStatic);
@@ -1633,7 +1644,10 @@ std::uint16_t Compiler::objectLit(const Node& n, int dst)
 
 std::uint16_t Compiler::function(const Node& n, const String& inferredName, int dst, bool exactName)
 {
-    CodeBlock* child = compileFunction(n, n.text.empty() || exactName ? inferredName : n.text);
+    const String& childName = n.text.empty() || exactName ? inferredName : n.text;
+    CodeBlock* child = lazyStub(n, childName);
+    if (!child)
+        child = compileFunction(n, childName);
     const std::size_t index = fn_->block->children.size();
     fn_->block->children.push_back(child);
     const std::uint16_t d = dest(dst);
@@ -2762,6 +2776,14 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
     const std::uint16_t mark = fn_->top;
     const std::uint16_t base = temps(2);
     const Node& callee = *n.a;
+    {
+        // A function expression called where it stands runs at once: it is compiled with what is around it.
+        const Node* target = &callee;
+        if (target->kind == NK::Member && !target->computed && (target->text == u"call" || target->text == u"apply"))
+            target = target->a.get();
+        if (target && target->kind == NK::FunctionExpr)
+            calledAtOnce_.insert(target);
+    }
     const bool superCall = callee.kind == NK::SuperExpr;
     if (superCall && (isNew || (fn_->isArrow ? resolve(String(u"%callee")).kind == Ref::Global
                                               : !((fn_->block->flags & CodeBlock::kClassConstructor) && (fn_->block->flags & CodeBlock::kDerived)))))
@@ -3822,7 +3844,7 @@ CodeBlock* Compiler::compileFunction(const Node& n, const String& name)
     }
 }
 
-CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std::uint32_t extraFlags)
+CodeBlock* Compiler::functionHeader(const Node& n, const String& name, std::uint32_t extraFlags)
 {
     const bool arrow = n.kind == NK::ArrowExpr;
     Key nameKey = name.empty() ? nullptr : vm_.internKey(StringView(name));
@@ -3853,6 +3875,25 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
             break;
         ++block->length;
     }
+    return block;
+}
+
+CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std::uint32_t extraFlags)
+{
+    CodeBlock* block = functionHeader(n, name, extraFlags);
+    try {
+        functionCode(n, block, extraFlags);
+    } catch (...) {
+        vm_.releaseCode(block);
+        throw;
+    }
+    return block;
+}
+
+/// The code of function `n` in `block`, whose header is made; the function around it is `fn_`.
+void Compiler::functionCode(const Node& n, CodeBlock* block, std::uint32_t extraFlags, const LazyInfo* resuming)
+{
+    const bool arrow = n.kind == NK::ArrowExpr;
     Fn child;
     child.isMethodFn = n.isMethod || (extraFlags & CodeBlock::kClassConstructor) != 0;
     child.parent = fn_;
@@ -3863,6 +3904,11 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
         block->flags |= CodeBlock::kStrict;
     if (arrow)
         block->flags |= CodeBlock::kArrow;
+    if (resuming) {
+        // The closures of this function exist: their upvalues are in this order.
+        for (std::size_t i = 0; i < resuming->upvalNames.size(); ++i)
+            child.upvalIndex[String(resuming->upvalNames[i].data(), resuming->upvalNames[i].size())] = std::uint16_t(i);
+    }
     collectCaptured(*n.d, child.captured, captures_);
     for (const dyn::NodePtr& p : n.list)
         collectCaptured(*p, child.captured, captures_);
@@ -3881,14 +3927,152 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
         line_ = savedLine;
         chain_ = savedChain;
         pendingLabels_.swap(savedLabels);
-        vm_.releaseCode(block);
         throw;
     }
     fn_ = saved;
     line_ = savedLine;
     chain_ = savedChain;
     pendingLabels_.swap(savedLabels);
+}
+
+/// Whether `n`, with the names `names` it and what it contains mention, is left to compile when it is first called: a plain
+/// function in a big program, whose names mean the same then as now. Nothing in a class, which brings private names and
+/// `super`, and nothing near a direct `eval`. Compiling later also reports what the language forbids later, so a small
+/// function (and every program of the conformance suites) is compiled at once.
+bool Compiler::lazyEligible(const Node& n, const NameViews& names) const
+{
+    std::size_t kProgramBytes = 64 * 1024, kFunctionBytes = 128;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    // SCRIPT_VM_LAZY=1: every function that qualifies, whatever the sizes, so the test suites run through the stubs.
+    if (const char* t = std::getenv("SCRIPT_VM_LAZY"); t && *t == '1')
+        kProgramBytes = kFunctionBytes = 0;
+    else if (t && *t == '0')
+        return false;  // SCRIPT_VM_LAZY=0: none
+#endif
+    if (!lazy_)
+        return false;
+    if (n.kind != NK::FunctionExpr || n.isMethod || n.propKind == PropKind::Constructor || n.propKind == PropKind::Getter ||
+        n.propKind == PropKind::Setter || !n.d || classDepth_ != 0 || pendingFlags_ != 0)
+        return false;
+    if (!source_ || source_->size() < kProgramBytes || n.srcEnd > source_->size() || n.srcEnd <= n.srcStart || n.srcEnd < n.srcStart + kFunctionBytes)
+        return false;
+    if (calledAtOnce_.count(&n))
+        return false;
+    for (const Fn* f = fn_; f; f = f->parent)
+        if (f->isEval || f->evalOuter || f->dynamicVars || !f->evalEnvName.empty())
+            return false;
+    for (std::u16string_view name : names)
+        if (!name.empty() && name[0] == u'%')
+            return false;  // `%all` (a direct `eval` inside) and the hidden names of arrows, classes and derived constructors
+    return true;
+}
+
+/// A function left to compile: its header and what makes a closure of it. It captures every variable around it that its
+/// text names, and the body may then use fewer. Null when it does not qualify.
+CodeBlock* Compiler::lazyStub(const Node& n, const String& name)
+{
+    if (!lazy_)
+        return nullptr;
+    const NameViews& names = capturedBelow(n, false, captures_);
+    if (!lazyEligible(n, names))
+        return nullptr;
+    std::vector<UpvalDesc> descs;
+    auto info = std::make_unique<LazyInfo>();
+    for (std::u16string_view view : names) {
+        const String key(view.data(), view.size());
+        const Ref r = resolve(key);
+        if (r.kind == Ref::Global)
+            continue;
+        UpvalDesc d;
+        if (r.kind == Ref::Local) {
+            if (!r.binding->boxed)
+                return nullptr;  // not a variable a closure can capture: compile it at once, which says what is wrong
+            d.index = r.binding->reg;
+            d.fromParentLocal = true;
+        } else {
+            d.index = r.upval;
+            d.fromParentLocal = false;
+        }
+        descs.push_back(d);
+        info->upvalNames.emplace_back(view);
+        info->upvalBits.push_back(std::uint8_t((r.isConst ? 1 : 0) | (r.isFnName ? 2 : 0) | (r.checked ? 4 : 0)));
+    }
+    info->line = n.line;
+    info->isDeclaration = !n.namedExpr && !n.text.empty();
+    info->strictOuter = fn_->strict;
+    CodeBlock* block = functionHeader(n, name, 0);
+    for (const UpvalDesc& d : descs)
+        block->upvals.push_back(d);
+    block->flags |= CodeBlock::kLazy;
+    block->lazy = info.release();
     return block;
+}
+
+void Compiler::resume(const Node& n, CodeBlock* stub)
+{
+    const LazyInfo& info = *stub->lazy;
+    // The function around it, as the stub saw it: one box for each name it captured.
+    Fn outer;
+    outer.isProgram = true;
+    outer.strict = info.strictOuter;
+    outer.scopes.emplace_back();
+    for (std::size_t i = 0; i < info.upvalNames.size(); ++i) {
+        Binding b;
+        b.name = String(info.upvalNames[i].data(), info.upvalNames[i].size());
+        b.reg = std::uint16_t(i);
+        b.boxed = true;
+        const std::uint8_t bits = info.upvalBits[i];
+        b.kind = (bits & 1) ? BKind::Const : (bits & 2) ? BKind::FnName : BKind::Var;
+        b.tdz = (bits & 4) != 0;
+        b.initialized = false;
+        outer.scopes.back().bindings.push_back(b);
+    }
+    fn_ = &outer;
+    const std::size_t upvals = stub->upvals.size();
+    for (;;) {
+        // Into a block of its own: a function with a far jump is compiled again without fused jumps, from nothing.
+        CodeBlock* made = functionHeader(n, String(), 0);
+        for (const UpvalDesc& d : stub->upvals)
+            made->upvals.push_back(d);
+        const bool savedFuse = noFuse_;
+        try {
+            functionCode(n, made, 0, &info);
+        } catch (const FusionOverflow&) {
+            vm_.releaseCode(made);
+            if (noFuse_) {
+                noFuse_ = savedFuse;
+                fn_ = nullptr;
+                throw;
+            }
+            noFuse_ = true;
+            continue;
+        } catch (...) {
+            vm_.releaseCode(made);
+            fn_ = nullptr;
+            throw;
+        }
+        fn_ = nullptr;
+        if (made->upvals.size() != upvals) {
+            vm_.releaseCode(made);
+            throw Error(ErrorCode::NotSupported, "vm core: internal error: a function that was left to compile captured more than it said");
+        }
+        stub->code.swap(made->code);
+        stub->consts.swap(made->consts);
+        stub->atoms.swap(made->atoms);
+        stub->children.swap(made->children);
+        stub->evalScopes.swap(made->evalScopes);
+        stub->evalHome.swap(made->evalHome);
+        stub->handlers.swap(made->handlers);
+        stub->lines.swap(made->lines);
+        stub->caches.swap(made->caches);
+        stub->nregs = made->nregs;
+        stub->flags |= made->flags;
+        stub->flags &= ~std::uint32_t(CodeBlock::kLazy);
+        vm_.releaseCode(made);
+        delete stub->lazy;
+        stub->lazy = nullptr;
+        return;
+    }
 }
 
 void Compiler::functionBody(const Node& n, CodeBlock* block)
@@ -4317,10 +4501,24 @@ CodeBlock* compileEval(VM& vm, const dyn::Node& program, std::string_view file, 
     return compiler.evalProgram(program, names, strict, home);
 }
 
-CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source)
+CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view file, std::shared_ptr<const std::string> source, bool lazy)
 {
-    Compiler compiler(vm, file, std::move(source));
+    Compiler compiler(vm, file, std::move(source), lazy);
     return compiler.program(program);
+}
+
+void compileLazy(VM& vm, CodeBlock* stub)
+{
+    dyn::Parser parser(*stub->source, toUtf8(stub->file), /*typescript=*/false);
+    const dyn::NodePtr node = parser.parseFunctionAt(stub->srcStart, stub->lazy->line, stub->lazy->isDeclaration);
+    Compiler compiler(vm, toUtf8(stub->file), stub->source, /*lazy=*/true);
+    compiler.resume(*node, stub);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SCRIPT_VM_DUMP")) {
+        std::fprintf(stderr, "lazy compiled (upvals %zu):\n", stub->upvals.size());
+        std::fputs(dump(*stub).c_str(), stderr);
+    }
+#endif
 }
 
 }  // namespace vm

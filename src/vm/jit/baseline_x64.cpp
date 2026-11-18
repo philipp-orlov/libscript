@@ -539,6 +539,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         return {res.bits, 1};
     }
     CodeBlock* c = f->code;
+    if (c->flags & CodeBlock::kLazy)
+        return {0, 0};  // the interpreter compiles it
     if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen) ||
         ((c->flags & CodeBlock::kClassConstructor) && !construct))
         return {0, 0};

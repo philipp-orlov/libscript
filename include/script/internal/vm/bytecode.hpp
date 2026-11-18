@@ -190,6 +190,17 @@ struct SuperCache
 /// The id a property instruction carries in the word after it when it has no cache (too many in one function).
 inline constexpr std::uint16_t kNoCache = 0xFFFF;
 
+/// What compiling a stub later needs of the code around it: the names it captured when its closure was made, and where its text
+/// starts.
+struct LazyInfo
+{
+    std::vector<std::u16string> upvalNames;  ///< parallel to `CodeBlock::upvals`
+    std::vector<std::uint8_t> upvalBits;     ///< 1 const, 2 the name of a function expression, 4 a read needs the hole check
+    std::uint32_t line = 0;
+    bool isDeclaration = false;
+    bool strictOuter = false;
+};
+
 struct CodeBlock
 {
     enum Flags : std::uint32_t
@@ -207,6 +218,7 @@ struct CodeBlock
         kNoThis = 1024,   ///< never reads `this` (found when the baseline code is made): a call need not make one
         kRestOnly = 4096,  ///< with `kNeedsArgs`: the register holds the rest parameter's array itself (nothing else uses `arguments`)
         kPrivate = 2048,  ///< names a private member: its element sites keep a `PrivateCache` each
+        kLazy = 8192,     ///< a stub: the header and the upvalues are made, `code` is empty until `ensureCompiled` compiles it
     };
 
     std::uint32_t refs = 1;
@@ -222,6 +234,7 @@ struct CodeBlock
     Vec<Key> atoms;       ///< property and global names; each holds a count
     Vec<CodeBlock*> children;  ///< each holds a count
     Vec<UpvalDesc> upvals;
+    LazyInfo* lazy = nullptr;  ///< owned; while `kLazy` is set
     Vec<Vec<EvalVar>> evalScopes;  ///< what each direct `eval` call in the function sees
     Vec<std::uint8_t> evalHome;    ///< for each of them, whether it is in a method, where `super.x` is allowed
     Vec<Handler> handlers;

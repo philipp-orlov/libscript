@@ -154,6 +154,44 @@ TEST(everySnippetAgreesInCompiledCode)
     CHECK_EQ(failed, 0);
 }
 
+// Every function that qualifies is left to compile on its first call (SCRIPT_VM_LAZY, whatever the sizes): the same programs
+// give the same answers, except that an error of the language found while compiling shows when the function is first called.
+TEST(everySnippetAgreesWhenFunctionsAreCompiledOnTheirFirstCall)
+{
+    int failed = 0;
+    auto run = [](const char* source, bool lazy) {
+        if (lazy)
+            setenv("SCRIPT_VM_LAZY", "1", 1);
+        const Outcome out = runOn(script::Context::Options::Core::Vm, source);
+        unsetenv("SCRIPT_VM_LAZY");
+        return out;
+    };
+    auto check = [&](const char* source) {
+        const Outcome want = run(source, false);
+        if (want.threw && want.code == script::ErrorCode::SyntaxError)
+            return;
+        const Outcome got = run(source, true);
+        if (!sameOutcome(want, got)) {
+            ++failed;
+            std::fprintf(stderr, "MISMATCH (lazy): %s\n   eager: %s%s\n    lazy: %s%s\n", source, want.threw ? "THROW " : "",
+                         want.text.c_str(), got.threw ? "THROW " : "", got.text.c_str());
+        }
+    };
+    for (const char* source : kSnippets)
+        check(source);
+    for (const char* source : kJitSnippets)
+        check(source);
+    // Closures over what is around them, at several levels, in generators and async functions, in a function called at once.
+    check("function mk(n) { var c = 0; const s = n; let t = 1; function inc() { c += s; return c; } "
+          "var f = function named(k) { return k <= 0 ? 0 : k + named(k - 1) + c + s + t; }; return { inc: inc, f: f }; } "
+          "var m = mk(3); m.inc(); m.inc(); String(m.f(4))");
+    check("function run() { var v = 5; function* g(n) { for (var i = 0; i < n; i++) { yield i * (function (q) { return q + v; })(i); } } "
+          "return [...g(4)].join(); } run()");
+    check("function outer() { var v = 1; function mid() { var w = 2; function inner() { return v + w; } return inner(); } return mid(); } String(outer())");
+    check("function f() { return x; } var r; try { f(); } catch (e) { r = e.name; } let x = 1; r + f()");
+    CHECK_EQ(failed, 0);
+}
+
 TEST(everyAsyncSnippetAgreesWithTheDynamicEngine)
 {
     int failed = 0;

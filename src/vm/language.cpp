@@ -54,7 +54,7 @@ std::shared_ptr<CompiledUnit> compileJavaScript(ContextImpl& ctx, std::string_vi
     unit->context = &ctx;
     unit->alive = ctx.alive;
     unit->vm = &vm;
-    unit->code = compileProgram(vm, *tree, name, std::make_shared<const std::string>(source));
+    unit->code = compileProgram(vm, *tree, name, std::make_shared<const std::string>(source), /*lazy=*/true);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("SCRIPT_VM_DUMP"))
         std::fputs(dump(*unit->code).c_str(), stderr);
@@ -89,7 +89,7 @@ JSValue VM::evalSource(std::string_view source, std::string_view name)
     try {
         dyn::Parser parser(source, std::string(name), /*typescript=*/false);
         dyn::NodePtr tree = parser.parseProgram();
-        code = compileProgram(*this, *tree, name, std::make_shared<const std::string>(source));
+        code = compileProgram(*this, *tree, name, std::make_shared<const std::string>(source), /*lazy=*/true);
     } catch (const Error& e) {
         return throwError(e.code() == ErrorCode::CompileError ? ErrorCode::SyntaxError : e.code(), e.what());
     }

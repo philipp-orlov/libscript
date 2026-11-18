@@ -206,6 +206,7 @@ void VM::releaseCode(CodeBlock* code) noexcept
         code->tier1 = nullptr;
     }
     codeByUid_.erase(code->uid);
+    delete code->lazy;
     if (CodeBlock* from = code->inlinedFrom) {
         if (from->selfInlined == code)
             from->selfInlined = nullptr;

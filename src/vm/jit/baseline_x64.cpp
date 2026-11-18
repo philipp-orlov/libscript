@@ -4554,6 +4554,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CNE, helper);
         // `prototype` in slot 2 (an ordinary function, or a class whatever its statics), by the shape's flag.
         a_.mov32(RSI, mem(RAX, 0));
+        a_.aluI32(4, RSI, std::int32_t(kShapeIndexMask));  // and: the table is indexed by the low bits of the id
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.shapeTable()));
         a_.mov(RSI, mem(RDI, RSI, 8));
         a_.testI8(mem(RSI, kShapeFlags), Shape::kProtoAt2);

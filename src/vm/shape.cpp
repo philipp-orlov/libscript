@@ -174,7 +174,8 @@ Shape* VM::newShape()
         freeShapeIds_.pop_back();
     } else {
         constexpr std::size_t kCommitStep = std::size_t(64) << 10;
-        if (shapeCount_ >= shapeRegionBytes_ / sizeof(Shape*))
+        // The last index is left unused: with the highest count above it, its id would be `kNoShape` of the RegExp slots.
+        if (shapeCount_ >= shapeRegionBytes_ / sizeof(Shape*) - 1)
             throw Error(ErrorCode::OutOfMemory, "too many shapes");
         if (shapeCount_ >= shapeCommitted_) {
             sys::vmCommit(reinterpret_cast<char*>(shapeRegionBase_) + shapeCommitted_ * sizeof(Shape*), kCommitStep);
@@ -190,8 +191,24 @@ Shape* VM::newShape()
         throw;
     }
     s->id = id;
-    shapeTable_[id] = s;
+    shapeTable_[id & kShapeIndexMask] = s;
     return s;
+}
+
+/// The id of a shape that is gone goes back to be used, as the next of its index: the count above the index goes up by one.
+/// An index that has been used as many times as the id has room for is not used again.
+void VM::releaseShapeId(std::uint32_t id) noexcept
+{
+    const std::uint32_t next = id + (1u << kShapeIndexBits);
+    if (next < (1u << kShapeIndexBits)) {
+        ++retiredShapes_;
+        return;
+    }
+    try {
+        freeShapeIds_.push_back(next);
+    } catch (...) {
+        ++retiredShapes_;  // the id is lost
+    }
 }
 
 void VM::destroyShape(Shape* shape) noexcept
@@ -216,28 +233,22 @@ void VM::retireShapeTree(Shape* root) noexcept
         } catch (...) {
             // What cannot be listed stays, as it did.
         }
-        shapeTable_[s->id] = nullptr;
-        ++retiredShapes_;
+        const std::uint32_t id = s->id;
+        shapeTable_[id & kShapeIndexMask] = nullptr;
         s->proto = nullptr;
         destroyShape(s);
+        releaseShapeId(id);
     }
 }
 
 void VM::freeShape(Shape* shape) noexcept
 {
-    shapeTable_[shape->id] = nullptr;
-    if (shape->flags & Shape::kCachedDict) {
-        ++retiredShapes_;  // an inline cache may still name it
-    } else {
-        try {
-            freeShapeIds_.push_back(shape->id);
-        } catch (...) {
-            // The id is lost; there are a million of them.
-        }
-    }
+    const std::uint32_t id = shape->id;
+    shapeTable_[id & kShapeIndexMask] = nullptr;
     // A dictionary's shape is private and holds nothing; a tree shape that fails to be made has no key yet.
     shape->~Shape();
     PoolAlloc<Shape>().deallocate(shape, 1);
+    releaseShapeId(id);
 }
 
 Shape* VM::rootShapeFor(JSObject* proto)

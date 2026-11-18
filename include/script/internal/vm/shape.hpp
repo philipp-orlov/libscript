@@ -34,6 +34,14 @@ inline constexpr std::uint8_t kDefault = kWritable | kEnumerable | kConfigurable
 
 inline constexpr std::uint32_t kNoShape = 0;
 inline constexpr std::uint32_t kDefaultMaxShapes = 1u << 20;
+/// Shape ids a context can hand out over its life: ids of shapes that died with their prototype are not used again (a cache
+/// may still name one), so a program that makes short-lived prototypes in a loop spends them. Only the table's address
+/// space is reserved up front; its pages are committed as the ids are used.
+inline constexpr std::uint32_t kShapeIdSpace = 1u << 23;
+/// A shape id is the table index in its low 23 bits and, above them, how many times that index has been used before: a cache
+/// or compiled code that names the id of a dead shape never matches the shape that takes its place in the table.
+inline constexpr std::uint32_t kShapeIndexBits = 23;
+inline constexpr std::uint32_t kShapeIndexMask = kShapeIdSpace - 1;
 /// Properties an object may have before it becomes a dictionary instead of growing its shape tree.
 inline constexpr std::uint32_t kMaxFastProperties = 128;
 /// Shapes with this many properties or fewer find one by walking the parent chain.

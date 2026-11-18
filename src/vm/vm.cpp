@@ -33,8 +33,8 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     interruptSet = &ctx.interruptSet;
     for (JSValue& v : smallStrings)
         v = JSValue::undefined();
-    // 2^20 ids, eight bytes each, reserved once so that the table never moves.
-    const sys::VmRegion region = sys::vmReserve(std::size_t(kDefaultMaxShapes) * sizeof(Shape*));
+    // 2^23 ids, eight bytes each, reserved once so that the table never moves.
+    const sys::VmRegion region = sys::vmReserve(std::size_t(kShapeIdSpace) * sizeof(Shape*));
     shapeRegionBase_ = region.base;
     shapeRegionBytes_ = region.bytes;
     shapeTable_ = static_cast<Shape**>(region.base);

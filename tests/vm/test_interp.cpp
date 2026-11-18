@@ -256,6 +256,9 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         {"var s = new Set([1, 2, 3]); var it = s[Symbol.iterator](); s.delete(1); String(it.next().value)", "2"},
         {"var s = new Set(); s.add(1); s.add(2); for (var x of s) { if (x < 5) s.add(x + 2); } [...s].join()", "1,2,3,4,5,6"},
         {"var s = new Set([1, 2, 3]); var r = []; for (var x of s) { r.push(x); if (x < 3) s.add(x + 10); } r.join()", "1,2,3,11,12"},
+        // Shapes of prototypes that died are used again: a loop that makes a constructor each time outlasts the table.
+        {"var n = 0; for (var i = 0; i < 600000; i++) { function C() { this.a = 1; } C.prototype.m = function () {}; var o = new C(); o.b = 2; n += o.a + o.b; } String(n)",
+         "1800000"},
         // The stack text starts with the error's own; `trim` takes every space of the language.
         {"var e = new Error('m'); String(e.stack.indexOf('Error: m'))", "0"},
         {"'x'.padEnd(3, 'ab') + ' abc '.trim().length + '\\u2003x\\u3000'.trim().length", "xab31"},

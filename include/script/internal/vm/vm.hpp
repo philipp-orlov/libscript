@@ -196,7 +196,7 @@ struct VM : EngineRuntime
 
     // ---- shapes ----
     /// Shape ids index this table, which is reserved once so that its address never changes.
-    Shape* shapeById(std::uint32_t id) const noexcept { return shapeTable_[id]; }
+    Shape* shapeById(std::uint32_t id) const noexcept { return shapeTable_[id & kShapeIndexMask]; }
     /// The table of shapes by id; it never moves, so compiled code can name it.
     Shape* const* shapeTable() const noexcept { return shapeTable_; }
     /// Whether `new` of `f` finds `prototype` as a data property in slot 2 (`Shape::kProtoAt2`).
@@ -480,6 +480,7 @@ private:
     bool holePlain_ = false;
     ValidityCell* allocValidity();
     void freeValidity(ValidityCell* cell) noexcept;
+    void releaseShapeId(std::uint32_t id) noexcept;
 
     void destroyNow(CellPtr cell) noexcept;
     friend struct Shape;

@@ -245,7 +245,7 @@ JSValue matchArray(VM& vm, RegExpData* d, JSValue input, StringView s, const Mat
 
 /// What `RegExp.lastMatch` and its kin report: a match of a RegExp made by the constructor itself replaces them, and one of a
 /// subclass instance makes them throw.
-void noteLegacyMatch(VM& vm, const RegExpData* d, JSValue text, const Match& m)
+void noteLegacyBounds(VM& vm, const RegExpData* d, JSValue text, const std::int32_t* bounds, std::size_t groups)
 {
     if (!d->legacy) {
         vm.legacyInvalid = true;
@@ -255,9 +255,14 @@ void noteLegacyMatch(VM& vm, const RegExpData* d, JSValue text, const Match& m)
     release(vm.legacyInput);
     vm.legacyInput = text;
     vm.legacyInvalid = false;
-    vm.legacyGroups = std::uint8_t(std::min<std::size_t>(m.groups(), 10));
+    vm.legacyGroups = std::uint8_t(std::min<std::size_t>(groups, 10));
     for (std::size_t i = 0; i < 2u * vm.legacyGroups; ++i)
-        vm.legacyBounds[i] = m.bounds[i];
+        vm.legacyBounds[i] = bounds[i];
+}
+
+void noteLegacyMatch(VM& vm, const RegExpData* d, JSValue text, const Match& m)
+{
+    noteLegacyBounds(vm, d, text, m.bounds.data(), m.groups());
 }
 
 /// RegExpBuiltinExec: a match array, null, or the exception sentinel.
@@ -290,6 +295,33 @@ JSValue builtinExec(VM& vm, JSValue re, JSValue input)
         return JSValue::exception();
     noteLegacyMatch(vm, d, text.get(), m);
     return matchArray(vm, d, text.get(), s, m);
+}
+
+/// `builtinExec` for a caller that wants to know only whether it matched: no match array, no capture strings, no vector of
+/// bounds (the matcher's registers are read where they are). 1 a match, 0 none, -1 an exception.
+int builtinTest(VM& vm, JSValue re, JSValue input)
+{
+    RegExpData* d = dataOf(re);
+    JSObject* o = asObject(re);
+    Handle text = Handle::adopt(toStringValue(vm, input));
+    if (text.get().isException())
+        return -1;
+    StringView s = asString(text.get())->text();
+    const bool useIndex = (d->flags & (regex::kGlobal | regex::kSticky)) != 0;
+    double last = 0;
+    if (!readLastIndex(vm, o, &last))
+        return -1;
+    if (!useIndex)
+        last = 0;
+    if (last > double(s.size()) || !regex::exec(*d->program, s, std::size_t(last), d->matcher)) {
+        if (useIndex && !writeLastIndex(vm, o, 0))
+            return -1;
+        return 0;
+    }
+    if (useIndex && !writeLastIndex(vm, o, d->matcher.registers[1]))
+        return -1;
+    noteLegacyBounds(vm, d, text.get(), d->matcher.registers.data(), regex::groupCount(*d->program));
+    return 1;
 }
 
 std::size_t advance(StringView s, std::size_t i, bool unicode)
@@ -642,6 +674,10 @@ NATIVE(regexpTest)
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
+    if (pristine(vm, self)) {
+        const int hit = builtinTest(vm, self, text.get());
+        return hit < 0 ? JSValue::exception() : JSValue::boolean(hit != 0);
+    }
     JSValue r = regExpExec(vm, self, text.get());
     if (r.isException())
         return r;

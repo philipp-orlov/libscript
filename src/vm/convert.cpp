@@ -80,7 +80,7 @@ Key toPropertyKey(VM& vm, JSValue v)
     Key s = nullptr;
     if (isString(v)) {
         StringCell* text = asString(v);
-        s = text->interned ? text : vm.ctx.intern(text);
+        s = text->interned ? text : vm.ctx.atomize(text);
     } else if (isSymbol(v)) {
         s = v.asCell();
     } else if (v.isNumber()) {
@@ -101,7 +101,12 @@ Key toPropertyKey(VM& vm, JSValue v)
 
 JSValue concatStrings(VM& vm, JSValue a, JSValue b)
 {
-    return fromValue(vm, vm.ctx.concat(asString(a), asString(b)));
+    StringCell* x = asString(a);
+    StringCell* y = asString(b);
+    const std::size_t total = std::size_t(x->length) + y->length;
+    if (total <= ContextImpl::kInternedLength && x->length && y->length)
+        return fromValue(vm, vm.ctx.fresh(x->text(), y->text()));  // not interned: what is made is rarely asked for again
+    return fromValue(vm, vm.ctx.concat(x, y));
 }
 
 int compareStrings(JSValue a, JSValue b) noexcept
@@ -113,7 +118,17 @@ int compareStrings(JSValue a, JSValue b) noexcept
 
 bool stringsEqual(JSValue a, JSValue b) noexcept
 {
-    return a == b || asString(a)->text() == asString(b)->text();
+    if (a == b)
+        return true;
+    const StringCell* x = asString(a);
+    const StringCell* y = asString(b);
+    if (x->length != y->length)
+        return false;
+    if (x->interned && y->interned)
+        return false;  // two atoms of one text are one cell
+    if (x->hash_ && y->hash_ && x->hash_ != y->hash_)
+        return false;
+    return x->text() == y->text();
 }
 
 }  // namespace vm

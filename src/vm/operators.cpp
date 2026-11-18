@@ -350,10 +350,10 @@ JSValue toStringValue(VM& vm, JSValue v)
         } while (n);
         if (negative)
             *--p = u'-';
-        return makeString(vm, StringView(p, std::size_t(end - p)));
+        return fromValue(vm, vm.ctx.fresh(StringView(p, std::size_t(end - p))));
     }
     if (v.isDouble())
-        return makeString(vm, numberToString(v.asDouble()));
+        return fromValue(vm, vm.ctx.fresh(numberToString(v.asDouble())));
     if (v.isUndefined())
         return makeString(vm, std::string_view("undefined"));
     if (v.isNull())

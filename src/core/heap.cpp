@@ -659,11 +659,45 @@ StringCell* ContextImpl::intern(StringCell* s)
     return cell;
 }
 
+StringCell* ContextImpl::atomize(StringCell* s)
+{
+    if (s->interned)
+        return s;
+    const StringView text = s->text();
+    const std::size_t hash = s->hash();
+    if (StringCell* existing = stringTable.find(text, hash))
+        return existing;
+    if (!(s->bits & (StringCell::kOutOfLine | StringCell::kRope))) {
+        // Its own text, not a part of another string's: the cell itself becomes the atom, so that using it as a name again
+        // finds it marked. The table's count is added to the holder's.
+        s->hash_ = hash;
+        s->interned = true;
+        detail::incRef(s);
+        stringTable.insert(s);
+        return s;
+    }
+    StringCell* cell = newString(text);
+    cell->hash_ = hash;
+    cell->interned = true;
+    stringTable.insert(cell);
+    return cell;
+}
+
 Value ContextImpl::str(StringView text)
 {
     if (text.size() <= kInternedLength)
         return detail::Access::make(Type::String, intern(text));
     return detail::Access::adopt(Type::String, newString(text));
+}
+
+Value ContextImpl::fresh(StringView text)
+{
+    return detail::Access::adopt(Type::String, newString(text));
+}
+
+Value ContextImpl::fresh(StringView head, StringView tail)
+{
+    return detail::Access::adopt(Type::String, newString(head, tail));
 }
 
 Value ContextImpl::substring(StringCell* s, std::size_t start, std::size_t count)

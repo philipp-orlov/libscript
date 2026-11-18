@@ -119,7 +119,7 @@ TEST(propertyKeysFromEveryKindOfValue)
     // A string that is not interned yet maps to the interned one.
     StringCell* loose = f.ctx.impl()->newString(u"looseName");
     Key k = toPropertyKey(vm, JSValue::cell(loose));
-    CHECK(k != loose && k->kind == script::detail::CellKind::String);
+    CHECK(k == loose && k->kind == script::detail::CellKind::String);  // the string itself becomes the atom
     CHECK(static_cast<StringCell*>(k)->interned);
     CHECK(k == toPropertyKey(vm, JSValue::cell(f.ctx.impl()->intern(u"looseName"))));
     // An object is not a key.

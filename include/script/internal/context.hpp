@@ -210,6 +210,10 @@ struct ContextImpl
     StringCell* intern(StringView text);
     /// The interned string with `s`'s text: `s` itself when it is one, found with the hash `s` keeps.
     StringCell* intern(StringCell* s);
+    /// `intern`, but a string that holds its own characters becomes the atom itself (the table takes a count of it), so that a
+    /// string made by an operation and then used as a name is found marked the next time. For the cores that do not hold
+    /// strings by identity.
+    StringCell* atomize(StringCell* s);
     StringCell* intern(const char* asciiText) { return intern(ascii(asciiText)); }
     /// A fresh string cell that is not interned.
     StringCell* newString(StringView text);
@@ -219,6 +223,10 @@ struct ContextImpl
     /// million and they are usually names, so one lookup saves the cell.
     Value str(StringView text);
     Value str(const char* asciiText) { return str(ascii(asciiText)); }
+    /// A string value that is not interned, whatever its length: for the result of an operation, which is usually not looked up
+    /// again (it becomes an atom, in place, when a program uses it as a property name).
+    Value fresh(StringView text);
+    Value fresh(StringView head, StringView tail);
     /// `str` of `head` and `tail` joined.
     Value concat(StringView head, StringView tail);
     /// `head + tail`, as a rope when it is long enough to be worth not copying.

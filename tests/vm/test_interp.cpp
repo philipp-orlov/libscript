@@ -189,6 +189,13 @@ TEST(everySnippetAgreesWhenFunctionsAreCompiledOnTheirFirstCall)
           "return [...g(4)].join(); } run()");
     check("function outer() { var v = 1; function mid() { var w = 2; function inner() { return v + w; } return inner(); } return mid(); } String(outer())");
     check("function f() { return x; } var r; try { f(); } catch (e) { r = e.name; } let x = 1; r + f()");
+    // A name a nested function declares for itself is not the variable around it; one it only declares in an inner block is.
+    check("function f() { var e = 1, t = 2; var g = function (e) { var t = e + 1; return function () { return e + t; }; }; "
+          "e++; t++; return g(10)() + ',' + e + t; } f()");
+    check("function f() { var x = 1; function g() { { let x = 5; } return x; } x = 2; return g(); } String(f())");
+    check("function f(n) { var r = function r(k) { return k ? k + r(k - 1) : 0; }; return r(n); } String(f(4))");
+    check("function f() { var a = 1; function g(b) { return function () { return function () { return a + b; }; }; } a = 5; return g(2)()(); } String(f())");
+    check("function f() { var v = 1; function g(p = function () { return v; }) { var v = 2; return p(); } v = 3; return g(); } String(f())");
     CHECK_EQ(failed, 0);
 }
 

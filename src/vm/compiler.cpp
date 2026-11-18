@@ -187,6 +187,36 @@ struct CaptureCache
 
 void capturedWalk(const Node& n, NameViews& out, bool nested, bool arrowChain, CaptureCache& cache, bool self);
 
+void collectPatternNames(const Node& n, std::vector<String>& out);
+void collectVars(const Node& n, std::vector<String>& out);
+
+/// The names function `n` declares in its own function-level scope, which every reference inside it (a nested function's
+/// too) finds there and never in the code around: its simple parameters, its own name when it is a function expression, and
+/// the `var`s, function declarations, classes and top-level `let`/`const` of its body. False when a parameter is a pattern
+/// or has a default, whose expressions run before the body's names exist.
+bool declaredByFunction(const Node& n, std::vector<String>& out)
+{
+    for (const dyn::NodePtr& p : n.list)
+        if (p->kind != NK::Identifier)
+            return false;
+    for (const dyn::NodePtr& p : n.list)
+        out.push_back(p->text);
+    if (n.kind == NK::FunctionExpr && n.namedExpr && !n.text.empty())
+        out.push_back(n.text);
+    if (!n.d || (n.d->kind != NK::Block && n.d->kind != NK::Program))
+        return true;
+    collectVars(*n.d, out);
+    for (const dyn::NodePtr& s : n.d->list) {
+        if (s->kind == NK::FunctionDecl || s->kind == NK::ClassDecl) {
+            out.push_back(s->text);
+        } else if (s->kind == NK::VarDecl && s->varKind != VarKind::Var) {
+            for (const dyn::NodePtr& d : s->list)
+                collectPatternNames(*d->a, out);
+        }
+    }
+    return true;
+}
+
 /// The names a node at nested depth contributes, with everything inside it.
 const NameViews& capturedBelow(const Node& n, bool arrowChain, CaptureCache& cache)
 {
@@ -197,6 +227,19 @@ const NameViews& capturedBelow(const Node& n, bool arrowChain, CaptureCache& cac
     capturedWalk(n, names, true, arrowChain, cache, true);
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
+    // What the function declares for itself is not captured from outside, whichever scope of its body mentions it.
+    if (isFunctionNode(n)) {
+        std::vector<String> own;
+        if (declaredByFunction(n, own) && !own.empty()) {
+            std::vector<std::u16string_view> gone;
+            for (const String& name : own)
+                gone.emplace_back(name.data(), name.size());
+            std::sort(gone.begin(), gone.end());
+            names.erase(std::remove_if(names.begin(), names.end(),
+                                       [&](std::u16string_view name) { return std::binary_search(gone.begin(), gone.end(), name); }),
+                        names.end());
+        }
+    }
     names.shrink_to_fit();
     return slot.emplace(&n, std::move(names)).first->second;  // references into an unordered_map survive rehashing
 }

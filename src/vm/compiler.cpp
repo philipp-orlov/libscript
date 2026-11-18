@@ -54,6 +54,20 @@ enum class BKind : std::uint8_t
     FnName,
 };
 
+/// The words strict code may not use as names; a test on the length first, since this runs for every name in strict code.
+inline bool isStrictReserved(const String& s) noexcept
+{
+    switch (s.size()) {
+        case 3: return s == u"let";
+        case 5: return s == u"yield";
+        case 6: return s == u"public" || s == u"static";
+        case 7: return s == u"package" || s == u"private";
+        case 9: return s == u"interface" || s == u"protected";
+        case 10: return s == u"implements";
+        default: return false;
+    }
+}
+
 struct Binding
 {
     String name;
@@ -1251,9 +1265,8 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             if (n.isPrivate)
                 fn_->block->flags |= CodeBlock::kPrivate;
             if (fn_->strict && !n.isPrivate)
-                for (const char* word : {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"})
-                    if (n.text == fromUtf8(word))
-                        syntaxError(n, "Unexpected strict mode reserved word");
+                if (isStrictReserved(n.text))
+                    syntaxError(n, "Unexpected strict mode reserved word");
             // A field initialiser has no `arguments`, and eval code in one may not name it.
             if (fn_->isEval && n.text == u"arguments" && resolve(n.text).kind == Ref::Global && resolve(String(u"%noargs")).kind != Ref::Global)
                 syntaxError(n, "'arguments' is not allowed in class field initializer or static initialization block");
@@ -3026,9 +3039,8 @@ void Compiler::checkBindingName(const String& name, const Node& at)
         return;
     if (name == u"eval" || name == u"arguments")
         syntaxError(at, "Unexpected eval or arguments in strict mode");
-    for (const char* word : {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"})
-        if (name == fromUtf8(word))
-            syntaxError(at, "Unexpected strict mode reserved word");
+    if (isStrictReserved(name))
+        syntaxError(at, "Unexpected strict mode reserved word");
 }
 
 /// The names the parameters bind; a duplicate is an error in strict code, with a non-simple list, in an arrow and in a method.
@@ -3378,7 +3390,7 @@ void Compiler::forStatement(const Node& n)
             collectPatternNames(*d->a, names);
         for (const String& name : names) {
             Binding& b = declare(name, n.a->varKind == VarKind::Const ? BKind::Const : BKind::Let);
-            b.tdz = mentions(*n.a, name) && false;
+            b.tdz = false;
             if (b.boxed)
                 emit(Op::NewBox, b.reg);
         }
@@ -3783,6 +3795,7 @@ void Compiler::tryStatement(const Node& n)
 CodeBlock* Compiler::compileFunction(const Node& n, const String& name)
 {
     const bool saved = noFuse_;
+    noFuse_ = false;  // a function inside one that needed it does not: its jumps are its own
     const std::uint32_t extra = pendingFlags_;
     pendingFlags_ = 0;
     for (;;) {

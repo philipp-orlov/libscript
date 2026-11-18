@@ -148,9 +148,32 @@ bool writeLastIndex(VM& vm, JSObject* o, double v)
 }
 
 /// The capture bounds of the last successful match.
+struct Bounds
+{
+    static constexpr std::size_t kInline = 20;  // a match with up to nine groups needs no allocation
+    std::int32_t small[kInline];
+    std::vector<std::int32_t> big;
+    std::size_t n = 0;
+    std::size_t size() const { return n; }
+    std::int32_t* data() { return big.empty() ? small : big.data(); }
+    const std::int32_t* data() const { return big.empty() ? small : big.data(); }
+    std::int32_t operator[](std::size_t i) const { return data()[i]; }
+    void assign(const std::int32_t* from, std::size_t count)
+    {
+        n = count;
+        if (count <= kInline) {
+            big.clear();
+            for (std::size_t i = 0; i < count; ++i)
+                small[i] = from[i];
+        } else {
+            big.assign(from, from + count);
+        }
+    }
+};
+
 struct Match
 {
-    std::vector<std::int32_t> bounds;  // two per group
+    Bounds bounds;  // two per group
     std::size_t groups() const { return bounds.size() / 2; }
     std::int32_t start() const { return bounds[0]; }
     std::int32_t end() const { return bounds[1]; }
@@ -161,7 +184,7 @@ bool runExec(RegExpData* d, StringView s, std::size_t start, Match* out)
     if (!regex::exec(*d->program, s, start, d->matcher))
         return false;
     const std::size_t n = regex::groupCount(*d->program);
-    out->bounds.assign(d->matcher.registers.begin(), d->matcher.registers.begin() + 2 * n);
+    out->bounds.assign(d->matcher.registers.data(), 2 * n);
     return true;
 }
 

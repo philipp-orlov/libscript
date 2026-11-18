@@ -5247,3 +5247,25 @@ TEST(theMegamorphicReadCacheFollowsPrototypesDictionariesAndGetters)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("477000 1151 999 4 999 proto own proto 78000 78700 15000"));
     }
 }
+
+TEST(aScopeOfManyNamesFindsEachAndChecksReadsBeforeTheirDeclaration)
+{
+    // More than sixteen names in one scope are looked up through an index; a `let` read before its declaration (directly,
+    // through a hoisted function, or through a closure made earlier) is still caught, and one read only after is not.
+    std::string decls, sum;
+    for (int i = 0; i < 40; ++i) {
+        decls += "let v" + std::to_string(i) + " = " + std::to_string(i) + ";";
+        sum += (i ? "+v" : "v") + std::to_string(i);
+    }
+    const std::string program =
+        "var out=[];"
+        "(function(){ var early=function(){ return v39; }; try{ early(); out.push('no'); }catch(e){ out.push(e.name); }"
+        + decls +
+        " function hoisted(){ return v5 + v38; }"
+        " out.push(" + sum + ", hoisted(), early());"
+        " { let inner = 1; let v3 = 100; out.push(v3 + inner + v4); }"
+        " try{ late; out.push('no'); }catch(e){ out.push(e.name); } let late = 2;"
+        " const after = () => v0 + 1; out.push(after()); })();"
+        "out.join(' ')";
+    CHECK_EQ(run(program.c_str()), std::string("ReferenceError 780 43 39 105 ReferenceError 1"));
+}

@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
@@ -61,10 +64,36 @@ struct Binding
     bool initialized = false;  ///< the declaration has run, on the path being compiled
 };
 
+struct NameHash
+{
+    std::size_t operator()(const String& s) const noexcept { return std::hash<std::u16string_view>()(s); }
+};
+
 struct Scope
 {
     std::vector<Binding> bindings;
     std::uint16_t baseTop = 0;
+
+    /// The first binding of this name. A scope of many names (a bundle's module function) is looked up through an index
+    /// that takes in the bindings added since the last lookup; bindings are only ever appended.
+    Binding* find(const String& name)
+    {
+        if (bindings.size() <= kScan) {
+            for (Binding& b : bindings)
+                if (b.name == name)
+                    return &b;
+            return nullptr;
+        }
+        for (; indexed < bindings.size(); ++indexed)
+            index.emplace(bindings[indexed].name, std::uint32_t(indexed));
+        const auto it = index.find(name);
+        return it == index.end() ? nullptr : &bindings[it->second];
+    }
+
+private:
+    static constexpr std::size_t kScan = 16;
+    std::unordered_map<String, std::uint32_t, NameHash> index;
+    std::size_t indexed = 0;
 };
 
 struct FusionOverflow
@@ -130,26 +159,59 @@ bool isFunctionNode(const Node& n) noexcept
 
 /// The names a function's nested functions mention, and whether an arrow inside it reads `this`: those variables
 /// live in boxes. A name used by any nested function counts, whichever scope declares it, which over-approximates.
-void collectCaptured(const Node& n, std::set<String>& out, bool nested, bool arrowChain)
+///
+/// Every function's compile asks this of its body, so what a nested function contributes is kept (`CaptureCache`, by node,
+/// as views of the tree's own names) and a function nested d deep is walked a few times, not d times.
+using NameViews = std::vector<std::u16string_view>;
+
+struct CaptureCache
+{
+    std::unordered_map<const Node*, NameViews> below[2];  ///< by the arrow chain the node is reached with
+};
+
+void capturedWalk(const Node& n, NameViews& out, bool nested, bool arrowChain, CaptureCache& cache, bool self);
+
+/// The names a node at nested depth contributes, with everything inside it.
+const NameViews& capturedBelow(const Node& n, bool arrowChain, CaptureCache& cache)
+{
+    auto& slot = cache.below[arrowChain ? 1 : 0];
+    if (const auto it = slot.find(&n); it != slot.end())
+        return it->second;
+    NameViews names;
+    capturedWalk(n, names, true, arrowChain, cache, true);
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    names.shrink_to_fit();
+    return slot.emplace(&n, std::move(names)).first->second;  // references into an unordered_map survive rehashing
+}
+
+void capturedWalk(const Node& n, NameViews& out, bool nested, bool arrowChain, CaptureCache& cache, bool self)
 {
     checkNativeStack();
+    const bool boundary = isFunctionNode(n) || n.kind == NK::FieldDef || n.kind == NK::StaticBlock;
+    // A boundary node adds nothing itself and its children are nested either way, so the summary serves at any depth.
+    if (boundary && !self) {
+        const NameViews& names = capturedBelow(n, arrowChain, cache);
+        out.insert(out.end(), names.begin(), names.end());
+        return;
+    }
     if (n.kind == NK::Identifier && nested)
-        out.insert(n.text);
+        out.push_back(n.text);
     if ((n.kind == NK::ThisExpr || n.kind == NK::SuperExpr) && nested && arrowChain) {
-        out.insert(String(u"this"));
-        out.insert(String(u"%bound"));
+        out.push_back(u"this");
+        out.push_back(u"%bound");
     }
     if (n.kind == NK::NewTarget && nested && arrowChain)
-        out.insert(String(u"%newtarget"));
+        out.push_back(u"%newtarget");
     // A direct `eval` can name any variable around it, so none of them may live in a bare register.
     if (n.kind == NK::Call && n.a && n.a->kind == NK::Identifier && n.a->text == u"eval") {
-        out.insert(String(u"%all"));
-        out.insert(String(u"%newtarget"));
+        out.push_back(u"%all");
+        out.push_back(u"%newtarget");
     }
     // `super()` in an arrow function needs the constructor around it and its new.target.
     if (n.kind == NK::Call && n.a && n.a->kind == NK::SuperExpr && nested && arrowChain) {
-        out.insert(String(u"%callee"));
-        out.insert(String(u"%newtarget"));
+        out.push_back(u"%callee");
+        out.push_back(u"%newtarget");
     }
     bool childNested = nested, childArrow = arrowChain;
     if (isFunctionNode(n)) {
@@ -162,9 +224,17 @@ void collectCaptured(const Node& n, std::set<String>& out, bool nested, bool arr
     }
     for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
         if (*child)
-            collectCaptured(**child, out, childNested, childArrow);
+            capturedWalk(**child, out, childNested, childArrow, cache, false);
     for (const dyn::NodePtr& child : n.list)
-        collectCaptured(*child, out, childNested, childArrow);
+        capturedWalk(*child, out, childNested, childArrow, cache, false);
+}
+
+void collectCaptured(const Node& n, std::set<String>& out, CaptureCache& cache)
+{
+    NameViews names;
+    capturedWalk(n, names, false, true, cache, false);
+    for (std::u16string_view name : names)
+        out.emplace_hint(out.end(), name);
 }
 
 /// The names `var` declares in a statement list, looking through blocks but not into functions.
@@ -378,17 +448,49 @@ bool mentions(const Node& n, const String& name)
     return false;
 }
 
-/// A `let`, `const` or `class` binding needs a hole at scope entry when something can read it before it is initialised:
-/// text before its declaration, its own initialiser, or a function declaration, which is made at scope entry.
-bool needsTdz(const std::vector<dyn::NodePtr>& statements, std::size_t declIndex, const String& name)
+/// Marks the names of `declAt` that statement `at` of a list mentions where they can be read before they are initialised.
+/// A nested function is looked at through the names it mentions (`capturedBelow`), which are kept for each one.
+void markEarlyReads(const Node& n, std::size_t at, bool hoisted,
+                    const std::unordered_map<std::u16string_view, std::size_t>& declAt,
+                    std::unordered_set<std::u16string_view>& early, CaptureCache& cache)
 {
-    for (std::size_t i = 0; i <= declIndex; ++i)
-        if (mentions(*statements[i], name))
-            return true;
-    for (std::size_t i = declIndex + 1; i < statements.size(); ++i)
-        if (statements[i]->kind == NK::FunctionDecl && mentions(*statements[i], name))
-            return true;
-    return false;
+    checkNativeStack();
+    const auto mark = [&](std::u16string_view name) {
+        const auto it = declAt.find(name);
+        if (it != declAt.end() && (at <= it->second || hoisted))
+            early.insert(it->first);
+    };
+    if (isFunctionNode(n) || n.kind == NK::FieldDef || n.kind == NK::StaticBlock) {
+        for (std::u16string_view name : capturedBelow(n, true, cache))
+            mark(name);
+        return;
+    }
+    if (n.kind == NK::Identifier)
+        mark(n.text);
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child)
+            markEarlyReads(**child, at, hoisted, declAt, early, cache);
+    for (const dyn::NodePtr& child : n.list)
+        if (child)
+            markEarlyReads(*child, at, hoisted, declAt, early, cache);
+}
+
+/// The `let` and `const` names of a statement list that need a hole at scope entry because something can read them before
+/// they are initialised: text before the declaration, its own initialiser, or a function declaration, which is made at scope
+/// entry. One walk over the list, however many names it declares.
+std::unordered_set<std::u16string_view> earlyReadNames(const std::vector<dyn::NodePtr>& statements,
+                                                       const std::vector<std::pair<String, std::size_t>>& names,
+                                                       CaptureCache& cache)
+{
+    std::unordered_set<std::u16string_view> early;
+    if (names.empty())
+        return early;
+    std::unordered_map<std::u16string_view, std::size_t> declAt;
+    for (const auto& [name, at] : names)
+        declAt.emplace(std::u16string_view(name), at);
+    for (std::size_t i = 0; i < statements.size(); ++i)
+        markEarlyReads(*statements[i], i, statements[i]->kind == NK::FunctionDecl, declAt, early, cache);
+    return early;
 }
 
 /// Whether evaluating a node can assign to a variable of this function.
@@ -526,6 +628,7 @@ private:
     bool chainUsed_ = false;
     bool noFuse_ = false;
     bool discard_ = false;  ///< the expression about to be compiled has its value thrown away
+    CaptureCache captures_;  ///< what each nested function captures, by node, for the whole tree being compiled
 
     // ---------------------------------------------------------------- emit ---
     std::uint32_t pc() const noexcept { return std::uint32_t(fn_->block->code.size()); }
@@ -699,9 +802,8 @@ private:
     Binding* findInScopes(Fn& fn, const String& name)
     {
         for (std::size_t i = fn.scopes.size(); i-- > 0;)
-            for (Binding& b : fn.scopes[i].bindings)
-                if (b.name == name)
-                    return &b;
+            if (Binding* b = fn.scopes[i].find(name))
+                return b;
         return nullptr;
     }
 
@@ -724,11 +826,8 @@ private:
     Binding& declare(const String& name, BKind kind)
     {
         Scope& scope = fn_->scopes.back();
-        for (Binding& b : scope.bindings)
-            if (b.name == name) {
-                // A second `var` or function of the same name is the first one.
-                return b;
-            }
+        if (Binding* b = scope.find(name))
+            return *b;  // a second `var` or function of the same name is the first one
         Binding b;
         b.name = name;
         b.kind = kind;
@@ -1821,9 +1920,9 @@ CodeBlock* Compiler::compileInitOnce(const std::vector<const Node*>& items, bool
     for (const Node* item : items) {
         if (item->kind == NK::FieldDef) {
             if (item->b)
-                collectCaptured(*item->b, child.captured, false, true);
+                collectCaptured(*item->b, child.captured, captures_);
         } else if (item->kind == NK::StaticBlock) {
-            collectCaptured(*item->d, child.captured, false, true);
+            collectCaptured(*item->d, child.captured, captures_);
         }
     }
     Fn* saved = fn_;
@@ -2782,6 +2881,16 @@ void Compiler::statements(const std::vector<dyn::NodePtr>& list)
 /// scope entry: a hole where a read can precede the declaration, and a fresh box where a closure captures it.
 void Compiler::declareLexical(const std::vector<dyn::NodePtr>& list)
 {
+    std::vector<std::pair<String, std::size_t>> lexical;
+    for (std::size_t i = 0; i < list.size(); ++i)
+        if (list[i]->kind == NK::VarDecl && list[i]->varKind != VarKind::Var) {
+            std::vector<String> names;
+            for (const dyn::NodePtr& d : list[i]->list)
+                collectPatternNames(*d->a, names);
+            for (String& name : names)
+                lexical.emplace_back(std::move(name), i);
+        }
+    const std::unordered_set<std::u16string_view> early = earlyReadNames(list, lexical, captures_);
     for (std::size_t i = 0; i < list.size(); ++i) {
         const Node& s = *list[i];
         if (s.kind == NK::ClassDecl) {
@@ -2800,7 +2909,7 @@ void Compiler::declareLexical(const std::vector<dyn::NodePtr>& list)
             collectPatternNames(*d->a, names);
         for (const String& name : names) {
             Binding& b = declare(name, s.varKind == VarKind::Const ? BKind::Const : BKind::Let);
-            b.tdz = needsTdz(list, i, name);
+            b.tdz = early.count(std::u16string_view(name)) != 0;
             b.initialized = false;
             if (b.tdz)
                 emit(Op::LoadUninit, b.reg);
@@ -3699,9 +3808,9 @@ CodeBlock* Compiler::compileFunctionOnce(const Node& n, const String& name, std:
         block->flags |= CodeBlock::kStrict;
     if (arrow)
         block->flags |= CodeBlock::kArrow;
-    collectCaptured(*n.d, child.captured, false, true);
+    collectCaptured(*n.d, child.captured, captures_);
     for (const dyn::NodePtr& p : n.list)
-        collectCaptured(*p, child.captured, false, true);
+        collectCaptured(*p, child.captured, captures_);
 
     Fn* saved = fn_;
     const std::uint32_t savedLine = line_;
@@ -4014,7 +4123,7 @@ CodeBlock* Compiler::evalOnce(const Node& program, const std::vector<String>& na
     top.strict = strict || hasUseStrict(program);
     if (top.strict)
         block->flags |= CodeBlock::kStrict;
-    collectCaptured(program, top.captured, false, true);
+    collectCaptured(program, top.captured, captures_);
     fn_ = &top;
     try {
         top.top = 1;
@@ -4093,7 +4202,7 @@ CodeBlock* Compiler::programOnce(const Node& program)
     top.strict = hasUseStrict(program);
     if (top.strict)
         block->flags |= CodeBlock::kStrict;
-    collectCaptured(program, top.captured, false, true);
+    collectCaptured(program, top.captured, captures_);
     fn_ = &top;
     try {
         top.top = 1;

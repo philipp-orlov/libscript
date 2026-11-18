@@ -754,12 +754,23 @@ void JSArray::removeRange(VM& vm, std::uint32_t from, std::uint32_t count)
     if (!count)
         return;
     // Keep the removed ones aside while the gap closes, so a destructor sees a consistent array.
-    Vec<JSValue> removed(elems + from, elems + from + count);
+    JSValue few[4];
+    Vec<JSValue> many;
+    JSValue* removed = few;
+    if (count > 4) {
+        many.assign(elems + from, elems + from + count);
+        removed = many.data();
+    } else {
+        for (std::uint32_t i = 0; i < count; ++i)
+            few[i] = elems[from + i];
+    }
     std::memmove(elems + from, elems + from + count, 8u * (length - from - count));
     length -= count;
-    repack(from);
-    for (JSValue v : removed)
-        release(v);
+    // The numbers known below `packed` that were after the gap are now `count` places lower: the bound moves with them.
+    if (packed > from)
+        packed = packed >= from + count ? packed - count : from;
+    for (std::uint32_t i = 0; i < count; ++i)
+        release(removed[i]);
 }
 
 void JSArray::insertGap(VM& vm, std::uint32_t at, std::uint32_t count)

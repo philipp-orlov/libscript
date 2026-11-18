@@ -2938,6 +2938,7 @@ do_call: {
         NEXT();
     }
     TICK();
+    SCRIPT_VM_CENSUS(ScriptCalls);
     CodeBlock* c = f->code;
     if ((c->flags & CodeBlock::kClassConstructor) && !isNew && !isSuper) [[unlikely]] {
         vm.throwError(ErrorCode::TypeError, "class constructor " + (c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string()) +

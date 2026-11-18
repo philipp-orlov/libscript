@@ -247,7 +247,7 @@ std::uint64_t censusTable[std::size_t(Census::Count)] = {};
 
 const char* const kCensusNames[] = {
     "SlowGetProp", "SlowPutProp", "SlowCall", "SlowElem", "IcMiss", "IcMonoToPoly", "IcToMega", "ChainInvalidated",
-    "Tier1Compiled", "Tier2Compiled", "Tier2Exit", "Tier2Invalidated", "ThrowCount", "CycleMinor", "CycleOld",
+    "Tier1Compiled", "Tier2Compiled", "Tier2Exit", "Tier2Invalidated", "ThrowCount", "ScriptCalls", "CycleMinor", "CycleOld",
     "CycleFull", "FreeDeferred",
 };
 static_assert(sizeof(kCensusNames) / sizeof(kCensusNames[0]) == std::size_t(Census::Count), "a name per counter");

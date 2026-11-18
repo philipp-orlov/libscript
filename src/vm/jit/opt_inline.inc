@@ -845,6 +845,11 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             result = regs[ci.a];
             return !stale(result);
         default:
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (!emit && depth == 0)
+                if (const char* t = std::getenv("T2INL"); t && *t == '2')
+                    std::fprintf(stderr, "inline refused: %s in a body of %u instructions\n", opName(op), unsigned(C->code.size()));
+#endif
             return false;
         }
     }
@@ -973,8 +978,10 @@ void Baseline::planDirectCalls()
             continue;
         const unsigned base = in.b, argc = in.c;
         const JSValue f = constantBefore(i, base);
-        if (!isFunction(f))
+        if (!isFunction(f)) {
+            planCodeCall(i);
             continue;
+        }
         auto* fn = static_cast<JSFunction*>(asObject(f));
         if (fn->flags & JSFunction::kNative)
             continue;
@@ -1037,6 +1044,28 @@ void Baseline::planDirectCalls()
             if (starts[m] > std::uint32_t(d))
                 exitRedirect_[starts[m]] = std::int32_t(d);
     }
+}
+
+/// A call whose callee is no constant (a method, a function in a variable): the callee that site has called, by its code's
+/// uid, is checked at the call and the frame is pushed from constants, as for a global function.
+void Baseline::planCodeCall(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    if (i >= code_->callProf.size() || !code_->callProf[i])
+        return;
+    CodeBlock* C = vm_.codeByUid(code_->callProf[i]);
+    const unsigned argc = in.c;
+    if (!C || C == code_ || C->inlinedFrom || argc > C->nparams ||
+        (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+                     CodeBlock::kClassConstructor | CodeBlock::kProgram)))
+        return;
+    if (inlineCall(i, true))
+        return;
+    directCalls_[i] = DirectCall{JSValue::raw(0), C, 0, false, 0, false, true};
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2INL"))
+        std::fprintf(stderr, "code call @%u of %s\n", i, codeName(C).c_str());
+#endif
 }
 
 /// A `new` made in place after another of the same constructor, with nothing between that could change the global, the
@@ -1482,8 +1511,19 @@ void Baseline::emitDirectCall(std::uint32_t i)
     Label& tickStub = coldLabels_.emplace_back();
     Label& fillStub = coldLabels_.emplace_back();
     a_.bind(retry);
-    // The global still holds the function (unless a self guard just saw that it does).
-    if (selfChecked_[i] && dc.fn == selfFn_) {
+    if (dc.byCode) {
+        // The register holds a function of that code (compared by uid: a block that died leaves no stale match).
+        a_.mov(RAX, R(base));
+        needObject(RAX, slowPath);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, slowPath);
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.test(RCX, RCX);
+        a_.jcc(CE, slowPath);
+        a_.movImm(RDX, C->uid);
+        a_.cmp(RDX, mem(RCX, kCbUid));
+        a_.jcc(CNE, slowPath);
+    } else if (selfChecked_[i] && dc.fn == selfFn_) {
         a_.movImm(RAX, dc.fn.bits);
     } else {
         a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
@@ -1495,7 +1535,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
     }
     // Its baseline code (once made, it stays while the block lives), room for its frame (stack, initialised stack, a
     // frame, native stack) and a tick. Code that holds registers without a count calls itself, while it is the entry.
-    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(C));
+    if (!dc.byCode)
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(C));
     if (borrowing) {
         a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&borrowInfo_->retired));
         a_.cmpI8(mem(RDX, 0), 0);
@@ -1623,13 +1664,15 @@ void Baseline::emitDirectCall(std::uint32_t i)
     savePool(i);
     if (borrowing)
         borrowGate(true);  // the long way may run other code
-    a_.mov(RDI, R12);
-    a_.movImm(RSI, dc.read);
-    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
-    a_.callC(RAX);
-    a_.aluI32(7, RAX, 1);
-    a_.jcc(CNE, exception(i));
-    restorePool(i);
+    if (!dc.byCode) {
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, dc.read);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&helperThunk<jitGetGlobal>));
+        a_.callC(RAX);
+        a_.aluI32(7, RAX, 1);
+        a_.jcc(CNE, exception(i));
+        restorePool(i);
+    }
     if (dc.thisSkipped) {
         a_.movImm(RAX, dc.thisNull ? kNull : kUndefined);
         write(base + 1, RAX);

@@ -1995,7 +1995,7 @@ void Baseline::findPlainRegs()
                 else
                     windowCleanup_[i].push_back(r);
             }
-            if (dc != directCalls_.end())
+            if (dc != directCalls_.end() && !dc->second.byCode)
                 windowCleanup_[i].push_back(in.b);  // the long way reads the callee into it
         }
     }

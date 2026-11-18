@@ -60,3 +60,7 @@ S("var s = 0; for (var i = 0; i < 3000; i++) { s += (i & 1) ? -i : i; s ^= i; s 
 S("var s = 0; for (var i = 0; i < 3000; i++) { s = (s << 3) | (i >> 2); s = s >>> 1; } s")
 S("var x = 0; for (var i = 0; i < 3000; i++) { x = -x; x += 0; } 1 / x")
 S("var x = 0; for (var i = 0; i < 100; i++) { x = x * -1; } 1 / x")
+S("var A = { m: function (x) { return x + 1; } }, B = { m: function (x) { return x * 2; } }; var s = 0; for (var i = 0; i < 20000; i++) { s += A.m(i) & 7; } var o = A; for (var i = 0; i < 20000; i++) { if (i == 10000) o = B; s += o.m(i) & 7; } String(s)")
+S("function mk(k) { return function (a) { return a + k; }; } var f = mk(1), s = 0; for (var i = 0; i < 20000; i++) { if (i == 15000) f = mk(100); s += f(i) & 15; } String(s)")
+S("var o = { v: 3, get: function () { return this.v; } }; var s = 0; for (var i = 0; i < 20000; i++) { s += o.get(); if (i == 12000) o.get = function () { return 7; }; } String(s)")
+S("function F(a) { return a; } var s = 0, g = { f: F }; for (var i = 0; i < 20000; i++) { s += g.f(i, 1, 2) & 3; } String(s)")

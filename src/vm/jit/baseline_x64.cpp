@@ -1670,7 +1670,11 @@ private:
         bool thisSkipped;
         std::uint32_t read;  ///< the `GetGlobal` of the callee
         bool thisNull;       ///< the skipped `this` is null (else undefined)
+        /// The callee is whatever the register holds, checked to be a function of `code` (by its uid) at the call: no
+        /// global read is skipped, and the long way is the plain call.
+        bool byCode = false;
     };
+    void planCodeCall(std::uint32_t i);
     /// A `JNotCallee` of a block `selfInline` made, whose callee is the global read before the jump to it: the read is
     /// skipped (and the `this` after it), the guard checks the global's slot and the frame's function, and the call the
     /// long way reads the global then.

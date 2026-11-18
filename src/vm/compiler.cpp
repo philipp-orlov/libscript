@@ -3994,8 +3994,11 @@ bool Compiler::lazyEligible(const Node& n, const NameViews& names) const
 #endif
     if (!lazy_)
         return false;
-    if (n.kind != NK::FunctionExpr || n.isMethod || n.propKind == PropKind::Constructor || n.propKind == PropKind::Getter ||
-        n.propKind == PropKind::Setter || !n.d || classDepth_ != 0 || pendingFlags_ != 0)
+    const bool arrow = n.kind == NK::ArrowExpr;
+    // An arrow with a body in braces is parsed again from its text; one with an expression for a body can end where the
+    // context decides (`in` in a `for` head), and one that names `super` needs the method around it.
+    if ((n.kind != NK::FunctionExpr && !arrow) || (arrow && (n.arrowExprBody || usesSuper(*n.d))) || n.isMethod ||
+        n.propKind == PropKind::Constructor || n.propKind == PropKind::Getter || n.propKind == PropKind::Setter || !n.d || classDepth_ != 0 || pendingFlags_ != 0)
         return false;
     if (!source_ || source_->size() < kProgramBytes || n.srcEnd > source_->size() || n.srcEnd <= n.srcStart || n.srcEnd < n.srcStart + kFunctionBytes)
         return false;
@@ -4005,8 +4008,8 @@ bool Compiler::lazyEligible(const Node& n, const NameViews& names) const
         if (f->isEval || f->evalOuter || f->dynamicVars || !f->evalEnvName.empty())
             return false;
     for (std::u16string_view name : names)
-        if (!name.empty() && name[0] == u'%')
-            return false;  // `%all` (a direct `eval` inside) and the hidden names of arrows, classes and derived constructors
+        if (!name.empty() && name[0] == u'%' && name != u"%newtarget")
+            return false;  // `%all` (a direct `eval` inside), `%callee` and the hidden names of classes and derived constructors
     return true;
 }
 
@@ -4016,7 +4019,8 @@ CodeBlock* Compiler::lazyStub(const Node& n, const String& name)
 {
     if (!lazy_)
         return nullptr;
-    const NameViews& names = capturedBelow(n, false, captures_);
+    // An arrow's `this`, `arguments` and `new.target` are those of the function around it.
+    const NameViews& names = capturedBelow(n, n.kind == NK::ArrowExpr, captures_);
     if (!lazyEligible(n, names))
         return nullptr;
     std::vector<UpvalDesc> descs;
@@ -4042,6 +4046,7 @@ CodeBlock* Compiler::lazyStub(const Node& n, const String& name)
     }
     info->line = n.line;
     info->isDeclaration = !n.namedExpr && !n.text.empty();
+    info->isArrow = n.kind == NK::ArrowExpr;
     info->strictOuter = fn_->strict;
     CodeBlock* block = functionHeader(n, name, 0);
     for (const UpvalDesc& d : descs)
@@ -4553,7 +4558,8 @@ CodeBlock* compileProgram(VM& vm, const dyn::Node& program, std::string_view fil
 void compileLazy(VM& vm, CodeBlock* stub)
 {
     dyn::Parser parser(*stub->source, toUtf8(stub->file), /*typescript=*/false);
-    const dyn::NodePtr node = parser.parseFunctionAt(stub->srcStart, stub->lazy->line, stub->lazy->isDeclaration);
+    const dyn::NodePtr node = stub->lazy->isArrow ? parser.parseArrowAt(stub->srcStart, stub->lazy->line)
+                                                   : parser.parseFunctionAt(stub->srcStart, stub->lazy->line, stub->lazy->isDeclaration);
     Compiler compiler(vm, toUtf8(stub->file), stub->source, /*lazy=*/true);
     compiler.resume(*node, stub);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)

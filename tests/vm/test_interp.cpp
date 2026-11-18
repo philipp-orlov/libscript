@@ -196,6 +196,13 @@ TEST(everySnippetAgreesWhenFunctionsAreCompiledOnTheirFirstCall)
     check("function f(n) { var r = function r(k) { return k ? k + r(k - 1) : 0; }; return r(n); } String(f(4))");
     check("function f() { var a = 1; function g(b) { return function () { return function () { return a + b; }; }; } a = 5; return g(2)()(); } String(f())");
     check("function f() { var v = 1; function g(p = function () { return v; }) { var v = 2; return p(); } v = 3; return g(); } String(f())");
+    // Arrow functions: the `this`, `arguments` and `new.target` of the function around them, nesting, defaults, async.
+    check("function F() { this.v = 7; this.f = () => { return this.v + arguments.length; }; } var o = new F(1, 2); String(o.f())");
+    check("function G() { var h = () => { return () => { return new.target === G; }; }; return h()(); } String(new G() instanceof G) + String(G())");
+    check("var f = (a, b = 5) => { var c = a + b; return () => { return c * 2; }; }; String(f(1)())");
+    check("var r = []; var g = async (x) => { var y = await x; r.push(y); return y; }; g(3); r.length");
+    check("var o = { v: 4, m() { return [1, 2].map(x => { return x + this.v; }).join(); } }; o.m()");
+    check("var t = this; var f = () => { return this === t; }; String(f())");
     CHECK_EQ(failed, 0);
 }
 

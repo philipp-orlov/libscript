@@ -198,6 +198,7 @@ struct LazyInfo
     std::vector<std::uint8_t> upvalBits;     ///< 1 const, 2 the name of a function expression, 4 a read needs the hole check
     std::uint32_t line = 0;
     bool isDeclaration = false;
+    bool isArrow = false;
     bool strictOuter = false;
 };
 

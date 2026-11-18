@@ -385,6 +385,17 @@ NodePtr Parser::parseFunctionAt(std::uint32_t start, std::uint32_t line, bool is
     return functionExpression(isDeclaration);
 }
 
+NodePtr Parser::parseArrowAt(std::uint32_t start, std::uint32_t line)
+{
+    lexer_.seek(start, line);
+    prevEnd_ = start;
+    lexer_.next(cur_, false);
+    NodePtr n = assignment();
+    if (n->kind != NK::ArrowExpr)
+        fail("an arrow function was expected");
+    return n;
+}
+
 NodePtr Parser::statement()
 {
     if (++depth_ > 400)
@@ -1904,6 +1915,7 @@ NodePtr Parser::arrowFromParams(std::vector<NodePtr> params, NodePtr returnType,
     if (at(Tok::LBrace)) {
         n->d = block();
     } else {
+        n->arrowExprBody = true;
         NodePtr body = makeNode(NK::Block, cur_.line);
         NodePtr ret = makeNode(NK::ReturnStmt, cur_.line);
         ret->a = assignment();

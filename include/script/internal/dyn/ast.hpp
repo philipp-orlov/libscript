@@ -193,6 +193,7 @@ struct Node final
     /// FunctionExpr, ArrowExpr, ClassExpr: whether a call of `eval` is anywhere inside, 1 or 0 as the parser saw it;
     /// -1 for a node that did not come from the parser, which is answered by looking.
     std::int8_t evalInside = -1;
+    bool arrowExprBody = false;  ///< ArrowExpr: the body is an expression (the block holds its `return`)
 
     String text;
     double number = 0;

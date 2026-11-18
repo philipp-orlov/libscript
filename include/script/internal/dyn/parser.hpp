@@ -32,6 +32,8 @@ public:
     /// The function whose text starts at byte `start`, on line `line`, parsed again on its own: a plain function needs
     /// nothing of what is around it.
     NodePtr parseFunctionAt(std::uint32_t start, std::uint32_t line, bool isDeclaration);
+    /// The arrow function whose text starts at byte `start`, parsed again on its own: its parameters and a body in braces.
+    NodePtr parseArrowAt(std::uint32_t start, std::uint32_t line);
 
 private:
     // ---- token plumbing ----

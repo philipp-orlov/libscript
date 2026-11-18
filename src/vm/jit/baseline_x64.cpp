@@ -4473,7 +4473,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     for (unsigned r = 1 + argc; r < window; ++r)
         looked += windowPlain(i, base + 1 + r) ? 0 : 1;
     const bool roomy = window <= 1 + argc + 6 || (looked <= 6 && window <= 1 + argc + 40);
-    const bool fast = in.opcode() == Op::Call && roomy;
+    // `super(...)` is such a call too, as a construction: the frame says so, and its `new.target` is this frame's.
+    const bool isSuper = in.opcode() == Op::SuperCall;
+    const bool fast = (in.opcode() == Op::Call || isSuper) && roomy;
     if (fast) {
         // A script function that is compiled, takes at least as many parameters as there are arguments and needs nothing
         // the interpreter's call sequence does on the side: its frame is pushed here.
@@ -4484,15 +4486,17 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
         a_.jcc(CNE, helper);
         a_.mov(RCX, mem(RAX, kFnCode));
-        if (code_->callProf.empty())
-            code_->callProf.assign(code_->code.size(), 0);
-        a_.mov(RDI, mem(RCX, kCbUid));
-        a_.movImm(RSI, reinterpret_cast<std::uint64_t>(&code_->callProf[i]));
-        a_.mov(mem(RSI, 0), RDI);
+        if (!isSuper) {
+            if (code_->callProf.empty())
+                code_->callProf.assign(code_->code.size(), 0);
+            a_.mov(RDI, mem(RCX, kCbUid));
+            a_.movImm(RSI, reinterpret_cast<std::uint64_t>(&code_->callProf[i]));
+            a_.mov(mem(RSI, 0), RDI);
+        }
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.test(RDX, RDX);
         a_.jcc(CE, helper);
-        a_.testI32(mem(RCX, kCbFlags), CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync |
+        a_.testI32(mem(RCX, kCbFlags), (isSuper ? 0 : CodeBlock::kClassConstructor) | CodeBlock::kGenerator | CodeBlock::kAsync |
                                            CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs);
         a_.jcc(CNE, helper);
         a_.movzx16(RSI, mem(RCX, kCbNparams));
@@ -4514,7 +4518,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         // What the frame sits on: caller registers above the arguments hold stale values; the call sequence of the
         // interpreter lets them go. Plain values are overwritten here; a cell takes the long way.
         clearWindow(i, base, argc, window, helper);
-        {
+        if (!isSuper) {
             // A sloppy function called with no `this` gets the global object.
             Label thisOk;
             a_.testI32(mem(RCX, kCbFlags), CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis);
@@ -4540,12 +4544,17 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(mem(R11, kFrameR), R9);
         a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
         a_.mov(mem(R11, kFrameRetDst), RDI);
-        a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
-        a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+        a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(isSuper ? 0x101 : 0x100));
+        if (isSuper) {
+            a_.mov(RDI, mem(R13, kFrameNewTarget));
+            a_.mov(mem(R11, kFrameNewTarget), RDI);
+        } else {
+            a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+        }
         a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
         a_.mov(RSI, R11);
         a_.mov(RDI, R9);
-        a_.mov(RDX, mem(RDX, kTierEntry));
+        a_.mov(RDX, mem(RDX, isSuper ? kTierRx : kTierEntry));  // a construction runs the baseline code
         a_.jmp(enter);
     }
     if (in.opcode() == Op::New && roomy) {
@@ -4571,9 +4580,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.test(RDX, RDX);
         a_.jcc(CE, helper);
-        // A derived class's constructor makes no `this` of its own: the long way.
         a_.testI32(mem(RCX, kCbFlags), CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                                           CodeBlock::kNeedsArgs | CodeBlock::kDerived);
+                                           CodeBlock::kNeedsArgs);
         a_.jcc(CNE, helper);
         a_.movzx16(RSI, mem(RCX, kCbNparams));
         a_.aluI32(7, RSI, std::int32_t(argc));

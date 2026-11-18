@@ -526,7 +526,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         release(old);
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
-    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? jitCaptureArguments(vm, newR + 1, argc) : nullptr;
+    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? jitCaptureArguments(vm, c, newR + 1, argc) : nullptr;
     if (newR + c->nregs + 1 > vm.stackInit) [[unlikely]]
         vm.fillStack(newR + c->nregs + 1);  // one past: compiled code's test of the stack wants it
     {

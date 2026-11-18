@@ -879,12 +879,25 @@ void unwrapBound(JSValue* R, std::uint32_t base) noexcept
 }
 
 /// The call's arguments, copied into an array for `arguments` and rest parameters.
+/// What `kNeedsArgs` puts in the register after the parameters: the arguments object, or (`kRestOnly`) the rest parameter's array.
+JSArray* captureArgumentsFor(VM& vm, const CodeBlock* c, const JSValue* args, std::uint32_t argc);
 JSArray* captureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
 {
     JSArray* all = vm.newArray(vm.protos.arguments, 0, argc);
     all->h.cls = std::uint8_t(ObjClass::Arguments);
     all->appendAll(vm, args, argc);
     return all;
+}
+
+JSArray* captureArgumentsFor(VM& vm, const CodeBlock* c, const JSValue* args, std::uint32_t argc)
+{
+    if (!(c->flags & CodeBlock::kRestOnly))
+        return captureArguments(vm, args, argc);
+    const std::uint32_t n = argc > c->nparams ? argc - c->nparams : 0;
+    JSArray* rest = vm.newArray(vm.protos.array, 0, n);
+    if (n)
+        rest->appendAll(vm, args + c->nparams, n);
+    return rest;
 }
 
 /// Add the own enumerable properties of `source` to `target`, as `{...source}` does.
@@ -2911,7 +2924,7 @@ do_call: {
         copyReg(newR[0], toJSValue(vm.global));
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
-    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArguments(vm, newR + 1, argc) : nullptr;
+    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArgumentsFor(vm, c, newR + 1, argc) : nullptr;
     // Past what is initialised the registers are fresh; below it, what this frame sits on top of may be the caller's dead
     // temporaries or arguments the callee has no parameter for, which let go of their values now.
     if (newR + c->nregs + 1 > vm.stackInit) [[unlikely]]
@@ -4148,9 +4161,9 @@ void jitUnwrapBound(JSValue* R, std::uint32_t base)
     unwrapBound(R, base);
 }
 
-JSArray* jitCaptureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
+JSArray* jitCaptureArguments(VM& vm, const CodeBlock* c, const JSValue* args, std::uint32_t argc)
 {
-    return captureArguments(vm, args, argc);
+    return captureArgumentsFor(vm, c, args, argc);
 }
 
 int jitInstanceOf(VM& vm, std::uint32_t index)
@@ -4467,7 +4480,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
         R[1 + i] = args[i];
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
-    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArguments(*this, R + 1, argc) : nullptr;
+    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArgumentsFor(*this, c, R + 1, argc) : nullptr;
     // The callee's registers above its parameters start undefined. What can be there instead: an argument past the
     // parameters, and dead temporaries of a frame below when this one sits on them (a native called from a function
     // whose own frame began inside its caller's).
@@ -4515,7 +4528,7 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
         g->regs[1 + i] = args[i];
     }
     if (c->flags & CodeBlock::kNeedsArgs)
-        g->regs[1 + c->nparams] = toJSValue(captureArguments(*this, args, argc));
+        g->regs[1 + c->nparams] = toJSValue(captureArgumentsFor(*this, c, args, argc));
     if ((c->flags & CodeBlock::kAsync) && !(c->flags & CodeBlock::kAsyncGen))
         return bi::asyncStart(*this, keep.take());
     // The parameters (their defaults may throw) and the declarations run now.

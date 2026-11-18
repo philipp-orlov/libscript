@@ -3882,8 +3882,12 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     // `this`, the fixed parameters, then (if any) the arguments array.
     fn_->top = std::uint16_t(1 + fixed + (needsArgs ? 1 : 0));
     block->nregs = fn_->top;
+    // A rest parameter and no `arguments`: the call makes the rest array itself, in the register after the parameters.
+    const bool restOnly = hasRest && !(!arrow && (usesArguments(*n.d) || fn_->captured.count(String(u"%all"))));
     if (needsArgs) {
         block->flags |= CodeBlock::kNeedsArgs;
+        if (restOnly)
+            block->flags |= CodeBlock::kRestOnly;
         fn_->scopes.reserve(0);
     }
 
@@ -4058,7 +4062,10 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
         }
         const std::uint16_t mark = fn_->top;
         const std::uint16_t v = temp();
-        emit(Op::RestSlice, v, std::uint16_t(1 + fixed), std::uint32_t(fixed));
+        if (restOnly)
+            emit(Op::Mov, v, std::uint16_t(1 + fixed));
+        else
+            emit(Op::RestSlice, v, std::uint16_t(1 + fixed), std::uint32_t(fixed));
         bindTarget(target, v, true, VarKind::Let);
         fn_->top = mark;
     }

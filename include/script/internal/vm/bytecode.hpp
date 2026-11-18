@@ -205,6 +205,7 @@ struct CodeBlock
         kGenerator = 128,        ///< a call makes a generator object instead of running
         kNeedsArgs = 16,  ///< the call keeps every argument in an array, in the register after the parameters
         kNoThis = 1024,   ///< never reads `this` (found when the baseline code is made): a call need not make one
+        kRestOnly = 4096,  ///< with `kNeedsArgs`: the register holds the rest parameter's array itself (nothing else uses `arguments`)
         kPrivate = 2048,  ///< names a private member: its element sites keep a `PrivateCache` each
     };
 

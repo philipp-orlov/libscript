@@ -481,13 +481,6 @@ void VM::collectCycles(bool minor) noexcept
 {
     if (destroying_ || tearingDown)
         return;
-    Vec<CellPtr> everything;
-    try {
-        heap.forEachSlot([](void* list, void* slot) { static_cast<Vec<CellPtr>*>(list)->push_back(static_cast<CellPtr>(slot)); },
-                         &everything);
-    } catch (...) {
-        return;
-    }
     // The world: the young cells of a minor collection, every cell otherwise. What lies outside it, and a cell that is never
     // freed, counts as a reference from outside.
     Vec<CellPtr> set;
@@ -497,21 +490,32 @@ void VM::collectCycles(bool minor) noexcept
     // Everything up to the garbage list can fail for want of memory, and the collector runs when memory is tight. Until the
     // loop over the garbage, the only thing written to a cell is its `gc` word, so giving up is putting that back.
     try {
-    for (CellPtr cell : everything) {
-        CellHeader* h = headerOf(cell);
-        if (h->flags & cellflags::kImmortal) {
-            // Its objects hold their prototypes without a count: what they inherit from stays.
-            if (kindOf(cell) == Kind::Object)
-                if (JSObject* p = reinterpret_cast<JSObject*>(cell)->proto(*this))
-                    work.push_back(reinterpret_cast<CellPtr>(p));
-            continue;
-        }
-        if (minor && !(h->flags & cellflags::kYoung))
-            continue;
-        set.push_back(cell);
-        h->gc = (h->rc & kCountMask) | kInSet;
-    }
-    Vec<CellPtr>().swap(everything);
+    struct Collect
+    {
+        VM* vm;
+        bool minor;
+        Vec<CellPtr>* set;
+        Vec<CellPtr>* work;
+    } collect{this, minor, &set, &work};
+    // Each cell is sorted as the heap shows it: there is no list of all of them to make and read again.
+    heap.forEachSlot(
+        [](void* context, void* slot) {
+            auto& c = *static_cast<Collect*>(context);
+            const CellPtr cell = static_cast<CellPtr>(slot);
+            CellHeader* h = headerOf(cell);
+            if (h->flags & cellflags::kImmortal) {
+                // Its objects hold their prototypes without a count: what they inherit from stays.
+                if (kindOf(cell) == Kind::Object)
+                    if (JSObject* p = reinterpret_cast<JSObject*>(cell)->proto(*c.vm))
+                        c.work->push_back(reinterpret_cast<CellPtr>(p));
+                return;
+            }
+            if (c.minor && !(h->flags & cellflags::kYoung))
+                return;
+            c.set->push_back(cell);
+            h->gc = (h->rc & kCountMask) | kInSet;
+        },
+        &collect);
 
     // A prototype is counted once by the root of the shapes of what inherits from it. That count is not a reference from
     // outside, but a collection that sees the whole heap can tell: whatever inherits from it reaches it below.

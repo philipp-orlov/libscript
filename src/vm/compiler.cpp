@@ -3646,6 +3646,17 @@ void Compiler::switchStatement(const Node& n)
             continue;
         }
         const std::uint16_t m2 = fn_->top;
+        if (!noFuse_) {
+            // One compare-and-jump per case: no boolean made, and a case read from a variable is compared where it is.
+            if (smallInt(*c.a)) {
+                emitFusedJump(Op::JStrictEqI, disc, std::uint16_t(std::int16_t(int(c.a->number))), caseLabels[i]);
+            } else {
+                const std::uint16_t t = exprAny(*c.a);
+                emitFusedJump(Op::JStrictEq, disc, t, caseLabels[i]);
+            }
+            fn_->top = m2;
+            continue;
+        }
         const std::uint16_t t = temp();
         expr(*c.a, t);
         emit(Op::StrictEq, t, disc, t);

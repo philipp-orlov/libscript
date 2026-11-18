@@ -358,9 +358,7 @@ NATIVE(tableCtor)
     const JSValue init = arg(args, argc, 0);
     if (!init.isNullish()) {
         // The entries go in through the `set` or `add` the new object has, which a subclass may have replaced.
-        Key adderKey = vm.internKey(std::string_view(k.isMap ? "set" : "add"));
-        Handle adder = Handle::adopt(getProperty(vm, self, adderKey));
-        detail::decRef(adderKey);
+        Handle adder = Handle::adopt(getProperty(vm, self, k.isMap ? vm.atoms.set : vm.atoms.add));
         if (adder.get().isException())
             return JSValue::exception();
         if (!isFunction(adder.get()))

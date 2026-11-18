@@ -87,6 +87,13 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     atoms.input = internKey("input");
     atoms.groups = internKey("groups");
     atoms.indices = internKey("indices");
+    atoms.then = internKey("then");
+    atoms.return_ = internKey("return");
+    atoms.join = internKey("join");
+    atoms.flags = internKey("flags");
+    atoms.exec = internKey("exec");
+    atoms.add = internKey("add");
+    atoms.set = internKey("set");
     {
         struct Well
         {

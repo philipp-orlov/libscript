@@ -77,6 +77,13 @@ struct Atoms
     Key input = nullptr;
     Key groups = nullptr;
     Key indices = nullptr;
+    Key then = nullptr;
+    Key return_ = nullptr;
+    Key join = nullptr;
+    Key flags = nullptr;
+    Key exec = nullptr;
+    Key add = nullptr;
+    Key set = nullptr;
     // The well-known symbols; each holds a count.
     Key symIterator = nullptr;
     Key symAsyncIterator = nullptr;

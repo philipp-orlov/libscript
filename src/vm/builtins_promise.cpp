@@ -138,9 +138,7 @@ void resolvePromise(VM& vm, JSValue promise, JSValue resolution)
         settle(vm, promise, PromiseData::Fulfilled, resolution);
         return;
     }
-    Key thenKey = vm.internKey(std::string_view("then"));
-    JSValue then = getProperty(vm, resolution, thenKey);
-    detail::decRef(thenKey);
+    JSValue then = getProperty(vm, resolution, vm.atoms.then);
     if (then.isException()) {
         JSValue e = takeException(vm);
         rejectPromise(vm, promise, e);
@@ -383,9 +381,7 @@ NATIVE(promiseThen)
 /// `target.then(a, b)`: Invoke.
 JSValue invokeThen(VM& vm, JSValue target, JSValue onFulfilled, JSValue onRejected, std::uint32_t argc)
 {
-    Key thenKey = vm.internKey(std::string_view("then"));
-    JSValue then = getProperty(vm, target, thenKey);
-    detail::decRef(thenKey);
+    JSValue then = getProperty(vm, target, vm.atoms.then);
     if (then.isException())
         return then;
     Handle keep = Handle::adopt(then);
@@ -566,9 +562,7 @@ NATIVE(promiseCtor)
 void closeAfterThrow(VM& vm, JSValue iterator)
 {
     Handle pending = Handle::adopt(takeException(vm));
-    Key returnKey = vm.internKey(std::string_view("return"));
-    JSValue method = getProperty(vm, iterator, returnKey);
-    detail::decRef(returnKey);
+    JSValue method = getProperty(vm, iterator, vm.atoms.return_);
     if (!method.isException()) {
         Handle keep = Handle::adopt(method);
         if (isFunction(method)) {

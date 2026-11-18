@@ -492,6 +492,11 @@ void VM::collectCycles(bool minor) noexcept
     // freed, counts as a reference from outside.
     Vec<CellPtr> set;
     Vec<CellPtr> work;
+    Vec<JSObject*> tables;
+    Vec<CellPtr> garbage;
+    // Everything up to the garbage list can fail for want of memory, and the collector runs when memory is tight. Until the
+    // loop over the garbage, the only thing written to a cell is its `gc` word, so giving up is putting that back.
+    try {
     for (CellPtr cell : everything) {
         CellHeader* h = headerOf(cell);
         if (h->flags & cellflags::kImmortal) {
@@ -503,8 +508,8 @@ void VM::collectCycles(bool minor) noexcept
         }
         if (minor && !(h->flags & cellflags::kYoung))
             continue;
-        h->gc = (h->rc & kCountMask) | kInSet;
         set.push_back(cell);
+        h->gc = (h->rc & kCountMask) | kInSet;
     }
     Vec<CellPtr>().swap(everything);
 
@@ -572,7 +577,6 @@ void VM::collectCycles(bool minor) noexcept
         if (h->gc & kCountMask)
             reach(cell);
     }
-    Vec<JSObject*> tables;
     while (!work.empty()) {
         CellPtr cell = work.back();
         work.pop_back();
@@ -615,7 +619,12 @@ void VM::collectCycles(bool minor) noexcept
             }
         }
     }
-    Vec<CellPtr> garbage;
+    garbage.reserve(set.size());
+    } catch (...) {
+        for (CellPtr cell : set)
+            headerOf(cell)->gc = 0;
+        return;
+    }
     for (CellPtr cell : set) {
         CellHeader* h = headerOf(cell);
         if (!(h->gc & kReached)) {
@@ -694,7 +703,8 @@ void VM::releaseRoots() noexcept
                    &atoms.symIterator, &atoms.symAsyncIterator, &atoms.symToPrimitive, &atoms.symToStringTag,
                    &atoms.symHasInstance, &atoms.symSpecies, &atoms.lastIndex, &atoms.index, &atoms.input,
                    &atoms.groups, &atoms.indices, &atoms.symMatch, &atoms.symMatchAll, &atoms.symReplace, &atoms.symSearch,
-                   &atoms.symSplit, &atoms.symIsConcatSpreadable, &atoms.symUnscopables}) {
+                   &atoms.symSplit, &atoms.symIsConcatSpreadable, &atoms.symUnscopables, &atoms.then, &atoms.return_,
+                   &atoms.join, &atoms.flags, &atoms.exec, &atoms.add, &atoms.set}) {
         if (*k)
             detail::decRef(*k);
         *k = nullptr;

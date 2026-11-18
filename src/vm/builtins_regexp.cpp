@@ -509,8 +509,7 @@ JSValue regExpExec(VM& vm, JSValue rx, JSValue S)
 {
     if (pristine(vm, rx))
         return builtinExec(vm, rx, S);
-    Name exec(vm, "exec");
-    Handle fn = Handle::adopt(getProperty(vm, rx, exec.key));
+    Handle fn = Handle::adopt(getProperty(vm, rx, vm.atoms.exec));
     if (fn.get().isException())
         return fn.get();
     if (isFunction(fn.get())) {

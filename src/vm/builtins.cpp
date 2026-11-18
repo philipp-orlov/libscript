@@ -1275,9 +1275,7 @@ NATIVE(arrayToString)
     Handle object = Handle::adopt(toObject(vm, self));
     if (object.get().isException())
         return object.get();
-    Key joinKey = vm.internKey(std::string_view("join"));
-    JSValue join = getProperty(vm, object.get(), joinKey);
-    detail::decRef(joinKey);
+    JSValue join = getProperty(vm, object.get(), vm.atoms.join);
     if (join.isException())
         return join;
     Handle keep = Handle::adopt(join);
@@ -2027,9 +2025,7 @@ NATIVE(stringReplace)
         // `replaceAll` takes only a global RegExp.
         bool ok = true;
         if (isRegExpValue(vm, pat, &ok)) {
-            Key flagsKey = vm.internKey(std::string_view("flags"));
-            Handle flags = Handle::adopt(getProperty(vm, pat, flagsKey));
-            detail::decRef(flagsKey);
+            Handle flags = Handle::adopt(getProperty(vm, pat, vm.atoms.flags));
             if (flags.get().isException())
                 return flags.get();
             if (flags.get().isNullish())

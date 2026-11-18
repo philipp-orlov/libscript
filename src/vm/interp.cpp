@@ -2693,9 +2693,7 @@ L_DelegateCall: {
                 NEXT();
             }
             // No `throw`: the iterator is closed, and that is a TypeError.
-            Key rk = vm.internKey(std::string_view("return"));
-            JSValue closer = getProperty(vm, iterator, rk);
-            detail::decRef(rk);
+            JSValue closer = getProperty(vm, iterator, vm.atoms.return_);
             if (closer.isException())
                 FAIL();
             if (!closer.isNullish()) {
@@ -3323,9 +3321,7 @@ L_IterClose: {
         release(old);
     }
     fr->pc = pc;
-    Key returnKey = vm.internKey(std::string_view("return"));
-    JSValue f = getProperty(vm, iterator, returnKey);
-    detail::decRef(returnKey);
+    JSValue f = getProperty(vm, iterator, vm.atoms.return_);
     if (f.isException()) {
         if (!quiet)
             FAIL();

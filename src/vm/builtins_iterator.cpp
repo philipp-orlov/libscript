@@ -71,9 +71,7 @@ bool closeIterator(VM& vm, JSValue iterator, bool throwing)
         vm.exceptionCode = ErrorCode::Ok;
     }
     bool ok = true;
-    Key k = vm.internKey(std::string_view("return"));
-    JSValue ret = getProperty(vm, iterator, k);
-    detail::decRef(k);
+    JSValue ret = getProperty(vm, iterator, vm.atoms.return_);
     if (ret.isException()) {
         ok = false;
     } else {
@@ -552,9 +550,7 @@ NATIVE(wrapReturn)
     Helper* h = helperOf(self);
     if (!h || h->kind != Kind::Wrap)
         return typeError(vm, "return method called on an incompatible receiver");
-    Key k = vm.internKey(std::string_view("return"));
-    JSValue ret = getProperty(vm, h->iterator.get(), k);
-    detail::decRef(k);
+    JSValue ret = getProperty(vm, h->iterator.get(), vm.atoms.return_);
     if (ret.isException())
         return ret;
     Handle retKeep = Handle::adopt(ret);

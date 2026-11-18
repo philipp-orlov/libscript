@@ -399,7 +399,12 @@ struct VM : EngineRuntime
         JSObject* owner;  ///< holds a count
         Key key;          ///< holds a count
         JSValue value;    ///< holds a count
+        /// Where the value is while the owner keeps the shape it had then (`kNoShape` for a dictionary): shapes other
+        /// than dictionaries are never freed, so the same shape id is the same layout.
+        std::uint32_t shape;
+        std::uint32_t index;
     };
+    static constexpr std::uint32_t kNoShape = ~std::uint32_t(0);
     std::vector<RegExpSlot> regexpSlots;
     std::uint32_t arrayRootShape = 0;
     /// Set by `SetEvalScope` just before a call that may be a direct `eval`.

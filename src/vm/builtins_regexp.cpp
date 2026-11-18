@@ -29,7 +29,33 @@ struct RegExpData : NativeState
     regex::Matcher matcher;
 };
 
+std::shared_ptr<const regex::Program> programForShared(StringView source, unsigned flags, std::string& error);
+
+/// The compiled program for a pattern: a literal in a loop makes a RegExp every time round, so a small direct-mapped cache of
+/// this thread's answers is looked at first, which neither allocates nor locks.
 std::shared_ptr<const regex::Program> programFor(StringView source, unsigned flags, std::string& error)
+{
+    struct Recent
+    {
+        std::u16string source;
+        unsigned flags = 0;
+        std::shared_ptr<const regex::Program> program;
+    };
+    static constexpr std::size_t kRecent = 64;
+    thread_local Recent recent[kRecent];
+    Recent& r = recent[(std::hash<StringView>()(source) ^ flags * 0x9E3779B1u) & (kRecent - 1)];
+    if (r.program && r.flags == flags && StringView(r.source) == source)
+        return r.program;
+    auto program = programForShared(source, flags, error);
+    if (program && source.size() <= 256) {
+        r.source.assign(source);
+        r.flags = flags;
+        r.program = program;
+    }
+    return program;
+}
+
+std::shared_ptr<const regex::Program> programForShared(StringView source, unsigned flags, std::string& error)
 {
     static std::mutex lock;
     static std::map<std::u16string, std::shared_ptr<const regex::Program>> cache;
@@ -360,6 +386,42 @@ bool isRegExpArg(VM& vm, JSValue v, bool* ok)
     return dataOf(v) != nullptr;
 }
 
+/// The text of `flags` for these flag bits, in the order the getter gives them (the bits are in that order).
+String flagLetters(unsigned flags)
+{
+    String out;
+    for (unsigned bit = 0; bit < 8; ++bit)
+        if (flags & (1u << bit))
+            out.push_back(u"dgimsuvy"[bit]);
+    return out;
+}
+
+/// Where a recorded property of the RegExp prototype or constructor is now: at the index it had while its owner keeps the shape
+/// it had, or, in a dictionary, while the entry at that index is still its key; else found again, and remembered.
+JSValue* recordedSlot(VM& vm, VM::RegExpSlot& s)
+{
+    JSObject* o = s.owner;
+    if (o->h.shape == s.shape)
+        return o->slotAt(s.index);
+    Shape* shape = o->shapeOf(vm);
+    if (shape->isDictionary()) {
+        const Dictionary& d = *o->rare()->dict;
+        if (s.index < d.entries.size() && d.entries[s.index].key == s.key)
+            return o->slotAt(s.index);
+        const std::int32_t i = d.find(s.key);
+        if (i < 0)
+            return nullptr;
+        s.index = std::uint32_t(i);
+        return o->slotAt(s.index);
+    }
+    const std::int32_t i = shape->indexOf(s.key, nullptr);
+    if (i < 0)
+        return nullptr;
+    s.shape = o->h.shape;
+    s.index = std::uint32_t(i);
+    return o->slotAt(s.index);
+}
+
 /// A plain RegExp made by this engine, with nothing on it or its prototype that a match could notice.
 bool pristine(VM& vm, JSValue rx)
 {
@@ -370,14 +432,13 @@ bool pristine(VM& vm, JSValue rx)
     if (o->proto(vm) != vm.protos.regexp)
         return false;
     Rare* r = o->rare();
-    if (!r || r->dict || vm.shapeById(o->h.shape)->count != 1)
+    const Shape* own = vm.shapeById(o->h.shape);
+    // Its one property is `lastIndex`, a writable number: the last a shape of one property added is that property.
+    if (!r || r->dict || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
+        !o->slotAt(0)->isNumber())
         return false;
-    std::uint8_t attrs = 0;
-    JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex, &attrs);
-    if (!slot || attrs != attr::kWritable || !slot->isNumber())
-        return false;
-    for (const VM::RegExpSlot& s : vm.regexpSlots) {
-        JSValue* now = s.owner->findOwn(vm, s.key);
+    for (VM::RegExpSlot& s : vm.regexpSlots) {
+        JSValue* now = recordedSlot(vm, s);
         if (!now || now->bits != s.value.bits)
             return false;
     }
@@ -396,6 +457,10 @@ bool getLastIndex(VM& vm, JSValue rx, double* out)
 /// The text of `rx.flags`; false with an exception pending.
 bool flagsOf(VM& vm, JSValue rx, String* out)
 {
+    if (pristine(vm, rx)) {
+        *out = flagLetters(dataOf(rx)->flags);
+        return true;
+    }
     Name flags(vm, "flags");
     Handle v = Handle::adopt(getProperty(vm, rx, flags.key));
     if (v.get().isException())
@@ -410,6 +475,8 @@ bool flagsOf(VM& vm, JSValue rx, String* out)
 /// RegExpExec: `rx.exec(S)`, or the built-in when `rx` has none.
 JSValue regExpExec(VM& vm, JSValue rx, JSValue S)
 {
+    if (pristine(vm, rx))
+        return builtinExec(vm, rx, S);
     Name exec(vm, "exec");
     Handle fn = Handle::adopt(getProperty(vm, rx, exec.key));
     if (fn.get().isException())
@@ -613,6 +680,8 @@ NATIVE(regexpFlagGetter)
     if (!isObject(self))
         return typeError(vm, "RegExp.prototype getter requires that 'this' be an Object");
     if (which == kFlagsGetter) {
+        if (pristine(vm, self))
+            return makeString(vm, StringView(flagLetters(dataOf(self)->flags)));
         // Read through the flag properties, so a subclass or an object of its own is heard.
         struct Flag
         {
@@ -1553,7 +1622,10 @@ void recordRegExpOriginals(VM& vm)
         retain(*slot);
         retain(toJSValue(owner));
         detail::incRef(key);
-        vm.regexpSlots.push_back(VM::RegExpSlot{owner, key, *slot});
+        Shape* shape = owner->shapeOf(vm);
+        const bool fixed = !shape->isDictionary();
+        const std::int32_t index = fixed ? shape->indexOf(key, nullptr) : owner->rare()->dict->find(key);
+        vm.regexpSlots.push_back(VM::RegExpSlot{owner, key, *slot, fixed ? owner->h.shape : VM::kNoShape, std::uint32_t(index)});
     };
     for (const char* name : names) {
         Key key = vm.internKey(std::string_view(name));

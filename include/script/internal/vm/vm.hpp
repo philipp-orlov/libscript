@@ -375,6 +375,8 @@ struct VM : EngineRuntime
     /// array is iterated by index. Not counted (the prototypes hold them).
     JSValue origArrayValues = JSValue::undefined();
     JSValue origIteratorNext = JSValue::undefined();
+    /// The `next` of generator objects as installed, which iteration may skip the result object for.
+    JSValue origGeneratorNext = JSValue::undefined();
     /// The RegExp constructor and `RegExp.prototype.exec` as made, and the slots a plain RegExp counts on staying as they are.
     JSValue regexpCtor = JSValue::undefined();
     JSValue regexpExec = JSValue::undefined();

@@ -24,7 +24,29 @@ JSValue iterResult(VM& vm, JSValue value, bool done)
 
 int iteratorStep(VM& vm, JSValue iterator, JSValue next, JSValue* out)
 {
-    JSValue res = vm.call(next, iterator, nullptr, 0);
+    JSValue res;
+    if (isObject(iterator) && asObject(iterator)->cls() == ObjClass::Generator) {
+        // A generator's own `next`: resumed without the result object that would be made and read at once.
+        if (next.bits == vm.origGeneratorNext.bits) {
+            JSValue value, raw = JSValue::undefined();
+            bool done = false;
+            if (!vm.resumeRaw(iterator, 0, JSValue::undefined(), &value, &done, &raw))
+                return -1;
+            if (!isObject(raw)) {
+                if (done) {
+                    release(value);
+                    return 0;
+                }
+                *out = value;
+                return 1;
+            }
+            res = raw;  // a `yield*` hands out what the inner iterator gave
+        } else {
+            res = vm.call(next, iterator, nullptr, 0);
+        }
+    } else {
+        res = vm.call(next, iterator, nullptr, 0);
+    }
     if (res.isException())
         return -1;
     if (!isObject(res)) {
@@ -372,6 +394,8 @@ void installSymbolAndIterators(VM& vm)
     vm.setIntrinsic(&vm.protos.generator, generatorProto);
     release(toJSValue(generatorProto));
     method(vm, generatorProto, "next", generatorResume, 1, reinterpret_cast<void*>(0));
+    if (JSValue* genNext = generatorProto->findOwn(vm, vm.atoms.next))
+        vm.origGeneratorNext = *genNext;
     method(vm, generatorProto, "throw", generatorResume, 1, reinterpret_cast<void*>(1));
     method(vm, generatorProto, "return", generatorResume, 1, reinterpret_cast<void*>(2));
     generatorProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("Generator")), attr::kConfigurable);

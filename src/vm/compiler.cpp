@@ -1153,11 +1153,17 @@ private:
         if (value.kind == NK::FunctionExpr && value.isMethod && value.d && usesSuper(*value.d))
             emit(Op::SetHome, fnReg, object);
     }
+    /// The function that owns `this` reads it from register 0 even when an arrow captured it: only a derived constructor,
+    /// where `super()` writes it, goes through the box.
+    bool thisInRegister()
+    {
+        return !fn_->isArrow && (!thisBindsLate() || !findInScopes(*fn_, String(u"this")));
+    }
     /// A register holding `this`: register 0, or a copy of the captured one inside an arrow.
     std::uint16_t thisRegister()
     {
         checkThisBound(Node(NK::ThisExpr));
-        if (!fn_->isArrow && !findInScopes(*fn_, String(u"this")))
+        if (thisInRegister())
             return 0;
         const std::uint16_t t = temp();
         loadVar(String(u"this"), t, Node(NK::ThisExpr));
@@ -1275,7 +1281,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             checkThisBound(n);
             if (fn_->isEval && resolve(String(u"this")).kind == Ref::Global)
                 return loadVar(String(u"globalThis"), dst, n);
-            if (fn_->isArrow || findInScopes(*fn_, String(u"this")))
+            if (!thisInRegister())
                 return loadVar(String(u"this"), dst, n);
             if (dst >= 0 && dst != 0) {
                 emit(Op::Mov, std::uint16_t(dst), 0);
@@ -1309,7 +1315,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             // Only as the object of `super.x = v` and the like, which store on `this`.
             checkThisBound(n);
             const std::uint16_t d = dest(dst);
-            if (fn_->isArrow || findInScopes(*fn_, String(u"this")))
+            if (!thisInRegister())
                 loadVar(String(u"this"), d, n);
             else
                 emit(Op::Mov, d, 0);

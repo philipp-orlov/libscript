@@ -2216,6 +2216,16 @@ Op immediateJump(Op op) noexcept
     }
 }
 
+/// 1 when a test is a literal that is always true (`true`, a non-zero number), 0 when always false, -1 otherwise.
+int constantTest(const Node& n) noexcept
+{
+    if (n.kind == NK::BoolLit)
+        return n.number != 0 ? 1 : 0;
+    if (n.kind == NK::NumberLit)
+        return n.number != 0 && n.number == n.number ? 1 : 0;
+    return -1;
+}
+
 bool smallInt(const Node& n) noexcept
 {
     return n.kind == NK::NumberLit && n.number == double(std::int16_t(n.number)) && !(n.number == 0 && std::signbit(n.number));
@@ -2321,6 +2331,12 @@ std::uint16_t Compiler::conditional(const Node& n, int dst)
 void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
 {
     checkNativeStack();
+    // `while (true)`: no value made and nothing tested.
+    if (const int k = constantTest(cond); k >= 0) {
+        if (k)
+            emitJump(Op::Jmp, 0, whenTrue);
+        return;
+    }
     // Only the jumps matter in a test: `&&`, `||` and `!` become control flow, no value made.
     if (cond.kind == NK::Logical && cond.op == Tok::AndAnd) {
         Label no;
@@ -2373,6 +2389,11 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
 void Compiler::condJump(const Node& cond, Label& whenFalse)
 {
     checkNativeStack();
+    if (const int k = constantTest(cond); k >= 0) {
+        if (!k)
+            emitJump(Op::Jmp, 0, whenFalse);
+        return;
+    }
     if (cond.kind == NK::Logical && cond.op == Tok::AndAnd) {
         condJump(*cond.a, whenFalse);
         condJump(*cond.b, whenFalse);

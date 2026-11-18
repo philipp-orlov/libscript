@@ -139,8 +139,9 @@ struct InlineCache
 struct PolyEntry
 {
     /// A read site's kinds, then a store site's: a write to an own data property, and an add (from `shape` to `next`, with
-    /// the validity of the chain when one is held).
-    enum Kind : std::uint8_t { OwnData, ProtoData, OwnAccessor, ProtoAccessor, Write, Add };
+    /// the validity of the chain when one is held). `Absent` is a read site's: the key is nowhere on the chain of objects of
+    /// `shape` (undefined), good while `validity` (of the receiver's prototype; none when it has none) is valid.
+    enum Kind : std::uint8_t { OwnData, ProtoData, OwnAccessor, ProtoAccessor, Write, Add, Absent };
     std::uint32_t shape = 0;
     std::uint32_t index = 0;
     JSObject* holder = nullptr;

@@ -422,6 +422,35 @@ void placePoly(VM& vm, CodeBlock* code, InlineCache& ic, PolyEntry entry)
     pc.e[at] = entry;
 }
 
+/// Whether `o` answers for a key without a property of its own (a string's characters, a typed array's numbers, an array's
+/// length and elements): the receiver or a prototype that does cannot be part of a cached miss.
+inline bool answersForKeys(JSObject* o) noexcept
+{
+    return o->cls() == ObjClass::TypedArray || o->cls() == ObjClass::String || hasElems(o);
+}
+
+/// A read of `key` on `o` found it nowhere: remember that for objects of this shape while the chain stays as it is. A prototype
+/// that gains the key invalidates the chain (`invalidateChain`), and the receiver's shape fixes its own keys and its prototype.
+bool learnAbsent(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key, bool numericKey)
+{
+    if (numericKey || !cacheable(vm, o))
+        return false;
+    for (JSObject* p = o; p; p = p->proto(vm)) {
+        if (!cacheable(vm, p) || answersForKeys(p))
+            return false;
+    }
+    PolyEntry entry;
+    entry.kind = PolyEntry::Absent;
+    entry.shape = o->h.shape;
+    if (JSObject* p = o->proto(vm)) {
+        entry.validity = vm.validityOf(p);
+        vm.retainValidity(entry.validity);
+    }
+    entry.aux = std::uint8_t(o->h.aux + 1u);
+    placePoly(vm, code, ic, entry);
+    return true;
+}
+
 /// Remember where a read of `key` on `o` finds it in the site's `PolyCache`: a data property or an accessor, own or inherited.
 bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
 {
@@ -451,7 +480,7 @@ bool learnPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, Key key)
             }
         }
         if (!inherited)
-            return false;
+            return learnAbsent(vm, code, ic, o, key, numericKey);
     }
     entry.shape = o->h.shape;
     entry.index = std::uint32_t(index);
@@ -481,6 +510,12 @@ int readPoly(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValue base
             continue;
         if ((e.kind == PolyEntry::ProtoData || e.kind == PolyEntry::ProtoAccessor) && !e.validity->valid)
             continue;
+        if (e.kind == PolyEntry::Absent) {
+            if (e.validity && !e.validity->valid)
+                continue;
+            *out = JSValue::undefined();
+            return 1;
+        }
         const JSValue slot = (e.holder ? e.holder : o)->slotAt(e.index)[0];
         if (e.kind == PolyEntry::OwnData || e.kind == PolyEntry::ProtoData) {
             retain(slot);

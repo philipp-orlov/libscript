@@ -2470,6 +2470,15 @@ Tier2Code* Baseline::compileOptimized()
         }
     }
 #endif
+    if (const char* mapFile = std::getenv("T2MAP")) {
+        // One line per instruction: where its code starts, to tell which instruction a sampled address belongs to.
+        if (std::FILE* f = std::fopen(mapFile, "a")) {
+            for (std::uint32_t j = 0; j < n_; j += length(j))
+                std::fprintf(f, "%llx %s %u %s %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(span.rx)),
+                             "fn", unsigned(code_->lines.empty() ? 0 : code_->lines[0]), opName(code_->code[j].opcode()), unsigned(offsets_[j]));
+            std::fclose(f);
+        }
+    }
     auto* t = new Tier2Code;
     t->rx = span.rx;
     t->bytes = span.bytes;

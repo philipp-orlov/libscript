@@ -70,3 +70,7 @@ S("class A { constructor() { this.t = new.target === B; } } class B extends A { 
 S("class A { constructor(x) { this.x = x; } } class B extends A { constructor(x) { try { this.q = 1; } catch (e) { s = 9; } super(x); } } var s = 0; for (var i = 0; i < 3000; i++) { try { new B(i); } catch (e) { s += 1; } } String(s)")
 S("function P(x) { this.x = x; } class D extends P { constructor(x) { super(x); this.d = x + 1; } } var s = 0; for (var i = 0; i < 20000; i++) { var d = new D(i); s += d.x + d.d; } String(s)")
 S("class A { constructor(x) { this.x = x; } } class B extends A { constructor(x, y) { super(x, y, 3); } } var s = 0; for (var i = 0; i < 20000; i++) { s += new B(i, 1).x; } String(s)")
+S("var s = 0; for (var i = 0; i < 20000; i++) { var m = /a(\\d+)/.exec('xa' + i); s += m[1].length; } String(s)")
+S("class P { #v = 1; #m() { return this.#v + 1; } get #g() { return 5; } static t(o) { return o.#m() + o.#g; } } var s = 0; for (var i = 0; i < 20000; i++) { s += P.t(new P()); } String(s)")
+S("var s = 0; function* g() { yield 1; yield 2; } for (var i = 0; i < 20000; i++) { var [a, b] = g(); s += a + b; var [c, d] = new Set([i, 1]); s += c + d; } String(s)")
+S("var s = 0; for (var i = 0; i < 5000; i++) { try { var [a] = null; } catch (e) { s += 1; } try { var [b] = {}; } catch (e) { s += 2; } } String(s)")

@@ -2698,6 +2698,11 @@ void Baseline::emit(std::uint32_t i)
     case Op::CallSpread: helperOrStep(i, &helperThunk<jitCallSpread>); return;
     case Op::IterNext: helperOp(i, &helperThunk<jitIterNext>); return;
     case Op::IterInit: helperOrStep(i, &helperThunk<jitIterInit>); return;
+    case Op::NewRegExp: helperOp(i, &helperThunk<jitNewRegExp>); return;
+    case Op::EnvHas: helperOp(i, &helperThunk<jitEnvHas>); return;
+    case Op::DefPrivMethod: case Op::DefPrivGetter: case Op::DefPrivSetter:
+        helperOp(i, &helperThunk<jitDefPrivMethod>);
+        return;
     case Op::IterClose: helperOrStep(i, &helperThunk<jitIterClose>); return;
     case Op::CheckInit: case Op::CheckBound: case Op::CheckUnbound: {
         // A compare; the interpreter throws, from the step the out-of-line path runs.

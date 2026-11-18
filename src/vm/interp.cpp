@@ -4129,11 +4129,82 @@ int jitIterInit(VM& vm, std::uint32_t index)
     const Ins* ins = c.ins;
     JSValue* R = c.R;
     const JSValue src = R[ins->b];
-    if (!arrayIterationIntact(vm, src) && !isString(src))
-        return 2;
+    if (!arrayIterationIntact(vm, src) && !isString(src)) {
+        // Any other iterable: its `Symbol.iterator` and the iterator's `next`, as the interpreter takes them.
+        if (src.isNullish()) {
+            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+            return 0;
+        }
+        JSValue method = getProperty(vm, src, vm.atoms.symIterator);
+        if (method.isException())
+            return 0;
+        if (!isFunction(method)) {
+            release(method);
+            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+            return 0;
+        }
+        JSValue iterator = vm.call(method, src, nullptr, 0);
+        release(method);
+        if (iterator.isException())
+            return 0;
+        if (!isObject(iterator)) {
+            release(iterator);
+            vm.throwError(ErrorCode::TypeError, "Result of the Symbol.iterator method is not an object");
+            return 0;
+        }
+        JSValue next = getProperty(vm, iterator, vm.atoms.next);
+        if (next.isException()) {
+            release(iterator);
+            return 0;
+        }
+        setReg(R[ins->a + 1], next);
+        setReg(R[ins->a], iterator);
+        return 1;
+    }
     retain(src);
     setReg(R[ins->a + 1], JSValue::int32(0));
     setReg(R[ins->a], src);
+    return 1;
+}
+
+int jitNewRegExp(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue r = bi::newRegExp(vm, asString(c.code->consts[ins->b])->text(), asString(c.code->consts[ins->c])->text());
+    if (r.isException())
+        return 0;
+    setReg(c.R[ins->a], r);
+    return 1;
+}
+
+int jitEnvHas(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    const JSValue env = c.R[ins->b];
+    setReg(c.R[ins->a], JSValue::boolean(isObject(env) && asObject(env)->findOwn(vm, c.atoms[ins->c]) != nullptr));
+    return 1;
+}
+
+int jitDefPrivMethod(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    JSObject* target = asObject(R[ins->a]);
+    const Op which = ins->opcode();
+    std::uint8_t existing = 0;
+    if (target->findOwn(vm, R[ins->b].asCell(), &existing) && (which == Op::DefPrivMethod || !(existing & attr::kAccessor))) {
+        vm.throwError(ErrorCode::TypeError, "Cannot initialize private methods of class twice on the same object");
+        return 0;
+    }
+    if (which == Op::DefPrivMethod) {
+        retain(R[ins->c]);
+        target->putOwn(vm, R[ins->b].asCell(), R[ins->c], 0);
+    } else {
+        initAccessor(vm, target, R[ins->b].asCell(), R[ins->c], which == Op::DefPrivGetter, attr::kConfigurable);
+    }
     return 1;
 }
 

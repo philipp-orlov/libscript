@@ -1094,6 +1094,34 @@ NATIVE(regexpReplace)
     return genericReplace(vm, self, text.get(), replacement, functional, templ.get());
 }
 
+/// `match` of a plain global RegExp: each match's text goes straight into the array, with no match array made for it. What
+/// the generic steps leave behind is left: `lastIndex` is 0 at the end, and the legacy `RegExp.$1` kin read the last match.
+JSValue globalMatch(VM& vm, JSValue re, JSValue text)
+{
+    RegExpData* d = dataOf(re);
+    JSObject* o = asObject(re);
+    const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
+    StringView s = asString(text)->text();
+    JSArray* out = vm.newArray(vm.protos.array);
+    Handle keep = Handle::adopt(toJSValue(out));
+    const std::size_t groups = regex::groupCount(*d->program);
+    std::size_t last = 0;
+    bool any = false;
+    Bounds lastMatch;  // a failing attempt at the end leaves the registers in no state to read
+    while (last <= s.size() && regex::exec(*d->program, s, last, d->matcher)) {
+        const std::int32_t from = d->matcher.registers[0], to = d->matcher.registers[1];
+        out->append(vm, makeString(vm, s.substr(std::size_t(from), std::size_t(to - from))));
+        lastMatch.assign(d->matcher.registers.data(), 2 * groups);
+        any = true;
+        last = to == from ? advance(s, std::size_t(to), unicode) : std::size_t(to);
+    }
+    if (any)
+        noteLegacyBounds(vm, d, text, lastMatch.data(), groups);
+    if (!writeLastIndex(vm, o, 0))
+        return JSValue::exception();
+    return any ? keep.take() : JSValue::null();
+}
+
 NATIVE(regexpMatch)
 {
     UNUSED();
@@ -1102,6 +1130,8 @@ NATIVE(regexpMatch)
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
+    if (pristine(vm, self) && (dataOf(self)->flags & regex::kGlobal))
+        return globalMatch(vm, self, text.get());
     String flags;
     if (!flagsOf(vm, self, &flags))
         return JSValue::exception();

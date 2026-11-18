@@ -491,3 +491,8 @@ S("function f(a, b) { var s = 0; for (var i = 0; i < 20; i++) s += a * i + b; re
 S("function P(x) { this.x = x; } function Q(x) { this.y = 0; this.x = x; } function g(o, n) { o.x = n; return o.x; } var a = new P(1), b = new Q(2), s = 0; for (var i = 0; i < 5000; i++) { s += g(a, i) + g(b, i * 2); } for (var i = 0; i < 5000; i++) s += g(i & 1 ? a : b, i + 0.5); s")
 S("function* g(n) { try { for (var i = 0; i < n; i++) { var x = yield i; if (x) i += x; } return 'ret'; } finally { g.fin = (g.fin | 0) + 1; } } function* d() { var r = yield* g(3); yield r; } var s = 0; for (var k = 0; k < 300; k++) { for (var v of g(5)) s += v; for (var w of d()) s += String(w).length; var [a, b] = g(4); s += a + b; s += [...g(3)].length; for (var z of g(10)) { if (z > 2) break; } } s + ':' + g.fin")
 S("var re = /^[a-z]+\\d*$/, g = /o/g, y = /a/y; var r = []; for (var i = 0; i < 400; i++) { r[0] = re.test('abc12'); r[1] = re.test('ABC'); r[2] = g.test('foo') + ':' + g.lastIndex; r[3] = y.test('aab') + ':' + y.lastIndex; } r.push(/(\\d+)-(\\d+)/.test('10-20') + RegExp.$1 + RegExp.$2, re.test(12), /undefined/.test()); re.exec = function () { return null; }; r.push(re.test('abc')); r.join()")
+S("'a1b22c333'.match(/\\d+/g).join()")
+S("String('xyz'.match(/\\d/g))")
+S("'aaa'.match(/a*?/g).length + ':' + '\\ud83d\\ude00a'.match(/(?:)/gu).length")
+S("var g = /(\\w)(\\d)/g; g.lastIndex = 3; 'a1 b2 c3'.match(g).join() + g.lastIndex + RegExp.$1 + RegExp.$2 + RegExp.lastMatch")
+S("var y = /a/gy; 'aab'.match(y).join() + y.lastIndex")

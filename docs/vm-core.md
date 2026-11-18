@@ -347,6 +347,58 @@ compilation and a third parsing, of every function up front, where JavaScriptCor
 top-level `const` bindings live on the global object as writable properties, so a read of one is not a constant (Air's
 switch cases are such reads); loose `==` is not fused into a jump.
 
+## Handoff: performance work against JavaScriptCore
+
+For whoever picks this up next. The state as of commit `5bee0d6`: JetStream 3 (JavaScript tests only) geometric mean 54.2
+against JavaScriptCore's 260.6, a gap of 4.8x; no test is ahead of JavaScriptCore. What was tried, kept and taken out is in
+the section above; read it first so as not to repeat it.
+
+**Measuring.**
+
+- Harness: `jsc-compare/harness/js3run.py jsc|libscript <out.jsonl> [test ...]` (one process per test, pinned to cores
+  5-9, binary from `$LS`); one test by hand from `bench/jetstream3`:
+  `libscript ../../harness/js3_libscript.js --no-prefetch <test>`. Scores move a few percent between runs: measure each
+  engine on the same core, twice, and compare against a frozen copy of the previous binary, not against old result files.
+- Keep builds and fuzzers off the cores a measurement runs on (`taskset -c 10-19 make -j10`); they move scores otherwise.
+- Native hot spots: `perf record -g`, then `perf report --no-children -g callee`. Compiled code: `SCRIPT_VM_PERFMAP=1`
+  writes `/tmp/perf-<pid>.map` (`js:` baseline, `js2:` optimized); `SCRIPT_VM_CODEDUMP=<dir>` writes each function's code
+  (`t1-*` baseline, `t2-*` optimized) for `objdump -D -b binary -maarch64`. Together they give a per-instruction profile.
+- Small kernels that copy a test's hot loop (globals, typed arrays, the same operators) are the quickest way to iterate;
+  check them against JavaScriptCore (`jsc`) and `SCRIPT_CORE=dyn` for the result.
+
+**Switches for tier 2** (builds with `SCRIPT_JIT_ENV_OVERRIDE`): `T2EXITS` (each exit, with the receiver and, for element
+sites, the base, index and element profile), `T2DBG` (each compile: webs and profile), `T2TRIG`, `T2REFUSED`, `T2ONLY=<fn>`,
+`T2INL` (inlining decisions), `T2CHAIN` (read chains), `T2HOIST` (what loops hoist, and when a loop "calls out"),
+`T2DOORS` (where a side door was counted), `T2FAIL=<i,...>`, `SCRIPT_VM_DUMP` (bytecode).
+
+**Before a commit.** `ctest` in four modes: as is, `SCRIPT_VM_TIER1=1 SCRIPT_VM_TIER2=1`, `SCRIPT_VM_TIER1=0`,
+`SCRIPT_VM_TIER2=0`; then `tools/vm_fuzz.py <libscript> 1200 180000`, the same with
+`FUZZ_TIER1=2 FUZZ_TIER2=10 FUZZ_REPS=40` (800 programs), and `tools/js_jit_fuzz.py --cores <libscript> 1500 13000`. A
+change that makes no test move past noise is taken out, not kept.
+
+**Open, in the order they would bring the most.**
+
+1. *Air regression (160 to 126), cause unknown.* It came with `eafa6c9` (baseline reads follow their site's cache as it
+   runs; `promotePoly`/`promoteStore` in `interp.cpp`, `cachedRead`/`cachedWrite` in `baseline_x64.cpp`). The time is in
+   `Inst_forEachArg` (ARES-6/Air/opcode.js), baseline code only, mostly its switch's case chain. Ruled out: the size of its
+   code (probes moved out of line, no change). Next to check: whether promotion makes the site caches of that function
+   thrash, so its reads go to `jitGetProp` far more often (count helper calls per site on `cbecc54` and on `eafa6c9`), and
+   whether that function stays out of tier 2 for its size. A fix must keep gbemu's gain from the same commit (24 to 39).
+2. *Compile lazily.* babylonjs-startup and the code-load tests are now about half bytecode compilation and a third parsing:
+   every function is compiled when its script loads (`Compiler::compileFunctionOnce`). JavaScriptCore compiles a function
+   on its first call. The hard part is the scope chain: a nested function resolves its free names against the enclosing
+   functions' bindings while they are compiled (`resolveIn`, `Fn::captured`), so a lazy compile needs that kept.
+3. *Top-level `const` as constants.* Top-level `let`/`const` are writable properties of the global object here (not a
+   separate lexical environment), so tier 2 cannot treat a read of one as a constant. Air's switch compares against
+   ~375 such constants per call. Either mark a `const` non-writable once initialised (check what assignment from another
+   script must then throw) or keep a per-global "never written after init" flag the compilers can trust.
+4. *Fuse loose `==`/`!=` into compare-and-jumps* (`condJump`/`condJumpTrue` in `compiler.cpp` fuse only `===`, `!==` and
+   relations). Needs new jump opcodes through interpreter, baseline and tier 2; for two numbers tier 2 can reuse the strict
+   path. About 6% on a mandreel-like loop, more on Octane code that uses `==` throughout.
+5. *mandreel's loops still call out.* Inlining now takes `uint()`, but its real hot loops (`sortMinDown`/`sortMaxDown`)
+   keep other calls, so their typed-array globals are still read on each access (epoch check and load). `T2HOIST` and
+   `T2DOORS` show which instruction stops the hoist.
+
 ## Known limits
 
 - Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in

@@ -219,6 +219,15 @@ struct CodeBlock
     /// The `uid` of the function the baseline code last called from each `Call` (0 for none): the optimizing compiler's hint
     /// for what to inline. One per instruction once the baseline code is made.
     Vec<std::uint64_t> callProf;
+    /// Where the baseline code of a `GetGlobal`/`PutGlobal` finds its data property of the global object: the slot's index,
+    /// good while `epoch` is the VM's `globalEpoch`; the helper that runs when it is not writes it again. One per
+    /// instruction once the baseline code is made.
+    struct GlobalRec
+    {
+        std::uint32_t epoch = 0xFFFFFFFFu;
+        std::uint32_t index = 0;
+    };
+    Vec<GlobalRec> globalRecs;
     std::uint64_t uid = 0;  ///< never reused; `VM::codeByUid` finds the block while it lives
     /// Inline slots for the objects `new` makes for this function: 3, or 8 when it gives `this` more properties than
     /// that (0 until counted; see `thisSlotsOf`).

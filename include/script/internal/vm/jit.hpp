@@ -112,6 +112,7 @@ std::uint64_t stepThrow(VM& vm, std::uint32_t index);
 /// One instruction's work without the interpreter's dispatch (interp.cpp): 1 when done, 0 for a pending exception, with
 /// the frame's pc set after the instruction. For compiled code that has no template of its own for the instruction, or
 /// whose template gave up.
+int jitPutGlobal(VM& vm, std::uint32_t index);
 int jitGetGlobal(VM& vm, std::uint32_t index);
 int jitGetProp(VM& vm, std::uint32_t index);
 int jitPutProp(VM& vm, std::uint32_t index);

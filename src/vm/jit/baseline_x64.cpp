@@ -1071,8 +1071,11 @@ private:
         if (index < g->h.aux) {
             a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->inl()[index]));
         } else {
-            // The slots move only with the epoch (`JSObject::growSlots`), which every user checks first.
-            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->slots[index - g->h.aux]));
+            // The buffer moves when it grows: where it is now is read each time.
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&g->slots));
+            a_.mov(RDX, mem(RDX, 0));
+            if (index != g->h.aux)
+                a_.lea(RDX, mem(RDX, std::int32_t(8 * (index - g->h.aux))));
         }
     }
     /// The compiled code reads this cell: it must outlive the code, whatever the inline cache does next.
@@ -1802,6 +1805,7 @@ private:
     void deliverInt(std::uint32_t i, unsigned dst);
     void deliverDouble(std::uint32_t i, unsigned dst);
     void afterGeneric(std::uint32_t i);
+    void globalRecSlot(std::uint32_t i, Label& bad);
     void int32OfWeb(std::int32_t w, Reg dst, std::uint32_t exitAt);
     bool typedSiteKind(std::uint32_t i, bool put, ElemKind* kind);
     void typedAccess(std::uint32_t i, const Ins& in, ElemKind kind, bool put, std::int32_t vw, Label& bad, std::uint32_t exitAt);
@@ -4298,8 +4302,42 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
     a_.mov32(mem(RAX, 0), std::int32_t(ic->next));
 }
 
+/// The address of the global object's property the record of instruction `i` names, into rdx; `bad` when the record is
+/// not for the global object as it is now. Clobbers rax and rcx.
+void Baseline::globalRecSlot(std::uint32_t i, Label& bad)
+{
+    JSObject* g = vm_.global;
+    if (code_->globalRecs.empty())
+        code_->globalRecs.assign(code_->code.size(), CodeBlock::GlobalRec{});
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(&code_->globalRecs[i]));
+    a_.mov32(RAX, mem(RCX, 0));
+    a_.alu32(7, RAX, mem(R12, kVmGlobalEpoch));
+    a_.jcc(CNE, bad);
+    a_.mov32(RAX, mem(RCX, 4));
+    Label outside, have;
+    a_.movImm(RDX, reinterpret_cast<std::uint64_t>(g));
+    a_.aluI32(7, RAX, std::int32_t(g->h.aux));
+    a_.jcc(CAE, outside);
+    a_.lea(RDX, mem(RDX, RAX, 8, kObjInline));
+    a_.jmp(have);
+    a_.bind(outside);
+    a_.mov(RDX, mem(RDX, kObjSlots));
+    a_.aluI32(5, RAX, std::int32_t(g->h.aux));
+    a_.lea(RDX, mem(RDX, RAX, 8));
+    a_.bind(have);
+}
+
 void Baseline::getGlobal(std::uint32_t i, const Ins& in)
 {
+    if (!optimizing()) {
+        // Self-healing: where the property is now is kept in a record the helper rewrites, so the code stays good after the
+        // global object grows or changes.
+        Label& stale = slow(i, &helperThunk<jitGetGlobal>);
+        globalRecSlot(i, stale);
+        a_.mov(RAX, mem(RDX, 0));
+        deliver(i, in.a);
+        return;
+    }
     // A data property the global object has now stays where it is until something deletes it or changes its attributes,
     // which the epoch counts.
     JSObject* g = vm_.global;
@@ -4327,6 +4365,16 @@ void Baseline::getGlobal(std::uint32_t i, const Ins& in)
 
 void Baseline::putGlobal(std::uint32_t i, const Ins& in)
 {
+    if (!optimizing()) {
+        Label& stale = slow(i, &helperThunk<jitPutGlobal>);
+        globalRecSlot(i, stale);
+        a_.mov(RCX, R(in.b));
+        retain(RCX);
+        a_.mov(RSI, mem(RDX, 0));
+        a_.mov(mem(RDX, 0), RCX);
+        release(RSI);
+        return;
+    }
     // As for a read: a writable data property of the global object stays where it is until the epoch moves. A name the global
     // object does not have yet, or one that cannot be written, is left to the interpreter.
     JSObject* g = vm_.global;

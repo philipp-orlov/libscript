@@ -3304,6 +3304,46 @@ inline JitCtx jitCtx(VM& vm, std::uint32_t index, bool hasCache)
 }
 }  // namespace
 
+namespace {
+/// Tell the baseline code of instruction `at` where the global object keeps the data property whose slot is `slot`.
+void noteGlobalSlot(VM& vm, CodeBlock* code, std::uint32_t at, JSValue* slot)
+{
+    if (at >= code->globalRecs.size())
+        return;
+    JSObject* g = vm.global;
+    JSValue* inl = g->inl();
+    CodeBlock::GlobalRec& r = code->globalRecs[at];
+    r.index = slot >= inl && slot < inl + g->h.aux ? std::uint32_t(slot - inl) : std::uint32_t(slot - g->slots) + g->h.aux;
+    r.epoch = vm.globalEpoch;
+}
+}  // namespace
+
+int jitPutGlobal(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, true);
+    const Ins* ins = c.ins;
+    Key key = c.atoms[ins->a];
+    JSObject* g = vm.global;
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm, key, &attrs);
+    if (slot && (attrs & attr::kWritable) && !(attrs & attr::kAccessor)) {
+        noteGlobalSlot(vm, c.code, index, slot);
+        const JSValue old = *slot;
+        *slot = c.R[ins->b];
+        retain(*slot);
+        release(old);
+        return 1;
+    }
+    const bool strict = (c.code->flags & CodeBlock::kStrict) != 0;
+    if (!slot && strict && !hasProperty(vm, toJSValue(g), key)) {
+        vm.throwError(ErrorCode::ReferenceError, toUtf8(static_cast<StringCell*>(key)->text()) + " is not defined");
+        return 0;
+    }
+    if (!setProperty(vm, toJSValue(g), key, c.R[ins->b], strict) && !vm.exception.isUndefined())
+        return 0;
+    return 1;
+}
+
 int jitGetGlobal(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, true);
@@ -3321,6 +3361,7 @@ int jitGetGlobal(VM& vm, std::uint32_t index)
                 ic.index = std::uint32_t(place);
             }
         }
+        noteGlobalSlot(vm, c.code, index, slot);
         copyReg(c.R[ins->a], *slot);
         return 1;
     }

@@ -5358,3 +5358,44 @@ TEST(aSmallFunctionWithATestIsInlinedAlongTheWayItFallsThrough)
         CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1498500,239400,750 1497904,239400,750"));
     }
 }
+
+TEST(aSwitchComparesEachCaseInOneJumpAndAGlobalDeletedInAHotLoopIsReadAgain)
+{
+    // Cases are compare-and-jumps: in order, each case expression run until one matches, NaN matching nothing and -0 matching
+    // 0. A global a hot loop reads is deleted and made again inside it: the code leaves and reads the new one.
+    const char* program =
+        "const A = Symbol('a'), B = Symbol('b');"
+        "var log = [];"
+        "function k(v) { log.push(v); return v; }"
+        "function f(x) {"
+        "  switch (x) {"
+        "    case 1: return 'one';"
+        "    case k(2): return 'two';"
+        "    case NaN: return 'nan';"
+        "    default: return 'def';"
+        "    case 0: return 'zero';"
+        "    case 's': return 'str';"
+        "    case A: return 'A';"
+        "    case B: return 'B';"
+        "  }"
+        "}"
+        "var out = [];"
+        "for (var i = 0; i < 3000; i++) out = [f(1), f(2), f(NaN), f(-0), f('s'), f(A), f(B), f(3), f({})];"
+        "var g = 0;"
+        "globalThis.tmp = new Int32Array(8).fill(3);"
+        "function h(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + tmp[i & 7]) | 0; if (i == 500) { delete globalThis.tmp; globalThis.tmp = new Int32Array(8).fill(5); } } return s; }"
+        "var hs = 0; for (var r = 0; r < 20; r++) { globalThis.tmp = new Int32Array(8).fill(3); hs = h(1000); }"
+        "out.push(log.length, hs);"
+        "out.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("one two def zero str A B def def 24000 3998"));
+    }
+}

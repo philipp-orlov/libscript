@@ -1436,8 +1436,8 @@ void Baseline::emitSelfGuard(std::uint32_t i)
         a_.jcc(CNE, cold);
     }
     // The long way, out of line, leaves this code: the global read as the skipped instruction would have, the `this` it
-    // skipped, and the guard runs again in the interpreter (registers this code never writes again).
-    sideDoor();
+    // skipped, and the guard runs again in the interpreter (registers this code never writes again). It does not come
+    // back, so a loop around it still knows what it hoisted.
     deferCold(i, [this, i, base, &cold]() {
         const SelfGuard& g = selfGuards_.at(i);
         a_.bind(cold);

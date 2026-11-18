@@ -1296,7 +1296,14 @@ public:
     std::set<std::uint32_t> noHoist_;
     std::set<std::uint32_t> hoistBroken_;
 private:
-    void sideDoor() { ++sideDoors_; }
+    void sideDoor()
+    {
+        ++sideDoors_;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("T2DOORS"))
+            std::fprintf(stderr, "side door at %u\n", unsigned(factAt_));
+#endif
+    }
     /// `bad` unless validity cell `c` still holds; nothing to do when it was checked already.
     void checkValidity(ValidityCell* c, Label& bad, bool remember = true)
     {
@@ -3502,7 +3509,6 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         // Nothing seen yet when this code was made: what the site's cache holds when it runs, or the table. Only a read
         // neither has counts as one the code knew nothing of (a site the table serves never learns more).
         Label& bad = slow(i, &helperThunk<jitGetProp>);
-        Label mega, fin;
         if (optimizing()) {
             // A site that has learned since makes the code give way to a compile that knows it; one marked for the
             // table never learns more, and does not.
@@ -3515,11 +3521,16 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         }
         a_.mov(RAX, R(in.b));
         needObject(RAX, bad);
-        cachedRead(i, in, ic, mega);
-        a_.jmp(fin);
-        a_.bind(mega);
-        megaProbe(i, in, ic, key, bad);
-        a_.bind(fin);
+        // The table's probe, which only a site the runtime marked takes, out of line.
+        Label& probeIn = coldLabels_.emplace_back();
+        Label& back = coldLabels_.emplace_back();
+        cachedRead(i, in, ic, probeIn);
+        a_.bind(back);
+        deferCold(i, [this, i, in, ic, key, &probeIn, &back, &bad]() {
+            a_.bind(probeIn);
+            megaProbe(i, in, ic, key, bad);
+            a_.jmp(back);
+        });
         return;
     }
     Label& bad = slow(i, &helperThunk<jitGetProp>);
@@ -3563,17 +3574,25 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         if (!last)
             a_.bind(next);
     }
+    // A shape none of those compiled in: out of line, so that a large function's hot code stays small. The shape the
+    // site's cache holds now, then the megamorphic table.
+    Label* coldBack = nullptr;
     if (probe && count > 0) {
+        Label& probeIn = coldLabels_.emplace_back();
+        Label& back = coldLabels_.emplace_back();
+        coldBack = &back;
         a_.jmp(done);
         a_.bind(cached);
-        {
-            Label mega, fin;
+        a_.jmp(probeIn);
+        deferCold(i, [this, i, in, ic, key, &probeIn, &back, &bad]() {
+            a_.bind(probeIn);
+            Label mega;
             cachedRead(i, in, ic, mega);
-            a_.jmp(fin);
+            a_.jmp(back);
             a_.bind(mega);
             megaProbe(i, in, ic, key, bad);
-            a_.bind(fin);
-        }
+            a_.jmp(back);
+        });
     }
     if (isLength) {
         a_.bind(lengthPath);
@@ -3612,6 +3631,8 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         }
     }
     a_.bind(done);
+    if (coldBack)
+        a_.bind(*coldBack);
 }
 
 void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad)
@@ -3807,11 +3828,20 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
     a_.jcc(CNE, probe ? other : bad);
     if (probe) {
+        // Another shape: where the site's cache says now, out of line.
+        Label& probeIn = coldLabels_.emplace_back();
+        Label& back = coldLabels_.emplace_back();
         putPropKnown(i, in, ic, bad);
         a_.jmp(done);
         a_.bind(other);
-        cachedWrite(i, in, ic, bad);
+        a_.jmp(probeIn);
+        deferCold(i, [this, i, in, ic, &probeIn, &back, &bad]() {
+            a_.bind(probeIn);
+            cachedWrite(i, in, ic, bad);
+            a_.jmp(back);
+        });
         a_.bind(done);
+        a_.bind(back);
         return;
     }
     putPropKnown(i, in, ic, bad);
@@ -4178,7 +4208,9 @@ void Baseline::getGlobal(std::uint32_t i, const Ins& in)
         index = std::uint32_t(slot - inlineBase);
     else
         index = std::uint32_t(slot - g->slots) + g->h.aux;
-    Label& bad = slow(i, &helperThunk<jitGetGlobal>);
+    // Optimized code leaves when the epoch has moved (a global deleted or changed, which is rare) rather than reading
+    // through the helper and going on: then a loop around the read keeps what it hoisted.
+    Label& bad = optimizing() ? exitBefore(i) : slow(i, &helperThunk<jitGetGlobal>);
     a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, bad);
     globalSlot(index);

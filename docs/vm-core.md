@@ -310,6 +310,10 @@ Kept:
 | `slice`/`substring`/`substr` of a long string share its characters | OfflineAssembler | 26.0 | 34.8 |
 | Typed arrays of every kind in place; typed access as a read chain; re-learn a guessed element site | mandreel | 16.9 | 26.1 |
 | Megamorphic read table at marked sites | espree-wtb / acorn-wtb / Babylon | 8.8 / 7.3 / 142 | 12.7 / 10.4 / 179 |
+| A small function with an int32 test inlined along its fall-through (`uint(x)`) | mandreel | 26.1 | 28.3 |
+| A switch case is one compare-and-jump | Air | 120 | 129 |
+
+The whole suite (71 tests, geometric mean) went from 50.4 to 54.2 over these, against JavaScriptCore's 260.6.
 
 How the three worst tests were found: `perf record` over the harness run, then `perf report --no-children -g callee` for
 native code and `SCRIPT_VM_PERFMAP=1` with a per-function share for compiled code. babylonjs-startup spent 72% in one
@@ -333,9 +337,15 @@ Measured and not the cause: reference counting is 3 to 5% of the Octane tests' t
 Loose `==` and `!=` in tests are never fused into a compare-and-jump (only `===`, `!==` and the relational operators are);
 on a mandreel-like loop fusing them would win about 6%.
 
-Still open, in order of what they would bring: a call of a small function with a branch (`uint(x)` in mandreel) is not
-inlined, so the loop around it cannot keep its global reads before the loop; Octane's code-load tests (`*-inspector-code-load`)
-are bound by parsing and the first runs.
+Air fell from 160 to 126 with the change that has baseline reads follow their site's cache as it runs (gbemu 24 to 39
+with it). Its largest function, `Inst_forEachArg`, runs in baseline code only, and its share of the run went from 15% to
+34%; its code grew from 1.0 MB to 1.75 MB. Moving the cache probes out of line did not bring it back, so the size of that
+code is not the cause; the cause is not found yet.
+
+Still open, in order of what they would bring: startup tests (babylonjs-startup, the code-load tests) are now half bytecode
+compilation and a third parsing, of every function up front, where JavaScriptCore compiles a function on its first call;
+top-level `const` bindings live on the global object as writable properties, so a read of one is not a constant (Air's
+switch cases are such reads); loose `==` is not fused into a jump.
 
 ## Known limits
 

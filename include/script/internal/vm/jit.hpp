@@ -123,6 +123,8 @@ int jitArrayPush(VM& vm, std::uint32_t index);
 int jitBinary(VM& vm, std::uint32_t index);
 int jitBinaryImm(VM& vm, std::uint32_t index);
 int jitInstanceOf(VM& vm, std::uint32_t index);
+/// The call's arguments in an array, for `arguments` and rest parameters.
+JSArray* jitCaptureArguments(VM& vm, const JSValue* args, std::uint32_t argc);
 int jitIn(VM& vm, std::uint32_t index);
 int jitToString(VM& vm, std::uint32_t index);
 int jitToNumber(VM& vm, std::uint32_t index);
@@ -133,6 +135,8 @@ int jitSpreadObj(VM& vm, std::uint32_t index);
 int jitKeysOf(VM& vm, std::uint32_t index);
 int jitLoadCallee(VM& vm, std::uint32_t index);
 int jitNewTarget(VM& vm, std::uint32_t index);
+int jitGetSuperCtor(VM& vm, std::uint32_t index);
+int jitFreshThisIfBound(VM& vm, std::uint32_t index);
 int jitIterInit(VM& vm, std::uint32_t index);
 int jitIterNext(VM& vm, std::uint32_t index);
 int jitIterClose(VM& vm, std::uint32_t index);

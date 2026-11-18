@@ -450,27 +450,50 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     const std::uint32_t base = ins->b, argc = ins->c;
     const JSValue callee = R[base];
     const bool isNew = ins->opcode() == Op::New;
+    const bool isSuper = ins->opcode() == Op::SuperCall;  // the parent's constructor, on the `this` the derived one holds
+    const bool construct = isNew || isSuper;
     if (!isFunction(callee))
         return {0, 0};
     auto* f = static_cast<JSFunction*>(asObject(callee));
-    if (isNew && ((f->flags & JSFunction::kNative) || !f->code->constructor || !vm.prototypeAt2(f) ||
-                  (f->code->flags & CodeBlock::kDerived)))
+    if (isNew && !vm.prototypeAt2(f))
+        return {0, 0};
+    if (isNew && ((f->flags & JSFunction::kNative) ? !(f->flags & JSFunction::kConstructor) : !f->code->constructor))
         return {0, 0};
     if (!(f->flags & JSFunction::kNative) && index < code->callProf.size())
         code->callProf[index] = f->code->uid;
     if (f->flags & JSFunction::kNative) {
         fr->pc = ins + 1;
         Rare* r = f->rare();
+        if (isNew) {
+            // As the interpreter's `new` of a native: `this` inherits from its `prototype`, and an answer that is no object
+            // is that `this`.
+            const JSValue pv = *f->slotAt(2);
+            Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
+            JSObject* made = vm.newObject(root, 3);
+            const JSValue old = R[base + 1];
+            R[base + 1] = toJSValue(made);
+            release(old);
+        }
         vm.stackTop = R + code->nregs;
         const JSValue saved = vm.newTarget;
-        vm.newTarget = JSValue::undefined();
-        const JSValue res = r->native(vm, R[base + 1], &R[base + 2], argc, r->nativeData);
+        vm.newTarget = isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined();
+        JSValue res = r->native(vm, R[base + 1], &R[base + 2], argc, r->nativeData);
         vm.newTarget = saved;
+        if (construct && !res.isException()) {
+            if (!isObject(res)) {
+                release(res);
+                res = R[base + 1];
+                retain(res);
+            } else if (isSuper && res != R[base + 1] && isObject(R[base + 1]) && !asObject(res)->isProto()) {
+                // A built-in that makes its own object: it gets the prototype of the class being constructed.
+                asObject(res)->setProto(vm, asObject(R[base + 1])->proto(vm));
+            }
+        }
         return {res.bits, 1};
     }
     CodeBlock* c = f->code;
-    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs) ||
-        ((c->flags & CodeBlock::kClassConstructor) && !isNew))
+    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen) ||
+        ((c->flags & CodeBlock::kClassConstructor) && !construct))
         return {0, 0};
     if (!c->tier1) {
         if (c->tier1Failed || !vm.tier1Threshold || ++c->hotness < vm.tier1Threshold)
@@ -501,6 +524,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         release(old);
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
+    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? jitCaptureArguments(vm, newR + 1, argc) : nullptr;
     if (newR + c->nregs + 1 > vm.stackInit) [[unlikely]]
         vm.fillStack(newR + c->nregs + 1);  // one past: compiled code's test of the stack wants it
     {
@@ -520,11 +544,20 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
             release(v);
         }
     }
+    if (argsArray) {
+        // In the register after the parameters, which the clearing above left empty.
+        if (newR + 1 + c->nparams >= vm.stackInit)
+            vm.fillStack(newR + 2 + c->nparams);
+        const JSValue old = newR[1 + c->nparams];
+        newR[1 + c->nparams] = toJSValue(argsArray);
+        release(old);
+    }
     *vm.frameTop++ =
-        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, isNew, true, isNew ? callee : JSValue::undefined()};
+        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, construct, true,
+              isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
     // `new` runs the baseline code: optimized code is made for calls only.
     return {reinterpret_cast<std::uint64_t>(vm.frameTop - 1),
-            reinterpret_cast<std::uint64_t>(isNew ? static_cast<void*>(c->tier1->rx) : c->tier1->entry)};
+            reinterpret_cast<std::uint64_t>(construct ? static_cast<void*>(c->tier1->rx) : c->tier1->entry)};
 }
 
 /// `this` for `new f(...)` from compiled code: an object inheriting from `f.prototype` (an ordinary function: the property
@@ -2763,8 +2796,27 @@ void Baseline::emit(std::uint32_t i)
         return;
     case Op::Call:
     case Op::New:
+    case Op::SuperCall:
         call(i, in);
         return;
+    case Op::GetSuperCtor: helperOp(i, &helperThunk<jitGetSuperCtor>); return;
+    case Op::FreshThisIfBound: helperOp(i, &helperThunk<jitFreshThisIfBound>); return;
+    case Op::CheckDerivedRet: {
+        // An object result, or none with `super()` called: all that is looked at in line.
+        Label& bad = slow(i);
+        Label ok, notObject;
+        a_.mov(RAX, R(in.a));
+        needObject(RAX, notObject);
+        a_.jmp(ok);
+        a_.bind(notObject);
+        a_.cmpI(RAX, std::int32_t(kUndefined));
+        a_.jcc(CNE, bad);
+        a_.mov(RAX, R(in.b));
+        a_.cmpI(RAX, std::int32_t(kTrue));
+        a_.jcc(CNE, bad);
+        a_.bind(ok);
+        return;
+    }
     case Op::GetGlobal:
     case Op::GetGlobalOrUndef:
         getGlobal(i, in);

@@ -3811,6 +3811,26 @@ int jitNewTarget(VM& vm, std::uint32_t index)
     return 1;
 }
 
+int jitGetSuperCtor(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    JSObject* p = c.fr->fn->proto(vm);
+    if (!p || !isFunction(toJSValue(p)) || !isConstructorFn(static_cast<JSFunction*>(p))) {
+        vm.throwError(ErrorCode::TypeError, "the super class is not a constructor");
+        return 0;
+    }
+    copyReg(c.R[c.ins->a], toJSValue(p));
+    return 1;
+}
+
+int jitFreshThisIfBound(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    if (c.R[c.ins->b] == JSValue::boolean(true))
+        setReg(c.R[c.ins->a], toJSValue(vm.newObject(vm.protos.object)));
+    return 1;
+}
+
 int jitIterInit(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
@@ -3891,6 +3911,11 @@ int jitIterClose(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     return isFunction(c.R[c.ins->a + 1]) ? 2 : 1;
+}
+
+JSArray* jitCaptureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
+{
+    return captureArguments(vm, args, argc);
 }
 
 int jitInstanceOf(VM& vm, std::uint32_t index)

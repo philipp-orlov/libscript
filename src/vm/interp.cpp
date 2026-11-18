@@ -3696,6 +3696,203 @@ int jitBinary(VM& vm, std::uint32_t index)
     return 1;
 }
 
+// Compiled code's helpers for opcodes that have no template: 1 done, 0 an exception, and 2 "not handled, nothing changed:
+// run the instruction in the interpreter" for the rare cases a helper does not take.
+
+int jitIn(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const int r = inOperator(vm, c.R[c.ins->b], c.R[c.ins->c]);
+    if (r < 0)
+        return 0;
+    setReg(c.R[c.ins->a], JSValue::boolean(r != 0));
+    return 1;
+}
+
+int jitToString(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const JSValue r = toStringValue(vm, c.R[c.ins->b]);
+    if (r.isException())
+        return 0;
+    setReg(c.R[c.ins->a], r);
+    return 1;
+}
+
+int jitToNumber(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const JSValue a = c.R[c.ins->b];
+    if (a.isNumber()) {
+        copyReg(c.R[c.ins->a], a);
+        return 1;
+    }
+    double d;
+    if (!toNumber(vm, a, &d))
+        return 0;
+    setReg(c.R[c.ins->a], JSValue::boxNumber(d));
+    return 1;
+}
+
+int jitUnary(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    const JSValue a = c.R[ins->b];
+    const bool neg = ins->opcode() == Op::Neg;
+    if (a.isInt32() && (!neg || (a.asInt32() != 0 && a.asInt32() != INT32_MIN))) {
+        setReg(c.R[ins->a], JSValue::int32(neg ? -a.asInt32() : ~a.asInt32()));
+        return 1;
+    }
+    JSValue n = toNumeric(vm, a);
+    if (n.isException())
+        return 0;
+    if (isBigInt(n)) {
+        JSValue r = bigintUnary(vm, neg ? 0 : 1, n);
+        release(n);
+        if (r.isException())
+            return 0;
+        setReg(c.R[ins->a], r);
+        return 1;
+    }
+    setReg(c.R[ins->a], neg ? JSValue::boxNumber(-n.asNumber()) : JSValue::int32(~toInt32(n.asNumber())));
+    return 1;
+}
+
+int jitCopyBox(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    Box* box = reinterpret_cast<Box*>(c.R[c.ins->a].asCell());
+    retain(box->value);
+    Box* fresh = vm.newBox(box->value);
+    setReg(c.R[c.ins->a], JSValue::cell(reinterpret_cast<CellPtr>(fresh)));
+    return 1;
+}
+
+int jitRestSlice(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    auto* all = static_cast<JSArray*>(asObject(c.R[c.ins->b]));
+    const std::uint32_t from = c.ins->c;
+    JSArray* rest = vm.newArray(vm.protos.array, 0, all->length > from ? all->length - from : 0);
+    if (all->length > from)
+        rest->appendAll(vm, all->elems + from, all->length - from);
+    setReg(c.R[c.ins->a], toJSValue(rest));
+    return 1;
+}
+
+int jitSpreadObj(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    return copyOwnProperties(vm, asObject(c.R[c.ins->a]), c.R[c.ins->b], nullptr) ? 1 : 0;
+}
+
+int jitKeysOf(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const JSValue keys = forInKeys(vm, c.R[c.ins->b]);
+    if (keys.isException())
+        return 0;
+    setReg(c.R[c.ins->a], keys);
+    return 1;
+}
+
+int jitLoadCallee(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    copyReg(c.R[c.ins->a], toJSValue(c.fr->fn));
+    return 1;
+}
+
+int jitNewTarget(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    copyReg(c.R[c.ins->a], c.fr->newTarget);
+    return 1;
+}
+
+int jitIterInit(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const JSValue src = R[ins->b];
+    if (!arrayIterationIntact(vm, src) && !isString(src))
+        return 2;
+    retain(src);
+    setReg(R[ins->a + 1], JSValue::int32(0));
+    setReg(R[ins->a], src);
+    return 1;
+}
+
+int jitIterNext(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue* R = c.R;
+    const std::uint32_t it = ins->b;
+    if (!R[it + 1].isInt32()) {
+        if (!isFunction(R[it + 1])) {
+            copyReg(R[ins->a], ins->c ? JSValue::undefined() : JSValue::hole());
+            return 1;
+        }
+        JSValue value;
+        const int step = iteratorStep(vm, R[it], R[it + 1], &value);
+        if (step <= 0) {
+            const JSValue old = R[it + 1];
+            R[it + 1] = JSValue::undefined();
+            release(old);
+            if (step < 0)
+                return 0;
+            copyReg(R[ins->a], ins->c ? JSValue::undefined() : JSValue::hole());
+        } else {
+            setReg(R[ins->a], value);
+        }
+        return 1;
+    }
+    const JSValue src = R[it];
+    const std::int32_t at = R[it + 1].asInt32();
+    JSValue out = JSValue::undefined();
+    bool owned = false, done;
+    std::int32_t step = 1;
+    if (isArray(src)) {
+        auto* a = static_cast<JSArray*>(asObject(src));
+        done = std::uint32_t(at) >= a->length;
+        if (!done && !a->elems[at].isHole())
+            out = a->elems[at];
+    } else {
+        StringCell* s = asString(src);
+        done = std::uint32_t(at) >= s->length;
+        if (!done) {
+            const StringView text = s->text();
+            std::size_t n = 1;
+            if (text[std::size_t(at)] >= 0xd800 && text[std::size_t(at)] < 0xdc00 && std::size_t(at) + 1 < text.size() &&
+                text[std::size_t(at) + 1] >= 0xdc00 && text[std::size_t(at) + 1] < 0xe000)
+                n = 2;
+            out = makeString(vm, text.substr(std::size_t(at), n));
+            owned = true;
+            step = std::int32_t(n);
+        }
+    }
+    if (done) {
+        if (!ins->c)
+            out = JSValue::hole();
+    } else {
+        R[it + 1] = JSValue::int32(at + step);
+    }
+    if (owned)
+        setReg(R[ins->a], out);
+    else
+        copyReg(R[ins->a], out);
+    return 1;
+}
+
+int jitIterClose(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    return isFunction(c.R[c.ins->a + 1]) ? 2 : 1;
+}
+
 int jitInstanceOf(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);

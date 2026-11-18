@@ -1808,6 +1808,28 @@ private:
         afterGeneric(i);
     }
 
+    /// `helperOp` for a helper that may answer 2: not taken, run the instruction in the interpreter instead.
+    void helperOrStep(std::uint32_t i, HelperFn fn)
+    {
+        sideDoor();
+        savePool(i);
+        Label done;
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, i);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(fn));
+        a_.callC(RAX);
+        a_.aluI32(7, RAX, 1);
+        a_.jcc(CE, done);
+        a_.aluI32(7, RAX, 2);
+        a_.jcc(CNE, exception(i));
+        callStep(i);
+        a_.cmpI(RAX, std::int32_t(kStepFall));
+        a_.jcc(CNE, tail_);
+        a_.bind(done);
+        restorePool(i);
+        afterGeneric(i);
+    }
+
     // ---- counting ----
     /// One more count for the value in `r`, if it is a cell.
     void retain(Reg r)
@@ -2571,6 +2593,20 @@ void Baseline::emit(std::uint32_t i)
         write(in.a, RAX);
         return;
     }
+    case Op::In: helperOp(i, &helperThunk<jitIn>); return;
+    case Op::ToString: helperOp(i, &helperThunk<jitToString>); return;
+    case Op::ToNumber: helperOp(i, &helperThunk<jitToNumber>); return;
+    case Op::Neg: case Op::BitNot: helperOp(i, &helperThunk<jitUnary>); return;
+    case Op::Mod: case Op::Exp: helperOp(i, &helperThunk<jitBinary>); return;
+    case Op::CopyBox: helperOp(i, &helperThunk<jitCopyBox>); return;
+    case Op::RestSlice: helperOp(i, &helperThunk<jitRestSlice>); return;
+    case Op::SpreadObj: helperOp(i, &helperThunk<jitSpreadObj>); return;
+    case Op::KeysOf: helperOp(i, &helperThunk<jitKeysOf>); return;
+    case Op::LoadCallee: helperOp(i, &helperThunk<jitLoadCallee>); return;
+    case Op::NewTarget: helperOp(i, &helperThunk<jitNewTarget>); return;
+    case Op::IterNext: helperOp(i, &helperThunk<jitIterNext>); return;
+    case Op::IterInit: helperOrStep(i, &helperThunk<jitIterInit>); return;
+    case Op::IterClose: helperOrStep(i, &helperThunk<jitIterClose>); return;
     case Op::CheckInit: case Op::CheckBound: case Op::CheckUnbound: {
         // A compare; the interpreter throws, from the step the out-of-line path runs.
         Label& bad = slow(i);

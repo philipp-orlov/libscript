@@ -788,6 +788,14 @@ int relational(VM& vm, Op op, JSValue a, JSValue b)
     return result;
 }
 
+static bool chainHasProxy(VM& vm, JSObject* o)
+{
+    for (; o; o = o->proto(vm))
+        if (proxyOf(o))
+            return true;
+    return false;
+}
+
 /// OrdinaryHasInstance(b, a).
 static int ordinaryHasInstance(VM& vm, JSValue b, JSValue a)
 {
@@ -796,18 +804,63 @@ static int ordinaryHasInstance(VM& vm, JSValue b, JSValue a)
     // A bound function asks about what it is bound to.
     if (Rare* r = asObject(b)->rare(); r && isFunction(r->boundTarget))
         return instanceOf(vm, a, r->boundTarget);
-    if (!isObject(a))
+    if (!isObject(a)) {
+        // A value that is no object has no chain: false, which the cache keeps under shape 0 (valid as long as the
+        // function's `prototype` and the `Symbol.hasInstance` it could inherit are as they were).
+        if (vm.prototypeAt2(asObject(b)) && isObject(*asObject(b)->slotAt(2)) && !vm.hasInstanceSeen && !vm.proxyAsProto &&
+            !chainHasProxy(vm, asObject(b))) {
+            JSObject* want = asObject(*asObject(b)->slotAt(2));
+            VM::InstanceEntry& e = vm.instanceCache[(std::uint32_t(reinterpret_cast<std::uintptr_t>(want) >> 4)) & (VM::kInstanceEntries - 1)];
+            ValidityCell* cell = vm.validityOf(vm.protos.object);
+            ++cell->refs;
+            if (e.validity)
+                vm.releaseValidity(e.validity);
+            e.shape = 0;
+            e.fnShape = asObject(b)->h.shape;
+            e.want = want;
+            e.validity = cell;
+            e.result = 0;
+        }
         return 0;
+    }
     if (vm.prototypeAt2(asObject(b)) && isObject(*asObject(b)->slotAt(2))) {
         // `prototype` is a data property in its usual slot: the walk reads shapes only (a proxy anywhere takes the long way).
         JSObject* want = asObject(*asObject(b)->slotAt(2));
-        for (JSObject* o = asObject(a); !proxyOf(o);) {
-            o = o->proto(vm);
-            if (!o)
-                return 0;
-            if (o == want)
-                return 1;
+        JSObject* const start = asObject(a);
+        VM::InstanceEntry& e = vm.instanceCache[(start->h.shape ^ std::uint32_t(reinterpret_cast<std::uintptr_t>(want) >> 4)) & (VM::kInstanceEntries - 1)];
+        if (e.want == want && e.shape == start->h.shape && e.fnShape == asObject(b)->h.shape && e.validity && e.validity->valid &&
+            !vm.hasInstanceSeen && !vm.proxyAsProto)
+            return e.result;
+        JSObject* o = start;
+        if (!proxyOf(o)) {
+            int found = 0;
+            for (;;) {
+                o = o->proto(vm);
+                if (!o)
+                    break;
+                if (o == want) {
+                    found = 1;
+                    break;
+                }
+                if (proxyOf(o))
+                    goto longWay;
+            }
+            // Remember it for the next object of this shape, while the chain above is as it is. Not once a proxy is a
+            // prototype or a `Symbol.hasInstance` exists: what `b` inherits could then change without its shape.
+            if (JSObject* p = start->proto(vm); p && !vm.hasInstanceSeen && !vm.proxyAsProto && !chainHasProxy(vm, asObject(b))) {
+                ValidityCell* cell = vm.validityOf(p);
+                ++cell->refs;
+                if (e.validity)
+                    vm.releaseValidity(e.validity);
+                e.shape = start->h.shape;
+                e.fnShape = asObject(b)->h.shape;
+                e.want = want;
+                e.validity = cell;
+                e.result = found != 0;
+            }
+            return found;
         }
+    longWay:;
     }
     JSValue proto = getProperty(vm, b, vm.atoms.prototype);
     if (proto.isException())

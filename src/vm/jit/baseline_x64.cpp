@@ -2459,6 +2459,7 @@ private:
     void truth(Reg v, Label& yes, Label& no, Label& bad);
     void typeOf(std::uint32_t i, const Ins& in);
     void strictValue(std::uint32_t i, const Ins& in);
+    void instanceOfOp(std::uint32_t i, const Ins& in);
     void getProp(std::uint32_t i, const Ins& in);
     void putProp(std::uint32_t i, const Ins& in);
     void getElem(std::uint32_t i, const Ins& in);
@@ -2765,8 +2766,7 @@ void Baseline::emit(std::uint32_t i)
         typeOf(i, in);
         return;
     case Op::InstanceOf:
-        // Straight to the runtime: no stepping through the interpreter.
-        helperOp(i, &helperThunk<jitInstanceOf>);
+        instanceOfOp(i, in);
         return;
     case Op::FieldInit: {
         // The class's field initialiser, a function in the `Rare` of the function running; else undefined.
@@ -3434,6 +3434,78 @@ void Baseline::strictJump(std::uint32_t i, const Ins& in)
     a_.bind(wantEqual ? eq : neq);
     go(i, target);
     a_.bind(wantEqual ? neq : eq);
+}
+
+/// `a instanceof F` for an object and a function the runtime has answered for before (`VM::instanceCache`): the entry of the
+/// object's shape names the function's shape and its `prototype`, and the chain above is as it was. Else the runtime.
+void Baseline::instanceOfOp(std::uint32_t i, const Ins& in)
+{
+    static_assert(sizeof(VM::InstanceEntry) == 32, "the entry is addressed by a shift");
+    static_assert(offsetof(VM::InstanceEntry, fnShape) == 4 && offsetof(VM::InstanceEntry, want) == 8 &&
+                  offsetof(VM::InstanceEntry, validity) == 16 && offsetof(VM::InstanceEntry, result) == 24, "layout");
+    Label& bad = slow(i, &helperThunk<jitInstanceOf>);
+    Label store, no, prim, probe;
+    a_.mov(RAX, R(in.b));
+    a_.mov(RCX, R(in.c));
+    needObject(RCX, bad);
+    // A constructor with its properties made: `prototype` is there, in slot 2 (a data property it cannot lose).
+    a_.cmpI8(mem(RCX, kHdrCls), std::uint8_t(ObjClass::Function));
+    a_.jcc(CNE, bad);
+    a_.mov32(RDX, mem(RCX, kFnFlags));
+    a_.aluI32(4, RDX, std::int32_t(JSFunction::kNative | JSFunction::kLazyProps | JSFunction::kConstructor));
+    a_.aluI32(7, RDX, std::int32_t(JSFunction::kConstructor));
+    a_.jcc(CNE, bad);
+    // The function's `prototype`: slot 2, in place or past the inline slots.
+    Label inPlace, have;
+    a_.movzx8(RSI, mem(RCX, kHdrAux));
+    a_.aluI32(7, RSI, 3);
+    a_.jcc(CAE, inPlace);
+    a_.movImm(RDX, 2);
+    a_.alu32(5, RDX, RSI);
+    a_.mov(RSI, mem(RCX, kObjSlots));
+    a_.mov(RDX, mem(RSI, RDX, 8, 0));
+    a_.jmp(have);
+    a_.bind(inPlace);
+    a_.mov(RDX, mem(RCX, kObjInline + 16));
+    a_.bind(have);
+    // The entry: by the object's shape (0 for a value that is no object) and the prototype's address.
+    a_.test(RAX, R15);
+    a_.jcc(CNE, prim);
+    a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+    a_.jcc(CNE, prim);
+    a_.mov32(RDI, mem(RAX, 0));
+    a_.jmp(probe);
+    a_.bind(prim);
+    a_.movImm(RDI, 0);
+    a_.bind(probe);
+    a_.mov(RSI, RDX);
+    a_.shiftI32(5, RSI, 4);
+    a_.alu32(6, RSI, RDI);
+    a_.aluI32(4, RSI, std::int32_t(VM::kInstanceEntries - 1));
+    a_.shiftI32(4, RSI, 5);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&vm_.instanceCache[0]));
+    a_.lea(RAX, mem(RAX, RSI, 1, 0));
+    a_.cmp(RDX, mem(RAX, 8));
+    a_.jcc(CNE, bad);
+    a_.alu32(7, RDI, mem(RAX, 0));
+    a_.jcc(CNE, bad);
+    a_.mov32(RDX, mem(RCX, 0));
+    a_.alu32(7, RDX, mem(RAX, 4));
+    a_.jcc(CNE, bad);
+    a_.mov(RSI, mem(RAX, 16));
+    a_.test(RSI, RSI);
+    a_.jcc(CE, bad);
+    a_.cmpI32(mem(RSI, 4), 0);
+    a_.jcc(CE, bad);
+    // No `Symbol.hasInstance` anywhere, no proxy as a prototype: the cache is emptied when either comes.
+    a_.cmpI8(mem(RAX, 24), 0);
+    a_.jcc(CE, no);
+    a_.movImm(RAX, kTrue);
+    a_.jmp(store);
+    a_.bind(no);
+    a_.movImm(RAX, kFalse);
+    a_.bind(store);
+    write(in.a, RAX);
 }
 
 void Baseline::strictValue(std::uint32_t i, const Ins& in)

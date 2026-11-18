@@ -128,8 +128,10 @@ Shape* Shape::after(VM& vm, Key k, std::uint8_t a)
     n->key = k;
     n->attrs = a;
     n->keyBits = keyBits | keyBit(k);
-    if (k == vm.atoms.symHasInstance)
+    if (k == vm.atoms.symHasInstance) {
         vm.hasInstanceSeen = true;
+        vm.clearInstanceCache();
+    }
     if ((count == 2 && k == vm.atoms.prototype && !(a & attr::kAccessor)) || (count > 2 && (flags & kProtoAt2)))
         n->flags |= kProtoAt2;
     detail::incRef(k);
@@ -251,6 +253,18 @@ void VM::freeShape(Shape* shape) noexcept
     releaseShapeId(id);
 }
 
+void VM::noteProtoChain(JSObject* proto)
+{
+    if (proxyAsProto)
+        return;
+    for (JSObject* o = proto; o; o = o->proto(*this))
+        if (proxyOf(o)) {
+            proxyAsProto = true;
+            clearInstanceCache();
+            return;
+        }
+}
+
 Shape* VM::rootShapeFor(JSObject* proto)
 {
     if (!proto) {
@@ -270,6 +284,7 @@ Shape* VM::rootShapeFor(JSObject* proto)
     root->proto = proto;
     detail::incRef(reinterpret_cast<CellPtr>(proto));
     proto->h.flags |= cellflags::kIsProto;
+    noteProtoChain(proto->proto(*this));  // a proxy as `proto` itself is met by the walks that fill the cache
     r.childRoot = root;
     return root;
 }

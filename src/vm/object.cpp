@@ -417,8 +417,10 @@ void JSObject::setProto(VM& vm, JSObject* next)
     }
     if (next)
         next->h.flags |= cellflags::kIsProto;
-    if (isProto())
+    if (isProto()) {
+        vm.noteProtoChain(next);
         vm.invalidateChain(this);
+    }
 }
 
 // ------------------------------------------------------------------ properties ---
@@ -459,8 +461,10 @@ void JSObject::addProperty(VM& vm, Key key, JSValue value, std::uint8_t attrs)
     if (s->isDictionary()) {
         Dictionary& d = *rare()->dict;
         vm.dictionaryGains(d);
-        if (key == vm.atoms.symHasInstance)
+        if (key == vm.atoms.symHasInstance) {
             vm.hasInstanceSeen = true;
+            vm.clearInstanceCache();
+        }
         const std::uint32_t index = std::uint32_t(d.entries.size());
         reserveSlot(vm, index);
         d.add(key, attrs);

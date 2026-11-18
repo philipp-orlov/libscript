@@ -351,6 +351,33 @@ struct VM : EngineRuntime
     JSValue typeofNames[8] = {};
     /// Set once any object has had a `Symbol.hasInstance` property: until then `instanceof` needs no look for one.
     bool hasInstanceSeen = false;
+    /// Set when a proxy is on the chain above something that is a prototype: until then a proxy can only be the first object of
+    /// a chain that matters.
+    bool proxyAsProto = false;
+    /// What `x instanceof F` found last for objects of one shape and functions of one shape whose `prototype` is one object,
+    /// good while the validity cell of the chain above the object's prototype holds (it holds a count). Direct-mapped by the
+    /// object's shape; compiled code reads it (offsets fixed by `InstanceEntry`).
+    struct InstanceEntry
+    {
+        std::uint32_t shape = 0;   ///< of the object
+        std::uint32_t fnShape = 0; ///< of the function
+        JSObject* want = nullptr;  ///< the function's `prototype`
+        ValidityCell* validity = nullptr;
+        std::uint8_t result = 0;
+        std::uint8_t pad[7] = {};
+    };
+    static constexpr std::uint32_t kInstanceEntries = 64;
+    InstanceEntry instanceCache[kInstanceEntries];
+    /// A prototype that something inherits from: when a proxy is on its chain, the instance cache is off for good.
+    void noteProtoChain(JSObject* proto);
+    void clearInstanceCache() noexcept
+    {
+        for (InstanceEntry& e : instanceCache) {
+            if (e.validity)
+                releaseValidity(e.validity);
+            e = InstanceEntry{};
+        }
+    }
     JSValue typeofName(unsigned which);
     /// The property names of the first thousand non-negative integers, made when first asked for; each holds a count.
     static constexpr std::size_t kSmallIndexKeys = 1024;

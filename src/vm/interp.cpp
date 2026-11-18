@@ -1026,7 +1026,18 @@ namespace {
 struct GenState : NativeState
 {
     enum State : std::uint8_t { Start, Suspended, Running, Done };
-    std::vector<JSValue> regs;
+    /// The frame's registers, in the same allocation as the state (`new (count) GenState`).
+    std::uint32_t count = 0;
+    JSValue* regs() noexcept { return reinterpret_cast<JSValue*>(this + 1); }
+    const JSValue* regs() const noexcept { return reinterpret_cast<const JSValue*>(this + 1); }
+    static void* operator new(std::size_t size, std::uint32_t registers) { return ::operator new(size + std::size_t(registers) * sizeof(JSValue)); }
+    static void operator delete(void* p) { ::operator delete(p); }
+    static void operator delete(void* p, std::uint32_t) { ::operator delete(p); }
+    explicit GenState(std::uint32_t registers) : count(registers)
+    {
+        for (std::uint32_t i = 0; i < registers; ++i)
+            regs()[i] = JSValue::undefined();
+    }
     JSValue callee = JSValue::undefined();
     std::uint32_t pcIndex = 0;
     std::uint16_t resumeDst = 0;
@@ -1039,14 +1050,14 @@ struct GenState : NativeState
     void values(Vec<JSValue>& out) const override
     {
         out.push_back(callee);
-        out.insert(out.end(), regs.begin(), regs.end());
+        out.insert(out.end(), regs(), regs() + count);
     }
     void clear(VM&) noexcept override { clear_(); }
     void clear_() noexcept
     {
-        for (JSValue& v : regs) {
-            release(v);
-            v = JSValue::undefined();
+        for (std::uint32_t i = 0; i < count; ++i) {
+            release(regs()[i]);
+            regs()[i] = JSValue::undefined();
         }
         release(callee);
         callee = JSValue::undefined();
@@ -2757,7 +2768,7 @@ L_GenStart: {
     g->pcIndex = std::uint32_t(pc - codeStart);
     g->state = GenState::Start;
     for (std::uint32_t i = 0; i < code->nregs; ++i) {
-        g->regs[i] = R[i];
+        g->regs()[i] = R[i];
         R[i] = JSValue::undefined();
     }
     --vm.frameTop;
@@ -3373,7 +3384,7 @@ L_Yield: {
     g->resumeDst = ins->a;
     g->state = GenState::Suspended;
     for (std::uint32_t i = 0; i < code->nregs; ++i) {
-        g->regs[i] = R[i];
+        g->regs()[i] = R[i];
         R[i] = JSValue::undefined();
     }
     --vm.frameTop;
@@ -4563,24 +4574,23 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     JSObject* fallback = (c->flags & CodeBlock::kAsyncGen) ? protos.asyncGenerator : protos.generator;
     JSObject* o = newObject(fallback);
     Handle keep = Handle::adopt(toJSValue(o));
-    auto* g = new GenState();
+    auto* g = new (c->nregs) GenState(c->nregs);
     o->h.cls = std::uint8_t(ObjClass::Generator);
     o->rareOf(*this).ext = g;
-    g->regs.assign(c->nregs, JSValue::undefined());
     g->callee = toJSValue(f);
     retain(g->callee);
     JSValue self = thisValue;
     if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self.isNullish())
         self = toJSValue(global);
     retain(self);
-    g->regs[0] = self;
+    g->regs()[0] = self;
     const std::uint32_t keep_ = argc < c->nparams ? argc : c->nparams;
     for (std::uint32_t i = 0; i < keep_; ++i) {
         retain(args[i]);
-        g->regs[1 + i] = args[i];
+        g->regs()[1 + i] = args[i];
     }
     if (c->flags & CodeBlock::kNeedsArgs)
-        g->regs[1 + c->nparams] = toJSValue(captureArgumentsFor(*this, c, args, argc));
+        g->regs()[1 + c->nparams] = toJSValue(captureArgumentsFor(*this, c, args, argc));
     if ((c->flags & CodeBlock::kAsync) && !(c->flags & CodeBlock::kAsyncGen))
         return bi::asyncStart(*this, keep.take());
     // The parameters (their defaults may throw) and the declarations run now.
@@ -4657,8 +4667,8 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     fillStack(R + c->nregs + 1);
     for (std::uint32_t i = 0; i < c->nregs; ++i) {
         const JSValue old = R[i];
-        R[i] = g->regs[i];
-        g->regs[i] = JSValue::undefined();
+        R[i] = g->regs()[i];
+        g->regs()[i] = JSValue::undefined();
         release(old);
     }
     if (g->state == GenState::Suspended && g->delegating) {

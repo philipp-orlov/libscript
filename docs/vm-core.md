@@ -295,6 +295,48 @@ drives; a generator's `return(v)` throws a marker that `finally` blocks see and 
 Unicode property tables and a few features the shared front end does not parse. What the old core passes and this one does
 not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 
+## Performance experiments
+
+What was tried against JetStream 3 (JavaScript tests, `jsc-compare/harness/js3run.py`, scores higher is better, arm64), what
+stayed and what did not. Measured with each engine pinned to one fast core; a test's score moves a few percent between runs,
+so a change was kept only when it moved a test well past that.
+
+Kept:
+
+| Change | Test | Before | After |
+|---|---|--:|--:|
+| Scope analyses walk the tree once (TDZ holes, captured names, scope index) | babylonjs-startup-es6 | 1.89 | 7.96 |
+| A plain RegExp skips the flag getters and `exec` lookup; per-thread program cache | OfflineAssembler | 15.7 | 26.0 |
+| `slice`/`substring`/`substr` of a long string share its characters | OfflineAssembler | 26.0 | 34.8 |
+| Typed arrays of every kind in place; typed access as a read chain; re-learn a guessed element site | mandreel | 16.9 | 26.1 |
+| Megamorphic read table at marked sites | espree-wtb / acorn-wtb / Babylon | 8.8 / 7.3 / 142 | 12.7 / 10.4 / 179 |
+
+How the three worst tests were found: `perf record` over the harness run, then `perf report --no-children -g callee` for
+native code and `SCRIPT_VM_PERFMAP=1` with a per-function share for compiled code. babylonjs-startup spent 72% in one
+compiler helper (`mentions`, called once per `let` of a scope over every statement before it), OfflineAssembler 30% in
+interning flag names for `rx.flags` and 17% in copying the remaining source on each `str.slice(n)`, and mandreel's hot loops
+took a count on the typed array for every `heap32[...]`.
+
+Tried and taken out:
+
+- Optimized code entered by `new` (constructors running tier 2 code): the constructor of espree's `Token` went from 3.2% to
+  2.7% of the run, nothing else moved, and Box2D's worst iteration fell from about 121 to 82 points (total 102 to 88): the
+  constructor code was made, failed a guard and was made again inside the timed part.
+- Caching a property read through a dictionary prototype by giving the dictionary a new shape id on every key it gains:
+  gbemu fell from 39 to 9, because its global object gains keys all the time. Replaced by an absence cell that only the
+  readers of a missing key hold (`Dictionary::absent`).
+- Keeping a compile try for exits at sites that had never run: the extra compiles cost more than they won.
+- Serving reads from the megamorphic table at every site: sites an inline cache handled well lost it (Box2D and gbemu fell).
+  The table now serves only sites marked megamorphic (`InlineCache::flags`).
+
+Measured and not the cause: reference counting is 3 to 5% of the Octane tests' time (count updates and frees together).
+Loose `==` and `!=` in tests are never fused into a compare-and-jump (only `===`, `!==` and the relational operators are);
+on a mandreel-like loop fusing them would win about 6%.
+
+Still open, in order of what they would bring: a call of a small function with a branch (`uint(x)` in mandreel) is not
+inlined, so the loop around it cannot keep its global reads before the loop; Octane's code-load tests (`*-inspector-code-load`)
+are bound by parsing and the first runs.
+
 ## Known limits
 
 - Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in

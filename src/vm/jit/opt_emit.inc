@@ -316,6 +316,77 @@ void Baseline::int32OfWeb(std::int32_t w, Reg dst, std::uint32_t exitAt)
     a_.jcc(CE, exitBefore(exitAt));
 }
 
+/// The one typed-array kind element instruction `i` has indexed, when it has seen one only and the optimizing compiler can
+/// load or store it in place: a store into a clamped array rounds, and a read of a Uint32 can be past int32.
+bool Baseline::typedSiteKind(std::uint32_t i, bool put, ElemKind* kind)
+{
+    using namespace elemprof;
+    const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+    if (ep == kFloat64 || ep == kInt32 || ep == kUint8) {
+        *kind = ep == kFloat64 ? ElemKind::Float64 : ep == kInt32 ? ElemKind::Int32 : ElemKind::Uint8;
+        return true;
+    }
+    if (ep != kOtherTyped)
+        return false;
+    const std::uint8_t seen = i < code_->elemKinds.size() ? code_->elemKinds[i] : 0;
+    if (seen == 0 || (seen & (seen - 1)) != 0)
+        return false;
+    *kind = ElemKind(__builtin_ctz(seen));
+    return !((put && *kind == ElemKind::Uint8Clamped) || (!put && *kind == ElemKind::Uint32));
+}
+
+/// RAX an object, RCX an int32 index: element `RCX` of a typed array of `kind`, read into the instruction's destination or
+/// written from web `vw`. A read past the end leaves through `bad`, a store there does nothing; a double that is no int32
+/// stored into an integer array leaves before instruction `exitAt`.
+void Baseline::typedAccess(std::uint32_t i, const Ins& in, ElemKind kind, bool put, std::int32_t vw, Label& bad,
+                           std::uint32_t exitAt)
+{
+    Label done;
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
+    a_.jcc(CNE, bad);
+    a_.alu32(7, RCX, mem(RAX, kTypedLength));
+    a_.jcc(CAE, put ? done : bad);  // a store to no element (past the end, or a negative index) does nothing
+    a_.mov(RSI, mem(RAX, kTypedData));
+    if (!put) {
+        switch (kind) {
+        case ElemKind::Float64:
+            a_.movsdLoad(0, mem(RSI, RCX, 8));
+            deliverDouble(i, in.a);
+            return;
+        case ElemKind::Float32:
+            a_.movssLoad(0, mem(RSI, RCX, 4));
+            a_.cvtss2sd(0, 0);
+            deliverDouble(i, in.a);
+            return;
+        case ElemKind::Int32: a_.mov32(RAX, mem(RSI, RCX, 4)); break;
+        case ElemKind::Int16: a_.movsx16(RAX, mem(RSI, RCX, 2)); a_.mov32(RAX, RAX); break;
+        case ElemKind::Uint16: a_.movzx16(RAX, mem(RSI, RCX, 2)); break;
+        case ElemKind::Int8: a_.movsx8(RAX, mem(RSI, RCX, 1)); a_.mov32(RAX, RAX); break;
+        default: a_.movzx8(RAX, mem(RSI, RCX, 1)); break;  // Uint8, Uint8Clamped
+        }
+        deliverInt(i, in.a);
+        return;
+    }
+    if (kind == ElemKind::Float64) {
+        const int x = operandF64(vw, 0, RAX);
+        a_.movsdStore(mem(RSI, RCX, 8), x);
+    } else if (kind == ElemKind::Float32) {
+        const int x = operandF64(vw, 0, RAX);
+        a_.cvtsd2ss(0, x);
+        a_.movssStore(mem(RSI, RCX, 4), 0);
+    } else {
+        int32OfWeb(vw, RAX, exitAt);
+        switch (kind) {
+        case ElemKind::Int32: case ElemKind::Uint32: a_.mov32(mem(RSI, RCX, 4), RAX); break;
+        case ElemKind::Int16: case ElemKind::Uint16: a_.mov16(mem(RSI, RCX, 2), RAX); break;
+        default: a_.mov8(mem(RSI, RCX, 1), RAX); break;  // Int8, Uint8
+        }
+    }
+    a_.bind(done);
+}
+
 namespace {
 
 /// Slots of the optimized frame for the values of inlined calls.
@@ -928,7 +999,8 @@ bool Baseline::emitTyped(std::uint32_t i)
         const bool notRun = ep == 0;
         if (ep == 0)
             ep = kArray;  // not run yet: the usual case, and a guard that fails says so
-        if (ep != kArray && ep != kFloat64 && ep != kInt32 && ep != kUint8)
+        ElemKind kind = ElemKind::Count;
+        if (ep != kArray && !typedSiteKind(i, put, &kind))
             return false;
         const std::int32_t vw = put ? uw[2] : -1;
         if (put && ep != kArray && vw < 0)
@@ -1054,38 +1126,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.bind(done);
             return true;
         }
-        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
-        a_.jcc(CNE, bad);
-        const ElemKind kind = ep == kFloat64 ? ElemKind::Float64 : ep == kInt32 ? ElemKind::Int32 : ElemKind::Uint8;
-        a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
-        a_.jcc(CNE, bad);
-        a_.alu32(7, RCX, mem(RAX, kTypedLength));
-        a_.jcc(CAE, put ? done : bad);  // a store to no element (past the end, or a negative index) does nothing
-        a_.mov(RSI, mem(RAX, kTypedData));
-        if (!put) {
-            if (kind == ElemKind::Float64) {
-                a_.movsdLoad(0, mem(RSI, RCX, 8));
-                deliverDouble(i, in.a);
-            } else {
-                if (kind == ElemKind::Int32)
-                    a_.mov32(RAX, mem(RSI, RCX, 4));
-                else
-                    a_.movzx8(RAX, mem(RSI, RCX, 1));
-                deliverInt(i, in.a);
-            }
-            return true;
-        }
-        if (kind == ElemKind::Float64) {
-            const int x = operandF64(vw, 0, RAX);
-            a_.movsdStore(mem(RSI, RCX, 8), x);
-        } else {
-            int32OfWeb(vw, RAX, i);
-            if (kind == ElemKind::Int32)
-                a_.mov32(mem(RSI, RCX, 4), RAX);
-            else
-                a_.mov8(mem(RSI, RCX, 1), RAX);
-        }
-        a_.bind(done);
+        typedAccess(i, in, kind, put, vw, bad, i);
         return true;
     }
     case Op::PutProp: {

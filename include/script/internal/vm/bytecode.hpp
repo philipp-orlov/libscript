@@ -227,6 +227,9 @@ struct CodeBlock
     Vec<std::uint8_t> prof;
     /// What `GetElem` and `PutElem` have indexed (`elemprof` bits), one byte per instruction; made with the baseline code.
     Vec<std::uint8_t> elemProf;
+    /// Which typed-array kinds below Float64 (`ElemKind` Int8 to Float32, which `elemprof::kOtherTyped` lumps together) each
+    /// of those instructions has indexed: a bit per kind, so the optimizing compiler can take the one a site sees.
+    Vec<std::uint8_t> elemKinds;
     /// The optimizing compiler's code for this function (jit.hpp), once the baseline code has run hot; owned.
     struct Tier2Code* tier2 = nullptr;
     std::int32_t tier2Counter = 0;  ///< entries and back edges of the baseline code left before the optimizing compiler is asked

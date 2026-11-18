@@ -5293,3 +5293,41 @@ TEST(aPlainRegExpSkipsItsFlagGettersUntilOneChangesAndALongSliceSharesItsText)
     CHECK_EQ(run(program),
              std::string("2 g string 0 2 null false true yx zx 39 400 119 klmno wxyzabcdef| def"));
 }
+
+TEST(typedArraysOfEveryKindAreReadAndWrittenInPlaceThroughGlobalsInHotLoops)
+{
+    // Every kind of typed array read and written through global variables in loops hot enough for the optimizing compiler:
+    // signed and unsigned narrow kinds, Uint32 past int32, Float32 rounding, stores past the end, a global given a new
+    // array while a loop runs, a site that meets a typed array only after it was compiled, and loops on constant tests.
+    const char* program =
+        "var buf = new ArrayBuffer(4096);"
+        "var i8 = new Int8Array(buf), u8 = new Uint8Array(buf), c8 = new Uint8ClampedArray(buf), i16 = new Int16Array(buf), u16 = new Uint16Array(buf);"
+        "var i32 = new Int32Array(buf), u32 = new Uint32Array(buf), f32 = new Float32Array(buf), f64 = new Float64Array(buf);"
+        "var out = [];"
+        "function fill(n) { var i = 0; while (true) { i16[i] = (i * 977 - 30000) | 0; i = (i + 1) | 0; if (i >= n) break; } return i; }"
+        "function sum(n) { var s = 0, i = 0; while (1) { s = (s + i8[i] + u8[i] + c8[i] + i16[i >> 1] + u16[i >> 1]) | 0; i = (i + 1) | 0; if (i >= n) break; } return s; }"
+        "function words(n) { var s = 0; for (var i = 0; i < n; i++) { u32[i + 512] = (i - 5) | 0; s += u32[i + 512] > 4e9 ? 1 : 0; i32[i + 600] = u32[i + 512] | 0; } return s; }"
+        "function floats(n) { var s = 0; for (var i = 0; i < n; i++) { f32[i + 800] = i / 3; s += f32[i + 800]; f64[i + 300] = f32[i + 800] * 2; } return s; }"
+        "function past(n) { var s = 0; for (var i = 0; i < n; i++) { i16[i + 2040] = i; s = (s + (i16[i + 2040] | 0)) | 0; } return s; }"
+        "function swap(n) { var s = 0; for (var i = 0; i < n; i++) { if (i == n >> 1) u8 = new Uint8Array(16).fill(7); s = (s + u8[i & 15]) | 0; } return s; }"
+        "function late(a, n) { var s = 0; for (var i = 0; i < n; i++) s = (s + a[i & 7]) | 0; return s; }"
+        "var r = [];"
+        "for (var k = 0; k < 30; k++) { r = [fill(1500), sum(1500), words(200), Math.round(floats(150) * 1000), past(30), swap(400)]; u8 = new Uint8Array(buf); }"
+        "for (var k = 0; k < 3000; k++) late([1, 2, 3, 4, 5, 6, 7, 8], 4);"
+        "r.push(late(new Int16Array([-1, -2, -3, -4, -5, -6, -7, -8]), 100), late(new Float32Array(8).fill(0.5), 10));"
+        "var z = 0; while (false) z = 1; do { z += 2; } while (0);"
+        "r.push(z, i16[3], u16[3], i8[5], c8[5], f64[301]);"
+        "r.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("1500 49118140 5 3725000 28 30474 -442 0 2 -27069 38467 -110 146 0.6666666865348816"));
+    }
+}

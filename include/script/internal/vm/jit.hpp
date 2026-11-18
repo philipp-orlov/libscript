@@ -103,6 +103,8 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index);
 inline constexpr std::uint64_t kStepFall = kHole;
 inline constexpr std::uint64_t kStepJump = kUninit;
 std::uint64_t stepInstruction(VM& vm, std::uint32_t index);
+/// Records in the element profile of instruction `index` (elemprof, and the typed kind) what `base` is.
+void noteElemBase(CodeBlock* code, std::uint32_t index, JSValue base);
 /// What the interpreter does when the call that the instruction at `index` made returned the exception sentinel: look for
 /// a handler in the top frame; `kStepJump` if there is one, else the frame is left and the exception sentinel returned.
 std::uint64_t stepThrow(VM& vm, std::uint32_t index);

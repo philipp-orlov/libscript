@@ -1631,7 +1631,20 @@ bool Baseline::chainable(std::uint32_t i, bool asConsumer)
         if (uw[1] >= 0 && !isI32(uw[1]))
             return false;
         const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
-        return ep == elemprof::kArray && in.b != in.c;
+        if (in.b == in.c)
+            return false;
+        if (ep == elemprof::kArray)
+            return true;
+        // A typed array's element, read straight into its destination: only the end of a chain.
+        ElemKind kind;
+        return asConsumer && uw[1] >= 0 && typedSiteKind(i, false, &kind);
+    }
+    case Op::PutElem: {
+        // A number stored into the one kind of typed array the site has seen, at an int32 index: the end of a chain.
+        const auto& uw = plan_->useWebs[i];
+        ElemKind kind;
+        return asConsumer && uw.size() >= 3 && uw[0] < 0 && uw[1] >= 0 && isI32(uw[1]) && uw[2] >= 0 && in.a != in.b &&
+               in.a != in.c && typedSiteKind(i, true, &kind);
     }
     case Op::GetProp: {
         const std::uint16_t cacheId = code_->code[i + 1].a;
@@ -1718,12 +1731,14 @@ void Baseline::planChains()
         const std::uint32_t c = starts[m];
         const Ins& cn = code_->code[c];
         const Op cop = cn.opcode();
-        if ((cop != Op::GetProp && cop != Op::GetElem) || cn.b != r || plan_->isLeader[c] || !chainable(c, true) ||
-            windowRead_.count(c) || (c < skipDef_.size() && skipDef_[c]))
+        // The register a link reads its object from: a store's is its first operand.
+        const bool store = cop == Op::PutElem;
+        if ((cop != Op::GetProp && cop != Op::GetElem && !store) || (store ? cn.a : cn.b) != r || plan_->isLeader[c] ||
+            !chainable(c, true) || windowRead_.count(c) || (c < skipDef_.size() && skipDef_[c]))
             continue;
         if (cop == Op::GetElem && cn.c == r)
             continue;
-        if (!(cn.a == r || deadAfter(m, r)))
+        if (!((!store && cn.a == r) || deadAfter(m, r)))
             continue;
         chainRole_[i] |= 1;
         chainRole_[c] |= 2;
@@ -1785,9 +1800,28 @@ void Baseline::emitChain(std::uint32_t i)
         a_.mov(RAX, mem(RDX, 0));
         break;
     }
+    case Op::PutElem: {
+        // The end of a chain: a number into a typed array that only the chain's read holds.
+        const auto& uw = plan_->useWebs[i];
+        ElemKind kind = ElemKind::Count;
+        typedSiteKind(i, true, &kind);
+        receiver(in.a);
+        needObject(RAX, bad);
+        a_.mov32(RCX, useI32(uw[1], RCX));
+        typedAccess(i, in, kind, true, uw[2], bad, std::uint32_t(chainHead_[i] >= 0 ? chainHead_[i] : std::int32_t(i)));
+        return;
+    }
     case Op::GetElem: {
         const auto& uw = plan_->useWebs[i];
         receiver(in.b);
+        ElemKind typedKind = ElemKind::Count;
+        const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+        if ((role & 2) && ep != elemprof::kArray && typedSiteKind(i, false, &typedKind)) {
+            needObject(RAX, bad);
+            a_.mov32(RCX, useI32(uw[1], RCX));
+            typedAccess(i, in, typedKind, false, -1, bad, std::uint32_t(chainHead_[i]));
+            return;
+        }
         bool known = false;
         for (const LoopGlobal& lg : loopGlobals_)
             known = known || (lg.array && lg.taker == i && lg.from <= factAt_ && factAt_ <= lg.to);

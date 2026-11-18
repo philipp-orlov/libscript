@@ -258,6 +258,15 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
     try {
         Frame* fr = vm->frameTop - 1;
         CodeBlock* code = fr->code;
+        // An element access the code was made for before the site had run, guessing an array, meets something else: the
+        // site now knows what it indexes, and a new compile will (no failure, as below).
+        if (kind == 0 && index < code->elemProf.size() && code->elemProf[index] == 0) {
+            const Ins& at = code->code[index];
+            if (at.opcode() == Op::GetElem || at.opcode() == Op::PutElem) {
+                noteElemBase(code, index, fr->R[at.opcode() == Op::GetElem ? at.b : at.a]);
+                kind = 2;
+            }
+        }
         if (kind == 2) {
             // Sites this code knew nothing of have run long enough: a new compile will know them (not a failure: no try
             // is used up).
@@ -281,6 +290,16 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                               isObject(o) ? "obj" : "other", isObject(o) ? asObject(o)->h.shape : 0u,
                               isObject(o) ? int(asObject(o)->h.aux) : -1, ic.shape, int(ic.aux) - 1, ic.holder != nullptr,
                               ic.pad ? int(code->poly[ic.pad - 1].n) : 0);
+                what = buf;
+            } else if (at.opcode() == Op::GetElem || at.opcode() == Op::PutElem) {
+                const JSValue o = fr->R[at.opcode() == Op::GetElem ? at.b : at.a];
+                const JSValue x = fr->R[at.opcode() == Op::GetElem ? at.c : at.b];
+                char buf[160];
+                std::snprintf(buf, sizeof buf, " base %s cls %d index %s %lld ep %d kinds %d", isObject(o) ? "obj" : o.isUndefined() ? "undef" : "other",
+                              isObject(o) ? int(asObject(o)->cls()) : -1, x.isInt32() ? "int" : x.isDouble() ? "dbl" : "other",
+                              x.isInt32() ? (long long)x.asInt32() : x.isDouble() ? (long long)x.asDouble() : 0LL,
+                              index < code->elemProf.size() ? int(code->elemProf[index]) : -1,
+                              index < code->elemKinds.size() ? int(code->elemKinds[index]) : -1);
                 what = buf;
             }
             std::fprintf(stderr, "tier2 exit %s @%u kind %d (n=%zu tries %d)%s\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind,
@@ -819,6 +838,16 @@ private:
         a_.movImm(tmp, reinterpret_cast<std::uint64_t>(&code_->elemProf[i]));
         a_.orI8(mem(tmp, 0), bit);
     }
+    /// Records that instruction `i` has indexed a typed array of `kind`, one of those `kOtherTyped` stands for.
+    void noteKind(std::uint32_t i, ElemKind kind, Reg tmp)
+    {
+        if (std::uint8_t(kind) >= 8)
+            return;
+        if (code_->elemKinds.empty())
+            code_->elemKinds.assign(code_->code.size(), 0);
+        a_.movImm(tmp, reinterpret_cast<std::uint64_t>(&code_->elemKinds[i]));
+        a_.orI8(mem(tmp, 0), std::uint8_t(1u << std::uint8_t(kind)));
+    }
     /// For each element kind `kinds[k]`, a jump (on RDX equal to it) to a stub that notes `bits[k]` and goes on to `to[k]`.
     void kindDispatch(std::uint32_t i, std::initializer_list<std::tuple<ElemKind, std::uint8_t, Label*>> kinds, Label& none)
     {
@@ -833,6 +862,8 @@ private:
         for (const auto& [kind, bit, to] : kinds) {
             a_.bind(stubs[k++]);
             noteElem(i, bit, RDX);
+            if (bit == elemprof::kOtherTyped)
+                noteKind(i, kind, RDX);
             a_.jmp(*to);
         }
     }
@@ -1732,6 +1763,8 @@ private:
     void deliverDouble(std::uint32_t i, unsigned dst);
     void afterGeneric(std::uint32_t i);
     void int32OfWeb(std::int32_t w, Reg dst, std::uint32_t exitAt);
+    bool typedSiteKind(std::uint32_t i, bool put, ElemKind* kind);
+    void typedAccess(std::uint32_t i, const Ins& in, ElemKind kind, bool put, std::int32_t vw, Label& bad, std::uint32_t exitAt);
     void typedJump(std::uint32_t i, const Ins& in);
     void emitCounter(std::uint32_t i, std::int64_t target);
 

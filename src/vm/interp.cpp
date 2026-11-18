@@ -3185,6 +3185,15 @@ JSValue run(VM& vm)
 
 }  // namespace
 
+namespace {
+void noteElem(CodeBlock* code, std::uint32_t index, JSValue base);
+}  // namespace
+
+void noteElemBase(CodeBlock* code, std::uint32_t index, JSValue base)
+{
+    noteElem(code, index, base);
+}
+
 std::uint64_t stepInstruction(VM& vm, std::uint32_t index)
 {
     Frame* fr = vm.frameTop - 1;
@@ -3226,6 +3235,8 @@ void noteElem(CodeBlock* code, std::uint32_t index, JSValue base)
             const ElemKind k = static_cast<JSTypedArray*>(o)->kind;
             bit = k == ElemKind::Float64 ? elemprof::kFloat64 : k == ElemKind::Int32 ? elemprof::kInt32
                 : k == ElemKind::Uint8 ? elemprof::kUint8 : elemprof::kOtherTyped;
+            if (bit == elemprof::kOtherTyped && std::uint8_t(k) < 8 && index < code->elemKinds.size())
+                code->elemKinds[index] |= std::uint8_t(1u << std::uint8_t(k));
         }
     }
     code->elemProf[index] |= bit;

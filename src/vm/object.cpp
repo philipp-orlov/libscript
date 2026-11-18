@@ -186,6 +186,12 @@ void VM::releaseCode(CodeBlock* code) noexcept
         for (std::uint8_t i = 0; i < p.n; ++i)
             if (p.e[i].validity)
                 releaseValidity(p.e[i].validity);
+    for (const ElemCache& e : code->elemCaches) {
+        if (e.validity)
+            releaseValidity(e.validity);
+        if (e.key)
+            detail::decRef(e.key);
+    }
     for (const SuperCache& s : code->superCaches)
         if (s.validity)
             releaseValidity(s.validity);

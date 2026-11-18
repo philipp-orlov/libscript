@@ -593,6 +593,73 @@ int readCachedSlow(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValu
     return 0;
 }
 
+/// A by-name read through the site's `ElemCache`: the slot, or null.
+inline JSValue* elemCached(CodeBlock* code, std::size_t at, JSObject* o, CellPtr key) noexcept
+{
+    if (at >= code->elemSite.size() || !code->elemSite[at])
+        return nullptr;
+    const ElemCache* ways = &code->elemCaches[code->elemSite[at] - 1];
+    for (std::uint32_t k = 0; k < ElemCache::kWays; ++k) {
+        const ElemCache& ec = ways[k];
+        if (ec.key == key && ec.shape == o->h.shape && (!ec.validity || ec.validity->valid))
+            return (ec.holder ? ec.holder : o)->slotAt(ec.index);
+    }
+    return nullptr;
+}
+
+/// Remember where `o[key]` found its data property, for the site at instruction `at`: in the way its key maps to.
+void learnElem(VM& vm, CodeBlock* code, std::size_t at, JSObject* o, Key key)
+{
+    if (code->elemSite.size() <= at)
+        code->elemSite.assign(code->code.size(), 0);
+    std::uint32_t& site = code->elemSite[at];
+    if (!site) {
+        site = std::uint32_t(code->elemCaches.size()) + 1;
+        for (std::uint32_t k = 0; k < ElemCache::kWays; ++k)
+            code->elemCaches.emplace_back();
+    }
+    ElemCache* ways = &code->elemCaches[site - 1];
+    if (ways[0].misses >= 24)
+        return;
+    double numeric;
+    if (o->cls() == ObjClass::TypedArray || o->cls() == ObjClass::String || canonicalNumericIndex(key, &numeric) ||
+        (hasElems(o) && key == vm.atoms.length) || !cacheable(vm, o)) {
+        ++ways[0].misses;
+        return;
+    }
+    InlineCache found;
+    if (!learnRead(vm, found, o, key)) {
+        ++ways[0].misses;
+        return;
+    }
+    // The way of this key and shape, else an empty one, else the one the key's address names.
+    std::uint32_t way = (reinterpret_cast<std::uintptr_t>(key) >> 4) & (ElemCache::kWays - 1);
+    bool placed = false;
+    for (std::uint32_t k = 0; k < ElemCache::kWays && !placed; ++k)
+        if (ways[k].key == key && ways[k].shape == found.shape) {
+            way = k;
+            placed = true;
+        }
+    for (std::uint32_t k = 0; k < ElemCache::kWays && !placed; ++k)
+        if (!ways[k].key) {
+            way = k;
+            placed = true;
+        }
+    ElemCache& ec = ways[way];
+    if (ec.key && ec.key != key)
+        ++ways[0].misses;  // a way taken by another key: a site that goes through many gives up
+    if (ec.validity)
+        vm.releaseValidity(ec.validity);
+    if (ec.key)
+        detail::decRef(ec.key);
+    detail::incRef(key);
+    ec.key = key;
+    ec.shape = found.shape;
+    ec.index = found.index;
+    ec.holder = found.holder;
+    ec.validity = found.validity;
+}
+
 /// The slot a cached add stores into: one in place, or an out-of-line one (the buffer is made or grown to hold it).
 inline JSValue* roomForAdd(VM& vm, JSObject* o, std::uint32_t index)
 {
@@ -1917,7 +1984,7 @@ L_GetElem: {
             k = JSValue::int32(std::int32_t(d));
     }
     if (k.isInt32() && k.asInt32() >= 0) {
-        if (isObject(base) && asObject(base)->cls() == ObjClass::Array) {
+        if (isObject(base) && hasElems(asObject(base))) {
             auto* a = static_cast<JSArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < a->length && !a->elems[i].isHole()) {
@@ -1958,6 +2025,12 @@ L_GetElem: {
         SETP(ins->a, v);
         NEXT();
     }
+    if (isObject(base) && k.isCell() && (isSymbol(k) || (isString(k) && asString(k)->interned))) {
+        if (JSValue* slot = elemCached(code, std::size_t(ins - codeStart), asObject(base), k.asCell())) {
+            COPYP(ins->a, *slot);
+            NEXT();
+        }
+    }
     JSValue prim = toPrimitive(vm, k, true);
     if (prim.isException())
         FAIL();
@@ -1965,6 +2038,8 @@ L_GetElem: {
     release(prim);
     if (!key)
         FAIL();
+    if (isObject(base) && prim.isCell() && (isSymbol(prim) || isString(prim)))
+        learnElem(vm, code, std::size_t(ins - codeStart), asObject(base), key);
     const JSValue v = getProperty(vm, base, key);
     release(JSValue::cell(key));
     if (v.isException())
@@ -4034,7 +4109,7 @@ int jitGetElem(VM& vm, std::uint32_t index)
             k = JSValue::int32(std::int32_t(d));
     }
     if (k.isInt32() && k.asInt32() >= 0) {
-        if (isObject(base) && asObject(base)->cls() == ObjClass::Array) {
+        if (isObject(base) && hasElems(asObject(base))) {
             auto* a = static_cast<JSArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < a->length && !a->elems[i].isHole()) {
@@ -4079,6 +4154,12 @@ int jitGetElem(VM& vm, std::uint32_t index)
         learnPrivate(vm, pc, base, k, false);
         return 1;
     }
+    if (isObject(base) && k.isCell() && (isSymbol(k) || (isString(k) && asString(k)->interned))) {
+        if (JSValue* slot = elemCached(c.code, index, asObject(base), k.asCell())) {
+            copyReg(R[ins->a], *slot);
+            return 1;
+        }
+    }
     JSValue prim = toPrimitive(vm, k, true);
     if (prim.isException())
         return 0;
@@ -4086,6 +4167,8 @@ int jitGetElem(VM& vm, std::uint32_t index)
     release(prim);
     if (!key)
         return 0;
+    if (isObject(base) && prim.isCell() && (isSymbol(prim) || isString(prim)))
+        learnElem(vm, c.code, index, asObject(base), key);
     const JSValue v = getProperty(vm, base, key);
     release(JSValue::cell(key));
     if (v.isException())

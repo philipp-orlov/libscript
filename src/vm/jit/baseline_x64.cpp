@@ -287,7 +287,11 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                 --code->tier2Tries;
             return stepInstruction(*vm, index);
         }
-        if (index < code->prof.size())
+        // A global read or write leaves when the global object has changed since the code was made, which the next compile
+        // takes in; it is marked as one that cannot be guarded only when that keeps happening.
+        const bool globalAccess = code->code[index].opcode() == Op::GetGlobal || code->code[index].opcode() == Op::GetGlobalOrUndef ||
+                                  code->code[index].opcode() == Op::PutGlobal;
+        if (index < code->prof.size() && (!globalAccess || code->tier2Tries >= 2))
             code->prof[index] |= opt::kProfFailed;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (std::getenv("T2EXITS"))

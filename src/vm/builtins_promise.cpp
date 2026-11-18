@@ -24,6 +24,7 @@ struct Reaction
 {
     Handle derived;  ///< the promise `then` made, or undefined for an internal reaction
     Handle handler;  ///< a function, or undefined to pass the outcome on
+    bool await = false;  ///< an `await`: `handler` is the generator that waits, `derived` the promise of its function
 };
 
 struct PromiseData : NativeState
@@ -120,7 +121,7 @@ void settle(VM& vm, JSValue promise, PromiseData::State state, JSValue value)
     d->onFulfilled.clear();
     d->onRejected.clear();
     for (const Reaction& r : reactions)
-        vm.enqueueJob(state == PromiseData::Fulfilled ? 0 : 1, r.handler.get(), r.derived.get(), value);
+        vm.enqueueJob((r.await ? 4 : 0) + (state == PromiseData::Fulfilled ? 0 : 1), r.handler.get(), r.derived.get(), value);
 }
 
 void rejectPromise(VM& vm, JSValue promise, JSValue reason) { settle(vm, promise, PromiseData::Rejected, reason); }
@@ -210,6 +211,19 @@ void performThen(VM& vm, JSValue promise, JSValue onFulfilled, JSValue onRejecte
     }
 }
 
+/// An `await` of `promise`: the generator goes on when it settles, with no function made for it.
+void performAwait(VM& vm, JSValue promise, JSValue generator, JSValue result)
+{
+    PromiseData* d = dataOf(promise);
+    d->handled = true;
+    if (d->state == PromiseData::Pending) {
+        d->onFulfilled.push_back(Reaction{Handle::retained(result), Handle::retained(generator), true});
+        d->onRejected.push_back(Reaction{Handle::retained(result), Handle::retained(generator), true});
+    } else {
+        vm.enqueueJob(d->state == PromiseData::Fulfilled ? 4 : 5, generator, result, d->result);
+    }
+}
+
 /// `Promise.resolve(v)`: v itself when it is a promise.
 JSValue promiseResolve(VM& vm, JSValue v)
 {
@@ -223,6 +237,8 @@ JSValue promiseResolve(VM& vm, JSValue v)
 }
 
 // ------------------------------------------------------------------ the jobs ---
+
+void asyncResume(VM& vm, JSValue generator, JSValue promise, int mode, JSValue sent);
 
 void runJob(VM& vm, const MicroJob& job)
 {
@@ -263,6 +279,11 @@ void runJob(VM& vm, const MicroJob& job)
             release(r);
             return;
         }
+        case 4:
+        case 5:
+            // a: the generator of an async function, b: its promise, c: what the awaited promise settled with.
+            asyncResume(vm, job.a, job.b, job.kind - 4, job.c);
+            return;
         case 2: {
             // a: the promise, b: the thenable, c: its `then`.
             Handle resolve, reject;
@@ -731,8 +752,6 @@ NATIVE(promiseCombinator)
     }
 }
 
-NATIVE(asyncContinue);
-
 void asyncStep(VM& vm, JSValue generator, JSValue promise, int mode, JSValue sent)
 {
     JSValue out;
@@ -748,22 +767,20 @@ void asyncStep(VM& vm, JSValue generator, JSValue promise, int mode, JSValue sen
         resolvePromise(vm, promise, out);
         return;
     }
-    // An `await`: go on when what was awaited settles.
+    // An `await`: go on when what was awaited settles. Something that is no object is fulfilled at once; nothing is made.
+    if (!isObject(out)) {
+        vm.enqueueJob(4, generator, promise, out);
+        return;
+    }
     JSValue awaited = promiseResolve(vm, out);
     Handle awaitedKeep = Handle::adopt(awaited);
-    Handle onFul = Handle::adopt(toJSValue(closureFn(vm, asyncContinue, generator, promise, 0)));
-    Handle onRej = Handle::adopt(toJSValue(closureFn(vm, asyncContinue, generator, promise, 1)));
-    performThen(vm, awaited, onFul.get(), onRej.get(), JSValue::undefined());
+    performAwait(vm, awaited, generator, promise);
 }
 
-NATIVE(asyncContinue)
+void asyncResume(VM& vm, JSValue generator, JSValue promise, int mode, JSValue sent)
 {
-    UNUSED();
-    Rare& r = carried(data);
-    asyncStep(vm, r.boundTarget, r.boundThis, int(r.fnState), arg(args, argc, 0));
-    return JSValue::undefined();
+    asyncStep(vm, generator, promise, mode, sent);
 }
-
 
 // ---------------------------------------------------------- async generators ---
 

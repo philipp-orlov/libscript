@@ -187,6 +187,12 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         {"function P(a, b) { this.s = a + b; } var B = P.bind(null, 1); new B(2).s", "3"},
         // A `let` read in its own initialiser is in its dead zone.
         {"var r; try { let v = (function () { return v; })(); } catch (e) { r = e.name; } r", "ReferenceError"},
+        // A `let` of one `switch` case is in its dead zone when another case is entered.
+        {"function t(k) { switch (k) { case 0: let x = 1; return x; case 1: try { return typeof x; } catch (e) { return e.name; } } } "
+         "t(0) + ':' + t(1)",
+         "1:ReferenceError"},
+        {"function t(k) { switch (k) { case 0: const x = 1; return x; case 1: try { return String(x); } catch (e) { return e.name; } } } t(1)",
+         "ReferenceError"},
         // A set's iterator goes on over what was added after it started, and skips what was deleted.
         {"var s = new Set([1, 2, 3]); var it = s[Symbol.iterator](); s.delete(1); String(it.next().value)", "2"},
         {"var s = new Set(); s.add(1); s.add(2); for (var x of s) { if (x < 5) s.add(x + 2); } [...s].join()", "1,2,3,4,5,6"},

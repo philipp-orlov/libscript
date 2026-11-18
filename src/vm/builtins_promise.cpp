@@ -92,7 +92,9 @@ JSValue makeAggregateError(VM& vm, JSValue results)
     }
     JSValue err = vm.makeError(ErrorCode::Exception, "All promises were rejected");
     retain(results);
-    asObject(err)->putOwn(vm, vm.internKey(std::string_view("errors")), results, attr::kWritable | attr::kConfigurable);
+    Key errorsKey = vm.internKey(std::string_view("errors"));
+    asObject(err)->putOwn(vm, errorsKey, results, attr::kWritable | attr::kConfigurable);
+    detail::decRef(errorsKey);
     return err;
 }
 
@@ -136,7 +138,9 @@ void resolvePromise(VM& vm, JSValue promise, JSValue resolution)
         settle(vm, promise, PromiseData::Fulfilled, resolution);
         return;
     }
-    JSValue then = getProperty(vm, resolution, vm.internKey(std::string_view("then")));
+    Key thenKey = vm.internKey(std::string_view("then"));
+    JSValue then = getProperty(vm, resolution, thenKey);
+    detail::decRef(thenKey);
     if (then.isException()) {
         JSValue e = takeException(vm);
         rejectPromise(vm, promise, e);

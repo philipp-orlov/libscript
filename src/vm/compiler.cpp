@@ -3673,6 +3673,10 @@ void Compiler::switchStatement(const Node& n)
     fn_->jumps.push_back(std::move(ctx));
     for (std::size_t i = 0; i < n.list.size(); ++i) {
         bind(caseLabels[i]);
+        // Control reaches a case by a jump, not from the case above it: what an earlier case declared has not run.
+        for (Binding& b : fn_->scopes.back().bindings)
+            if (b.tdz)
+                b.initialized = false;
         statements(n.list[i]->list);
     }
     fn_->jumps.pop_back();

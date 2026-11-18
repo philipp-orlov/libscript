@@ -267,6 +267,43 @@ struct ProxyState : NativeState
 };
 
 /// What an ArrayBuffer's object keeps (in its `Rare::ext`).
+/// The typed arrays on a buffer: the first two are kept in place, since a buffer almost always has one.
+class ViewList
+{
+public:
+    std::size_t size() const noexcept { return n_; }
+    JSTypedArray** begin() noexcept { return data(); }
+    JSTypedArray** end() noexcept { return data() + n_; }
+    JSTypedArray*& operator[](std::size_t i) noexcept { return data()[i]; }
+    JSTypedArray*& back() noexcept { return data()[n_ - 1]; }
+    void push_back(JSTypedArray* v)
+    {
+        if (n_ < 2) {
+            inline_[n_++] = v;
+        } else {
+            if (n_ == 2)
+                heap_.assign(inline_, inline_ + 2);
+            heap_.push_back(v);
+            ++n_;
+        }
+    }
+    void pop_back() noexcept
+    {
+        --n_;
+        if (n_ == 2) {
+            inline_[0] = heap_[0];
+            inline_[1] = heap_[1];
+            heap_.clear();
+        }
+    }
+
+private:
+    JSTypedArray** data() noexcept { return n_ <= 2 ? inline_ : heap_.data(); }
+    JSTypedArray* inline_[2] = {nullptr, nullptr};
+    std::vector<JSTypedArray*> heap_;
+    std::size_t n_ = 0;
+};
+
 struct BufferState : NativeState
 {
     std::uint8_t* data = nullptr;
@@ -276,7 +313,7 @@ struct BufferState : NativeState
     bool detached = false;
     bool shared = false;       ///< a SharedArrayBuffer
     VM* vm = nullptr;
-    std::vector<JSTypedArray*> views;  ///< the typed arrays on this buffer, to follow a resize or a detach
+    ViewList views;  ///< the typed arrays on this buffer, to follow a resize or a detach
     ~BufferState() override;
     /// Give each view the length the current size leaves it (none when it no longer fits, or the buffer is detached).
     void refreshViews() noexcept;

@@ -578,8 +578,17 @@ void promotePoly(CodeBlock* code, InlineCache& ic, std::uint32_t shape) noexcept
 int readCachedSlow(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValue base, Key key, JSValue* out)
 {
     int r = readPoly(vm, code, ic, o, base, out);
-    if (r == 1)
-        promotePoly(code, ic, o->h.shape);
+    if (r == 1) {
+        // A site that alternates between shapes would swap its entries at every read: the second entry takes the inline
+        // cache's place only on its third hit (the count is in bits 1-2 of the flags).
+        const unsigned seen = (ic.flags >> 1) & 3u;
+        if (seen >= 2) {
+            promotePoly(code, ic, o->h.shape);
+            ic.flags = std::uint8_t(ic.flags & ~6u);
+        } else {
+            ic.flags = std::uint8_t(ic.flags + 2u);
+        }
+    }
     if (r)
         return r;
     if ((ic.shape == 0 || ic.shape == o->h.shape) && learnRead(vm, ic, o, key)) {
@@ -3616,7 +3625,8 @@ int jitGetProp(VM& vm, std::uint32_t index)
         } hold{base};
         // A site whose cache cannot hold the read, or has every entry taken: it reads through the megamorphic table.
         const bool full = ic.pad && c.code->poly[ic.pad - 1].n == 4;
-        if (c.cacheId != kNoCache) {
+        // (A marked site has done with the caches: no learning into them, only the table.)
+        if (c.cacheId != kNoCache && !(ic.flags & InlineCache::kMegaSite)) {
             JSValue got;
             const int r = readCachedSlow(vm, c.code, ic, o, base, key, &got);
             if (r < 0)

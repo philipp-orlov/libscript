@@ -1002,9 +1002,10 @@ NATIVE(functionBind)
     r->boundTarget = self;
     r->boundThis = arg(args, argc, 0);
     retain(r->boundThis);
-    r->boundArgs = vm.newArray(vm.protos.array);
-    if (bound)
+    if (bound) {
+        r->boundArgs = vm.newArray(vm.protos.array);
         r->boundArgs->appendAll(vm, args + 1, bound);
+    }
     const bool constructible = (target->flags & JSFunction::kNative) ? (target->flags & JSFunction::kConstructor) != 0 : target->code->constructor;
     if (constructible)
         f->flags |= JSFunction::kConstructor;

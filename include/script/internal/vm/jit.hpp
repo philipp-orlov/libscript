@@ -124,6 +124,8 @@ int jitArrayPush(VM& vm, std::uint32_t index);
 int jitBinary(VM& vm, std::uint32_t index);
 int jitBinaryImm(VM& vm, std::uint32_t index);
 int jitInstanceOf(VM& vm, std::uint32_t index);
+/// Replace a bound function (without bound arguments) in a call's window by its target and `this`.
+void jitUnwrapBound(JSValue* R, std::uint32_t base);
 /// The call's arguments in an array, for `arguments` and rest parameters.
 JSArray* jitCaptureArguments(VM& vm, const JSValue* args, std::uint32_t argc);
 int jitIn(VM& vm, std::uint32_t index);

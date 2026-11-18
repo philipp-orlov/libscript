@@ -856,6 +856,28 @@ void spreadOverWindow(VM& vm, JSValue* window, JSArray* list, std::uint32_t n)
     release(keep);
 }
 
+/// A call of a function bound to a target and a `this` and no arguments is a call of the target with that `this`: the bound
+/// function's place in the window is taken by them, as often as it is bound again. (Bound arguments, `new` and the rest
+/// go through the native.)
+void unwrapBound(JSValue* R, std::uint32_t base) noexcept
+{
+    for (;;) {
+        if (!isFunction(R[base]))
+            return;
+        auto* f = static_cast<JSFunction*>(asObject(R[base]));
+        if (!(f->flags & JSFunction::kNative))
+            return;
+        Rare* r = f->rare();
+        if (!r || !isFunction(r->boundTarget) || (r->boundArgs && r->boundArgs->length))
+            return;
+        const JSValue target = r->boundTarget, thisValue = r->boundThis;
+        retain(target);
+        retain(thisValue);
+        setReg(R[base], target);  // may be the last count of the bound function: all is read from it already
+        setReg(R[base + 1], thisValue);
+    }
+}
+
 /// The call's arguments, copied into an array for `arguments` and rest parameters.
 JSArray* captureArguments(VM& vm, const JSValue* args, std::uint32_t argc)
 {
@@ -2797,6 +2819,8 @@ L_SuperCall:
 do_call: {
     const bool isNew = callMode == 1, isSuper = callMode == 2;
     const std::uint32_t base = callBase, argc = callArgc;
+    if (!isNew && !isSuper)
+        unwrapBound(R, base);
     const JSValue callee = R[base];
     fr->pc = pc;
     if (!isFunction(callee)) [[unlikely]] {
@@ -4117,6 +4141,11 @@ int jitIterClose(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     return isFunction(c.R[c.ins->a + 1]) ? 2 : 1;
+}
+
+void jitUnwrapBound(JSValue* R, std::uint32_t base)
+{
+    unwrapBound(R, base);
 }
 
 JSArray* jitCaptureArguments(VM& vm, const JSValue* args, std::uint32_t argc)

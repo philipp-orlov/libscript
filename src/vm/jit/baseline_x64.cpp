@@ -448,6 +448,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     const Ins* ins = code->code.data() + index;
     JSValue* R = fr->R;
     const std::uint32_t base = ins->b, argc = ins->c;
+    if (ins->opcode() == Op::Call)
+        jitUnwrapBound(R, base);
     const JSValue callee = R[base];
     const bool isNew = ins->opcode() == Op::New;
     const bool isSuper = ins->opcode() == Op::SuperCall;  // the parent's constructor, on the `this` the derived one holds
@@ -694,6 +696,7 @@ constexpr std::int32_t kTypedData = std::int32_t(offsetof(JSTypedArray, data));
 constexpr std::int32_t kTypedLength = std::int32_t(offsetof(JSTypedArray, length));
 constexpr std::int32_t kTypedKind = std::int32_t(offsetof(JSTypedArray, kind));
 constexpr std::int32_t kRareNative = std::int32_t(offsetof(Rare, native));
+constexpr std::int32_t kRareBoundTarget = std::int32_t(offsetof(Rare, boundTarget));
 constexpr std::int32_t kRareData = std::int32_t(offsetof(Rare, nativeData));
 constexpr std::int32_t kRareHome = std::int32_t(offsetof(Rare, home));
 constexpr std::int32_t kRareFieldInit = std::int32_t(offsetof(Rare, fieldInit));
@@ -4771,6 +4774,11 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CE, notNative);
         a_.testI8(mem(RAX, kHdrFlags), cellflags::kHasRare);
         a_.jcc(CE, notNative);
+        // A bound function is called through its target: the long way (`callPrepare`) takes that apart.
+        a_.mov(RCX, mem(RAX, kObjSlots));
+        a_.mov(RCX, mem(RCX, -16));
+        a_.cmpI(mem(RCX, kRareBoundTarget), std::int32_t(kUndefined));
+        a_.jcc(CNE, notNative);
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
         a_.mov(mem(R13, kFramePc), RDI);
         a_.lea(RDI, R(code_->nregs));

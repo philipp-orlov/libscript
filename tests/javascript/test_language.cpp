@@ -5331,3 +5331,30 @@ TEST(typedArraysOfEveryKindAreReadAndWrittenInPlaceThroughGlobalsInHotLoops)
                  std::string("1500 49118140 5 3725000 28 30474 -442 0 2 -27069 38467 -110 146 0.6666666865348816"));
     }
 }
+
+TEST(aSmallFunctionWithATestIsInlinedAlongTheWayItFallsThrough)
+{
+    // `if (v >= 0) return v;` and kin: the optimizing compiler runs the body in place the way the test falls through and
+    // leaves for the call itself the other way; a site that then sees the other way often gets the call back.
+    const char* program =
+        "function uint(v) { if (v >= 0) return v; return 4294967296 + v; }"
+        "function clampTo(v, k) { if (v > k) return k; return v; }"
+        "function same(a, b) { if (a === b) return 1; return 0; }"
+        "function run(n, neg) { var s = 0, t = 0, e = 0;"
+        "  for (var i = 0; i < n; i++) { var x = neg && (i % 7 == 0) ? -i : i; s += uint(x) % 1000;"
+        "    t = (t + clampTo(i & 255, 100)) | 0; e = (e + same(i & 3, 2)) | 0; }"
+        "  return [s, t, e].join(','); }"
+        "var r = []; for (var k = 0; k < 20; k++) r = [run(3000, false)]; for (var k = 0; k < 20; k++) r[1] = run(3000, true);"
+        "r.join(' ')";
+    for (int mode = 0; mode < 3; ++mode) {
+        script::Context::Options options;
+        if (mode == 0)
+            options.jit.mode = script::JitOptions::Mode::Off;
+        else if (mode == 1)
+            options.jit.threshold = 1;
+        else
+            options.jit.mode = script::JitOptions::Mode::Eager;
+        js::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(), std::string("1498500,239400,750 1497904,239400,750"));
+    }
+}

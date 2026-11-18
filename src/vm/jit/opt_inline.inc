@@ -794,6 +794,53 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             regs[ci.a] = out;
             break;
         }
+        case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
+        case Op::JNotGe: case Op::JStrictEq: case Op::JStrictNe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI:
+        case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictEqI: case Op::JStrictNeI: {
+            // A test of int32s (`if (x >= 0) return x;`): the body goes on the way the test falls through, and the other
+            // way leaves before any effect, running the call itself. Two constants decide it here.
+            const bool imm = op == Op::JLtI || op == Op::JLeI || op == Op::JGtI || op == Op::JGeI || op == Op::JNotLtI ||
+                             op == Op::JNotLeI || op == Op::JNotGtI || op == Op::JNotGeI || op == Op::JStrictEqI ||
+                             op == Op::JStrictNeI;
+            const IVal A = regs[ci.a];
+            IVal B;
+            if (imm)
+                B.c = JSValue::int32(std::int16_t(ci.b));
+            else
+                B = regs[ci.b];
+            if (stale(A) || stale(B) || !isInt(A) || !isInt(B))
+                return false;
+            const Relation rel = relationOf(op);
+            if (A.kind == IVal::Const && B.kind == IVal::Const && A.c.isInt32() && B.c.isInt32()) {
+                const std::int32_t x = A.c.asInt32(), y = B.c.asInt32();
+                bool taken = false;
+                switch (rel.ic) {
+                case CL: taken = x < y; break;
+                case CLE: taken = x <= y; break;
+                case CG: taken = x > y; break;
+                case CGE: taken = x >= y; break;
+                case CE: taken = x == y; break;
+                default: taken = x != y; break;
+                }
+                if (taken)
+                    return false;  // the way it jumps is not followed
+                break;
+            }
+            Label* bad = cx.fail(this);
+            if (!bad)
+                return false;
+            if (emit) {
+                inlineI32(A, RAX, bad);
+                if (imm) {
+                    a_.aluI32(7, RAX, std::int16_t(ci.b));
+                } else {
+                    inlineI32(B, RCX, bad);
+                    a_.alu32(7, RAX, RCX);
+                }
+                a_.jcc(rel.ic, *bad);
+            }
+            break;
+        }
         case Op::Ret:
             result = regs[ci.a];
             return !stale(result);

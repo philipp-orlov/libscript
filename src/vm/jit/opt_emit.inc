@@ -1139,8 +1139,12 @@ bool Baseline::emitTyped(std::uint32_t i)
         const InlineCache& ic = code_->caches[cacheId];
         if (ic.shape == 0 || ic.holder || ic.next != 0)
             return false;
+        // A site that has made this code leave before (the other shape of a polymorphic store: only one is guarded here) is
+        // left to the generic store, or the function would be recompiled to leave again until it is retired.
+        if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
+            return false;
         Label& bad = exitBefore(i);
-        const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
+        const bool failed = false;
         // The value boxed in rdi first (finding the slot uses rax, rcx, rdx and rsi), then stored into the slot.
         const std::int32_t vw = uw[1];
         const std::int32_t boxAt = a_.here();
@@ -1933,6 +1937,9 @@ void Baseline::emitOptTails()
     emitExits();
     a_.bind(entryFail_);
     a_.aluI(0, RSP, spill_);
+    a_.mov(RDI, R12);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptEntryFail));
+    a_.callC(RAX);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(0)));
     a_.jmp(RAX);
 }
@@ -2431,6 +2438,9 @@ Tier2Code* Baseline::compileOptimized()
             a_.jmp(at_[h]);
         a_.bind(fail);
         a_.aluI(0, RSP, spill_);
+        a_.mov(RDI, R12);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptEntryFail));
+        a_.callC(RAX);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(h)));
         a_.jmp(RAX);
     }

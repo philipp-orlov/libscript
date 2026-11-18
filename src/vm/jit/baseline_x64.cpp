@@ -238,6 +238,18 @@ extern "C" int scriptVmJitFillStack(VM* vm, JSValue* upTo)
     return 1;
 }
 
+/// The entries and back edges to wait before the optimizing compiler is asked again: the threshold, doubled for each time
+/// optimized code has been taken out of use or could not be made, so that a function it cannot settle on is looked at ever
+/// more rarely, and never after the sixteenth.
+std::int32_t tier2Backoff(const VM& vm, const CodeBlock* code) noexcept
+{
+    if (vm.tier2Threshold <= 0 || code->tier2Tries >= 16)
+        return 0x40000000;
+    const int shift = code->tier2Tries > 10 ? 10 : (code->tier2Tries > 0 ? code->tier2Tries - 1 : 0);
+    const std::int64_t wait = std::int64_t(vm.tier2Threshold) << shift;
+    return wait > 0x3fffffff ? 0x3fffffff : std::int32_t(wait);
+}
+
 /// Take optimized code out of use for new calls and entries: what it was told is no longer true. Frames already in it
 /// finish there.
 void retireTier2(VM& vm, CodeBlock* code) noexcept
@@ -246,9 +258,9 @@ void retireTier2(VM& vm, CodeBlock* code) noexcept
         code->tier1->entry = code->tier1->rx;
     if (code->tier2 && code->tier2->borrow)
         code->tier2->borrow->retired = 1;
-    code->tier2Counter = vm.tier2Threshold > 0 ? vm.tier2Threshold : 0x40000000;
     if (code->tier2Tries < 255)
         ++code->tier2Tries;
+    code->tier2Counter = tier2Backoff(vm, code);
 }
 
 /// A guard of optimized code failed at instruction `index` (kind 0: it has not run, kind 1: it has). Records that, so that
@@ -328,6 +340,33 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
     }
 }
 
+/// The optimized code was entered (from a call, or into a loop) with a parameter of a kind it was not made for. The profile
+/// of the parameters is written only while there is no baseline code, so this is where it learns: with a kind new to it,
+/// the code is taken out of use to be made again (no try is used up); with nothing new, it counts as an exit.
+extern "C" void scriptVmOptEntryFail(VM* vm)
+{
+    Frame* fr = vm->frameTop - 1;
+    CodeBlock* code = fr->code;
+    bool widened = false;
+    const std::size_t at = code->code.size();
+    if (code->prof.size() >= at + code->nparams)
+        for (std::uint32_t k = 0; k < code->nparams; ++k) {
+            const std::uint8_t bit = profBit(fr->R[1 + k]);
+            if ((code->prof[at + k] & bit) != bit) {
+                code->prof[at + k] = std::uint8_t(code->prof[at + k] | bit);
+                widened = true;
+            }
+        }
+    SCRIPT_VM_CENSUS(Tier2Exit);
+    if (widened) {
+        retireTier2(*vm, code);
+        if (code->tier2Tries)
+            --code->tier2Tries;
+    } else if (++code->optExits > 40) {
+        retireTier2(*vm, code);
+    }
+}
+
 Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code);
 
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -360,7 +399,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
                          code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
                          code->lines.empty() ? 0u : unsigned(code->lines[0]), code->code.size(), int(code->tier2Tries), int(header));
 #endif
-        if (!code->tier1 || code->tier2Tries >= 5) {
+        if (!code->tier1 || code->tier2Tries >= 16) {
             code->tier2Counter = 0x40000000;
             return nullptr;
         }
@@ -382,8 +421,10 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
         if (!active) {
             Tier2Code* t = compileOptimizedCode(*vm, code);
             if (!t) {
-                code->tier2Counter = 0x40000000;
-                code->tier2Tries = 5;
+                // No room now, or a branch out of reach, or something it does not model: not for good, but each time later.
+                if (code->tier2Tries < 255)
+                    ++code->tier2Tries;
+                code->tier2Counter = tier2Backoff(*vm, code);
                 return nullptr;
             }
             t->older = code->tier2;
@@ -5055,8 +5096,14 @@ void compileTier1(VM& vm, CodeBlock* code)
     if (code->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen))
         return;
     const std::size_t limit = vm.ctx.options.jit.codeCacheLimit;
-    if (code->code.size() > 20000 || !entryStub() || (limit && codeInUse() > limit))
+    if (code->code.size() > 20000 || !entryStub())
         return;
+    if (limit && codeInUse() > limit) {
+        // No room now, which is not for good: tried again after as many calls as it took to get here.
+        code->tier1Failed = false;
+        code->hotness = 0;
+        return;
+    }
     // A conditional branch that did not reach (a very large function) is made long, and only that one: the compile goes again
     // until none is out of reach. If a round finds none to name, every branch is made long.
     Tier1Code* t = nullptr;

@@ -183,6 +183,10 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         {"var P = {}; function mk() { var o = Object.create(P); o.x = 1; return o; } mk(); mk(); "
          "Object.defineProperty(P, 'x', {value: 7, writable: false}); var o = mk(); String(o.x)",
          "7"},
+        // A read of a `let` in its dead zone from a function that compiled code runs.
+        {"function outer(k) { function g() { return x; } if (k) return g(); let x = 1; return g(); } var s = 0; "
+         "for (var i = 0; i < 600; i++) s += outer(0); var r; try { outer(1); } catch (e) { r = e.name; } s + ' ' + r",
+         "600 ReferenceError"},
         // The same where the property is not among the object's slots in place.
         {"var P = {}; function mk(i) { var o = Object.create(P); o.a = 1; o.b = 2; o.c = 3; o.d = 4; o.e = 5; o.f = i; return o; } "
          "var r = []; for (var i = 0; i < 5; i++) r.push(mk(i).f); Object.defineProperty(P, 'f', { value: 7, writable: false }); "

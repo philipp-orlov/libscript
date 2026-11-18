@@ -2571,6 +2571,15 @@ void Baseline::emit(std::uint32_t i)
         write(in.a, RAX);
         return;
     }
+    case Op::CheckInit: case Op::CheckBound: case Op::CheckUnbound: {
+        // A compare; the interpreter throws, from the step the out-of-line path runs.
+        Label& bad = slow(i);
+        a_.mov(RAX, R(in.a));
+        a_.movImm(RCX, in.opcode() == Op::CheckInit ? kUninit : kTrue);
+        a_.cmp(RAX, RCX);
+        a_.jcc(in.opcode() == Op::CheckBound ? CNE : CE, bad);
+        return;
+    }
     case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::BitAnd: case Op::BitOr: case Op::BitXor:
     case Op::Shl: case Op::Shr: case Op::UShr:
         arith(i, in);

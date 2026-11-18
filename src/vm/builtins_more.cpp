@@ -597,7 +597,7 @@ bool listFromArrayLike(VM& vm, JSValue list, Vec<Handle>& out)
         typeError(vm, "CreateListFromArrayLike called on non-object");
         return false;
     }
-    if (isArray(list)) {
+    if (hasElems(list)) {
         auto* a = static_cast<JSArray*>(asObject(list));
         for (std::uint32_t i = 0; i < a->length; ++i)
             out.push_back(Handle::retained(a->at(i).isHole() ? JSValue::undefined() : a->at(i)));

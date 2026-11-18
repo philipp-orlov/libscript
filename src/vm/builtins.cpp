@@ -916,6 +916,16 @@ NATIVE(functionApply)
 {
     UNUSED();
     JSValue list = arg(args, argc, 1);
+    if (hasElems(list) && isFunction(self) && !(static_cast<JSFunction*>(asObject(self))->flags & JSFunction::kNative)) {
+        // A script function takes its arguments into a frame of its own before it runs anything: the elements are passed
+        // where they are (the list is held by the caller's window), when there is no hole to read as undefined.
+        auto* a = static_cast<JSArray*>(asObject(list));
+        bool holes = false;
+        for (std::uint32_t i = 0; i < a->length && !holes; ++i)
+            holes = a->elems[i].isHole();
+        if (!holes)
+            return vm.call(self, arg(args, argc, 0), a->elems, a->length);
+    }
     Vec<Handle> held;
     if (!list.isNullish() && !listFromArrayLike(vm, list, held))
         return JSValue::exception();

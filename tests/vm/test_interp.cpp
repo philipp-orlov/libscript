@@ -183,6 +183,11 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         {"var P = {}; function mk() { var o = Object.create(P); o.x = 1; return o; } mk(); mk(); "
          "Object.defineProperty(P, 'x', {value: 7, writable: false}); var o = mk(); String(o.x)",
          "7"},
+        // The same where the property is not among the object's slots in place.
+        {"var P = {}; function mk(i) { var o = Object.create(P); o.a = 1; o.b = 2; o.c = 3; o.d = 4; o.e = 5; o.f = i; return o; } "
+         "var r = []; for (var i = 0; i < 5; i++) r.push(mk(i).f); Object.defineProperty(P, 'f', { value: 7, writable: false }); "
+         "var o = mk(9); r.push(o.f); r.push(Object.keys(o).join()); r.join()",
+         "0,1,2,3,4,7,a,b,c,d,e"},
         // A bound function can be constructed, with its bound arguments in front.
         {"function P(a, b) { this.s = a + b; } var B = P.bind(null, 1); new B(2).s", "3"},
         // A `let` read in its own initialiser is in its dead zone.

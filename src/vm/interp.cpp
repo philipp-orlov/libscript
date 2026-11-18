@@ -593,8 +593,16 @@ int readCachedSlow(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValu
     return 0;
 }
 
+/// The slot a cached add stores into: one in place, or an out-of-line one (the buffer is made or grown to hold it).
+inline JSValue* roomForAdd(VM& vm, JSObject* o, std::uint32_t index)
+{
+    if (index >= o->h.aux)
+        o->reserveSlot(vm, index);
+    return o->slotAt(index);
+}
+
 /// A store through the site's `PolyCache`: true when an entry applied and the store is done.
-bool storePoly(CodeBlock* code, const InlineCache& ic, JSObject* o, JSValue v)
+bool storePoly(VM& vm, CodeBlock* code, const InlineCache& ic, JSObject* o, JSValue v)
 {
     if (!ic.pad)
         return false;
@@ -612,8 +620,8 @@ bool storePoly(CodeBlock* code, const InlineCache& ic, JSObject* o, JSValue v)
             return true;
         }
         if (e.kind == PolyEntry::Add && (!e.validity || e.validity->valid) &&
-            !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible)) && e.index < o->h.aux) {
-            o->inl()[e.index] = v;
+            !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
+            *roomForAdd(vm, o, e.index) = v;
             retain(v);
             o->h.shape = e.next;
             return true;
@@ -692,7 +700,7 @@ void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key ke
         return;
     Shape* now = o->shapeOf(vm);
     Shape* was = vm.shapeById(before);
-    if (!was || now->parent != was || now->key != key || now->attrs != attr::kDefault || was->count >= o->h.aux)
+    if (!was || now->parent != was || now->key != key || now->attrs != attr::kDefault)
         return;
     ValidityCell* cell = nullptr;
     if (throughChain) {
@@ -1806,10 +1814,10 @@ L_PutProp: {
                 NEXT();
             }
             // A store that adds the property, where the prototypes still have nothing to say about it.
-            // The new property's slot must be among the object's inline ones: objects of one shape can have fewer.
-            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible)) &&
-                ic.index < o->h.aux) {
-                JSValue* slot = &o->inl()[ic.index];
+            // The new property's slot is in place or out of line (made when it is the first): objects of one shape can
+            // have different inline counts.
+            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
+                JSValue* slot = roomForAdd(vm, o, ic.index);
                 *slot = R[ins->c];
                 retain(*slot);
                 o->h.shape = ic.next;
@@ -1817,7 +1825,7 @@ L_PutProp: {
                 NEXT();
             }
         }
-        if (storePoly(code, ic, o, R[ins->c])) {
+        if (storePoly(vm, code, ic, o, R[ins->c])) {
             ++pc;
             NEXT();
         }
@@ -2066,9 +2074,9 @@ L_InitProp: {
     InlineCache scratch;
     const std::uint16_t cacheId = pc->a;
     InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
-    if (o->h.shape == ic.shape && ic.index < o->h.aux) [[likely]] {
-        // The literal's next property: the shape it had and the shape it gets (in a slot the object has in place).
-        JSValue* slot = &o->inl()[ic.index];
+    if (o->h.shape == ic.shape) [[likely]] {
+        // The literal's next property: the shape it had and the shape it gets.
+        JSValue* slot = roomForAdd(vm, o, ic.index);
         *slot = R[ins->c];
         retain(*slot);
         o->h.shape = ic.next;
@@ -3538,17 +3546,17 @@ int jitPutProp(VM& vm, std::uint32_t index)
                 release(old);
                 return 1;
             }
-            // The new property's slot must be among the object's inline ones: objects of one shape can have fewer.
-            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible)) &&
-                ic.index < o->h.aux) {
-                JSValue* slot = &o->inl()[ic.index];
+            // The new property's slot is in place or out of line (made when it is the first): objects of one shape can
+            // have different inline counts.
+            if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
+                JSValue* slot = roomForAdd(vm, o, ic.index);
                 *slot = R[ins->c];
                 retain(*slot);
                 o->h.shape = ic.next;
                 return 1;
             }
         }
-        if (const std::uint32_t was = o->h.shape; storePoly(c.code, ic, o, R[ins->c])) {
+        if (const std::uint32_t was = o->h.shape; storePoly(vm, c.code, ic, o, R[ins->c])) {
             promoteStore(c.code, ic, was);
             return 1;
         }
@@ -3603,8 +3611,8 @@ int jitInitProp(VM& vm, std::uint32_t index)
     JSObject* o = asObject(R[ins->a]);
     InlineCache scratch;
     InlineCache& ic = *c.ic(scratch);
-    if (o->h.shape == ic.shape && ic.index < o->h.aux) {
-        JSValue* slot = &o->inl()[ic.index];
+    if (o->h.shape == ic.shape) {
+        JSValue* slot = roomForAdd(vm, o, ic.index);
         *slot = R[ins->c];
         retain(*slot);
         o->h.shape = ic.next;

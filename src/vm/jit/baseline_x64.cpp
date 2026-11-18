@@ -3897,7 +3897,12 @@ void Baseline::putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* i
     }
     a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto | cellflags::kNotExtensible));
     a_.jcc(CNE, bad);
-    // The slot in place: objects of one shape can have fewer inline slots than the one the cache learned from.
+    // The slot in place: objects of one shape can have fewer inline slots than the one the cache learned from. A property
+    // past the inline slots (an index that is no byte) is stored by the helper, which makes room for it.
+    if (ic->index >= 200) {
+        a_.jmp(bad);
+        return;
+    }
     a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic->index));
     a_.jcc(CBE, bad);
     a_.mov(RCX, R(in.c));
@@ -4183,6 +4188,10 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
     a_.mov(RAX, R(in.a));
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
     a_.jcc(CNE, bad);
+    if (ic->index >= 200) {
+        a_.jmp(bad);
+        return;
+    }
     a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic->index));
     a_.jcc(CBE, bad);
     a_.mov(RCX, R(in.c));

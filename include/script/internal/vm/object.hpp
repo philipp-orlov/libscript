@@ -148,7 +148,7 @@ struct JSArray : JSObject
     JSValue* elems;  ///< the elements, `capacity` of them: `small` until there are more than it holds
     std::uint32_t length;
     std::uint32_t capacity;
-    static constexpr std::uint32_t kSmall = 4;
+    static constexpr std::uint32_t kSmall = 6;
     JSValue small[kSmall];  ///< the first elements of an array that has never had more
     /// The elements below `packed` are numbers: no hole and no cell among them, so a store of a number over one of them
     /// has nothing to look at or let go of, and nothing below it needs a look when the array is freed or traced. A

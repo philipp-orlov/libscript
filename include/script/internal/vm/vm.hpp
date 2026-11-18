@@ -386,6 +386,8 @@ struct VM : EngineRuntime
     JSValue origIteratorNext = JSValue::undefined();
     /// The `next` of generator objects as installed, which iteration may skip the result object for.
     JSValue origGeneratorNext = JSValue::undefined();
+    /// The `next` of each family of built-in iterators (array, string, map, set, regexp) as installed, indexed by `IteratorFamily`.
+    JSValue origNativeNext[8] = {};
     /// The RegExp constructor and `RegExp.prototype.exec` as made, and the slots a plain RegExp counts on staying as they are.
     JSValue regexpCtor = JSValue::undefined();
     JSValue regexpExec = JSValue::undefined();

@@ -44,6 +44,17 @@ int iteratorStep(VM& vm, JSValue iterator, JSValue next, JSValue* out)
         } else {
             res = vm.call(next, iterator, nullptr, 0);
         }
+    } else if (isObject(iterator) && asObject(iterator)->cls() == ObjClass::Iterator) {
+        // A built-in iterator's own `next`: it steps without the result object that would be made and read at once.
+        Rare* r = asObject(iterator)->rare();
+        if (r && r->ext) {
+            auto* state = static_cast<IteratorState*>(r->ext);
+            if (state->family > 0 && state->family < 8 && next.bits == vm.origNativeNext[state->family].bits) {
+                *out = JSValue::undefined();
+                return state->step(vm, out);
+            }
+        }
+        res = vm.call(next, iterator, nullptr, 0);
     } else {
         res = vm.call(next, iterator, nullptr, 0);
     }
@@ -385,6 +396,8 @@ void installSymbolAndIterators(VM& vm)
             vm.setIntrinsic(&vm.protos.iteratorFamilies[family], proto);
             release(toJSValue(proto));
             method(vm, proto, "next", iteratorNext, 0, reinterpret_cast<void*>(std::intptr_t(family)));
+            if (JSValue* own = proto->findOwn(vm, vm.atoms.next))
+                vm.origNativeNext[family] = *own;
             proto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view(tags[family])), attr::kConfigurable);
         }
     }

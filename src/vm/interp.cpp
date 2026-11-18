@@ -680,6 +680,31 @@ void learnElem(VM& vm, CodeBlock* code, std::size_t at, JSObject* o, Key key)
     ec.validity = found.validity;
 }
 
+/// A read of `key` on a string, for a name `String.prototype` has as an own data property (its methods): through the site's
+/// cache, which then says what it says of an object of that shape, `String.prototype` itself. The slot, or null.
+JSValue* stringMethodRead(VM& vm, InlineCache& ic, Key key)
+{
+    JSObject* sp = vm.protos.string;
+    if (!sp || key == vm.atoms.length)
+        return nullptr;
+    if (ic.shape == sp->h.shape && !ic.holder && ic.next == 0 && ic.shape != 0)
+        return sp->slotAt(ic.index);
+    if (ic.shape != 0)
+        return nullptr;  // the site is some other shape's: not for learning
+    double numeric;
+    std::uint8_t attrs = 0;
+    if (canonicalNumericIndex(key, &numeric) || !cacheable(vm, sp))
+        return nullptr;
+    const std::int32_t index = sp->shapeOf(vm)->indexOf(key, &attrs);
+    if (index < 0 || (attrs & attr::kAccessor))
+        return nullptr;
+    ic.shape = sp->h.shape;
+    ic.index = std::uint32_t(index);
+    ic.next = 0;
+    ic.aux = std::uint8_t(sp->h.aux + 1u);
+    return sp->slotAt(ic.index);
+}
+
 /// The slot a cached add stores into: one in place, or an out-of-line one (the buffer is made or grown to hold it).
 inline JSValue* roomForAdd(VM& vm, JSObject* o, std::uint32_t index)
 {
@@ -1889,6 +1914,12 @@ L_GetProp: {
         SETP(ins->a, JSValue::int32(std::int32_t(asString(base)->length)));
         ++pc;
         NEXT();
+    } else if (isString(base) && cacheId != kNoCache) {
+        if (JSValue* slot = stringMethodRead(vm, ic, key)) {
+            COPYP(ins->a, *slot);
+            ++pc;
+            NEXT();
+        }
     }
     fr->pc = pc;
     const JSValue v = getProperty(vm, base, key);
@@ -3662,6 +3693,11 @@ int jitGetProp(VM& vm, std::uint32_t index)
     } else if (isString(base) && key == vm.atoms.length) {
         setReg(R[ins->a], JSValue::int32(std::int32_t(asString(base)->length)));
         return 1;
+    } else if (isString(base) && c.cacheId != kNoCache) {
+        if (JSValue* slot = stringMethodRead(vm, ic, key)) {
+            copyReg(R[ins->a], *slot);
+            return 1;
+        }
     }
     const JSValue v = getProperty(vm, base, key);
     if (v.isException())

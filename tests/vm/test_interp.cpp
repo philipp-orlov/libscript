@@ -192,6 +192,11 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
          "var r = []; for (var i = 0; i < 5; i++) r.push(mk(i).f); Object.defineProperty(P, 'f', { value: 7, writable: false }); "
          "var o = mk(9); r.push(o.f); r.push(Object.keys(o).join()); r.join()",
          "0,1,2,3,4,7,a,b,c,d,e"},
+        // A property that is not enumerable hides an enumerable one of the same name further up the chain.
+        {"var P = { a: 1, b: 2, shared: 3 }; var C = Object.create(P); C.c = 1; C.shared = 4; "
+         "Object.defineProperty(C, 'b', { value: 9, enumerable: false }); C[2] = 'x'; C[1] = 'y'; var r = []; "
+         "for (var k in C) r.push(k); r.join()",
+         "1,2,c,shared,a"},
         // A bound function can be constructed, with its bound arguments in front.
         {"function P(a, b) { this.s = a + b; } var B = P.bind(null, 1); new B(2).s", "3"},
         // A `let` read in its own initialiser is in its dead zone.

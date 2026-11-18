@@ -5,6 +5,7 @@
 // functions made inside it (a new frame on the VM stack, no C++ recursion), and one inline cache per property
 // instruction. Registers own their values: every write releases what was there.
 #include <algorithm>
+#include <unordered_set>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -247,17 +248,35 @@ JSValue forInKeys(VM& vm, JSValue value)
 {
     JSArray* result = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(result));
-    std::vector<Key> seen;
+    // The names of the objects above the one being looked at, enumerable or not: a name an earlier object has hides the
+    // same name of a later one. The names of one object are all different, so it is compared with the earlier ones only.
+    std::vector<Key> earlier;
+    std::unordered_set<Key> earlierSet;  // made when there are many and one is asked about
+    std::size_t inSet = 0;
+    auto seenBefore = [&](Key k) {
+        if (earlier.size() <= 16)
+            return std::find(earlier.begin(), earlier.end(), k) != earlier.end();
+        for (; inSet < earlier.size(); ++inSet)
+            earlierSet.insert(earlier[inSet]);
+        return earlierSet.count(k) != 0;
+    };
+    auto remember = [&](const std::vector<Key>& level) { earlier.insert(earlier.end(), level.begin(), level.end()); };
     auto add = [&](Key k) {
-        if (std::find(seen.begin(), seen.end(), k) != seen.end())
-            return;
-        seen.push_back(k);
         retain(JSValue::cell(k));
         result->append(vm, JSValue::cell(k));
     };
     auto visit = [&](JSObject* o) {
+        if (!o->proto(vm) && !hasElems(o) && o->cls() != ObjClass::TypedArray && !o->isDictionary(vm)) {
+            // The last object of the chain, with no enumerable name of its own (Object.prototype, usually): nothing to
+            // list, and nothing above it for its names to hide.
+            bool any = false;
+            for (const Shape* sh = o->shapeOf(vm); sh && sh->count && !any; sh = sh->parent)
+                any = sh->key->kind == detail::CellKind::String && (sh->attrs & attr::kEnumerable);
+            if (!any && !(o->cls() == ObjClass::Function && (static_cast<JSFunction*>(o)->flags & JSFunction::kLazyProps)))
+                return;
+        }
         std::vector<std::uint32_t> indexes;
-        std::vector<Key> named;
+        std::vector<Key> named, level;
         if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             for (std::uint32_t i = 0; i < a->length; ++i)
@@ -268,8 +287,12 @@ JSValue forInKeys(VM& vm, JSValue value)
                 indexes.push_back(i);
         }
         o->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue) {
-            if (!(attrs & attr::kEnumerable) || k->kind != detail::CellKind::String)
+            if (k->kind != detail::CellKind::String)
                 return;
+            if (!(attrs & attr::kEnumerable)) {
+                level.push_back(k);  // hides the same name further up, though it is not listed
+                return;
+            }
             std::uint32_t index;
             if (arrayIndexOf(k, &index))
                 indexes.push_back(index);
@@ -278,13 +301,20 @@ JSValue forInKeys(VM& vm, JSValue value)
         });
         std::sort(indexes.begin(), indexes.end());
         indexes.erase(std::unique(indexes.begin(), indexes.end()), indexes.end());
+        const bool first = earlier.empty();
         for (std::uint32_t index : indexes) {
             Key k = toPropertyKey(vm, JSValue::boxNumber(double(index)));
-            add(k);
-            release(JSValue::cell(k));
+            if (first || !seenBefore(k))
+                add(k);
+            level.push_back(k);
+            release(JSValue::cell(k));  // the property name table holds it on
         }
-        for (Key k : named)
-            add(k);
+        for (Key k : named) {
+            if (first || !seenBefore(k))
+                add(k);
+            level.push_back(k);
+        }
+        remember(level);
     };
     if (isObject(value)) {
         Handle cur = Handle::retained(value);
@@ -294,8 +324,14 @@ JSValue forInKeys(VM& vm, JSValue value)
                 Vec<Handle> names;
                 if (!bi::objOwnKeysFiltered(vm, o, true, false, true, names))
                     return JSValue::exception();
-                for (Handle& name : names)
-                    add(static_cast<Key>(name.get().asCell()));
+                std::vector<Key> level;
+                for (Handle& name : names) {
+                    const Key k = static_cast<Key>(name.get().asCell());
+                    if (!seenBefore(k))
+                        add(k);
+                    level.push_back(k);
+                }
+                remember(level);
             } else {
                 visit(o);
             }

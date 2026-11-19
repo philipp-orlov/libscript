@@ -1642,8 +1642,9 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
     auto takeFields = [&]() {
         const CodeBlock* F = fieldFn->code;
         std::vector<const void*> fkey(F->nregs, nullptr);
-        std::vector<std::int8_t> fconst(F->nregs, 0);
+        std::vector<std::int8_t> fconst(F->nregs, 0), fself(F->nregs, 0);
         std::vector<JSValue> fval(F->nregs, JSValue::undefined());
+        std::vector<JSValue*> fown(F->nregs, nullptr);
         for (std::uint32_t j = 0; j < F->code.size(); j = opt::nextOf(*F, j)) {
             const Ins& fi = F->code[j];
             switch (fi.opcode()) {
@@ -1655,9 +1656,32 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
                 const Box* box = reinterpret_cast<Box*>(fieldFn->upvals()[fi.b]);
                 if (!box->value.isCell())
                     return false;
-                fkey[fi.a] = box->value.asCell();
                 fconst[fi.a] = 0;
+                fown[fi.a] = nullptr;
+                fself[fi.a] = 0;
+                fkey[fi.a] = nullptr;
+                if (box->value.bits == known.bits) {
+                    // The class itself (`color = Light.defaultColor`): the box checked to hold it.
+                    fself[fi.a] = 1;
+                    p.selfBoxes.push_back(box);
+                    break;
+                }
+                fkey[fi.a] = box->value.asCell();
                 p.keyBoxes.emplace_back(box, box->value.bits);
+                break;
+            }
+            case Op::GetProp: {
+                // A static field of the class: its slot in the class, read when stored (the class's shape is checked).
+                if (fi.a == 0 || fi.b >= F->nregs || !fself[fi.b])
+                    return false;
+                std::uint8_t attrs = 0;
+                JSValue* slot = f->findOwn(vm_, F->atoms[fi.c], &attrs);
+                if (!slot || (attrs & attr::kAccessor))
+                    return false;
+                fconst[fi.a] = 0;
+                fself[fi.a] = 0;
+                fkey[fi.a] = nullptr;
+                fown[fi.a] = slot;
                 break;
             }
             case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt:
@@ -1665,6 +1689,8 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
                     return false;
                 fconst[fi.a] = 1;
                 fkey[fi.a] = nullptr;
+                fself[fi.a] = 0;
+                fown[fi.a] = nullptr;
                 fval[fi.a] = fi.opcode() == Op::LoadUndef ? JSValue::undefined() : fi.opcode() == Op::LoadNull ? JSValue::null()
                            : fi.opcode() == Op::LoadInt ? JSValue::int32(fi.imm()) : JSValue::boolean(fi.opcode() == Op::LoadTrue);
                 break;
@@ -1686,7 +1712,7 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
             }
             case Op::InitProp: {
                 // A public field: added as the site found it.
-                if (fi.a != 0 || fi.c >= F->nregs || !fconst[fi.c] || j + 1 >= F->code.size() ||
+                if (fi.a != 0 || fi.c >= F->nregs || (!fconst[fi.c] && !fown[fi.c]) || j + 1 >= F->code.size() ||
                     F->code[j + 1].opcode() != Op::Cache)
                     return false;
                 const std::uint16_t cacheId = F->code[j + 1].a;
@@ -1700,7 +1726,10 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
                         return false;
                     p.cells.push_back(ic.validity);
                 }
-                p.stores.push_back(SsaNew::Store{ic.index, -1, fval[fi.c]});
+                if (fown[fi.c])
+                    p.stores.push_back(SsaNew::Store{ic.index, -2, JSValue::undefined(), fown[fi.c]});
+                else
+                    p.stores.push_back(SsaNew::Store{ic.index, -1, fval[fi.c]});
                 p.shape = ic.next;
                 break;
             }

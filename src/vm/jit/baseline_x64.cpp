@@ -2728,7 +2728,7 @@ void Baseline::emit(std::uint32_t i)
     case Op::Jmp: case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined:
     case Op::JNotUndefined: case Op::JHole: case Op::JNotCallee:
     case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
-    case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq:
+    case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe:
     case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI:
     case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI:
         jumps(i, in);
@@ -3149,7 +3149,7 @@ Relation relationOf(Op op)
     case Op::JNotLe: case Op::JNotLeI: return {CG, true, CB, true};
     case Op::JNotGt: case Op::JNotGtI: return {CLE, false, CBE, true};
     case Op::JNotGe: case Op::JNotGeI: return {CL, false, CB, true};
-    case Op::Eq: case Op::StrictEq: case Op::JStrictEq: case Op::JStrictEqI: return {CE, false, CE, false};
+    case Op::Eq: case Op::StrictEq: case Op::JStrictEq: case Op::JStrictEqI: case Op::JEq: return {CE, false, CE, false};
     default: return {CNE, false, CNE, false};
     }
 }
@@ -3605,6 +3605,25 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
         a_.bind(taken);
         go(i, target);
         a_.bind(notTaken);
+        return;
+    }
+    case Op::JEq:
+    case Op::JNe: {
+        // `==` and `!=`: int32s here, and what looseCore decides; strings, symbols, bigints and mixed kinds the long way.
+        const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
+        Label& bad = slow(i);
+        Label loose, eq, neq;
+        a_.mov(RAX, R(in.a));
+        a_.mov(RCX, R(in.b));
+        needInts(RAX, RCX, loose);
+        a_.alu32(7, RAX, RCX);
+        a_.jcc(CE, eq);
+        a_.jmp(neq);
+        a_.bind(loose);
+        looseCore(eq, neq, bad);
+        a_.bind(op == Op::JEq ? eq : neq);
+        go(i, target);
+        a_.bind(op == Op::JEq ? neq : eq);
         return;
     }
     case Op::JNullish:

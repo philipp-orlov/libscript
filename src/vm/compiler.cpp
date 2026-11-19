@@ -2469,11 +2469,13 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
             case Tok::Ge: fused = Op::JGe; break;
             case Tok::EqEqEq: fused = Op::JStrictEq; break;
             case Tok::NotEqEq: fused = Op::JStrictNe; break;
+            case Tok::EqEq: fused = Op::JEq; break;
+            case Tok::NotEq: fused = Op::JNe; break;
             default: break;
         }
         if (fused != Op::Nop) {
             const std::uint16_t mark = fn_->top;
-            if (smallInt(*cond.b)) {
+            if (smallInt(*cond.b) && immediateJump(fused) != Op::Nop) {
                 const std::uint16_t a = exprAny(*cond.a);
                 emitFusedJump(immediateJump(fused), a, std::uint16_t(std::int16_t(int(cond.b->number))), whenTrue);
                 fn_->top = mark;
@@ -2533,11 +2535,13 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
             case Tok::Ge: fused = Op::JNotGe; break;
             case Tok::EqEqEq: fused = Op::JStrictNe; break;
             case Tok::NotEqEq: fused = Op::JStrictEq; break;
+            case Tok::EqEq: fused = Op::JNe; break;
+            case Tok::NotEq: fused = Op::JEq; break;
             default: break;
         }
         if (fused != Op::Nop) {
             const std::uint16_t mark = fn_->top;
-            if (smallInt(*cond.b)) {
+            if (smallInt(*cond.b) && immediateJump(fused) != Op::Nop) {
                 const std::uint16_t a = exprAny(*cond.a);
                 emitFusedJump(immediateJump(fused), a, std::uint16_t(std::int16_t(int(cond.b->number))), whenFalse);
                 fn_->top = mark;

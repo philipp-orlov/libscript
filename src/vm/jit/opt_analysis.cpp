@@ -22,7 +22,7 @@ bool isConditionalJump(Op op)
     switch (op) {
     case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined:
     case Op::JHole: case Op::JNotCallee: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
-    case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI:
+    case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI:
     case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI:
         return true;
     default:
@@ -38,7 +38,7 @@ std::int64_t jumpTarget(const CodeBlock& code, std::uint32_t i)
     case Op::JNotUndefined: case Op::JHole: case Op::JNotCallee:
         return std::int64_t(i) + 1 + in.jump();
     case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt: case Op::JNotGe:
-    case Op::JStrictNe: case Op::JStrictEq: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
+    case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
     case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI:
         return std::int64_t(i) + 1 + in.jump16();
     default:
@@ -102,7 +102,7 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
         rd(in.a);
         break;
     case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt: case Op::JNotGe:
-    case Op::JStrictNe: case Op::JStrictEq:
+    case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe:
         rd(in.a); rd(in.b);
         break;
     case Op::PutProp: case Op::InitProp: case Op::InitGetter: case Op::InitSetter:

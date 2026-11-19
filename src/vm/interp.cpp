@@ -1844,6 +1844,22 @@ L_JNotGe: {
         pc += ins->jump16();
     NEXT();
 }
+L_JNe:
+L_JEq: {
+    const JSValue a = R[ins->a], b = R[ins->b];
+    bool ok = true, eq;
+    if (a.isInt32() && b.isInt32()) {
+        eq = a.bits == b.bits;
+    } else {
+        fr->pc = pc;
+        eq = looseEquals(vm, a, b, &ok);
+        if (!ok)
+            FAIL();
+    }
+    if (eq == (ins->opcode() == Op::JEq))
+        TAKE16();
+    NEXT();
+}
 L_JStrictNe:
 L_JStrictEq: {
     const bool eq = fastStrictEquals(R[ins->a], R[ins->b]);

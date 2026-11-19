@@ -1272,7 +1272,7 @@ bool Baseline::emitTyped(std::uint32_t i)
     case Op::JTrue: case Op::JFalse: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe:
     case Op::JNotGt: case Op::JNotGe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
     case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictEq: case Op::JStrictNe: case Op::JStrictEqI:
-    case Op::JStrictNeI:
+    case Op::JStrictNeI: case Op::JEq: case Op::JNe:
         if ((op == Op::JTrue || op == Op::JFalse) && !uw.empty() && uw[0] < 0) {
             // A value in the frame: booleans, int32s, undefined and null here; anything else in the interpreter, so the
             // variables need not be written back on the way.
@@ -1333,7 +1333,8 @@ void Baseline::typedJump(std::uint32_t i, const Ins& in)
                      op == Op::JNotLeI || op == Op::JNotGtI || op == Op::JNotGeI || op == Op::JStrictEqI || op == Op::JStrictNeI;
     const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
     const std::int32_t k = imm ? std::int32_t(std::int16_t(in.b)) : 0;
-    const bool strict = op == Op::JStrictEq || op == Op::JStrictNe || op == Op::JStrictEqI || op == Op::JStrictNeI;
+    const bool strict = op == Op::JStrictEq || op == Op::JStrictNe || op == Op::JStrictEqI || op == Op::JStrictNeI ||
+                        op == Op::JEq || op == Op::JNe;  // numbers only here: the same test
     const Relation rel = relationOf(op);
     const bool bothInt = isI32(uw[0]) && (imm || isI32(uw[1]));
     if (bothInt) {
@@ -1358,7 +1359,7 @@ void Baseline::typedJump(std::uint32_t i, const Ins& in)
     }
     if (strict) {
         a_.ucomisd(xa, xb);
-        if (op == Op::JStrictEq || op == Op::JStrictEqI) {
+        if (op == Op::JStrictEq || op == Op::JStrictEqI || op == Op::JEq) {
             Label no;
             a_.jcc(CP, no);
             goIf(CE, i, target);

@@ -43,7 +43,7 @@ bool inPlaceOp(Op op)
     case Op::Not: case Op::BitNot: case Op::TypeOf: case Op::Inc: case Op::Dec:
     case Op::Jmp: case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined:
     case Op::JNotUndefined: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe:
-    case Op::JNotGt: case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JLtI: case Op::JLeI: case Op::JGtI:
+    case Op::JNotGt: case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe: case Op::JLtI: case Op::JLeI: case Op::JGtI:
     case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI:
     case Op::JStrictEqI:
     case Op::GetProp: case Op::PutProp: case Op::GetElem: case Op::PutElem: case Op::NewObject: case Op::NewArray:

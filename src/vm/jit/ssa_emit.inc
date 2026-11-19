@@ -302,6 +302,12 @@ void Baseline::emitColdPaths()
 void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
 {
     const Ins& in = code_->code[i];
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SSA_GENERIC"))
+        std::fprintf(stderr, "ssa generic %s @%u %s prof %d\n",
+                     code_->name ? toUtf8(static_cast<StringCell*>(code_->name)->text()).c_str() : "anon", i,
+                     opName(in.opcode()), i < code_->prof.size() ? int(code_->prof[i]) : -1);
+#endif
     const opt::Effects e = ssa::effects(*code_, i);
     const unsigned nregs = code_->nregs;
     std::vector<std::uint8_t> clobber(nregs, 0);
@@ -864,9 +870,14 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             }
             switch (op) {
             case Op::GetProp:
-                if (!native_[i])
+                if (!native_[i]) {
+                    const std::uint16_t c = i + 1 < n_ && code_->code[i + 1].opcode() == Op::Cache ? code_->code[i + 1].a
+                                                                                                   : kNoCache;
+                    if (ssaOn_ >= 2 && c != kNoCache && code_->caches[c].shape == 0 &&
+                        !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+                        ssaImmature(i);
                     ssaGeneric(i, liveAfter[b][k]);
-                else if (!ssaGetProp(i))
+                } else if (!ssaGetProp(i))
                     a_.jmp(ssaExit(i));
                 break;
             case Op::PutProp:
@@ -1148,6 +1159,17 @@ Label& Baseline::ssaExit(std::uint32_t i)
     exitAt_ = i;
     exitLabel_ = &ssaExits_.back().label;
     return *exitLabel_;
+}
+
+/// Instruction `i` knew nothing when this code was made (an empty cache): after the code has run a while, it makes way
+/// for code made with what the baseline code has learned since (exit kind 2: nothing is marked failed). Before `i`.
+void Baseline::ssaImmature(std::uint32_t i)
+{
+    ssaExits_.push_back(SsaExit{i, name_, frame_, liveBefore_, Label{}});
+    ssaExits_.back().kind = 2;
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&code_->tier2Budget));
+    a_.dec32(mem(RAX, 0));
+    a_.jcc(CE, ssaExits_.back().label);
 }
 
 /// The instruction's result, in rax, is the value it defines (`bits`: what that is known to be).

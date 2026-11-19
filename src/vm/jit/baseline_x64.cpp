@@ -2731,6 +2731,7 @@ private:
     ssa::Bits liveBefore_;  ///< registers live before the instruction being emitted
     ssa::Bits curLiveAfter_;  ///< and after it
     Label& ssaExit(std::uint32_t i);
+    void ssaImmature(std::uint32_t i);
     void ssaKnow(std::uint32_t v, std::uint8_t bits, std::uint32_t shape = 0);
     void ssaForgetShapes();
     void ssaResetFacts();

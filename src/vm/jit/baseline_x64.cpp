@@ -327,8 +327,8 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                     what += buf;
                 }
             }
-            std::fprintf(stderr, "tier2 exit %s @%u kind %d (n=%zu tries %d)%s\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind,
-                         code->code.size(), int(code->tier2Tries), what.c_str());
+            std::fprintf(stderr, "tier2 exit %s @%u %s kind %d (n=%zu tries %d)%s\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index,
+                         opName(code->code[index].opcode()), kind, code->code.size(), int(code->tier2Tries), what.c_str());
         }
 #endif
         SCRIPT_VM_CENSUS(Tier2Exit);

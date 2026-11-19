@@ -2448,10 +2448,22 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     native_.assign(n_, 0);
     intArith_.assign(n_, 0);
     dblArith_.assign(n_, 0);
+    // An arithmetic site that has failed: the function's int32 profiles are not to be trusted (doubles came after them),
+    // and each site failing in turn would cost an exit and a compile. Its other adds and products are then decided by
+    // their operands (`byOperands` below), as sites with an empty profile are.
+    bool arithFailed = false;
+    for (std::uint32_t i = 0; i < n_; i = opt::nextOf(*code_, i)) {
+        const Op op = code_->code[i].opcode();
+        if ((op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI || op == Op::MulI) &&
+            i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
+            arithFailed = true;
+    }
     for (std::uint32_t i = 0; i < n_; i = opt::nextOf(*code_, i)) {
         const Op op = code_->code[i].opcode();
         const std::uint8_t prof = i < code_->prof.size() ? code_->prof[i] : 0;
         if (ssaOn_ < 2 || (prof & opt::kProfFailed))
+            continue;
+        if (arithFailed && prof == 1 && (op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::MulI))
             continue;
         switch (op) {
         case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
@@ -2493,7 +2505,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     // nothing): what its operands are decides, below. All int32: int32 arithmetic, an exit on overflow; a double and
     // numbers: double arithmetic; anything else: the template.
     std::vector<std::vector<std::uint32_t>> operandsOf(nv);
-    std::vector<std::uint8_t> byOperands(nv, 0);
+    std::vector<std::uint8_t> byOperands(nv, 0);  // 1: an empty profile; 2: an int32 profile (a double operand widens it)
     if (ssaOn_ >= 2)
         for (std::uint32_t b = 1; b < nb; ++b) {
             const ssa::Block& bl = g.blocks[b];
@@ -2506,10 +2518,19 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 const opt::Effects e = ssa::effects(*code_, i);
                 const bool arith = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI ||
                                    op == Op::MulI || op == Op::Inc || op == Op::Dec;
-                if (arith && i < code_->prof.size() && code_->prof[i] == 0 && g.defBase[i] != ssa::kNone &&
-                    !intArith_[i] && !dblArith_[i]) {
+                const std::uint8_t pf = i < code_->prof.size() ? code_->prof[i] : 0;
+                const bool distrusted = arithFailed && pf == 1 &&
+                                        (op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::MulI);
+                if (arith && (pf == 0 || distrusted) && g.defBase[i] != ssa::kNone && !intArith_[i] && !dblArith_[i]) {
                     const std::uint32_t d = g.defBase[i];
                     byOperands[d] = 1;
+                    for (std::uint16_t r : e.rd)
+                        operandsOf[d].push_back(names[r]);
+                } else if (arith && intArith_[i] && g.defBase[i] != ssa::kNone && op != Op::Inc && op != Op::Dec) {
+                    // Profiled int32: a double among its operands (an element read that has made doubles since) makes it
+                    // double arithmetic, which an int32 operand takes too; else each such site leaves in turn.
+                    const std::uint32_t d = g.defBase[i];
+                    byOperands[d] = 2;
                     for (std::uint16_t r : e.rd)
                         operandsOf[d].push_back(names[r]);
                 }
@@ -2528,7 +2549,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         if (sval_[v].isConst) {
             const JSValue k = JSValue::raw(sval_[v].bits);
             cls[v] = k.isInt32() ? 1 : k.isDouble() ? 2 : 3;
-        } else if (byOperands[v]) {
+        } else if (byOperands[v] == 1) {
             cls[v] = 0;
         } else if (sv.kind == ssa::Value::Def) {
             cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : elemRep[sv.at];
@@ -2549,8 +2570,12 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             if (!byOperands[v])
                 continue;
             std::uint8_t m = 0;
-            for (std::uint32_t o : operandsOf[v])
-                m = std::max(m, o == ssa::kNone ? std::uint8_t(3) : cls[o]);
+            for (std::uint32_t o : operandsOf[v]) {
+                std::uint8_t oc = o == ssa::kNone ? std::uint8_t(3) : cls[o];
+                if (byOperands[v] == 2 && oc != 2)
+                    oc = 1;  // profiled int32: a boxed operand is taken as the profile says
+                m = std::max(m, oc);
+            }
             const std::uint8_t c = std::max(cls[v], m);
             if (c != cls[v]) {
                 cls[v] = c;
@@ -2587,10 +2612,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     for (std::uint32_t v = 0; v < nv; ++v)
         if (byOperands[v]) {
             const std::uint32_t at = g.values[v].at;
-            if (cls[v] == 1 || cls[v] == 0)
-                intArith_[at] = 1;
-            else if (cls[v] == 2)
-                dblArith_[at] = 1;
+            intArith_[at] = cls[v] == 1 || cls[v] == 0;
+            dblArith_[at] = cls[v] == 2;
             if (cls[v] == 0)
                 cls[v] = 1;
         }

@@ -903,6 +903,12 @@ private:
                 JSValue* slot = vm_.global->findOwn(vm_, code_->atoms[in.b], &attrs);
                 return slot && !(attrs & attr::kAccessor) ? *slot : JSValue::undefined();
             }
+            if (in.opcode() == Op::GetUpval && in.a == reg) {
+                // What the upvalue holds for a closure of this code running now (the code compares before it relies).
+                for (const Frame* fr = vm_.frameTop; fr-- > vm_.frameBase;)
+                    if (fr->code == code_ && fr->fn && in.b < fr->fn->nUpvals)
+                        return reinterpret_cast<Box*>(fr->fn->upvals()[in.b])->value;
+            }
             return JSValue::undefined();
         }
         return JSValue::undefined();

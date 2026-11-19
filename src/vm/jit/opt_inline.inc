@@ -2151,6 +2151,12 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             constReg[ci.a] = 1;
             constVal[ci.a] = JSValue::int32(ci.imm());
             break;
+        case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse:
+            if (ci.a == 0 || ci.a <= C->nparams)
+                return false;
+            constReg[ci.a] = 1;
+            constVal[ci.a] = ci.opcode() == Op::LoadNull ? JSValue::null() : JSValue::boolean(ci.opcode() == Op::LoadTrue);
+            break;
         case Op::Ret:
             if (!constReg[ci.a] || !constVal[ci.a].isUndefined())
                 return false;

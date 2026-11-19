@@ -1490,6 +1490,18 @@ private:
     };
     std::vector<Borrow> borrows_;
     std::set<std::uint32_t> slowNext_;  ///< instructions a slow path comes back to
+    /// `o.#x` whose name the `GetUpval` just before reads into a register nothing else reads: the read takes the name from
+    /// the upvalue itself (by read: the upvalue's index), the `GetUpval` writes nothing, an exit runs from it.
+    std::map<std::uint32_t, std::uint16_t> privKeyUpval_;
+    void planPrivateReads();
+    bool privateReadSite(std::uint32_t i) const
+    {
+        const Ins& in = code_->code[i];
+        const auto& uw = plan_->useWebs[i];
+        return in.opcode() == Op::GetElem && (code_->flags & CodeBlock::kPrivate) && i < code_->privCaches.size() &&
+               code_->privCaches[i].key && code_->privCaches[i].shape && uw.size() >= 2 && uw[0] < 0 && uw[1] < 0 &&
+               !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed));
+    }
     /// Code that seldom runs, emitted after the function's own (`emitTails`), so that the code that runs stays together.
     /// Each block is made with the variables' state as it was where it is entered.
     std::deque<std::function<void()>> cold_;

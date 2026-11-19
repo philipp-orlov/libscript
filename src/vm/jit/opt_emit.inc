@@ -983,9 +983,7 @@ bool Baseline::emitTyped(std::uint32_t i)
         }
     }
     case Op::GetElem:
-        if ((code_->flags & CodeBlock::kPrivate) && i < code_->privCaches.size() && code_->privCaches[i].key &&
-            code_->privCaches[i].shape && uw.size() >= 2 && uw[0] < 0 && uw[1] < 0 &&
-            !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))) {
+        if (privateReadSite(i)) {
             // `o.#x` where the site has found it: the name and the shape checked, the slot read straight into the
             // result's variable. Anything else leaves the code before the read.
             const PrivateCache& pc = code_->privCaches[i];
@@ -993,7 +991,13 @@ bool Baseline::emitTyped(std::uint32_t i)
             holdValue(key);
             Label& bad = exitBefore(i);
             a_.movImm(RCX, key.bits);
-            a_.cmp(RCX, R(in.c));
+            if (auto pk = privKeyUpval_.find(i); pk != privKeyUpval_.end()) {
+                a_.mov(RDX, mem(R13, kFrameFn));
+                a_.mov(RDX, mem(RDX, kFnUpvals + std::int32_t(8 * pk->second)));
+                a_.cmp(RCX, mem(RDX, kBoxValue));
+            } else {
+                a_.cmp(RCX, R(in.c));
+            }
             a_.jcc(CNE, bad);
             a_.mov(RAX, provenSlotMem(in.b, pc.shape, pc.index, 0, bad));
             if (dw >= 0)
@@ -1727,6 +1731,26 @@ void Baseline::emitOpt(std::uint32_t i)
     saveReadValue(i);
 }
 
+void Baseline::planPrivateReads()
+{
+    privKeyUpval_.clear();
+    if (!(code_->flags & CodeBlock::kPrivate) || !code_->handlers.empty())
+        return;
+    for (std::uint32_t i = 1; i < n_; i += length(i)) {
+        const Ins& in = code_->code[i];
+        if (in.opcode() != Op::GetElem || plan_->isLeader[i] || !privateReadSite(i))
+            continue;
+        const std::uint32_t j = i - 1;
+        const Ins& g = code_->code[j];
+        if (g.opcode() != Op::GetUpval || g.a != in.c || in.c == in.b || in.c == in.a || plan_->defWeb[j] >= 0 ||
+            (j < skipDef_.size() && skipDef_[j]) || exitRedirect_[i] >= 0 || !regDeadAfter(i, in.c))
+            continue;
+        privKeyUpval_[i] = g.b;
+        skipDef_[j] = 1;
+        exitRedirect_[i] = std::int32_t(j);
+    }
+}
+
 void Baseline::planTestReads()
 {
     testReads_.clear();
@@ -2410,6 +2434,7 @@ Tier2Code* Baseline::compileOptimized()
     movedOut_.clear();
     planChains();
     planTestReads();
+    planPrivateReads();
     factShape_.assign(code_->nregs + 1, 0u);
     factAux_.assign(code_->nregs + 1, -1);
     factInl_.assign(code_->nregs + 1, 0);

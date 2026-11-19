@@ -5423,7 +5423,13 @@ void compileTier1(VM& vm, CodeBlock* code)
     // until none is out of reach. If a round finds none to name, every branch is made long.
     Tier1Code* t = nullptr;
     Asm::longSet().clear();
-    for (int round = 0;; ++round) {
+    // A very large function would be compiled again for each branch found out of reach: every branch is long at once.
+    if (code->code.size() > 4000) {
+        Asm::longBranchDefault() = true;
+        t = Baseline(vm, code).compile();
+        Asm::longBranchDefault() = false;
+    }
+    for (int round = 0; !t; ++round) {
         Asm::reachFailed() = false;
         Asm::newLong().clear();
         t = Baseline(vm, code).compile();

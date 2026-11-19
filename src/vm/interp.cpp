@@ -1132,7 +1132,7 @@ Frame* fr = vm.frameTop - 1;
     do {                                                                                 \
         /* in a single step, the frames of a call it made may move into compiled code; the stepped one not */ \
         if (!Step || fr != home) {                                                       \
-            if (vm.tier1Threshold && !code->tier1Failed && ++code->hotness >= kOsrAfter) [[unlikely]] { \
+            if (vm.tier1Threshold && !code->tier1Failed && ++code->hotness >= kOsrAfter + code->code.size()) [[unlikely]] { \
                 fr->pc = pc;                                                             \
                 if (!code->tier1)                                                        \
                     compileTier1(vm, code);                                              \

@@ -1154,6 +1154,14 @@ Frame* fr = vm.frameTop - 1;
         }                                                                                \
         TICK();                                                                          \
     } while (0)
+/// A taken jump of the 24-bit kind: a back edge counts as one of a loop's.
+#define TAKE()                    \
+    do {                          \
+        const int o_ = ins->jump(); \
+        pc += o_;                 \
+        if (o_ < 0)               \
+            LOOP_TICK();          \
+    } while (0)
 #define TAKE16()                  \
     do {                          \
         const int o_ = ins->jump16(); \
@@ -1766,28 +1774,28 @@ L_JTrue:
 L_JFalse: {
     const JSValue v = R[ins->a];
     if (v.isBool() ? !v.asBool() : !toBoolean(v))
-        pc += ins->jump();
+        TAKE();
     NEXT();
 }
 L_JNullish:
     if (R[ins->a].isNullish())
-        pc += ins->jump();
+        TAKE();
     NEXT();
 L_JNotNullish:
     if (!R[ins->a].isNullish())
-        pc += ins->jump();
+        TAKE();
     NEXT();
 L_JUndefined:
     if (R[ins->a].isUndefined())
-        pc += ins->jump();
+        TAKE();
     NEXT();
 L_JNotUndefined:
     if (!R[ins->a].isUndefined())
-        pc += ins->jump();
+        TAKE();
     NEXT();
 L_JHole:
     if (R[ins->a].isHole())
-        pc += ins->jump();
+        TAKE();
     NEXT();
 L_JLt:
 L_JLe:

@@ -524,6 +524,7 @@ void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to)
     const unsigned nregs = code_->nregs;
     if (to > from) {
         ssaEdgeMoves(from, to);
+        ssaLoadLoopCache(to);
         edgeIn_[to].push_back(EdgeState{frame_, ssaFacts()});
         a_.jmp(blockLabel_[to]);
         return;
@@ -744,12 +745,21 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             st[r] = r;  // the slots hold the entry values
         edgeIn_[1].push_back(EdgeState{st, {}});
         ssaEdgeMoves(0, 1);
+        ssaLoadLoopCache(1);
     }
     for (std::uint32_t b = 1; b < nb && !ssaFailed_; ++b) {
         const ssa::Block& bl = g.blocks[b];
         if (!bl.reached)
             continue;
         a_.bind(blockLabel_[b]);
+        if (!loopCache_[b].empty()) {
+            // From here to the loop's last block, these values are in their loop registers.
+            for (const auto& [v, r] : loopCache_[b]) {
+                cacheSaved_.emplace_back(v, sval_[v].reg);
+                sval_[v].reg = std::int8_t(r);
+            }
+            cacheEnd_ = loopLast_[b];
+        }
         ssaEnterBlock(b);
         ssaResetFacts();
         {
@@ -876,6 +886,12 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         }
         if (!ended && !ssaFailed_)
             ssaEdge(b, bl.succs[0]);
+        if (b == cacheEnd_ && !cacheSaved_.empty()) {
+            for (const auto& [v, r] : cacheSaved_)
+                sval_[v].reg = r;
+            cacheSaved_.clear();
+            cacheEnd_ = 0;
+        }
     }
     if (ssaFailed_)
         return fail();
@@ -940,6 +956,10 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                 }
             }
         }
+        // The registers of the loop with a cache this head is in (its own, or one around it).
+        for (std::uint32_t h = 1; h <= b; ++h)
+            if (!loopCache_[h].empty() && b <= loopLast_[h])
+                ssaLoadLoopCache(h);
         a_.jmp(blockLabel_[b]);
         a_.bind(fail);
         a_.aluI(0, RSP, spill_);
@@ -1717,11 +1737,20 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         last[v] = std::max(last[v], at);
     };
     std::int32_t pos = 0;
+    std::vector<std::pair<std::int32_t, std::int32_t>> blockPos(nb, {-1, -1});
+    std::vector<std::vector<std::int32_t>> uses(nv);
     for (std::uint32_t b = 1; b < nb; ++b) {
         const ssa::Block& bl = g.blocks[b];
         if (!bl.reached)
             continue;
         const std::int32_t start = pos++;
+        blockPos[b].first = start;
+        if (b == 1)
+            // The way in (block 0) ends here: what it gives block 1's phis is needed until then.
+            for (std::uint32_t p : bl.phis)
+                for (std::size_t q = 0; q < bl.preds.size(); ++q)
+                    if (bl.preds[q] == 0)
+                        touch(g.values[p].in[q], start);
         for (unsigned r = 0; r < code_->nregs; ++r)
             if (ssa::bitTest(bl.liveIn, r))
                 touch(bl.nameIn[r], start);
@@ -1734,7 +1763,11 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             const std::int32_t use = pos++, def = pos++;
             const opt::Effects e = ssa::effects(*code_, i);
             for (std::uint16_t r : e.rd)
+            {
                 touch(name_[r], use);
+                if (name_[r] != ssa::kNone && !sval_[name_[r]].isConst)
+                    uses[name_[r]].push_back(use);
+            }
             native_[i] = ssaNative(i);
             if (!native_[i])
                 clob.push_back(use);
@@ -1756,6 +1789,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             }
         }
         const std::int32_t end = pos++;
+        blockPos[b].second = end;
         for (unsigned r = 0; r < code_->nregs; ++r)
             if (ssa::bitTest(bl.liveOut, r))
                 touch(name_[r], end);
@@ -1815,7 +1849,77 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         return false;
     }
     spill_ = std::int32_t((8 * slots + 15) & ~15);
+    // Loops that clobber no register: values from before them that live in slots, read inside, get a register for the
+    // loop, loaded where it is entered (values never change, so the slot stays right and nothing is written back).
+    loopCache_.assign(nb, {});
+    loopLast_.assign(nb, 0);
+    std::int32_t cachedUntil = -1;
+    for (std::uint32_t h = 1; h < nb && !noRegs; ++h) {
+        const ssa::Block& hb = g.blocks[h];
+        if (!hb.reached || !hb.loopHeader || blockPos[h].first <= cachedUntil)
+            continue;
+        std::uint32_t lastB = h;
+        for (std::uint32_t b = h + 1; b < nb && g.blocks[b].start < hb.loopEnd; ++b)
+            if (g.blocks[b].reached)
+                lastB = b;
+        const std::int32_t from = blockPos[h].first, to = blockPos[lastB].second;
+        // Clean, and entered at its head only.
+        const auto c = std::lower_bound(clob.begin(), clob.end(), from);
+        if (c != clob.end() && *c <= to)
+            continue;
+        bool closed = true;
+        for (std::uint32_t b = h + 1; b <= lastB && closed; ++b)
+            if (g.blocks[b].reached)
+                for (std::uint32_t p : g.blocks[b].preds)
+                    closed = closed && p >= h && p <= lastB;
+        if (!closed)
+            continue;
+        std::vector<std::uint8_t> busy(64, 0);  // registers some value has inside the loop (gprs 0..31, xmms 32..)
+        for (std::uint32_t v = 0; v < nv; ++v)
+            if (sval_[v].reg >= 0 && last[v] >= from && first[v] <= to)
+                busy[(sval_[v].rep == kRepF64 ? 32 : 0) + sval_[v].reg] = 1;
+        std::vector<int> freeG, freeX;
+        for (int r : {int(R8), int(R9), int(R10), int(R11), int(R16), int(R17), int(R18), int(R19), int(R20)})
+            if ((r < 16 || r < 16 + Asm::kExtraGpr - 2) && !busy[r])
+                freeG.push_back(r);
+        for (int x = 2; x < 2 + 14 + Asm::kExtraXmm; ++x)
+            if (!busy[32 + x])
+                freeX.push_back(x);
+        std::vector<std::pair<std::size_t, std::uint32_t>> cands;  // (reads inside, value)
+        for (std::uint32_t v = 0; v < nv; ++v) {
+            if (sval_[v].slot < 0 || sval_[v].isConst || first[v] >= from || last[v] < from)
+                continue;
+            std::size_t n = 0;
+            for (std::int32_t u : uses[v])
+                n += u >= from && u <= to ? 1 : 0;
+            if (n)
+                cands.emplace_back(n, v);
+        }
+        std::sort(cands.begin(), cands.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        for (const auto& [n, v] : cands) {
+            std::vector<int>& pool = sval_[v].rep == kRepF64 ? freeX : freeG;
+            if (pool.empty())
+                continue;
+            loopCache_[h].emplace_back(v, pool.back());
+            pool.pop_back();
+        }
+        if (!loopCache_[h].empty()) {
+            loopLast_[h] = lastB;
+            cachedUntil = to;
+        }
+    }
     return true;
+}
+
+/// Load the registers loop `h` keeps values in from their slots (on a way into it from outside).
+void Baseline::ssaLoadLoopCache(std::uint32_t h)
+{
+    for (const auto& [v, r] : loopCache_[h]) {
+        if (sval_[v].rep == kRepF64)
+            a_.movsdLoad(r, mem(RSP, moveRoom_ + 8 + 8 * sval_[v].slot));
+        else
+            a_.mov(Reg(r), mem(RSP, moveRoom_ + 8 + 8 * sval_[v].slot));
+    }
 }
 
 void Baseline::ssaSaveRegs()

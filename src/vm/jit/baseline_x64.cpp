@@ -2626,6 +2626,11 @@ private:
     bool ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter);
     void ssaNeedArray(std::uint32_t v, Reg r, ObjClass cls, Label& bad);
     void loadToInt32(std::uint32_t v, Reg dst, Label& bad);
+    std::vector<std::vector<std::pair<std::uint32_t, int>>> loopCache_;  ///< per loop header: (value, register)
+    std::vector<std::uint32_t> loopLast_;                                ///< per cached loop header: its last block
+    std::vector<std::pair<std::uint32_t, std::int8_t>> cacheSaved_;
+    std::uint32_t cacheEnd_ = 0;
+    void ssaLoadLoopCache(std::uint32_t h);
     bool ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter);
     template <typename Then>
     void ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, std::int32_t imm, bool isImm, Label& bad,

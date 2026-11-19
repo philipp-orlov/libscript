@@ -185,7 +185,7 @@ void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to)
     const unsigned nregs = code_->nregs;
     if (to > from) {
         ssaEdgeMoves(from, to);
-        edgeIn_[to].push_back(EdgeState{frame_});
+        edgeIn_[to].push_back(EdgeState{frame_, ssaFacts()});
         a_.jmp(blockLabel_[to]);
         return;
     }
@@ -416,6 +416,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
     blockLabel_.assign(nb, Label{});
     edgeIn_.assign(nb, {});
     headerFrame_.assign(nb, {});
+    headerFacts_.assign(nb, {});
     a_.push(RBX);
     a_.push(R13);
     a_.aluI(5, RSP, 8 + spill_);
@@ -430,7 +431,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         std::vector<std::uint32_t> st(nregs);
         for (unsigned r = 0; r < nregs; ++r)
             st[r] = r;  // the slots hold the entry values
-        edgeIn_[1].push_back(EdgeState{st});
+        edgeIn_[1].push_back(EdgeState{st, {}});
         ssaEdgeMoves(0, 1);
     }
     for (std::uint32_t b = 1; b < nb && !ssaFailed_; ++b) {
@@ -440,6 +441,31 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         a_.bind(blockLabel_[b]);
         ssaEnterBlock(b);
         ssaResetFacts();
+        {
+            // What every edge in knows (a loop's head: not the shapes, which its body may change).
+            const std::vector<EdgeState>& ins = edgeIn_[b];
+            if (!ins.empty())
+                for (const Fact& f : ins[0].facts) {
+                    std::uint8_t bits = f.bits;
+                    std::uint32_t shape = bl.loopHeader ? 0 : f.shape;
+                    for (std::size_t e = 1; e < ins.size() && (bits || shape); ++e) {
+                        auto it = std::lower_bound(ins[e].facts.begin(), ins[e].facts.end(), f.v,
+                                                   [](const Fact& x, std::uint32_t v) { return x.v < v; });
+                        if (it == ins[e].facts.end() || it->v != f.v) {
+                            bits = 0;
+                            shape = 0;
+                        } else {
+                            bits &= it->bits;
+                            if (it->shape != shape)
+                                shape = 0;
+                        }
+                    }
+                    if (bits || shape)
+                        ssaKnow(f.v, bits, shape);
+                }
+            if (bl.loopHeader)
+                headerFacts_[b] = ssaFacts();
+        }
         std::size_t k = 0;
         bool ended = false;
         for (std::uint32_t i = bl.start; i < bl.end && !ssaFailed_; i = opt::nextOf(*code_, i), ++k) {
@@ -471,6 +497,18 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             case Op::PutProp:
                 if (ssaOn_ < 2 || !ssaPutProp(i, liveAfter[b][k]))
                     ssaGeneric(i, liveAfter[b][k]);
+                break;
+            case Op::GetGlobal:
+                if (ssaOn_ < 2 || !ssaGetGlobal(i))
+                    ssaGeneric(i, liveAfter[b][k]);
+                break;
+            case Op::Eq: case Op::Ne: case Op::StrictEq: case Op::StrictNe:
+                if (ssaOn_ < 2 || !ssaEquals(i))
+                    ssaGeneric(i, liveAfter[b][k]);
+                break;
+            case Op::Ret:
+                ssaRet(i);
+                ended = true;
                 break;
             case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
             case Op::ShlI: case Op::ShrI: case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr:
@@ -510,21 +548,64 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         osr.emplace_back(bl.start, std::uint32_t(a_.here()));
         a_.aluI(5, RSP, spill_);
         std::vector<std::uint8_t> done(g.values.size(), 0);
+        Label fail;
         for (unsigned r = 0; r < nregs; ++r) {
             const std::uint32_t v = bl.nameIn[r];
-            if (v == ssa::kNone || sval_[v].slot < 0 || done[v])
+            if (v == ssa::kNone || done[v])
                 continue;
             done[v] = 1;
             a_.mov(RAX, R(r));
-            a_.mov(slotOf(v), RAX);
+            if (sval_[v].slot >= 0)
+                a_.mov(slotOf(v), RAX);
+            // What the loop's code takes as known of it.
+            for (const Fact& f : headerFacts_[b]) {
+                if (f.v != v)
+                    continue;
+                const std::uint8_t bits = std::uint8_t(f.bits & ~vDef_[v]);
+                if (bits & kVInt) {
+                    needInt(RAX, fail);
+                } else if (bits & kVBool) {
+                    a_.mov(RDX, RAX);
+                    a_.aluI(4, RDX, -2);
+                    a_.cmpI(RDX, std::int32_t(kFalse));
+                    a_.jcc(CNE, fail);
+                } else if (bits & kVObj) {
+                    needObject(RAX, fail);
+                } else if (bits & kVNotCell) {
+                    Label ok;
+                    a_.test(RAX, R15);
+                    a_.jcc(CNE, ok);
+                    a_.test(RAX, RAX);
+                    a_.jcc(CNE, fail);
+                    a_.bind(ok);
+                }
+            }
         }
         a_.jmp(blockLabel_[b]);
+        a_.bind(fail);
+        a_.aluI(0, RSP, spill_);
+        a_.mov(RDI, R12);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptEntryFail));
+        a_.callC(RAX);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(bl.start)));
+        a_.jmp(RAX);
     }
     emitTails();
     CodeSpan span = a_.failed() ? CodeSpan{} : allocateCode(a_.buf.size());
     if (!span)
         return fail();
     commitCode(span, a_.buf.data(), a_.buf.size());
+    if (const char* mapFile = std::getenv("T2MAP")) {
+        // One line per instruction: where its code starts (as the optimizing compiler writes them).
+        if (std::FILE* f = std::fopen(mapFile, "a")) {
+            for (std::uint32_t j = 0; j < n_; j += length(j))
+                if (offsets_[j] != ~0u)
+                    std::fprintf(f, "%llx %s %u %s %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(span.rx)),
+                                 "fn", unsigned(code_->lines.empty() ? 0 : code_->lines[0]), opName(code_->code[j].opcode()),
+                                 unsigned(offsets_[j]));
+            std::fclose(f);
+        }
+    }
     auto* t = new Tier2Code;
     t->rx = span.rx;
     t->bytes = span.bytes;
@@ -573,6 +654,18 @@ void Baseline::ssaKnow(std::uint32_t v, std::uint8_t bits, std::uint32_t shape)
     if (shape)
         vShape_[v] = shape;
     touched_.push_back(v);
+}
+
+std::vector<Baseline::Fact> Baseline::ssaFacts()
+{
+    std::vector<std::uint32_t> vs = touched_;
+    std::sort(vs.begin(), vs.end());
+    vs.erase(std::unique(vs.begin(), vs.end()), vs.end());
+    std::vector<Fact> out;
+    for (std::uint32_t v : vs)
+        if (vKnown_[v] != vDef_[v] || vShape_[v])
+            out.push_back(Fact{v, vKnown_[v], vShape_[v]});
+    return out;
 }
 
 void Baseline::ssaForgetShapes()
@@ -1023,4 +1116,116 @@ bool Baseline::ssaArith(std::uint32_t i)
     a_.or_(RAX, R14);
     ssaDef(i, kVInt | kVNotCell);
     return true;
+}
+
+bool Baseline::ssaGetGlobal(std::uint32_t i)
+{
+    // A data property the global object has now stays where it is until something deletes it or changes its attributes,
+    // which the epoch counts. The value read is the global object's: borrowed.
+    const Ins& in = code_->code[i];
+    if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed) && code_->tier2Tries >= 2)
+        return false;
+    JSObject* g = vm_.global;
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm_, code_->atoms[in.b], &attrs);
+    if (!slot || (attrs & attr::kAccessor))
+        return false;
+    std::uint32_t index;
+    JSValue* inlineBase = g->inl();
+    if (slot >= inlineBase && slot < inlineBase + g->h.aux)
+        index = std::uint32_t(slot - inlineBase);
+    else
+        index = std::uint32_t(slot - g->slots) + g->h.aux;
+    Label& bad = ssaExit(i);
+    a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+    a_.jcc(CNE, bad);
+    globalSlot(index);
+    a_.mov(RAX, mem(RDX, 0));
+    ssaDef(i, 0);
+    return true;
+}
+
+/// `==`, `!=`, `===`, `!==` into a boolean, where they compare bits: against null or undefined (loose), against a constant
+/// that is no number and no cell, two int32s, two objects; anything else leaves.
+bool Baseline::ssaEquals(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const Op op = in.opcode();
+    const std::uint32_t va = name_[in.b], vb = name_[in.c];
+    const bool eq = op == Op::Eq || op == Op::StrictEq;
+    const bool loose = op == Op::Eq || op == Op::Ne;
+    const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
+    auto plainConst = [&](std::uint32_t v) {
+        if (!sval_[v].isConst)
+            return false;
+        const JSValue k = JSValue::raw(sval_[v].bits);
+        return !k.isNumber() && !k.isCell();
+    };
+    const bool pa = plainConst(va), pb = plainConst(vb);
+    auto finish = [&](Cond c) {
+        a_.setcc(c, RAX);
+        a_.movzx8(RAX, RAX);
+        a_.aluI32(1, RAX, std::int32_t(kFalse));
+        ssaDef(i, kVBool | kVNotCell);
+    };
+    if (loose && (pa || pb)) {
+        const JSValue k = JSValue::raw(sval_[pa ? va : vb].bits);
+        if (!k.isNullish())
+            return false;
+        loadValue(pa ? vb : va, RAX);
+        a_.aluI(4, RAX, -9);
+        a_.cmpI(RAX, std::int32_t(kNull));
+        finish(eq ? CE : CNE);
+        return true;
+    }
+    if (pa || pb || (known(va, kVInt) && known(vb, kVInt))) {
+        loadValue(va, RAX);
+        loadValue(vb, RCX);
+        a_.cmp(RAX, RCX);
+        finish(eq ? CE : CNE);
+        return true;
+    }
+    if (failed)
+        return false;
+    Label& bad = ssaExit(i);
+    loadValue(va, RAX);
+    loadValue(vb, RCX);
+    Label bits;
+    a_.mov(RDX, RAX);
+    a_.and_(RDX, RCX);
+    a_.cmp(RDX, R14);
+    a_.jcc(CAE, bits);
+    a_.test(RAX, R15);
+    a_.jcc(CNE, bad);
+    a_.test(RCX, R15);
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
+    a_.jcc(CNE, bad);
+    a_.bind(bits);
+    a_.cmp(RAX, RCX);
+    finish(eq ? CE : CNE);
+    return true;
+}
+
+/// A return: the result in its slot, then the baseline's way out, told which slots may hold something to clear.
+void Baseline::ssaRet(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const unsigned nregs = code_->nregs;
+    ssaSync({in.a}, ssa::Bits((nregs + 63) / 64, 0), std::vector<std::uint8_t>(nregs, 0));
+    std::vector<std::uint64_t> dirty((nregs + 63) / 64, 0);
+    ssaPlain_.assign(nregs, 0);
+    for (unsigned r = 0; r < nregs; ++r) {
+        const std::uint32_t v = frame_[r];
+        const bool undef = v != ssa::kNone && sval_[v].isConst && sval_[v].bits == kUndefined;
+        if (!undef)
+            dirty[r / 64] |= std::uint64_t(1) << (r % 64);
+        if (v != ssa::kNone && !mayBeCell(v) && r != in.a)
+            ssaPlain_[r] = 1;
+    }
+    dirty[in.a / 64] |= std::uint64_t(1) << (in.a % 64);
+    ret(i, in, false, &dirty);
+    ssaPlain_.clear();
 }

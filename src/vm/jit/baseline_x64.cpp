@@ -2607,10 +2607,19 @@ private:
     std::vector<SVal> sval_;
     /// While emitting: the value each register holds (`name_`) and what its frame slot holds (`frame_`, kNone: not known).
     std::vector<std::uint32_t> name_, frame_;
+    struct Fact
+    {
+        std::uint32_t v;
+        std::uint8_t bits;
+        std::uint32_t shape;
+    };
     struct EdgeState
     {
         std::vector<std::uint32_t> frame;
+        std::vector<Fact> facts;  ///< what is known of values as the edge leaves, by value
     };
+    std::vector<Fact> ssaFacts();
+    std::vector<std::vector<Fact>> headerFacts_;  ///< per loop header: what its code takes as known (OSR checks it)
     std::vector<std::vector<EdgeState>> edgeIn_;     ///< per block: the frame state of each forward edge into it
     std::vector<std::vector<std::uint32_t>> headerFrame_;  ///< per loop header: the frame state its code takes as given
     std::vector<Label> blockLabel_;
@@ -2658,6 +2667,10 @@ private:
     bool ssaGetProp(std::uint32_t i);
     bool ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter);
     bool ssaArith(std::uint32_t i);
+    bool ssaEquals(std::uint32_t i);
+    bool ssaGetGlobal(std::uint32_t i);
+    void ssaRet(std::uint32_t i);
+    std::vector<std::uint8_t> ssaPlain_;  ///< for `ret`: registers whose slot holds no cell
 };
 
 void Baseline::emitTails()
@@ -5297,7 +5310,8 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
     // Registers a call put its arguments in belong to the caller; those the call did not fill and everything above the
     // parameters are this frame's to clear. When none can hold a cell, nothing here calls out and rax stays.
     auto isPlain = [&](unsigned r) {
-        return (taken && r == in.a) || (r < plainRegs_.size() && plainRegs_[r]) || plainAt(i, r) || fnBorrowed(r);
+        return (taken && r == in.a) || (r < plainRegs_.size() && plainRegs_[r]) || plainAt(i, r) || fnBorrowed(r) ||
+               (r < ssaPlain_.size() && ssaPlain_[r]);
     };
     unsigned cells = 0;
     for (unsigned r = first; r < code_->nregs; ++r)

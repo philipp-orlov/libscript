@@ -613,6 +613,29 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             regs[ci.a] = out;
             break;
         }
+        case Op::GetGlobal: {
+            // A global that is there, as a data property: read with the epoch check the other global reads have.
+            std::uint8_t attrs = 0;
+            JSValue* slot = vm_.global->findOwn(vm_, C->atoms[ci.b], &attrs);
+            Label* bad = cx.fail(this);
+            if (!slot || (attrs & attr::kAccessor) || !bad)
+                return false;
+            if (emit) {
+                JSObject* g = vm_.global;
+                JSValue* inl = g->inl();
+                const std::uint32_t index = slot >= inl && slot < inl + g->h.aux ? std::uint32_t(slot - inl)
+                                                                                : std::uint32_t(slot - g->slots) + g->h.aux;
+                a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+                a_.jcc(CNE, *bad);
+                globalSlot(index);
+                a_.mov(RAX, mem(RDX, 0));
+            }
+            IVal out;
+            if (!takeRead(p ? p : 8, bad, out))
+                return false;
+            regs[ci.a] = out;
+            break;
+        }
         case Op::GetUpval: {
             if (ci.b < upKnown.size() && upKnown[ci.b] >= 0) {
                 regs[ci.a] = upVal[ci.b];

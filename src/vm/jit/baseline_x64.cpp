@@ -4221,12 +4221,17 @@ void Baseline::putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* i
 {
     (void)i;
     if (ic->next == 0) {
+        // A store of what the slot holds already changes nothing and counts nothing.
+        Label same;
         slotAddress(ic->index);
         a_.mov(RCX, R(in.c));
-        retain(RCX);
         a_.mov(RSI, mem(RDX, 0));
+        a_.cmp(RSI, RCX);
+        a_.jcc(CE, same);
+        retain(RCX);
         a_.mov(mem(RDX, 0), RCX);
         release(RSI);
+        a_.bind(same);
         return;
     }
     if (ic->validity) {

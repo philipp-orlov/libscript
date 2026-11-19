@@ -330,7 +330,7 @@ bool Baseline::typedSiteKind(std::uint32_t i, bool put, ElemKind* kind)
     if (seen == 0 || (seen & (seen - 1)) != 0)
         return false;
     *kind = ElemKind(__builtin_ctz(seen));
-    return !((put && *kind == ElemKind::Uint8Clamped) || (!put && *kind == ElemKind::Uint32));
+    return !(put && *kind == ElemKind::Uint8Clamped);
 }
 
 /// RAX an object, RCX an int32 index: element `RCX` of a typed array of `kind`, read into the instruction's destination or
@@ -359,6 +359,32 @@ void Baseline::typedAccess(std::uint32_t i, const Ins& in, ElemKind kind, bool p
             deliverDouble(i, in.a);
             return;
         case ElemKind::Int32: a_.mov32(RAX, mem(RSI, RCX, 4)); break;
+        case ElemKind::Uint32: {
+            // Past int32 it is a double: one for a double variable, a leave for an int32 one, boxed for the frame.
+            a_.mov32(RAX, mem(RSI, RCX, 4));
+            const std::int32_t w = optimizing() ? plan_->defWeb[i] : -1;
+            if (w >= 0 && !isI32(w)) {
+                a_.cvtsi2sd64(0, RAX);
+                deliverDouble(i, in.a);
+                return;
+            }
+            if (w >= 0) {
+                a_.test32(RAX, RAX);
+                a_.jcc(CS, exitBefore(i));
+                deliverInt(i, in.a);
+                return;
+            }
+            Label big, out;
+            a_.test32(RAX, RAX);
+            a_.jcc(CS, big);
+            deliverInt(i, in.a);
+            a_.jmp(out);
+            a_.bind(big);
+            a_.cvtsi2sd64(0, RAX);
+            deliverDouble(i, in.a);
+            a_.bind(out);
+            return;
+        }
         case ElemKind::Int16: a_.movsx16(RAX, mem(RSI, RCX, 2)); a_.mov32(RAX, RAX); break;
         case ElemKind::Uint16: a_.movzx16(RAX, mem(RSI, RCX, 2)); break;
         case ElemKind::Int8: a_.movsx8(RAX, mem(RSI, RCX, 1)); a_.mov32(RAX, RAX); break;

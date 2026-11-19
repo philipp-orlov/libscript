@@ -1556,18 +1556,6 @@ private:
     /// The address of slot `index` of the object of shape `shape` in frame register `reg`, in RDX (the object in RAX), `bad`
     /// when it is another. `aux` is the inline slot count the cache saw, plus one (0: unknown): with it the address is fixed.
     /// As `provenSlot`, for a read: the slot as a memory operand (on rax or rdx) instead of its address.
-    /// The object in rax (shape proven) has `inl` inline slots, as the site saw: checked once, then known for the register.
-    /// A site that sees objects of the shape with other counts exits here, and is compiled again with the count not assumed.
-    void provenCount(unsigned reg, std::int32_t inl, std::uint32_t index, Label& bad)
-    {
-        if (factAux_[reg] == inl)
-            return;
-        if (std::int32_t(index) < inl && (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index)))
-            return;
-        a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(inl));
-        a_.jcc(CNE, bad);
-        factAux_[reg] = inl;
-    }
     Mem provenSlotMem(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
         provenShape(reg, shape, bad);
@@ -1576,7 +1564,6 @@ private:
             return mem(RDX, 0);
         }
         const std::int32_t inl = std::int32_t(aux) - 1;
-        provenCount(reg, inl, index, bad);
         if (std::int32_t(index) < inl) {
             // In place in the objects the site learned on. Objects of one shape can be made with more slots in place, or
             // fewer: unless enough are known to be there, found from the object's own count.
@@ -1602,7 +1589,6 @@ private:
             return;
         }
         const std::int32_t inl = std::int32_t(aux) - 1;
-        provenCount(reg, inl, index, bad);
         if (std::int32_t(index) < inl) {
             if (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index))
                 a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));

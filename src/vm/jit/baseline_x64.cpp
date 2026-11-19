@@ -2593,6 +2593,7 @@ private:
 public:
     Tier2Code* compileSsa(const ssa::Graph& g, Tier1Code* base);
     const char* ssaWhy_ = "";
+    int ssaOn_ = 2;  ///< SCRIPT_VM_SSA: 1 every instruction through the frame, 2 the fast paths too
 
 private:
     const ssa::Graph* ssa_ = nullptr;
@@ -2617,7 +2618,7 @@ private:
     Mem slotOf(std::uint32_t v) const { return mem(RSP, 8 + 8 * sval_[v].slot); }
     bool mayBeCell(std::uint32_t v) const
     {
-        return !(sval_[v].isConst && !JSValue::raw(sval_[v].bits).isCell());
+        return !(vDef_[v] & (kVNotCell | kVInt | kVBool));
     }
     void loadValue(std::uint32_t v, Reg r);
     void ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const std::vector<std::uint8_t>& clobber);
@@ -2627,6 +2628,36 @@ private:
     void ssaEdgeMoves(std::uint32_t from, std::uint32_t to);
     void ssaEnterBlock(std::uint32_t b);
     void emitSsaTails();
+    // M2: what is known of values, exits, and the instructions done in place.
+    static constexpr std::uint8_t kVInt = 1, kVObj = 2, kVBool = 4, kVNotCell = 8;
+    std::vector<std::uint8_t> vDef_;     ///< per value: what its definition proves
+    std::vector<std::uint8_t> vKnown_;   ///< per value: what is known of it here (forgotten at block heads)
+    std::vector<std::uint32_t> vShape_;  ///< per value: its object's shape, known here (0: not known)
+    std::vector<std::uint32_t> touched_; ///< values with something in vKnown_ or vShape_ beyond vDef_
+    struct SsaExit
+    {
+        std::uint32_t i;
+        std::vector<std::uint32_t> name, frame;
+        ssa::Bits live;
+        Label label;
+    };
+    std::deque<SsaExit> ssaExits_;
+    std::int64_t exitAt_ = -1;
+    Label* exitLabel_ = nullptr;
+    ssa::Bits liveBefore_;  ///< registers live before the instruction being emitted
+    Label& ssaExit(std::uint32_t i);
+    void ssaKnow(std::uint32_t v, std::uint8_t bits, std::uint32_t shape = 0);
+    void ssaForgetShapes();
+    void ssaResetFacts();
+    bool known(std::uint32_t v, std::uint8_t bits) const { return (vKnown_[v] & bits) == bits; }
+    void needIntV(std::uint32_t v, Reg r, Label& bad);
+    void needObjV(std::uint32_t v, Reg r, Label& bad);
+    void ssaDef(std::uint32_t i, std::uint8_t bits);
+    void ssaCondEdges(std::uint32_t b, Cond taken);
+    bool ssaBranch(std::uint32_t b, std::uint32_t i);
+    bool ssaGetProp(std::uint32_t i);
+    bool ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter);
+    bool ssaArith(std::uint32_t i);
 };
 
 void Baseline::emitTails()
@@ -5374,7 +5405,7 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
     // The SSA tier, while it is being built: only with SCRIPT_VM_SSA=1, and only on arm64 (x64 is not tested).
     static const bool ssaTier = [] {
         const char* e = std::getenv("SCRIPT_VM_SSA");
-        return e && *e == '1';
+        return e && (*e == '1' || *e == '2');
     }();
     if (ssaTier) {
         const ssa::Graph g = ssa::build(*code);
@@ -5386,6 +5417,7 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
                              dump(*code).c_str());
 #endif
             Baseline compiler(vm, code);
+            compiler.ssaOn_ = std::getenv("SCRIPT_VM_SSA")[0] - '0';
             if (Tier2Code* t = compiler.compileSsa(g, code->tier1))
                 return t;
             why = compiler.ssaWhy_;

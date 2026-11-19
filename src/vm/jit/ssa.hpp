@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "script/internal/vm/bytecode.hpp"
+#include "opt_analysis.hpp"
 
 namespace script {
 namespace internal {
@@ -63,6 +64,10 @@ struct Graph
     /// For each instruction of block `b`, in order: the registers live after it.
     std::vector<Bits> liveAfter(const CodeBlock& code, std::uint32_t b) const;
 };
+
+/// The registers instruction `i` reads and writes, as `opt::effectsOf` says, and also those it reads that it does not
+/// name (`JNotCode` looks at the `this` after the callee).
+opt::Effects effects(const CodeBlock& code, std::uint32_t i);
 
 /// Whether the SSA tier can take the instruction at all (its registers are modelled, it has a way to be compiled).
 bool supported(const CodeBlock& code, std::uint32_t i);

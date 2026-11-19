@@ -29,6 +29,14 @@ std::int32_t windowBase(const Ins& in)
 
 }  // namespace
 
+opt::Effects effects(const CodeBlock& code, std::uint32_t i)
+{
+    opt::Effects e = opt::effectsOf(code, i);
+    if (code.code[i].opcode() == Op::JNotCode)
+        e.rd.push_back(std::uint16_t(code.code[i].a + 1u));
+    return e;
+}
+
 bool supported(const CodeBlock& code, std::uint32_t i)
 {
     const Op op = code.code[i].opcode();
@@ -47,7 +55,7 @@ std::vector<Bits> Graph::liveAfter(const CodeBlock& code, std::uint32_t b) const
     Bits live = bl.liveOut;
     for (std::size_t k = ins.size(); k-- > 0;) {
         out[k] = live;
-        const opt::Effects e = opt::effectsOf(code, ins[k]);
+        const opt::Effects e = effects(code, ins[k]);
         for (std::uint16_t r : e.wr)
             bitClear(live, r);
         for (std::uint16_t r : e.rd)
@@ -86,7 +94,7 @@ Graph build(const CodeBlock& code)
             g.why = "op";
             return g;
         }
-        eff[i] = opt::effectsOf(code, i);
+        eff[i] = effects(code, i);
         for (std::uint16_t r : eff[i].rd)
             if (r >= nregs) {
                 g.why = "reg";

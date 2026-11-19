@@ -197,6 +197,9 @@ void VM::releaseCode(CodeBlock* code) noexcept
             releaseValidity(s.validity);
     for (CodeBlock* child : code->children)
         releaseCode(child);
+    for (const InlineSite& s : code->inlineSites)
+        if (s.callee)
+            releaseCode(s.callee);
     if (code->tier2) {
         releaseTier2(code->tier2, this);
         code->tier2 = nullptr;
@@ -207,6 +210,8 @@ void VM::releaseCode(CodeBlock* code) noexcept
     }
     codeByUid_.erase(code->uid);
     delete code->lazy;
+    if (CodeBlock* from = code->mergedFrom)
+        releaseCode(from);
     if (CodeBlock* from = code->inlinedFrom) {
         if (from->selfInlined == code)
             from->selfInlined = nullptr;

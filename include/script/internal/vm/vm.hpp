@@ -305,6 +305,8 @@ struct VM : EngineRuntime
     /// How many levels deep a function that calls itself by name runs those calls in place, from when it turns hot
     /// (`selfInline`); 0 for not at all; only with the optimizing compiler on.
     std::uint8_t selfInlining = 0;
+    /// Whether a function turning hot takes the code of the functions its calls reached into its own block (`mergeInline`).
+    bool mergeInlining = false;
     bool selfInliningSet = false;  ///< set by SCRIPT_VM_SELFINLINE: no deeper copy for very small functions
     /// The lowest machine stack address compiled code may reach before a call is made the slow way (0: no limit).
     std::uintptr_t jitStackFloor = 0;

@@ -91,6 +91,14 @@ void releaseTier1(Tier1Code* code, VM* vm) noexcept;
 /// A copy of `code` that runs the function's calls of itself in place one level deep, made once and kept while a function
 /// holds it (null when the function is not one for it); it comes with no count of its own. See self_inline.cpp.
 CodeBlock* selfInline(VM& vm, CodeBlock* code);
+/// The registers of `c` some path from the entry reads before writing, past `this` and the parameters; `reached` gets which
+/// instructions a path from the entry reaches.
+std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reached);
+/// A copy of `code` with the code of the functions its calls have reached (by the uid each `Call` last saw) in place, each
+/// behind a guard on that uid, the call the long way after it. Null when no call qualifies. The copy has the profile of
+/// what it was made from, and no count of its own. See merge_inline.cpp.
+/// From a loop that turned hot (`loop`, its header): only when a call in that loop is one to take in.
+CodeBlock* mergeInline(VM& vm, CodeBlock* code, std::uint32_t loop = ~0u);
 /// The block `f` (whose block is `code`, turning hot) runs from now on: `selfInline`'s copy when there is one, which `f` then
 /// holds in place of `code`. The copy starts cold, in the interpreter, which learns what its instructions make.
 CodeBlock* tierUpBlock(VM& vm, struct JSFunction* f, CodeBlock* code);

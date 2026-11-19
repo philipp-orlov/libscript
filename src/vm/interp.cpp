@@ -1440,6 +1440,19 @@ L_JNotCallee:
     if (R[ins->a].bits != toJSValue(fn).bits)
         pc += ins->jump();
     NEXT();
+L_JNotCode: {
+    // The register holds a function of the code whose uid the constant names, and a `this` it can take as it is.
+    const JSValue v = R[ins->a];
+    bool same = false;
+    if (isFunction(v)) {
+        const CodeBlock* callee = static_cast<JSFunction*>(asObject(v))->code;
+        same = callee && callee->uid == std::uint64_t(K[ins->b].asInt32()) &&
+               ((callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) || isObject(R[ins->a + 1]));
+    }
+    if (!same)
+        pc += ins->jump16();
+    NEXT();
+}
 
 // ---- arithmetic ----
 L_Add: {

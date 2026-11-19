@@ -55,6 +55,8 @@ bool inPlaceOp(Op op)
     }
 }
 
+}  // namespace
+
 /// The registers of `c` some path from the entry reads before writing, past `this` and the parameters; `reached` gets which
 /// instructions a path from the entry reaches.
 std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reached)
@@ -108,8 +110,6 @@ std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reach
         reached[j] = !written[j].empty();
     return need;
 }
-
-}  // namespace
 
 CodeBlock* selfInline(VM& vm, CodeBlock* c)
 {

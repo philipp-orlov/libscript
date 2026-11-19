@@ -21,7 +21,7 @@ bool isConditionalJump(Op op)
 {
     switch (op) {
     case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined:
-    case Op::JHole: case Op::JNotCallee: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
+    case Op::JHole: case Op::JNotCallee: case Op::JNotCode: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
     case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI:
     case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI:
         return true;
@@ -39,7 +39,7 @@ std::int64_t jumpTarget(const CodeBlock& code, std::uint32_t i)
         return std::int64_t(i) + 1 + in.jump();
     case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt: case Op::JNotGe:
     case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
-    case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI:
+    case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI: case Op::JNotCode:
         return std::int64_t(i) + 1 + in.jump16();
     default:
         return -1;
@@ -97,7 +97,7 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
         rd(in.c); wr(in.a);
         break;
     case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined:
-    case Op::JHole: case Op::JNotCallee: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI:
+    case Op::JHole: case Op::JNotCallee: case Op::JNotCode: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI:
     case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI: case Op::Ret: case Op::Throw:
         rd(in.a);
         break;

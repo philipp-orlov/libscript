@@ -75,6 +75,12 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     }
 #endif
 
+    mergeInlining = tier2Threshold > 0;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (const char* t = std::getenv("SCRIPT_VM_MERGE"))
+        mergeInlining = mergeInlining && std::atoi(t) != 0;
+#endif
+
     atoms.length = internKey("length");
     atoms.prototype = internKey("prototype");
     atoms.constructor = internKey("constructor");
@@ -193,7 +199,12 @@ std::string VM::captureStack() const
             for (const InlineSite* s : in) {
                 if (shown + 1 >= 16)
                     break;
-                out += "\n    at " + name + " (" + toUtf8(c->file) + ":" + std::to_string(line) + ")";
+                // A function of another block run in place has its own name and file.
+                const CodeBlock* at = s->callee ? s->callee : c;
+                std::string inName = at->name ? toUtf8(static_cast<StringCell*>(at->name)->text()) : std::string();
+                if (inName.empty())
+                    inName = "<anonymous>";
+                out += "\n    at " + inName + " (" + toUtf8(at->file) + ":" + std::to_string(line) + ")";
                 ++shown;
                 line = s->site < c->lines.size() ? c->lines[s->site] : 0;
             }
@@ -247,7 +258,7 @@ std::uint64_t censusTable[std::size_t(Census::Count)] = {};
 
 const char* const kCensusNames[] = {
     "SlowGetProp", "SlowPutProp", "SlowCall", "SlowElem", "IcMiss", "IcMonoToPoly", "IcToMega", "ChainInvalidated",
-    "Tier1Compiled", "Tier2Compiled", "Tier2Exit", "Tier2Invalidated", "ThrowCount", "ScriptCalls", "CycleMinor", "CycleOld",
+    "Tier1Compiled", "Tier2Compiled", "Tier2Exit", "Tier2Invalidated", "ThrowCount", "MergedSites", "ScriptCalls", "CycleMinor", "CycleOld",
     "CycleFull", "FreeDeferred",
 };
 static_assert(sizeof(kCensusNames) / sizeof(kCensusNames[0]) == std::size_t(Census::Count), "a name per counter");

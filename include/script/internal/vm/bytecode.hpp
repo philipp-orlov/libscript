@@ -105,6 +105,7 @@ struct InlineSite
     std::uint32_t start;
     std::uint32_t end;
     std::uint32_t site;
+    CodeBlock* callee = nullptr;  ///< the function run in place, when it is not the block's own (holds a count)
 };
 
 struct Handler
@@ -293,6 +294,9 @@ struct CodeBlock
     CodeBlock* inlinedFrom = nullptr;
     CodeBlock* selfInlined = nullptr;  ///< the block `selfInline` made from this one, while it lives
     bool selfInlineTried = false;
+    /// The block `mergeInline` made this one from, taking the place of it in the function that was running it (holds a count).
+    CodeBlock* mergedFrom = nullptr;
+    bool mergeTried = false;
     Vec<InlineSite> inlineSites;
 
     CodeBlock() = default;

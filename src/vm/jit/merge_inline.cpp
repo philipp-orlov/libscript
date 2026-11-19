@@ -1,0 +1,410 @@
+// Copyright (c) 2026 Philipp Orlov
+// SPDX-License-Identifier: Apache-2.0
+
+// Calls of other functions run in place. A function that has turned hot gets a copy of its block in which a `Call` whose
+// callee the baseline code saw (the uid in `callProf`) is followed by that callee's own instructions, behind a guard
+// (`JNotCode`) that the register holds a function of that code; when it does not, the call is made as before. The callee's
+// registers sit where its frame would have put them (`this` right after the callee's register, then the arguments), its
+// constants and names are added to the copy's, and what the baseline code learned about each of its instructions comes
+// along, so the optimizing compiler sees one body with the profile of both. The interpreter and both compilers see an
+// ordinary block.
+
+#include "opt_analysis.hpp"
+#include "script/internal/vm/bytecode.hpp"
+#include "script/internal/vm/census.hpp"
+#include "script/internal/vm/jit.hpp"
+#include "script/internal/vm/object.hpp"
+#include "script/internal/vm/vm.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <vector>
+
+namespace script {
+namespace internal {
+namespace vm {
+
+namespace {
+
+constexpr std::uint32_t kMergeMaxCallee = 80;
+constexpr std::uint32_t kMergeMaxAdded = 600;
+constexpr unsigned kMergeMaxSites = 8;
+constexpr std::size_t kMergeMaxTotal = 1500;
+constexpr std::uint32_t kMergeMaxLooping = 200;
+
+/// The instructions a callee run in place may hold: none looks at the frame beyond its registers (the upvalues, the
+/// closures and the home object are the callee's own, which the copy has no way to name).
+bool mergeOp(Op op)
+{
+    switch (op) {
+    case Op::Nop: case Op::Cache: case Op::Mov: case Op::LoadK: case Op::LoadInt: case Op::LoadUndef: case Op::LoadNull:
+    case Op::LoadTrue: case Op::LoadFalse: case Op::LoadHole: case Op::LoadUninit: case Op::CheckInit: case Op::GetGlobal:
+    case Op::GetGlobalOrUndef: case Op::PutGlobal:
+    case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod: case Op::Exp: case Op::BitAnd: case Op::BitOr:
+    case Op::BitXor: case Op::Shl: case Op::Shr: case Op::UShr: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+    case Op::Eq: case Op::Ne: case Op::StrictEq: case Op::StrictNe: case Op::In: case Op::InstanceOf:
+    case Op::AddI: case Op::SubI: case Op::MulI: case Op::ModI: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
+    case Op::ShlI: case Op::ShrI: case Op::UShrI: case Op::Neg: case Op::ToNumber: case Op::ToNumeric: case Op::ToString:
+    case Op::Not: case Op::BitNot: case Op::TypeOf: case Op::Inc: case Op::Dec:
+    case Op::Jmp: case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined:
+    case Op::JNotUndefined: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe:
+    case Op::JNotGt: case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe: case Op::JLtI: case Op::JLeI: case Op::JGtI:
+    case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI:
+    case Op::JStrictEqI:
+    case Op::GetProp: case Op::PutProp: case Op::GetElem: case Op::PutElem: case Op::NewObject: case Op::NewArray:
+    case Op::ArrayPush: case Op::InitProp: case Op::InitElem: case Op::Call: case Op::New: case Op::Ret: case Op::Throw:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Whether the function `C` may be run in place of a call with `argc` arguments.
+bool mergeable(const CodeBlock* C, unsigned argc)
+{
+    const std::uint32_t n = std::uint32_t(C->code.size());
+    if (!n || n > kMergeMaxCallee || !C->handlers.empty() || !C->evalScopes.empty() || C->lines.size() != n ||
+        C->prof.empty() || argc > C->nparams || C->uid > 0x7fffffffu || C->inlinedFrom || C->mergedFrom)
+        return false;
+    if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+                    CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
+                    CodeBlock::kPrivate))
+        return false;
+    for (std::uint32_t j = 0; j < n; j = opt::nextOf(*C, j)) {
+        if (!mergeOp(C->code[j].opcode()))
+            return false;
+        if (!opt::effectsOf(*C, j).ok)
+            return false;
+        const std::int64_t t = opt::jumpTarget(*C, j);
+        // A loop is no small method: its own optimized code runs it better than a copy in each caller.
+        if (t > std::int64_t(n) || (t >= 0 && t <= std::int64_t(j)))
+            return false;
+    }
+    return C->code[n - 1].opcode() == Op::Ret || C->code[n - 1].opcode() == Op::Throw;
+}
+
+}  // namespace
+
+CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
+{
+    if (c->mergeTried)
+        return nullptr;
+    c->mergeTried = true;
+    const std::uint32_t n = std::uint32_t(c->code.size());
+    if (!n || c->callProf.size() != n || c->prof.empty() || c->lines.size() != n || !c->evalScopes.empty() ||
+        c->inlinedFrom || c->mergedFrom || !c->inlineSites.empty())
+        return nullptr;
+    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+                    CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
+                    CodeBlock::kPrivate))
+        return nullptr;
+
+    // The calls to take in: their callee, and what it adds.
+    struct Site
+    {
+        std::uint32_t at;
+        CodeBlock* callee;
+    };
+    std::vector<Site> sites;
+    std::uint32_t added = 0;
+    for (std::uint32_t j = 0; j < n; j = opt::nextOf(*c, j)) {
+        const Ins& in = c->code[j];
+        if (in.opcode() != Op::Call || !c->callProf[j] || in.a > in.b)
+            continue;
+        CodeBlock* C = vm.codeByUid(c->callProf[j]);
+        if (!C || C == c || !mergeable(C, in.c))
+            continue;
+        const std::uint32_t cost = std::uint32_t(C->code.size()) + C->nregs + 4;
+        if (sites.size() >= kMergeMaxSites || added + cost > kMergeMaxAdded)
+            break;
+        added += cost;
+        sites.push_back(Site{j, C});
+    }
+    if (sites.empty())
+        return nullptr;
+    if (loop != ~0u) {
+        // A large function that loops is copied and compiled again for little: only small ones.
+        if (n > kMergeMaxLooping)
+            return nullptr;
+        // The loop runs from its header to its last back edge.
+        std::int64_t end = -1;
+        for (std::uint32_t j = 0; j < n; j = opt::nextOf(*c, j))
+            if (opt::jumpTarget(*c, j) == std::int64_t(loop))
+                end = std::max<std::int64_t>(end, j);
+        bool inLoop = false;
+        for (const Site& s : sites)
+            inLoop = inLoop || (s.at >= loop && std::int64_t(s.at) <= end);
+        if (!inLoop)
+            return nullptr;
+    }
+
+    CodeBlock* d = vm.newCodeBlock(c->name, c->length, c->constructor);
+    d->flags = c->flags;
+    d->nparams = c->nparams;
+    d->nregs = c->nregs;
+    d->thisSlots = c->thisSlots;
+    d->file = c->file;
+    d->source = c->source;
+    d->srcStart = c->srcStart;
+    d->srcEnd = c->srcEnd;
+    d->upvals = c->upvals;
+    d->evalHome = c->evalHome;
+    for (JSValue v : c->consts) {
+        retain(v);
+        d->consts.push_back(v);
+    }
+    for (Key k : c->atoms) {
+        detail::incRef(k);
+        d->atoms.push_back(k);
+    }
+    for (CodeBlock* child : c->children) {
+        ++child->refs;
+        d->children.push_back(child);
+    }
+
+    const bool hasElemProf = c->elemProf.size() == n, hasElemKinds = c->elemKinds.size() == n,
+               hasGlobalRecs = c->globalRecs.size() == n, hasElemSite = c->elemSite.size() == n;
+    // The side tables are kept one entry to an instruction as the code grows.
+    auto putSide = [&](const CodeBlock& from, std::uint32_t at) {
+        d->prof.push_back(at < from.prof.size() ? from.prof[at] : std::uint8_t(0));
+        d->callProf.push_back(at < from.callProf.size() ? from.callProf[at] : 0);
+        if (hasElemProf)
+            d->elemProf.push_back(at < from.elemProf.size() ? from.elemProf[at] : std::uint8_t(0));
+        if (hasElemKinds)
+            d->elemKinds.push_back(at < from.elemKinds.size() ? from.elemKinds[at] : std::uint8_t(0));
+        if (hasGlobalRecs)
+            d->globalRecs.push_back(at < from.globalRecs.size() ? from.globalRecs[at] : CodeBlock::GlobalRec{});
+        std::uint32_t site = 0;
+        if (at < from.elemSite.size() && from.elemSite[at]) {
+            const std::uint32_t first = from.elemSite[at] - 1;
+            site = std::uint32_t(d->elemCaches.size()) + 1;
+            for (std::uint32_t w = 0; w < ElemCache::kWays; ++w) {
+                ElemCache e = from.elemCaches[first + w];
+                if (e.validity)
+                    ++e.validity->refs;
+                if (e.key)
+                    detail::incRef(e.key);
+                d->elemCaches.push_back(e);
+            }
+        }
+        if (hasElemSite)
+            d->elemSite.push_back(site);
+    };
+    auto putCache = [&](const CodeBlock& from, std::uint16_t id) -> std::uint16_t {
+        if (id == kNoCache || id >= from.caches.size())
+            return kNoCache;
+        InlineCache ic = from.caches[id];
+        if (ic.validity)
+            ++ic.validity->refs;
+        if (ic.pad && ic.pad <= from.poly.size()) {
+            PolyCache pc = from.poly[ic.pad - 1];
+            for (std::uint8_t k = 0; k < pc.n; ++k)
+                if (pc.e[k].validity)
+                    ++pc.e[k].validity->refs;
+            d->poly.push_back(pc);
+            ic.pad = std::uint16_t(d->poly.size());
+        } else {
+            ic.pad = 0;
+        }
+        d->caches.push_back(ic);
+        return std::uint16_t(d->caches.size() - 1);
+    };
+    auto put = [&](Ins in, std::uint32_t line, const CodeBlock& from, std::uint32_t at) {
+        d->code.push_back(in);
+        d->lines.push_back(line);
+        putSide(from, at);
+        return std::uint32_t(d->code.size() - 1);
+    };
+    auto jumpTo = [&](std::uint32_t from, std::uint32_t to) {
+        Ins& in = d->code[from];
+        const char* kinds = opKinds(in.opcode());
+        if (kinds[1] != '-' && kinds[1] != 'J' && kinds[2] == 'J')  // two operands: 16 bits in c
+            in.c = std::uint16_t(std::int16_t(std::int32_t(to) - std::int32_t(from) - 1));
+        else
+            in.setJump(std::int32_t(to) - std::int32_t(from) - 1);
+    };
+    bool tooFar = false;
+    auto fits16 = [&](std::uint32_t from, std::uint32_t to) {
+        const std::int64_t delta = std::int64_t(to) - std::int64_t(from) - 1;
+        return delta >= -32768 && delta <= 32767;
+    };
+    std::map<std::pair<const CodeBlock*, std::uint32_t>, std::uint32_t> constOf;
+    auto constFor = [&](const CodeBlock& from, std::uint32_t k) {
+        auto it = constOf.find({&from, k});
+        if (it != constOf.end())
+            return it->second;
+        retain(from.consts[k]);
+        d->consts.push_back(from.consts[k]);
+        return constOf[{&from, k}] = std::uint32_t(d->consts.size() - 1);
+    };
+    std::map<std::pair<const CodeBlock*, std::uint32_t>, std::uint32_t> atomOf;
+    auto atomFor = [&](const CodeBlock& from, std::uint32_t k) {
+        auto it = atomOf.find({&from, k});
+        if (it != atomOf.end())
+            return it->second;
+        detail::incRef(from.atoms[k]);
+        d->atoms.push_back(from.atoms[k]);
+        return atomOf[{&from, k}] = std::uint32_t(d->atoms.size() - 1);
+    };
+
+    // The caller's instruction `k` (and its cache word) as it was, its registers, names and constants its own.
+    std::vector<std::uint32_t> moved(n + 1, 0);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ownJumps;  // (new index, old target)
+    for (std::uint32_t k = 0; k < n;) {
+        moved[k] = std::uint32_t(d->code.size());
+        const Ins in = c->code[k];
+        const std::uint32_t len = opt::nextOf(*c, k) - k;
+        auto site = std::find_if(sites.begin(), sites.end(), [&](const Site& s) { return s.at == k; });
+        if (site != sites.end()) {
+            CodeBlock* C = site->callee;
+            const unsigned inner = in.b + 1u, argc = in.c;
+            const std::uint32_t line = c->lines[k];
+            std::vector<bool> reached;
+            const std::vector<bool> needInit = readBeforeWritten(*C, reached);
+            const std::uint32_t guard = put(Ins::make(Op::JNotCode, in.b, std::uint16_t(0), 0), line, *c, k);
+            {
+                JSValue uid = JSValue::int32(std::int32_t(C->uid));
+                d->consts.push_back(uid);
+                d->code[guard].b = std::uint16_t(d->consts.size() - 1);
+                if (d->consts.size() > 0xFFFF)
+                    tooFar = true;
+            }
+            for (unsigned p = argc; p < C->nparams; ++p)
+                put(Ins::make(Op::LoadUndef, std::uint16_t(inner + 1 + p)), line, *c, k);
+            for (unsigned r = 1u + C->nparams; r < C->nregs; ++r)
+                if (needInit[r])
+                    put(Ins::make(Op::LoadUndef, std::uint16_t(inner + r)), line, *c, k);
+            const std::uint32_t body = std::uint32_t(d->code.size());
+            const std::uint32_t cn = std::uint32_t(C->code.size());
+            std::vector<std::uint32_t> cmoved(cn + 1, 0);
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> calleeJumps;
+            std::vector<std::uint32_t> outs;
+            for (std::uint32_t m = 0; m < cn; ++m) {
+                cmoved[m] = std::uint32_t(d->code.size());
+                Ins ci = C->code[m];
+                const Op op = ci.opcode();
+                const bool live = op == Op::Cache ? m > 0 && reached[m - 1] : reached[m];
+                if (!live) {
+                    put(Ins::make(Op::Nop), C->lines[m], *C, m);
+                    continue;
+                }
+                if (op == Op::Ret) {
+                    // The value to the call's destination, the registers let go as the frame of a call would have on its
+                    // way out, then on after the call.
+                    put(Ins::make(Op::Mov, in.a, std::uint16_t(ci.a + inner)), C->lines[m], *C, m);
+                    for (unsigned r = 0; r < C->nregs; ++r)
+                        put(Ins::make(Op::LoadUndef, std::uint16_t(inner + r)), C->lines[m], *C, m);
+                    outs.push_back(put(Ins::make(Op::Jmp), C->lines[m], *C, m));
+                    continue;
+                }
+                if (op == Op::Cache) {
+                    ci.a = putCache(*C, ci.a);
+                } else {
+                    const char* kinds = opKinds(op);
+                    std::uint16_t* fields[3] = {&ci.a, &ci.b, &ci.c};
+                    for (int f = 0; f < 3; ++f) {
+                        if (kinds[f] == 'R') {
+                            *fields[f] = std::uint16_t(*fields[f] + inner);
+                        } else if (kinds[f] == 'A') {
+                            *fields[f] = std::uint16_t(atomFor(*C, *fields[f]));
+                        } else if (kinds[f] == 'K') {
+                            if (op == Op::LoadK) {
+                                const std::uint32_t idx = constFor(*C, ci.kIndex());
+                                ci.b = std::uint16_t(idx & 0xFFFF);
+                                ci.c = std::uint16_t(idx >> 16);
+                            } else {
+                                *fields[f] = std::uint16_t(constFor(*C, *fields[f]));
+                            }
+                        }
+                    }
+                    if (d->atoms.size() > 0xFFFF || d->consts.size() > 0xFFFFFFu)
+                        tooFar = true;
+                }
+                const std::uint32_t at = put(ci, C->lines[m], *C, m);
+                const std::int64_t t = op == Op::Cache ? -1 : opt::jumpTarget(*C, m);
+                if (t >= 0)
+                    calleeJumps.emplace_back(at, std::uint32_t(t));
+            }
+            cmoved[cn] = std::uint32_t(d->code.size());
+            for (const auto& [at, t] : calleeJumps) {
+                const char* kinds = opKinds(d->code[at].opcode());
+                if (kinds[1] != '-' && kinds[1] != 'J' && kinds[2] == 'J' && !fits16(at, cmoved[t]))
+                    tooFar = true;
+                else
+                    jumpTo(at, cmoved[t]);
+            }
+            d->inlineSites.push_back(InlineSite{body, std::uint32_t(d->code.size()), guard, C});
+            ++C->refs;
+            // The guard's miss goes to the call the long way, which falls through to what follows.
+            if (!fits16(guard, std::uint32_t(d->code.size())))
+                tooFar = true;
+            else
+                jumpTo(guard, std::uint32_t(d->code.size()));
+            // The call and its cache word, as they were.
+            for (std::uint32_t m = 0; m < len; ++m) {
+                Ins x = c->code[k + m];
+                if (x.opcode() == Op::Cache)
+                    x.a = putCache(*c, x.a);
+                put(x, c->lines[k + m], *c, k + m);
+            }
+            for (std::uint32_t at : outs)
+                jumpTo(at, std::uint32_t(d->code.size()));
+            d->nregs = std::max<std::uint32_t>(d->nregs, inner + C->nregs);
+            if (inner + C->nregs > 0xFFF0)
+                tooFar = true;
+            SCRIPT_VM_CENSUS(MergedSites);
+            k += len;
+            continue;
+        }
+        for (std::uint32_t m = 0; m < len; ++m) {
+            Ins x = c->code[k + m];
+            if (x.opcode() == Op::Cache)
+                x.a = putCache(*c, x.a);
+            const std::uint32_t at = put(x, c->lines[k + m], *c, k + m);
+            const std::int64_t t = x.opcode() == Op::Cache ? -1 : opt::jumpTarget(*c, k + m);
+            if (t >= 0)
+                ownJumps.emplace_back(at, std::uint32_t(t));
+        }
+        k += len;
+    }
+    moved[n] = std::uint32_t(d->code.size());
+    for (const auto& [at, t] : ownJumps) {
+        const char* kinds = opKinds(d->code[at].opcode());
+        if (kinds[1] != '-' && kinds[1] != 'J' && kinds[2] == 'J' && !fits16(at, moved[t]))
+            tooFar = true;
+        else
+            jumpTo(at, moved[t]);
+    }
+    for (const Handler& h : c->handlers) {
+        Handler g = h;
+        g.start = moved[h.start];
+        g.end = moved[h.end];
+        g.target = moved[h.target];
+        d->handlers.push_back(g);
+    }
+    // The parameters' feedback, past the instructions'.
+    for (std::uint32_t p = 0; p < c->nparams + 2u; ++p)
+        d->prof.push_back(n + p < c->prof.size() ? c->prof[n + p] : std::uint8_t(0));
+    if (tooFar || d->code.size() > kMergeMaxTotal) {
+        vm.releaseCode(d);
+        return nullptr;
+    }
+    d->mergedFrom = c;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2INL")) {
+        auto nm = [](const CodeBlock* b) { return b->name ? toUtf8(static_cast<StringCell*>(b->name)->text()) : std::string("anon"); };
+        std::fprintf(stderr, "merge %s line %u: %zu -> %zu instructions, sites:", nm(c).c_str(),
+                     c->lines.empty() ? 0u : unsigned(c->lines[0]), c->code.size(), d->code.size());
+        for (const Site& s : sites)
+            std::fprintf(stderr, " %s@%u", nm(s.callee).c_str(), s.at);
+        std::fprintf(stderr, "\n");
+    }
+#endif
+    return d;
+}
+
+}  // namespace vm
+}  // namespace internal
+}  // namespace script

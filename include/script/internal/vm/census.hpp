@@ -30,6 +30,7 @@ enum class Census : std::uint8_t
     Tier2Exit,
     Tier2Invalidated,
     ThrowCount,
+    MergedSites,  ///< calls put in place by `mergeInline`
     ScriptCalls,  ///< calls of script functions made by the interpreter (run with SCRIPT_VM_TIER1=0 to count them all)
     CycleMinor,
     CycleOld,

@@ -390,6 +390,43 @@ void perfMapNote(const void* rx, std::size_t bytes, const CodeBlock* code, const
 }
 #endif
 
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+int tier2Compiles = 0;
+#endif
+
+/// Compile `code`'s optimized code and make it the function's entry; false when it could not be made.
+bool installTier2(VM* vm, CodeBlock* code)
+{
+    Tier2Code* t = compileOptimizedCode(*vm, code);
+    if (!t)
+        return false;
+    t->older = code->tier2;
+    code->tier2 = t;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    ++tier2Compiles;
+    if (std::getenv("T2MAX") && std::getenv("T2DBG"))
+        std::fprintf(stderr, "tier2 compiled #%d\n", tier2Compiles);
+    if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
+        static int serial2 = 0;
+        const std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");
+        char at[32]; std::snprintf(at, sizeof at, "%p", static_cast<void*>(t->rx)); const std::string path = std::string(dir) + "/t2-" + std::to_string(++serial2) + "-" + nm + "@" + at + ".bin";
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(t->rx, 1, t->bytes, f);
+            std::fclose(f);
+        }
+    }
+#endif
+    code->tier1->entry = t->entry;
+    code->optExits = 0;
+    // Optimized code may have been made before parts of the function had run: it makes way after those have run
+    // a while, a few times, each given longer.
+    code->tier2Budget = code->tier2Matured < 4 ? 20000 << (2 * code->tier2Matured) : 0x7fffffff;
+    if (code->tier2Matured < 4)
+        ++code->tier2Matured;
+    SCRIPT_VM_CENSUS(Tier2Compiled);
+    return true;
+}
+
 /// The baseline code's counter ran out at the function's entry (`header` is ~0u) or a loop's back edge: compile the
 /// optimizing tier if it is not there, and return the way into it from the loop, if there is one.
 extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
@@ -409,8 +446,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
         }
         const bool active = code->tier2 && code->tier1->entry == code->tier2->entry;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
-        static int compiles = 0;
-        if (!active && std::getenv("T2MAX") && compiles >= std::atoi(std::getenv("T2MAX"))) {
+        if (!active && std::getenv("T2MAX") && tier2Compiles >= std::atoi(std::getenv("T2MAX"))) {
             code->tier2Counter = 0x40000000;
             return nullptr;
         }
@@ -422,39 +458,31 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             }
         }
 #endif
-        if (!active) {
-            Tier2Code* t = compileOptimizedCode(*vm, code);
-            if (!t) {
-                // No room now, or a branch out of reach, or something it does not model: not for good, but each time later.
-                if (code->tier2Tries < 255)
-                    ++code->tier2Tries;
-                code->tier2Counter = tier2Backoff(*vm, code);
-                return nullptr;
-            }
-            t->older = code->tier2;
-            code->tier2 = t;
-#if defined(SCRIPT_JIT_ENV_OVERRIDE)
-            ++compiles;
-            if (std::getenv("T2MAX") && std::getenv("T2DBG"))
-                std::fprintf(stderr, "tier2 compiled #%d\n", compiles);
-            if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
-                static int serial2 = 0;
-                const std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");
-                char at[32]; std::snprintf(at, sizeof at, "%p", static_cast<void*>(t->rx)); const std::string path = std::string(dir) + "/t2-" + std::to_string(++serial2) + "-" + nm + "@" + at + ".bin";
-                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
-                    std::fwrite(t->rx, 1, t->bytes, f);
-                    std::fclose(f);
+        // A function turning hot for the first time takes in the code of the functions its calls reached; its function runs
+        // the new block from its next call on. Entered hot, this call finishes in the baseline code it is in; a loop that
+        // turned hot is compiled below for this call as usual.
+        if (!active && vm->mergeInlining && !code->mergeTried && !code->tier2 && !fr->construct && fr->fn &&
+            fr->fn->code == code) {
+            if (CodeBlock* d = mergeInline(*vm, code, header)) {
+                compileTier1(*vm, d);
+                if (d->tier1) {
+                    fr->fn->code = d;  // the function's count of `code` is now `d`'s
+                    if (header == 0xFFFFFFFFu) {
+                        code->tier2Counter = vm->tier2Threshold > 0 ? vm->tier2Threshold : 0x40000000;
+                        return nullptr;
+                    }
+                } else {
+                    d->mergedFrom = nullptr;
+                    vm->releaseCode(d);
                 }
             }
-#endif
-            code->tier1->entry = t->entry;
-            code->optExits = 0;
-            // Optimized code may have been made before parts of the function had run: it makes way after those have run
-            // a while, a few times, each given longer.
-            code->tier2Budget = code->tier2Matured < 4 ? 20000 << (2 * code->tier2Matured) : 0x7fffffff;
-            if (code->tier2Matured < 4)
-                ++code->tier2Matured;
-            SCRIPT_VM_CENSUS(Tier2Compiled);
+        }
+        if (!active && !installTier2(vm, code)) {
+            // No room now, or a branch out of reach, or something it does not model: not for good, but each time later.
+            if (code->tier2Tries < 255)
+                ++code->tier2Tries;
+            code->tier2Counter = tier2Backoff(*vm, code);
+            return nullptr;
         }
         code->tier2Counter = 0x40000000;
         // Optimized code is made for calls: a frame `new` made stays in the baseline code.
@@ -2726,7 +2754,7 @@ void Baseline::emit(std::uint32_t i)
         compare(i, in);
         return;
     case Op::Jmp: case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined:
-    case Op::JNotUndefined: case Op::JHole: case Op::JNotCallee:
+    case Op::JNotUndefined: case Op::JHole: case Op::JNotCallee: case Op::JNotCode:
     case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe: case Op::JNotGt:
     case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe:
     case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI:
@@ -3641,6 +3669,32 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
         }
         const bool wantEqual = op == Op::JNullish || op == Op::JUndefined || op == Op::JHole;
         goIf(wantEqual ? CE : CNE, i, target);
+        return;
+    }
+    case Op::JNotCode: {
+        // The register holds a function of the code whose uid the constant names, and a `this` it can take as it is.
+        const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
+        const std::uint64_t uid = std::uint64_t(code_->consts[in.b].asInt32());
+        Label no, yes;
+        a_.mov(RAX, R(in.a));
+        needObject(RAX, no);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, no);
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.test(RCX, RCX);
+        a_.jcc(CE, no);
+        a_.movImm(RDX, uid);
+        a_.cmp(RDX, mem(RCX, kCbUid));
+        a_.jcc(CNE, no);
+        if (CodeBlock* callee = vm_.codeByUid(uid);
+            !callee || !(callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) {
+            a_.mov(RAX, R(in.a + 1));
+            needObject(RAX, no);
+        }
+        a_.jmp(yes);
+        a_.bind(no);
+        go(i, target);
+        a_.bind(yes);
         return;
     }
     case Op::JNotCallee: {
@@ -5162,13 +5216,17 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
 #endif
     // A loop whose shapes were taken as known turned out to call out: again, without that for it.
     std::set<std::uint32_t> noHoist;
-    for (int attempt = 0; attempt < 4; ++attempt) {
+    // Each round names at least one more loop, so there are at most as many rounds as loops.
+    for (std::size_t attempt = 0; attempt <= plan.loopHeaders.size(); ++attempt) {
         Baseline compiler(vm, code);
         compiler.noHoist_ = noHoist;
         Tier2Code* t = compiler.optimize(plan, code->tier1);
         if (compiler.hoistBroken_.empty())
             return t;
+        const std::size_t before = noHoist.size();
         noHoist.insert(compiler.hoistBroken_.begin(), compiler.hoistBroken_.end());
+        if (noHoist.size() == before)
+            break;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (std::getenv("T2HOIST"))
             std::fprintf(stderr, "hoist: a loop calls out; compiled again\n");

@@ -982,7 +982,28 @@ bool Baseline::emitTyped(std::uint32_t i)
             return true;
         }
     }
-    case Op::GetElem: case Op::PutElem: {
+    case Op::GetElem:
+        if ((code_->flags & CodeBlock::kPrivate) && i < code_->privCaches.size() && code_->privCaches[i].key &&
+            code_->privCaches[i].shape && uw.size() >= 2 && uw[0] < 0 && uw[1] < 0 &&
+            !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))) {
+            // `o.#x` where the site has found it: the name and the shape checked, the slot read straight into the
+            // result's variable. Anything else leaves the code before the read.
+            const PrivateCache& pc = code_->privCaches[i];
+            const JSValue key = JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(pc.key)));
+            holdValue(key);
+            Label& bad = exitBefore(i);
+            a_.movImm(RCX, key.bits);
+            a_.cmp(RCX, R(in.c));
+            a_.jcc(CNE, bad);
+            a_.mov(RAX, provenSlotMem(in.b, pc.shape, pc.index, 0, bad));
+            if (dw >= 0)
+                unboxRax(dw, bad);
+            else
+                writeCounting(in.a);
+            return true;
+        }
+        [[fallthrough]];
+    case Op::PutElem: {
         // An element of the one kind of indexed object the site has seen, at an int32 index: no boxing of the index, one
         // class test, the kind's own load or store.
         const bool put = op == Op::PutElem;

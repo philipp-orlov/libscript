@@ -2792,11 +2792,13 @@ private:
         struct Store
         {
             std::uint32_t index;
-            int arg;    ///< the argument (0-based), or -1: `c`
+            int arg;    ///< the argument (0-based), or -1: `c`, or -2: what `own` holds when it is stored
             JSValue c;
+            JSValue* own = nullptr;  ///< a data property of the constructor itself (a static field)
         };
         std::vector<Store> stores;
         std::vector<ValidityCell*> cells;
+        std::vector<const Box*> selfBoxes;  ///< upvalues that must hold the constructor
     };
     bool ssaNewPlan(std::uint32_t i, SsaNew* out);
     bool ssaNew(std::uint32_t i, const ssa::Bits& liveAfter);

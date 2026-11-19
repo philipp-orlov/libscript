@@ -1556,7 +1556,10 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
     CodeBlock* C = f->code;
     if (!C || !C->constructor ||
         (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                     CodeBlock::kNeedsArgs | CodeBlock::kDerived | CodeBlock::kClassConstructor)))
+                     CodeBlock::kNeedsArgs | CodeBlock::kDerived)))
+        return false;
+    // A base class's constructor: one with no field initialiser (fixed when the class is made) only.
+    if ((C->flags & CodeBlock::kClassConstructor) && f->rare() && isFunction(f->rare()->fieldInit))
         return false;
     const JSValue pv = *f->slotAt(2);
     if (!isObject(pv))
@@ -1570,16 +1573,63 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
     p.shape = root->id;
     if (!canAllocObject(p.aux))
         return false;
-    std::vector<std::int8_t> isConst(C->nregs, 0);
+    std::vector<std::int8_t> isConst(C->nregs, 0), isSelf(C->nregs, 0);
     std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
-    for (std::uint32_t j = 0; j < C->code.size(); j = opt::nextOf(*C, j)) {
+    std::vector<JSValue*> ownOf(C->nregs, nullptr);
+    auto plainReg = [&](unsigned r) {
+        isConst[r] = 0;
+        isSelf[r] = 0;
+        ownOf[r] = nullptr;
+    };
+    std::int64_t jumpTo = -1;
+    for (std::uint32_t j = 0; j < C->code.size();
+         j = jumpTo >= 0 ? std::uint32_t(std::exchange(jumpTo, -1)) : opt::nextOf(*C, j)) {
         const Ins& ci = C->code[j];
         switch (ci.opcode()) {
         case Op::Nop:
             break;
+        case Op::FieldInit:  // no initialiser: undefined
+            if (!(C->flags & CodeBlock::kClassConstructor) || ci.a <= C->nparams)
+                return false;
+            plainReg(ci.a);
+            isConst[ci.a] = 1;
+            constVal[ci.a] = JSValue::undefined();
+            break;
+        case Op::JUndefined: {
+            const std::int64_t t = opt::jumpTarget(*C, j);
+            if (ci.a >= C->nregs || !isConst[ci.a] || !constVal[ci.a].isUndefined() || t <= std::int64_t(j))
+                return false;
+            jumpTo = t;
+            break;
+        }
+        case Op::GetUpval: {
+            // The class itself (its own name in its methods): the box is checked to hold it when the code runs.
+            if (ci.a <= C->nparams || ci.b >= f->nUpvals)
+                return false;
+            const Box* box = reinterpret_cast<Box*>(f->upvals()[ci.b]);
+            if (box->value.bits != known.bits)
+                return false;
+            plainReg(ci.a);
+            isSelf[ci.a] = 1;
+            p.selfBoxes.push_back(box);
+            break;
+        }
+        case Op::GetProp: {
+            // A data property of the constructor itself, read when it is stored (its shape is checked).
+            if (ci.a <= C->nparams || ci.b >= C->nregs || !isSelf[ci.b])
+                return false;
+            std::uint8_t attrs = 0;
+            JSValue* slot = f->findOwn(vm_, C->atoms[ci.c], &attrs);
+            if (!slot || (attrs & attr::kAccessor))
+                return false;
+            plainReg(ci.a);
+            ownOf[ci.a] = slot;
+            break;
+        }
         case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt:
             if (ci.a <= C->nparams)
                 return false;
+            plainReg(ci.a);
             isConst[ci.a] = 1;
             constVal[ci.a] = ci.opcode() == Op::LoadUndef ? JSValue::undefined() : ci.opcode() == Op::LoadNull ? JSValue::null()
                            : ci.opcode() == Op::LoadInt ? JSValue::int32(ci.imm()) : JSValue::boolean(ci.opcode() == Op::LoadTrue);
@@ -1598,7 +1648,9 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
                     return false;
                 p.cells.push_back(ic.validity);
             }
-            if (isConst[ci.c])
+            if (ownOf[ci.c])
+                p.stores.push_back(SsaNew::Store{ic.index, -2, JSValue::undefined(), ownOf[ci.c]});
+            else if (isConst[ci.c])
                 p.stores.push_back(SsaNew::Store{ic.index, -1, constVal[ci.c]});
             else if (ci.c <= C->nparams)
                 p.stores.push_back(ci.c - 1u < in.c ? SsaNew::Store{ic.index, int(ci.c) - 1, JSValue::undefined()}
@@ -1651,6 +1703,12 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
         }
+        for (const Box* box : p.selfBoxes) {
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(box));
+            a_.movImm(RCX, p.fn.bits);
+            a_.cmp(RCX, mem(RDX, kBoxValue));
+            a_.jcc(CNE, bad);
+        }
     }
     // The result's register lets go of what it held, and the runtime may collect: every live value, and every argument
     // stored, gets an owner first.
@@ -1675,6 +1733,22 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
     a_.bind(allocated);
     for (const SsaNew::Store& st : p.stores) {
         const Mem slot = mem(RAX, kObjInline + std::int32_t(8 * st.index));
+        if (st.own) {
+            // The constructor's own slot: inline in it, or in its slot array (its shape is checked: the place holds).
+            auto* fn = static_cast<JSFunction*>(asObject(p.fn));
+            JSValue* inl = fn->inl();
+            if (st.own >= inl && st.own < inl + fn->h.aux) {
+                a_.movImm(RDX, reinterpret_cast<std::uint64_t>(st.own));
+                a_.mov(RCX, mem(RDX, 0));
+            } else {
+                a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&fn->slots));
+                a_.mov(RDX, mem(RDX, 0));
+                a_.mov(RCX, mem(RDX, std::int32_t(8 * (st.own - fn->slots))));
+            }
+            retain(RCX);
+            a_.mov(slot, RCX);
+            continue;
+        }
         if (st.arg < 0) {
             const std::int64_t bits = std::int64_t(st.c.bits);
             if (bits >= INT32_MIN && bits <= INT32_MAX) {

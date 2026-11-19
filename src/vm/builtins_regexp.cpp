@@ -491,6 +491,29 @@ JSValue* recordedSlot(VM& vm, VM::RegExpSlot& s)
 }
 
 /// A plain RegExp made by this engine, with nothing on it or its prototype that a match could notice.
+/// As `pristine`, for what reads only `exec` (RegExpExec, `test`): that one original checked, not all.
+bool execPristine(VM& vm, JSValue rx)
+{
+    RegExpData* d = dataOf(rx);
+    if (!d)
+        return false;
+    JSObject* o = asObject(rx);
+    if (o->proto(vm) != vm.protos.regexp)
+        return false;
+    Rare* r = o->rare();
+    const Shape* own = vm.shapeById(o->h.shape);
+    if (!r || r->dict || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
+        !o->slotAt(0)->isNumber())
+        return false;
+    for (VM::RegExpSlot& s : vm.regexpSlots) {
+        if (s.key != vm.atoms.exec || s.owner != vm.protos.regexp)
+            continue;
+        JSValue* now = recordedSlot(vm, s);
+        return now && now->bits == s.value.bits;
+    }
+    return false;
+}
+
 bool pristine(VM& vm, JSValue rx)
 {
     RegExpData* d = dataOf(rx);
@@ -543,7 +566,7 @@ bool flagsOf(VM& vm, JSValue rx, String* out)
 /// RegExpExec: `rx.exec(S)`, or the built-in when `rx` has none.
 JSValue regExpExec(VM& vm, JSValue rx, JSValue S)
 {
-    if (pristine(vm, rx))
+    if (execPristine(vm, rx))
         return builtinExec(vm, rx, S);
     Handle fn = Handle::adopt(getProperty(vm, rx, vm.atoms.exec));
     if (fn.get().isException())
@@ -709,7 +732,7 @@ NATIVE(regexpTest)
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
-    if (pristine(vm, self)) {
+    if (execPristine(vm, self)) {
         const int hit = builtinTest(vm, self, text.get());
         return hit < 0 ? JSValue::exception() : JSValue::boolean(hit != 0);
     }
@@ -1143,8 +1166,12 @@ NATIVE(regexpMatch)
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();
-    if (pristine(vm, self) && (dataOf(self)->flags & regex::kGlobal))
-        return globalMatch(vm, self, text.get());
+    if (pristine(vm, self)) {
+        // Its flags and its exec as they were: one look decides.
+        if (dataOf(self)->flags & regex::kGlobal)
+            return globalMatch(vm, self, text.get());
+        return builtinExec(vm, self, text.get());
+    }
     String flags;
     if (!flagsOf(vm, self, &flags))
         return JSValue::exception();

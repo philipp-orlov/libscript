@@ -1130,7 +1130,8 @@ Frame* fr = vm.frameTop - 1;
 /// A loop's back edge: as TICK, and a function that keeps looping moves into compiled code in the middle of the loop.
 #define LOOP_TICK()                                                                      \
     do {                                                                                 \
-        if constexpr (!Step) {                                                           \
+        /* in a single step, the frames of a call it made may move into compiled code; the stepped one not */ \
+        if (!Step || fr != home) {                                                       \
             if (vm.tier1Threshold && !code->tier1Failed && ++code->hotness >= kOsrAfter) [[unlikely]] { \
                 fr->pc = pc;                                                             \
                 if (!code->tier1)                                                        \

@@ -2123,6 +2123,9 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         std::vector<const void*> fkey(F->nregs, nullptr);
         std::vector<std::int8_t> fconst(F->nregs, 0);
         std::vector<JSValue> fval(F->nregs, JSValue::undefined());
+        // A register read from an upvalue holds a private name or a private method's function: a constant either way,
+        // its box checked when the code runs.
+        auto upvalConst = [&](unsigned r) { return fkey[r] ? JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(fkey[r]))) : JSValue::undefined(); };
         for (std::uint32_t j = 0; j < F->code.size(); j = opt::nextOf(*F, j)) {
             const Ins& fi = F->code[j];
             switch (fi.opcode()) {
@@ -2145,13 +2148,34 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                 fval[fi.a] = fi.opcode() == Op::LoadUndef ? JSValue::undefined() : fi.opcode() == Op::LoadNull ? JSValue::null()
                            : fi.opcode() == Op::LoadInt ? JSValue::int32(fi.imm()) : JSValue::boolean(fi.opcode() == Op::LoadTrue);
                 break;
-            case Op::DefPrivate: {
-                if (fi.a != 0 || fi.b >= F->nregs || fi.c >= F->nregs || !fkey[fi.b] || !fconst[fi.c])
+            case Op::DefPrivate: case Op::DefPrivMethod: {
+                if (fi.a != 0 || fi.b >= F->nregs || fi.c >= F->nregs || !fkey[fi.b])
+                    return false;
+                IVal v;
+                if (fconst[fi.c])
+                    v.c = fval[fi.c];
+                else if (fi.opcode() == Op::DefPrivMethod && fkey[fi.c] && isFunction(upvalConst(fi.c)))
+                    v.c = upvalConst(fi.c);
+                else
+                    return false;
+                if (!privateStore(F, j, fkey[fi.b], true, v))
+                    return false;
+                break;
+            }
+            case Op::InitProp: {
+                // A public field: added as the site found it.
+                if (fi.a != 0 || fi.c >= F->nregs || !fconst[fi.c] || j + 1 >= F->code.size())
+                    return false;
+                const std::uint16_t cacheId = F->code[j + 1].a;
+                if (cacheId == kNoCache || cacheId >= F->caches.size())
+                    return false;
+                const InlineCache& ic = F->caches[cacheId];
+                if (ic.shape != shape || ic.next == 0 || ic.index >= aux || ic.holder)
                     return false;
                 IVal v;
                 v.c = fval[fi.c];
-                if (!privateStore(F, j, fkey[fi.b], true, v))
-                    return false;
+                stores.push_back(Store{ic.index, v});
+                shape = ic.next;
                 break;
             }
             case Op::Ret:

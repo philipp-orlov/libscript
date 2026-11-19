@@ -4237,8 +4237,16 @@ int jitDefPrivMethod(VM& vm, std::uint32_t index)
         return 0;
     }
     if (which == Op::DefPrivMethod) {
+        const std::uint32_t before = target->h.shape;
         retain(R[ins->c]);
         target->putOwn(vm, R[ins->b].asCell(), R[ins->c], 0);
+        // The add, for the compiled code, as for a private field (`jitDefPrivate`).
+        if (PrivateCache* pc = privateCacheAt(c.code, index); pc && !target->isProto() && !target->isDictionary(vm) && !proxyOf(target)) {
+            Shape* now = target->shapeOf(vm);
+            Shape* was = vm.shapeById(before);
+            if (was && now->parent == was && now->key == R[ins->b].asCell() && now->attrs == 0 && was->count < target->h.aux)
+                *pc = PrivateCache{R[ins->b].asCell(), before, was->count, target->h.shape};
+        }
     } else {
         initAccessor(vm, target, R[ins->b].asCell(), R[ins->c], which == Op::DefPrivGetter, attr::kConfigurable);
     }

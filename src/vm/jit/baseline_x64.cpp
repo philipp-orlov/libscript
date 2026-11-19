@@ -2548,6 +2548,7 @@ private:
     void emit(std::uint32_t i);
     void emitTails();
     void arith(std::uint32_t i, const Ins& in);
+    bool truncatedUse(std::uint32_t i);
     void arithImm(std::uint32_t i, const Ins& in);
     void compare(std::uint32_t i, const Ins& in);
     void jumps(std::uint32_t i, const Ins& in);
@@ -3048,9 +3049,36 @@ void Baseline::emit(std::uint32_t i)
     }
 }
 
+/// Whether the result of instruction `i` is read only by a bitwise operator right after it, which takes it modulo 2^32:
+/// then an int32 sum or difference that overflows gives that operator what the double would.
+bool Baseline::truncatedUse(std::uint32_t i)
+{
+    if (!optimizing())
+        return false;
+    const unsigned r = code_->code[i].a;
+    const std::uint32_t next = i + length(i);
+    if (next >= n_ || plan_->isLeader[next])
+        return false;
+    const Ins& x = code_->code[next];
+    switch (x.opcode()) {
+    case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr: case Op::UShr:
+        if (x.b != r && x.c != r)
+            return false;
+        break;
+    case Op::BitAndI: case Op::BitOrI: case Op::BitXorI: case Op::ShlI: case Op::ShrI: case Op::UShrI:
+        if (x.b != r)
+            return false;
+        break;
+    default:
+        return false;
+    }
+    return x.a == r || regDeadAfter(next, r);
+}
+
 void Baseline::arith(std::uint32_t i, const Ins& in)
 {
     const Op op = in.opcode();
+    const bool wrap = (op == Op::Add || op == Op::Sub) && truncatedUse(i);
     Label& bad = slow(i, &helperThunk<jitBinary>);
     Label dbl, done;
     const bool numeric = op == Op::Add || op == Op::Sub || op == Op::Mul;
@@ -3064,8 +3092,8 @@ void Baseline::arith(std::uint32_t i, const Ins& in)
         needInts(RAX, RCX, dbl);
     }
     switch (op) {
-    case Op::Add: a_.mov32(RDX, RAX); a_.alu32(0, RDX, RCX); a_.jcc(CO, dbl); a_.mov32(RAX, RDX); break;
-    case Op::Sub: a_.mov32(RDX, RAX); a_.alu32(5, RDX, RCX); a_.jcc(CO, dbl); a_.mov32(RAX, RDX); break;
+    case Op::Add: a_.mov32(RDX, RAX); a_.alu32(0, RDX, RCX); if (!wrap) a_.jcc(CO, dbl); a_.mov32(RAX, RDX); break;
+    case Op::Sub: a_.mov32(RDX, RAX); a_.alu32(5, RDX, RCX); if (!wrap) a_.jcc(CO, dbl); a_.mov32(RAX, RDX); break;
     case Op::Mul:
         a_.mov32(RDX, RAX);
         a_.imul32(RDX, RCX);

@@ -96,6 +96,10 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
     case Op::GetSuperProp:
         rd(in.c); wr(in.a);
         break;
+    case Op::EnvHas: case Op::EnvGet:
+        // A name of a direct eval's scope: a look at an ordinary object's own properties.
+        rd(in.b); wr(in.a);
+        break;
     case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined:
     case Op::JHole: case Op::JNotCallee: case Op::JNotCode: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI:
     case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI: case Op::JStrictEqI: case Op::Ret: case Op::Throw:

@@ -272,6 +272,11 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         // Code made at run time, when the host allows it.
         {"var f = new Function('a', 'b', 'return a * b'); String(f(3, 4))", "12"},
         {"String(eval('1 + 2') + eval('var zz = 5; zz * 2'))", "13"},
+        // Names a direct eval may declare are looked up in its scope first, in optimized code too (EnvHas).
+        {"function outer(code) { eval(code); function inner(n) { var s = 0; for (var i = 0; i < n; i++) s += typeof maybe === "
+         "'undefined' ? i : maybe + i; return s + (typeof Math.max); } var r = []; for (var k = 0; k < 4000; k++) r[0] = inner(20); "
+         "eval('var maybe = 100'); r.push(inner(20)); return r.join(); } outer('var x = 1') + '|' + outer('')",
+         "190function,2190function|190function,2190function"},
     };
     for (const Expect& e : expected) {
         const Outcome got = runOn(script::Context::Options::Core::Vm, e.source, true);

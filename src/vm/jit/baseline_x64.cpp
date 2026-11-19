@@ -35,6 +35,7 @@
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
 #include "opt_analysis.hpp"
+#include "ssa.hpp"
 
 #if defined(__GNUC__)
 // The compilers bake the offsets of fields of cells, which are not standard layout, into the code they emit.
@@ -2587,6 +2588,45 @@ private:
     void getGlobal(std::uint32_t i, const Ins& in);
     void putGlobal(std::uint32_t i, const Ins& in);
     void initProp(std::uint32_t i, const Ins& in);
+
+    // ---- the SSA tier (ssa_emit.inc); `ssa_` is null otherwise ----
+public:
+    Tier2Code* compileSsa(const ssa::Graph& g, Tier1Code* base);
+    const char* ssaWhy_ = "";
+
+private:
+    const ssa::Graph* ssa_ = nullptr;
+    /// Where an SSA value is: a constant (no code makes it), or a stack slot of this code's frame.
+    struct SVal
+    {
+        std::int32_t slot = -1;
+        bool isConst = false;
+        std::uint64_t bits = 0;
+    };
+    std::vector<SVal> sval_;
+    /// While emitting: the value each register holds (`name_`) and what its frame slot holds (`frame_`, kNone: not known).
+    std::vector<std::uint32_t> name_, frame_;
+    struct EdgeState
+    {
+        std::vector<std::uint32_t> frame;
+    };
+    std::vector<std::vector<EdgeState>> edgeIn_;     ///< per block: the frame state of each forward edge into it
+    std::vector<std::vector<std::uint32_t>> headerFrame_;  ///< per loop header: the frame state its code takes as given
+    std::vector<Label> blockLabel_;
+    bool ssaFailed_ = false;
+    Mem slotOf(std::uint32_t v) const { return mem(RSP, 8 + 8 * sval_[v].slot); }
+    bool mayBeCell(std::uint32_t v) const
+    {
+        return !(sval_[v].isConst && !JSValue::raw(sval_[v].bits).isCell());
+    }
+    void loadValue(std::uint32_t v, Reg r);
+    void ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const std::vector<std::uint8_t>& clobber);
+    void ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter);
+    void ssaStepJump(std::uint32_t b, std::uint32_t i);
+    void ssaEdge(std::uint32_t from, std::uint32_t to);
+    void ssaEdgeMoves(std::uint32_t from, std::uint32_t to);
+    void ssaEnterBlock(std::uint32_t b);
+    void emitSsaTails();
 };
 
 void Baseline::emitTails()
@@ -2626,6 +2666,8 @@ void Baseline::emitTails()
     }
     if (optimizing())
         emitOptTails();
+    if (ssa_)
+        emitSsaTails();
     for (ColdUndo& u : coldUndos_) {
         a_.bind(u.entry);
         a_.aluI32(5, u.r, u.step);
@@ -2679,7 +2721,7 @@ void Baseline::emitTails()
     a_.bind(tick_);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitTick));
     a_.jmpC(RAX);
-    if (optimizing()) {
+    if (optimizing() || ssa_) {
         // A cell let go of in optimized code: the variables in caller-saved registers survive the call.
         a_.bind(free_);
         a_.push(R8);
@@ -5300,7 +5342,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
     if (!plain)
         a_.mov(RAX, mem(RSP, 0));
     // The way out in place (as at exit_).
-    a_.aluI(0, RSP, optimizing() ? 8 + spill_ : 8);
+    a_.aluI(0, RSP, 8 + spill_);
     a_.pop(R13);
     a_.pop(RBX);
     a_.ret();
@@ -5308,6 +5350,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
 
 #include "opt_emit.inc"
 #include "opt_inline.inc"
+#include "ssa_emit.inc"
 
 Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
 {
@@ -5325,6 +5368,35 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
             if (*q == ',')
                 ++q;
         }
+    }
+#endif
+#if defined(__aarch64__)
+    // The SSA tier, while it is being built: only with SCRIPT_VM_SSA=1, and only on arm64 (x64 is not tested).
+    static const bool ssaTier = [] {
+        const char* e = std::getenv("SCRIPT_VM_SSA");
+        return e && *e == '1';
+    }();
+    if (ssaTier) {
+        const ssa::Graph g = ssa::build(*code);
+        const char* why = g.why;
+        if (g.ok) {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+            if (std::getenv("SSA_DUMP"))
+                std::fprintf(stderr, "== ssa %s\n%s", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
+                             dump(*code).c_str());
+#endif
+            Baseline compiler(vm, code);
+            if (Tier2Code* t = compiler.compileSsa(g, code->tier1))
+                return t;
+            why = compiler.ssaWhy_;
+        }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("SSA_REFUSED"))
+            std::fprintf(stderr, "ssa refused %s line %u: %s\n",
+                         code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
+                         code->lines.empty() ? 0u : unsigned(code->lines[0]), why);
+#endif
+        (void)why;
     }
 #endif
     opt::Plan plan = opt::analyse(*code);

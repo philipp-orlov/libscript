@@ -2603,7 +2603,26 @@ private:
         std::int32_t slot = -1;
         bool isConst = false;
         std::uint64_t bits = 0;
+        std::uint8_t rep = 0;   ///< kRepTagged, kRepI32 or kRepF64
+        std::int8_t reg = -1;   ///< its register for its whole life (a Reg, or an xmm number for a double), or -1
     };
+    static constexpr std::uint8_t kRepTagged = 0, kRepI32 = 1, kRepF64 = 2;
+    std::int32_t moveRoom_ = 0;  ///< bytes pushed below the slots while a parallel move holds its values there
+    std::vector<std::uint8_t> native_;   ///< per instruction: done in place (nothing is clobbered), as planned
+    std::vector<std::uint8_t> intArith_, dblArith_;  ///< per instruction: planned int32 / double arithmetic
+    bool hasLoc(std::uint32_t v) const { return sval_[v].slot >= 0 || sval_[v].reg >= 0; }
+    void storeTagged(std::uint32_t v, Reg src);
+    void loadI32(std::uint32_t v, Reg dst, Label* bad);
+    void loadF64(std::uint32_t v, int x, Label* bad);
+    void ssaDefI32(std::uint32_t i);
+    void ssaDefF64(std::uint32_t i, int x);
+    bool ssaArithF64(std::uint32_t i);
+    bool ssaNative(std::uint32_t i);
+    bool ssaPutFast(std::uint32_t i) const;
+    bool ssaGlobalFast(std::uint32_t i) const;
+    bool ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter);
+    void ssaSaveRegs();
+    void ssaRestoreRegs();
     std::vector<SVal> sval_;
     /// While emitting: the value each register holds (`name_`) and what its frame slot holds (`frame_`, kNone: not known).
     std::vector<std::uint32_t> name_, frame_;
@@ -2624,7 +2643,7 @@ private:
     std::vector<std::vector<std::uint32_t>> headerFrame_;  ///< per loop header: the frame state its code takes as given
     std::vector<Label> blockLabel_;
     bool ssaFailed_ = false;
-    Mem slotOf(std::uint32_t v) const { return mem(RSP, 8 + 8 * sval_[v].slot); }
+    Mem slotOf(std::uint32_t v) const { return mem(RSP, moveRoom_ + 8 + 8 * sval_[v].slot); }
     bool mayBeCell(std::uint32_t v) const
     {
         return !(vDef_[v] & (kVNotCell | kVInt | kVBool));

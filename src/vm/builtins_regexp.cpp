@@ -134,6 +134,10 @@ bool initializeWith(VM& vm, JSObject* o, StringView pattern, std::shared_ptr<con
 /// ToLength of a value; false with an exception pending.
 bool toLengthOf(VM& vm, JSValue v, double* out)
 {
+    if (v.isInt32()) {
+        *out = v.asInt32() < 0 ? 0 : double(v.asInt32());
+        return true;
+    }
     double d = 0;
     if (!toNumber(vm, v, &d))
         return false;
@@ -152,6 +156,15 @@ bool readLastIndex(VM& vm, JSObject* o, double* out)
 /// `rx.lastIndex = v`, throwing when it cannot be written; false with the exception pending.
 bool writeLastIndex(VM& vm, JSObject* o, double v)
 {
+    // A RegExp's own writable `lastIndex` (as it always starts): stored in place.
+    std::uint8_t attrs = 0;
+    if (o->cls() == ObjClass::RegExp && !proxyOf(o))
+        if (JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex, &attrs); slot && !(attrs & attr::kAccessor) && (attrs & attr::kWritable)) {
+            const JSValue old = *slot;
+            *slot = JSValue::boxNumber(v);
+            release(old);
+            return true;
+        }
     return setProperty(vm, toJSValue(o), vm.atoms.lastIndex, JSValue::boxNumber(v), true);
 }
 

@@ -826,6 +826,12 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                 else if (!ssaPutProp(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
                 break;
+            case Op::TypeOf:
+                if (!native_[i])
+                    ssaGeneric(i, liveAfter[b][k]);
+                else
+                    ssaTypeOf(i);
+                break;
             case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox: case Op::ToNumeric: case Op::Not:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
@@ -1232,26 +1238,12 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             ssaCondEdges(b, eqTaken ? CE : CNE);
             return true;
         }
-        if (failed)
+        if (failed && loose)
             return false;
         Label& bad = ssaExit(i);
-        Label bits;
-        // Two int32s, or two objects: equal when their bits are.
-        a_.mov(RDX, RAX);
-        a_.and_(RDX, RCX);
-        a_.cmp(RDX, R14);
-        a_.jcc(CAE, bits);
-        a_.test(RAX, R15);
-        a_.jcc(CNE, bad);
-        a_.test(RCX, R15);
-        a_.jcc(CNE, bad);
-        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
-        a_.jcc(CNE, bad);
-        a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
-        a_.jcc(CNE, bad);
-        a_.bind(bits);
-        a_.cmp(RAX, RCX);
-        ssaCondEdges(b, eqTaken ? CE : CNE);
+        ssaEqualsCore(i, loose, bad);
+        a_.test32(RAX, RAX);
+        ssaCondEdges(b, eqTaken ? CNE : CE);
         return true;
     }
     case Op::JStrictEqI: case Op::JStrictNeI: {
@@ -1599,7 +1591,7 @@ bool Baseline::ssaNative(std::uint32_t i)
         const bool pa = plainConst(va), pb = plainConst(vb);
         if (loose && (pa || pb))
             return JSValue::raw(sval_[pa ? va : vb].bits).isNullish();
-        if (pa || pb || (known(va, kVInt) && known(vb, kVInt)))
+        if (pa || pb || (known(va, kVInt) && known(vb, kVInt)) || !loose)
             return true;
         return !failed;
     };
@@ -1609,7 +1601,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::GetGlobal: return ssaGlobalFast(i);
     case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox:
         return true;
-    case Op::ToNumeric: case Op::Not:
+    case Op::ToNumeric: case Op::Not: case Op::TypeOf:
         return !failed;
     case Op::GetElem: case Op::PutElem: {
         ElemKind kind;
@@ -1922,6 +1914,52 @@ void Baseline::ssaLoadLoopCache(std::uint32_t h)
     }
 }
 
+/// The registers that hold values live here (before or after the instruction being emitted): a gpr as its number, an
+/// xmm as 100 plus its number.
+std::vector<int> Baseline::ssaLiveRegs() const
+{
+    std::vector<int> out;
+    for (unsigned r = 0; r < code_->nregs; ++r) {
+        if (!(ssa::bitTest(liveBefore_, r) || ssa::bitTest(curLiveAfter_, r)))
+            continue;
+        const std::uint32_t v = name_[r];
+        if (v == ssa::kNone || sval_[v].isConst || sval_[v].reg < 0)
+            continue;
+        out.push_back(sval_[v].rep == kRepF64 ? 100 + sval_[v].reg : sval_[v].reg);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+void Baseline::ssaSaveRegs(const std::vector<int>& regs)
+{
+    if (regs.empty())
+        return;
+    const std::int32_t room = std::int32_t((8 * regs.size() + 15) & ~std::size_t(15));
+    a_.aluI(5, RSP, room);
+    for (std::size_t k = 0; k < regs.size(); ++k) {
+        if (regs[k] >= 100)
+            a_.movsdStore(mem(RSP, std::int32_t(8 * k)), regs[k] - 100);
+        else
+            a_.mov(mem(RSP, std::int32_t(8 * k)), Reg(regs[k]));
+    }
+}
+
+void Baseline::ssaRestoreRegs(const std::vector<int>& regs)
+{
+    if (regs.empty())
+        return;
+    const std::int32_t room = std::int32_t((8 * regs.size() + 15) & ~std::size_t(15));
+    for (std::size_t k = 0; k < regs.size(); ++k) {
+        if (regs[k] >= 100)
+            a_.movsdLoad(regs[k] - 100, mem(RSP, std::int32_t(8 * k)));
+        else
+            a_.mov(Reg(regs[k]), mem(RSP, std::int32_t(8 * k)));
+    }
+    a_.aluI(0, RSP, room);
+}
+
 void Baseline::ssaSaveRegs()
 {
     const int gprs = 4 + Asm::kExtraGpr, xmms = 14 + Asm::kExtraXmm;
@@ -2011,27 +2049,14 @@ bool Baseline::ssaEquals(std::uint32_t i)
         finish(eq ? CE : CNE);
         return true;
     }
-    if (failed)
+    if (failed && loose)
         return false;
     Label& bad = ssaExit(i);
     loadValue(va, RAX);
     loadValue(vb, RCX);
-    Label bits;
-    a_.mov(RDX, RAX);
-    a_.and_(RDX, RCX);
-    a_.cmp(RDX, R14);
-    a_.jcc(CAE, bits);
-    a_.test(RAX, R15);
-    a_.jcc(CNE, bad);
-    a_.test(RCX, R15);
-    a_.jcc(CNE, bad);
-    a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
-    a_.jcc(CNE, bad);
-    a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
-    a_.jcc(CNE, bad);
-    a_.bind(bits);
-    a_.cmp(RAX, RCX);
-    finish(eq ? CE : CNE);
+    ssaEqualsCore(i, loose, bad);
+    a_.test32(RAX, RAX);
+    finish(eq ? CNE : CE);
     return true;
 }
 
@@ -2484,4 +2509,183 @@ bool Baseline::ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter)
     default:
         return false;
     }
+}
+
+}  // namespace
+
+extern "C" std::uint64_t scriptVmSsaStrictEquals(std::uint64_t a, std::uint64_t b)
+{
+    return strictEquals(JSValue::raw(a), JSValue::raw(b)) ? 1 : 0;
+}
+
+/// 1 or 0 for `a == b` (neither an object), 2 with an exception pending.
+extern "C" std::uint64_t scriptVmSsaLooseEquals(VM* vm, std::uint64_t a, std::uint64_t b)
+{
+    try {
+        bool ok = true;
+        const bool r = looseEquals(*vm, JSValue::raw(a), JSValue::raw(b), &ok);
+        return !ok ? 2 : r ? 1 : 0;
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 2;
+    }
+}
+
+namespace {
+
+/// rax and rcx (boxed): rax becomes 1 when they are equal (`==` when `loose`, else `===`), else 0. Bits, int32s and
+/// objects are decided here; the rest by the runtime, the registers kept (it runs no script: a loose compare with an
+/// object leaves through `bad` first).
+void Baseline::ssaEqualsCore(std::uint32_t i, bool loose, Label& bad)
+{
+    Label eq, ne, slow, differ, notCellA, done;
+    a_.cmp(RAX, RCX);
+    a_.jcc(CNE, differ);
+    // The same bits: equal, unless a double (a NaN is not itself).
+    a_.cmp(RAX, RBP);
+    a_.jcc(CB, eq);
+    a_.cmp(RAX, R14);
+    a_.jcc(CAE, eq);
+    a_.jmp(slow);
+    a_.bind(differ);
+    a_.mov(RDX, RAX);
+    a_.and_(RDX, RCX);
+    a_.cmp(RDX, R14);
+    a_.jcc(CAE, ne);  // two int32s
+    a_.test(RAX, R15);
+    a_.jcc(CNE, notCellA);
+    // A is a cell.
+    if (loose) {
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CE, bad);
+        Label bCell;
+        a_.test(RCX, R15);
+        a_.jcc(CE, bCell);
+        a_.jmp(slow);
+        a_.bind(bCell);
+        a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
+        a_.jcc(CE, bad);
+        a_.jmp(slow);
+    } else {
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CE, ne);
+        a_.test(RCX, R15);
+        a_.jcc(CNE, ne);
+        a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
+        a_.jcc(CE, ne);
+        a_.jmp(slow);  // two strings, two bigints
+    }
+    a_.bind(notCellA);
+    if (loose) {
+        Label bCell;
+        a_.test(RCX, R15);
+        a_.jcc(CNE, slow);
+        a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
+        a_.jcc(CE, bad);
+        a_.jmp(slow);
+    } else {
+        // A is no cell: equal only to a number of the same value (an int32 and a double).
+        a_.test(RAX, R14);
+        a_.jcc(CE, ne);
+        a_.test(RCX, R14);
+        a_.jcc(CE, ne);
+        a_.jmp(slow);
+    }
+    a_.bind(slow);
+    if (!loose) {
+        // Two strings that are both in the string table are equal only as the same cell; of other lengths, not at all.
+        Label call;
+        a_.test(RAX, R15);
+        a_.jcc(CNE, call);
+        a_.test(RCX, R15);
+        a_.jcc(CNE, call);
+        a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::String));
+        a_.jcc(CNE, call);
+        a_.cmpI8(mem(RCX, kGcKind), std::uint8_t(detail::CellKind::String));
+        a_.jcc(CNE, call);
+        a_.mov32(RDX, mem(RAX, kStrLength));
+        a_.alu32(7, RDX, mem(RCX, kStrLength));
+        a_.jcc(CNE, ne);
+        a_.movzx8(RDX, mem(RAX, kStrInterned));
+        a_.movzx8(RSI, mem(RCX, kStrInterned));
+        a_.and_(RDX, RSI);
+        a_.test32(RDX, RDX);
+        a_.jcc(CNE, ne);
+        a_.bind(call);
+    }
+    a_.mov(RSI, RAX);
+    a_.mov(RDX, RCX);
+    const std::vector<int> keep = ssaLiveRegs();
+    ssaSaveRegs(keep);
+    if (loose) {
+        a_.mov(RDI, R12);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaLooseEquals));
+    } else {
+        a_.mov(RDI, RSI);
+        a_.mov(RSI, RDX);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaStrictEquals));
+    }
+    a_.callC(RAX);
+    ssaRestoreRegs(keep);
+    if (loose) {
+        a_.cmpI(RAX, 2);
+        a_.jcc(CE, exception(i));
+    }
+    a_.jmp(done);
+    a_.bind(eq);
+    a_.movImm(RAX, 1);
+    a_.jmp(done);
+    a_.bind(ne);
+    a_.movImm(RAX, 0);
+    a_.bind(done);
+}
+
+/// `typeof v`: one of the names the VM keeps (for its life, so the value is held by nothing here); a bigint or a symbol
+/// leaves.
+bool Baseline::ssaTypeOf(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    std::uint64_t names[8];
+    for (unsigned k = 0; k < 8; ++k) {
+        const JSValue n = vm_.typeofName(k);
+        names[k] = n.bits;
+        vm::release(n);
+    }
+    Label& bad = ssaExit(i);
+    Label number, undef, object, boolean, string, function, cell, done, notObject;
+    loadValue(name_[in.b], RAX);
+    a_.cmp(RAX, RBP);
+    a_.jcc(CAE, number);
+    a_.test(RAX, R15);
+    a_.jcc(CE, cell);
+    a_.cmpI(RAX, std::int32_t(kNull));
+    a_.jcc(CE, object);
+    a_.mov(RDX, RAX);
+    a_.aluI(4, RDX, -2);
+    a_.cmpI(RDX, std::int32_t(kFalse));
+    a_.jcc(CE, boolean);
+    a_.jmp(undef);
+    a_.bind(cell);
+    a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+    a_.jcc(CNE, notObject);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+    a_.jcc(CE, function);
+    a_.jmp(object);
+    a_.bind(notObject);
+    a_.testI8(mem(RAX, 7), 0x80);
+    a_.jcc(CNE, bad);
+    a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::String));
+    a_.jcc(CNE, bad);
+    a_.bind(string);
+    a_.movImm(RAX, names[4]);
+    a_.jmp(done);
+    const std::pair<Label*, unsigned> cases[] = {{&undef, 0}, {&object, 1}, {&boolean, 2}, {&number, 3}, {&function, 7}};
+    for (const auto& [l, k] : cases) {
+        a_.bind(*l);
+        a_.movImm(RAX, names[k]);
+        a_.jmp(done);
+    }
+    a_.bind(done);
+    ssaDef(i, 0);
+    return true;
 }

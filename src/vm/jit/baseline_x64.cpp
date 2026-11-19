@@ -34,6 +34,7 @@
 #include "script/internal/vm/census.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/object.hpp"
+#include "script/internal/vm/operators.hpp"
 #include "opt_analysis.hpp"
 #include "ssa.hpp"
 
@@ -2632,11 +2633,16 @@ private:
     std::uint32_t cacheEnd_ = 0;
     void ssaLoadLoopCache(std::uint32_t h);
     bool ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter);
+    void ssaEqualsCore(std::uint32_t i, bool loose, Label& bad);
+    bool ssaTypeOf(std::uint32_t i);
     template <typename Then>
     void ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, std::int32_t imm, bool isImm, Label& bad,
                      Then then);
     void ssaSaveRegs();
     void ssaRestoreRegs();
+    std::vector<int> ssaLiveRegs() const;
+    void ssaSaveRegs(const std::vector<int>& regs);
+    void ssaRestoreRegs(const std::vector<int>& regs);
     std::vector<SVal> sval_;
     /// While emitting: the value each register holds (`name_`) and what its frame slot holds (`frame_`, kNone: not known).
     std::vector<std::uint32_t> name_, frame_;

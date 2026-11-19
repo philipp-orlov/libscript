@@ -2460,6 +2460,38 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         else if (plan == 1 && prof && !(prof & ~3))
             elemRep[i] = prof == 1 ? 1 : 2;  // a plain array the site found numbers in, only
     }
+    // Arithmetic that nothing has noted (an empty profile: the interpreter never ran it, and the baseline code notes
+    // nothing): what its operands are decides, below. All int32: int32 arithmetic, an exit on overflow; a double and
+    // numbers: double arithmetic; anything else: the template.
+    std::vector<std::vector<std::uint32_t>> operandsOf(nv);
+    std::vector<std::uint8_t> byOperands(nv, 0);
+    if (ssaOn_ >= 2)
+        for (std::uint32_t b = 1; b < nb; ++b) {
+            const ssa::Block& bl = g.blocks[b];
+            if (!bl.reached)
+                continue;
+            std::vector<std::uint32_t> names = bl.nameIn;
+            for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(*code_, i)) {
+                const Ins& in = code_->code[i];
+                const Op op = in.opcode();
+                const opt::Effects e = ssa::effects(*code_, i);
+                const bool arith = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI ||
+                                   op == Op::MulI || op == Op::Inc || op == Op::Dec;
+                if (arith && i < code_->prof.size() && code_->prof[i] == 0 && g.defBase[i] != ssa::kNone &&
+                    !intArith_[i] && !dblArith_[i]) {
+                    const std::uint32_t d = g.defBase[i];
+                    byOperands[d] = 1;
+                    for (std::uint16_t r : e.rd)
+                        operandsOf[d].push_back(names[r]);
+                }
+                if (op == Op::Mov) {
+                    names[in.a] = names[in.b];
+                    continue;
+                }
+                for (std::size_t w = 0; w < e.wr.size(); ++w)
+                    names[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
+            }
+        }
     // Representations: an instruction's by what it does; a phi's the least that holds every input.
     std::vector<std::uint8_t> cls(nv, 0);  // 0 none yet, 1 int32, 2 double, 3 boxed
     for (std::uint32_t v = 0; v < nv; ++v) {
@@ -2467,6 +2499,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         if (sval_[v].isConst) {
             const JSValue k = JSValue::raw(sval_[v].bits);
             cls[v] = k.isInt32() ? 1 : k.isDouble() ? 2 : 3;
+        } else if (byOperands[v]) {
+            cls[v] = 0;
         } else if (sv.kind == ssa::Value::Def) {
             cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : elemRep[sv.at];
         } else if (sv.kind == ssa::Value::Entry) {
@@ -2482,6 +2516,18 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     auto checkable = [&](std::uint32_t in) { return !sval_[in].isConst && (cls[in] == 0 || cls[in] == 1 || cls[in] == 3); };
     for (bool changed = true; changed;) {
         changed = false;
+        for (std::uint32_t v = 0; v < nv; ++v) {
+            if (!byOperands[v])
+                continue;
+            std::uint8_t m = 0;
+            for (std::uint32_t o : operandsOf[v])
+                m = std::max(m, o == ssa::kNone ? std::uint8_t(3) : cls[o]);
+            const std::uint8_t c = std::max(cls[v], m);
+            if (c != cls[v]) {
+                cls[v] = c;
+                changed = true;
+            }
+        }
         for (std::uint32_t b = 1; b < nb; ++b)
             for (std::uint32_t p : g.blocks[b].phis) {
                 const ssa::Value& pv = g.values[p];
@@ -2509,6 +2555,16 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 }
             }
     }
+    for (std::uint32_t v = 0; v < nv; ++v)
+        if (byOperands[v]) {
+            const std::uint32_t at = g.values[v].at;
+            if (cls[v] == 1 || cls[v] == 0)
+                intArith_[at] = 1;
+            else if (cls[v] == 2)
+                dblArith_[at] = 1;
+            if (cls[v] == 0)
+                cls[v] = 1;
+        }
     loopGuards_.assign(nb, {});
     for (std::uint32_t b = 1; b < nb; ++b) {
         if (!g.blocks[b].reached || !guarded(b))

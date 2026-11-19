@@ -1146,6 +1146,15 @@ private:
     }
     /// A register holding the value, which may be a local's own register: not to be kept across code that can assign.
     std::uint16_t exprAny(const Node& n) { return expr(n, -1); }
+    /// `null`, the global `undefined` or `void 0`: what a loose compare with is a test for null or undefined.
+    bool nullishLiteral(const Node& n)
+    {
+        if (n.kind == NK::NullLit)
+            return true;
+        if (n.kind == NK::Identifier && n.text == u"undefined")
+            return resolve(n.text).kind == Ref::Global;
+        return n.kind == NK::Unary && n.op == Tok::Void && n.a && n.a->kind == NK::NumberLit;
+    }
     std::uint16_t dest(int dst) { return dst >= 0 ? std::uint16_t(dst) : temp(); }
     /// For constructs that write their destination before they are done (a literal, a condition): through a temporary
     /// unless the caller gave a register that nothing else reads.
@@ -2460,10 +2469,11 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
         condJump(*cond.a, whenTrue);
         return;
     }
-    if (cond.kind == NK::Binary && !noFuse_ && (cond.op == Tok::EqEq || cond.op == Tok::NotEq) && cond.b->kind == NK::NullLit) {
-        // `x == null` and `x != null`: one test of the value, no boolean.
+    if (cond.kind == NK::Binary && !noFuse_ && (cond.op == Tok::EqEq || cond.op == Tok::NotEq) &&
+        (nullishLiteral(*cond.b) || nullishLiteral(*cond.a))) {
+        // `x == null` and `x != null` (or `undefined`, either side): one test of the value, no boolean.
         const std::uint16_t mark = fn_->top;
-        const std::uint16_t a = exprAny(*cond.a);
+        const std::uint16_t a = exprAny(nullishLiteral(*cond.b) ? *cond.a : *cond.b);
         emitJump(cond.op == Tok::EqEq ? Op::JNullish : Op::JNotNullish, a, whenTrue);
         fn_->top = mark;
         return;
@@ -2527,10 +2537,11 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
         condJumpTrue(*cond.a, whenFalse);
         return;
     }
-    if (cond.kind == NK::Binary && !noFuse_ && (cond.op == Tok::EqEq || cond.op == Tok::NotEq) && cond.b->kind == NK::NullLit) {
-        // `x == null` and `x != null`: one test of the value, no boolean.
+    if (cond.kind == NK::Binary && !noFuse_ && (cond.op == Tok::EqEq || cond.op == Tok::NotEq) &&
+        (nullishLiteral(*cond.b) || nullishLiteral(*cond.a))) {
+        // `x == null` and `x != null` (or `undefined`, either side): one test of the value, no boolean.
         const std::uint16_t mark = fn_->top;
-        const std::uint16_t a = exprAny(*cond.a);
+        const std::uint16_t a = exprAny(nullishLiteral(*cond.b) ? *cond.a : *cond.b);
         emitJump(cond.op == Tok::EqEq ? Op::JNotNullish : Op::JNullish, a, whenFalse);
         fn_->top = mark;
         return;

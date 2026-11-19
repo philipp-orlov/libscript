@@ -931,6 +931,8 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             case Op::GetElem:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
+                else if (ssaPrivateSite(i))
+                    ssaPrivateRead(i);
                 else if (!ssaGetElem(i))
                     a_.jmp(ssaExit(i));
                 break;
@@ -1558,9 +1560,14 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
         (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
                      CodeBlock::kNeedsArgs | CodeBlock::kDerived)))
         return false;
-    // A base class's constructor: one with no field initialiser (fixed when the class is made) only.
-    if ((C->flags & CodeBlock::kClassConstructor) && f->rare() && isFunction(f->rare()->fieldInit))
-        return false;
+    // A base class's constructor. Its field initialiser is fixed when the class is made: undefined (the call of it jumped
+    // over), or one that only defines fields as constants, which is taken in too.
+    JSFunction* fieldFn = nullptr;
+    if ((C->flags & CodeBlock::kClassConstructor) && f->rare() && isFunction(f->rare()->fieldInit)) {
+        fieldFn = static_cast<JSFunction*>(asObject(f->rare()->fieldInit));
+        if ((fieldFn->flags & JSFunction::kNative) || !fieldFn->code || (fieldFn->code->flags & CodeBlock::kLazy))
+            return false;
+    }
     const JSValue pv = *f->slotAt(2);
     if (!isObject(pv))
         return false;
@@ -1576,10 +1583,115 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
     std::vector<std::int8_t> isConst(C->nregs, 0), isSelf(C->nregs, 0);
     std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
     std::vector<JSValue*> ownOf(C->nregs, nullptr);
+    std::vector<const void*> keyOf(C->nregs, nullptr);
     auto plainReg = [&](unsigned r) {
         isConst[r] = 0;
         isSelf[r] = 0;
         ownOf[r] = nullptr;
+        keyOf[r] = nullptr;
+    };
+    // `this.#x = v` (`define`: the initialiser's `#x = v`) at the index the site found, the shape as it was.
+    auto privateStore = [&](const CodeBlock* B, std::uint32_t j, const void* key, bool define, const SsaNew::Store& st) {
+        if (!key || j >= B->privCaches.size())
+            return false;
+        const PrivateCache& pc = B->privCaches[j];
+        if (pc.key != key || pc.shape != p.shape || pc.index >= p.aux || (define ? pc.next == 0 : pc.next != 0))
+            return false;
+        SsaNew::Store s = st;
+        s.index = pc.index;
+        p.stores.push_back(s);
+        if (define)
+            p.shape = pc.next;
+        return true;
+    };
+    // The field initialiser's body, run on the object being made: private names read from its upvalues, constants
+    // defined as fields of `this`, then `return undefined`.
+    auto takeFields = [&]() {
+        const CodeBlock* F = fieldFn->code;
+        std::vector<const void*> fkey(F->nregs, nullptr);
+        std::vector<std::int8_t> fconst(F->nregs, 0);
+        std::vector<JSValue> fval(F->nregs, JSValue::undefined());
+        for (std::uint32_t j = 0; j < F->code.size(); j = opt::nextOf(*F, j)) {
+            const Ins& fi = F->code[j];
+            switch (fi.opcode()) {
+            case Op::Nop:
+                break;
+            case Op::GetUpval: {
+                if (fi.a == 0 || fi.b >= fieldFn->nUpvals)
+                    return false;
+                const Box* box = reinterpret_cast<Box*>(fieldFn->upvals()[fi.b]);
+                if (!box->value.isCell())
+                    return false;
+                fkey[fi.a] = box->value.asCell();
+                fconst[fi.a] = 0;
+                p.keyBoxes.emplace_back(box, box->value.bits);
+                break;
+            }
+            case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt:
+                if (fi.a == 0)
+                    return false;
+                fconst[fi.a] = 1;
+                fkey[fi.a] = nullptr;
+                fval[fi.a] = fi.opcode() == Op::LoadUndef ? JSValue::undefined() : fi.opcode() == Op::LoadNull ? JSValue::null()
+                           : fi.opcode() == Op::LoadInt ? JSValue::int32(fi.imm()) : JSValue::boolean(fi.opcode() == Op::LoadTrue);
+                break;
+            case Op::DefPrivate: case Op::DefPrivMethod: {
+                // A constant, or (a private method) the function an upvalue holds, checked to hold it when the code runs.
+                if (fi.a != 0 || fi.b >= F->nregs || fi.c >= F->nregs || !fkey[fi.b])
+                    return false;
+                JSValue v;
+                if (fconst[fi.c])
+                    v = fval[fi.c];
+                else if (fi.opcode() == Op::DefPrivMethod && fkey[fi.c] &&
+                         isFunction(JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(fkey[fi.c])))))
+                    v = JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(fkey[fi.c])));
+                else
+                    return false;
+                if (!privateStore(F, j, fkey[fi.b], true, SsaNew::Store{0, -1, v}))
+                    return false;
+                break;
+            }
+            case Op::InitProp: {
+                // A public field: added as the site found it.
+                if (fi.a != 0 || fi.c >= F->nregs || !fconst[fi.c] || j + 1 >= F->code.size() ||
+                    F->code[j + 1].opcode() != Op::Cache)
+                    return false;
+                const std::uint16_t cacheId = F->code[j + 1].a;
+                if (cacheId == kNoCache || cacheId >= F->caches.size())
+                    return false;
+                const InlineCache& ic = F->caches[cacheId];
+                if (ic.shape != p.shape || ic.next == 0 || ic.index >= p.aux || ic.holder || ic.pad)
+                    return false;
+                if (ic.validity) {
+                    if (!ic.validity->valid)
+                        return false;
+                    p.cells.push_back(ic.validity);
+                }
+                p.stores.push_back(SsaNew::Store{ic.index, -1, fval[fi.c]});
+                p.shape = ic.next;
+                break;
+            }
+            case Op::Ret:
+                return fi.a < F->nregs && fconst[fi.a] && fval[fi.a].isUndefined();
+            default:
+                return false;
+            }
+        }
+        return false;
+    };
+    std::int64_t fieldReg = -1, thisCopy = -1;
+    bool fieldsTaken = false;
+    // The value register `r` holds at a store: a constant, an argument (undefined past them), or a static field.
+    auto valueOf = [&](unsigned r, SsaNew::Store* st) {
+        if (ownOf[r])
+            *st = SsaNew::Store{0, -2, JSValue::undefined(), ownOf[r]};
+        else if (isConst[r])
+            *st = SsaNew::Store{0, -1, constVal[r]};
+        else if (r >= 1 && r <= C->nparams)
+            *st = r - 1u < in.c ? SsaNew::Store{0, int(r) - 1, JSValue::undefined()} : SsaNew::Store{0, -1, JSValue::undefined()};
+        else
+            return false;
+        return true;
     };
     std::int64_t jumpTo = -1;
     for (std::uint32_t j = 0; j < C->code.size();
@@ -1588,18 +1700,49 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
         switch (ci.opcode()) {
         case Op::Nop:
             break;
-        case Op::FieldInit:  // no initialiser: undefined
+        case Op::FieldInit:  // the field initialiser, or undefined
             if (!(C->flags & CodeBlock::kClassConstructor) || ci.a <= C->nparams)
                 return false;
             plainReg(ci.a);
+            if (fieldFn) {
+                fieldReg = ci.a;
+                break;
+            }
             isConst[ci.a] = 1;
             constVal[ci.a] = JSValue::undefined();
             break;
         case Op::JUndefined: {
             const std::int64_t t = opt::jumpTarget(*C, j);
+            if (fieldFn && std::int64_t(ci.a) == fieldReg)
+                break;  // a function: on to its call
             if (ci.a >= C->nregs || !isConst[ci.a] || !constVal[ci.a].isUndefined() || t <= std::int64_t(j))
                 return false;
             jumpTo = t;
+            break;
+        }
+        case Op::Mov:
+            // `this` into the window of the field initialiser's call.
+            if (!fieldFn || ci.b != 0 || std::int64_t(ci.a) != fieldReg + 1)
+                return false;
+            thisCopy = ci.a;
+            break;
+        case Op::Call:
+            if (!fieldFn || fieldsTaken || std::int64_t(ci.b) != fieldReg || ci.c != 0 || thisCopy != std::int64_t(ci.b) + 1 ||
+                ci.a <= C->nparams || !takeFields())
+                return false;
+            fieldsTaken = true;
+            fieldReg = thisCopy = -1;
+            plainReg(ci.a);
+            isConst[ci.a] = 1;  // its result: undefined
+            constVal[ci.a] = JSValue::undefined();
+            break;
+        case Op::PutElem: {
+            // `this.#x = v` over a field the initialiser defined.
+            if (ci.a != 0 || ci.b >= C->nregs || ci.c >= C->nregs || !keyOf[ci.b])
+                return false;
+            SsaNew::Store st{};
+            if (!valueOf(ci.c, &st) || !privateStore(C, j, keyOf[ci.b], false, st))
+                return false;
             break;
         }
         case Op::GetUpval: {
@@ -1607,9 +1750,15 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
             if (ci.a <= C->nparams || ci.b >= f->nUpvals)
                 return false;
             const Box* box = reinterpret_cast<Box*>(f->upvals()[ci.b]);
-            if (box->value.bits != known.bits)
-                return false;
             plainReg(ci.a);
+            if (box->value.bits != known.bits) {
+                // A private name, for `this.#x = v`: the box checked to hold it.
+                if (!(C->flags & CodeBlock::kPrivate) || !box->value.isCell())
+                    return false;
+                keyOf[ci.a] = box->value.asCell();
+                p.keyBoxes.emplace_back(box, box->value.bits);
+                break;
+            }
             isSelf[ci.a] = 1;
             p.selfBoxes.push_back(box);
             break;
@@ -1641,23 +1790,21 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
             if (cacheId == kNoCache)
                 return false;
             const InlineCache& ic = C->caches[cacheId];
-            if (ic.shape != p.shape || ic.next == 0 || ic.index >= p.aux || ic.holder || ic.pad)
+            // An add, or (after the field initialiser) a store over a field the object has.
+            if (ic.shape != p.shape || ic.index >= p.aux || ic.holder || ic.pad || (ic.next == 0 && !fieldsTaken))
                 return false;
             if (ic.validity) {
                 if (!ic.validity->valid)
                     return false;
                 p.cells.push_back(ic.validity);
             }
-            if (ownOf[ci.c])
-                p.stores.push_back(SsaNew::Store{ic.index, -2, JSValue::undefined(), ownOf[ci.c]});
-            else if (isConst[ci.c])
-                p.stores.push_back(SsaNew::Store{ic.index, -1, constVal[ci.c]});
-            else if (ci.c <= C->nparams)
-                p.stores.push_back(ci.c - 1u < in.c ? SsaNew::Store{ic.index, int(ci.c) - 1, JSValue::undefined()}
-                                                    : SsaNew::Store{ic.index, -1, JSValue::undefined()});
-            else
+            SsaNew::Store st{};
+            if (!valueOf(ci.c, &st))
                 return false;
-            p.shape = ic.next;
+            st.index = ic.index;
+            p.stores.push_back(st);
+            if (ic.next)
+                p.shape = ic.next;
             break;
         }
         case Op::Ret:
@@ -1709,6 +1856,13 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
             a_.cmp(RCX, mem(RDX, kBoxValue));
             a_.jcc(CNE, bad);
         }
+        for (const auto& [box, bits] : p.keyBoxes) {
+            holdValue(JSValue::raw(bits));
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(box));
+            a_.movImm(RCX, bits);
+            a_.cmp(RCX, mem(RDX, kBoxValue));
+            a_.jcc(CNE, bad);
+        }
     }
     // The result's register lets go of what it held, and the runtime may collect: every live value, and every argument
     // stored, gets an owner first.
@@ -1751,7 +1905,13 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
         }
         if (st.arg < 0) {
             const std::int64_t bits = std::int64_t(st.c.bits);
-            if (bits >= INT32_MIN && bits <= INT32_MAX) {
+            if (st.c.isCell()) {
+                // A function a private method names: held by the code, counted for the object.
+                holdValue(st.c);
+                a_.movImm(RCX, st.c.bits);
+                a_.inc32(mem(RCX, kHdrRc));
+                a_.mov(slot, RCX);
+            } else if (bits >= INT32_MIN && bits <= INT32_MAX) {
                 a_.mov(slot, std::int32_t(bits));
             } else {
                 a_.movImm(RCX, st.c.bits);
@@ -1790,6 +1950,36 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
     frame_[in.a] = ssa_->defBase[i];
     ssaKnow(ssa_->defBase[i], kVObj, p.shape);
     return true;
+}
+
+bool Baseline::ssaPrivateSite(std::uint32_t i) const
+{
+    return code_->code[i].opcode() == Op::GetElem && (code_->flags & CodeBlock::kPrivate) && i < code_->privCaches.size() &&
+           code_->privCaches[i].key && code_->privCaches[i].shape;
+}
+
+void Baseline::ssaPrivateRead(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const PrivateCache& pc = code_->privCaches[i];
+    const JSValue key = JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(pc.key)));
+    holdValue(key);
+    Label& bad = ssaExit(i);
+    loadValue(name_[in.c], RCX);
+    a_.movImm(RDX, key.bits);
+    a_.cmp(RCX, RDX);
+    a_.jcc(CNE, bad);
+    const std::uint32_t v = name_[in.b];
+    loadValue(v, RAX);
+    needObjV(v, RAX, bad);
+    if (vShape_[v] != pc.shape) {
+        a_.cmpI32(mem(RAX, 0), std::int32_t(pc.shape));
+        a_.jcc(CNE, bad);
+    }
+    slotAddress(pc.index);
+    a_.mov(RAX, mem(RDX, 0));
+    ssaKnow(v, kVObj, pc.shape);
+    ssaDef(i, 0);
 }
 
 CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
@@ -2102,6 +2292,8 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::ToNumeric: case Op::Not: case Op::TypeOf:
         return !failed;
     case Op::GetElem: case Op::PutElem: {
+        if (op == Op::GetElem && ssaPrivateSite(i))
+            return !failed;
         ElemKind kind;
         return ssaElemPlan(i, op == Op::PutElem, &kind) != 0;
     }
@@ -2643,7 +2835,7 @@ void Baseline::ssaRet(std::uint32_t i)
 /// How element instruction `i` is done in place: 1 on a plain array, 2 on a typed array of `kind`, 0 not.
 int Baseline::ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind)
 {
-    if (ssaOn_ < 2 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+    if (ssaOn_ < 2 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)) || (!put && ssaPrivateSite(i)))
         return 0;
     const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
     // Nothing noted: tier 1 reads a plain array in place without a note (only its slow path notes), as tier 2 knows.

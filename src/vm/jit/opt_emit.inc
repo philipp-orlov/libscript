@@ -1319,8 +1319,29 @@ bool Baseline::emitTyped(std::uint32_t i)
             a_.bind(notTaken);
             return true;
         }
-        if (!allTyped())
-            return false;
+        if (!allTyped()) {
+            // An int32 held as one against a value in the frame (a property just read): the frame's must be an int32 too,
+            // else the code leaves before the jump. A site that left so before goes the generic way.
+            const bool regs = op == Op::JLt || op == Op::JLe || op == Op::JGt || op == Op::JGe || op == Op::JNotLt ||
+                              op == Op::JNotLe || op == Op::JNotGt || op == Op::JNotGe || op == Op::JStrictEq ||
+                              op == Op::JStrictNe || op == Op::JEq || op == Op::JNe;
+            if (!regs || uw.size() < 2 || (uw[0] >= 0) == (uw[1] >= 0) || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+                return false;
+            const int typedSide = uw[0] >= 0 ? 0 : 1;
+            if (!isI32(uw[typedSide]))
+                return false;
+            Label& bad = exitBefore(i);
+            const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
+            const Reg t = useI32(uw[typedSide], RCX);
+            a_.mov(RAX, R(typedSide == 0 ? in.b : in.a));
+            needInt(RAX, bad);
+            if (typedSide == 0)
+                a_.alu32(7, t, RAX);
+            else
+                a_.alu32(7, RAX, t);
+            goIf(relationOf(op).ic, i, target);
+            return true;
+        }
         typedJump(i, in);
         return true;
     default:

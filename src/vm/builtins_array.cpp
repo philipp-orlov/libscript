@@ -772,6 +772,18 @@ NATIVE(arrayIndexOfGeneric)
         return JSValue::exception();
     double k = (n >= 0 ? n : std::max(len + n, 0.0)) + 0.0;
     JSArray* dense = hasElems(o.get()) ? static_cast<JSArray*>(asObject(o.get())) : nullptr;
+    if (dense && (isObject(needle) || isSymbol(needle) || needle.isNull() || needle.isBool())) {
+        // A value equal only to itself: the dense elements compared by their bits, up to a hole (read through the
+        // prototype by the loop below).
+        const double end = std::min(len, double(dense->length));
+        for (; k < end; ++k) {
+            const JSValue e = dense->at(std::uint32_t(k));
+            if (e.bits == needle.bits)
+                return mode == 0 ? JSValue::boolean(true) : JSValue::boxNumber(k);
+            if (e.isHole())
+                break;
+        }
+    }
     for (; k < len; ++k) {
         if (dense && k < double(dense->length) && !dense->at(std::uint32_t(k)).isHole()) {
             const JSValue e = dense->at(std::uint32_t(k));

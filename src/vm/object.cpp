@@ -397,7 +397,7 @@ void JSObject::setProto(VM& vm, JSObject* next)
         return;
     materialize(vm);
     Shape* s = shapeOf(vm);
-    if (!s->isDictionary() && s->count > kMaxFastProperties / 2) {
+    if (!s->isDictionary() && s->count > kMaxReplayedProperties) {
         toDictionary(vm);
         s = shapeOf(vm);
     }

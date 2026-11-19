@@ -43,7 +43,9 @@ inline constexpr std::uint32_t kShapeIdSpace = 1u << 23;
 inline constexpr std::uint32_t kShapeIndexBits = 23;
 inline constexpr std::uint32_t kShapeIndexMask = kShapeIdSpace - 1;
 /// Properties an object may have before it becomes a dictionary instead of growing its shape tree.
-inline constexpr std::uint32_t kMaxFastProperties = 128;
+inline constexpr std::uint32_t kMaxFastProperties = 512;
+/// Properties an object may have when it changes prototype and keeps a shape of the new tree (they are replayed there).
+inline constexpr std::uint32_t kMaxReplayedProperties = 64;
 /// Shapes with this many properties or fewer find one by walking the parent chain.
 inline constexpr std::uint32_t kScanLimit = 8;
 /// Transitions out of one shape for names made at run time (not spelled in a program's source) before the objects

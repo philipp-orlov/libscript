@@ -2068,10 +2068,14 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     if (!C || !C->constructor || (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
                                               CodeBlock::kNeedsArgs | CodeBlock::kDerived)))
         return false;
-    // A base class's constructor as a function's: when the class has no field initialiser (fixed when the class is made),
-    // its `FieldInit` reads undefined and the call of it is jumped over.
-    if ((C->flags & CodeBlock::kClassConstructor) && f->rare() && isFunction(f->rare()->fieldInit))
-        return false;
+    // A base class's constructor as a function's. Its field initialiser (fixed when the class is made) is undefined, and
+    // the call of it jumped over; or one that only defines private fields as constants, which is taken in too.
+    JSFunction* fieldFn = nullptr;
+    if ((C->flags & CodeBlock::kClassConstructor) && f->rare() && isFunction(f->rare()->fieldInit)) {
+        fieldFn = static_cast<JSFunction*>(asObject(f->rare()->fieldInit));
+        if ((fieldFn->flags & JSFunction::kNative) || !fieldFn->code || (fieldFn->code->flags & CodeBlock::kLazy))
+            return false;
+    }
     const JSValue pv = *f->slotAt(2);
     if (!isObject(pv))
         return false;
@@ -2096,6 +2100,68 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     std::uint32_t shape = vm_.rootShapeFor(proto)->id;
     std::vector<std::int8_t> constReg(C->nregs, 0);
     std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
+    // Upvalues (their boxes) that must hold these private names when the code runs.
+    std::vector<std::pair<const Box*, std::uint64_t>> keyBoxes;
+    std::vector<const void*> keyReg(C->nregs, nullptr);
+    std::int64_t fieldFnReg = -1, thisCopy = -1;
+    // `this.#x = v` and the field initialiser's `#x = constant`: stores at the index the site found, the shape as it was.
+    auto privateStore = [&](const CodeBlock* B, std::uint32_t j, const void* key, bool define, IVal v) {
+        if (!key || j >= B->privCaches.size())
+            return false;
+        const PrivateCache& pc = B->privCaches[j];
+        if (pc.key != key || pc.shape != shape || pc.index >= aux || (define ? pc.next == 0 : pc.next != 0))
+            return false;
+        stores.push_back(Store{pc.index, v});
+        if (define)
+            shape = pc.next;
+        return true;
+    };
+    // The field initialiser's body, run on the object being made: private names read from its upvalues, constants
+    // defined as private fields of `this`, then `return undefined`.
+    auto takeFields = [&]() {
+        const CodeBlock* F = fieldFn->code;
+        std::vector<const void*> fkey(F->nregs, nullptr);
+        std::vector<std::int8_t> fconst(F->nregs, 0);
+        std::vector<JSValue> fval(F->nregs, JSValue::undefined());
+        for (std::uint32_t j = 0; j < F->code.size(); j = opt::nextOf(*F, j)) {
+            const Ins& fi = F->code[j];
+            switch (fi.opcode()) {
+            case Op::GetUpval: {
+                if (fi.a == 0 || fi.b >= fieldFn->nUpvals)
+                    return false;
+                const Box* box = reinterpret_cast<Box*>(fieldFn->upvals()[fi.b]);
+                if (!box->value.isCell())
+                    return false;
+                fkey[fi.a] = box->value.asCell();
+                fconst[fi.a] = 0;
+                keyBoxes.emplace_back(box, box->value.bits);
+                break;
+            }
+            case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt:
+                if (fi.a == 0)
+                    return false;
+                fconst[fi.a] = 1;
+                fkey[fi.a] = nullptr;
+                fval[fi.a] = fi.opcode() == Op::LoadUndef ? JSValue::undefined() : fi.opcode() == Op::LoadNull ? JSValue::null()
+                           : fi.opcode() == Op::LoadInt ? JSValue::int32(fi.imm()) : JSValue::boolean(fi.opcode() == Op::LoadTrue);
+                break;
+            case Op::DefPrivate: {
+                if (fi.a != 0 || fi.b >= F->nregs || fi.c >= F->nregs || !fkey[fi.b] || !fconst[fi.c])
+                    return false;
+                IVal v;
+                v.c = fval[fi.c];
+                if (!privateStore(F, j, fkey[fi.b], true, v))
+                    return false;
+                break;
+            }
+            case Op::Ret:
+                return fconst[fi.a] && fval[fi.a].isUndefined();
+            default:
+                return false;
+            }
+        }
+        return false;
+    };
     bool returned = false;
     std::int64_t jumpTo = -1;
     for (std::uint32_t j = 0; j < C->code.size() && !returned;
@@ -2105,8 +2171,18 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         case Op::GetUpval: {
             if (ci.a == 0 || ci.a <= C->nparams || ci.b >= f->nUpvals)
                 return false;
-            if (reinterpret_cast<Box*>(f->upvals()[ci.b])->value.bits != known.bits)
-                return false;
+            if (const Box* box = reinterpret_cast<Box*>(f->upvals()[ci.b]); box->value.bits != known.bits) {
+                // A private name, checked to be the one the sites found when the code runs.
+                if (!(C->flags & CodeBlock::kPrivate) || !box->value.isCell())
+                    return false;
+                keyReg[ci.a] = box->value.asCell();
+                keyBoxes.emplace_back(box, box->value.bits);
+                selfReg[ci.a] = 0;
+                ownReg[ci.a] = nullptr;
+                constReg[ci.a] = 0;
+                break;
+            }
+            keyReg[ci.a] = nullptr;
             selfReg[ci.a] = 1;
             constReg[ci.a] = 0;
             ownReg[ci.a] = nullptr;
@@ -2128,14 +2204,51 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         case Op::FieldInit:
             if (!(C->flags & CodeBlock::kClassConstructor) || ci.a == 0 || ci.a <= C->nparams)
                 return false;
+            if (fieldFn) {
+                fieldFnReg = ci.a;
+                constReg[ci.a] = 0;
+                break;
+            }
             constReg[ci.a] = 1;
             constVal[ci.a] = JSValue::undefined();
             break;
         case Op::JUndefined: {
             const std::int64_t t = opt::jumpTarget(*C, j);
+            if (fieldFn && std::int64_t(ci.a) == fieldFnReg)
+                break;  // a function: on to its call
             if (ci.a >= C->nregs || !constReg[ci.a] || !constVal[ci.a].isUndefined() || t <= std::int64_t(j))
                 return false;
             jumpTo = t;
+            break;
+        }
+        case Op::Mov:
+            // `this` into the window of the field initialiser's call.
+            if (!fieldFn || ci.b != 0 || std::int64_t(ci.a) != fieldFnReg + 1)
+                return false;
+            thisCopy = ci.a;
+            break;
+        case Op::Call:
+            if (!fieldFn || std::int64_t(ci.b) != fieldFnReg || ci.c != 0 || thisCopy != std::int64_t(ci.b) + 1 || !takeFields())
+                return false;
+            fieldFnReg = thisCopy = -1;
+            constReg[ci.a] = 1;  // its result: undefined
+            constVal[ci.a] = JSValue::undefined();
+            break;
+        case Op::PutElem: {
+            // `this.#x = v` over a field the initialiser defined.
+            if (ci.a != 0 || ci.b >= C->nregs || ci.c >= C->nregs || !keyReg[ci.b])
+                return false;
+            IVal v;
+            if (constReg[ci.c])
+                v.c = constVal[ci.c];
+            else if (ci.c >= 1 && ci.c <= C->nparams && ci.c - 1u < argc)
+                v = callerValue(i, base + 1 + ci.c, 1 + ci.c, 8);
+            else if (ci.c >= 1 && ci.c <= C->nparams)
+                v.c = JSValue::undefined();
+            else
+                return false;
+            if (!privateStore(C, j, keyReg[ci.b], false, v))
+                return false;
             break;
         }
         case Op::PutProp: {
@@ -2250,6 +2363,17 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     } else {
         for (ValidityCell* c : cells)
             hold(c);
+    }
+    if (!keyBoxes.empty()) {
+        // The private names the sites found are the ones the upvalues hold.
+        Label& bad = exitBefore(i);
+        for (const auto& [box, bits] : keyBoxes) {
+            holdValue(JSValue::raw(bits));
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(box));
+            a_.movImm(RCX, bits);
+            a_.cmp(RCX, mem(RDX, kBoxValue));
+            a_.jcc(CNE, bad);
+        }
     }
     if (!selfUpvals.empty()) {
         // The constructor's own name still names it (the code reads its static fields through it).

@@ -569,6 +569,28 @@ bool hasAssignment(const Node& n)
     return false;
 }
 
+/// Whether evaluating a node can assign to the variable `name` of this function by an assignment or update in the node
+/// itself (an assignment to a member, or to another name, cannot).
+bool assignsName(const Node& n, const String& name)
+{
+    checkNativeStack();
+    if (n.kind == NK::Assign || n.kind == NK::Update) {
+        if (!n.a || n.a->kind != NK::Member && n.a->kind != NK::Identifier)
+            return true;
+        if (n.a->kind == NK::Identifier && n.a->text == name)
+            return true;
+    }
+    if (isFunctionNode(n))
+        return false;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child && assignsName(**child, name))
+            return true;
+    for (const dyn::NodePtr& child : n.list)
+        if (child && assignsName(*child, name))
+            return true;
+    return false;
+}
+
 /// Whether a direct `eval` call is in this function's own code: its parameters and body, not a function inside them.
 bool containsDirectEval(const Node& n)
 {
@@ -2789,7 +2811,9 @@ std::uint16_t Compiler::member(const Node& n, int dst)
     }
     const std::uint16_t mark = fn_->top;
     const bool constantKey = n.computed && n.b->kind == NK::StringLit;
-    const std::uint16_t o = (n.computed && !constantKey && hasAssignment(*n.b)) ? exprTemp(*n.a) : exprAny(*n.a);
+    const bool indexAssigns = n.computed && !constantKey &&
+                              (n.a->kind == NK::Identifier ? assignsName(*n.b, n.a->text) : hasAssignment(*n.b));
+    const std::uint16_t o = indexAssigns ? exprTemp(*n.a) : exprAny(*n.a);
     if (n.optional) {
         emitJump(Op::JNullish, o, *chain_);
         chainUsed_ = true;

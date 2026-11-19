@@ -33,6 +33,10 @@ constexpr std::uint32_t kMergeMaxAdded = 600;
 constexpr unsigned kMergeMaxSites = 8;
 constexpr std::size_t kMergeMaxTotal = 1500;
 constexpr std::uint32_t kMergeMaxLooping = 200;
+constexpr std::uint32_t kMergeTinyCallee = 12;    ///< with the SSA tier: a callee this small is taken in at more sites
+constexpr unsigned kMergeMaxTinySites = 64;
+constexpr std::uint32_t kMergeMaxTinyAdded = 2000;
+constexpr std::size_t kMergeMaxTotalSsa = 8000;
 
 /// The instructions a callee run in place may hold: none looks at the frame beyond its registers (the upvalues, the
 /// closures and the home object are the callee's own, which the copy has no way to name).
@@ -108,7 +112,14 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
         CodeBlock* callee;
     };
     std::vector<Site> sites;
-    std::uint32_t added = 0;
+    std::uint32_t added = 0, addedTiny = 0;
+    unsigned normal = 0;
+    // With the SSA tier, which inlines nothing itself, a tiny callee (`uint` in compiled C) is taken in at many more sites.
+    static const bool ssaTier = [] {
+        const char* s = std::getenv("SCRIPT_VM_SSA");
+        return s && *s >= '2';
+    }();
+    auto tiny = [&](const CodeBlock* C) { return ssaTier && C->code.size() <= kMergeTinyCallee; };
     for (std::uint32_t j = 0; j < n; j = opt::nextOf(*c, j)) {
         const Ins& in = c->code[j];
         if (in.opcode() != Op::Call || !c->callProf[j] || in.a > in.b)
@@ -117,17 +128,32 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
         if (!C || C == c || !mergeable(C, in.c))
             continue;
         const std::uint32_t cost = std::uint32_t(C->code.size()) + C->nregs + 4;
-        if (sites.size() >= kMergeMaxSites || added + cost > kMergeMaxAdded)
-            break;
+        if (tiny(C)) {
+            if (sites.size() >= kMergeMaxTinySites || addedTiny + cost > kMergeMaxTinyAdded)
+                continue;
+            addedTiny += cost;
+            sites.push_back(Site{j, C});
+            continue;
+        }
+        if (normal >= kMergeMaxSites || added + cost > kMergeMaxAdded)
+            continue;
         added += cost;
+        ++normal;
         sites.push_back(Site{j, C});
     }
     if (sites.empty())
         return nullptr;
     if (loop != ~0u) {
-        // A large function that loops is copied and compiled again for little: only small ones.
-        if (n > kMergeMaxLooping)
-            return nullptr;
+        // A large function that loops is copied and compiled again for little: only small ones, or (with the SSA tier)
+        // only its calls of tiny callees.
+        if (n > kMergeMaxLooping) {
+            if (!ssaTier)
+                return nullptr;
+            sites.erase(std::remove_if(sites.begin(), sites.end(), [&](const Site& s) { return !tiny(s.callee); }),
+                        sites.end());
+            if (sites.empty())
+                return nullptr;
+        }
         // The loop runs from its header to its last back edge.
         std::int64_t end = -1;
         for (std::uint32_t j = 0; j < n; j = opt::nextOf(*c, j))
@@ -393,7 +419,7 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
     // The parameters' feedback, past the instructions'.
     for (std::uint32_t p = 0; p < c->nparams + 2u; ++p)
         d->prof.push_back(n + p < c->prof.size() ? c->prof[n + p] : std::uint8_t(0));
-    if (tooFar || d->code.size() > kMergeMaxTotal) {
+    if (tooFar || d->code.size() > (ssaTier ? kMergeMaxTotalSsa : kMergeMaxTotal)) {
         vm.releaseCode(d);
         return nullptr;
     }

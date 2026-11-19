@@ -2344,7 +2344,11 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
         case Op::ShlI: case Op::ShrI: case Op::MulI: case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd:
         case Op::BitOr: case Op::BitXor:
-            if (prof == 1)
+            // A bitwise operation with nothing noted (0: the interpreter has not run it; the baseline code notes
+            // nothing): its result is an int32 whatever the operands (a double truncates). A template there would make
+            // every value across it live in a slot, in the hot code around it too.
+            if (prof == 1 || (prof == 0 && (op == Op::BitAndI || op == Op::BitOrI || op == Op::BitXorI || op == Op::ShlI ||
+                                            op == Op::ShrI || op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor)))
                 intArith_[i] = 1;
             break;
         default:

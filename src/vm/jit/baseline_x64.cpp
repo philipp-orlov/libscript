@@ -331,13 +331,43 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
             if (index < t->siteExits.size() && t->siteExits[index] < 255)
                 again = ++t->siteExits[index] >= 3;
         }
-        if (++code->optExits > 40 || again)
-            retireTier2(*vm, code);
-        else if (code->tier2Counter > 300)
+        // Only while the code is still the function's entry: frames still in code already taken out of use (a loop that
+        // keeps running there) do not take it out again, and use up no more tries.
+        const bool active = code->tier2 && code->tier1 && code->tier1->entry == code->tier2->entry;
+        if (++code->optExits > 40 || again) {
+            if (active)
+                retireTier2(*vm, code);
+        } else if (code->tier2Counter > 300)
             code->tier2Counter = 300;  // a loop that left optimized code goes back in soon
         if (kind == 1)
             return kStepFall;
-        return stepInstruction(*vm, index);
+        // A value of a kind the site had not made before (an int32 field that now holds a double): the profile has
+        // learned it, and the code is made again with it now (no try is used up), not after more exits at each such site.
+        // A chain of reads (`a.b.c`) leaves from its first read whichever link failed: the reads after it run in the
+        // interpreter as well, so that the one that failed learns what it found.
+        bool widened = false;
+        std::uint64_t r = 0;
+        const std::uint32_t firstIndex = index;
+        for (int steps = 0;; ++steps) {
+            const std::uint8_t before = index < code->prof.size() ? code->prof[index] : 0;
+            r = stepInstruction(*vm, index);
+            widened = widened || (index < code->prof.size() && (code->prof[index] & ~before & ~opt::kProfFailed));
+            if (r != kStepFall || vm->frameTop - 1 != fr || steps >= 3)
+                break;
+            const std::uint32_t next = opt::nextOf(*code, index);
+            if (next >= code->code.size() || code->code[next].opcode() != Op::GetProp)
+                break;
+            index = next;
+            fr->pc = code->code.data() + index;
+        }
+        if (r == kStepFall && fr->pc != code->code.data() + opt::nextOf(*code, firstIndex))
+            r = kStepJump;  // more than one ran: the frame's pc is where to go on
+        if (widened && code->tier2 && code->tier1 && code->tier1->entry == code->tier2->entry) {
+            retireTier2(*vm, code);
+            if (code->tier2Tries)
+                --code->tier2Tries;
+        }
+        return r;
     } catch (...) {
         pendingException = std::current_exception();
         return 0;

@@ -52,7 +52,7 @@ bool mergeOp(Op op)
     case Op::JNotUndefined: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe:
     case Op::JNotGt: case Op::JNotGe: case Op::JStrictNe: case Op::JStrictEq: case Op::JEq: case Op::JNe: case Op::JLtI: case Op::JLeI: case Op::JGtI:
     case Op::JGeI: case Op::JNotLtI: case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictNeI:
-    case Op::JStrictEqI:
+    case Op::JStrictEqI: case Op::JNotCode:
     case Op::GetProp: case Op::PutProp: case Op::GetElem: case Op::PutElem: case Op::NewObject: case Op::NewArray:
     case Op::ArrayPush: case Op::InitProp: case Op::InitElem: case Op::Call: case Op::New: case Op::Ret: case Op::Throw:
         return true;
@@ -66,7 +66,7 @@ bool mergeable(const CodeBlock* C, unsigned argc)
 {
     const std::uint32_t n = std::uint32_t(C->code.size());
     if (!n || n > kMergeMaxCallee || !C->handlers.empty() || !C->evalScopes.empty() || C->lines.size() != n ||
-        C->prof.empty() || argc > C->nparams || C->uid > 0x7fffffffu || C->inlinedFrom || C->mergedFrom)
+        C->prof.empty() || argc > C->nparams || C->uid > 0x7fffffffu || C->inlinedFrom)
         return false;
     if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
                     CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
@@ -337,6 +337,12 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
             }
             d->inlineSites.push_back(InlineSite{body, std::uint32_t(d->code.size()), guard, C});
             ++C->refs;
+            // A callee that is itself a merged copy brings the calls it runs in place.
+            for (const InlineSite& s : C->inlineSites) {
+                d->inlineSites.push_back(InlineSite{cmoved[s.start], cmoved[s.end], cmoved[s.site], s.callee});
+                if (s.callee)
+                    ++s.callee->refs;
+            }
             // The guard's miss goes to the call the long way, which falls through to what follows.
             if (!fits16(guard, std::uint32_t(d->code.size())))
                 tooFar = true;

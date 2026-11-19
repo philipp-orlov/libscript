@@ -1734,6 +1734,15 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             vDef_[v] = kVNotCell;
     }
     vKnown_ = vDef_;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SSA_REPS"))
+        for (std::uint32_t v = g.nregs; v < nv; ++v)
+            if (!sval_[v].isConst && sval_[v].rep != kRepTagged) {
+                const ssa::Value& sv = g.values[v];
+                std::fprintf(stderr, "v%u r%u %s @%u %s\n", v, unsigned(sv.reg), sv.kind == ssa::Value::Phi ? "phi" : "def",
+                             unsigned(sv.at), sval_[v].rep == kRepI32 ? "i32" : "f64");
+            }
+#endif
     // In place or not, with names as the code will have them; then where each value is first and last needed.
     std::vector<std::int32_t> first(nv, INT32_MAX), last(nv, -1);
     std::vector<std::int32_t> clob;

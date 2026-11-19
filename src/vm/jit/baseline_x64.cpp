@@ -319,6 +319,13 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                               index < code->elemProf.size() ? int(code->elemProf[index]) : -1,
                               index < code->elemKinds.size() ? int(code->elemKinds[index]) : -1);
                 what = buf;
+                if (fr > vm->frameBase && fr[-1].code && fr[-1].pc) {
+                    const Frame& up = fr[-1];
+                    std::snprintf(buf, sizeof buf, " from %s @%ld",
+                                  up.code->name ? toUtf8(static_cast<StringCell*>(up.code->name)->text()).c_str() : "anon",
+                                  long(up.pc - up.code->code.data()));
+                    what += buf;
+                }
             }
             std::fprintf(stderr, "tier2 exit %s @%u kind %d (n=%zu tries %d)%s\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index, kind,
                          code->code.size(), int(code->tier2Tries), what.c_str());
@@ -3319,7 +3326,11 @@ void Baseline::arith(std::uint32_t i, const Ins& in)
             a_.jmp(done);
         }
         a_.bind(asDouble);
-        boxDouble0();
+        // A product of two int32s comes here when it is zero: an int32 zero unless it is -0, as the runtime makes it.
+        if (op == Op::Mul)
+            boxNumber0();
+        else
+            boxDouble0();
         write(in.a, RAX, in.a == in.b || in.a == in.c);
     }
     a_.bind(done);
@@ -3394,7 +3405,11 @@ void Baseline::arithImm(std::uint32_t i, const Ins& in)
             a_.subsd(0, 1);
         else
             a_.mulsd(0, 1);
-        boxDouble0();
+        // An int32 times the immediate comes here when the product is zero: an int32 zero unless it is -0.
+        if (op == Op::MulI)
+            boxNumber0();
+        else
+            boxDouble0();
         write(in.a, RAX, in.a == in.b);
     }
     a_.bind(done);

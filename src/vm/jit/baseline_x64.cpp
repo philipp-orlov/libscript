@@ -2805,6 +2805,9 @@ private:
     bool ssaNew(std::uint32_t i, const ssa::Bits& liveAfter);
     /// `o.#x` (a `GetElem` whose site has found the private name): the name and the shape checked, the slot read.
     bool ssaPrivateSite(std::uint32_t i) const;
+    /// A property added in place (`PutProp`, `InitProp`): the cache saw the transition, into an inline slot.
+    bool ssaAddFast(std::uint32_t i) const;
+    void ssaPutAdd(std::uint32_t i);
     void ssaPrivateRead(std::uint32_t i);
     /// The callee a `Call` has always called, by its code's uid (`callProf`), when its frame can be pushed from constants.
     CodeBlock* ssaDirectCallee(std::uint32_t i) const;

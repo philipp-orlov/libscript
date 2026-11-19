@@ -910,9 +910,11 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                 } else if (!ssaGetProp(i))
                     a_.jmp(ssaExit(i));
                 break;
-            case Op::PutProp:
+            case Op::PutProp: case Op::InitProp:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
+                else if (ssaAddFast(i))
+                    ssaPutAdd(i);
                 else if (!ssaPutProp(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
                 break;
@@ -957,6 +959,25 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             case Op::Ret:
                 ssaRet(i);
                 ended = true;
+                break;
+            case Op::CheckInit:
+                if (!native_[i]) {
+                    ssaGeneric(i, liveAfter[b][k]);
+                } else {
+                    // A binding read before its declaration ran: the interpreter throws.
+                    const std::uint32_t v = name_[in.a];
+                    if (sval_[v].isConst ? JSValue::raw(sval_[v].bits).bits == kUninit
+                                         : sval_[v].rep == kRepTagged && !(vKnown_[v] & (kVInt | kVBool | kVObj))) {
+                        Label& bad = ssaExit(i);
+                        if (sval_[v].isConst) {
+                            a_.jmp(bad);
+                        } else {
+                            loadValue(v, RAX);
+                            a_.cmpI(RAX, std::int32_t(kUninit));
+                            a_.jcc(CE, bad);
+                        }
+                    }
+                }
                 break;
             case Op::New:
                 if (!native_[i])
@@ -1982,6 +2003,53 @@ void Baseline::ssaPrivateRead(std::uint32_t i)
     ssaDef(i, 0);
 }
 
+bool Baseline::ssaAddFast(std::uint32_t i) const
+{
+    const Op op = code_->code[i].opcode();
+    if (ssaOn_ < 2 || (op != Op::PutProp && op != Op::InitProp) || i + 1 >= n_ || code_->code[i + 1].opcode() != Op::Cache)
+        return false;
+    const std::uint16_t cacheId = code_->code[i + 1].a;
+    if (cacheId == kNoCache || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return false;
+    const InlineCache& ic = code_->caches[cacheId];
+    return ic.shape != 0 && ic.next != 0 && !ic.holder && !ic.pad && ic.index < 200 &&
+           (op == Op::InitProp || !ic.validity || ic.validity->valid);
+}
+
+void Baseline::ssaPutAdd(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const InlineCache& ic = code_->caches[code_->code[i + 1].a];
+    const std::uint32_t v = name_[in.a], x = name_[in.c];
+    Label& bad = ssaExit(i);
+    loadValue(v, RAX);
+    needObjV(v, RAX, bad);
+    if (vShape_[v] != ic.shape) {
+        a_.cmpI32(mem(RAX, 0), std::int32_t(ic.shape));
+        a_.jcc(CNE, bad);
+    }
+    if (in.opcode() == Op::PutProp) {
+        // An add: no setter on the way (the cell), an object that may grow.
+        if (ic.validity) {
+            hold(ic.validity);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic.validity));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+        }
+        a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto | cellflags::kNotExtensible));
+        a_.jcc(CNE, bad);
+    }
+    // Objects of one shape can have fewer inline slots than the one the cache learned from.
+    a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic.index));
+    a_.jcc(CBE, bad);
+    loadValue(x, RCX);
+    if (mayBeCell(x))
+        retain(RCX);
+    a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic.index)), RCX);
+    a_.mov32(mem(RAX, 0), std::int32_t(ic.next));
+    ssaKnow(v, kVObj, ic.next);
+}
+
 CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
 {
     const Ins& in = code_->code[i];
@@ -2285,10 +2353,13 @@ bool Baseline::ssaNative(std::uint32_t i)
     switch (op) {
     case Op::GetProp: return plainReadable(i);
     case Op::New: return ssaNewPlan(i, nullptr);
-    case Op::PutProp: return ssaPutFast(i);
+    case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
+    case Op::InitProp: return ssaAddFast(i);
     case Op::GetGlobal: return ssaGlobalFast(i);
     case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox:
         return true;
+    case Op::CheckInit:
+        return !failed;
     case Op::ToNumeric: case Op::Not: case Op::TypeOf:
         return !failed;
     case Op::GetElem: case Op::PutElem: {

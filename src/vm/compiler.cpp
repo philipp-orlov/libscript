@@ -591,6 +591,14 @@ bool assignsName(const Node& n, const String& name)
     return false;
 }
 
+/// Whether the value of `first`, evaluated into a register it may share with a local, is still that value after `later`
+/// runs: a name only an assignment in `later` itself can change (a local that a closure writes is in a box, and is read
+/// into a register of its own).
+bool stableAcross(const Node& first, const Node& later)
+{
+    return first.kind == NK::Identifier ? !assignsName(later, first.text) : !hasAssignment(later);
+}
+
 /// Whether a direct `eval` call is in this function's own code: its parameters and body, not a function inside them.
 bool containsDirectEval(const Node& n)
 {
@@ -2380,7 +2388,7 @@ std::uint16_t Compiler::binaryStep(const Node& n, int dst, int left)
         emit(immediateOp(op), d, a, std::uint16_t(std::int16_t(int(n.b->number))));
         return d;
     }
-    const std::uint16_t a = leftOperand(!hasAssignment(*n.b));
+    const std::uint16_t a = leftOperand(stableAcross(*n.a, *n.b));
     const std::uint16_t b = exprAny(*n.b);
     fn_->top = mark;
     const std::uint16_t d = dest(dst);
@@ -2481,7 +2489,8 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
                 fn_->top = mark;
                 return;
             }
-            const std::uint16_t a = isPure(*cond.b) ? exprAny(*cond.a) : exprTemp(*cond.a);
+            const std::uint16_t a = isPure(*cond.b) || (cond.a->kind == NK::Identifier && stableAcross(*cond.a, *cond.b))
+                                        ? exprAny(*cond.a) : exprTemp(*cond.a);
             const std::uint16_t b = exprAny(*cond.b);
             emitFusedJump(fused, a, b, whenTrue);
             fn_->top = mark;
@@ -2547,7 +2556,8 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
                 fn_->top = mark;
                 return;
             }
-            const std::uint16_t a = isPure(*cond.b) ? exprAny(*cond.a) : exprTemp(*cond.a);
+            const std::uint16_t a = isPure(*cond.b) || (cond.a->kind == NK::Identifier && stableAcross(*cond.a, *cond.b))
+                                        ? exprAny(*cond.a) : exprTemp(*cond.a);
             const std::uint16_t b = exprAny(*cond.b);
             emitFusedJump(fused, a, b, whenFalse);
             fn_->top = mark;
@@ -2594,10 +2604,12 @@ std::uint16_t Compiler::update(const Node& n, int dst, bool discard)
         return d;
     }
     if (target.kind == NK::Member) {
-        const std::uint16_t o = exprTemp(*target.a);
+        // Nothing after the key's evaluation can assign a local: the object and the key need no copies unless the key
+        // assigns the object's name.
+        const std::uint16_t o = !target.computed || stableAcross(*target.a, *target.b) ? exprAny(*target.a) : exprTemp(*target.a);
         std::uint16_t k = 0;
         if (target.computed)
-            k = exprTemp(*target.b);
+            k = exprAny(*target.b);
         const std::uint16_t old = temp();
         if (target.computed)
             emit(Op::GetElem, old, o, k);
@@ -2712,12 +2724,14 @@ std::uint16_t Compiler::assign(const Node& n, int dst, bool unused)
 
     if (target.kind == NK::Member) {
         // A local the right side cannot assign needs no copy.
-        const bool stable = !hasAssignment(*n.b) && (!target.computed || !hasAssignment(*target.b));
-        const std::uint16_t o = stable ? exprAny(*target.a) : exprTemp(*target.a);
-        std::uint16_t k = 0;
         const bool computed = target.computed;
+        const bool objectStable = stableAcross(*target.a, *n.b) && (!computed || stableAcross(*target.a, *target.b));
+        const bool keyStable = !computed || stableAcross(*target.b, *n.b);
+        const bool stable = objectStable && keyStable;
+        const std::uint16_t o = objectStable ? exprAny(*target.a) : exprTemp(*target.a);
+        std::uint16_t k = 0;
         if (computed)
-            k = stable ? exprAny(*target.b) : exprTemp(*target.b);
+            k = keyStable ? exprAny(*target.b) : exprTemp(*target.b);
         const std::uint16_t nameAtom = computed ? 0 : atom(target.text);
         auto put = [&](std::uint16_t value) {
             if (computed)

@@ -2067,7 +2067,11 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         return false;
     CodeBlock* C = f->code;
     if (!C || !C->constructor || (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                                              CodeBlock::kNeedsArgs | CodeBlock::kClassConstructor | CodeBlock::kDerived)))
+                                              CodeBlock::kNeedsArgs | CodeBlock::kDerived)))
+        return false;
+    // A base class's constructor as a function's: when the class has no field initialiser (fixed when the class is made),
+    // its `FieldInit` reads undefined and the call of it is jumped over.
+    if ((C->flags & CodeBlock::kClassConstructor) && f->rare() && isFunction(f->rare()->fieldInit))
         return false;
     const JSValue pv = *f->slotAt(2);
     if (!isObject(pv))
@@ -2088,9 +2092,24 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     std::vector<std::int8_t> constReg(C->nregs, 0);
     std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
     bool returned = false;
-    for (std::uint32_t j = 0; j < C->code.size() && !returned; j = opt::nextOf(*C, j)) {
+    std::int64_t jumpTo = -1;
+    for (std::uint32_t j = 0; j < C->code.size() && !returned;
+         j = jumpTo >= 0 ? std::uint32_t(std::exchange(jumpTo, -1)) : opt::nextOf(*C, j)) {
         const Ins& ci = C->code[j];
         switch (ci.opcode()) {
+        case Op::FieldInit:
+            if (!(C->flags & CodeBlock::kClassConstructor) || ci.a == 0 || ci.a <= C->nparams)
+                return false;
+            constReg[ci.a] = 1;
+            constVal[ci.a] = JSValue::undefined();
+            break;
+        case Op::JUndefined: {
+            const std::int64_t t = opt::jumpTarget(*C, j);
+            if (ci.a >= C->nregs || !constReg[ci.a] || !constVal[ci.a].isUndefined() || t <= std::int64_t(j))
+                return false;
+            jumpTo = t;
+            break;
+        }
         case Op::PutProp: {
             if (ci.a != 0 || ci.c == 0 || ci.c >= C->nregs)
                 return false;

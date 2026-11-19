@@ -351,7 +351,11 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
         for (int steps = 0;; ++steps) {
             const std::uint8_t before = index < code->prof.size() ? code->prof[index] : 0;
             r = stepInstruction(*vm, index);
-            widened = widened || (index < code->prof.size() && (code->prof[index] & ~before & ~opt::kProfFailed));
+            if (index < code->prof.size() && (code->prof[index] & ~before & ~opt::kProfFailed)) {
+                // What the site made is of a kind new to it: that, not a guard that keeps failing, made the code leave.
+                widened = true;
+                code->prof[index] &= std::uint8_t(~opt::kProfFailed);
+            }
             if (r != kStepFall || vm->frameTop - 1 != fr || steps >= 3)
                 break;
             const std::uint32_t next = opt::nextOf(*code, index);

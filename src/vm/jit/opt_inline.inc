@@ -1996,8 +1996,7 @@ void Baseline::emitChain(std::uint32_t i)
     if (dw >= 0) {
         unboxRax(dw, bad);
     } else {
-        retain(RAX);
-        write(in.a, RAX);
+        writeCounting(in.a);
     }
 }
 

@@ -1979,6 +1979,28 @@ private:
         a_.call(free_);
         a_.bind(done);
     }
+    /// R[dst] = the value in rax, not yet counted: counted, and the old value let go, unless the register holds the same
+    /// value already (a read of what it read before), which then has its count. Clobbers rdx, rdi.
+    void writeCounting(unsigned dst)
+    {
+        if (fnBorrowed(dst)) {
+            write(dst, RAX);
+            return;
+        }
+        if (dst < plainRegs_.size() && plainRegs_[dst]) {
+            retain(RAX);
+            write(dst, RAX);
+            return;
+        }
+        Label same;
+        a_.mov(RDX, R(dst));
+        a_.cmp(RDX, RAX);
+        a_.jcc(CE, same);
+        retain(RAX);
+        a_.mov(R(dst), RAX);
+        release(RDX);
+        a_.bind(same);
+    }
     /// R[dst] = the value in `v`, whose count the caller has taken; the old value is let go. Clobbers rdx, rdi.
     void write(unsigned dst, Reg v, bool oldIsNumber = false)
     {
@@ -2690,9 +2712,7 @@ void Baseline::emit(std::uint32_t i)
         return;
     case Op::Mov:
         a_.mov(RAX, R(in.b));
-        if (!fnBorrowed(in.a))
-            retain(RAX);
-        write(in.a, RAX);
+        writeCounting(in.a);
         return;
     case Op::LoadK: {
         const JSValue k = code_->consts[in.kIndex()];

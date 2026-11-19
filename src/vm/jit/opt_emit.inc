@@ -245,9 +245,7 @@ void Baseline::deliver(std::uint32_t i, unsigned dst)
 {
     const std::int32_t w = optimizing() ? plan_->defWeb[i] : -1;
     if (w < 0) {
-        if (!fnBorrowed(dst))
-            retain(RAX);
-        write(dst, RAX);
+        writeCounting(dst);
         return;
     }
     delivered_ = true;
@@ -899,9 +897,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             } else {
                 a_.mov(RAX, provenSlotMem(in.b, ic.shape, ic.index, failed ? 0 : ic.aux, bad));
             }
-            if (!fnBorrowed(in.a))
-                retain(RAX);
-            write(in.a, RAX);
+            writeCounting(in.a);
             return true;
         }
         if (const LoopRead* lr = hoistedRead(i)) {

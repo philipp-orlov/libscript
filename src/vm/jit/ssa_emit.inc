@@ -2791,8 +2791,9 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     std::vector<int> gprs, xmms;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     static const bool noRegs = std::getenv("SSA_NOREGS") != nullptr;
+    static const bool noEvict = std::getenv("SSA_NOEVICT") != nullptr;
 #else
-    static const bool noRegs = false;
+    static const bool noRegs = false, noEvict = false;
 #endif
     if (!noRegs) {
         for (int r : {int(R20), int(R19), int(R18), int(R17), int(R16), int(R11), int(R10), int(R9), int(R8)})
@@ -2806,6 +2807,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         std::int32_t end;
         int reg;
         bool x;
+        std::uint32_t v;
     };
     std::vector<Active> active;
     std::int32_t slots = 0;
@@ -2826,7 +2828,23 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         if (!cross && !pool.empty()) {
             sval_[v].reg = std::int8_t(pool.back());
             pool.pop_back();
-            active.push_back(Active{last[v], sval_[v].reg, x});
+            active.push_back(Active{last[v], sval_[v].reg, x, v});
+        } else if (!cross && !noRegs && !noEvict) {
+            // No register free: the value of this kind that is needed longest gives up its own, when that is longer than
+            // this one is (a short value in a slot costs a store and a load; a long one, a load where it is read).
+            std::size_t far = active.size();
+            for (std::size_t a = 0; a < active.size(); ++a)
+                if (active[a].x == x && active[a].end > last[v] && (far == active.size() || active[a].end > active[far].end))
+                    far = a;
+            if (far < active.size()) {
+                const std::uint32_t w = active[far].v;
+                sval_[v].reg = std::int8_t(active[far].reg);
+                sval_[w].reg = -1;
+                sval_[w].slot = slots++;
+                active[far] = Active{last[v], sval_[v].reg, x, v};
+            } else {
+                sval_[v].slot = slots++;
+            }
         } else {
             sval_[v].slot = slots++;
         }

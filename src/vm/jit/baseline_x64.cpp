@@ -2639,6 +2639,15 @@ private:
     std::vector<std::pair<std::uint32_t, std::int8_t>> cacheSaved_;
     std::uint32_t cacheEnd_ = 0;
     void ssaLoadLoopCache(std::uint32_t h);
+    /// Per loop header: checks on each way in from before the loop, whose facts hold in all of it (an SSA value's kind
+    /// never changes). `ints`: phis made int32 whose input from before the loop is checked; `arrays`, `typed`: values the
+    /// loop does not write that it reads elements of.
+    struct LoopGuards
+    {
+        std::vector<std::uint32_t> ints, arrays, typed;
+    };
+    std::vector<LoopGuards> loopGuards_;
+    void ssaLoopGuards(std::uint32_t from, std::uint32_t to);
     bool ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter);
     void ssaEqualsCore(std::uint32_t i, bool loose, Label& bad);
     bool ssaTypeOf(std::uint32_t i);

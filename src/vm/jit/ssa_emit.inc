@@ -518,14 +518,57 @@ void Baseline::ssaEdgeMoves(std::uint32_t from, std::uint32_t to)
 
 /// Leave block `from` for block `to`: a back edge looks at the interrupt flag, puts in the slots the loop's head takes as
 /// given, and moves the phis; a forward edge moves the phis and leaves its frame state for the join.
+/// On a way into loop header `to` from before the loop: its checks (`loopGuards_`). One that fails leaves at the head,
+/// where the frame is what it is here.
+void Baseline::ssaLoopGuards(std::uint32_t from, std::uint32_t to)
+{
+    const LoopGuards& lg = loopGuards_[to];
+    if (lg.ints.empty() && lg.arrays.empty() && lg.typed.empty())
+        return;
+    const ssa::Block& tb = ssa_->blocks[to];
+    const ssa::Bits live = liveBefore_;
+    liveBefore_ = tb.liveIn;
+    exitAt_ = -1;
+    Label& bad = ssaExit(tb.start);
+    exitAt_ = -1;
+    liveBefore_ = live;
+    for (std::uint32_t p : lg.ints)
+        for (std::size_t k = 0; k < tb.preds.size(); ++k) {
+            const std::uint32_t v = ssa_->values[p].in[k];
+            if (tb.preds[k] != from || v == p || known(v, kVInt))
+                continue;
+            if (sval_[v].rep == kRepI32)
+                continue;
+            loadValue(v, RAX);
+            needInt(RAX, bad);
+            ssaKnow(v, kVInt | kVNotCell);
+        }
+    for (std::uint32_t v : lg.arrays)
+        if (!known(v, kVArray)) {
+            loadValue(v, RAX);
+            ssaNeedArray(v, RAX, ObjClass::Array, bad);
+        }
+    for (std::uint32_t v : lg.typed)
+        if (!known(v, kVTyped)) {
+            loadValue(v, RAX);
+            ssaNeedArray(v, RAX, ObjClass::TypedArray, bad);
+        }
+}
+
 void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to)
 {
     const ssa::Block& tb = ssa_->blocks[to];
     const unsigned nregs = code_->nregs;
     if (to > from) {
+        // What the loop's checks prove holds on this edge only: code emitted after it may be on another way.
+        const std::vector<std::uint8_t> known = tb.loopHeader ? vKnown_ : std::vector<std::uint8_t>{};
+        if (tb.loopHeader)
+            ssaLoopGuards(from, to);
         ssaEdgeMoves(from, to);
         ssaLoadLoopCache(to);
         edgeIn_[to].push_back(EdgeState{frame_, ssaFacts()});
+        if (tb.loopHeader)
+            vKnown_ = known;
         a_.jmp(blockLabel_[to]);
         return;
     }
@@ -743,7 +786,13 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         std::vector<std::uint32_t> st(nregs);
         for (unsigned r = 0; r < nregs; ++r)
             st[r] = r;  // the slots hold the entry values
-        edgeIn_[1].push_back(EdgeState{st, {}});
+        name_ = st;
+        frame_ = st;
+        liveBefore_ = g.blocks[1].liveIn;
+        ssaResetFacts();
+        if (g.blocks[1].loopHeader)
+            ssaLoopGuards(0, 1);
+        edgeIn_[1].push_back(EdgeState{st, ssaFacts()});
         ssaEdgeMoves(0, 1);
         ssaLoadLoopCache(1);
     }
@@ -950,8 +999,12 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                     a_.aluI(4, RDX, -2);
                     a_.cmpI(RDX, std::int32_t(kFalse));
                     a_.jcc(CNE, fail);
-                } else if (bits & kVObj) {
+                } else if (bits & (kVObj | kVArray | kVTyped)) {
                     needObject(RAX, fail);
+                    if (bits & (kVArray | kVTyped)) {
+                        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(bits & kVArray ? ObjClass::Array : ObjClass::TypedArray));
+                        a_.jcc(CNE, fail);
+                    }
                 } else if (bits & kVNotCell) {
                     Label ok;
                     a_.test(RAX, R15);
@@ -1450,36 +1503,47 @@ bool Baseline::ssaArith(std::uint32_t i)
     }
     const bool bitwise = op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor || op == Op::BitAndI ||
                          op == Op::BitOrI || op == Op::BitXorI || op == Op::ShlI || op == Op::ShrI;
-    if (bitwise) {
-        // ToInt32 of each operand: a double truncates.
-        loadToInt32(va, RAX, bad);
-        if (rr) {
-            a_.mov(RDI, RAX);
+    // Made in the result's own register when it has one that holds no operand (an exit reads the operands), else in
+    // rax; an int32 operand in a register is read where it is.
+    auto regOf = [&](std::uint32_t v) {
+        return v != ssa::kNone && !sval_[v].isConst && sval_[v].rep == kRepI32 && sval_[v].reg >= 0 ? sval_[v].reg : -1;
+    };
+    auto anyReg = [&](std::uint32_t v) { return v != ssa::kNone && !sval_[v].isConst ? sval_[v].reg : -1; };
+    const std::uint32_t def = ssa_->defBase[i];
+    const int rb = regOf(vb);
+    Reg t = RAX;
+    if (sval_[def].rep == kRepI32 && sval_[def].reg >= 0 && sval_[def].reg != anyReg(va) && sval_[def].reg != anyReg(vb))
+        t = Reg(sval_[def].reg);
+    if (bitwise)  // ToInt32 of each operand: a double truncates
+        loadToInt32(va, t, bad);
+    else
+        loadI32(va, t, &bad);
+    Reg b = RCX;
+    if (rr) {
+        if (rb >= 0)
+            b = Reg(rb);
+        else if (bitwise)
             loadToInt32(vb, RCX, bad);
-            a_.mov(RAX, RDI);
-        }
-    } else {
-        loadI32(va, RAX, &bad);
-        if (rr)
+        else
             loadI32(vb, RCX, &bad);
     }
     const std::int32_t imm = op == Op::Inc ? 1 : op == Op::Dec ? -1 : std::int32_t(std::int16_t(in.c));
     switch (op) {
-    case Op::AddI: case Op::Inc: case Op::Dec: a_.aluI32(0, RAX, imm); a_.jcc(CO, bad); break;
-    case Op::SubI: a_.aluI32(5, RAX, imm); a_.jcc(CO, bad); break;
-    case Op::BitAndI: a_.aluI32(4, RAX, imm); break;
-    case Op::BitOrI: a_.aluI32(1, RAX, imm); break;
-    case Op::BitXorI: a_.aluI32(6, RAX, imm); break;
-    case Op::ShlI: a_.shiftI32(4, RAX, imm & 31); break;
-    case Op::ShrI: a_.shiftI32(7, RAX, imm & 31); break;
-    case Op::Add: a_.alu32(0, RAX, RCX); a_.jcc(CO, bad); break;
-    case Op::Sub: a_.alu32(5, RAX, RCX); a_.jcc(CO, bad); break;
-    case Op::BitAnd: a_.alu32(4, RAX, RCX); break;
-    case Op::BitOr: a_.alu32(1, RAX, RCX); break;
-    case Op::BitXor: a_.alu32(6, RAX, RCX); break;
+    case Op::AddI: case Op::Inc: case Op::Dec: a_.aluI32(0, t, imm); a_.jcc(CO, bad); break;
+    case Op::SubI: a_.aluI32(5, t, imm); a_.jcc(CO, bad); break;
+    case Op::BitAndI: a_.aluI32(4, t, imm); break;
+    case Op::BitOrI: a_.aluI32(1, t, imm); break;
+    case Op::BitXorI: a_.aluI32(6, t, imm); break;
+    case Op::ShlI: a_.shiftI32(4, t, imm & 31); break;
+    case Op::ShrI: a_.shiftI32(7, t, imm & 31); break;
+    case Op::Add: a_.alu32(0, t, b); a_.jcc(CO, bad); break;
+    case Op::Sub: a_.alu32(5, t, b); a_.jcc(CO, bad); break;
+    case Op::BitAnd: a_.alu32(4, t, b); break;
+    case Op::BitOr: a_.alu32(1, t, b); break;
+    case Op::BitXor: a_.alu32(6, t, b); break;
     case Op::MulI: {
         // An overflow, or a zero that may be a negative zero: the interpreter's.
-        a_.imulI32(RDX, RAX, imm);
+        a_.imulI32(RDX, t, imm);
         a_.jcc(CO, bad);
         Label nz;
         a_.test32(RDX, RDX);
@@ -1487,28 +1551,32 @@ bool Baseline::ssaArith(std::uint32_t i)
         if (imm < 0) {
             a_.jmp(bad);
         } else {
-            a_.test32(RAX, RAX);
+            a_.test32(t, t);
             a_.jcc(CS, bad);
         }
         a_.bind(nz);
-        a_.mov32(RAX, RDX);
+        a_.mov32(t, RDX);
         break;
     }
     case Op::Mul: {
         // An overflow, or a zero that may be a negative zero (an operand below zero): the interpreter's.
-        a_.mov32(RDX, RAX);
-        a_.imul32(RAX, RCX);
+        a_.mov32(RDX, t);
+        a_.imul32(t, b);
         a_.jcc(CO, bad);
         Label nz;
-        a_.test32(RAX, RAX);
+        a_.test32(t, t);
         a_.jcc(CNE, nz);
-        a_.alu32(1, RDX, RCX);
+        a_.alu32(1, RDX, b);
         a_.jcc(CS, bad);
         a_.bind(nz);
         break;
     }
     default:
         break;
+    }
+    if (t != RAX) {
+        name_[in.a] = def;
+        return true;
     }
     ssaDefI32(i);
     return true;
@@ -1710,19 +1778,71 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             cls[v] = 3;
         }
     }
+    // A loop head whose instruction has not failed may check what comes in from before the loop (`loopGuards_`).
+    auto guarded = [&](std::uint32_t b) {
+        const ssa::Block& bl = g.blocks[b];
+        return ssaOn_ >= 2 && bl.loopHeader && !(bl.start < code_->prof.size() && (code_->prof[bl.start] & opt::kProfFailed));
+    };
+    // Whether forward input `in` of a phi can be checked to be an int32 on its way in (a boxed value that is not a constant).
+    auto checkable = [&](std::uint32_t in) { return !sval_[in].isConst && (cls[in] == 0 || cls[in] == 1 || cls[in] == 3); };
     for (bool changed = true; changed;) {
         changed = false;
         for (std::uint32_t b = 1; b < nb; ++b)
             for (std::uint32_t p : g.blocks[b].phis) {
-                std::uint8_t c = cls[p];
-                for (std::uint32_t in : g.values[p].in)
-                    if (in != p)
-                        c = std::max(c, cls[in]);
+                const ssa::Value& pv = g.values[p];
+                std::uint8_t c = cls[p], back = 0;
+                bool check = guarded(b);
+                for (std::size_t k = 0; k < pv.in.size(); ++k) {
+                    const std::uint32_t in = pv.in[k];
+                    if (in == p)
+                        continue;
+                    if (g.blocks[b].preds[k] >= b)
+                        back = std::max(back, cls[in]);
+                    else
+                        check = check && checkable(in);
+                }
+                // A loop's int32 that comes in boxed: an int32 phi, the input checked on its way in.
+                if (check && back == 1)
+                    c = std::max(c, back);
+                else
+                    for (std::uint32_t in : pv.in)
+                        if (in != p)
+                            c = std::max(c, cls[in]);
                 if (c != cls[p]) {
                     cls[p] = c;
                     changed = true;
                 }
             }
+    }
+    loopGuards_.assign(nb, {});
+    for (std::uint32_t b = 1; b < nb; ++b) {
+        if (!g.blocks[b].reached || !guarded(b))
+            continue;
+        const ssa::Block& bl = g.blocks[b];
+        for (std::uint32_t p : bl.phis) {
+            if (cls[p] != 1)
+                continue;
+            for (std::size_t k = 0; k < bl.preds.size(); ++k)
+                if (bl.preds[k] < b && g.values[p].in[k] != p && cls[g.values[p].in[k]] != 1) {
+                    loopGuards_[b].ints.push_back(p);
+                    break;
+                }
+        }
+        // Element reads and writes in place, of a value the loop does not write: its kind checked once.
+        for (std::uint32_t i = bl.start; i < bl.loopEnd; i = opt::nextOf(*code_, i)) {
+            const Op op = code_->code[i].opcode();
+            if (op != Op::GetElem && op != Op::PutElem)
+                continue;
+            ElemKind kind;
+            const int plan = ssaElemPlan(i, op == Op::PutElem, &kind);
+            const unsigned r = op == Op::GetElem ? code_->code[i].b : code_->code[i].a;
+            const std::uint32_t v = bl.nameIn[r];
+            if (!plan || v == ssa::kNone || ssa::bitTest(g.loopWrites[b], r) || sval_[v].isConst)
+                continue;
+            std::vector<std::uint32_t>& list = plan == 1 ? loopGuards_[b].arrays : loopGuards_[b].typed;
+            if (std::find(list.begin(), list.end(), v) == list.end())
+                list.push_back(v);
+        }
     }
     for (std::uint32_t v = 0; v < nv; ++v) {
         if (sval_[v].isConst)

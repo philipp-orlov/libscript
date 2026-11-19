@@ -2083,9 +2083,15 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     {
         std::uint32_t index;
         IVal value;
+        JSValue* own = nullptr;  ///< a data property of the constructor itself (a static field), read when stored
     };
     std::vector<Store> stores;
     std::vector<ValidityCell*> cells;
+    // Registers holding the constructor itself (its class's own name, an upvalue that cannot change), checked at run time;
+    // and those holding one of its data properties.
+    std::vector<std::int8_t> selfReg(C->nregs, 0);
+    std::vector<JSValue*> ownReg(C->nregs, nullptr);
+    std::vector<std::uint16_t> selfUpvals;
     const std::uint8_t aux = newSlotsOf(C, vm_.rootShapeFor(proto));
     std::uint32_t shape = vm_.rootShapeFor(proto)->id;
     std::vector<std::int8_t> constReg(C->nregs, 0);
@@ -2096,6 +2102,29 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
          j = jumpTo >= 0 ? std::uint32_t(std::exchange(jumpTo, -1)) : opt::nextOf(*C, j)) {
         const Ins& ci = C->code[j];
         switch (ci.opcode()) {
+        case Op::GetUpval: {
+            if (ci.a == 0 || ci.a <= C->nparams || ci.b >= f->nUpvals)
+                return false;
+            if (reinterpret_cast<Box*>(f->upvals()[ci.b])->value.bits != known.bits)
+                return false;
+            selfReg[ci.a] = 1;
+            constReg[ci.a] = 0;
+            ownReg[ci.a] = nullptr;
+            selfUpvals.push_back(ci.b);
+            break;
+        }
+        case Op::GetProp: {
+            if (ci.a == 0 || ci.a <= C->nparams || ci.b >= C->nregs || !selfReg[ci.b])
+                return false;
+            std::uint8_t attrs = 0;
+            JSValue* slot = f->findOwn(vm_, C->atoms[ci.c], &attrs);
+            if (!slot || (attrs & attr::kAccessor))
+                return false;
+            ownReg[ci.a] = slot;
+            constReg[ci.a] = 0;
+            selfReg[ci.a] = 0;
+            break;
+        }
         case Op::FieldInit:
             if (!(C->flags & CodeBlock::kClassConstructor) || ci.a == 0 || ci.a <= C->nparams)
                 return false;
@@ -2125,6 +2154,11 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             }
             // The value as the register holds it at this store: an argument (undefined past them) or a constant.
             IVal v;
+            if (ownReg[ci.c]) {
+                stores.push_back(Store{ic.index, v, ownReg[ci.c]});
+                shape = ic.next;
+                break;
+            }
             if (constReg[ci.c]) {
                 v.c = constVal[ci.c];
             } else if (ci.c <= C->nparams) {
@@ -2141,18 +2175,24 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         case Op::LoadUndef:
             if (ci.a == 0 || ci.a <= C->nparams)
                 return false;
+            selfReg[ci.a] = 0;
+            ownReg[ci.a] = nullptr;
             constReg[ci.a] = 1;
             constVal[ci.a] = JSValue::undefined();
             break;
         case Op::LoadInt:
             if (ci.a == 0 || ci.a <= C->nparams)
                 return false;
+            selfReg[ci.a] = 0;
+            ownReg[ci.a] = nullptr;
             constReg[ci.a] = 1;
             constVal[ci.a] = JSValue::int32(ci.imm());
             break;
         case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse:
             if (ci.a == 0 || ci.a <= C->nparams)
                 return false;
+            selfReg[ci.a] = 0;
+            ownReg[ci.a] = nullptr;
             constReg[ci.a] = 1;
             constVal[ci.a] = ci.opcode() == Op::LoadNull ? JSValue::null() : JSValue::boolean(ci.opcode() == Op::LoadTrue);
             break;
@@ -2211,6 +2251,16 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         for (ValidityCell* c : cells)
             hold(c);
     }
+    if (!selfUpvals.empty()) {
+        // The constructor's own name still names it (the code reads its static fields through it).
+        Label& bad = exitBefore(i);
+        for (std::uint16_t u : selfUpvals) {
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(f->upvals()[u]));
+            a_.movImm(RCX, known.bits);
+            a_.cmp(RCX, mem(RDX, kBoxValue));
+            a_.jcc(CNE, bad);
+        }
+    }
     // No room without a collection: the call the long way (to the constructor just checked).
     allocObject(shape, aux, slowPath);
     // Constants that are no cell go straight into the object; the rest through rax, the object kept on the stack.
@@ -2219,7 +2269,9 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     for (std::size_t k = 0; k < stores.size(); ++k) {
         const IVal& v = stores[k].value;
         const std::int64_t bits = std::int64_t(v.c.bits);
-        if (v.kind == IVal::Const && !v.c.isCell() && bits >= INT32_MIN && bits <= INT32_MAX) {
+        if (stores[k].own) {
+            rest = true;
+        } else if (v.kind == IVal::Const && !v.c.isCell() && bits >= INT32_MIN && bits <= INT32_MAX) {
             a_.mov(mem(RAX, kObjInline + std::int32_t(8 * stores[k].index)), std::int32_t(bits));
             inPlace[k] = 1;
         } else {
@@ -2233,6 +2285,22 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         if (inPlace[k])
             continue;
         const IVal& v = stores[k].value;
+        if (JSValue* own = stores[k].own) {
+            // The constructor's property as it is now: its shape was checked, so the slot is where it was.
+            JSValue* inl = f->inl();
+            if (own >= inl && own < inl + f->h.aux) {
+                a_.movImm(RDX, reinterpret_cast<std::uint64_t>(own));
+                a_.mov(RAX, mem(RDX, 0));
+            } else {
+                a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&f->slots));
+                a_.mov(RDX, mem(RDX, 0));
+                a_.mov(RAX, mem(RDX, std::int32_t(8 * (own - f->slots))));
+            }
+            retain(RAX);
+            a_.mov(RCX, inlineSlot(0));
+            a_.mov(mem(RCX, kObjInline + std::int32_t(8 * stores[k].index)), RAX);
+            continue;
+        }
         int from = -1;
         if (v.kind == IVal::Box && v.frameReg > int(code_->nparams) && v.slot > -2 && !movedFrom.count(v.frameReg) &&
             !fnBorrowed(unsigned(v.frameReg)) &&

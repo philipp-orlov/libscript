@@ -235,11 +235,21 @@ struct CodeSet
 {
     std::uint32_t low[8] = {};  ///< below 256
     Ranges high;                ///< the rest, as bare pairs to search
+    char32_t highLo = 0, highHi = 0;  ///< the span of `high` (empty: 0, 0)
     bool has(std::uint32_t c) const noexcept
     {
         if (c < 256)
             return low[c >> 5] >> (c & 31) & 1;
-        return !high.empty() && contains(high, c);
+        if (c < highLo || c > highHi)
+            return false;
+        if (high.size() <= 8) {
+            // A few ranges (a class of some characters): looked at in turn.
+            for (const auto& [lo, hi] : high)
+                if (c >= lo && c <= hi)
+                    return true;
+            return false;
+        }
+        return contains(high, c);
     }
     explicit CodeSet(const Ranges& r)
     {
@@ -248,6 +258,14 @@ struct CodeSet
                 low[c >> 5] |= 1u << (c & 31);
             if (hi >= 256)
                 high.emplace_back(std::max<char32_t>(lo, 256), hi);
+        }
+        if (!high.empty()) {
+            highLo = high.front().first;
+            highHi = high.front().second;
+            for (const auto& [lo, hi] : high) {
+                highLo = std::min(highLo, lo);
+                highHi = std::max(highHi, hi);
+            }
         }
     }
 };

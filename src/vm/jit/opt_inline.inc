@@ -2105,13 +2105,13 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     std::vector<const void*> keyReg(C->nregs, nullptr);
     std::int64_t fieldFnReg = -1, thisCopy = -1;
     // `this.#x = v` and the field initialiser's `#x = constant`: stores at the index the site found, the shape as it was.
-    auto privateStore = [&](const CodeBlock* B, std::uint32_t j, const void* key, bool define, IVal v) {
+    auto privateStore = [&](const CodeBlock* B, std::uint32_t j, const void* key, bool define, IVal v, JSValue* own = nullptr) {
         if (!key || j >= B->privCaches.size())
             return false;
         const PrivateCache& pc = B->privCaches[j];
         if (pc.key != key || pc.shape != shape || pc.index >= aux || (define ? pc.next == 0 : pc.next != 0))
             return false;
-        stores.push_back(Store{pc.index, v});
+        stores.push_back(Store{pc.index, v, own});
         if (define)
             shape = pc.next;
         return true;
@@ -2126,6 +2126,13 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         // A register read from an upvalue holds a private name or a private method's function: a constant either way,
         // its box checked when the code runs.
         auto upvalConst = [&](unsigned r) { return fkey[r] ? JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(fkey[r]))) : JSValue::undefined(); };
+        // A static field of the class (`color = Light.defaultColor`): its slot in the class, read when stored.
+        std::vector<JSValue*> fown(F->nregs, nullptr);
+        auto ownOf = [&](const void* key) -> JSValue* {
+            std::uint8_t attrs = 0;
+            JSValue* slot = f->findOwn(vm_, static_cast<CellPtr>(const_cast<void*>(key)), &attrs);
+            return slot && !(attrs & attr::kAccessor) ? slot : nullptr;
+        };
         for (std::uint32_t j = 0; j < F->code.size(); j = opt::nextOf(*F, j)) {
             const Ins& fi = F->code[j];
             switch (fi.opcode()) {
@@ -2137,7 +2144,25 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                     return false;
                 fkey[fi.a] = box->value.asCell();
                 fconst[fi.a] = 0;
+                fown[fi.a] = nullptr;
                 keyBoxes.emplace_back(box, box->value.bits);
+                break;
+            }
+            case Op::GetProp: case Op::GetElem: {
+                // A read of the class itself (its own name): a data property of its own.
+                if (fi.a == 0 || fi.b >= F->nregs || !fkey[fi.b] || upvalConst(fi.b).bits != known.bits)
+                    return false;
+                const void* key = nullptr;
+                if (fi.opcode() == Op::GetProp)
+                    key = F->atoms[fi.c];
+                else if (fi.c < F->nregs && fkey[fi.c])
+                    key = fkey[fi.c];
+                JSValue* slot = key ? ownOf(key) : nullptr;
+                if (!slot)
+                    return false;
+                fown[fi.a] = slot;
+                fkey[fi.a] = nullptr;
+                fconst[fi.a] = 0;
                 break;
             }
             case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt:
@@ -2145,6 +2170,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                     return false;
                 fconst[fi.a] = 1;
                 fkey[fi.a] = nullptr;
+                fown[fi.a] = nullptr;
                 fval[fi.a] = fi.opcode() == Op::LoadUndef ? JSValue::undefined() : fi.opcode() == Op::LoadNull ? JSValue::null()
                            : fi.opcode() == Op::LoadInt ? JSValue::int32(fi.imm()) : JSValue::boolean(fi.opcode() == Op::LoadTrue);
                 break;
@@ -2152,19 +2178,22 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                 if (fi.a != 0 || fi.b >= F->nregs || fi.c >= F->nregs || !fkey[fi.b])
                     return false;
                 IVal v;
+                JSValue* own = nullptr;
                 if (fconst[fi.c])
                     v.c = fval[fi.c];
                 else if (fi.opcode() == Op::DefPrivMethod && fkey[fi.c] && isFunction(upvalConst(fi.c)))
                     v.c = upvalConst(fi.c);
+                else if (fi.opcode() == Op::DefPrivate && fown[fi.c])
+                    own = fown[fi.c];
                 else
                     return false;
-                if (!privateStore(F, j, fkey[fi.b], true, v))
+                if (!privateStore(F, j, fkey[fi.b], true, v, own))
                     return false;
                 break;
             }
             case Op::InitProp: {
                 // A public field: added as the site found it.
-                if (fi.a != 0 || fi.c >= F->nregs || !fconst[fi.c] || j + 1 >= F->code.size())
+                if (fi.a != 0 || fi.c >= F->nregs || (!fconst[fi.c] && !fown[fi.c]) || j + 1 >= F->code.size())
                     return false;
                 const std::uint16_t cacheId = F->code[j + 1].a;
                 if (cacheId == kNoCache || cacheId >= F->caches.size())
@@ -2174,7 +2203,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                     return false;
                 IVal v;
                 v.c = fval[fi.c];
-                stores.push_back(Store{ic.index, v});
+                stores.push_back(Store{ic.index, v, fconst[fi.c] ? nullptr : fown[fi.c]});
                 shape = ic.next;
                 break;
             }
@@ -2282,7 +2311,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             if (cacheId == kNoCache)
                 return false;
             const InlineCache& ic = C->caches[cacheId];
-            if (ic.shape != shape || ic.next == 0 || ic.index >= aux)
+            // An add, or (after a field initialiser) a store over a field the object has.
+            if (ic.shape != shape || ic.index >= aux || (ic.next == 0 && (!fieldFn || ic.holder)))
                 return false;
             if (ic.validity) {
                 if (!ic.validity->valid)
@@ -2293,7 +2323,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             IVal v;
             if (ownReg[ci.c]) {
                 stores.push_back(Store{ic.index, v, ownReg[ci.c]});
-                shape = ic.next;
+                if (ic.next)
+                    shape = ic.next;
                 break;
             }
             if (constReg[ci.c]) {
@@ -2306,7 +2337,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                 return false;
             }
             stores.push_back(Store{ic.index, v});
-            shape = ic.next;
+            if (ic.next)
+                shape = ic.next;
             break;
         }
         case Op::LoadUndef:

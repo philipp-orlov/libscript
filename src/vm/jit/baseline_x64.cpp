@@ -3452,6 +3452,34 @@ void Baseline::strictJump(std::uint32_t i, const Ins& in)
         case Op::LoadFalse: k = std::int64_t(kFalse); break;
         default: break;
         }
+        if (p.opcode() == Op::LoadK && (p.a == in.a) != (p.a == in.b) && code_->consts[p.kIndex()].isCell() &&
+            reinterpret_cast<detail::GCObject*>(code_->consts[p.kIndex()].asCell())->kind == detail::CellKind::String) {
+            // Against a string constant (interned): the same cell, or a string of other characters, or another kind of
+            // value. A string not in the table is compared by the interpreter.
+            const JSValue kv = code_->consts[p.kIndex()];
+            Label& bad = slow(i);
+            Label eq, neq;
+            a_.mov(RAX, R(p.a == in.a ? in.b : in.a));
+            a_.movImm(RCX, kv.bits);
+            a_.cmp(RAX, RCX);
+            a_.jcc(CE, eq);
+            a_.cmp(RAX, RBP);
+            a_.jcc(CAE, neq);
+            a_.testI(RAX, 2);
+            a_.jcc(CNE, neq);
+            a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::String));
+            a_.jcc(CNE, neq);
+            a_.mov32(RDX, mem(RAX, kStrLength));
+            a_.alu32(7, RDX, mem(RCX, kStrLength));
+            a_.jcc(CNE, neq);
+            a_.cmpI8(mem(RAX, kStrInterned), 0);
+            a_.jcc(CE, bad);
+            a_.jmp(neq);  // two strings in the table are the same cell when they are equal
+            a_.bind(wantEqual ? eq : neq);
+            go(i, target);
+            a_.bind(wantEqual ? neq : eq);
+            return;
+        }
         if (k >= 0 && (p.a == in.a) != (p.a == in.b)) {
             if (auto tr = testReads_.find(i); tr != testReads_.end()) {
                 // The property read here, into no register.

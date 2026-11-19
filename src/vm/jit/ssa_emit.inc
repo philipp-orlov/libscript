@@ -2671,11 +2671,15 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 const Ins& in = code_->code[i];
                 const opt::Effects e = ssa::effects(*code_, i);
                 const Op op = in.opcode();
+                // The value a store into an integer typed array takes is truncated by the store.
+                ElemKind kind = ElemKind::Float64;
+                const bool intStore = op == Op::PutElem && ssaElemPlan(i, true, &kind) == 2 && kind != ElemKind::Float32 &&
+                                      kind != ElemKind::Float64;
                 for (std::uint16_t r : e.rd) {
                     const std::uint32_t v = names[r];
                     if (v == ssa::kNone)
                         continue;
-                    if (truncates(op))
+                    if (truncates(op) || (intStore && r == in.c && in.a != in.c && in.b != in.c))
                         continue;
                     if (isWrapOp(op) && g.defBase[i] != ssa::kNone && wrapOk_[g.defBase[i]])
                         wrapUsers[v].push_back(g.defBase[i]);

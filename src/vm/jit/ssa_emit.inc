@@ -331,7 +331,37 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
     ssaSync(reads, keep, clobber);
     if (ssaFailed_)
         return;
+    // A call covers the registers above its operands with the callee's frame: a slot known to hold no cell is
+    // overwritten without a look (`windowPlain`). A register above the parameters that still holds its entry value holds
+    // undefined.
+    ssaPlainWin_.assign(nregs, 0);
+    if (in.opcode() == Op::Call || in.opcode() == Op::New || in.opcode() == Op::SuperCall)
+        for (unsigned r = in.b + 1u; r < nregs; ++r) {
+            const std::uint32_t v = frame_[r];
+            if (v == ssa::kNone)
+                continue;
+            const SVal& s = sval_[v];
+            const bool plain = s.isConst ? !JSValue::raw(s.bits).isCell()
+                                         : s.rep != kRepTagged || (vKnown_[v] & kVNotCell) ||
+                                               (v == r && ssa_->values[v].kind == ssa::Value::Entry && r > code_->nparams);
+            ssaPlainWin_[r] = plain;
+        }
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("WINDBG") && (in.opcode() == Op::Call || in.opcode() == Op::New)) {
+        std::fprintf(stderr, "win %s @%u b%u argc%u nregs%u:", code_->name ? toUtf8(static_cast<StringCell*>(code_->name)->text()).c_str() : "anon", i, unsigned(in.b), unsigned(in.c), nregs);
+        for (unsigned r = in.b + 2u + in.c; r < nregs; ++r)
+            std::fprintf(stderr, " r%u:%s", r, frame_[r] == ssa::kNone ? "?" : ssaPlainWin_[r] ? "p" : "c");
+        std::fprintf(stderr, "\n");
+    }
+#endif
+    if (CodeBlock* C = ssaDirectCallee(i)) {
+        Label slow;
+        ssaDirectCall(i, C, slow);
+        a_.jmp(at_[i + length(i)]);
+        a_.bind(slow);
+    }
     emit(i);
+    ssaPlainWin_.clear();
     a_.bind(at_[i + length(i)]);  // where the template's long way comes back
     ssaForgetShapes();
     for (unsigned r = 0; r < nregs; ++r)
@@ -926,6 +956,12 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                 ssaRet(i);
                 ended = true;
                 break;
+            case Op::New:
+                if (!native_[i])
+                    ssaGeneric(i, liveAfter[b][k]);
+                else if (!ssaNew(i, liveAfter[b][k]))
+                    a_.jmp(ssaExit(i));
+                break;
             case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
             case Op::ShlI: case Op::ShrI: case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr:
             case Op::BitXor: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Div: case Op::MulI:
@@ -1498,6 +1534,288 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
     return true;
 }
 
+/// Whether `new` instruction `i` can be made in place (`SsaNew`): its constructor, as the register's last global or upvalue
+/// read found it, is a plain function whose body stores arguments or constants into new properties of `this` (each an
+/// add its cache saw, into an inline slot) and returns undefined.
+bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
+{
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || in.opcode() != Op::New || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return false;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    static const bool noNew = std::getenv("SSA_NONEW") != nullptr;
+    if (noNew)
+        return false;
+#endif
+    const JSValue known = guessBefore(i, in.b);
+    if (!isFunction(known))
+        return false;
+    auto* f = static_cast<JSFunction*>(asObject(known));
+    if ((f->flags & JSFunction::kNative) || !vm_.prototypeAt2(f))
+        return false;
+    CodeBlock* C = f->code;
+    if (!C || !C->constructor ||
+        (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
+                     CodeBlock::kNeedsArgs | CodeBlock::kDerived | CodeBlock::kClassConstructor)))
+        return false;
+    const JSValue pv = *f->slotAt(2);
+    if (!isObject(pv))
+        return false;
+    const Shape* root = vm_.rootShapeFor(asObject(pv));
+    SsaNew p;
+    p.fn = known;
+    p.proto = pv;
+    p.fnShape = f->h.shape;
+    p.aux = newSlotsOf(C, root);
+    p.shape = root->id;
+    if (!canAllocObject(p.aux))
+        return false;
+    std::vector<std::int8_t> isConst(C->nregs, 0);
+    std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
+    for (std::uint32_t j = 0; j < C->code.size(); j = opt::nextOf(*C, j)) {
+        const Ins& ci = C->code[j];
+        switch (ci.opcode()) {
+        case Op::Nop:
+            break;
+        case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt:
+            if (ci.a <= C->nparams)
+                return false;
+            isConst[ci.a] = 1;
+            constVal[ci.a] = ci.opcode() == Op::LoadUndef ? JSValue::undefined() : ci.opcode() == Op::LoadNull ? JSValue::null()
+                           : ci.opcode() == Op::LoadInt ? JSValue::int32(ci.imm()) : JSValue::boolean(ci.opcode() == Op::LoadTrue);
+            break;
+        case Op::PutProp: {
+            if (ci.a != 0 || ci.c == 0 || ci.c >= C->nregs || j + 1 >= C->code.size() || C->code[j + 1].opcode() != Op::Cache)
+                return false;
+            const std::uint16_t cacheId = C->code[j + 1].a;
+            if (cacheId == kNoCache)
+                return false;
+            const InlineCache& ic = C->caches[cacheId];
+            if (ic.shape != p.shape || ic.next == 0 || ic.index >= p.aux || ic.holder || ic.pad)
+                return false;
+            if (ic.validity) {
+                if (!ic.validity->valid)
+                    return false;
+                p.cells.push_back(ic.validity);
+            }
+            if (isConst[ci.c])
+                p.stores.push_back(SsaNew::Store{ic.index, -1, constVal[ci.c]});
+            else if (ci.c <= C->nparams)
+                p.stores.push_back(ci.c - 1u < in.c ? SsaNew::Store{ic.index, int(ci.c) - 1, JSValue::undefined()}
+                                                    : SsaNew::Store{ic.index, -1, JSValue::undefined()});
+            else
+                return false;
+            p.shape = ic.next;
+            break;
+        }
+        case Op::Ret:
+            if (ci.a >= C->nregs || !isConst[ci.a] || !constVal[ci.a].isUndefined())
+                return false;
+            if (out)
+                *out = std::move(p);
+            return true;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+/// `new` made in place (`ssaNewPlan`): every check before the object is made. When the heap's current block has no
+/// room or a collection is due, the same object is made by the runtime (`scriptVmSsaNewObject`), then filled here.
+bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
+{
+    SsaNew p;
+    if (!ssaNewPlan(i, &p))
+        return false;
+    const Ins& in = code_->code[i];
+    {
+        Label& bad = ssaExit(i);
+        holdValue(p.fn);
+        holdValue(p.proto);
+        loadValue(name_[in.b], RAX);
+        a_.movImm(RCX, p.fn.bits);
+        a_.cmp(RCX, RAX);
+        a_.jcc(CNE, bad);
+        a_.cmpI32(mem(RAX, 0), std::int32_t(p.fnShape));
+        a_.jcc(CNE, bad);
+        a_.mov(RDX, mem(RAX, kObjSlots));
+        a_.movImm(RCX, p.proto.bits);
+        a_.cmp(RCX, mem(RDX, 16));
+        a_.jcc(CNE, bad);
+        std::sort(p.cells.begin(), p.cells.end());
+        p.cells.erase(std::unique(p.cells.begin(), p.cells.end()), p.cells.end());
+        for (ValidityCell* c : p.cells) {
+            hold(c);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(c));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+        }
+    }
+    // The result's register lets go of what it held, and the runtime may collect: every live value, and every argument
+    // stored, gets an owner first.
+    {
+        std::vector<std::uint8_t> clobber(code_->nregs, 0);
+        clobber[in.a] = 1;
+        ssa::Bits keep = liveAfter;
+        ssa::bitClear(keep, in.a);
+        std::vector<unsigned> args;
+        for (const SsaNew::Store& st : p.stores)
+            if (st.arg >= 0)
+                args.push_back(in.b + 2u + unsigned(st.arg));
+        ssaSync(args, keep, clobber);
+        if (ssaFailed_)
+            return true;
+    }
+    exitAt_ = -1;
+    Label& failed = ssaExit(i);  // the runtime could not make it: the instruction runs again in the interpreter
+    exitAt_ = -1;
+    Label slowAlloc, allocated, after;
+    allocObject(p.shape, p.aux, slowAlloc);
+    a_.bind(allocated);
+    for (const SsaNew::Store& st : p.stores) {
+        const Mem slot = mem(RAX, kObjInline + std::int32_t(8 * st.index));
+        if (st.arg < 0) {
+            const std::int64_t bits = std::int64_t(st.c.bits);
+            if (bits >= INT32_MIN && bits <= INT32_MAX) {
+                a_.mov(slot, std::int32_t(bits));
+            } else {
+                a_.movImm(RCX, st.c.bits);
+                a_.mov(slot, RCX);
+            }
+            continue;
+        }
+        const std::uint32_t v = name_[in.b + 2u + unsigned(st.arg)];
+        loadValue(v, RCX);
+        if (mayBeCell(v))
+            retain(RCX);
+        a_.mov(slot, RCX);
+    }
+    // Into the result's slot, which owns it.
+    a_.mov(RDI, R(in.a));
+    a_.mov(R(in.a), RAX);
+    release(RDI);
+    a_.mov(RAX, R(in.a));
+    a_.jmp(after);
+    a_.bind(slowAlloc);
+    {
+        const std::vector<int> keep = ssaLiveRegs();
+        ssaSaveRegs(keep);
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, p.shape);
+        a_.movImm(RDX, p.aux);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaNewObject));
+        a_.callC(RAX);
+        ssaRestoreRegs(keep);
+        a_.test(RAX, RAX);
+        a_.jcc(CE, failed);
+        a_.jmp(allocated);
+    }
+    a_.bind(after);
+    ssaDef(i, kVObj);
+    frame_[in.a] = ssa_->defBase[i];
+    ssaKnow(ssa_->defBase[i], kVObj, p.shape);
+    return true;
+}
+
+CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
+{
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || in.opcode() != Op::Call || i >= code_->callProf.size() || !code_->callProf[i])
+        return nullptr;
+    CodeBlock* C = vm_.codeByUid(code_->callProf[i]);
+    if (!C || C->inlinedFrom || in.c > C->nparams ||
+        (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+                     CodeBlock::kClassConstructor | CodeBlock::kProgram)))
+        return nullptr;
+    return C;
+}
+
+/// `Call` of a function of code `C` (the frame written: the callee, `this` and the arguments in their slots), its frame
+/// pushed from constants; anything else goes to `slow`, the baseline call sequence. Comes back after the instruction.
+void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
+{
+    const Ins& in = code_->code[i];
+    const unsigned base = in.b, argc = in.c;
+    throws_.emplace_back(i, Label{});
+    Label& exc = throws_.back().second;
+    // The register holds a function of that code (compared by uid: a block that died leaves no stale match).
+    a_.mov(RAX, R(base));
+    needObject(RAX, slow);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+    a_.jcc(CNE, slow);
+    a_.mov(RCX, mem(RAX, kFnCode));
+    a_.test(RCX, RCX);
+    a_.jcc(CE, slow);
+    a_.movImm(RDX, C->uid);
+    a_.cmp(RDX, mem(RCX, kCbUid));
+    a_.jcc(CNE, slow);
+    a_.mov(RDX, mem(RCX, kCbTier1));
+    a_.test(RDX, RDX);
+    a_.jcc(CE, slow);
+    a_.lea(R9, R(base + 1));
+    // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
+    a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 8)));
+    a_.alu(7, R10, mem(R12, kVmStackInit));
+    a_.jcc(CA, slow);
+    a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame))));
+    a_.alu(7, R11, mem(R12, kVmFrameLimit));
+    a_.jcc(CAE, slow);
+    a_.alu(7, RSP, mem(R12, kVmStackFloor));
+    a_.jcc(CB, slow);
+    a_.cmpI32(mem(R12, kVmTicks), 1);
+    a_.jcc(CBE, slow);
+    a_.dec32(mem(R12, kVmTicks));
+    // Caller registers the callee's frame covers past the arguments: a plain one is overwritten, a cell goes the long way.
+    const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
+    for (unsigned r = 1 + argc; r < window && r < C->nregs; ++r) {
+        if (!windowPlain(i, base + 1 + r)) {
+            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
+            a_.test(RDI, R15);
+            a_.jcc(CE, slow);
+        }
+        a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+    }
+    if (!(C->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) {
+        // A sloppy function called with no `this` gets the global object.
+        Label thisOk;
+        a_.mov(RDI, R(base + 1));
+        a_.aluI(4, RDI, -9);
+        a_.cmpI(RDI, std::int32_t(kNull));
+        a_.jcc(CNE, thisOk);
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
+        a_.inc32(mem(RDI, kHdrRc));
+        a_.mov(R(base + 1), RDI);
+        a_.bind(thisOk);
+    }
+    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+    a_.mov(mem(R13, kFramePc), RDI);
+    static_assert(sizeof(Frame) == 64, "a frame is found by a shift");
+    a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
+    a_.mov(mem(R12, kVmFrameTop), RDI);
+    a_.mov(mem(R11, kFrameCode), RCX);
+    a_.mov(mem(R11, kFrameFn), RAX);
+    a_.mov(mem(R11, kFramePc), 0);
+    a_.mov(mem(R11, kFrameR), R9);
+    a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
+    a_.mov(mem(R11, kFrameRetDst), RDI);
+    a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
+    bool reads = false;
+    for (const Ins& ci : C->code)
+        reads = reads || ci.opcode() == Op::NewTarget || ci.opcode() == Op::SetNewTarget || ci.opcode() == Op::SuperCall;
+    if (reads) {
+        a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+        a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+    }
+    a_.mov(RSI, R11);
+    a_.mov(RDI, R9);
+    a_.mov(RDX, mem(RDX, kTierEntry));
+    a_.callReg(RDX);
+    a_.test(RAX, RAX);
+    a_.jcc(CE, exc);
+    write(in.a, RAX);
+}
+
 bool Baseline::ssaArith(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
@@ -1702,6 +2020,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     };
     switch (op) {
     case Op::GetProp: return plainReadable(i);
+    case Op::New: return ssaNewPlan(i, nullptr);
     case Op::PutProp: return ssaPutFast(i);
     case Op::GetGlobal: return ssaGlobalFast(i);
     case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox:

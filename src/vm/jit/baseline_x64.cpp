@@ -564,6 +564,36 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     const Ins* ins = code->code.data() + index;
     JSValue* R = fr->R;
     const std::uint32_t base = ins->b, argc = ins->c;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    static const bool callDbg = std::getenv("CALLDBG") != nullptr;
+    if (callDbg) {
+        static std::map<std::string, long>* counts = nullptr;
+        if (!counts) {
+            counts = new std::map<std::string, long>;
+            std::atexit([] {
+                std::vector<std::pair<long, std::string>> v;
+                for (auto& [k, n] : *counts)
+                    v.emplace_back(n, k);
+                std::sort(v.rbegin(), v.rend());
+                for (std::size_t k = 0; k < v.size() && k < 25; ++k)
+                    std::fprintf(stderr, "calldbg %8ld %s\n", v[k].first, v[k].second.c_str());
+            });
+        }
+        const JSValue cv = R[base];
+        std::string what = "other";
+        if (isFunction(cv)) {
+            auto* f = static_cast<JSFunction*>(asObject(cv));
+            if (f->flags & JSFunction::kNative)
+                what = f->rare() && !f->rare()->boundTarget.isUndefined() ? "bound" : "native";
+            else
+                what = std::string("js ") + (f->code->tier1 ? "t1 " : "no-t1 ") + "np" + std::to_string(f->code->nparams) +
+                       " flags" + std::to_string(f->code->flags) + " nregs" + std::to_string(f->code->nregs);
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof buf, " @%u %s argc%u t2%d", index, opName(ins->opcode()), argc, code->tier2 != nullptr);
+        (*counts)[(code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon")) + buf + " -> " + what]++;
+    }
+#endif
     if (ins->opcode() == Op::Call)
         jitUnwrapBound(R, base);
     const JSValue callee = R[base];
@@ -753,6 +783,22 @@ extern "C" CallResult scriptVmJitCall(VM* vm, std::uint32_t index)
 extern "C" void scriptVmJitFree(CellPtr cell)
 {
     detail::destroyUnreferenced(cell);
+}
+
+/// The SSA tier's `new` made in place, when the heap's current block has no room or a collection is due: the object as
+/// `VM::newObject` makes it, with the shape the constructor gives it (its slots are filled by the caller). Null when the
+/// runtime refused.
+extern "C" JSObject* scriptVmSsaNewObject(VM* vm, std::uint32_t shape, std::uint32_t aux)
+{
+    try {
+        auto* o = static_cast<JSObject*>(vm->allocCell(JSObject::bytesFor(std::uint8_t(aux)), Kind::Object, ObjClass::Plain,
+                                                       std::uint8_t(aux)));
+        o->h.shape = shape;
+        o->slots = nullptr;
+        return o;
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 /// Let go of `count` registers from `first` and leave undefined in them.
@@ -2519,8 +2565,12 @@ private:
     }
     bool windowPlain(std::uint32_t i, unsigned reg) const
     {
+        if (ssa_)
+            return reg < ssaPlainWin_.size() && ssaPlainWin_[reg];
         return optimizing() && ((reg < plainRegs_.size() && plainRegs_[reg]) || plainAt(i, reg));
     }
+    /// The SSA tier, at a call: the frame registers whose slots hold no cell (`windowPlain`).
+    std::vector<std::uint8_t> ssaPlainWin_;
     /// The caller registers past a call's arguments, `r9` the callee's registers and `rsi` its register count: those it
     /// covers made undefined, a cell in one taking the long way. A plain one (dead, never a cell) is written whether
     /// covered or not.
@@ -2732,6 +2782,27 @@ private:
     ssa::Bits curLiveAfter_;  ///< and after it
     Label& ssaExit(std::uint32_t i);
     void ssaImmature(std::uint32_t i);
+    /// `new` made in place by the SSA tier: a plain constructor that only stores its arguments and constants into new
+    /// properties of `this`.
+    struct SsaNew
+    {
+        JSValue fn, proto;
+        std::uint32_t fnShape = 0, shape = 0;
+        std::uint8_t aux = 0;
+        struct Store
+        {
+            std::uint32_t index;
+            int arg;    ///< the argument (0-based), or -1: `c`
+            JSValue c;
+        };
+        std::vector<Store> stores;
+        std::vector<ValidityCell*> cells;
+    };
+    bool ssaNewPlan(std::uint32_t i, SsaNew* out);
+    bool ssaNew(std::uint32_t i, const ssa::Bits& liveAfter);
+    /// The callee a `Call` has always called, by its code's uid (`callProf`), when its frame can be pushed from constants.
+    CodeBlock* ssaDirectCallee(std::uint32_t i) const;
+    void ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow);
     void ssaKnow(std::uint32_t v, std::uint8_t bits, std::uint32_t shape = 0);
     void ssaForgetShapes();
     void ssaResetFacts();

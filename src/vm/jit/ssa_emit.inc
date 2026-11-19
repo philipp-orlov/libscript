@@ -3268,19 +3268,48 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
     a_.jcc(CAE, bad);
     a_.mov(RDX, mem(RAX, kArrayElems));
     a_.lea(RDX, mem(RDX, RCX, 8));
+    // A hole of a plain array whose prototypes nothing can intercept a store with (`plainHoleGuard`): filled here.
+    Label hole;
     if (number) {
         // A number over a number: nothing to count or let go of.
         a_.mov(RDI, mem(RDX, 0));
+        a_.cmpI(RDI, std::int32_t(kHole));
+        a_.jcc(CE, hole);
         a_.test(RDI, R14);
         a_.jcc(CE, bad);
     } else {
         a_.cmpI(mem(RDX, 0), std::int32_t(kHole));
-        a_.jcc(CE, bad);
+        a_.jcc(CE, hole);
     }
     loadValue(vx, RSI);
+    auto fillHole = [&]() {
+        // Below `packed` there is no hole: the index is at or above it.
+        a_.bind(hole);
+        if (!plainHoleGuard(RDI, bad)) {
+            a_.jmp(bad);
+            return;
+        }
+        loadValue(vx, RSI);
+        if (number) {
+            packAt(RAX, RCX);
+        } else {
+            retain(RSI);
+            Label isNumber, stored;
+            a_.test(RSI, R14);
+            a_.jcc(CNE, isNumber);
+            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+            a_.jmp(stored);
+            a_.bind(isNumber);
+            packAt(RAX, RCX);
+            a_.bind(stored);
+        }
+        a_.mov(mem(RDX, 0), RSI);
+    };
     if (number) {
         packAt(RAX, RCX);
         a_.mov(mem(RDX, 0), RSI);
+        a_.jmp(join);
+        fillHole();
         return true;
     }
     retain(RSI);
@@ -3296,6 +3325,8 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
     a_.mov(RDI, mem(RDX, 0));
     a_.mov(mem(RDX, 0), RSI);
     release(RDI);
+    a_.jmp(join);
+    fillHole();
     return true;
 }
 

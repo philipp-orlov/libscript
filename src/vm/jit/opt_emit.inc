@@ -1269,6 +1269,49 @@ bool Baseline::emitTyped(std::uint32_t i)
         }
         return true;
     }
+    case Op::Eq: case Op::Ne: case Op::StrictEq: case Op::StrictNe: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: {
+        // A compare of numbers held as numbers: the boolean made from the flags, no trip of the operands through the frame.
+        if (dw >= 0 || uw.size() < 2 || !allTyped())
+            return false;
+        const Relation rel = relationOf(op);
+        const bool equality = op == Op::Eq || op == Op::Ne || op == Op::StrictEq || op == Op::StrictNe;
+        const bool negate = op == Op::Ne || op == Op::StrictNe;
+        Label yes, done;
+        if (isI32(uw[0]) && isI32(uw[1])) {
+            const Reg x = useI32(uw[0], RAX);
+            const Reg y = useI32(uw[1], RCX);
+            a_.alu32(7, x, y);
+            a_.jcc(rel.ic, yes);
+        } else {
+            const int xa = operandF64(uw[0], 0, RAX);
+            const int xb = operandF64(uw[1], 1, RCX);
+            if (equality) {
+                a_.ucomisd(xa, xb);
+                if (negate) {
+                    a_.jcc(CP, yes);
+                    a_.jcc(CNE, yes);
+                } else {
+                    Label no;
+                    a_.jcc(CP, no);
+                    a_.jcc(CE, yes);
+                    a_.bind(no);
+                }
+            } else {
+                if (rel.swap)
+                    a_.ucomisd(xb, xa);
+                else
+                    a_.ucomisd(xa, xb);
+                a_.jcc(rel.dc, yes);
+            }
+        }
+        a_.movImm(RAX, kFalse);
+        a_.jmp(done);
+        a_.bind(yes);
+        a_.movImm(RAX, kTrue);
+        a_.bind(done);
+        write(in.a, RAX);
+        return true;
+    }
     case Op::JTrue: case Op::JFalse: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe:
     case Op::JNotGt: case Op::JNotGe: case Op::JLtI: case Op::JLeI: case Op::JGtI: case Op::JGeI: case Op::JNotLtI:
     case Op::JNotLeI: case Op::JNotGtI: case Op::JNotGeI: case Op::JStrictEq: case Op::JStrictNe: case Op::JStrictEqI:

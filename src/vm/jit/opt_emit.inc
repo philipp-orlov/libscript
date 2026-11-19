@@ -1131,7 +1131,7 @@ bool Baseline::emitTyped(std::uint32_t i)
     }
     case Op::PutProp: {
         // A number stored to an existing own data property: boxed in place, no trip through the frame.
-        if (uw.size() < 2 || uw[0] >= 0 || uw[1] < 0)
+        if (uw.size() < 2 || uw[0] >= 0)
             return false;
         const std::uint16_t cacheId = code_->code[i + 1].a;
         if (cacheId == kNoCache)
@@ -1144,6 +1144,20 @@ bool Baseline::emitTyped(std::uint32_t i)
         if (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
             return false;
         Label& bad = exitBefore(i);
+        if (uw[1] < 0) {
+            // Any other value from the frame, to the same kind of property: the guards the facts already cover are not
+            // repeated; the value is counted, the old one let go. A guard that fails leaves the code before the store.
+            const Mem slot = provenSlotMem(in.a, ic.shape, ic.index, ic.aux, bad);
+            a_.mov(RCX, R(in.c));
+            retain(RCX);
+            a_.mov(RSI, slot);
+            a_.mov(slot, RCX);
+            release(RSI);
+            for (auto it = factNum_.begin(); it != factNum_.end();)
+                it = it->first.second == ic.index ? factNum_.erase(it) : std::next(it);
+            raxObj_ = -1;
+            return true;
+        }
         const bool failed = false;
         // The value boxed in rdi first (finding the slot uses rax, rcx, rdx and rsi), then stored into the slot.
         const std::int32_t vw = uw[1];

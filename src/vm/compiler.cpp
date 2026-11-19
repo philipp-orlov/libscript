@@ -2452,6 +2452,14 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
         condJump(*cond.a, whenTrue);
         return;
     }
+    if (cond.kind == NK::Binary && !noFuse_ && (cond.op == Tok::EqEq || cond.op == Tok::NotEq) && cond.b->kind == NK::NullLit) {
+        // `x == null` and `x != null`: one test of the value, no boolean.
+        const std::uint16_t mark = fn_->top;
+        const std::uint16_t a = exprAny(*cond.a);
+        emitJump(cond.op == Tok::EqEq ? Op::JNullish : Op::JNotNullish, a, whenTrue);
+        fn_->top = mark;
+        return;
+    }
     if (cond.kind == NK::Binary && !noFuse_) {
         Op fused = Op::Nop;
         switch (cond.op) {
@@ -2506,6 +2514,14 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
     }
     if (cond.kind == NK::Unary && cond.op == Tok::Bang) {
         condJumpTrue(*cond.a, whenFalse);
+        return;
+    }
+    if (cond.kind == NK::Binary && !noFuse_ && (cond.op == Tok::EqEq || cond.op == Tok::NotEq) && cond.b->kind == NK::NullLit) {
+        // `x == null` and `x != null`: one test of the value, no boolean.
+        const std::uint16_t mark = fn_->top;
+        const std::uint16_t a = exprAny(*cond.a);
+        emitJump(cond.op == Tok::EqEq ? Op::JNotNullish : Op::JNullish, a, whenFalse);
+        fn_->top = mark;
         return;
     }
     if (cond.kind == NK::Binary && !noFuse_) {

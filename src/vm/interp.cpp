@@ -4819,7 +4819,11 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     g->state = GenState::Running;
     JSValue* savedTop = stackTop;
     *frameTop++ = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, 0, false, true, JSValue::undefined(), generator};
-    const JSValue result = run(*this);
+    // A body resumed often runs in compiled code from where it stopped (a `yield` or `await` there is one instruction of
+    // the interpreter's, which leaves the frame as it does). A resumption that throws starts in the interpreter.
+    if (!c->tier1 && !c->tier1Failed && tier1Threshold && ++c->hotness >= tier1Threshold)
+        compileTier1(*this, c);
+    const JSValue result = c->tier1 && !resumeThrow ? enterTier1(*this, c->tier1, g->pcIndex) : run(*this);
     stackTop = savedTop;
     const bool finished = g->state == GenState::Running;
     g->prologue = false;

@@ -5403,7 +5403,8 @@ bool tier1Available() noexcept
 void compileTier1(VM& vm, CodeBlock* code)
 {
     code->tier1Failed = true;
-    if (code->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen))
+    // Async functions are resumed for a few instructions each time: they stay in the interpreter.
+    if (code->flags & (CodeBlock::kAsync | CodeBlock::kAsyncGen))
         return;
     const std::size_t limit = vm.ctx.options.jit.codeCacheLimit;
     if (code->code.size() > 20000 || !entryStub())

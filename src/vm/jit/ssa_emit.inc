@@ -303,10 +303,22 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
 {
     const Ins& in = code_->code[i];
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
-    if (std::getenv("SSA_GENERIC"))
-        std::fprintf(stderr, "ssa generic %s @%u %s prof %d\n",
+    if (std::getenv("SSA_GENERIC")) {
+        std::string ic;
+        if (i + 1 < n_ && code_->code[i + 1].opcode() == Op::Cache && code_->code[i + 1].a != kNoCache) {
+            const InlineCache& c = code_->caches[code_->code[i + 1].a];
+            char buf[96];
+            std::snprintf(buf, sizeof buf, " ic shape %u next %u holder %d valid %d pad %u", c.shape, c.next, c.holder != nullptr,
+                          c.validity ? int(c.validity->valid) : -1, unsigned(c.pad));
+            ic = buf;
+            if (in.opcode() == Op::GetProp && in.c < code_->atoms.size() && code_->atoms[in.c] &&
+                isString(JSValue::cell(code_->atoms[in.c])))
+                ic += " ." + toUtf8(static_cast<StringCell*>(code_->atoms[in.c])->text());
+        }
+        std::fprintf(stderr, "ssa generic %s @%u %s prof %d%s\n",
                      code_->name ? toUtf8(static_cast<StringCell*>(code_->name)->text()).c_str() : "anon", i,
-                     opName(in.opcode()), i < code_->prof.size() ? int(code_->prof[i]) : -1);
+                     opName(in.opcode()), i < code_->prof.size() ? int(code_->prof[i]) : -1, ic.c_str());
+    }
 #endif
     const opt::Effects e = ssa::effects(*code_, i);
     const unsigned nregs = code_->nregs;

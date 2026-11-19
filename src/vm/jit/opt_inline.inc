@@ -550,6 +550,38 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
             regs[ci.a] = out;
             break;
         }
+        case Op::GetElem: {
+            // `this.#x` of a getter or small method: the name and the shape the site found, checked, then the slot.
+            if (!(C->flags & CodeBlock::kPrivate) || j >= C->privCaches.size())
+                return false;
+            const PrivateCache& pc = C->privCaches[j];
+            const IVal recv = regs[ci.b], keyv = regs[ci.c];
+            if (!pc.key || !pc.shape || recv.kind != IVal::Box || keyv.kind != IVal::Box || stale(recv) || stale(keyv) ||
+                (C->prof[j] & opt::kProfFailed))
+                return false;
+            Label* bad = cx.fail(this);
+            if (!bad)
+                return false;
+            if (emit) {
+                const JSValue key = JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(pc.key)));
+                holdValue(key);
+                inlineBits(keyv, RCX);
+                a_.movImm(RDX, key.bits);
+                a_.cmp(RCX, RDX);
+                a_.jcc(CNE, *bad);
+                inlineBits(recv, RAX);
+                needObject(RAX, *bad);
+                a_.cmpI32(mem(RAX, 0), std::int32_t(pc.shape));
+                a_.jcc(CNE, *bad);
+                slotAddress(pc.index);
+                a_.mov(RAX, mem(RDX, 0));
+            }
+            IVal out;
+            if (!takeRead(p, bad, out))
+                return false;
+            regs[ci.a] = out;
+            break;
+        }
         case Op::GetSuperProp: {
             // The slot the baseline code found, while this function's home object and its chain are as they were.
             if (j >= C->superCaches.size())

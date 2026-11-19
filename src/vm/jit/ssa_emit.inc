@@ -2231,7 +2231,8 @@ int Baseline::ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind)
     if (ssaOn_ < 2 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
         return 0;
     const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
-    if (ep == elemprof::kArray)
+    // Nothing noted: tier 1 reads a plain array in place without a note (only its slow path notes), as tier 2 knows.
+    if (ep == elemprof::kArray || ep == 0)
         return 1;
     if (typedSiteKind(i, put, kind)) {
         switch (*kind) {
@@ -2283,14 +2284,28 @@ bool Baseline::ssaGetElem(std::uint32_t i)
         a_.mov32(RCX, RCX);
         loadValue(vb, RAX);
         ssaNeedArray(vb, RAX, ObjClass::Array, bad);
+        // A boxed result: a hole, or past the end, of an array whose prototypes have no elements is undefined, here.
+        const std::uint32_t def = ssa_->defBase[i];
+        Label hole;
+        Label& missing = sval_[def].rep == kRepTagged ? hole : cold;
         a_.alu32(7, RCX, mem(RAX, kArrayLength));  // unsigned: below zero is past the end
-        a_.jcc(CAE, cold);
+        a_.jcc(CAE, missing);
         a_.mov(RDX, mem(RAX, kArrayElems));
         a_.mov(RAX, mem(RDX, RCX, 8));
         a_.cmpI(RAX, std::int32_t(kHole));
-        a_.jcc(CE, cold);
-        const std::uint32_t def = ssa_->defBase[i];
-        if (sval_[def].rep == kRepI32) {
+        a_.jcc(CE, missing);
+        if (sval_[def].rep == kRepTagged) {
+            ssaDef(i, 0);
+            a_.jmp(join);
+            a_.bind(hole);
+            loadValue(vb, RAX);
+            if (plainHoleGuard(RDX, cold)) {
+                a_.movImm(RAX, kUndefined);
+                ssaDef(i, 0);
+            } else {
+                a_.jmp(cold);
+            }
+        } else if (sval_[def].rep == kRepI32) {
             needInt(RAX, bad);
             ssaDefI32(i);
         } else if (sval_[def].rep == kRepF64) {

@@ -1525,8 +1525,23 @@ bool Baseline::ssaArithF64(std::uint32_t i)
     const std::uint32_t def = ssa_->defBase[i];
     const std::uint32_t vb = rr ? name_[in.c] : ssa::kNone;
     const bool inReg = rr && !sval_[vb].isConst && sval_[vb].rep == kRepF64 && sval_[vb].reg >= 0;
-    const int y = inReg ? sval_[vb].reg : 1;
+    int y = inReg ? sval_[vb].reg : 1;
     int x = sval_[def].reg >= 0 && sval_[def].rep == kRepF64 && sval_[def].reg != y ? sval_[def].reg : 0;
+    if (inReg && x == 0 && sval_[def].rep == kRepF64 && sval_[def].reg == y &&
+        (op == Op::Add || op == Op::Mul)) {
+        // The result takes the second operand's register: the order does not matter, so do it there, with no move.
+        const std::uint32_t va = name_[in.b];
+        const bool aReg = !sval_[va].isConst && sval_[va].rep == kRepF64 && sval_[va].reg >= 0;
+        const int z = aReg ? sval_[va].reg : 1;
+        if (!aReg)
+            loadF64(va, 1, &bad);
+        if (op == Op::Add)
+            a_.addsd(y, z);
+        else
+            a_.mulsd(y, z);
+        ssaDefF64(i, y);
+        return true;
+    }
     if (rr && !inReg)
         loadF64(vb, 1, &bad);
     loadF64(name_[in.b], x, &bad);
@@ -1678,7 +1693,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         const int plan = ssaElemPlan(i, false, &kind);
         const std::uint8_t prof = i < code_->prof.size() ? code_->prof[i] : 0;
         if (plan == 2)
-            elemRep[i] = kind == ElemKind::Float64 || kind == ElemKind::Float32 ? 2 : 1;
+            elemRep[i] = kind == ElemKind::Float64 || kind == ElemKind::Float32 || kind == ElemKind::Uint32 ? 2 : 1;
         else if (plan == 1 && prof && !(prof & ~3))
             elemRep[i] = prof == 1 ? 1 : 2;  // a plain array the site found numbers in, only
     }
@@ -2092,7 +2107,7 @@ int Baseline::ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind)
     if (typedSiteKind(i, put, kind)) {
         switch (*kind) {
         case ElemKind::Int8: case ElemKind::Uint8: case ElemKind::Int16: case ElemKind::Uint16: case ElemKind::Int32:
-        case ElemKind::Float32: case ElemKind::Float64:
+        case ElemKind::Uint32: case ElemKind::Float32: case ElemKind::Float64:
             return 2;
         case ElemKind::Uint8Clamped:
             return put ? 0 : 2;
@@ -2151,8 +2166,9 @@ bool Baseline::ssaGetElem(std::uint32_t i)
             ssaDefI32(i);
         } else if (sval_[def].rep == kRepF64) {
             needNumber(RAX, bad);
-            loadNumber(0, RAX, RDX);
-            ssaDefF64(i, 0);
+            const int x = sval_[def].reg >= 0 ? sval_[def].reg : 0;
+            loadNumber(x, RAX, RDX);
+            ssaDefF64(i, x);
         } else {
             ssaDef(i, 0);
         }
@@ -2179,6 +2195,11 @@ bool Baseline::ssaGetElem(std::uint32_t i)
     case ElemKind::Float32:
         a_.movssLoad(0, mem(RSI, RCX, 4));
         a_.cvtss2sd(0, 0);
+        ssaDefF64(i, 0);
+        return true;
+    case ElemKind::Uint32:  // past int32 it is a double, so always a double
+        a_.mov32(RAX, mem(RSI, RCX, 4));
+        a_.cvtsi2sd64(0, RAX);
         ssaDefF64(i, 0);
         return true;
     case ElemKind::Int32: a_.mov32(RAX, mem(RSI, RCX, 4)); break;
@@ -2218,7 +2239,7 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
         switch (kind) {
         case ElemKind::Float64: a_.movsdStore(mem(RSI, RCX, 8), 0); break;
         case ElemKind::Float32: a_.cvtsd2ss(0, 0); a_.movssStore(mem(RSI, RCX, 4), 0); break;
-        case ElemKind::Int32: a_.mov32(mem(RSI, RCX, 4), RDI); break;
+        case ElemKind::Int32: case ElemKind::Uint32: a_.mov32(mem(RSI, RCX, 4), RDI); break;
         case ElemKind::Int16: case ElemKind::Uint16: a_.mov16(mem(RSI, RCX, 2), RDI); break;
         default: a_.mov8(mem(RSI, RCX, 1), RDI); break;
         }

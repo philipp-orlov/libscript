@@ -724,6 +724,13 @@ void VM::releaseRoots() noexcept
         detail::decRef(s.key);
     }
     regexpSlots.clear();
+    for (RegExpLiteral& l : regexpLiterals) {
+        if (l.pattern.bits)
+            release(l.pattern);
+        if (l.flags.bits)
+            release(l.flags);
+        l = RegExpLiteral{};
+    }
     release(regexpCtor);
     release(regexpExec);
     release(promiseCtor);

@@ -94,6 +94,8 @@ RegExpData* thisRegExp(VM& vm, JSValue self, const char* method)
     return nullptr;
 }
 
+bool initializeWith(VM& vm, JSObject* o, StringView pattern, std::shared_ptr<const regex::Program> program, unsigned bits);
+
 /// Set up `o` as a RegExp for `pattern` and `flags`; false with an exception pending.
 bool initialize(VM& vm, JSObject* o, StringView pattern, StringView flagText)
 {
@@ -108,6 +110,12 @@ bool initialize(VM& vm, JSObject* o, StringView pattern, StringView flagText)
         vm.throwError(ErrorCode::SyntaxError, "Invalid regular expression: /" + toUtf8(pattern) + "/: " + error);
         return false;
     }
+    return initializeWith(vm, o, pattern, std::move(program), bits);
+}
+
+/// Set up `o` as a RegExp of a compiled program.
+bool initializeWith(VM& vm, JSObject* o, StringView pattern, std::shared_ptr<const regex::Program> program, unsigned bits)
+{
     auto* data = new RegExpData();
     data->program = std::move(program);
     data->source = String(pattern);
@@ -458,6 +466,11 @@ JSValue* recordedSlot(VM& vm, VM::RegExpSlot& s)
     JSObject* o = s.owner;
     if (o->h.shape == s.shape)
         return o->slotAt(s.index);
+    if (s.shape == VM::kNoShape) {
+        // Recorded on a dictionary (the prototype is one): its entry, without looking up the shape.
+        if (Rare* r = o->rare(); r && r->dict && s.index < r->dict->entries.size() && r->dict->entries[s.index].key == s.key)
+            return o->slotAt(s.index);
+    }
     Shape* shape = o->shapeOf(vm);
     if (shape->isDictionary()) {
         const Dictionary& d = *o->rare()->dict;
@@ -1511,6 +1524,33 @@ JSValue newRegExp(VM& vm, StringView pattern, StringView flags)
     JSObject* o = vm.newObject(vm.protos.regexp);
     Handle keep = Handle::adopt(toJSValue(o));
     if (!initialize(vm, o, pattern, flags))
+        return JSValue::exception();
+    return keep.take();
+}
+
+JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags)
+{
+    VM::RegExpLiteral& l = vm.regexpLiterals[((pattern.bits >> 4) ^ (flags.bits >> 6)) & 63];
+    if (l.pattern.bits != pattern.bits || l.flags.bits != flags.bits) {
+        unsigned bits = 0;
+        std::string error;
+        std::shared_ptr<const regex::Program> program;
+        if (!regex::parseFlags(asString(flags)->text(), bits) || !(program = programFor(asString(pattern)->text(), bits, error)))
+            return newRegExp(vm, asString(pattern)->text(), asString(flags)->text());  // the error, as it would be
+        retain(pattern);
+        retain(flags);
+        if (l.pattern.bits)
+            release(l.pattern);
+        if (l.flags.bits)
+            release(l.flags);
+        l.pattern = pattern;
+        l.flags = flags;
+        l.program = std::move(program);
+        l.bits = bits;
+    }
+    JSObject* o = vm.newObject(vm.protos.regexp);
+    Handle keep = Handle::adopt(toJSValue(o));
+    if (!initializeWith(vm, o, asString(pattern)->text(), std::static_pointer_cast<const regex::Program>(l.program), l.bits))
         return JSValue::exception();
     return keep.take();
 }

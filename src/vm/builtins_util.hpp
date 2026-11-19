@@ -204,6 +204,8 @@ int mapLookup(JSValue map, JSValue key, JSValue* out);
 bool mapStore(JSValue map, JSValue key, JSValue value);
 /// A new RegExp object (a literal's, or `new RegExp`): owned, or the exception sentinel with a SyntaxError.
 JSValue newRegExp(VM& vm, StringView pattern, StringView flags);
+/// A regular expression literal: its pattern and flags are string constants of the code.
+JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags);
 void installRegExp(VM& vm);
 void installArrayCallbacks(VM& vm);
 /// What the typed array methods share with the constructors and the array iterators.

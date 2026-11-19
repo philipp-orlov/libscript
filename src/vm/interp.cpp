@@ -3273,7 +3273,7 @@ L_SetHome: {
 }
 L_NewRegExp: {
     fr->pc = pc;
-    JSValue r = bi::newRegExp(vm, asString(K[ins->b])->text(), asString(K[ins->c])->text());
+    JSValue r = bi::newRegExpLiteral(vm, K[ins->b], K[ins->c]);
     if (r.isException())
         FAIL();
     SET(ins->a, r);
@@ -4208,7 +4208,7 @@ int jitNewRegExp(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     const Ins* ins = c.ins;
-    JSValue r = bi::newRegExp(vm, asString(c.code->consts[ins->b])->text(), asString(c.code->consts[ins->c])->text());
+    JSValue r = bi::newRegExpLiteral(vm, c.code->consts[ins->b], c.code->consts[ins->c]);
     if (r.isException())
         return 0;
     setReg(c.R[ins->a], r);

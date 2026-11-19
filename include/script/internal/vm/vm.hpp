@@ -448,6 +448,15 @@ struct VM : EngineRuntime
     };
     static constexpr std::uint32_t kNoShape = ~std::uint32_t(0);
     std::vector<RegExpSlot> regexpSlots;
+    /// A regular expression literal's compiled program, by the string constants of its pattern and flags (each entry holds
+    /// a count of both): a literal in a loop makes a RegExp each time round with no parse of its flags and no lookup by text.
+    struct RegExpLiteral
+    {
+        JSValue pattern = JSValue::raw(0), flags = JSValue::raw(0);
+        std::shared_ptr<const void> program;
+        unsigned bits = 0;
+    };
+    RegExpLiteral regexpLiterals[64];
     std::uint32_t arrayRootShape = 0;
     /// Set by `SetEvalScope` just before a call that may be a direct `eval`.
     const CodeBlock* evalCode = nullptr;

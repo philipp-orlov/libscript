@@ -2975,7 +2975,20 @@ void Baseline::ssaRet(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
     const unsigned nregs = code_->nregs;
-    ssaSync({in.a}, ssa::Bits((nregs + 63) / 64, 0), std::vector<std::uint8_t>(nregs, 0));
+    // The result into rax with one count for the caller: the count of a slot this frame clears on its way out that holds
+    // it (the slot then holds undefined), else a new one.
+    const std::uint32_t v = name_[in.a];
+    loadValue(v, RAX);
+    int movedFrom = -1;
+    if (mayBeCell(v)) {
+        for (unsigned r = 1u + code_->nparams; r < nregs && movedFrom < 0; ++r)
+            if (frame_[r] == v) {
+                a_.mov(R(r), std::int32_t(kUndefined));
+                movedFrom = int(r);
+            }
+        if (movedFrom < 0)
+            retain(RAX);
+    }
     std::vector<std::uint64_t> dirty((nregs + 63) / 64, 0);
     ssaPlain_.assign(nregs, 0);
     for (unsigned r = 0; r < nregs; ++r) {
@@ -2986,8 +2999,9 @@ void Baseline::ssaRet(std::uint32_t i)
         if (v != ssa::kNone && !mayBeCell(v) && r != in.a)
             ssaPlain_[r] = 1;
     }
-    dirty[in.a / 64] |= std::uint64_t(1) << (in.a % 64);
-    ret(i, in, false, &dirty);
+    if (movedFrom >= 0)
+        ssaPlain_[unsigned(movedFrom)] = 1;  // undefined now
+    ret(i, in, true, &dirty);
     ssaPlain_.clear();
 }
 

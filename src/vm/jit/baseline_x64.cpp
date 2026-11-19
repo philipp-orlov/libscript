@@ -2668,6 +2668,7 @@ private:
     std::int32_t moveRoom_ = 0;  ///< bytes pushed below the slots while a parallel move holds its values there
     std::vector<std::uint8_t> native_;   ///< per instruction: done in place (nothing is clobbered), as planned
     std::vector<std::uint8_t> intArith_, dblArith_;  ///< per instruction: planned int32 / double arithmetic
+    std::vector<std::uint8_t> wrapOk_;  ///< per value: an int32 add whose every use truncates to int32 (it may wrap)
     bool hasLoc(std::uint32_t v) const { return sval_[v].slot >= 0 || sval_[v].reg >= 0; }
     void storeTagged(std::uint32_t v, Reg src);
     void loadI32(std::uint32_t v, Reg dst, Label* bad);

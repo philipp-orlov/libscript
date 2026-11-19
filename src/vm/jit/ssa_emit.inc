@@ -2212,16 +2212,17 @@ bool Baseline::ssaArith(std::uint32_t i)
             loadI32(vb, RCX, &bad);
     }
     const std::int32_t imm = op == Op::Inc ? 1 : op == Op::Dec ? -1 : std::int32_t(std::int16_t(in.c));
+    const bool wraps = wrapOk_[def] != 0;  // every use truncates: no overflow check
     switch (op) {
-    case Op::AddI: case Op::Inc: case Op::Dec: a_.aluI32(0, t, imm); a_.jcc(CO, bad); break;
-    case Op::SubI: a_.aluI32(5, t, imm); a_.jcc(CO, bad); break;
+    case Op::AddI: case Op::Inc: case Op::Dec: a_.aluI32(0, t, imm); if (!wraps) a_.jcc(CO, bad); break;
+    case Op::SubI: a_.aluI32(5, t, imm); if (!wraps) a_.jcc(CO, bad); break;
     case Op::BitAndI: a_.aluI32(4, t, imm); break;
     case Op::BitOrI: a_.aluI32(1, t, imm); break;
     case Op::BitXorI: a_.aluI32(6, t, imm); break;
     case Op::ShlI: a_.shiftI32(4, t, imm & 31); break;
     case Op::ShrI: a_.shiftI32(7, t, imm & 31); break;
-    case Op::Add: a_.alu32(0, t, b); a_.jcc(CO, bad); break;
-    case Op::Sub: a_.alu32(5, t, b); a_.jcc(CO, bad); break;
+    case Op::Add: a_.alu32(0, t, b); if (!wraps) a_.jcc(CO, bad); break;
+    case Op::Sub: a_.alu32(5, t, b); if (!wraps) a_.jcc(CO, bad); break;
     case Op::BitAnd: a_.alu32(4, t, b); break;
     case Op::BitOr: a_.alu32(1, t, b); break;
     case Op::BitXor: a_.alu32(6, t, b); break;
@@ -2548,6 +2549,77 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             vDef_[v] = kVNotCell;
     }
     vKnown_ = vDef_;
+    // An int32 add or subtract whose every use truncates to int32 (a bitwise operation, or another such add) needs no
+    // overflow check: ToInt32 of the exact sum is the wrapped one. A product is not exact past 2^53: not taken in.
+    {
+        auto isWrapOp = [](Op op) {
+            return op == Op::Add || op == Op::Sub || op == Op::AddI || op == Op::SubI || op == Op::Inc || op == Op::Dec;
+        };
+        auto truncates = [](Op op) {
+            switch (op) {
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr: case Op::UShr: case Op::BitAndI:
+            case Op::BitOrI: case Op::BitXorI: case Op::ShlI: case Op::ShrI: case Op::UShrI:
+                return true;
+            default:
+                return false;
+            }
+        };
+        wrapOk_.assign(nv, 0);
+        std::vector<std::uint8_t> badUse(nv, 0);
+        std::vector<std::vector<std::uint32_t>> wrapUsers(nv);  // candidate defs that use the value
+        for (std::uint32_t v = 0; v < nv; ++v) {
+            const ssa::Value& sv = g.values[v];
+            if (sv.kind == ssa::Value::Def && !sval_[v].isConst && sval_[v].rep == kRepI32 && intArith_[sv.at] &&
+                isWrapOp(code_->code[sv.at].opcode()))
+                wrapOk_[v] = 1;
+            if (sv.kind == ssa::Value::Phi)
+                for (std::uint32_t in : sv.in)
+                    if (in != ssa::kNone)
+                        badUse[in] = 1;
+        }
+        for (std::uint32_t b = 1; b < nb; ++b) {
+            const ssa::Block& bl = g.blocks[b];
+            if (!bl.reached)
+                continue;
+            std::vector<std::uint32_t> names = bl.nameIn;
+            for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(*code_, i)) {
+                const Ins& in = code_->code[i];
+                const opt::Effects e = ssa::effects(*code_, i);
+                const Op op = in.opcode();
+                for (std::uint16_t r : e.rd) {
+                    const std::uint32_t v = names[r];
+                    if (v == ssa::kNone)
+                        continue;
+                    if (truncates(op))
+                        continue;
+                    if (isWrapOp(op) && g.defBase[i] != ssa::kNone && wrapOk_[g.defBase[i]])
+                        wrapUsers[v].push_back(g.defBase[i]);
+                    else
+                        badUse[v] = 1;
+                }
+                if (op == Op::Mov) {
+                    names[in.a] = names[in.b];
+                    continue;
+                }
+                for (std::size_t w = 0; w < e.wr.size(); ++w)
+                    names[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
+            }
+        }
+        for (std::uint32_t v = 0; v < nv; ++v)
+            if (badUse[v])
+                wrapOk_[v] = 0;
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::uint32_t v = 0; v < nv; ++v)
+                if (wrapOk_[v])
+                    for (std::uint32_t u : wrapUsers[v])
+                        if (!wrapOk_[u]) {
+                            wrapOk_[v] = 0;
+                            changed = true;
+                            break;
+                        }
+        }
+    }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("SSA_REPS"))
         for (std::uint32_t v = g.nregs; v < nv; ++v)

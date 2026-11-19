@@ -2621,6 +2621,15 @@ private:
     bool ssaPutFast(std::uint32_t i) const;
     bool ssaGlobalFast(std::uint32_t i) const;
     bool ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter);
+    int ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind);
+    bool ssaGetElem(std::uint32_t i);
+    bool ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter);
+    void ssaNeedArray(std::uint32_t v, Reg r, ObjClass cls, Label& bad);
+    void loadToInt32(std::uint32_t v, Reg dst, Label& bad);
+    bool ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter);
+    template <typename Then>
+    void ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, std::int32_t imm, bool isImm, Label& bad,
+                     Then then);
     void ssaSaveRegs();
     void ssaRestoreRegs();
     std::vector<SVal> sval_;
@@ -2650,6 +2659,25 @@ private:
     }
     void loadValue(std::uint32_t v, Reg r);
     void ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const std::vector<std::uint8_t>& clobber);
+    std::vector<unsigned> ssaSyncSet(std::vector<unsigned> regs, const ssa::Bits& live,
+                                     const std::vector<std::uint8_t>& clobber);
+    void ssaSyncEmit(const std::vector<unsigned>& set);
+    struct ColdPath
+    {
+        std::uint32_t i;
+        HelperFn helper;
+        std::vector<std::uint32_t> name, frame;
+        std::vector<unsigned> set;
+        std::uint32_t def;
+        unsigned dst;
+        Label* entry;
+        Label* join;
+        ssa::Bits liveAfter;
+    };
+    std::vector<std::uint8_t> elemNum_;  ///< per GetElem: the elements are taken as int32s (1) or numbers (2)
+    std::deque<ColdPath> coldPaths_;
+    void ssaColdCall(std::uint32_t i, HelperFn helper, const ssa::Bits& liveAfter, Label& entry, Label& join);
+    void emitColdPaths();
     void ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter);
     void ssaStepJump(std::uint32_t b, std::uint32_t i);
     void ssaEdge(std::uint32_t from, std::uint32_t to);
@@ -2657,7 +2685,7 @@ private:
     void ssaEnterBlock(std::uint32_t b);
     void emitSsaTails();
     // M2: what is known of values, exits, and the instructions done in place.
-    static constexpr std::uint8_t kVInt = 1, kVObj = 2, kVBool = 4, kVNotCell = 8;
+    static constexpr std::uint8_t kVInt = 1, kVObj = 2, kVBool = 4, kVNotCell = 8, kVArray = 16, kVTyped = 32;
     std::vector<std::uint8_t> vDef_;     ///< per value: what its definition proves
     std::vector<std::uint8_t> vKnown_;   ///< per value: what is known of it here (forgotten at block heads)
     std::vector<std::uint32_t> vShape_;  ///< per value: its object's shape, known here (0: not known)
@@ -2668,11 +2696,13 @@ private:
         std::vector<std::uint32_t> name, frame;
         ssa::Bits live;
         Label label;
+        int kind = 0;  ///< 0: before instruction i (it runs in the interpreter); 1: after it (it has run)
     };
     std::deque<SsaExit> ssaExits_;
     std::int64_t exitAt_ = -1;
     Label* exitLabel_ = nullptr;
     ssa::Bits liveBefore_;  ///< registers live before the instruction being emitted
+    ssa::Bits curLiveAfter_;  ///< and after it
     Label& ssaExit(std::uint32_t i);
     void ssaKnow(std::uint32_t v, std::uint8_t bits, std::uint32_t shape = 0);
     void ssaForgetShapes();

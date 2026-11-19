@@ -138,7 +138,8 @@ void Baseline::loadF64(std::uint32_t v, int x, Label* bad)
 /// Write the slots of `regs` (with the value each register holds), and of every other live register whose value would
 /// otherwise have no owner once the slots of `clobber` (1 per register) are overwritten by what comes next. New values are
 /// counted first, the old contents let go of last, so nothing live is freed in between.
-void Baseline::ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const std::vector<std::uint8_t>& clobber)
+std::vector<unsigned> Baseline::ssaSyncSet(std::vector<unsigned> regs, const ssa::Bits& live,
+                                           const std::vector<std::uint8_t>& clobber)
 {
     const unsigned nregs = code_->nregs;
     std::vector<std::uint8_t> in(nregs, 0);
@@ -178,13 +179,19 @@ void Baseline::ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const 
             if (clobber[r]) {
                 ssaFailed_ = true;
                 ssaWhy_ = "live in a call's window";
-                return;
+                return set;
             }
             add(r);
             changed = true;
         }
     }
-    // Already there: nothing to write.
+    return set;
+}
+
+/// Write the slots of `set` (each with the value its register holds): new values counted first, the old contents let go
+/// of last, so nothing live is freed in between.
+void Baseline::ssaSyncEmit(const std::vector<unsigned>& set)
+{
     std::vector<unsigned> todo;
     for (unsigned r : set)
         if (frame_[r] != name_[r])
@@ -203,6 +210,90 @@ void Baseline::ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const 
         if (old)
             release(RDX);
         frame_[r] = name_[r];
+    }
+}
+
+/// Write the slots of `regs`, and of every other live register whose value would otherwise have no owner once the slots
+/// of `clobber` (1 per register) are overwritten by what comes next.
+void Baseline::ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const std::vector<std::uint8_t>& clobber)
+{
+    const std::vector<unsigned> set = ssaSyncSet(std::move(regs), live, clobber);
+    if (!ssaFailed_)
+        ssaSyncEmit(set);
+}
+
+/// The long way of an instruction done in place: out of line, the frame as the helper wants it (what it reads, every
+/// live value owned), the registers kept, the helper called; back at `join`. The slots it writes are "not known" after
+/// the instruction on both ways, which is true of either. `dst`: the register the helper writes (ssa::kNone: none),
+/// whose value (boxed) is taken into the instruction's value.
+void Baseline::ssaColdCall(std::uint32_t i, HelperFn helper, const ssa::Bits& liveAfter, Label& entry, Label& join)
+{
+    const opt::Effects e = ssa::effects(*code_, i);
+    std::vector<std::uint8_t> clobber(code_->nregs, 0);
+    for (std::uint16_t r : e.wr)
+        clobber[r] = 1;
+    ssa::Bits keep = liveAfter;
+    for (std::uint16_t r : e.wr)
+        ssa::bitClear(keep, r);
+    const std::vector<unsigned> set = ssaSyncSet(std::vector<unsigned>(e.rd.begin(), e.rd.end()), keep, clobber);
+    if (ssaFailed_)
+        return;
+    const std::uint32_t def = e.wr.empty() ? ssa::kNone : ssa_->defBase[i];
+    const unsigned dst = e.wr.empty() ? 0 : e.wr[0];
+    ColdPath c{i, helper, name_, frame_, set, def, dst, &entry, &join, liveAfter};
+    coldPaths_.push_back(std::move(c));
+    // After the instruction, either way: those slots hold what the way taken left there.
+    for (unsigned r : set)
+        if (frame_[r] != name_[r])
+            frame_[r] = ssa::kNone;
+    for (std::uint16_t r : e.wr)
+        frame_[r] = ssa::kNone;
+}
+
+void Baseline::emitColdPaths()
+{
+    for (ColdPath& c : coldPaths_) {
+        a_.bind(*c.entry);
+        name_ = c.name;
+        frame_ = c.frame;
+        ssaSyncEmit(c.set);
+        ssaSaveRegs();
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, c.i);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(c.helper));
+        a_.callC(RAX);
+        ssaRestoreRegs();
+        a_.aluI32(7, RAX, 1);
+        a_.jcc(CNE, exception(c.i));
+        if (c.def != ssa::kNone && hasLoc(c.def)) {
+            a_.mov(RAX, R(c.dst));
+            const std::uint8_t rep = sval_[c.def].rep;
+            if (rep == kRepTagged) {
+                storeTagged(c.def, RAX);
+            } else {
+                // Not of the kind the code takes it to be: leave after the instruction (its result is in its slot).
+                name_[c.dst] = c.def;
+                frame_[c.dst] = c.def;
+                ssaExits_.push_back(SsaExit{c.i, name_, frame_, c.liveAfter, Label{}, 1});
+                Label& after = ssaExits_.back().label;
+                const SVal& d = sval_[c.def];
+                if (rep == kRepI32) {
+                    needInt(RAX, after);
+                    if (d.reg >= 0)
+                        a_.mov32(Reg(d.reg), RAX);
+                    else
+                        a_.mov32(slotOf(c.def), RAX);
+                } else {
+                    needNumber(RAX, after);
+                    loadNumber(0, RAX, RDX);
+                    if (d.reg >= 0)
+                        a_.movaps(d.reg, 0);
+                    else
+                        a_.movsdStore(slotOf(c.def), 0);
+                }
+            }
+        }
+        a_.jmp(*c.join);
     }
 }
 
@@ -254,26 +345,52 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
 }
 
 /// The phi moves of edge `from` -> `to`: each phi of `to` gets its input from `from` (converted to the phi's
-/// representation), all read before any is written: through the stack when there is more than one.
+/// representation), all read before any is written. Moves of one representation between registers and slots are put in
+/// an order that reads every source before its place is written, a cycle broken through a scratch register; a move that
+/// converts or loads a constant goes last, unless that would write a place another move still reads (then everything goes
+/// through the stack).
 void Baseline::ssaEdgeMoves(std::uint32_t from, std::uint32_t to)
 {
     const ssa::Block& tb = ssa_->blocks[to];
     std::size_t k = 0;
     while (k < tb.preds.size() && tb.preds[k] != from)
         ++k;
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> moves;  // (source value, phi)
+    struct Move
+    {
+        std::uint32_t src, dst;  // values
+    };
+    std::vector<Move> plain, complex;
     for (std::uint32_t p : tb.phis) {
         const std::uint32_t src = ssa_->values[p].in[k];
         if (src == p || !hasLoc(p))
             continue;
-        if (!sval_[src].isConst && sval_[src].rep == sval_[p].rep && sval_[src].reg == sval_[p].reg &&
-            sval_[src].slot == sval_[p].slot)
+        const SVal& a = sval_[src];
+        const SVal& d = sval_[p];
+        if (!a.isConst && a.rep == d.rep && a.reg == d.reg && a.slot == d.slot)
             continue;
-        moves.emplace_back(src, p);
+        if (!a.isConst && a.rep == d.rep)
+            plain.push_back(Move{src, p});
+        else
+            complex.push_back(Move{src, p});
     }
-    if (moves.empty())
+    if (plain.empty() && complex.empty())
         return;
-    // Each source in the phi's representation, as eight bytes in rax (a double's bits for a double phi).
+    // A place: a register (class by representation) or a slot.
+    auto place = [&](std::uint32_t v) {
+        const SVal& s = sval_[v];
+        if (s.reg >= 0)
+            return std::int64_t(s.rep == kRepF64 ? 1000 + s.reg : s.reg);
+        return std::int64_t(100000 + s.slot);
+    };
+    bool viaStack = false;
+    for (const Move& c : complex) {
+        for (const Move& m : plain)
+            if (place(m.src) == place(c.dst) || (!sval_[c.src].isConst && place(c.src) == place(m.dst)))
+                viaStack = true;
+        for (const Move& o : complex)
+            if (&o != &c && !sval_[o.src].isConst && place(o.src) == place(c.dst))
+                viaStack = true;
+    }
     auto fetch = [&](std::uint32_t src, std::uint32_t p) {
         switch (sval_[p].rep) {
         case kRepI32:
@@ -302,24 +419,101 @@ void Baseline::ssaEdgeMoves(std::uint32_t from, std::uint32_t to)
             a_.mov(slotOf(p), RAX);
         }
     };
-    if (moves.size() == 1) {
-        fetch(moves[0].first, moves[0].second);
-        put(moves[0].second);
+    if (viaStack) {
+        std::vector<Move> all = plain;
+        all.insert(all.end(), complex.begin(), complex.end());
+        const std::int32_t room = std::int32_t((8 * all.size() + 15) & ~std::size_t(15));
+        a_.aluI(5, RSP, room);
+        moveRoom_ = room;
+        for (std::size_t m = 0; m < all.size(); ++m) {
+            fetch(all[m].src, all[m].dst);
+            a_.mov(mem(RSP, std::int32_t(8 * m)), RAX);
+        }
+        for (std::size_t m = 0; m < all.size(); ++m) {
+            a_.mov(RAX, mem(RSP, std::int32_t(8 * m)));
+            put(all[m].dst);
+        }
+        moveRoom_ = 0;
+        a_.aluI(0, RSP, room);
         return;
     }
-    const std::int32_t room = std::int32_t((8 * moves.size() + 15) & ~std::size_t(15));
-    a_.aluI(5, RSP, room);
-    moveRoom_ = room;
-    for (std::size_t m = 0; m < moves.size(); ++m) {
-        fetch(moves[m].first, moves[m].second);
-        a_.mov(mem(RSP, std::int32_t(8 * m)), RAX);
+    // One plain move: from a place to a place of the same representation. `tmpFrom`: the source is the scratch.
+    auto move = [&](std::uint32_t src, std::uint32_t dst, bool tmpFrom) {
+        const SVal& a = sval_[src];
+        const SVal& d = sval_[dst];
+        if (d.rep == kRepF64) {
+            const int x = tmpFrom ? 1 : (a.reg >= 0 ? a.reg : -1);
+            if (x < 0) {
+                if (d.reg >= 0)
+                    a_.movsdLoad(d.reg, slotOf(src));
+                else {
+                    a_.mov(RAX, slotOf(src));
+                    a_.mov(slotOf(dst), RAX);
+                }
+            } else if (d.reg >= 0) {
+                if (d.reg != x)
+                    a_.movaps(d.reg, x);
+            } else {
+                a_.movsdStore(slotOf(dst), x);
+            }
+            return;
+        }
+        Reg r;
+        if (tmpFrom)
+            r = RCX;
+        else if (a.reg >= 0)
+            r = Reg(a.reg);
+        else {
+            a_.mov(RAX, slotOf(src));
+            r = RAX;
+        }
+        if (d.reg >= 0)
+            a_.mov(Reg(d.reg), r);
+        else
+            a_.mov(slotOf(dst), r);
+    };
+    std::vector<Move> pending = plain;
+    std::vector<std::uint8_t> fromTmp(pending.size(), 0);  // the move's source is in the scratch of its class
+    while (!pending.empty()) {
+        bool progress = false;
+        for (std::size_t m = 0; m < pending.size(); ++m) {
+            const std::int64_t d = place(pending[m].dst);
+            bool read = false;
+            for (std::size_t o = 0; o < pending.size() && !read; ++o)
+                read = o != m && !fromTmp[o] && place(pending[o].src) == d;
+            if (read)
+                continue;
+            move(pending[m].src, pending[m].dst, fromTmp[m] != 0);
+            pending.erase(pending.begin() + std::ptrdiff_t(m));
+            fromTmp.erase(fromTmp.begin() + std::ptrdiff_t(m));
+            progress = true;
+            break;
+        }
+        if (progress)
+            continue;
+        // Every place written is still read: a cycle. The first destination's contents go to the scratch, and the move
+        // that reads them reads the scratch.
+        const std::uint32_t dv = pending[0].dst;
+        const SVal& d = sval_[dv];
+        const std::int64_t dp = place(dv);
+        if (d.rep == kRepF64) {
+            if (d.reg >= 0)
+                a_.movaps(1, d.reg);
+            else
+                a_.movsdLoad(1, slotOf(dv));
+        } else if (d.reg >= 0) {
+            a_.mov(RCX, Reg(d.reg));
+        } else {
+            a_.mov(RCX, slotOf(dv));
+        }
+        for (std::size_t o = 0; o < pending.size(); ++o)
+            if (!fromTmp[o] && place(pending[o].src) == dp)
+                fromTmp[o] = 1;
     }
-    for (std::size_t m = 0; m < moves.size(); ++m) {
-        a_.mov(RAX, mem(RSP, std::int32_t(8 * m)));
-        put(moves[m].second);
+    for (const Move& c : complex) {
+        fetch(c.src, c.dst);
+        put(c.dst);
     }
-    moveRoom_ = 0;
-    a_.aluI(0, RSP, room);
 }
 
 /// Leave block `from` for block `to`: a back edge looks at the interrupt flag, puts in the slots the loop's head takes as
@@ -590,6 +784,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             const Op op = in.opcode();
             offsets_[i] = std::uint32_t(a_.here());
             exitAt_ = -1;
+            curLiveAfter_ = liveAfter[b][k];
             {
                 const opt::Effects e = ssa::effects(*code_, i);
                 liveBefore_ = liveAfter[b][k];
@@ -619,6 +814,24 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
                 else if (!ssaPutProp(i, liveAfter[b][k]))
+                    a_.jmp(ssaExit(i));
+                break;
+            case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox: case Op::ToNumeric: case Op::Not:
+                if (!native_[i])
+                    ssaGeneric(i, liveAfter[b][k]);
+                else if (!ssaSmall(i, liveAfter[b][k]))
+                    a_.jmp(ssaExit(i));
+                break;
+            case Op::GetElem:
+                if (!native_[i])
+                    ssaGeneric(i, liveAfter[b][k]);
+                else if (!ssaGetElem(i))
+                    a_.jmp(ssaExit(i));
+                break;
+            case Op::PutElem:
+                if (!native_[i])
+                    ssaGeneric(i, liveAfter[b][k]);
+                else if (!ssaPutElem(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
                 break;
             case Op::GetGlobal:
@@ -767,6 +980,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
 
 void Baseline::emitSsaTails()
 {
+    emitColdPaths();
     for (SsaExit& e : ssaExits_) {
         a_.bind(e.label);
         name_ = e.name;
@@ -779,7 +993,7 @@ void Baseline::emitSsaTails()
         a_.aluI(0, RSP, spill_);
         a_.mov(RDI, R12);
         a_.movImm(RSI, e.i);
-        a_.movImm(RDX, 0);
+        a_.movImm(RDX, std::uint64_t(e.kind));
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptExit));
         a_.callC(RAX);
         Label notFall;
@@ -1050,25 +1264,8 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         if (failed && !(known(va, kVInt) && (imm || known(vb, kVInt))))
             return false;
         Label& bad = ssaExit(i);
-        loadI32(va, RAX, &bad);
-        if (imm) {
-            a_.aluI32(7, RAX, std::int32_t(std::int16_t(in.b)));
-        } else {
-            loadI32(vb, RCX, &bad);
-            a_.alu32(7, RAX, RCX);
-        }
-        Cond c;
-        switch (op) {
-        case Op::JLt: case Op::JLtI: c = CL; break;
-        case Op::JLe: case Op::JLeI: c = CLE; break;
-        case Op::JGt: case Op::JGtI: c = CG; break;
-        case Op::JGe: case Op::JGeI: c = CGE; break;
-        case Op::JNotLt: case Op::JNotLtI: c = CGE; break;
-        case Op::JNotLe: case Op::JNotLeI: c = CG; break;
-        case Op::JNotGt: case Op::JNotGtI: c = CLE; break;
-        default: c = CL; break;  // JNotGe
-        }
-        ssaCondEdges(b, c);
+        ssaRelation(i, va, vb, imm ? std::int32_t(std::int16_t(in.b)) : 0, imm, bad,
+                    [&](Cond c) { ssaCondEdges(b, c); });
         return true;
     }
     case Op::JNotCode: {
@@ -1226,9 +1423,34 @@ bool Baseline::ssaArith(std::uint32_t i)
     const std::uint32_t va = name_[in.b];
     const std::uint32_t vb = rr ? name_[in.c] : ssa::kNone;
     Label& bad = ssaExit(i);
-    loadI32(va, RAX, &bad);
-    if (rr)
-        loadI32(vb, RCX, &bad);
+    if (compare) {
+        // Into a boolean: rax 0 or 1, then false or true.
+        Label done;
+        ssaRelation(i, va, vb, 0, false, bad, [&](Cond c) {
+            a_.setcc(c, RAX);
+            a_.movzx8(RAX, RAX);
+            a_.jmp(done);
+        });
+        a_.bind(done);
+        a_.aluI32(1, RAX, std::int32_t(kFalse));
+        ssaDef(i, kVBool | kVNotCell);
+        return true;
+    }
+    const bool bitwise = op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor || op == Op::BitAndI ||
+                         op == Op::BitOrI || op == Op::BitXorI || op == Op::ShlI || op == Op::ShrI;
+    if (bitwise) {
+        // ToInt32 of each operand: a double truncates.
+        loadToInt32(va, RAX, bad);
+        if (rr) {
+            a_.mov(RDI, RAX);
+            loadToInt32(vb, RCX, bad);
+            a_.mov(RAX, RDI);
+        }
+    } else {
+        loadI32(va, RAX, &bad);
+        if (rr)
+            loadI32(vb, RCX, &bad);
+    }
     const std::int32_t imm = op == Op::Inc ? 1 : op == Op::Dec ? -1 : std::int32_t(std::int16_t(in.c));
     switch (op) {
     case Op::AddI: case Op::Inc: case Op::Dec: a_.aluI32(0, RAX, imm); a_.jcc(CO, bad); break;
@@ -1273,21 +1495,8 @@ bool Baseline::ssaArith(std::uint32_t i)
         a_.bind(nz);
         break;
     }
-    default: {
-        Cond c = CL;
-        switch (op) {
-        case Op::Lt: c = CL; break;
-        case Op::Le: c = CLE; break;
-        case Op::Gt: c = CG; break;
-        default: c = CGE; break;
-        }
-        a_.alu32(7, RAX, RCX);
-        a_.setcc(c, RAX);
-        a_.movzx8(RAX, RAX);
-        a_.aluI32(1, RAX, std::int32_t(kFalse));
-        ssaDef(i, kVBool | kVNotCell);
-        return true;
-    }
+    default:
+        break;
     }
     ssaDefI32(i);
     return true;
@@ -1300,20 +1509,26 @@ bool Baseline::ssaArithF64(std::uint32_t i)
     const Op op = in.opcode();
     const bool rr = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Div;
     Label& bad = ssaExit(i);
-    loadF64(name_[in.b], 0, &bad);
-    if (rr) {
-        loadF64(name_[in.c], 1, &bad);
-    } else {
+    // In the result's own register when it has one that is not the second operand's; the second operand where it is.
+    const std::uint32_t def = ssa_->defBase[i];
+    const std::uint32_t vb = rr ? name_[in.c] : ssa::kNone;
+    const bool inReg = rr && !sval_[vb].isConst && sval_[vb].rep == kRepF64 && sval_[vb].reg >= 0;
+    const int y = inReg ? sval_[vb].reg : 1;
+    int x = sval_[def].reg >= 0 && sval_[def].rep == kRepF64 && sval_[def].reg != y ? sval_[def].reg : 0;
+    if (rr && !inReg)
+        loadF64(vb, 1, &bad);
+    loadF64(name_[in.b], x, &bad);
+    if (!rr) {
         a_.movImm(RDX, std::uint32_t(std::int32_t(std::int16_t(in.c))));
         a_.cvtsi2sd32(1, RDX);
     }
     switch (op) {
-    case Op::Add: case Op::AddI: a_.addsd(0, 1); break;
-    case Op::Sub: case Op::SubI: a_.subsd(0, 1); break;
-    case Op::Mul: case Op::MulI: a_.mulsd(0, 1); break;
-    default: a_.divsd(0, 1); break;
+    case Op::Add: case Op::AddI: a_.addsd(x, y); break;
+    case Op::Sub: case Op::SubI: a_.subsd(x, y); break;
+    case Op::Mul: case Op::MulI: a_.mulsd(x, y); break;
+    default: a_.divsd(x, y); break;
     }
-    ssaDefF64(i, 0);
+    ssaDefF64(i, x);
     return true;
 }
 
@@ -1372,6 +1587,14 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::GetProp: return plainReadable(i);
     case Op::PutProp: return ssaPutFast(i);
     case Op::GetGlobal: return ssaGlobalFast(i);
+    case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox:
+        return true;
+    case Op::ToNumeric: case Op::Not:
+        return !failed;
+    case Op::GetElem: case Op::PutElem: {
+        ElemKind kind;
+        return ssaElemPlan(i, op == Op::PutElem, &kind) != 0;
+    }
     case Op::Eq: case Op::Ne: case Op::StrictEq: case Op::StrictNe:
         return equalsNative(name_[in.b], name_[in.c], op == Op::Eq || op == Op::Ne);
     case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
@@ -1434,6 +1657,19 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             break;
         }
     }
+    // An element read of a typed array makes a number of its kind.
+    std::vector<std::uint8_t> elemRep(n_, 3);
+    for (std::uint32_t i = 0; i < n_; i = opt::nextOf(*code_, i)) {
+        ElemKind kind;
+        if (code_->code[i].opcode() != Op::GetElem)
+            continue;
+        const int plan = ssaElemPlan(i, false, &kind);
+        const std::uint8_t prof = i < code_->prof.size() ? code_->prof[i] : 0;
+        if (plan == 2)
+            elemRep[i] = kind == ElemKind::Float64 || kind == ElemKind::Float32 ? 2 : 1;
+        else if (plan == 1 && prof && !(prof & ~3))
+            elemRep[i] = prof == 1 ? 1 : 2;  // a plain array the site found numbers in, only
+    }
     // Representations: an instruction's by what it does; a phi's the least that holds every input.
     std::vector<std::uint8_t> cls(nv, 0);  // 0 none yet, 1 int32, 2 double, 3 boxed
     for (std::uint32_t v = 0; v < nv; ++v) {
@@ -1442,7 +1678,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             const JSValue k = JSValue::raw(sval_[v].bits);
             cls[v] = k.isInt32() ? 1 : k.isDouble() ? 2 : 3;
         } else if (sv.kind == ssa::Value::Def) {
-            cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : 3;
+            cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : elemRep[sv.at];
         } else if (sv.kind == ssa::Value::Entry) {
             cls[v] = 3;
         }
@@ -1714,4 +1950,434 @@ void Baseline::ssaRet(std::uint32_t i)
     dirty[in.a / 64] |= std::uint64_t(1) << (in.a % 64);
     ret(i, in, false, &dirty);
     ssaPlain_.clear();
+}
+
+/// How element instruction `i` is done in place: 1 on a plain array, 2 on a typed array of `kind`, 0 not.
+int Baseline::ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind)
+{
+    if (ssaOn_ < 2 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return 0;
+    const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+    if (ep == elemprof::kArray)
+        return 1;
+    if (typedSiteKind(i, put, kind)) {
+        switch (*kind) {
+        case ElemKind::Int8: case ElemKind::Uint8: case ElemKind::Int16: case ElemKind::Uint16: case ElemKind::Int32:
+        case ElemKind::Float32: case ElemKind::Float64:
+            return 2;
+        case ElemKind::Uint8Clamped:
+            return put ? 0 : 2;
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/// Value `v` in `r` is an object of class `cls` (an array or a typed array), else `bad`.
+void Baseline::ssaNeedArray(std::uint32_t v, Reg r, ObjClass cls, Label& bad)
+{
+    const std::uint8_t fact = cls == ObjClass::Array ? kVArray : kVTyped;
+    if (known(v, fact))
+        return;
+    needObjV(v, r, bad);
+    a_.cmpI8(mem(r, kHdrCls), std::uint8_t(cls));
+    a_.jcc(CNE, bad);
+    ssaKnow(v, std::uint8_t(kVObj | fact));
+}
+
+bool Baseline::ssaGetElem(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    ElemKind kind = ElemKind::Int8;
+    const int plan = ssaElemPlan(i, false, &kind);
+    if (!plan)
+        return false;
+    const std::uint32_t vb = name_[in.b], vi = name_[in.c];
+    if (plan == 1) {
+        // Anything but an element the array has: the runtime's, out of line.
+        Label& cold = coldLabels_.emplace_back();
+        Label& join = coldLabels_.emplace_back();
+        const std::vector<std::uint32_t> frameBefore = frame_;
+        ssaColdCall(i, &helperThunk<jitGetElem>, curLiveAfter_, cold, join);
+        if (ssaFailed_)
+            return true;
+        const std::vector<std::uint32_t> frameAfter = frame_;
+        frame_ = frameBefore;
+        // Not an int32 index or not an array: leave (what is known after holds on both ways back to `join`).
+        Label& bad = ssaExit(i);
+        loadI32(vi, RCX, &bad);
+        a_.mov32(RCX, RCX);
+        loadValue(vb, RAX);
+        ssaNeedArray(vb, RAX, ObjClass::Array, bad);
+        a_.alu32(7, RCX, mem(RAX, kArrayLength));  // unsigned: below zero is past the end
+        a_.jcc(CAE, cold);
+        a_.mov(RDX, mem(RAX, kArrayElems));
+        a_.mov(RAX, mem(RDX, RCX, 8));
+        a_.cmpI(RAX, std::int32_t(kHole));
+        a_.jcc(CE, cold);
+        const std::uint32_t def = ssa_->defBase[i];
+        if (sval_[def].rep == kRepI32) {
+            needInt(RAX, bad);
+            ssaDefI32(i);
+        } else if (sval_[def].rep == kRepF64) {
+            needNumber(RAX, bad);
+            loadNumber(0, RAX, RDX);
+            ssaDefF64(i, 0);
+        } else {
+            ssaDef(i, 0);
+        }
+        a_.bind(join);
+        frame_ = frameAfter;
+        ssaForgetShapes();
+        return true;
+    }
+    Label& bad = ssaExit(i);
+    loadI32(vi, RCX, &bad);
+    a_.mov32(RCX, RCX);
+    loadValue(vb, RAX);
+    ssaNeedArray(vb, RAX, ObjClass::TypedArray, bad);
+    a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
+    a_.jcc(CNE, bad);
+    a_.alu32(7, RCX, mem(RAX, kTypedLength));
+    a_.jcc(CAE, bad);
+    a_.mov(RSI, mem(RAX, kTypedData));
+    switch (kind) {
+    case ElemKind::Float64:
+        a_.movsdLoad(0, mem(RSI, RCX, 8));
+        ssaDefF64(i, 0);
+        return true;
+    case ElemKind::Float32:
+        a_.movssLoad(0, mem(RSI, RCX, 4));
+        a_.cvtss2sd(0, 0);
+        ssaDefF64(i, 0);
+        return true;
+    case ElemKind::Int32: a_.mov32(RAX, mem(RSI, RCX, 4)); break;
+    case ElemKind::Int16: a_.movsx16(RAX, mem(RSI, RCX, 2)); break;
+    case ElemKind::Uint16: a_.movzx16(RAX, mem(RSI, RCX, 2)); break;
+    case ElemKind::Int8: a_.movsx8(RAX, mem(RSI, RCX, 1)); break;
+    default: a_.movzx8(RAX, mem(RSI, RCX, 1)); break;  // Uint8, Uint8Clamped
+    }
+    ssaDefI32(i);
+    return true;
+}
+
+bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
+{
+    const Ins& in = code_->code[i];
+    ElemKind kind = ElemKind::Int8;
+    const int plan = ssaElemPlan(i, true, &kind);
+    if (!plan)
+        return false;
+    const std::uint32_t vb = name_[in.a], vi = name_[in.b], vx = name_[in.c];
+    if (plan == 2) {
+        Label& bad = ssaExit(i);
+        const bool flt = kind == ElemKind::Float64 || kind == ElemKind::Float32;
+        if (flt)
+            loadF64(vx, 0, &bad);
+        else
+            loadI32(vx, RDI, &bad);
+        loadI32(vi, RCX, &bad);
+        a_.mov32(RCX, RCX);
+        loadValue(vb, RAX);
+        ssaNeedArray(vb, RAX, ObjClass::TypedArray, bad);
+        a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
+        a_.jcc(CNE, bad);
+        a_.alu32(7, RCX, mem(RAX, kTypedLength));
+        a_.jcc(CAE, bad);
+        a_.mov(RSI, mem(RAX, kTypedData));
+        switch (kind) {
+        case ElemKind::Float64: a_.movsdStore(mem(RSI, RCX, 8), 0); break;
+        case ElemKind::Float32: a_.cvtsd2ss(0, 0); a_.movssStore(mem(RSI, RCX, 4), 0); break;
+        case ElemKind::Int32: a_.mov32(mem(RSI, RCX, 4), RDI); break;
+        case ElemKind::Int16: case ElemKind::Uint16: a_.mov16(mem(RSI, RCX, 2), RDI); break;
+        default: a_.mov8(mem(RSI, RCX, 1), RDI); break;
+        }
+        return true;
+    }
+    // A plain array, an element it has (no append, no hole). A number over a number (the array holds numbers only) lets
+    // nothing go; anything else may, so every live value gets an owner first.
+    const bool number = known(vx, kVInt) || sval_[vx].rep == kRepF64 ||
+                        (sval_[vx].isConst && JSValue::raw(sval_[vx].bits).isNumber());
+    if (!number) {
+        ssaSync({}, liveAfter, std::vector<std::uint8_t>(code_->nregs, 0));
+        if (ssaFailed_)
+            return true;
+    }
+    // Anything but a store over an element the array has (an append, a hole, another object): the runtime's, out of line.
+    Label& bad = coldLabels_.emplace_back();
+    Label& join = coldLabels_.emplace_back();
+    const std::vector<std::uint32_t> frameBefore = frame_;
+    ssaColdCall(i, &helperThunk<jitPutElem>, liveAfter, bad, join);
+    if (ssaFailed_)
+        return true;
+    const std::vector<std::uint32_t> frameAfter = frame_;
+    frame_ = frameBefore;
+    struct Done
+    {
+        Baseline* self;
+        Label* join;
+        std::vector<std::uint32_t> after;
+        ~Done()
+        {
+            self->a_.bind(*join);
+            self->frame_ = after;
+            self->ssaForgetShapes();
+        }
+    } done{this, &join, frameAfter};
+    {
+        Label& out = ssaExit(i);
+        loadI32(vi, RCX, &out);
+        a_.mov32(RCX, RCX);
+        loadValue(vb, RAX);
+        ssaNeedArray(vb, RAX, ObjClass::Array, out);
+    }
+    a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
+    a_.jcc(CNE, bad);
+    a_.alu32(7, RCX, mem(RAX, kArrayLength));
+    a_.jcc(CAE, bad);
+    a_.mov(RDX, mem(RAX, kArrayElems));
+    a_.lea(RDX, mem(RDX, RCX, 8));
+    if (number) {
+        // A number over a number: nothing to count or let go of.
+        a_.mov(RDI, mem(RDX, 0));
+        a_.test(RDI, R14);
+        a_.jcc(CE, bad);
+    } else {
+        a_.cmpI(mem(RDX, 0), std::int32_t(kHole));
+        a_.jcc(CE, bad);
+    }
+    loadValue(vx, RSI);
+    if (number) {
+        packAt(RAX, RCX);
+        a_.mov(mem(RDX, 0), RSI);
+        return true;
+    }
+    retain(RSI);
+    Label isNumber, stored;
+    a_.test(RSI, R14);
+    a_.jcc(CNE, isNumber);
+    a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+    unpackAt(RAX, RCX);
+    a_.jmp(stored);
+    a_.bind(isNumber);
+    packAt(RAX, RCX);
+    a_.bind(stored);
+    a_.mov(RDI, mem(RDX, 0));
+    a_.mov(mem(RDX, 0), RSI);
+    release(RDI);
+    return true;
+}
+
+/// Value `v` converted by ToInt32 into the low half of `dst` (a double truncates), else `bad`. Clobbers rdx, xmm0.
+void Baseline::loadToInt32(std::uint32_t v, Reg dst, Label& bad)
+{
+    const SVal& s = sval_[v];
+    if (s.isConst) {
+        const JSValue k = JSValue::raw(s.bits);
+        if (k.isInt32()) {
+            a_.movImm(dst, std::uint32_t(k.asInt32()));
+        } else if (k.isDouble()) {
+            const double d = k.asDouble();
+            std::int32_t r = 0;
+            if (d == d && d > -9.2e18 && d < 9.2e18)
+                r = std::int32_t(std::uint32_t(std::uint64_t(std::int64_t(d))));
+            else
+                a_.jmp(bad);
+            a_.movImm(dst, std::uint32_t(r));
+        } else {
+            a_.jmp(bad);
+        }
+        return;
+    }
+    if (s.rep == kRepF64 || (s.rep == kRepTagged && !known(v, kVInt))) {
+        Label done;
+        if (s.rep == kRepF64) {
+            loadF64(v, 0, nullptr);
+        } else {
+            Label dbl;
+            loadValue(v, dst);
+            a_.cmp(dst, R14);
+            a_.jcc(CB, dbl);
+            a_.jmp(done);
+            a_.bind(dbl);
+            a_.test(dst, R14);
+            a_.jcc(CE, bad);
+            a_.mov(RDX, dst);
+            a_.sub(RDX, RBP);
+            a_.movqToX(0, RDX);
+        }
+        // The low half of the truncation, for a double that fits 64 bits; else the interpreter's.
+        a_.cvttsd2si64(dst, 0);
+        a_.movImm(RDX, std::uint64_t(1) << 63);
+        a_.cmp(dst, RDX);
+        a_.jcc(CE, bad);
+        a_.bind(done);
+        a_.mov32(dst, dst);
+        return;
+    }
+    loadI32(v, dst, nullptr);
+}
+
+/// A relation of `va` and `vb` (or the int32 `imm`): `then(c)` is called with the flags set and `c` the condition that is
+/// true when it holds; for int32s, for doubles, or (values whose kind is not known) both, at run time. Not numbers: `bad`.
+template <typename Then>
+void Baseline::ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, std::int32_t imm, bool isImm,
+                           Label& bad, Then then)
+{
+    const Relation rel = relationOf(code_->code[i].opcode());
+    auto isDouble = [&](std::uint32_t v) {
+        return sval_[v].isConst ? JSValue::raw(sval_[v].bits).isDouble() : sval_[v].rep == kRepF64;
+    };
+    const bool aI = known(va, kVInt), bI = isImm || known(vb, kVInt);
+    auto doubles = [&]() {
+        loadF64(va, 0, &bad);
+        if (isImm) {
+            a_.movImm(RDX, std::uint32_t(imm));
+            a_.cvtsi2sd32(1, RDX);
+        } else {
+            loadF64(vb, 1, &bad);
+        }
+        if (rel.swap)
+            a_.ucomisd(1, 0);
+        else
+            a_.ucomisd(0, 1);
+        then(rel.dc);
+    };
+    if (aI && bI) {
+        loadI32(va, RAX, nullptr);
+        if (isImm) {
+            a_.aluI32(7, RAX, imm);
+        } else {
+            loadI32(vb, RCX, nullptr);
+            a_.alu32(7, RAX, RCX);
+        }
+        then(rel.ic);
+        return;
+    }
+    if (isDouble(va) || (!isImm && isDouble(vb))) {
+        doubles();
+        return;
+    }
+    // Not known: two int32s compare as such, anything else as doubles.
+    const std::vector<std::uint32_t> st = frame_;
+    Label dbl;
+    if (!isImm && (aI || bI)) {
+        // One is an int32 already: only the other is looked at.
+        const std::uint32_t other = aI ? vb : va;
+        loadValue(other, aI ? RCX : RAX);
+        a_.cmp(aI ? RCX : RAX, R14);
+        a_.jcc(CB, dbl);
+        loadI32(aI ? va : vb, aI ? RAX : RCX, nullptr);
+        a_.alu32(7, RAX, RCX);
+        then(rel.ic);
+        a_.bind(dbl);
+        frame_ = st;
+        doubles();
+        return;
+    }
+    loadValue(va, RAX);
+    if (isImm) {
+        a_.cmp(RAX, R14);
+        a_.jcc(CB, dbl);
+        a_.aluI32(7, RAX, imm);
+    } else {
+        loadValue(vb, RCX);
+        a_.mov(RDX, RAX);
+        a_.and_(RDX, RCX);
+        a_.cmp(RDX, R14);
+        a_.jcc(CB, dbl);
+        a_.alu32(7, RAX, RCX);
+    }
+    then(rel.ic);
+    a_.bind(dbl);
+    frame_ = st;
+    doubles();
+}
+
+/// Upvalues and boxes (borrowed reads; a store gives every live value an owner first, as the old value is let go of),
+/// `ToNumeric` of a number, `!` of what has a plain truth.
+bool Baseline::ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter)
+{
+    const Ins& in = code_->code[i];
+    switch (in.opcode()) {
+    case Op::GetUpval:
+        a_.mov(RAX, mem(R13, kFrameFn));
+        a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * in.b)));
+        a_.mov(RAX, mem(RAX, kBoxValue));
+        ssaDef(i, 0);
+        return true;
+    case Op::GetBox:
+        loadValue(name_[in.b], RAX);
+        a_.mov(RAX, mem(RAX, kBoxValue));
+        ssaDef(i, 0);
+        return true;
+    case Op::PutUpval: case Op::PutBox: {
+        const bool upval = in.opcode() == Op::PutUpval;
+        ssaSync({}, liveAfter, std::vector<std::uint8_t>(code_->nregs, 0));
+        if (ssaFailed_)
+            return true;
+        if (upval) {
+            a_.mov(RAX, mem(R13, kFrameFn));
+            a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * in.a)));
+        } else {
+            loadValue(name_[in.a], RAX);
+        }
+        loadValue(name_[in.b], RCX);
+        if (mayBeCell(name_[in.b]))
+            retain(RCX);
+        a_.mov(RSI, mem(RAX, kBoxValue));
+        a_.mov(mem(RAX, kBoxValue), RCX);
+        release(RSI);
+        return true;
+    }
+    case Op::ToNumeric: {
+        const std::uint32_t v = name_[in.b];
+        const SVal& sv = sval_[v];
+        Label& bad = ssaExit(i);
+        loadValue(v, RAX);
+        if (!known(v, kVInt) && (sv.isConst || sv.rep == kRepTagged)) {
+            a_.cmp(RAX, RBP);
+            a_.jcc(CB, bad);
+        }
+        ssaDef(i, kVNotCell);
+        return true;
+    }
+    case Op::Not: {
+        const std::uint32_t v = name_[in.b];
+        Label& bad = ssaExit(i);
+        loadValue(v, RAX);
+        Label t, f, done, notInt;
+        if (known(v, kVBool)) {
+            a_.aluI32(6, RAX, 1);  // true <-> false
+            ssaDef(i, kVBool | kVNotCell);
+            return true;
+        }
+        a_.cmpI(RAX, std::int32_t(kTrue));
+        a_.jcc(CE, t);
+        a_.cmpI(RAX, std::int32_t(kFalse));
+        a_.jcc(CE, f);
+        a_.cmp(RAX, R14);
+        a_.jcc(CB, notInt);
+        a_.test32(RAX, RAX);
+        a_.jcc(CNE, t);
+        a_.jmp(f);
+        a_.bind(notInt);
+        a_.mov(RDX, RAX);
+        a_.aluI(4, RDX, -9);
+        a_.cmpI(RDX, std::int32_t(kNull));
+        a_.jcc(CE, f);
+        needObject(RAX, bad);
+        a_.bind(t);
+        a_.movImm(RAX, kFalse);
+        a_.jmp(done);
+        a_.bind(f);
+        a_.movImm(RAX, kTrue);
+        a_.bind(done);
+        ssaDef(i, kVBool | kVNotCell);
+        return true;
+    }
+    default:
+        return false;
+    }
 }

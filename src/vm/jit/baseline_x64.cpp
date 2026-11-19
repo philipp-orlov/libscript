@@ -3676,19 +3676,27 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
         const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
         const std::uint64_t uid = std::uint64_t(code_->consts[in.b].asInt32());
         Label no, yes;
+        // The block that holds this instruction holds a count of the callee's block: its address names it.
+        CodeBlock* callee = vm_.codeByUid(uid);
         a_.mov(RAX, R(in.a));
         needObject(RAX, no);
         a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
         a_.jcc(CNE, no);
         a_.mov(RCX, mem(RAX, kFnCode));
-        a_.test(RCX, RCX);
-        a_.jcc(CE, no);
-        a_.movImm(RDX, uid);
-        a_.cmp(RDX, mem(RCX, kCbUid));
+        if (callee) {
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(callee));
+            a_.cmp(RDX, RCX);
+        } else {
+            a_.test(RCX, RCX);
+            a_.jcc(CE, no);
+            a_.movImm(RDX, uid);
+            a_.cmp(RDX, mem(RCX, kCbUid));
+        }
         a_.jcc(CNE, no);
-        if (CodeBlock* callee = vm_.codeByUid(uid);
-            !callee || !(callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) {
-            a_.mov(RAX, R(in.a + 1));
+        const unsigned self = in.a + 1u;
+        const bool thisKnown = optimizing() && self < factShape_.size() && factShape_[self] != 0;
+        if ((!callee || !(callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) && !thisKnown) {
+            a_.mov(RAX, R(self));
             needObject(RAX, no);
         }
         a_.jmp(yes);

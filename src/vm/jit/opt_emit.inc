@@ -1695,7 +1695,8 @@ void Baseline::emitOpt(std::uint32_t i)
         return;
     if (emitReturnCopy(i))
         return;
-    forgetFacts();
+    if (code_->code[i].opcode() != Op::JNotCode)  // a test of a function's code changes no object
+        forgetFacts();
     materializeReads(i);
     // A jump that may run the interpreter (a test of an object, a tick) leaves the frame as the interpreter wants it. A
     // forward `Jmp` runs nothing, and where it goes every variable's frame copy counts as stale.

@@ -4,6 +4,8 @@
 #include "ssa.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 
 #include "opt_analysis.hpp"
 
@@ -389,6 +391,85 @@ Graph build(const CodeBlock& code)
     }
     g.ok = true;
     return g;
+}
+
+
+namespace {
+bool writesUpvalues(const CodeBlock& c)
+{
+    for (const Ins& in : c.code)
+        if (in.opcode() == Op::PutUpval || in.opcode() == Op::PutBox)  // a closure that keeps state
+            return true;
+    return false;
+}
+}  // namespace
+
+bool preferTier2(const CodeBlock& code, const VM& vm, const char** why)
+{
+    // Which rules apply (a debug mask: 1 recursion, 2 tiny callees, 4 fields).
+    static const int rules = [] {
+        const char* e = std::getenv("SSA_PREFER");
+        return e ? std::atoi(e) : 7;
+    }();
+    const std::uint32_t n = std::uint32_t(code.code.size());
+    // The loops: header .. last back edge.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> loops;
+    for (std::uint32_t i = 0; i < n; i = opt::nextOf(code, i)) {
+        const Op op = code.code[i].opcode();
+        if (op == Op::JNotCallee && (rules & 1)) {
+            *why = "self-inlined recursion";
+            return true;
+        }
+        const std::int64_t t = opt::jumpTarget(code, i);
+        if (t >= 0 && t <= std::int64_t(i))
+            loops.emplace_back(std::uint32_t(t), i);
+    }
+    for (const auto& [h, e] : loops) {
+        std::vector<std::uint8_t> written(code.nregs, 0);
+        bool calls = false;
+        for (std::uint32_t i = h; i <= e && i < n; i = opt::nextOf(code, i)) {
+            const Ins& in = code.code[i];
+            const Op op = in.opcode();
+            if (op == Op::Call || op == Op::New || op == Op::CallSpread || op == Op::NewSpread || op == Op::SuperCall) {
+                // A call of a native (`Math.sqrt`) leaves no callee in the profile: not taken as one that may change fields.
+                const bool script = op != Op::Call || (i < code.callProf.size() && code.callProf[i]);
+                calls = calls || script;
+                if (op == Op::Call && i < code.callProf.size() && code.callProf[i])
+                    if (const CodeBlock* C = vm.codeByUid(code.callProf[i]);
+                        (rules & 2) && C && C != &code && C->code.size() <= 20 && writesUpvalues(*C)) {
+                        *why = "tiny callee in a loop";
+                        return true;
+                    }
+            }
+            const opt::Effects ef = opt::effectsOf(code, i);
+            for (std::uint16_t w : ef.wr)
+                if (w < code.nregs)
+                    written[w] = 1;
+        }
+        // A small loop only: in a large one, the fields are a small part of the work (Box2D's constraint solver).
+        if (calls || !(rules & 4) || e - h > 200)
+            continue;
+        // Properties read and written through a register the loop does not write: three or more.
+        std::vector<std::pair<std::uint16_t, std::uint16_t>> fields;
+        for (std::uint32_t i = h; i <= e && i < n; i = opt::nextOf(code, i)) {
+            const Ins& p = code.code[i];
+            if (p.opcode() != Op::PutProp || p.a >= code.nregs || written[p.a])
+                continue;
+            for (std::uint32_t j = h; j <= e && j < n; j = opt::nextOf(code, j)) {
+                const Ins& g = code.code[j];
+                if (g.opcode() == Op::GetProp && g.b == p.a && g.c == p.b &&
+                    std::find(fields.begin(), fields.end(), std::make_pair(p.a, p.b)) == fields.end()) {
+                    fields.emplace_back(p.a, p.b);
+                    break;
+                }
+            }
+        }
+        if (fields.size() >= 3) {
+            *why = "fields a loop reads and writes";
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace ssa

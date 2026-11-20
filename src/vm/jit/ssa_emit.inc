@@ -978,6 +978,15 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                 ssaRet(i);
                 ended = true;
                 break;
+            case Op::Call:
+                if (!native_[i]) {
+                    ssaGeneric(i, liveAfter[b][k]);
+                } else if (JSFunction* f = ssaMathCallee(i)) {
+                    ssaMathCall(i, f);
+                } else {
+                    ssaGeneric(i, liveAfter[b][k]);
+                }
+                break;
             case Op::CheckInit:
                 if (!native_[i]) {
                     ssaGeneric(i, liveAfter[b][k]);
@@ -1573,26 +1582,61 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
     const std::uint32_t v = name_[in.a];
     if (vShape_[v] && vShape_[v] != ic.shape)
         return false;
-    // The old value is let go of: every live value gets an owner first.
-    ssaSync({}, liveAfter, std::vector<std::uint8_t>(code_->nregs, 0));
+    const std::uint32_t x = name_[in.c];
+    const bool number = !mayBeCell(x) && (sval_[x].rep != kRepTagged ||
+                                          (sval_[x].isConst && JSValue::raw(sval_[x].bits).isNumber()));
+    if (!number) {
+        // A value that may be a cell (most likely over another): every live value gets an owner, the old one goes here.
+        ssaSync({}, liveAfter, std::vector<std::uint8_t>(code_->nregs, 0));
+        if (ssaFailed_)
+            return true;
+        Label& bad = ssaExit(i);
+        loadValue(v, RAX);
+        needObjV(v, RAX, bad);
+        if (!vShape_[v]) {
+            a_.cmpI32(mem(RAX, 0), std::int32_t(ic.shape));
+            a_.jcc(CNE, bad);
+            ssaKnow(v, kVObj, ic.shape);
+        }
+        slotAddress(ic.index);
+        loadValue(x, RCX);
+        if (mayBeCell(x))
+            retain(RCX);
+        a_.mov(RDI, mem(RDX, 0));
+        a_.mov(mem(RDX, 0), RCX);
+        release(RDI);
+        return true;
+    }
+    {
+        Label& bad = ssaExit(i);
+        loadValue(v, RAX);
+        needObjV(v, RAX, bad);
+        if (!vShape_[v]) {
+            a_.cmpI32(mem(RAX, 0), std::int32_t(ic.shape));
+            a_.jcc(CNE, bad);
+        }
+    }
+    // An old value that is a cell is let go of, which may free what a live value borrows: the runtime's store, out of
+    // line, after every live value has an owner. Anything else (a number over a number) is stored here, with no sync.
+    Label& cold = coldLabels_.emplace_back();
+    Label& join = coldLabels_.emplace_back();
+    const std::vector<std::uint32_t> frameBefore = frame_;
+    ssaColdCall(i, &helperThunk<jitPutProp>, liveAfter, cold, join);
     if (ssaFailed_)
         return true;
-    const std::uint32_t x = name_[in.c];
-    Label& bad = ssaExit(i);
-    loadValue(v, RAX);
-    needObjV(v, RAX, bad);
-    if (!vShape_[v]) {
-        a_.cmpI32(mem(RAX, 0), std::int32_t(ic.shape));
-        a_.jcc(CNE, bad);
-        ssaKnow(v, kVObj, ic.shape);
-    }
+    const std::vector<std::uint32_t> frameAfter = frame_;
+    frame_ = frameBefore;
     slotAddress(ic.index);
+    a_.mov(RDI, mem(RDX, 0));
+    a_.test(RDI, R15);
+    a_.jcc(CE, cold);  // a cell
     loadValue(x, RCX);
     if (mayBeCell(x))
         retain(RCX);
-    a_.mov(RDI, mem(RDX, 0));
     a_.mov(mem(RDX, 0), RCX);
-    release(RDI);
+    a_.bind(join);
+    frame_ = frameAfter;  // the runtime's store over a data property of that shape changes no shape
+    ssaKnow(v, kVObj, ic.shape);
     return true;
 }
 
@@ -2118,6 +2162,62 @@ void Baseline::ssaPutAdd(std::uint32_t i)
     ssaKnow(v, kVObj, ic.next);
 }
 
+JSFunction* Baseline::ssaMathCallee(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || in.opcode() != Op::Call || in.c != 1 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return nullptr;
+    // The instruction that wrote the callee's register last: a read of a property of a global object.
+    for (std::uint32_t j = i; j-- > 0;) {
+        if (code_->code[j].opcode() == Op::Cache)
+            continue;
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        if (std::find(e.wr.begin(), e.wr.end(), std::uint16_t(in.b)) == e.wr.end())
+            continue;
+        const Ins& r = code_->code[j];
+        if (r.opcode() != Op::GetProp || r.a != in.b)
+            return nullptr;
+        const JSValue base = guessBefore(j, r.b);
+        if (!isObject(base))
+            return nullptr;
+        std::uint8_t attrs = 0;
+        JSValue* slot = asObject(base)->findOwn(vm_, code_->atoms[r.c], &attrs);
+        if (!slot || (attrs & attr::kAccessor) || !isFunction(*slot))
+            return nullptr;
+        auto* f = static_cast<JSFunction*>(asObject(*slot));
+        if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != mathUnaryNative())
+            return nullptr;
+        return f;
+    }
+    return nullptr;
+}
+
+/// The call of `ssaMathCallee`: the callee checked to be that function, the argument a number, the C function of its
+/// data called with the live registers saved, the result boxed as the runtime boxes a number.
+void Baseline::ssaMathCall(std::uint32_t i, JSFunction* f)
+{
+    const Ins& in = code_->code[i];
+    holdValue(toJSValue(f));
+    Label& bad = ssaExit(i);
+    loadValue(name_[in.b], RAX);
+    a_.movImm(RCX, toJSValue(f).bits);
+    a_.cmp(RAX, RCX);
+    a_.jcc(CNE, bad);
+    loadF64(name_[in.b + 2u], 0, &bad);
+    const std::vector<int> keep = ssaLiveRegs();
+    ssaSaveRegs(keep);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(f->rare()->nativeData));
+    a_.callC(RAX);
+    ssaRestoreRegs(keep);
+    const std::uint32_t def = ssa_->defBase[i];
+    if (sval_[def].rep == kRepF64) {
+        ssaDefF64(i, 0);
+    } else {
+        boxNumber0();
+        ssaDef(i, kVNotCell);
+    }
+}
+
 CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
 {
     const Ins& in = code_->code[i];
@@ -2452,6 +2552,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     switch (op) {
     case Op::GetProp: return plainReadable(i);
     case Op::New: return ssaNewPlan(i, nullptr);
+    case Op::Call: return ssaMathCallee(i) != nullptr;
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
     case Op::InitProp: return ssaAddFast(i);
     case Op::GetGlobal: return ssaGlobalFast(i);

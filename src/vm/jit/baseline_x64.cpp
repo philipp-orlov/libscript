@@ -2810,6 +2810,10 @@ private:
     bool ssaNew(std::uint32_t i, const ssa::Bits& liveAfter);
     /// `o.#x` (a `GetElem` whose site has found the private name): the name and the shape checked, the slot read.
     bool ssaPrivateSite(std::uint32_t i) const;
+    /// `Math.sqrt(x)` and its kind (a native of one double, `mathUnaryNative`): the function the callee register was read
+    /// as, from a global object's own data property; null when the site is not one.
+    JSFunction* ssaMathCallee(std::uint32_t i);
+    void ssaMathCall(std::uint32_t i, JSFunction* f);
     /// A property added in place (`PutProp`, `InitProp`): the cache saw the transition, into an inline slot.
     bool ssaAddFast(std::uint32_t i) const;
     void ssaPutAdd(std::uint32_t i);
@@ -5587,7 +5591,19 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
 #endif
 #if defined(__aarch64__)
     // The SSA tier first; tier 2 compiles what it refuses (`ssaTierMode`).
-    if (ssaTierMode() != 0) {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    static const bool noPrefer = std::getenv("SSA_NOPREFER") != nullptr;
+#else
+    static const bool noPrefer = false;
+#endif
+    const char* preferWhy = "";
+    if (ssaTierMode() != 0 && !noPrefer && ssa::preferTier2(*code, vm, &preferWhy)) {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("SSA_REFUSED"))
+            std::fprintf(stderr, "ssa leaves to tier 2 %s: %s\n",
+                         code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", preferWhy);
+#endif
+    } else if (ssaTierMode() != 0) {
         const ssa::Graph g = ssa::build(*code);
         const char* why = g.why;
         if (g.ok) {

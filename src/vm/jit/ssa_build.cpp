@@ -404,13 +404,6 @@ bool writesUpvalues(const CodeBlock& c)
             return true;
     return false;
 }
-bool makesCalls(const CodeBlock& c)
-{
-    for (const Ins& in : c.code)
-        if (in.opcode() == Op::Call || in.opcode() == Op::New || in.opcode() == Op::CallSpread || in.opcode() == Op::SuperCall)
-            return true;
-    return false;
-}
 }  // namespace
 
 bool preferTier2(const CodeBlock& code, const VM& vm, const char** why)
@@ -446,8 +439,7 @@ bool preferTier2(const CodeBlock& code, const VM& vm, const char** why)
                 if (op == Op::Call && i < code.callProf.size() && code.callProf[i])
                     if (const CodeBlock* C = vm.codeByUid(code.callProf[i]);
                         (rules & 2) && C && C != &code &&
-                        ((C->code.size() <= 20 && writesUpvalues(*C)) ||
-                         ((rules & 8) && !code.mergedFrom && C->code.size() <= 12 && !makesCalls(*C)))) {
+                        C->code.size() <= 20 && writesUpvalues(*C)) {
                         *why = "tiny callee in a loop";
                         return true;
                     }

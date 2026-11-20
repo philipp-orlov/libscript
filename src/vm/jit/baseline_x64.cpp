@@ -2706,7 +2706,11 @@ private:
     {
         std::vector<std::uint32_t> ints, arrays, typed;
         std::vector<std::uint32_t> intParams;  ///< parameters the loop reads and does not write, profiled int32 only
+        std::vector<std::uint32_t> globals;    ///< `GetGlobal`s of the loop read once, on the way in (`ssaHoisted_`)
     };
+    std::vector<std::uint8_t> ssaHoisted_;  ///< per instruction: a `GetGlobal` read before its loop
+    /// The read of global `i` into its value's place; `bad` when the global object has changed (`ssaGetGlobal`).
+    void ssaGlobalRead(std::uint32_t i, Label& bad);
     std::vector<LoopGuards> loopGuards_;
     void ssaLoopGuards(std::uint32_t from, std::uint32_t to);
     bool ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter);

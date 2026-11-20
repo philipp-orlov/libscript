@@ -571,7 +571,7 @@ void Baseline::ssaEdgeMoves(std::uint32_t from, std::uint32_t to)
 void Baseline::ssaLoopGuards(std::uint32_t from, std::uint32_t to)
 {
     const LoopGuards& lg = loopGuards_[to];
-    if (lg.ints.empty() && lg.arrays.empty() && lg.typed.empty() && lg.intParams.empty())
+    if (lg.ints.empty() && lg.arrays.empty() && lg.typed.empty() && lg.intParams.empty() && lg.globals.empty())
         return;
     const ssa::Block& tb = ssa_->blocks[to];
     const ssa::Bits live = liveBefore_;
@@ -591,6 +591,10 @@ void Baseline::ssaLoopGuards(std::uint32_t from, std::uint32_t to)
             needInt(RAX, bad);
             ssaKnow(v, kVInt | kVNotCell);
         }
+    for (std::uint32_t i : lg.globals) {
+        ssaGlobalRead(i, bad);
+        storeTagged(ssa_->defBase[i], RAX);
+    }
     for (std::uint32_t v : lg.intParams)
         if (!known(v, kVInt)) {
             loadValue(v, RAX);
@@ -1122,6 +1126,27 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                     a_.test(RAX, RAX);
                     a_.jcc(CNE, fail);
                     a_.bind(ok);
+                }
+            }
+        }
+        // The globals read before the loops this head is in, and what is checked of them.
+        for (std::uint32_t h = 1; h <= b; ++h) {
+            if (loopGuards_[h].globals.empty())
+                continue;
+            std::uint32_t lastB = h;
+            for (std::uint32_t q = h + 1; q < nb && g.blocks[q].start < g.blocks[h].loopEnd; ++q)
+                if (g.blocks[q].reached)
+                    lastB = q;
+            if (b > lastB)
+                continue;
+            for (std::uint32_t gi : loopGuards_[h].globals) {
+                const std::uint32_t v = ssa_->defBase[gi];
+                ssaGlobalRead(gi, fail);
+                storeTagged(v, RAX);
+                if (std::find(loopGuards_[h].arrays.begin(), loopGuards_[h].arrays.end(), v) != loopGuards_[h].arrays.end()) {
+                    needObject(RAX, fail);
+                    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+                    a_.jcc(CNE, fail);
                 }
             }
         }
@@ -3153,6 +3178,50 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 touch(name_[r], end);
     }
     std::sort(clob.begin(), clob.end());
+    // A global read in a loop that clobbers nothing and writes no global, its register written by nothing else there:
+    // read once on the way in (the outermost such loop), its value alive in all of the loop.
+    ssaHoisted_.assign(n_, 0);
+    for (std::uint32_t h = 1; h < nb && ssaOn_ >= 2; ++h) {
+        const ssa::Block& hb = g.blocks[h];
+        if (!hb.reached || !hb.loopHeader || !guarded(h))
+            continue;
+        std::uint32_t lastB = h;
+        for (std::uint32_t b = h + 1; b < nb && g.blocks[b].start < hb.loopEnd; ++b)
+            if (g.blocks[b].reached)
+                lastB = b;
+        bool clean = true;
+        std::vector<unsigned> writers(code_->nregs, 0);
+        for (std::uint32_t i = hb.start; i < hb.loopEnd && clean; i = opt::nextOf(*code_, i)) {
+            if (!native_[i] || code_->code[i].opcode() == Op::PutGlobal)
+                clean = false;
+            const opt::Effects e = ssa::effects(*code_, i);
+            for (std::uint16_t w : e.wr)
+                if (w < code_->nregs)
+                    ++writers[w];
+        }
+        if (!clean)
+            continue;
+        for (std::uint32_t i = hb.start; i < hb.loopEnd; i = opt::nextOf(*code_, i)) {
+            const Ins& in = code_->code[i];
+            if (in.opcode() != Op::GetGlobal || ssaHoisted_[i] || writers[in.a] != 1 || g.defBase[i] == ssa::kNone)
+                continue;
+            const std::uint32_t v = g.defBase[i];
+            ssaHoisted_[i] = 1;
+            loopGuards_[h].globals.push_back(i);
+            first[v] = std::min(first[v], blockPos[h].first);
+            last[v] = std::max(last[v], blockPos[lastB].second);
+            // Elements read or written of it in place: an array, checked once.
+            for (std::uint32_t j = hb.start; j < hb.loopEnd; j = opt::nextOf(*code_, j)) {
+                const Op op = code_->code[j].opcode();
+                ElemKind kind;
+                if ((op == Op::GetElem || op == Op::PutElem) &&
+                    (op == Op::GetElem ? code_->code[j].b : code_->code[j].a) == in.a &&
+                    ssaElemPlan(j, op == Op::PutElem, &kind) == 1 &&
+                    std::find(loopGuards_[h].arrays.begin(), loopGuards_[h].arrays.end(), v) == loopGuards_[h].arrays.end())
+                    loopGuards_[h].arrays.push_back(v);
+            }
+        }
+    }
     // Linear scan, one interval per value; a value across a clobber lives in a slot.
     std::vector<std::uint32_t> order;
     for (std::uint32_t v = 0; v < nv; ++v)
@@ -3384,13 +3453,29 @@ bool Baseline::ssaGetGlobal(std::uint32_t i)
         index = std::uint32_t(slot - inlineBase);
     else
         index = std::uint32_t(slot - g->slots) + g->h.aux;
+    if (ssaHoisted_[i]) {
+        name_[in.a] = ssa_->defBase[i];  // read on the way into the loop
+        return true;
+    }
+    (void)index;
     Label& bad = ssaExit(i);
+    ssaGlobalRead(i, bad);
+    ssaDef(i, 0);
+    return true;
+}
+
+void Baseline::ssaGlobalRead(std::uint32_t i, Label& bad)
+{
+    JSObject* g = vm_.global;
+    std::uint8_t attrs = 0;
+    JSValue* slot = g->findOwn(vm_, code_->atoms[code_->code[i].b], &attrs);
+    JSValue* inlineBase = g->inl();
+    const std::uint32_t index = slot >= inlineBase && slot < inlineBase + g->h.aux ? std::uint32_t(slot - inlineBase)
+                                                                                 : std::uint32_t(slot - g->slots) + g->h.aux;
     a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, bad);
     globalSlot(index);
     a_.mov(RAX, mem(RDX, 0));
-    ssaDef(i, 0);
-    return true;
 }
 
 /// `==`, `!=`, `===`, `!==` into a boolean, where they compare bits: against null or undefined (loose), against a constant

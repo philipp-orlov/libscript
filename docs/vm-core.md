@@ -218,6 +218,52 @@ register holds; `JSON.parse` follows known shape transitions and reads short dec
 waits until the cells have grown fourfold; `String.fromCharCode`, `Array.prototype.map`/`filter`/`forEach` and short
 decimals in `Number.prototype.toString` have fast paths; `MulI` wraps when its result only reaches `ToInt32`.
 
+## The SSA tier
+
+On arm64 the SSA tier (`ssa.hpp`, `ssa_build.cpp`, `ssa_emit.inc`) compiles a hot function first. Tier 2 compiles the functions
+it refuses: generators, async functions, functions that need `arguments`, functions with exception handlers, and `with`
+scopes. `SCRIPT_VM_SSA` sets the mode: 0 off (tier 2 only), 1 every instruction through the baseline templates, 2 (the
+default on arm64) with its own fast paths. It is off on x86-64, where it is not tested.
+
+**The graph.** One value per instruction and register it writes, per register at the entry, and per phi. A `Mov` is a second
+name for a value. A loop head has a phi for each register the loop writes; phis that join one value only are removed.
+
+**The planner** (`ssaPlan`) gives each value a representation: int32, double or boxed. An arithmetic site takes it from its
+profile. A site with an empty profile (code that only tier 1 has run: only the interpreter writes profiles) takes it from its
+operands. A double operand widens an int32-profiled site to a double, and once an add or product of a function has failed, its
+other int32 sites are decided by their operands; without these rules, each site would leave in turn, with a compile each. An
+int32 add whose every use truncates to int32 has no overflow check.
+
+**Registers.** A linear scan gives each value one register or one slot. A value across an instruction that the code does not do
+in place (a template: it clobbers registers) lives in a slot. When no register is free, the value needed longest gives up its
+register. A loop that clobbers nothing keeps the values it reads from before it in registers (the loop register cache).
+
+**Ownership.** Each frame slot owns one count of what it holds. A value no slot owns is borrowed, and stays valid until an event
+(a call, a release, an exit); `ssaSync` gives every live value an owner before one. An exit writes the live values into the frame
+and goes on in the baseline code at that instruction.
+
+**In place:** int32 and double arithmetic and comparisons, property reads (one shape or several, own or on a prototype), property
+writes and adds, element reads and writes of arrays (holes as well, when `plainHoleGuard` holds) and of typed arrays, private
+field reads, `typeof`, strict and loose equality, globals, upvalues, `let`/`const` checks. A plain constructor's `new` (stores of
+its arguments, constants and static fields into new properties, class field initializers too) makes its object in place. A call
+whose site has called one code is made directly, with its frame pushed from constants. Checks on the way into a loop (an array
+it reads, a boxed loop variable) hold in all of it.
+
+**It inlines nothing itself.** With the SSA tier, merge inlining (`mergeInline`) also takes a callee of up to 12 instructions at
+up to 64 sites. Tier 2 compiles a function where it uses what the SSA tier lacks (`ssa::preferTier2`): a self-inlined recursion
+(borrowed frames), a loop that calls a tiny closure that writes an upvalue or reads through a tiny getter (run in place), and a
+small loop that reads and writes three or more properties of objects it does not change (kept in registers).
+
+**Also in place:** `Math.sqrt` and the other one-double natives, `s.charCodeAt(i)`, `String.prototype` methods of a string,
+`.length` of strings and arrays, `ModI` (a multiply by a magic number), and a global read that a loop which clobbers nothing
+reads once on the way in. Values known never to be below zero (`nonNeg_`) need no sign or -0 checks.
+
+**Switches** (builds with `SCRIPT_JIT_ENV_OVERRIDE`): `SSA_DUMP` (bytecode and graph), `SSA_REPS` (representations),
+`SSA_REFUSED`, `SSA_GENERIC` (each instruction compiled through a template, with its cache state), `SSA_SYNCALL`,
+`SSA_NOREGS`, `SSA_NOEVICT`, `SSA_NONEW`, `SSA_NOPREFER` (no function left to tier 2), `SSA_PREFER=<mask>` (which rules),
+`CALLDBG` (calls that reach `callPrepare`, per site), `WINDBG` (the call windows), `RETDBG` (what a return clears).
+`T2EXITS` names the exits of both tiers, with the opcode and, for element exits, the caller.
+
 ## Arrays of numbers
 
 An array knows how many of its first elements are numbers (`JSArray::packed`: no hole and no cell below it). It is a
@@ -371,8 +417,8 @@ sites, the base, index and element profile), `T2DBG` (each compile: webs and pro
 `T2INL` (inlining decisions), `T2CHAIN` (read chains), `T2HOIST` (what loops hoist, and when a loop "calls out"),
 `T2DOORS` (where a side door was counted), `T2FAIL=<i,...>`, `SCRIPT_VM_DUMP` (bytecode).
 
-**Before a commit.** `ctest` in four modes: as is, `SCRIPT_VM_TIER1=1 SCRIPT_VM_TIER2=1`, `SCRIPT_VM_TIER1=0`,
-`SCRIPT_VM_TIER2=0`; then `tools/vm_fuzz.py <libscript> 1200 180000`, the same with
+**Before a commit.** `ctest` in five modes: as is, `SCRIPT_VM_TIER1=1 SCRIPT_VM_TIER2=1`, `SCRIPT_VM_TIER1=0`,
+`SCRIPT_VM_TIER2=0`, and `SCRIPT_VM_SSA=0` (tier 2 alone); then `tools/vm_fuzz.py <libscript> 1200 180000`, the same with
 `FUZZ_TIER1=2 FUZZ_TIER2=10 FUZZ_REPS=40` (800 programs), and `tools/js_jit_fuzz.py --cores <libscript> 1500 13000`. A
 change that makes no test move past noise is taken out, not kept.
 
@@ -401,9 +447,9 @@ change that makes no test move past noise is taken out, not kept.
 
 ## Known limits
 
-- Tier 1 (the baseline compiler) compiles a function after 200 calls; tier 2 (the first optimizing form: int32 and double webs in
-  registers) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in builds with
-  `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). Both tiers run on x86-64 and on arm64 (Linux).
+- Tier 1 (the baseline compiler) compiles a function after 200 calls; the optimizing tier (the SSA tier on arm64, tier 2 for what
+  it refuses and on x86-64) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in
+  builds with `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). Tier 1 and tier 2 run on x86-64 and on arm64 (Linux).
 - Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` take 0.89x its time in
   geometric mean (Xeon Gold 5420+, median of eleven runs of each engine in turn on one core): `sort_cmp` 0.49,
   `float_mandel` 0.70, `alloc_small` 0.71, `string_ops` 0.86, `int_loop` 0.87, `map_dict` 0.91, `array_push_hof` 0.93,

@@ -5860,7 +5860,11 @@ int ssaTierMode() noexcept
     static const int mode = [] {
         if (const char* e = std::getenv("SCRIPT_VM_SSA"); e && *e >= '0' && *e <= '2')
             return *e - '0';
-        return 0;  // off unless asked for, until it beats tier 2 everywhere
+#if defined(__aarch64__)
+        return 2;
+#else
+        return 0;  // x64 is not tested
+#endif
     }();
     return mode;
 }

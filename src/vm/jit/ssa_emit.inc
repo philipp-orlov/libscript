@@ -2506,6 +2506,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     // numbers: double arithmetic; anything else: the template.
     std::vector<std::vector<std::uint32_t>> operandsOf(nv);
     std::vector<std::uint8_t> byOperands(nv, 0);  // 1: an empty profile; 2: an int32 profile (a double operand widens it)
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> elemReads;  // (instruction, base value) of int32 array reads
+    std::vector<std::uint8_t> baseMadeDoubles(nv, 0);
     if (ssaOn_ >= 2)
         for (std::uint32_t b = 1; b < nb; ++b) {
             const ssa::Block& bl = g.blocks[b];
@@ -2518,6 +2520,13 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 const opt::Effects e = ssa::effects(*code_, i);
                 const bool arith = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI ||
                                    op == Op::MulI || op == Op::Inc || op == Op::Dec;
+                if (op == Op::GetElem && names[in.b] != ssa::kNone) {
+                    const std::uint8_t pe = i < code_->prof.size() ? code_->prof[i] : 0;
+                    if (elemRep[i] == 1)
+                        elemReads.emplace_back(i, names[in.b]);
+                    else if ((pe & 2) && !(pe & ~3))
+                        baseMadeDoubles[names[in.b]] = 1;
+                }
                 const std::uint8_t pf = i < code_->prof.size() ? code_->prof[i] : 0;
                 const bool distrusted = arithFailed && pf == 1 &&
                                         (op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::MulI);
@@ -2542,6 +2551,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                     names[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
             }
         }
+    // A read of an array another read has found doubles in: a double too (each site learning it in turn would leave).
+    for (const auto& [i, base] : elemReads)
+        if (baseMadeDoubles[base])
+            elemRep[i] = 2;
     // Representations: an instruction's by what it does; a phi's the least that holds every input.
     std::vector<std::uint8_t> cls(nv, 0);  // 0 none yet, 1 int32, 2 double, 3 boxed
     for (std::uint32_t v = 0; v < nv; ++v) {

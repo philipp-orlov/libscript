@@ -3786,7 +3786,11 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
     a_.lea(RDX, mem(RDX, RCX, 8));
     // A hole of a plain array whose prototypes nothing can intercept a store with (`plainHoleGuard`): filled here.
     Label hole;
+    Label overNumber;
     if (number) {
+        // Below `packed` every element is a number: stored without a look at the old one (no load to wait for).
+        a_.alu32(7, RCX, mem(RAX, kArrayPacked));
+        a_.jcc(CB, overNumber);
         // A number over a number: nothing to count or let go of.
         a_.mov(RDI, mem(RDX, 0));
         a_.cmpI(RDI, std::int32_t(kHole));
@@ -3822,7 +3826,9 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
         a_.mov(mem(RDX, 0), RSI);
     };
     if (number) {
-        packAt(RAX, RCX);
+        // A number over a number: `packed` (a lower bound) stays right as it is.
+        a_.bind(overNumber);
+        loadValue(vx, RSI);
         a_.mov(mem(RDX, 0), RSI);
         a_.jmp(join);
         fillHole();

@@ -356,7 +356,7 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
             const bool plain = s.isConst ? !JSValue::raw(s.bits).isCell()
                                          : s.rep != kRepTagged || (vKnown_[v] & kVNotCell) ||
                                                (v == r && ssa_->values[v].kind == ssa::Value::Entry && r > code_->nparams);
-            ssaPlainWin_[r] = plain;
+            ssaPlainWin_[r] = plain || neverCell_[r];
         }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("WINDBG") && (in.opcode() == Op::Call || in.opcode() == Op::New)) {
@@ -1048,6 +1048,13 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             continue;
         osr.emplace_back(bl.start, std::uint32_t(a_.here()));
         a_.aluI(5, RSP, spill_);
+        // A slot the code takes to hold no cell, dead here: what the baseline code left there goes.
+        for (unsigned r = 0; r < nregs; ++r)
+            if (neverCell_[r] && !ssa::bitTest(bl.liveIn, r)) {
+                a_.mov(RDX, R(r));
+                a_.mov(R(r), std::int32_t(kUndefined));
+                release(RDX);
+            }
         std::vector<std::uint8_t> done(g.values.size(), 0);
         Label fail;
         for (unsigned r = 0; r < nregs; ++r) {
@@ -1437,6 +1444,13 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         Label& bad = ssaExit(i);
         ssaRelation(i, va, vb, imm ? std::int32_t(std::int16_t(in.b)) : 0, imm, bad,
                     [&](Cond c) { ssaCondEdges(b, c); });
+        return true;
+    }
+    case Op::JNotCallee: {
+        // The register holds the function this frame runs (a call of itself, run in place by `selfInline`).
+        loadValue(name_[in.a], RAX);
+        a_.cmp(RAX, mem(R13, kFrameFn));
+        ssaCondEdges(b, CNE);
         return true;
     }
     case Op::JNotCode: {
@@ -2464,7 +2478,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         return !failed;
     case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined: case Op::JHole:
-    case Op::JNotCode:
+    case Op::JNotCode: case Op::JNotCallee:
         return true;
     case Op::JTrue: case Op::JFalse:
         return known(name_[in.a], kVBool) || !failed;
@@ -2802,6 +2816,29 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                             break;
                         }
         }
+    }
+    // Registers whose slots never hold a cell: above the parameters, every value of them a number or a constant that is
+    // no cell, and no call's argument (a callee may assign its parameters).
+    neverCell_.assign(code_->nregs, 0);
+    for (unsigned r = 1u + code_->nparams; r < code_->nregs; ++r)
+        neverCell_[r] = 1;
+    for (std::uint32_t v = g.nregs; v < nv; ++v) {
+        const unsigned r = g.values[v].reg;
+        if (r >= code_->nregs || !neverCell_[r])
+            continue;
+        const SVal& sv = sval_[v];
+        if (sv.isConst ? JSValue::raw(sv.bits).isCell() : sv.rep == kRepTagged)
+            neverCell_[r] = 0;
+    }
+    for (std::uint32_t i = 0; i < n_; i = opt::nextOf(*code_, i)) {
+        const Ins& in = code_->code[i];
+        const Op op = in.opcode();
+        if (op == Op::Call || op == Op::New || op == Op::SuperCall || op == Op::CallSpread || op == Op::NewSpread)
+            for (unsigned r = in.b + 1u; r <= in.b + 1u + in.c && r < code_->nregs; ++r)
+                neverCell_[r] = 0;
+        const opt::Effects e = ssa::effects(*code_, i);
+        if (!e.ok)
+            std::fill(neverCell_.begin(), neverCell_.end(), std::uint8_t(0));
     }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("SSA_REPS"))
@@ -3202,6 +3239,19 @@ void Baseline::ssaRet(std::uint32_t i)
     }
     if (movedFrom >= 0)
         ssaPlain_[unsigned(movedFrom)] = 1;  // undefined now
+    for (unsigned r = 0; r < nregs; ++r)
+        ssaPlain_[r] = ssaPlain_[r] || neverCell_[r];
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("RETDBG")) {
+        unsigned nd = 0, np = 0, unk = 0;
+        for (unsigned r = 1u + code_->nparams; r < nregs; ++r) {
+            nd += (dirty[r / 64] >> (r % 64)) & 1;
+            np += ssaPlain_[r];
+            unk += frame_[r] == ssa::kNone;
+        }
+        std::fprintf(stderr, "ret @%u nregs %u dirty %u plain %u unknown %u\n", i, nregs, nd, np, unk);
+    }
+#endif
     ret(i, in, true, &dirty);
     ssaPlain_.clear();
 }

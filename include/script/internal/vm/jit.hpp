@@ -97,6 +97,9 @@ std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reach
 /// A copy of `code` with the code of the functions its calls have reached (by the uid each `Call` last saw) in place, each
 /// behind a guard on that uid, the call the long way after it. Null when no call qualifies. The copy has the profile of
 /// what it was made from, and no count of its own. See merge_inline.cpp.
+/// The SSA tier's mode: 0 off (tier 2 compiles every function), 1 every instruction through the baseline templates, 2
+/// with its own fast paths. `SCRIPT_VM_SSA` sets it (0 by default; arm64 only, x64 is not tested).
+int ssaTierMode() noexcept;
 /// From a loop that turned hot (`loop`, its header): only when a call in that loop is one to take in.
 CodeBlock* mergeInline(VM& vm, CodeBlock* code, std::uint32_t loop = ~0u);
 /// The block `f` (whose block is `code`, turning hot) runs from now on: `selfInline`'s copy when there is one, which `f` then

@@ -2696,6 +2696,7 @@ private:
     struct LoopGuards
     {
         std::vector<std::uint32_t> ints, arrays, typed;
+        std::vector<std::uint32_t> intParams;  ///< parameters the loop reads and does not write, profiled int32 only
     };
     std::vector<LoopGuards> loopGuards_;
     void ssaLoopGuards(std::uint32_t from, std::uint32_t to);
@@ -5582,12 +5583,8 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
     }
 #endif
 #if defined(__aarch64__)
-    // The SSA tier, while it is being built: only with SCRIPT_VM_SSA=1, and only on arm64 (x64 is not tested).
-    static const bool ssaTier = [] {
-        const char* e = std::getenv("SCRIPT_VM_SSA");
-        return e && (*e == '1' || *e == '2');
-    }();
-    if (ssaTier) {
+    // The SSA tier first; tier 2 compiles what it refuses (`ssaTierMode`).
+    if (ssaTierMode() != 0) {
         const ssa::Graph g = ssa::build(*code);
         const char* why = g.why;
         if (g.ok) {
@@ -5597,7 +5594,7 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
                              dump(*code).c_str());
 #endif
             Baseline compiler(vm, code);
-            compiler.ssaOn_ = std::getenv("SCRIPT_VM_SSA")[0] - '0';
+            compiler.ssaOn_ = ssaTierMode();
             if (Tier2Code* t = compiler.compileSsa(g, code->tier1))
                 return t;
             why = compiler.ssaWhy_;
@@ -5817,6 +5814,16 @@ CodeBlock::~CodeBlock()
         releaseTier2(tier2, nullptr);
     if (tier1)
         releaseTier1(tier1, nullptr);
+}
+
+int ssaTierMode() noexcept
+{
+    static const int mode = [] {
+        if (const char* e = std::getenv("SCRIPT_VM_SSA"); e && *e >= '0' && *e <= '2')
+            return *e - '0';
+        return 0;  // off unless asked for, until it beats tier 2 everywhere
+    }();
+    return mode;
 }
 
 }  // namespace vm

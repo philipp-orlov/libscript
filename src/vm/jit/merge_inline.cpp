@@ -115,10 +115,7 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
     std::uint32_t added = 0, addedTiny = 0;
     unsigned normal = 0;
     // With the SSA tier, which inlines nothing itself, a tiny callee (`uint` in compiled C) is taken in at many more sites.
-    static const bool ssaTier = [] {
-        const char* s = std::getenv("SCRIPT_VM_SSA");
-        return s && *s >= '2';
-    }();
+    const bool ssaTier = ssaTierMode() >= 2;
     auto tiny = [&](const CodeBlock* C) { return ssaTier && C->code.size() <= kMergeTinyCallee; };
     for (std::uint32_t j = 0; j < n; j = opt::nextOf(*c, j)) {
         const Ins& in = c->code[j];

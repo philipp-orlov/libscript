@@ -925,6 +925,10 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                         !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
                         ssaImmature(i);
                     ssaGeneric(i, liveAfter[b][k]);
+                } else if (ssaLengthSite(i)) {
+                    ssaLength(i);
+                } else if (const std::int32_t at = ssaStringProtoIndex(i); at >= 0) {
+                    ssaStringProtoRead(i, std::uint32_t(at));
                 } else if (!ssaGetProp(i))
                     a_.jmp(ssaExit(i));
                 break;
@@ -983,6 +987,8 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                     ssaGeneric(i, liveAfter[b][k]);
                 } else if (JSFunction* f = ssaMathCallee(i)) {
                     ssaMathCall(i, f);
+                } else if (JSFunction* f = ssaCharCodeCallee(i)) {
+                    ssaCharCode(i, f);
                 } else {
                     ssaGeneric(i, liveAfter[b][k]);
                 }
@@ -2218,6 +2224,133 @@ void Baseline::ssaMathCall(std::uint32_t i, JSFunction* f)
     }
 }
 
+bool Baseline::ssaLengthSite(std::uint32_t i) const
+{
+    const Ins& in = code_->code[i];
+    return ssaOn_ >= 2 && in.opcode() == Op::GetProp && in.c < code_->atoms.size() && code_->atoms[in.c] == vm_.atoms.length &&
+           !plainReadable(i) && !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed));
+}
+
+void Baseline::ssaLength(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const std::uint32_t v = name_[in.b];
+    Label& bad = ssaExit(i);
+    Label notString, done;
+    loadValue(v, RAX);
+    a_.test(RAX, R15);
+    a_.jcc(CNE, bad);  // no cell
+    a_.testI8(mem(RAX, 7), 0x80);
+    a_.jcc(CNE, notString);
+    a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::String));
+    a_.jcc(CNE, notString);
+    a_.mov32(RAX, mem(RAX, kStrLength));
+    a_.jmp(done);
+    a_.bind(notString);
+    needObject(RAX, bad);  // on this way only: nothing is known of the value after it
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+    a_.jcc(CNE, bad);
+    a_.mov32(RAX, mem(RAX, kArrayLength));
+    a_.test32(RAX, RAX);
+    a_.jcc(CS, bad);  // past int32
+    a_.bind(done);
+    if (sval_[ssa_->defBase[i]].rep == kRepI32) {
+        ssaDefI32(i);
+    } else {
+        a_.or_(RAX, R14);
+        ssaDef(i, kVInt | kVNotCell);
+    }
+}
+
+std::int32_t Baseline::ssaStringProtoIndex(std::uint32_t i) const
+{
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || in.opcode() != Op::GetProp || plainReadable(i) || !vm_.protos.string ||
+        (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)) || code_->atoms[in.c] == vm_.atoms.length)
+        return -1;
+    JSObject* sp = vm_.protos.string;
+    std::uint8_t attrs = 0;
+    JSValue* slot = sp->findOwn(vm_, code_->atoms[in.c], &attrs);
+    if (!slot || (attrs & attr::kAccessor) || !isFunction(*slot))
+        return -1;
+    JSValue* inl = sp->inl();
+    if (slot >= inl && slot < inl + sp->h.aux)
+        return std::int32_t(slot - inl);
+    return sp->slots && slot >= sp->slots ? std::int32_t(sp->h.aux + (slot - sp->slots)) : -1;
+}
+
+/// `ssaStringProtoIndex`: the base checked to be a string and `String.prototype` to have the shape it had, its slot read.
+void Baseline::ssaStringProtoRead(std::uint32_t i, std::uint32_t index)
+{
+    const Ins& in = code_->code[i];
+    JSObject* sp = vm_.protos.string;
+    holdValue(toJSValue(sp));
+    Label& bad = ssaExit(i);
+    loadValue(name_[in.b], RSI);
+    needString(RSI, bad);
+    a_.movImm(RAX, toJSValue(sp).bits);
+    a_.cmpI32(mem(RAX, 0), std::int32_t(sp->h.shape));
+    a_.jcc(CNE, bad);
+    slotAddress(index);
+    a_.mov(RAX, mem(RDX, 0));
+    ssaDef(i, kVObj);
+}
+
+JSFunction* Baseline::ssaCharCodeCallee(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || in.opcode() != Op::Call || in.c != 1 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)) ||
+        !vm_.protos.string)
+        return nullptr;
+    for (std::uint32_t j = i; j-- > 0;) {
+        if (code_->code[j].opcode() == Op::Cache)
+            continue;
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        if (std::find(e.wr.begin(), e.wr.end(), std::uint16_t(in.b)) == e.wr.end())
+            continue;
+        const Ins& r = code_->code[j];
+        if (r.opcode() != Op::GetProp || r.a != in.b)
+            return nullptr;
+        std::uint8_t attrs = 0;
+        JSValue* slot = vm_.protos.string->findOwn(vm_, code_->atoms[r.c], &attrs);
+        if (!slot || (attrs & attr::kAccessor) || !isFunction(*slot))
+            return nullptr;
+        auto* f = static_cast<JSFunction*>(asObject(*slot));
+        if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != stringCharNative() ||
+            f->rare()->nativeData != reinterpret_cast<void*>(1))
+            return nullptr;
+        return f;
+    }
+    return nullptr;
+}
+
+/// `s.charCodeAt(i)` of `ssaCharCodeCallee`: the callee checked, a flat string and an index within it, the character
+/// read here. Anything else leaves.
+void Baseline::ssaCharCode(std::uint32_t i, JSFunction* f)
+{
+    const Ins& in = code_->code[i];
+    holdValue(toJSValue(f));
+    Label& bad = ssaExit(i);
+    loadValue(name_[in.b], RAX);
+    a_.movImm(RCX, toJSValue(f).bits);
+    a_.cmp(RAX, RCX);
+    a_.jcc(CNE, bad);
+    loadValue(name_[in.b + 1u], RSI);
+    needString(RSI, bad);
+    loadI32(name_[in.b + 2u], RDX, &bad);
+    a_.mov32(RDX, RDX);
+    a_.alu32(7, RDX, mem(RSI, kStrLength));
+    a_.jcc(CAE, bad);  // also a negative index
+    stringChars(RSI, RCX, bad);
+    a_.movzx16(RAX, mem(RCX, RDX, 2));
+    if (sval_[ssa_->defBase[i]].rep == kRepI32) {
+        ssaDefI32(i);
+    } else {
+        a_.or_(RAX, R14);
+        ssaDef(i, kVInt | kVNotCell);
+    }
+}
+
 CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
 {
     const Ins& in = code_->code[i];
@@ -2550,9 +2683,9 @@ bool Baseline::ssaNative(std::uint32_t i)
         return !failed;
     };
     switch (op) {
-    case Op::GetProp: return plainReadable(i);
+    case Op::GetProp: return plainReadable(i) || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
     case Op::New: return ssaNewPlan(i, nullptr);
-    case Op::Call: return ssaMathCallee(i) != nullptr;
+    case Op::Call: return ssaMathCallee(i) != nullptr || ssaCharCodeCallee(i) != nullptr;
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
     case Op::InitProp: return ssaAddFast(i);
     case Op::GetGlobal: return ssaGlobalFast(i);
@@ -2726,6 +2859,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             cls[v] = 0;
         } else if (sv.kind == ssa::Value::Def) {
             cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : elemRep[sv.at];
+            if (ssaOn_ >= 2 && cls[v] == 3 && (ssaLengthSite(sv.at) || ssaCharCodeCallee(sv.at)))
+                cls[v] = 1;  // an int32 when it does not leave
         } else if (sv.kind == ssa::Value::Entry) {
             cls[v] = 3;
         }

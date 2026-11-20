@@ -405,6 +405,12 @@ extern "C" void scriptVmOptEntryFail(VM* vm)
             }
         }
     SCRIPT_VM_CENSUS(Tier2Exit);
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("T2EXITS"))
+        std::fprintf(stderr, "tier2 entry fail %s pc %ld widened %d exits %u\n",
+                     code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
+                     fr->pc ? long(fr->pc - code->code.data()) : -1L, int(widened), unsigned(code->optExits));
+#endif
     if (widened) {
         retireTier2(*vm, code);
         if (code->tier2Tries)
@@ -2813,6 +2819,15 @@ private:
     /// `Math.sqrt(x)` and its kind (a native of one double, `mathUnaryNative`): the function the callee register was read
     /// as, from a global object's own data property; null when the site is not one.
     JSFunction* ssaMathCallee(std::uint32_t i);
+    /// `x.length` with an empty cache: of a string or an array, read here.
+    bool ssaLengthSite(std::uint32_t i) const;
+    /// `s.name` of a string, `name` a data property of `String.prototype` (a method): its index there; -1 when not one.
+    std::int32_t ssaStringProtoIndex(std::uint32_t i) const;
+    void ssaStringProtoRead(std::uint32_t i, std::uint32_t index);
+    void ssaLength(std::uint32_t i);
+    /// `s.charCodeAt(i)`: the function `String.prototype.charCodeAt` is now (`stringCharNative`); null when not one.
+    JSFunction* ssaCharCodeCallee(std::uint32_t i);
+    void ssaCharCode(std::uint32_t i, JSFunction* f);
     void ssaMathCall(std::uint32_t i, JSFunction* f);
     /// A property added in place (`PutProp`, `InitProp`): the cache saw the transition, into an inline slot.
     bool ssaAddFast(std::uint32_t i) const;

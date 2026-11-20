@@ -2551,8 +2551,10 @@ bool Baseline::ssaArith(std::uint32_t i)
     case Op::BitXor: a_.alu32(6, t, b); break;
     case Op::ModI: {
         // A dividend below zero: the interpreter's (its remainder may be -0). A power of two is a mask.
-        a_.test32(t, t);
-        a_.jcc(CS, bad);
+        if (!nonNeg_[va]) {
+            a_.test32(t, t);
+            a_.jcc(CS, bad);
+        }
         if ((imm & (imm - 1)) == 0) {
             a_.aluI32(4, t, imm - 1);
         } else {
@@ -2562,7 +2564,7 @@ bool Baseline::ssaArith(std::uint32_t i)
             a_.mov32(RDX, t);  // x, kept (t may be rax)
             a_.mov32(RAX, RDX);
             a_.movImm(RCX, magic);
-            a_.imul64(RAX, RCX);
+            a_.mul64(RAX, RCX);
             a_.shiftI(5, RAX, int(32 + l));
             a_.imulI32(RCX, RAX, imm);
             a_.alu32(5, RDX, RCX);
@@ -2574,30 +2576,36 @@ bool Baseline::ssaArith(std::uint32_t i)
         // An overflow, or a zero that may be a negative zero: the interpreter's.
         a_.imulI32(RDX, t, imm);
         a_.jcc(CO, bad);
-        Label nz;
-        a_.test32(RDX, RDX);
-        a_.jcc(CNE, nz);
-        if (imm < 0) {
-            a_.jmp(bad);
-        } else {
-            a_.test32(t, t);
-            a_.jcc(CS, bad);
+        if (!(imm >= 0 && nonNeg_[va])) {
+            Label nz;
+            a_.test32(RDX, RDX);
+            a_.jcc(CNE, nz);
+            if (imm < 0) {
+                a_.jmp(bad);
+            } else {
+                a_.test32(t, t);
+                a_.jcc(CS, bad);
+            }
+            a_.bind(nz);
         }
-        a_.bind(nz);
         a_.mov32(t, RDX);
         break;
     }
     case Op::Mul: {
         // An overflow, or a zero that may be a negative zero (an operand below zero): the interpreter's.
-        a_.mov32(RDX, t);
+        const bool noNegZero = nonNeg_[va] && vb != ssa::kNone && nonNeg_[vb];  // two not below zero: no -0
+        if (!noNegZero)
+            a_.mov32(RDX, t);
         a_.imul32(t, b);
         a_.jcc(CO, bad);
-        Label nz;
-        a_.test32(t, t);
-        a_.jcc(CNE, nz);
-        a_.alu32(1, RDX, b);
-        a_.jcc(CS, bad);
-        a_.bind(nz);
+        if (!noNegZero) {
+            Label nz;
+            a_.test32(t, t);
+            a_.jcc(CNE, nz);
+            a_.alu32(1, RDX, b);
+            a_.jcc(CS, bad);
+            a_.bind(nz);
+        }
         break;
     }
     default:
@@ -3077,6 +3085,80 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                             break;
                         }
         }
+    }
+    // Int32 values that are never below zero: a fixpoint from the most hopeful guess (every phi), as long as each
+    // input of a phi and each operand that matters is one too. Overflow leaves, so a sum of two stays one.
+    {
+        nonNeg_.assign(nv, 0);
+        std::vector<std::vector<std::uint32_t>> ops(nv);
+        std::vector<std::uint8_t> kindOf(nv, 0);  // 1 always, 2 when every operand is, 3 when one operand is (`&`)
+        for (std::uint32_t v = 0; v < nv; ++v)
+            if (sval_[v].isConst) {
+                const JSValue k = JSValue::raw(sval_[v].bits);
+                nonNeg_[v] = k.isInt32() && k.asInt32() >= 0;
+            } else if (g.values[v].kind == ssa::Value::Phi && sval_[v].rep == kRepI32) {
+                nonNeg_[v] = 1;
+                kindOf[v] = 2;
+                for (std::uint32_t in : g.values[v].in)
+                    if (in != v)
+                        ops[v].push_back(in);
+            }
+        for (std::uint32_t b = 1; b < nb; ++b) {
+            const ssa::Block& bl = g.blocks[b];
+            if (!bl.reached)
+                continue;
+            std::vector<std::uint32_t> names = bl.nameIn;
+            for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(*code_, i)) {
+                const Ins& in = code_->code[i];
+                const Op op = in.opcode();
+                const opt::Effects e = ssa::effects(*code_, i);
+                const std::uint32_t d = g.defBase[i];
+                if (d != ssa::kNone && sval_[d].rep == kRepI32) {
+                    const std::int32_t imm = std::int32_t(std::int16_t(in.c));
+                    std::uint8_t k = 0;
+                    if (op == Op::ModI || op == Op::UShrI || ssaLengthSite(i) || (op == Op::BitAndI && imm >= 0))
+                        k = 1;
+                    else if (((op == Op::Inc || (op == Op::AddI && imm >= 0) || op == Op::Add) && !wrapOk_[d]) ||
+                             (op == Op::MulI && imm >= 0) || (op == Op::ShrI && (imm & 31) != 0) || op == Op::Mul)
+                        k = 2;  // (an add that may wrap can turn negative)
+                    else if (op == Op::BitAnd)
+                        k = 3;
+                    if (k) {
+                        kindOf[d] = k;
+                        nonNeg_[d] = 1;
+                        for (std::uint16_t r : e.rd)
+                            ops[d].push_back(names[r]);
+                    }
+                }
+                if (op == Op::Mov) {
+                    names[in.a] = names[in.b];
+                    continue;
+                }
+                for (std::size_t w = 0; w < e.wr.size(); ++w)
+                    names[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
+            }
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::uint32_t v = 0; v < nv; ++v) {
+                if (!nonNeg_[v] || kindOf[v] < 2)
+                    continue;
+                bool all = true, any = false;
+                for (std::uint32_t o : ops[v]) {
+                    const bool nn = o != ssa::kNone && nonNeg_[o];
+                    all = all && nn;
+                    any = any || nn;
+                }
+                if (kindOf[v] == 2 ? !all : !any) {
+                    nonNeg_[v] = 0;
+                    changed = true;
+                }
+            }
+        }
+        // Not run (no code, no value): not trusted.
+        for (std::uint32_t v = 0; v < nv; ++v)
+            if (g.values[v].kind == ssa::Value::Entry)
+                nonNeg_[v] = 0;
     }
     // Registers whose slots never hold a cell: above the parameters, every value of them a number or a constant that is
     // no cell, and no call's argument (a callee may assign its parameters).

@@ -949,6 +949,12 @@ public:
         pendingTest(kTmp, true);
         pendingMul_ = 1;
     }
+    /// d = d * s, the low 64 bits, no flags.
+    void mul64(Reg d, Reg s)
+    {
+        ins(0x9B007C00u | (std::uint32_t(X(s)) << 16) | (std::uint32_t(X(d)) << 5) | std::uint32_t(X(d)));  // mul
+        flags_ = Flags::None;
+    }
     void imul64(Reg d, Reg s)
     {
         ins(0x9B407C00u | (std::uint32_t(X(s)) << 16) | (std::uint32_t(X(d)) << 5) | kTmp);              // smulh x14

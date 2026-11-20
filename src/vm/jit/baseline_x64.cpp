@@ -2677,6 +2677,7 @@ private:
     /// Per register: its slot can never hold a cell (every value of it is a number, it is no call's argument; an OSR entry
     /// clears an old cell there). A return or a call window overwrites it without a look.
     std::vector<std::uint8_t> neverCell_;
+    std::vector<std::uint8_t> nonNeg_;  ///< per value: an int32 that is never below zero (no -0 to make, no sign to check)
     std::vector<std::uint8_t> wrapOk_;  ///< per value: an int32 add whose every use truncates to int32 (it may wrap)
     bool hasLoc(std::uint32_t v) const { return sval_[v].slot >= 0 || sval_[v].reg >= 0; }
     void storeTagged(std::uint32_t v, Reg src);

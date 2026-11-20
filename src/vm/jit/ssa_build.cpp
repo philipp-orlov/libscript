@@ -8,6 +8,8 @@
 #include <cstdio>
 
 #include "opt_analysis.hpp"
+#include "script/internal/vm/object.hpp"
+#include "script/internal/vm/vm.hpp"
 
 namespace script {
 namespace internal {
@@ -402,6 +404,13 @@ bool writesUpvalues(const CodeBlock& c)
             return true;
     return false;
 }
+bool makesCalls(const CodeBlock& c)
+{
+    for (const Ins& in : c.code)
+        if (in.opcode() == Op::Call || in.opcode() == Op::New || in.opcode() == Op::CallSpread || in.opcode() == Op::SuperCall)
+            return true;
+    return false;
+}
 }  // namespace
 
 bool preferTier2(const CodeBlock& code, const VM& vm, const char** why)
@@ -436,10 +445,33 @@ bool preferTier2(const CodeBlock& code, const VM& vm, const char** why)
                 calls = calls || script;
                 if (op == Op::Call && i < code.callProf.size() && code.callProf[i])
                     if (const CodeBlock* C = vm.codeByUid(code.callProf[i]);
-                        (rules & 2) && C && C != &code && C->code.size() <= 20 && writesUpvalues(*C)) {
+                        (rules & 2) && C && C != &code &&
+                        ((C->code.size() <= 20 && writesUpvalues(*C)) ||
+                         ((rules & 8) && !code.mergedFrom && C->code.size() <= 12 && !makesCalls(*C)))) {
                         *why = "tiny callee in a loop";
                         return true;
                     }
+            }
+            // A read that has always found one getter on a prototype, a tiny one: tier 2 runs its body in place.
+            if (op == Op::GetProp && (rules & 2) && i + 1 < n && code.code[i + 1].opcode() == Op::Cache &&
+                code.code[i + 1].a != kNoCache) {
+                const InlineCache& ic = code.caches[code.code[i + 1].a];
+                if (ic.shape == 0 && ic.pad && ic.pad <= code.poly.size() && code.poly[ic.pad - 1].n == 1) {
+                    const PolyEntry& pe = code.poly[ic.pad - 1].e[0];
+                    if (pe.kind == PolyEntry::ProtoAccessor && pe.validity && pe.validity->valid && pe.holder) {
+                        const JSValue slot = *pe.holder->slotAt(pe.index);
+                        if (slot.isCell()) {
+                            const auto* gs = reinterpret_cast<const GetterSetter*>(slot.asCell());
+                            if (isFunction(gs->getter)) {
+                                const auto* gf = static_cast<const JSFunction*>(asObject(gs->getter));
+                                if (!(gf->flags & JSFunction::kNative) && gf->code && gf->code->code.size() <= 12) {
+                                    *why = "tiny getter in a loop";
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             const opt::Effects ef = opt::effectsOf(code, i);
             for (std::uint16_t w : ef.wr)

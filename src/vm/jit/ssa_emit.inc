@@ -802,6 +802,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
 {
     ssa_ = &g;
     base_ = base;
+    ssaCtor_ = ssa::constructs(*code_) && vm_.deferred;
     if (n_ <= kPoolCode)
         a_.usePool();
     auto fail = [&]() -> Tier2Code* {
@@ -1303,6 +1304,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     t->bytes = span.bytes;
     t->entry = t->rx;
     t->osr = std::move(osr);
+    t->ctor = ssaCtor_;
     for (const auto& [at, bad] : epochSites_)
         t->epochSites.emplace_back(std::uint32_t(at), std::uint32_t(bad->pos));
     t->validities = std::move(validities_);
@@ -4360,6 +4362,12 @@ void Baseline::ssaRet(std::uint32_t i)
     // The result into rax with one count for the caller: the count of a slot this frame clears on its way out that holds
     // it (the slot then holds undefined), else a new one.
     const std::uint32_t v = name_[in.a];
+    if (ssaCtor_ && frame_[0] != name_[0]) {
+        // What a construction gives back when the result is no object.
+        loadValue(name_[0], RAX);
+        a_.mov(R(0), RAX);
+        frame_[0] = name_[0];
+    }
     loadValue(v, RAX);
     int movedFrom = -1;
     if (mayBeCell(v) && !def_) {  // a deferred frame returns its result without a count

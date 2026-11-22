@@ -78,6 +78,9 @@ struct Graph
 /// name (`JNotCode` looks at the `this` after the callee).
 opt::Effects effects(const CodeBlock& code, std::uint32_t i);
 
+/// Whether frames that `new` made run the function often: its returns look at `this` then.
+bool constructs(const CodeBlock& code);
+
 /// Whether the SSA tier can take the instruction at all (its registers are modelled, it has a way to be compiled).
 bool supported(const CodeBlock& code, std::uint32_t i);
 

@@ -339,7 +339,7 @@ std::int32_t tier2Backoff(const VM& vm, const CodeBlock* code) noexcept
 void retireTier2(VM& vm, CodeBlock* code) noexcept
 {
     if (code->tier1 && code->tier2 && code->tier1->entry == code->tier2->entry)
-        code->tier1->entry = code->tier1->rx;
+        code->tier1->entry = code->tier1->ctorEntry = code->tier1->rx;
     if (code->tier2 && code->tier2->borrow)
         code->tier2->borrow->retired = 1;
     if (code->tier2Tries < 255)
@@ -564,6 +564,7 @@ bool installTier2(VM* vm, CodeBlock* code)
     }
 #endif
     code->tier1->entry = t->entry;
+    code->tier1->ctorEntry = t->ctor ? t->entry : code->tier1->rx;
     code->optExits = 0;
     // Optimized code may have been made before parts of the function had run: it makes way after those have run
     // a while, a few times, each given longer.
@@ -592,6 +593,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             return nullptr;
         }
         const bool active = code->tier2 && code->tier1->entry == code->tier2->entry;
+        code->constructed = code->constructed || fr->construct;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (!active && std::getenv("T2MAX") && tier2Compiles >= std::atoi(std::getenv("T2MAX"))) {
             code->tier2Counter = 0x40000000;
@@ -639,8 +641,8 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             return nullptr;
         }
         code->tier2Counter = 0x40000000;
-        // Optimized code is made for calls: a frame `new` made stays in the baseline code.
-        return header == 0xFFFFFFFFu || fr->construct ? nullptr : code->tier2->osrAddress(header);
+        // A frame `new` made stays in the baseline code, unless the optimized code was made for those too.
+        return header == 0xFFFFFFFFu || (fr->construct && !code->tier2->ctor) ? nullptr : code->tier2->osrAddress(header);
     } catch (...) {
         return nullptr;
     }
@@ -856,7 +858,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
               isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
     // `new` runs the baseline code: optimized code is made for calls only.
     return {reinterpret_cast<std::uint64_t>(vm.frameTop - 1),
-            reinterpret_cast<std::uint64_t>(construct ? static_cast<void*>(c->tier1->rx) : c->tier1->entry)};
+            reinterpret_cast<std::uint64_t>(construct ? c->tier1->ctorEntry : c->tier1->entry)};
 }
 
 /// `this` for `new f(...)` from compiled code: an object inheriting from `f.prototype` (an ordinary function: the property
@@ -1004,7 +1006,7 @@ constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
 constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
 constexpr std::int32_t kCbNregs = std::int32_t(offsetof(CodeBlock, nregs));
 constexpr std::int32_t kTierEntry = std::int32_t(offsetof(Tier1Code, entry));
-constexpr std::int32_t kTierRx = std::int32_t(offsetof(Tier1Code, rx));  // the baseline code's own entry
+constexpr std::int32_t kTierCtor = std::int32_t(offsetof(Tier1Code, ctorEntry));  // of a frame `new` made
 constexpr std::int32_t kFrameArgc = std::int32_t(offsetof(Frame, argc));
 constexpr std::int32_t kFrameConstruct = std::int32_t(offsetof(Frame, construct));
 static_assert(offsetof(Frame, entry) == offsetof(Frame, construct) + 1, "a frame push writes both flags in one store");
@@ -1129,7 +1131,7 @@ public:
         auto* t = new Tier1Code;
         t->rx = span.rx;
         t->bytes = span.bytes;
-        t->entry = t->rx;
+        t->entry = t->ctorEntry = t->rx;
         t->validities = std::move(validities_);
         t->labels = std::move(offsets_);
         return t;
@@ -2978,6 +2980,7 @@ public:
 
 private:
     const ssa::Graph* ssa_ = nullptr;
+    bool ssaCtor_ = false;  ///< made for frames `new` makes too
     /// Per instruction: a read whose value is known from one before it (`ssaLoadElim`), which is its value then.
     std::vector<std::uint8_t> elim_;
     /// Per value, where it is first and last needed, and per instruction, where its operands are read (the plan's numbering).
@@ -5911,7 +5914,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
         a_.mov(RSI, R11);
         a_.mov(RDI, R9);
-        a_.mov(RDX, mem(RDX, isSuper ? kTierRx : kTierEntry));  // a construction runs the baseline code
+        a_.mov(RDX, mem(RDX, isSuper ? kTierCtor : kTierEntry));
         a_.jmp(enter);
     }
     if (in.opcode() == Op::New && roomy) {
@@ -6050,7 +6053,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
         a_.mov(RSI, R11);
         a_.mov(RDI, R9);
-        a_.mov(RDX, mem(RDX, kTierRx));  // `new` runs the baseline code: optimized code is made for calls only
+        a_.mov(RDX, mem(RDX, kTierCtor));
         a_.jmp(enter);
     }
     a_.bind(helper);
@@ -6260,7 +6263,7 @@ void Baseline::retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, boo
         Label have, useThis;
         a_.cmpI8(mem(R13, kFrameConstruct), 0);
         a_.jcc(CE, have);
-        if (!numberInRax) {
+        if (!numberInRax || ssa_) {
             a_.test(RAX, R15);
             a_.jcc(CNE, useThis);
             a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
@@ -6287,8 +6290,8 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
     const unsigned first = 1 + code_->nparams;
     // A result in a register this frame clears on its way out goes with that register's count (optimized code).
     const bool taken = optimizing() && !numberInRax && in.a >= first && in.a < code_->nregs;
-    // Optimized code runs no frame `new` made (it enters the baseline code), so its result is what it returns.
-    const bool constructs = !optimizing() && (code_->constructor || (code_->flags & CodeBlock::kClassConstructor));
+    // Optimized code that runs no frame `new` made returns what it returns.
+    const bool constructs = ssa_ ? ssaCtor_ : !optimizing() && (code_->constructor || (code_->flags & CodeBlock::kClassConstructor));
     if (def_) {
         retDeferred(i, in, numberInRax, constructs, dirty);
         return;
@@ -6663,7 +6666,7 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
     }
     const Stubs& st = stubs();
     // `new` runs the baseline code: optimized code is made for calls only.
-    const std::uint64_t bits = index == 0 ? st.run(&vm, fr, nullptr, fr->construct ? static_cast<void*>(code->rx) : code->entry)
+    const std::uint64_t bits = index == 0 ? st.run(&vm, fr, nullptr, fr->construct ? code->ctorEntry : code->entry)
                                           : st.run(&vm, fr, code->addressFor(index), st.osrEnter);
     if (bits == 0 && pendingException) [[unlikely]] {
         std::exception_ptr e = std::move(pendingException);

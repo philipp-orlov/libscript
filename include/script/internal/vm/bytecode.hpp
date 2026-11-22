@@ -313,6 +313,7 @@ struct CodeBlock
     /// The block `mergeInline` made this one from, taking the place of it in the function that was running it (holds a count).
     CodeBlock* mergedFrom = nullptr;
     bool mergeTried = false;
+    bool constructed = false;  ///< a frame `new` made of it has turned hot
     Vec<InlineSite> inlineSites;
     /// A generator's suspensions (`planSuspends`): for the instruction it resumes at, where in `suspendRegs` its live registers
     /// are: how many, then which. `suspendMax`: the most values a suspended frame keeps; 0 until planned.

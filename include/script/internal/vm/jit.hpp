@@ -33,6 +33,7 @@ struct Tier1Code
 {
     std::uint8_t* rx = nullptr;               ///< where the code runs
     void* entry = nullptr;                    ///< the code for the first instruction
+    void* ctorEntry = nullptr;                ///< the same for a frame `new` made: optimized code is not always made for those
     std::size_t bytes = 0;
     std::vector<std::uint32_t> labels;        ///< per instruction index: offset from `rx` of its code, or ~0u
     std::vector<ValidityCell*> validities;    ///< cells the code reads, each held with a count of its own
@@ -76,6 +77,7 @@ struct Tier2Code
     std::vector<ValidityCell*> validities;
     std::vector<JSValue> held;                                    ///< values the code compares against, each counted
     std::vector<std::uint8_t> siteExits;                          ///< exits so far at each instruction
+    bool ctor = false;                                            ///< a frame `new` made may run it
     Tier2Code* older = nullptr;                                   ///< a version it replaced, kept while frames may be in it
     void* osrAddress(std::uint32_t header) const noexcept
     {

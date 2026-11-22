@@ -33,6 +33,11 @@ std::int32_t windowBase(const Ins& in)
 
 }  // namespace
 
+bool constructs(const CodeBlock& code)
+{
+    return (code.flags & CodeBlock::kClassConstructor) || (code.constructed && code.constructor);
+}
+
 opt::Effects effects(const CodeBlock& code, std::uint32_t i)
 {
     opt::Effects e = opt::effectsOf(code, i);
@@ -40,6 +45,8 @@ opt::Effects effects(const CodeBlock& code, std::uint32_t i)
     const Op op = in.opcode();
     if (op == Op::JNotCode)
         e.rd.push_back(std::uint16_t(in.a + 1u));
+    if (op == Op::Ret && in.a != 0 && constructs(code))
+        e.rd.push_back(0);
     if (e.ok)
         return e;
     // What only this tier takes, each done as the baseline code does it.

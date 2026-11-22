@@ -3801,12 +3801,13 @@ void megaLearnRead(VM& vm, JSObject* o, Key key) noexcept
 {
     if (!vm.megaRead || key == vm.atoms.length || hasElems(o))
         return;
+    // (A name that is an index, or a typed array's, is answered by elements on objects of the same shape.)
+    double numeric;
+    if (canonicalNumericIndex(key, &numeric))
+        return;
     if (const MegaEntry& was = vm.megaRead[VM::megaSlot(o->h.shape, key)];
         was.shape == o->h.shape && was.key == key && (!was.validity || was.validity->valid) && (!was.absent || was.absent->valid))
         return;  // there already
-    double numeric;
-    if (o->cls() == ObjClass::TypedArray && canonicalNumericIndex(key, &numeric))
-        return;
     // A dictionary only once a site's cache took it (the table does not count its reads: a dictionary marked cached gives
     // up its shape for a new one on every delete).
     if (o->isDictionary(vm) && !(o->shapeOf(vm)->flags & Shape::kCachedDict))
@@ -3826,7 +3827,7 @@ void megaLearnRead(VM& vm, JSObject* o, Key key) noexcept
             // validity holds: its changes invalidate it.
             const bool dictProto = p->isDictionary(vm) && !proxyOf(p) &&
                                    !(p->cls() == ObjClass::Function && (static_cast<JSFunction*>(p)->flags & JSFunction::kLazyProps));
-            if ((!cacheable(vm, p) && !dictProto) || (p->cls() == ObjClass::TypedArray && canonicalNumericIndex(key, &numeric)))
+            if (!cacheable(vm, p) && !dictProto)
                 return;
             if (dictProto) {
                 const Dictionary& d = *p->rare()->dict;
@@ -3846,7 +3847,7 @@ void megaLearnRead(VM& vm, JSObject* o, Key key) noexcept
             for (JSObject* p = o; p; p = p->proto(vm))
                 if (answersForKeys(p))
                     return;
-            if (canonicalNumericIndex(key, &numeric) || !(holder = o->proto(vm)))
+            if (!(holder = o->proto(vm)))
                 return;
             index = std::int32_t(VM::kMegaAbsent);
             attrs = 0;
@@ -4153,9 +4154,12 @@ int jitBinary(VM& vm, std::uint32_t index)
 int jitIn(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
-    const int r = inOperator(vm, c.R[c.ins->b], c.R[c.ins->c]);
+    const JSValue key = c.R[c.ins->b], o = c.R[c.ins->c];
+    const int r = inOperator(vm, key, o);
     if (r < 0)
         return 0;
+    if (isString(key) && asString(key)->interned && isObject(c.R[c.ins->c]) && c.R[c.ins->c] == o)
+        megaLearnRead(vm, asObject(o), key.asCell());
     setReg(vm, c.R[c.ins->a], JSValue::boolean(r != 0));
     return 1;
 }
@@ -4582,11 +4586,14 @@ int jitGetElem(VM& vm, std::uint32_t index)
     if (isObject(base) && prim.isCell() && (isSymbol(prim) || isString(prim)))
         learnElem(vm, c.code, index, asObject(base), key);
     const JSValue v = getProperty(vm, base, key);
+    if (!v.isException()) {
+        // (A getter may have let go of the object.)
+        if (isObject(R[ins->b]) && R[ins->b] == base)
+            megaLearnRead(vm, asObject(base), key);
+        setReg(vm, R[ins->a], v);
+    }
     release(JSValue::cell(key));
-    if (v.isException())
-        return 0;
-    setReg(vm, R[ins->a], v);
-    return 1;
+    return !v.isException();
 }
 
 int jitPutElem(VM& vm, std::uint32_t index)

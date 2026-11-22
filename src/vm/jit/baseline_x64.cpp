@@ -908,6 +908,10 @@ constexpr std::int32_t kShapeFlags = std::int32_t(offsetof(Shape, flags));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
 constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
 constexpr std::int32_t kSuperSlot = std::int32_t(offsetof(SuperCache, slot));
+constexpr std::int32_t kMegaShape = std::int32_t(offsetof(MegaEntry, shape)), kMegaIndex = std::int32_t(offsetof(MegaEntry, index)),
+                       kMegaKey = std::int32_t(offsetof(MegaEntry, key)), kMegaHolder = std::int32_t(offsetof(MegaEntry, holder)),
+                       kMegaValid = std::int32_t(offsetof(MegaEntry, validity)),
+                       kMegaNoKey = std::int32_t(offsetof(MegaEntry, absent));
 constexpr std::int32_t kIcShape = std::int32_t(offsetof(InlineCache, shape));
 constexpr std::int32_t kIcIndex = std::int32_t(offsetof(InlineCache, index));
 constexpr std::int32_t kIcNext = std::int32_t(offsetof(InlineCache, next));
@@ -2779,6 +2783,9 @@ private:
     void defPrivate(std::uint32_t i, const Ins& in);
     void cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad);
+    MegaEntry* megaTable();
+    void megaFind(const std::uint32_t* mix, Label& bad);
+    void megaLoad();
     void cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
@@ -3201,7 +3208,28 @@ void Baseline::emit(std::uint32_t i)
         write(in.a, RAX);
         return;
     }
-    case Op::In: helperOp(i, &helperThunk<jitIn>); return;
+    case Op::In: {
+        Label& bad = slow(i, &helperThunk<jitIn>);
+        if (!megaTable()) {
+            a_.jmp(bad);
+            return;
+        }
+        // `key in o`: what the table says a read of it finds.
+        Label absent, done;
+        a_.mov(RCX, R(in.b));
+        a_.mov(RAX, R(in.c));
+        needObject(RAX, bad);
+        megaFind(nullptr, bad);
+        a_.movImm(RAX, kTrue);
+        a_.test(RDI, RDI);
+        a_.jcc(CE, done);
+        a_.cmpI32(mem(RDX, kMegaIndex), std::int32_t(VM::kMegaAbsent));
+        a_.jcc(CNE, done);
+        a_.movImm(RAX, kFalse);
+        a_.bind(done);
+        write(in.a, RAX);
+        return;
+    }
     case Op::ToString: helperOp(i, &helperThunk<jitToString>); return;
     case Op::ToNumber: helperOp(i, &helperThunk<jitToNumber>); return;
     case Op::Exp: helperOp(i, &helperThunk<jitBinary>); return;
@@ -4615,61 +4643,63 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         a_.bind(*coldBack);
 }
 
-void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad)
+/// The megamorphic table, made on first use; null without memory for it.
+MegaEntry* Baseline::megaTable()
 {
-    // The object in rax: where the megamorphic table says objects of its shape find `key`, an own slot or a prototype's.
-    if (!vm_.megaRead) {
+    if (!vm_.megaRead)
         vm_.megaRead = static_cast<MegaEntry*>(std::calloc(std::size_t(1) << VM::kMegaBits, sizeof(MegaEntry)));
-        if (!vm_.megaRead) {
-            a_.jmp(bad);
-            return;
-        }
-    }
+    return vm_.megaRead;
+}
+
+/// The table's entry for the object in rax and the key whose mix is `mix` (or, without one, is made of the key in rcx), its
+/// address in rdx; one that does not hold goes to `bad`. The entry's holder in rdi (null: the object). Uses rsi.
+void Baseline::megaFind(const std::uint32_t* mix, Label& bad)
+{
     static_assert(sizeof(MegaEntry) == 64, "an entry is 64 bytes");
-    // Only a site the runtime marked: elsewhere a miss goes to the runtime, which teaches the site's own cache.
-    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic));
-    a_.testI8(mem(RCX, kIcFlags), InlineCache::kMegaSite);
-    a_.jcc(CE, bad);
-    constexpr std::int32_t kShape = std::int32_t(offsetof(MegaEntry, shape)), kIndex = std::int32_t(offsetof(MegaEntry, index)),
-                           kKey = std::int32_t(offsetof(MegaEntry, key)), kHolder = std::int32_t(offsetof(MegaEntry, holder)),
-                           kValid = std::int32_t(offsetof(MegaEntry, validity)),
-                           kAbsent = std::int32_t(offsetof(MegaEntry, absent));
     a_.mov32(RSI, mem(RAX, 0));
-    a_.imulI32(RCX, RSI, std::int32_t(0x9E3779B1u));
-    a_.aluI32(6, RCX, std::int32_t(VM::megaKeyMix(key)));
-    a_.shiftI32(5, RCX, 32 - int(VM::kMegaBits));
-    a_.shiftI(4, RCX, 6);
-    a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.megaRead));
-    a_.alu(0, RDX, RCX);
-    a_.alu32(7, RSI, mem(RDX, kShape));
+    a_.imulI32(RDX, RSI, std::int32_t(0x9E3779B1u));
+    if (mix) {
+        a_.aluI32(6, RDX, std::int32_t(*mix));
+    } else {
+        a_.mov(RDI, RCX);
+        a_.shiftI(5, RDI, 4);
+        a_.imulI32(RDI, RDI, std::int32_t(0x85EBCA6Bu));
+        a_.alu32(6, RDX, RDI);
+    }
+    a_.shiftI32(5, RDX, 32 - int(VM::kMegaBits));
+    a_.shiftI(4, RDX, 6);
+    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.megaRead));
+    a_.add(RDX, RDI);
+    a_.alu32(7, RSI, mem(RDX, kMegaShape));
     a_.jcc(CNE, bad);
-    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(key));
-    a_.cmp(RCX, mem(RDX, kKey));
+    a_.cmp(RCX, mem(RDX, kMegaKey));
     a_.jcc(CNE, bad);
     Label own;
-    a_.mov(RCX, mem(RDX, kHolder));
-    a_.test(RCX, RCX);
+    a_.mov(RDI, mem(RDX, kMegaHolder));
+    a_.test(RDI, RDI);
     a_.jcc(CE, own);
-    a_.mov(RDI, mem(RDX, kValid));
-    a_.cmpI32(mem(RDI, kValidityValid), 0);
+    a_.mov(RSI, mem(RDX, kMegaValid));
+    a_.cmpI32(mem(RSI, kValidityValid), 0);
     a_.jcc(CE, bad);
-    {
-        Label tree;
-        a_.mov(RDI, mem(RDX, kAbsent));
-        a_.test(RDI, RDI);
-        a_.jcc(CE, tree);
-        a_.cmpI32(mem(RDI, kValidityValid), 0);
-        a_.jcc(CE, bad);
-        a_.bind(tree);
-    }
-    a_.mov(RAX, RCX);
-    a_.mov32(RSI, mem(RDX, kIndex));
-    a_.aluI32(7, RSI, std::int32_t(VM::kMegaAbsent));
-    Label absent;
-    a_.jcc(CE, absent);
+    a_.mov(RSI, mem(RDX, kMegaNoKey));
+    a_.test(RSI, RSI);
+    a_.jcc(CE, own);
+    a_.cmpI32(mem(RSI, kValidityValid), 0);
+    a_.jcc(CE, bad);
     a_.bind(own);
-    a_.mov32(RSI, mem(RDX, kIndex));
-    Label out, have;
+}
+
+/// What the entry `megaFind` found says the object in rax has, into rax. Uses rcx, rdx, rsi, rdi.
+void Baseline::megaLoad()
+{
+    Label own, out, have, absent;
+    a_.mov32(RSI, mem(RDX, kMegaIndex));
+    a_.test(RDI, RDI);
+    a_.jcc(CE, own);
+    a_.aluI32(7, RSI, std::int32_t(VM::kMegaAbsent));
+    a_.jcc(CE, absent);
+    a_.mov(RAX, RDI);
+    a_.bind(own);
     a_.movzx8(RDI, mem(RAX, kHdrAux));
     a_.alu32(7, RSI, RDI);
     a_.jcc(CAE, out);
@@ -4683,6 +4713,23 @@ void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, 
     a_.bind(absent);
     a_.movImm(RAX, kUndefined);
     a_.bind(have);
+}
+
+void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad)
+{
+    // The object in rax: where the megamorphic table says objects of its shape find `key`, an own slot or a prototype's.
+    if (!megaTable()) {
+        a_.jmp(bad);
+        return;
+    }
+    // Only a site the runtime marked: elsewhere a miss goes to the runtime, which teaches the site's own cache.
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic));
+    a_.testI8(mem(RCX, kIcFlags), InlineCache::kMegaSite);
+    a_.jcc(CE, bad);
+    const std::uint32_t mix = VM::megaKeyMix(key);
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(key));
+    megaFind(&mix, bad);
+    megaLoad();
     deliver(i, in.a);
 }
 
@@ -4937,10 +4984,11 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     const bool priv = privateSites();
     a_.mov(RAX, R(in.b));
     a_.mov(RCX, R(in.c));
-    needInt(RCX, priv ? notInt : bad);
+    Label noObject;
+    needInt(RCX, notInt);
     a_.test32(RCX, RCX);
     a_.jcc(CS, bad);
-    needObject(RAX, bad);
+    needObject(RAX, noObject);
     a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
     a_.jcc(CNE, typed);
     a_.mov32(RCX, RCX);
@@ -5005,11 +5053,39 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.movzx16(RAX, mem(RSI, RCX, 2));
     a_.bind(intResult);
     deliverInt(i, in.a);
+    a_.jmp(done);
+    a_.bind(notInt);
     if (priv) {
-        a_.jmp(done);
-        a_.bind(notInt);
         privateSlot(i, bad);
         a_.mov(RAX, mem(RDX, 0));
+        deliver(i, in.a);
+    } else if (megaTable()) {
+        // By a name or a symbol: where the table says objects of the shape find it (its keys are atoms, compared by address).
+        needObject(RAX, bad);
+        megaFind(nullptr, bad);
+        megaLoad();
+        deliver(i, in.a);
+    } else {
+        a_.jmp(bad);
+    }
+    a_.jmp(done);
+    a_.bind(noObject);
+    {
+        // A character of a string, one the runtime keeps made.
+        a_.mov(RAX, R(in.b));
+        needString(RAX, bad);
+        a_.mov32(RCX, RCX);
+        a_.alu32(7, RCX, mem(RAX, kStrLength));
+        a_.jcc(CAE, bad);
+        stringChars(RAX, RDX, bad);
+        a_.movzx16(RCX, mem(RDX, RCX, 2));
+        a_.aluI32(7, RCX, 255);
+        a_.jcc(CA, bad);
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&vm_.smallStrings[0]));
+        a_.mov(RAX, mem(RDX, RCX, 8));
+        a_.cmpI(RAX, std::int32_t(kUndefined));
+        a_.jcc(CE, bad);
+        noteElem(i, elemprof::kOther, RDX);
         deliver(i, in.a);
     }
     a_.bind(done);

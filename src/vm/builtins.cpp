@@ -643,6 +643,7 @@ JSValue defineOrdinaryImpl(VM& vm, JSObject* o, Key key, const PropDesc& desc, b
         JSValue* where = o->findOwn(vm, key);
         const JSValue old = *where;
         *where = fresh;
+        vm.slotWritten(o, where);
         release(old);
     };
     if (desc.isAccessor()) {

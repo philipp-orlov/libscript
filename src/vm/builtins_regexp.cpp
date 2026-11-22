@@ -622,6 +622,8 @@ bool execPristine(VM& vm, JSValue rx)
     if ((r && r->dict) || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
         !o->slotAt(0)->isNumber())
         return false;
+    if (vm.regexpEpoch == vm.globalEpoch)
+        return true;
     for (VM::RegExpSlot& s : vm.regexpSlots) {
         if (s.key != vm.atoms.exec || s.owner != vm.protos.regexp)
             continue;
@@ -645,6 +647,8 @@ bool pristine(VM& vm, JSValue rx)
     if ((r && r->dict) || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
         !o->slotAt(0)->isNumber())
         return false;
+    if (vm.regexpEpoch == vm.globalEpoch)
+        return true;
     const JSObject* owner = nullptr;
     const Dictionary* dict = nullptr;
     for (VM::RegExpSlot& s : vm.regexpSlots) {
@@ -661,6 +665,9 @@ bool pristine(VM& vm, JSValue rx)
         if (!now || now->bits != s.value.bits)
             return false;
     }
+    JSObject* ctor = asObject(vm.regexpCtor);
+    if (vm.watchMethod(vm.protos.regexp, vm.protos.regexp) && vm.watchMethod(ctor, ctor))
+        vm.regexpEpoch = vm.globalEpoch;
     return true;
 }
 

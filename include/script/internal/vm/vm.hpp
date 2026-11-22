@@ -528,6 +528,9 @@ struct VM : EngineRuntime
     };
     static constexpr std::uint32_t kNoShape = ~std::uint32_t(0);
     std::vector<RegExpSlot> regexpSlots;
+    /// Where `globalEpoch` was when all of them were found as they were made, and watched; nothing has changed while it stands
+    /// there.
+    std::uint32_t regexpEpoch = ~0u;
     /// A regular expression literal's compiled program, by the string constants of its pattern and flags (each entry holds
     /// a count of both): a literal in a loop makes a RegExp each time round with no parse of its flags and no lookup by text.
     struct RegExpLiteral

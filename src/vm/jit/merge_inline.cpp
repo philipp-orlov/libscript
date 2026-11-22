@@ -38,8 +38,8 @@ constexpr unsigned kMergeMaxTinySites = 64;
 constexpr std::uint32_t kMergeMaxTinyAdded = 2000;
 constexpr std::size_t kMergeMaxTotalSsa = 8000;
 
-/// The instructions a callee run in place may hold: none looks at the frame beyond its registers (the upvalues, the
-/// closures and the home object are the callee's own, which the copy has no way to name).
+/// The instructions a callee run in place may hold: none looks at the frame beyond its registers (the closures and the home
+/// object are the callee's own, which the copy has no way to name; `needsSelf` has those that take the function itself).
 bool mergeOp(Op op)
 {
     switch (op) {
@@ -65,6 +65,13 @@ bool mergeOp(Op op)
     }
 }
 
+/// What takes the function itself: its upvalues' boxes and the function are constants of the copy, whose guard then tests
+/// for that function. Only where there is one function of the code.
+bool needsSelf(Op op)
+{
+    return op == Op::GetUpval || op == Op::PutUpval || op == Op::LoadCallee;
+}
+
 /// Whether the function `C` may be run in place of a call with `argc` arguments.
 bool mergeable(const CodeBlock* C, unsigned argc)
 {
@@ -77,7 +84,8 @@ bool mergeable(const CodeBlock* C, unsigned argc)
                     CodeBlock::kPrivate))
         return false;
     for (std::uint32_t j = 0; j < n; j = opt::nextOf(*C, j)) {
-        if (!mergeOp(C->code[j].opcode()))
+        const Op op = C->code[j].opcode();
+        if (needsSelf(op) ? C->made != 1 || !C->only || C->only->code != C : !mergeOp(op))
             return false;
         if (!opt::effectsOf(*C, j).ok)
             return false;
@@ -288,8 +296,12 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
             const std::vector<bool> needInit = readBeforeWritten(*C, reached);
             const std::uint32_t guard = put(Ins::make(Op::JNotCode, in.b, std::uint16_t(0), 0), line, *c, k);
             {
-                JSValue uid = JSValue::int32(std::int32_t(C->uid));
-                d->consts.push_back(uid);
+                JSValue what = JSValue::int32(std::int32_t(C->uid));
+                for (std::uint32_t m = 0; m < C->code.size(); m = opt::nextOf(*C, m))
+                    if (reached[m] && needsSelf(C->code[m].opcode()))
+                        what = toJSValue(C->only);
+                retain(what);
+                d->consts.push_back(what);
                 d->code[guard].b = std::uint16_t(d->consts.size() - 1);
                 if (d->consts.size() > 0xFFFF)
                     tooFar = true;
@@ -320,6 +332,28 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
                     for (unsigned r = 0; r < C->nregs; ++r)
                         put(Ins::make(Op::LoadUndef, std::uint16_t(inner + r)), C->lines[m], *C, m);
                     outs.push_back(put(Ins::make(Op::Jmp), C->lines[m], *C, m));
+                    continue;
+                }
+                if (needsSelf(op)) {
+                    const bool store = op == Op::PutUpval;
+                    const std::uint32_t n = store ? ci.a : ci.b;
+                    const std::uint16_t reg = std::uint16_t(inner + (store ? C->nregs : ci.a));
+                    const JSValue k = op == Op::LoadCallee ? toJSValue(C->only)
+                                                           : JSValue::cell(reinterpret_cast<CellPtr>(C->only->upvals()[n]));
+                    retain(k);
+                    d->consts.push_back(k);
+                    Ins load = Ins::make(Op::LoadK, reg);
+                    load.b = std::uint16_t((d->consts.size() - 1) & 0xFFFF);
+                    load.c = std::uint16_t((d->consts.size() - 1) >> 16);
+                    put(load, C->lines[m], *C, m);
+                    if (op == Op::GetUpval)
+                        put(Ins::make(Op::GetBox, reg, reg), C->lines[m], *C, m);
+                    if (store) {
+                        put(Ins::make(Op::PutBox, reg, std::uint16_t(ci.b + inner)), C->lines[m], *C, m);
+                        put(Ins::make(Op::LoadUndef, reg), C->lines[m], *C, m);
+                    }
+                    if (d->consts.size() > 0xFFFFFFu)
+                        tooFar = true;
                     continue;
                 }
                 if (op == Op::Cache) {
@@ -380,8 +414,8 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
             }
             for (std::uint32_t at : outs)
                 jumpTo(at, std::uint32_t(d->code.size()));
-            d->nregs = std::max<std::uint32_t>(d->nregs, inner + C->nregs);
-            if (inner + C->nregs > 0xFFF0)
+            d->nregs = std::max<std::uint32_t>(d->nregs, inner + C->nregs + 1);
+            if (inner + C->nregs + 1 > 0xFFF0)
                 tooFar = true;
             SCRIPT_VM_CENSUS(MergedSites);
             k += len;

@@ -785,7 +785,8 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             case Op::LoadK: bits = code_->consts[in.kIndex()].bits; break;  // the block holds it as long as this code
             case Op::GetGlobal: k = ssaGlobalConst(sv.at, &bits); break;
             case Op::GetProp: k = ssaMethodConst(sv.at, &bits); break;
-        case Op::GetUpval: k = ssaUpvalConst(sv.at, &bits); break;
+            case Op::GetUpval: k = ssaUpvalConst(sv.at, &bits); break;
+            case Op::GetBox: k = ssaUpvalConst(sv.at, &bits); break;
             default: k = false; break;
             }
             sval_[v].isConst = k;
@@ -994,7 +995,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                     ssaTypeOf(i);
                 break;
             case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox: case Op::ToNumeric: case Op::Not:
-                if (op == Op::GetUpval && sval_[g.defBase[i]].isConst) {
+                if ((op == Op::GetUpval || op == Op::GetBox) && sval_[g.defBase[i]].isConst) {
                     ssaEpochCheck(i);
                     name_[in.a] = g.defBase[i];
                 } else if (!native_[i])
@@ -1336,17 +1337,26 @@ bool Baseline::ssaMethodConst(std::uint32_t i, std::uint64_t* bits)
 
 bool Baseline::ssaUpvalConst(std::uint32_t i, std::uint64_t* bits)
 {
-    JSFunction* f = code_->only;
-    const std::uint32_t k = code_->code[i].b;
-    if (ssaOn_ < 2 || code_->made != 1 || !f || f->code != code_ || k >= f->nUpvals ||
-        (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
         return false;
-    Box* box = f->upvals()[k];
+    Box* box;
+    if (in.opcode() == Op::GetBox) {
+        box = namedBox(i);
+        if (!box)
+            return false;
+    } else {
+        JSFunction* f = code_->only;
+        if (code_->made != 1 || !f || f->code != code_ || in.b >= f->nUpvals)
+            return false;
+        box = f->upvals()[in.b];
+    }
     const JSValue v = box->value;
     if ((box->h.aux & Box::kNotConstant) || (box->h.aux & Box::kWrites) == Box::kWrites || v.isUndefined() || v.isHole() || v.isUninit())
         return false;
     box->h.aux |= Box::kWatched;
-    code_->singleAssumed = true;
+    if (in.opcode() == Op::GetUpval)
+        code_->singleAssumed = true;
     if (v.isCell())
         holdValue(v);
     *bits = v.bits;
@@ -1474,10 +1484,10 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                     shape = es[0].shape;
                     index = es[0].index;
                 }
-            } else if (native_[i] && op == Op::GetUpval) {
+            } else if (native_[i] && op == Op::GetUpval && !sval_[g.defBase[i]].isConst) {
                 read = true;
                 index = in.b;
-            } else if (native_[i] && op == Op::GetBox) {
+            } else if (native_[i] && op == Op::GetBox && !sval_[g.defBase[i]].isConst) {
                 read = true;
                 obj = names[in.b];
                 shape = 1;
@@ -1800,15 +1810,23 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         return true;
     }
     case Op::JNotCode: {
-        // The register holds a function of the code whose uid the constant names, and a `this` it can take as it is.
-        const std::uint64_t uid = std::uint64_t(code_->consts[in.b].asInt32());
-        CodeBlock* callee = vm_.codeByUid(uid);
+        // The register holds a function of the code whose uid the constant names (or the constant itself, a function), and a
+        // `this` it can take as it is.
+        const JSValue want = code_->consts[in.b];
+        const std::uint64_t uid = want.isInt32() ? std::uint64_t(want.asInt32()) : 0;
+        CodeBlock* callee = want.isInt32() ? vm_.codeByUid(uid) : static_cast<JSFunction*>(asObject(want))->code;
         const std::uint32_t vf = name_[in.a], vt = name_[in.a + 1u];
         Label no, yes;
         const JSValue kf = sval_[vf].isConst ? JSValue::raw(sval_[vf].bits) : JSValue::undefined();
         // A constant function of that code: nothing to test.
-        const bool sure = isFunction(kf) && callee && static_cast<JSFunction*>(asObject(kf))->code == callee;
-        if (!sure) {
+        const bool sure = want.isInt32() ? isFunction(kf) && callee && static_cast<JSFunction*>(asObject(kf))->code == callee
+                                         : kf.bits == want.bits;
+        if (!sure && !want.isInt32()) {
+            loadValue(vf, RAX);
+            a_.movImm(RDX, want.bits);
+            a_.cmp(RAX, RDX);
+            a_.jcc(CNE, no);
+        } else if (!sure) {
         loadValue(vf, RAX);
         if (!known(vf, kVObj)) {
             a_.test(RAX, R15);

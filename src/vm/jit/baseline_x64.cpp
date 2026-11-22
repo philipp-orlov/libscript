@@ -1029,6 +1029,14 @@ private:
     }
     /// The value frame register `reg` will hold when instruction `i` runs, if straight-line code before it in the same block
     /// loads it from a global and (optionally) one property of that: read now, to be guarded at run time. Undefined if not.
+    /// The box a `GetBox` reads where the code names it (`mergeInline` puts the constant just before), else null.
+    Box* namedBox(std::uint32_t i) const
+    {
+        const Ins* in = &code_->code[i];
+        return i && in[-1].opcode() == Op::LoadK && in[-1].a == in->b
+                   ? reinterpret_cast<Box*>(code_->consts[in[-1].kIndex()].asCell())
+                   : nullptr;
+    }
     /// What register `reg` likely holds as instruction `i` begins: the global the nearest instruction before it that writes
     /// the register read, as it is now. Calls and joins between are passed over: only for code that checks the guess.
     JSValue guessBefore(std::uint32_t i, unsigned reg) const
@@ -1055,6 +1063,9 @@ private:
                     if (fr->code == code_ && fr->fn && in.b < fr->fn->nUpvals)
                         return reinterpret_cast<Box*>(fr->fn->upvals()[in.b])->value;
             }
+            if (in.opcode() == Op::GetBox && in.a == reg)
+                if (const Box* box = namedBox(j))
+                    return box->value;
             return JSValue::undefined();
         }
         return JSValue::undefined();
@@ -4537,13 +4548,20 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
         return;
     }
     case Op::JNotCode: {
-        // The register holds a function of the code whose uid the constant names, and a `this` it can take as it is.
+        // The register holds a function of the code whose uid the constant names (or the constant itself, a function), and a
+        // `this` it can take as it is.
         const std::uint32_t target = i + 1 + std::uint32_t(std::int32_t(in.jump16()));
-        const std::uint64_t uid = std::uint64_t(code_->consts[in.b].asInt32());
+        const JSValue want = code_->consts[in.b];
+        const std::uint64_t uid = want.isInt32() ? std::uint64_t(want.asInt32()) : 0;
         Label no, yes;
         // The block that holds this instruction holds a count of the callee's block: its address names it.
-        CodeBlock* callee = vm_.codeByUid(uid);
+        CodeBlock* callee = want.isInt32() ? vm_.codeByUid(uid) : static_cast<JSFunction*>(asObject(want))->code;
         a_.mov(RAX, R(in.a));
+        if (!want.isInt32()) {
+            a_.movImm(RDX, want.bits);
+            a_.cmp(RAX, RDX);
+            a_.jcc(CNE, no);
+        } else {
         needObject(RAX, no);
         a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
         a_.jcc(CNE, no);
@@ -4558,6 +4576,7 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
             a_.cmp(RDX, mem(RCX, kCbUid));
         }
         a_.jcc(CNE, no);
+        }
         const unsigned self = in.a + 1u;
         const bool thisKnown = optimizing() && self < factShape_.size() && factShape_[self] != 0;
         if ((!callee || !(callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) && !thisKnown) {

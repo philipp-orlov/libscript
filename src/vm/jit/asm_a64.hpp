@@ -1231,6 +1231,21 @@ public:
         callRuntime(kAddr);
     }
     void ret() { ins(0xD65F03C0u); }
+    /// Both pushed (`a` first), and `bytes` of stack below them; and back.
+    void enter(Reg a, Reg b, std::int32_t bytes)
+    {
+        addImm(31, 31, -std::int64_t(16 + bytes));
+        ins(0xA9800000u | (0x7Eu << 15) | (std::uint32_t(X(a)) << 10) | (std::uint32_t(kStack) << 5) | std::uint32_t(X(b)));  // stp b, a, [x28, #-16]!
+        addImm(kStack, kStack, -std::int64_t(bytes));
+        flags_ = Flags::None;
+    }
+    void leave(Reg a, Reg b, std::int32_t bytes)
+    {
+        addImm(kStack, kStack, bytes);
+        ins(0xA8C00000u | (0x02u << 15) | (std::uint32_t(X(a)) << 10) | (std::uint32_t(kStack) << 5) | std::uint32_t(X(b)));  // ldp b, a, [x28], #16
+        addImm(31, 31, 16 + bytes);
+        flags_ = Flags::None;
+    }
     void push(Reg r) { pushX(X(r)); }
     void pop(Reg r) { popX(X(r)); }
     void int3() { ins(0xD4200000u); }

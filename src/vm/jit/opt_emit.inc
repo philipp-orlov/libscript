@@ -2490,9 +2490,7 @@ Tier2Code* Baseline::compileOptimized()
         borrowInfo_->regs.assign(fnBorrow_.begin(), fnBorrow_.end());
     }
     a_.bind(selfEntry_);
-    a_.push(RBX);
-    a_.push(R13);
-    a_.aluI(5, RSP, 8 + spill_);
+    a_.enter(RBX, R13, 8 + spill_);
     a_.mov(R13, RSI);
     a_.mov(RBX, RDI);  // the frame's registers, as every way in passes them
     for (const opt::LiveWeb& lw : plan_->liveBefore[0])

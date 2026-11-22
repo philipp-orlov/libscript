@@ -405,6 +405,19 @@ public:
     void shiftCl32(int kind, Reg r) { opReg(false, 0xD3, kind, r); }
     void shiftCl(int kind, Reg r) { opReg(true, 0xD3, kind, r); }
     void cdq() { b(0x99); }
+    /// Both pushed (`a` first), and `bytes` of stack below them; and back.
+    void enter(Reg a, Reg b, std::int32_t bytes)
+    {
+        push(a);
+        push(b);
+        aluI(5, RSP, bytes);
+    }
+    void leave(Reg a, Reg b, std::int32_t bytes)
+    {
+        aluI(0, RSP, bytes);
+        pop(b);
+        pop(a);
+    }
     void usePool() noexcept {}
     void finishPool() {}
     static bool hasToInt32() noexcept { return false; }

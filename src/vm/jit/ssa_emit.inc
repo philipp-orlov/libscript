@@ -908,13 +908,15 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     edgeIn_.assign(nb, {});
     headerFrame_.assign(nb, {});
     headerFacts_.assign(nb, {});
-    a_.push(RBX);
-    a_.push(R13);
-    a_.aluI(5, RSP, 8 + spill_);
+    a_.enter(RBX, R13, 8 + spill_);
     a_.mov(R13, RSI);
     a_.mov(RBX, RDI);
     for (unsigned r = 0; r < nregs; ++r)
         if (ssa::bitTest(g.blocks[1].liveIn, r) && hasLoc(r)) {
+            if (sval_[r].reg >= 0) {
+                a_.mov(Reg(sval_[r].reg), R(r));
+                continue;
+            }
             a_.mov(RAX, R(r));
             storeTagged(r, RAX);
         }
@@ -2964,9 +2966,10 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     a_.jcc(CAE, slow);
     a_.alu(7, RSP, mem(R12, kVmStackFloor));
     a_.jcc(CB, slow);
-    a_.cmpI32(mem(R12, kVmTicks), 1);
+    a_.mov32(RDI, mem(R12, kVmTicks));
+    a_.aluI32(5, RDI, 1);
     a_.jcc(CBE, slow);
-    a_.dec32(mem(R12, kVmTicks));
+    a_.mov32(mem(R12, kVmTicks), RDI);
     // Caller registers the callee's frame covers past the arguments: a plain one is overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     // (A deferred frame has nothing to let go of there. Past the callee's registers, a call it makes may reach them.)

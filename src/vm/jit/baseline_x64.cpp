@@ -79,9 +79,7 @@ struct Stubs
 /// store of them.
 void emitPrologue(Asm& a)
 {
-    a.push(RBX);
-    a.push(R13);
-    a.aluI(5, RSP, 8);
+    a.enter(RBX, R13, 8);
     a.mov(R13, RSI);
     a.mov(RBX, RDI);
 }
@@ -3178,18 +3176,14 @@ void Baseline::emitTails()
         a_.cmpI(RAX, std::int32_t(kStepJump));
         a_.jcc(CE, dispBase_);
         a_.bind(exitBase_);
-        a_.aluI(0, RSP, 8);
-        a_.pop(R13);
-        a_.pop(RBX);
+        a_.leave(RBX, R13, 8);
         a_.ret();
         a_.bind(dispBase_);
         a_.mov(RDI, R12);
         a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitTarget));
         a_.jmp(RAX);
         a_.bind(exit_);
-        a_.aluI(0, RSP, 8 + spill_);
-        a_.pop(R13);
-        a_.pop(RBX);
+        a_.leave(RBX, R13, 8 + spill_);
         a_.ret();
         return;
     }
@@ -3200,9 +3194,7 @@ void Baseline::emitTails()
     a_.cmpI(RAX, std::int32_t(kStepJump));
     a_.jcc(CE, dispatch_);
     a_.bind(exit_);
-    a_.aluI(0, RSP, 8);
-    a_.pop(R13);
-    a_.pop(RBX);
+    a_.leave(RBX, R13, 8);
     a_.ret();
     a_.bind(dispatch_);
     a_.mov(RDI, R12);
@@ -6144,9 +6136,7 @@ void Baseline::retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, boo
         }
     }
     a_.mov(mem(R12, kVmFrameTop), R13);
-    a_.aluI(0, RSP, 8 + spill_);
-    a_.pop(R13);
-    a_.pop(RBX);
+    a_.leave(RBX, R13, 8 + spill_);
     a_.ret();
 }
 
@@ -6293,9 +6283,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
     if (!plain)
         a_.mov(RAX, mem(RSP, 0));
     // The way out in place (as at exit_).
-    a_.aluI(0, RSP, 8 + spill_);
-    a_.pop(R13);
-    a_.pop(RBX);
+    a_.leave(RBX, R13, 8 + spill_);
     a_.ret();
 }
 

@@ -84,7 +84,19 @@ void* VM::allocPayload(std::size_t bytes)
     ctx.heapBytes += bytes;
     ownedBytes_ += bytes;
     ctx.totalAllocated += bytes;
+    if (bytes >= kLargeCell) [[unlikely]]
+        noteLarge(bytes);
     return p;
+}
+
+/// A large payload or a large cell in the zero-count table: the scan does not wait for the table to fill.
+void VM::noteLarge(std::size_t bytes) noexcept
+{
+    largeSinceScan_ += bytes;
+    if (deferred && largeSinceScan_ >= kLargeScan && zctCount() && !immediate_) {
+        zctLimit_ = std::min(zctLimit_, zctCount());
+        noteZct();
+    }
 }
 
 void VM::freePayload(void* p, std::size_t bytes) noexcept
@@ -579,6 +591,8 @@ bool VM::deferOld(detail::GCObject* cell) noexcept
         return true;  // out of memory: a frame may hold it, so it stays (a collection or the context's end frees it)
     }
     cell->inZct = 1;
+    if (cell->gcBytes >= kLargeCell) [[unlikely]]
+        noteLarge(cell->gcBytes);
     if (zctCount() >= zctLimit_) [[unlikely]]
         noteZct();
     return true;
@@ -736,6 +750,7 @@ void VM::zctPush(CellPtr cell) noexcept
 
 void VM::setZctLimit() noexcept
 {
+    largeSinceScan_ = 0;
     zctLimit_ = std::max<std::size_t>({zctMin_, 2 * zctCount(), scanned_ / 4});
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (!zctMin_)

@@ -224,7 +224,8 @@ struct VM : EngineRuntime
                 h->gc = kInZct;
                 return;
             }
-        } else if (!cell->pinned && !cell->inZct && zctOld_.size() < zctOld_.capacity() && zctCount() < zctLimit_) {
+        } else if (!cell->pinned && !cell->inZct && cell->gcBytes < kLargeCell && zctOld_.size() < zctOld_.capacity() &&
+                   zctCount() < zctLimit_) {
             zctOld_.push_back(cell);  // within its capacity: nothing to allocate
             cell->inZct = 1;
             return;
@@ -538,6 +539,7 @@ struct VM : EngineRuntime
     /// Where `globalEpoch` was when all of them were found as they were made, and watched; nothing has changed while it stands
     /// there.
     std::uint32_t regexpEpoch = ~0u;
+    std::size_t jsonRoom = 0;  ///< how many characters the next JSON.stringify starts with room for
     /// A regular expression literal's compiled program, by the string constants of its pattern and flags (each entry holds
     /// a count of both): a literal in a loop makes a RegExp each time round with no parse of its flags and no lookup by text.
     struct RegExpLiteral
@@ -617,6 +619,9 @@ private:
     /// One count more (`delta` 1) or fewer (-1) for every cell a frame's register holds.
     void countRoots(int delta) noexcept;
     void noteZct() noexcept;
+    void noteLarge(std::size_t bytes) noexcept;
+    static constexpr std::size_t kLargeCell = std::size_t(32) << 10, kLargeScan = std::size_t(2) << 20;
+    std::size_t largeSinceScan_ = 0;  ///< bytes of those noted since the last scan
     void auditCounts() noexcept;
     void freeZct() noexcept;
     bool rootsCounted_ = false;

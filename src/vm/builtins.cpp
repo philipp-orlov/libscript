@@ -2796,6 +2796,9 @@ NATIVE(jsonStringify)
 {
     UNUSED();
     JsonWriter j{vm, {}, {}, false, {}, {}, {}, {}, nullptr};
+    // Room for as much as the last time, when that was much: no growing by copies.
+    if (vm.jsonRoom)
+        j.out.grow(vm.jsonRoom);
     j.toJson = vm.internKey(std::string_view("toJSON"));
     struct Release
     {
@@ -2842,6 +2845,7 @@ NATIVE(jsonStringify)
         return JSValue::exception();
     if (r == 2)
         return JSValue::undefined();
+    vm.jsonRoom = j.out.size >= 4096 && j.out.size <= (std::size_t(16) << 20) ? j.out.size + j.out.size / 16 : 0;
     return makeString(vm, StringView(j.out.data, j.out.size));
 }
 

@@ -2043,6 +2043,46 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
 }
 
 /// Empty when the site has found nothing, something of another kind, or has made code leave.
+bool Baseline::ssaGetterRead(const PolyEntry& pe, std::uint32_t* index) const
+{
+    const Shape* s = liveShape(pe.shape);
+    if (ssaOn_ < 2 || pe.kind != PolyEntry::ProtoAccessor || !s || !s->proto || !pe.holder || s->isDictionary())
+        return false;
+    const JSValue pair = *pe.holder->slotAt(pe.index);
+    if (!pair.isCell() || isObject(pair) || !isVmCell(pair.asCell()) || kindOf(pair.asCell()) != Kind::GetterSetter)
+        return false;
+    const JSValue g = reinterpret_cast<const GetterSetter*>(pair.asCell())->getter;
+    if (!isFunction(g))
+        return false;
+    auto* f = static_cast<JSFunction*>(asObject(g));
+    const CodeBlock* c = f->code;
+    if ((f->flags & JSFunction::kNative) || !c || (c->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync)) ||
+        c->code.size() < 3)
+        return false;
+    Key key = nullptr;
+    Box* box = nullptr;
+    const Ins* in = c->code.data();
+    if (in[0].opcode() == Op::GetProp && in[0].b == 0 && in[1].opcode() == Op::Cache && in[2].opcode() == Op::Ret && in[2].a == in[0].a) {
+        key = c->atoms[in[0].c];
+    } else if (in[0].opcode() == Op::GetUpval && in[0].a != 0 && in[1].opcode() == Op::GetElem && in[1].b == 0 && in[1].c == in[0].a &&
+               in[2].opcode() == Op::Ret && in[2].a == in[1].a && (c->flags & CodeBlock::kPrivate) && in[0].b < f->nUpvals) {
+        box = f->upvals()[in[0].b];
+        if (!isSymbol(box->value) || (box->h.aux & Box::kNotConstant) || (box->h.aux & Box::kWrites) == Box::kWrites)
+            return false;
+        key = static_cast<Key>(box->value.asCell());
+    }
+    if (!key)
+        return false;
+    std::uint8_t attrs = 0;
+    const std::int32_t at = const_cast<Shape*>(s)->indexOf(key, &attrs);
+    if (at < 0 || (attrs & attr::kAccessor) || !vm_.watchMethod(s->proto, pe.holder))
+        return false;
+    if (box)
+        box->h.aux |= Box::kWatched;
+    *index = std::uint32_t(at);
+    return true;
+}
+
 std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i) const
 {
     std::vector<ReadEntry> es;
@@ -2066,6 +2106,8 @@ std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i) const
                 es.push_back({e.shape, e.index, e.holder, e.validity, false});
             } else if (e.kind == PolyEntry::Absent && (!e.validity || e.validity->valid)) {
                 es.push_back({e.shape, 0, nullptr, e.validity, true});
+            } else if (std::uint32_t index = 0; ssaGetterRead(e, &index)) {
+                es.push_back({e.shape, index, nullptr, nullptr, false, true});
             } else {
                 es.clear();
                 return es;
@@ -2108,6 +2150,11 @@ bool Baseline::ssaGetProp(std::uint32_t i)
     Label& bad = ssaExit(i);
     const Reg o = valueReg(v), d = defReg(i);
     needCellV(v, o, bad);
+    for (const ReadEntry& e : es)
+        if (e.watched) {
+            ssaEpochCheck(i);
+            break;
+        }
     std::vector<std::size_t> emit;
     if (vShape_[v]) {
         for (std::size_t k = 0; k < es.size() && emit.empty(); ++k)

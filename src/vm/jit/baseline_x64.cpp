@@ -2141,7 +2141,11 @@ private:
         JSObject* holder;
         ValidityCell* validity;
         bool absent;
+        bool watched = false;  ///< good while the epoch stands: what a getter found on a prototype reads (`ssaGetterRead`)
     };
+    /// Whether the accessor of `pe` is a function that only reads a data property of `this` (or a private field), which objects
+    /// of the entry's shape have: the property's index. The accessor is watched then.
+    bool ssaGetterRead(const PolyEntry& pe, std::uint32_t* index) const;
     std::vector<ReadEntry> ssaReadEntries(std::uint32_t i) const;
     /// The value of the global `GetGlobal` `i` reads, when it is taken for a constant (and watched from now on).
     bool ssaGlobalConst(std::uint32_t i, std::uint64_t* bits);

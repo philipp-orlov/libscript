@@ -444,27 +444,6 @@ bool preferTier2(const CodeBlock& code, const VM& vm, const char** why)
                         return true;
                     }
             }
-            // A read that has always found one getter on a prototype, a tiny one: tier 2 runs its body in place.
-            if (op == Op::GetProp && (rules & 2) && i + 1 < n && code.code[i + 1].opcode() == Op::Cache &&
-                code.code[i + 1].a != kNoCache) {
-                const InlineCache& ic = code.caches[code.code[i + 1].a];
-                if (ic.shape == 0 && ic.pad && ic.pad <= code.poly.size() && code.poly[ic.pad - 1].n == 1) {
-                    const PolyEntry& pe = code.poly[ic.pad - 1].e[0];
-                    if (pe.kind == PolyEntry::ProtoAccessor && pe.validity && pe.validity->valid && pe.holder) {
-                        const JSValue slot = *pe.holder->slotAt(pe.index);
-                        if (slot.isCell()) {
-                            const auto* gs = reinterpret_cast<const GetterSetter*>(slot.asCell());
-                            if (isFunction(gs->getter)) {
-                                const auto* gf = static_cast<const JSFunction*>(asObject(gs->getter));
-                                if (!(gf->flags & JSFunction::kNative) && gf->code && gf->code->code.size() <= 12) {
-                                    *why = "tiny getter in a loop";
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             const opt::Effects ef = opt::effectsOf(code, i);
             for (std::uint16_t w : ef.wr)
                 if (w < code.nregs)

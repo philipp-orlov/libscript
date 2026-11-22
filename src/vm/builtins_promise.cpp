@@ -886,7 +886,7 @@ AsyncGenState* asyncGenOf(JSValue v)
 {
     if (isObject(v) && asObject(v)->cls() == ObjClass::Native)
         if (Rare* r = asObject(v)->rare())
-            return dynamic_cast<AsyncGenState*>(r->ext);
+            return r->ext && typeid(*r->ext) == typeid(AsyncGenState) ? static_cast<AsyncGenState*>(r->ext) : nullptr;
     return nullptr;
 }
 
@@ -1012,7 +1012,7 @@ NATIVE(syncWrapStep)
     SyncWrap* w = nullptr;
     if (isObject(self) && asObject(self)->cls() == ObjClass::Native)
         if (Rare* r = asObject(self)->rare())
-            w = dynamic_cast<SyncWrap*>(r->ext);
+            w = r->ext && typeid(*r->ext) == typeid(SyncWrap) ? static_cast<SyncWrap*>(r->ext) : nullptr;
     JSValue derived = newPromiseObject(vm);
     Handle derivedKeep = Handle::adopt(derived);
     if (!w) {

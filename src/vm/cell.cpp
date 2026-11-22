@@ -1188,6 +1188,13 @@ void VM::releaseRoots() noexcept
         ++headerOf(c)->rc;
     for (CellPtr c : all)
         clearReferences(*this, c);
+    // The constants of a merged block that are cells of this family (`mergeInline`): the blocks go with the functions below.
+    for (auto& [uid, code] : codeByUid_)
+        for (JSValue& v : code->consts)
+            if (v.isCell() && isVmCell(v.asCell())) {
+                release(v);
+                v = JSValue::undefined();
+            }
     for (std::uint32_t id = 1; id < shapeCount_; ++id)
         if (Shape* s = shapeTable_[id]) {
             shapeTable_[id] = nullptr;

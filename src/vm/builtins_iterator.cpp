@@ -4,6 +4,7 @@
 // The global Iterator: Iterator.from, Iterator.concat, and the helpers on %Iterator.prototype% (map, filter, take, drop,
 // flatMap, and the consuming reduce, toArray, forEach, some, every, find).
 
+#include <typeinfo>
 #include <cmath>
 #include <limits>
 
@@ -54,7 +55,7 @@ Helper* helperOf(JSValue v)
 {
     if (isObject(v) && asObject(v)->cls() == ObjClass::Iterator)
         if (Rare* r = asObject(v)->rare(); r && r->ext)
-            return dynamic_cast<Helper*>(r->ext);
+            return typeid(*r->ext) == typeid(Helper) ? static_cast<Helper*>(r->ext) : nullptr;
     return nullptr;
 }
 

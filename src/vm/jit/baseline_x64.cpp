@@ -657,6 +657,13 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         code->callProf[index] = f->code->uid;
     if (f->flags & JSFunction::kNative) {
         fr->pc = ins + 1;
+        if (!isSuper && callee.bits == vm.arrayConstructor.bits &&
+            (argc == 0 || (argc == 1 && R[base + 2].isInt32() && std::uint32_t(R[base + 2].asInt32()) <= JSArray::kMaxDenseGap))) {
+            // `new Array(n)`: the array, without the object that `this` would be.
+            vm.stackTop = R + code->nregs;
+            const std::uint32_t n = argc ? std::uint32_t(R[base + 2].asInt32()) : 0;
+            return {handOver(vm, toJSValue(vm.newArray(vm.protos.array, n)).bits), 1};
+        }
         Rare* r = f->rare();
         if (isNew) {
             // As the interpreter's `new` of a native: `this` inherits from its `prototype`, and an answer that is no object

@@ -863,7 +863,7 @@ NATIVE(objectToString)
         tag = "[object Boolean]";
     else if (isObject(self) && asObject(self)->cls() == ObjClass::Date)
         tag = "[object Date]";
-    else if (isObject(self) && asObject(self)->cls() == ObjClass::RegExp)
+    else if (isObject(self) && (asObject(self)->cls() == ObjClass::RegExp || asObject(self)->cls() == ObjClass::RegExpCell))
         tag = "[object RegExp]";
     if (!self.isNullish()) {
         JSValue custom = getProperty(vm, self, vm.atoms.symToStringTag);

@@ -107,6 +107,7 @@ std::size_t cellBytesOf(const detail::GCObject* cell) noexcept
                 case ObjClass::TypedArray: return sizeof(JSTypedArray);
                 case ObjClass::Function: return JSFunction::bytesFor(static_cast<const JSFunction*>(o)->nUpvals);
                 case ObjClass::Promise: return JSObject::bytesFor(o->h.aux) + JSObject::kPromiseStateBytes;
+                case ObjClass::RegExpCell: return JSObject::bytesFor(o->h.aux) + JSObject::kRegExpStateBytes;
                 default: return JSObject::bytesFor(o->h.aux);
             }
         }

@@ -52,6 +52,7 @@ enum class ObjClass : std::uint8_t
     Generator,
     Global,
     Native,
+    RegExpCell,  ///< a RegExp whose state is in its cell (`JSObject::embeddedState`); a subclass instance is `RegExp`
 };
 
 namespace cellflags {

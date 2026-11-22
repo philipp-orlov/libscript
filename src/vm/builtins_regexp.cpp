@@ -21,13 +21,34 @@ namespace regex = dyn::regex;
 
 namespace {
 
-struct RegExpData : NativeState
+/// What every RegExp a literal makes has in common, and one made any other way has to itself. Counted by this VM's objects.
+struct RegExpText
 {
+    std::uint32_t refs = 1;
+    unsigned flags = 0;
     std::shared_ptr<const regex::Program> program;
     String source;
-    unsigned flags = 0;
-    bool legacy = true;  ///< made by the RegExp constructor itself, so it may be recompiled
+    void release() noexcept
+    {
+        if (--refs == 0)
+            delete this;
+    }
 };
+
+struct RegExpData : NativeState
+{
+    RegExpText* text;  ///< counted
+    bool legacy = true;  ///< made by the RegExp constructor itself, so it may be recompiled
+
+    explicit RegExpData(RegExpText* t) noexcept : text(t) {}
+    ~RegExpData() override { text->release(); }
+    RegExpData(const RegExpData&) = delete;
+    RegExpData& operator=(const RegExpData&) = delete;
+    const regex::Program& program() const noexcept { return *text->program; }
+    const String& source() const noexcept { return text->source; }
+    unsigned flags() const noexcept { return text->flags; }
+};
+static_assert(sizeof(RegExpData) <= JSObject::kRegExpStateBytes && alignof(RegExpData) <= 8, "a RegExp's state fits in its cell");
 
 /// `regex::exec`, natively where the context lets code be compiled.
 bool execProgram(VM& vm, const regex::Program& program, StringView s, std::size_t start, regex::Matcher& matcher)
@@ -99,8 +120,13 @@ std::shared_ptr<const regex::Program> programForShared(StringView source, unsign
 
 RegExpData* dataOf(JSValue v)
 {
-    if (isObject(v) && asObject(v)->cls() == ObjClass::RegExp)
-        if (Rare* r = asObject(v)->rare())
+    if (!isObject(v))
+        return nullptr;
+    JSObject* o = asObject(v);
+    if (o->cls() == ObjClass::RegExpCell)
+        return static_cast<RegExpData*>(o->embeddedState());
+    if (o->cls() == ObjClass::RegExp)
+        if (Rare* r = o->rare())
             return static_cast<RegExpData*>(r->ext);
     return nullptr;
 }
@@ -113,7 +139,7 @@ RegExpData* thisRegExp(VM& vm, JSValue self, const char* method)
     return nullptr;
 }
 
-bool initializeWith(VM& vm, JSObject* o, StringView pattern, std::shared_ptr<const regex::Program> program, unsigned bits);
+bool initializeWith(VM& vm, JSObject* o, RegExpText* text);
 
 /// Set up `o` as a RegExp for `pattern` and `flags`; false with an exception pending.
 bool initialize(VM& vm, JSObject* o, StringView pattern, StringView flagText)
@@ -129,20 +155,45 @@ bool initialize(VM& vm, JSObject* o, StringView pattern, StringView flagText)
         vm.throwError(ErrorCode::SyntaxError, "Invalid regular expression: /" + toUtf8(pattern) + "/: " + error);
         return false;
     }
-    return initializeWith(vm, o, pattern, std::move(program), bits);
+    auto* text = new RegExpText();
+    text->program = std::move(program);
+    text->source = String(pattern);
+    text->flags = bits;
+    return initializeWith(vm, o, text);
 }
 
-/// Set up `o` as a RegExp of a compiled program.
-bool initializeWith(VM& vm, JSObject* o, StringView pattern, std::shared_ptr<const regex::Program> program, unsigned bits)
+/// A RegExp object, its state (of `text`, whose count it takes) in its own cell; not yet with its `lastIndex`.
+JSObject* newRegExpCell(VM& vm, RegExpText* text)
 {
-    auto* data = new RegExpData();
-    data->program = std::move(program);
-    data->source = String(pattern);
-    data->flags = bits;
-    o->h.cls = std::uint8_t(ObjClass::RegExp);
-    Rare& rare = o->rareOf(vm);
-    delete rare.ext;
-    rare.ext = data;
+    constexpr std::uint8_t aux = 3;
+    JSObject* o;
+    try {
+        o = static_cast<JSObject*>(
+            vm.allocCell(JSObject::bytesFor(aux) + JSObject::kRegExpStateBytes, Kind::Object, ObjClass::RegExpCell, aux));
+    } catch (...) {
+        text->release();
+        throw;
+    }
+    o->h.shape = vm.rootShapeFor(vm.protos.regexp)->id;
+    o->slots = nullptr;
+    ::new (static_cast<void*>(o->embeddedState())) RegExpData(text);
+    return o;
+}
+
+/// Set up `o` as a RegExp of `text`, whose count it takes.
+bool initializeWith(VM& vm, JSObject* o, RegExpText* text)
+{
+    if (o->cls() == ObjClass::RegExpCell) {
+        auto* data = static_cast<RegExpData*>(o->embeddedState());
+        data->text->release();
+        data->text = text;
+    } else {
+        auto* data = new RegExpData(text);
+        o->h.cls = std::uint8_t(ObjClass::RegExp);
+        Rare& rare = o->rareOf(vm);
+        delete rare.ext;
+        rare.ext = data;
+    }
     if (!o->findOwn(vm, vm.atoms.lastIndex)) {
         o->putOwn(vm, vm.atoms.lastIndex, JSValue::int32(0), attr::kWritable);
         return true;
@@ -177,7 +228,7 @@ bool writeLastIndex(VM& vm, JSObject* o, double v)
 {
     // A RegExp's own writable `lastIndex` (as it always starts): stored in place.
     std::uint8_t attrs = 0;
-    if (o->cls() == ObjClass::RegExp && !proxyOf(o))
+    if ((o->cls() == ObjClass::RegExp || o->cls() == ObjClass::RegExpCell) && !proxyOf(o))
         if (JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex, &attrs); slot && !(attrs & attr::kAccessor) && (attrs & attr::kWritable)) {
             const JSValue old = *slot;
             *slot = JSValue::boxNumber(v);
@@ -222,9 +273,9 @@ struct Match
 bool runExec(VM& vm, RegExpData* d, StringView s, std::size_t start, Match* out)
 {
     regex::Matcher& matcher = scratch();
-    if (!execProgram(vm, *d->program, s, start, matcher))
+    if (!execProgram(vm, d->program(), s, start, matcher))
         return false;
-    const std::size_t n = regex::groupCount(*d->program);
+    const std::size_t n = regex::groupCount(d->program());
     out->bounds.assign(matcher.registers.data(), 2 * n);
     return true;
 }
@@ -239,7 +290,7 @@ JSValue captureString(VM& vm, StringView s, const Match& m, std::size_t g)
 /// The `groups` object of a match, or undefined when the pattern names none. Owned.
 JSValue namedGroupsObject(VM& vm, RegExpData* d, StringView s, const Match& m)
 {
-    const auto& names = regex::namedGroups(*d->program);
+    const auto& names = regex::namedGroups(d->program());
     if (names.empty())
         return JSValue::undefined();
     JSObject* g = vm.newObject(static_cast<JSObject*>(nullptr));
@@ -269,7 +320,7 @@ JSValue matchArray(VM& vm, RegExpData* d, JSValue input, StringView s, const Mat
     retain(input);
     a->putOwn(vm, vm.atoms.input, input, attr::kDefault);
     a->putOwn(vm, vm.atoms.groups, namedGroupsObject(vm, d, s, m), attr::kDefault);
-    if (d->flags & regex::kHasIndices) {
+    if (d->flags() & regex::kHasIndices) {
         JSArray* idx = vm.newArray(vm.protos.array, 0, std::uint32_t(m.groups()));
         Handle idxKeep = Handle::adopt(toJSValue(idx));
         for (std::size_t g = 0; g < m.groups(); ++g) {
@@ -282,7 +333,7 @@ JSValue matchArray(VM& vm, RegExpData* d, JSValue input, StringView s, const Mat
             pair->append(vm, JSValue::int32(m.bounds[2 * g + 1]));
             idx->append(vm, toJSValue(pair));
         }
-        const auto& names = regex::namedGroups(*d->program);
+        const auto& names = regex::namedGroups(d->program());
         JSValue groupsValue = JSValue::undefined();
         if (!names.empty()) {
             JSObject* g = vm.newObject(static_cast<JSObject*>(nullptr));
@@ -338,7 +389,7 @@ JSValue builtinExec(VM& vm, JSValue re, JSValue input)
     if (text.get().isException())
         return JSValue::exception();
     StringView s = asString(text.get())->text();
-    const bool useIndex = (d->flags & (regex::kGlobal | regex::kSticky)) != 0;
+    const bool useIndex = (d->flags() & (regex::kGlobal | regex::kSticky)) != 0;
     double last = 0;
     if (!readLastIndex(vm, o, &last))
         return JSValue::exception();
@@ -371,21 +422,21 @@ int builtinTest(VM& vm, JSValue re, JSValue input)
     if (text.get().isException())
         return -1;
     StringView s = asString(text.get())->text();
-    const bool useIndex = (d->flags & (regex::kGlobal | regex::kSticky)) != 0;
+    const bool useIndex = (d->flags() & (regex::kGlobal | regex::kSticky)) != 0;
     double last = 0;
     if (!readLastIndex(vm, o, &last))
         return -1;
     if (!useIndex)
         last = 0;
     regex::Matcher& matcher = scratch();
-    if (last > double(s.size()) || !execProgram(vm, *d->program, s, std::size_t(last), matcher)) {
+    if (last > double(s.size()) || !execProgram(vm, d->program(), s, std::size_t(last), matcher)) {
         if (useIndex && !writeLastIndex(vm, o, 0))
             return -1;
         return 0;
     }
     if (useIndex && !writeLastIndex(vm, o, matcher.registers[1]))
         return -1;
-    noteLegacyBounds(vm, d, text.get(), matcher.registers.data(), regex::groupCount(*d->program));
+    noteLegacyBounds(vm, d, text.get(), matcher.registers.data(), regex::groupCount(d->program()));
     return 1;
 }
 
@@ -536,7 +587,7 @@ bool execPristine(VM& vm, JSValue rx)
         return false;
     Rare* r = o->rare();
     const Shape* own = vm.shapeById(o->h.shape);
-    if (!r || r->dict || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
+    if ((r && r->dict) || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
         !o->slotAt(0)->isNumber())
         return false;
     for (VM::RegExpSlot& s : vm.regexpSlots) {
@@ -559,7 +610,7 @@ bool pristine(VM& vm, JSValue rx)
     Rare* r = o->rare();
     const Shape* own = vm.shapeById(o->h.shape);
     // Its one property is `lastIndex`, a writable number: the last a shape of one property added is that property.
-    if (!r || r->dict || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
+    if ((r && r->dict) || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
         !o->slotAt(0)->isNumber())
         return false;
     for (VM::RegExpSlot& s : vm.regexpSlots) {
@@ -583,7 +634,7 @@ bool getLastIndex(VM& vm, JSValue rx, double* out)
 bool flagsOf(VM& vm, JSValue rx, String* out)
 {
     if (pristine(vm, rx)) {
-        *out = flagLetters(dataOf(rx)->flags);
+        *out = flagLetters(dataOf(rx)->flags());
         return true;
     }
     Name flags(vm, "flags");
@@ -663,8 +714,8 @@ NATIVE(regexpCtor)
     }
     Handle sourceValue, flagValue;
     if (RegExpData* d = dataOf(pattern)) {
-        sourceValue = Handle::adopt(makeString(vm, StringView(d->source)));
-        flagValue = flags.isUndefined() ? Handle::adopt(makeString(vm, StringView(flagString(d->flags)))) : Handle::retained(flags);
+        sourceValue = Handle::adopt(makeString(vm, StringView(d->source())));
+        flagValue = flags.isUndefined() ? Handle::adopt(makeString(vm, StringView(flagString(d->flags())))) : Handle::retained(flags);
     } else if (patternIsRegExp) {
         Name source(vm, "source");
         sourceValue = Handle::adopt(getProperty(vm, pattern, source.key));
@@ -725,8 +776,8 @@ NATIVE(regexpCompile)
     if (RegExpData* d = dataOf(pattern)) {
         if (!flags.isUndefined())
             return typeError(vm, "flags must be undefined when the pattern is a RegExp");
-        source = d->source;
-        flagText = flagString(d->flags);
+        source = d->source();
+        flagText = flagString(d->flags());
     } else {
         if (!pattern.isUndefined()) {
             JSValue t = toStringValue(vm, pattern);
@@ -809,7 +860,7 @@ NATIVE(regexpFlagGetter)
         return typeError(vm, "RegExp.prototype getter requires that 'this' be an Object");
     if (which == kFlagsGetter) {
         if (pristine(vm, self))
-            return makeString(vm, StringView(flagLetters(dataOf(self)->flags)));
+            return makeString(vm, StringView(flagLetters(dataOf(self)->flags())));
         // Read through the flag properties, so a subclass or an object of its own is heard.
         struct Flag
         {
@@ -835,8 +886,8 @@ NATIVE(regexpFlagGetter)
         return typeError(vm, "RegExp.prototype getter requires that 'this' be a RegExp object");
     }
     if (which == 0)
-        return makeString(vm, StringView(escapeSource(d->source)));
-    return JSValue::boolean((d->flags & unsigned(which)) != 0);
+        return makeString(vm, StringView(escapeSource(d->source())));
+    return JSValue::boolean((d->flags() & unsigned(which)) != 0);
 }
 
 // ----------------------------------------------------------------- replace ---
@@ -880,14 +931,14 @@ void expand(String& out, StringView templ, StringView s, const Match& m, RegExpD
             } else {
                 out.push_back(c);
             }
-        } else if (n == u'<' && d && !regex::namedGroups(*d->program).empty()) {
+        } else if (n == u'<' && d && !regex::namedGroups(d->program()).empty()) {
             const std::size_t close = templ.find(u'>', i + 2);
             if (close == StringView::npos) {
                 out.push_back(c);
                 continue;
             }
             const StringView name = templ.substr(i + 2, close - i - 2);
-            for (const regex::NamedGroup& ng : regex::namedGroups(*d->program))
+            for (const regex::NamedGroup& ng : regex::namedGroups(d->program()))
                 if (StringView(ng.name) == name)
                     for (std::uint32_t g : ng.groups)
                         if (m.bounds[2 * g] >= 0) {
@@ -972,8 +1023,8 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
 {
     JSObject* o = asObject(self);
     StringView s = asString(textValue)->text();
-    const bool global = (d->flags & regex::kGlobal) != 0, sticky = (d->flags & regex::kSticky) != 0;
-    const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
+    const bool global = (d->flags() & regex::kGlobal) != 0, sticky = (d->flags() & regex::kSticky) != 0;
+    const bool unicode = (d->flags() & (regex::kUnicode | regex::kUnicodeSets)) != 0;
     std::size_t at = 0;
     if (global) {
         if (!writeLastIndex(vm, o, 0))
@@ -1016,7 +1067,7 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
                 callArgs.push_back(Handle::adopt(captureString(vm, s, m, g)));
             callArgs.push_back(Handle::adopt(JSValue::int32(std::int32_t(ms))));
             callArgs.push_back(Handle::retained(textValue));
-            if (!regex::namedGroups(*d->program).empty())
+            if (!regex::namedGroups(d->program()).empty())
                 callArgs.push_back(Handle::adopt(namedGroupsObject(vm, d, s, m)));
             std::vector<JSValue> raw;
             for (const Handle& h : callArgs)
@@ -1170,16 +1221,16 @@ JSValue globalMatch(VM& vm, JSValue re, JSValue text)
 {
     RegExpData* d = dataOf(re);
     JSObject* o = asObject(re);
-    const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
+    const bool unicode = (d->flags() & (regex::kUnicode | regex::kUnicodeSets)) != 0;
     StringView s = asString(text)->text();
     JSArray* out = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(out));
-    const std::size_t groups = regex::groupCount(*d->program);
+    const std::size_t groups = regex::groupCount(d->program());
     std::size_t last = 0;
     bool any = false;
     Bounds lastMatch;  // a failing attempt at the end leaves the registers in no state to read
     regex::Matcher& matcher = scratch();
-    while (last <= s.size() && execProgram(vm, *d->program, s, last, matcher)) {
+    while (last <= s.size() && execProgram(vm, d->program(), s, last, matcher)) {
         const std::int32_t from = matcher.registers[0], to = matcher.registers[1];
         out->append(vm, makeString(vm, s.substr(std::size_t(from), std::size_t(to - from))));
         lastMatch.assign(matcher.registers.data(), 2 * groups);
@@ -1203,7 +1254,7 @@ NATIVE(regexpMatch)
         return JSValue::exception();
     if (pristine(vm, self)) {
         // Its flags and its exec as they were: one look decides.
-        if (dataOf(self)->flags & regex::kGlobal)
+        if (dataOf(self)->flags() & regex::kGlobal)
             return globalMatch(vm, self, text.get());
         return builtinExec(vm, self, text.get());
     }
@@ -1270,15 +1321,16 @@ JSValue fastSplit(VM& vm, RegExpData* d, StringView s, double limit)
     if (limit == 0)
         return keep.take();
     // The engine matches at or after a position; a sticky pattern would match only at it, so run a copy without that.
-    RegExpData plain;
+    auto* plainText = new RegExpText();
+    RegExpData plain(plainText);
     RegExpData* e = d;
-    if (d->flags & regex::kSticky) {
+    if (d->flags() & regex::kSticky) {
         std::string error;
-        plain.program = programFor(StringView(d->source), d->flags & ~unsigned(regex::kSticky), error);
-        plain.flags = d->flags & ~unsigned(regex::kSticky);
+        plainText->program = programFor(StringView(d->source()), d->flags() & ~unsigned(regex::kSticky), error);
+        plainText->flags = d->flags() & ~unsigned(regex::kSticky);
         e = &plain;
     }
-    const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
+    const bool unicode = (d->flags() & (regex::kUnicode | regex::kUnicodeSets)) != 0;
     Match m;
     if (s.empty()) {
         if (!runExec(vm, e, s, 0, &m) || m.end() != 0)
@@ -1607,13 +1659,17 @@ JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags)
             release(l.flags);
         l.pattern = pattern;
         l.flags = flags;
-        l.program = std::move(program);
-        l.bits = bits;
+        auto* made = new RegExpText();
+        made->program = std::move(program);
+        made->source = String(asString(pattern)->text());
+        made->flags = bits;
+        l.text = std::shared_ptr<void>(made, [](void* t) { static_cast<RegExpText*>(t)->release(); });
     }
-    JSObject* o = vm.newObject(vm.protos.regexp);
+    auto* text = static_cast<RegExpText*>(l.text.get());
+    ++text->refs;
+    JSObject* o = newRegExpCell(vm, text);
     Handle keep = Handle::adopt(toJSValue(o));
-    if (!initializeWith(vm, o, asString(pattern)->text(), std::static_pointer_cast<const regex::Program>(l.program), l.bits))
-        return JSValue::exception();
+    o->putOwn(vm, vm.atoms.lastIndex, JSValue::int32(0), attr::kWritable);
     return keep.take();
 }
 

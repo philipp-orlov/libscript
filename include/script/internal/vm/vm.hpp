@@ -503,8 +503,7 @@ struct VM : EngineRuntime
     struct RegExpLiteral
     {
         JSValue pattern = JSValue::raw(0), flags = JSValue::raw(0);
-        std::shared_ptr<const void> program;
-        unsigned bits = 0;
+        std::shared_ptr<void> text;  ///< what its RegExps share (builtins_regexp.cpp)
     };
     RegExpLiteral regexpLiterals[64];
     std::uint32_t arrayRootShape = 0;

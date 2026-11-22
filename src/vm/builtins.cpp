@@ -20,6 +20,7 @@
 #include "script/internal/dyn/object.hpp"
 #include "script/internal/vm/convert.hpp"
 #include "script/internal/vm/host.hpp"
+#include "script/internal/vm/jit.hpp"
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
 #include "script/internal/vm/typed.hpp"
@@ -3408,6 +3409,8 @@ NATIVE(performanceNow)
 
 namespace bi {
 
+double mathFround(double x) { return double(float(x)); }
+
 JSValue sortDenseArray(VM& vm, JSValue array, JSValue compare)
 {
     const JSValue args[1] = {compare};
@@ -3803,6 +3806,25 @@ bool mathUnaryIsSqrt(const void* data) noexcept
 FastNative mathUnaryNative() noexcept
 {
     return mathUnary;
+}
+
+MathOp mathOp(FastNative native, const void* data) noexcept
+{
+    if (native == mathMinMax)
+        return data ? MathOp::Max : MathOp::Min;
+    if (native == mathImul)
+        return MathOp::Imul;
+    if (native != mathUnary)
+        return MathOp::None;
+    const auto fn = reinterpret_cast<double (*)(double)>(const_cast<void*>(data));
+    return fn == mathFloor         ? MathOp::Floor
+           : fn == mathCeil        ? MathOp::Ceil
+           : fn == mathTrunc       ? MathOp::Trunc
+           : fn == mathRound       ? MathOp::Round
+           : fn == mathSqrt        ? MathOp::Sqrt
+           : fn == mathAbs         ? MathOp::Abs
+           : fn == bi::mathFround  ? MathOp::Fround
+                                   : MathOp::Unary;
 }
 
 FastNative stringCharNative() noexcept

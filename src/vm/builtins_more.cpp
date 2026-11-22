@@ -8,6 +8,7 @@
 
 #include "script/internal/dyn/numconv.hpp"
 #include "script/internal/dyn/object.hpp"
+#include "script/internal/vm/jit.hpp"
 #include "script/internal/vm/typed.hpp"
 #include "builtins_util.hpp"
 
@@ -870,17 +871,6 @@ NATIVE(numberFormat)
 
 // --------------------------------------------------------------------- Math ---
 
-NATIVE(mathFn)
-{
-    UNUSED();
-    double x;
-    if (!toNumber(vm, arg(args, argc, 0), &x))
-        return JSValue::exception();
-    auto fn = reinterpret_cast<double (*)(double)>(data);
-    return JSValue::boxNumber(fn(x));
-}
-
-double fround(double x) { return double(float(x)); }
 double clz32(double x)
 {
     const std::uint32_t v = toUint32(x);
@@ -1132,8 +1122,8 @@ void installMore(VM& vm)
                     Unary{"tanh", [](double x) { return std::tanh(x); }}, Unary{"asinh", [](double x) { return std::asinh(x); }},
                     Unary{"acosh", [](double x) { return std::acosh(x); }}, Unary{"atanh", [](double x) { return std::atanh(x); }},
                     Unary{"expm1", [](double x) { return std::expm1(x); }}, Unary{"log1p", [](double x) { return std::log1p(x); }},
-                    Unary{"fround", fround}, Unary{"clz32", clz32}})
-        method(vm, math, u.name, mathFn, 1, reinterpret_cast<void*>(u.fn));
+                    Unary{"fround", bi::mathFround}, Unary{"clz32", clz32}})
+        method(vm, math, u.name, mathUnaryNative(), 1, reinterpret_cast<void*>(u.fn));
     value(vm, math, "LOG2E", JSValue::boxDouble(1.4426950408889634), 0);
     value(vm, math, "LOG10E", JSValue::boxDouble(0.4342944819032518), 0);
     value(vm, math, "SQRT1_2", JSValue::boxDouble(0.7071067811865476), 0);

@@ -237,6 +237,7 @@ JSValue arrayReverseGeneric(VM& vm, JSValue self);
 JSValue arraySortGeneric(VM& vm, JSValue self, const JSValue* args, std::uint32_t argc);
 /// Sort a dense array in place with `compare` (or by default); an owned value, or the exception sentinel.
 JSValue sortDenseArray(VM& vm, JSValue array, JSValue compare);
+double mathFround(double x);
 /// `ArraySpeciesCreate(original, length)`, owned; the exception sentinel on a failure.
 JSValue arraySpeciesCreate(VM& vm, JSValue original, double length);
 /// Note what a plain RegExp counts on staying as it is; once all that goes on the prototype and the constructor is there.

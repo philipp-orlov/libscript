@@ -32,6 +32,7 @@ struct Mem
     std::int32_t disp = 0;
     int index = -1;  ///< a Reg, or -1 for none
     std::uint8_t scale = 1;
+    bool low = false;  ///< only the low half of the index counts (`kLowIndex`)
 };
 inline Mem mem(Reg base, std::int32_t disp = 0) { return Mem{base, disp, -1, 1}; }
 inline Mem mem(Reg base, Reg index, std::uint8_t scale, std::int32_t disp = 0) { return Mem{base, disp, index, scale}; }
@@ -420,11 +421,21 @@ public:
     }
     void nop() {}
     static constexpr bool kPatches = false;
+    static constexpr bool kLowIndex = false;
     void callStub(const void*) {}
     void usePool() noexcept {}
     void finishPool() {}
     static bool hasToInt32() noexcept { return false; }
     void toInt32(Reg, int) {}
+    void toInt32Exact(Reg, int) {}
+    static constexpr bool kFpMath = false;
+    void floorsd(int, int) {}
+    void ceilsd(int, int) {}
+    void truncsd(int, int) {}
+    void abssd(int, int) {}
+    void minsd(int, int) {}
+    void maxsd(int, int) {}
+    void roundsd(int, int) {}
     void idiv32(Reg r) { opReg(false, 0xF7, 7, r); }
     void setcc(Cond c, Reg r)
     {

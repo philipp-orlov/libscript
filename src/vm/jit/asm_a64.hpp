@@ -61,6 +61,7 @@ struct Mem
     std::int32_t disp = 0;
     int index = -1;  ///< a Reg, or -1 for none
     std::uint8_t scale = 1;
+    bool low = false;  ///< only the low half of the index counts (`kLowIndex`)
 };
 inline Mem mem(Reg base, std::int32_t disp = 0) { return Mem{base, disp, -1, 1}; }
 inline Mem mem(Reg base, Reg index, std::uint8_t scale, std::int32_t disp = 0) { return Mem{base, disp, index, scale}; }
@@ -336,6 +337,7 @@ private:
         int index;  ///< -1 for none
         int shift;
         std::int32_t disp;
+        bool low = false;
     };
     static int log2Of(unsigned scale) noexcept { return scale == 8 ? 3 : scale == 4 ? 2 : scale == 2 ? 1 : 0; }
     /// `rd = rn + v`, setting no flags.
@@ -365,11 +367,12 @@ private:
     /// An address one access of `1 << size` bytes can use as it stands; what `m` needs beyond that is worked out into x16.
     Ea ea(const Mem& m, int size)
     {
-        Ea a{X(m.base), m.index >= 0 ? X(Reg(m.index)) : -1, log2Of(m.scale), m.disp};
+        Ea a{X(m.base), m.index >= 0 ? X(Reg(m.index)) : -1, log2Of(m.scale), m.disp, m.low};
         if (a.index >= 0) {
             if (a.disp == 0 && (a.shift == 0 || a.shift == size))
                 return a;
-            ins(0x8B000000u | (std::uint32_t(a.index) << 16) | (std::uint32_t(a.shift) << 10) | (std::uint32_t(a.base) << 5) | kAddr);
+            ins((a.low ? 0x8B204000u : 0x8B000000u) | (std::uint32_t(a.index) << 16) | (std::uint32_t(a.shift) << 10) |
+                (std::uint32_t(a.base) << 5) | kAddr);
             a = Ea{kAddr, -1, 0, m.disp};
         }
         const bool scaled = a.disp >= 0 && (a.disp & ((1 << size) - 1)) == 0 && (a.disp >> size) < 4096;
@@ -415,7 +418,7 @@ private:
     void single(std::uint32_t unscaled, int size, std::uint32_t t, std::uint32_t b, const Ea& a)
     {
         if (a.index >= 0) {
-            ins(unscaled | 0x00206800u | (a.shift ? 0x1000u : 0u) | (std::uint32_t(a.index) << 16) | b | t);
+            ins(unscaled | (a.low ? 0x00204800u : 0x00206800u) | (a.shift ? 0x1000u : 0u) | (std::uint32_t(a.index) << 16) | b | t);
         } else if (a.disp >= 0 && (a.disp & ((1 << size) - 1)) == 0 && (a.disp >> size) < 4096) {
             ins(unscaled | 0x01000000u | (std::uint32_t(a.disp >> size) << 10) | b | t);
         } else {
@@ -437,7 +440,7 @@ private:
     void loadVal(std::uint32_t unscaled, int size, const Mem& m)
     {
         const bool same = valAt_ == buf.size() && valOp_ == unscaled && valMem_.base == m.base && valMem_.disp == m.disp &&
-                          valMem_.index == m.index && valMem_.scale == m.scale;
+                          valMem_.index == m.index && valMem_.scale == m.scale && valMem_.low == m.low;
         if (!same)
             access(unscaled, size, kVal, m);
         valOp_ = unscaled;
@@ -859,7 +862,7 @@ public:
     {
         const int rd = X(d);
         if (m.index >= 0) {
-            ins(0x8B000000u | (std::uint32_t(X(Reg(m.index))) << 16) | (std::uint32_t(log2Of(m.scale)) << 10) |
+            ins((m.low ? 0x8B204000u : 0x8B000000u) | (std::uint32_t(X(Reg(m.index))) << 16) | (std::uint32_t(log2Of(m.scale)) << 10) |
                 (std::uint32_t(X(m.base)) << 5) | std::uint32_t(rd));
             addImm(rd, rd, m.disp);
         } else {
@@ -1215,6 +1218,8 @@ public:
     }
     /// Whether code made before may be changed (`patchCode`): a jump over an instruction.
     static constexpr bool kPatches = true;
+    /// An index register may hold anything in its high half (`Mem::low`).
+    static constexpr bool kLowIndex = true;
     /// A call of a stub, through no register code has.
     void callStub(const void* stub)
     {
@@ -1341,6 +1346,33 @@ public:
         ins(0x1E7E0000u | (std::uint32_t(V(x)) << 5) | std::uint32_t(X(r)));
         flags_ = Flags::None;
         zext_ |= 1u << X(r);
+    }
+    /// As `toInt32`; the flags say whether the double is that int32 (CE; not -0).
+    void toInt32Exact(Reg r, int x)
+    {
+        toInt32(r, x);
+        flags_ = Flags::Logic;
+    }
+    /// Whether the machine rounds, and takes the less or the greater of two doubles, as JavaScript does.
+    static constexpr bool kFpMath = true;
+    void floorsd(int x, int y) { ins(0x1E654000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
+    void ceilsd(int x, int y) { ins(0x1E64C000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
+    void truncsd(int x, int y) { ins(0x1E65C000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
+    void abssd(int x, int y) { ins(0x1E60C000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
+    void minsd(int x, int y) { fp2(0x1E605800u, x, y); }
+    void maxsd(int x, int y) { fp2(0x1E604800u, x, y); }
+    /// `Math.round`: the ceiling, one less when that is more than a half above. `x` is not `y`.
+    void roundsd(int x, int y)
+    {
+        const std::uint32_t d = std::uint32_t(V(x)), n = std::uint32_t(V(y)), t = kVTmp;
+        ins(0x1E64C000u | (n << 5) | d);                                  // frintp d, n
+        ins(0x1E6C1000u | t);                                             // fmov t, #0.5
+        ins(0x1E603800u | (t << 16) | (d << 5) | t);                      // fsub t, d, t
+        ins(0x1E602000u | (n << 16) | (t << 5));                          // fcmp t, n
+        ins(0x1E6E1000u | t);                                             // fmov t, #1.0
+        ins(0x1E603800u | (t << 16) | (d << 5) | t);                      // fsub t, d, t
+        ins(0x1E600C00u | (d << 16) | (12u << 12) | (t << 5) | d);        // fcsel d, t, d, gt
+        flags_ = Flags::None;
     }
     void cvttsd2si64(Reg r, int x)
     {

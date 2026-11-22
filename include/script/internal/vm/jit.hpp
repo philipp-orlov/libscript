@@ -43,6 +43,9 @@ struct Tier1Code
 /// The native behind `Math.floor`, `Math.sqrt` and the other one-argument functions of `Math`: a function whose `data` is
 /// a `double (*)(double)`, which compiled code calls directly.
 FastNative mathUnaryNative() noexcept;
+/// The functions of `Math` the SSA tier does itself (`Unary`: any other of one double).
+enum class MathOp : std::uint8_t { None, Unary, Floor, Ceil, Trunc, Round, Sqrt, Abs, Fround, Min, Max, Imul };
+MathOp mathOp(FastNative native, const void* data) noexcept;
 /// `String.prototype.charAt`, and with data 1 `charCodeAt`: compiled code reads a character itself.
 FastNative stringCharNative() noexcept;
 /// `Array.prototype.push` and `pop`: compiled code does the usual case itself.

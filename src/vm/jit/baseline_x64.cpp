@@ -2749,20 +2749,31 @@ private:
         a_.aluI32(4, dst, 1);
     }
     /// xmm0 as the number `JSValue::boxNumber` makes of it, in rax: an int32 when it is one, else a double.
+    /// The double in xmm`x` as an int32 in `r`, when it is one, else `no`. Clobbers xmm1 and rax.
+    void exactInt32(Reg r, int x, Label& no)
+    {
+        if (Asm::hasToInt32()) {
+            a_.toInt32Exact(r, x);
+            a_.jcc(CNE, no);
+            return;
+        }
+        Label ok;
+        a_.cvttsd2si32(r, x);
+        a_.cvtsi2sd32(1, r);
+        a_.ucomisd(x, 1);
+        a_.jcc(CNE, no);
+        a_.jcc(CP, no);
+        a_.test32(r, r);
+        a_.jcc(CNE, ok);
+        a_.movqFromX(r == RAX ? RDX : RAX, x);  // a zero is an int unless it is a negative zero
+        a_.test(r == RAX ? RDX : RAX, r == RAX ? RDX : RAX);
+        a_.jcc(CS, no);
+        a_.bind(ok);
+    }
     void boxNumber0()
     {
-        Label asDouble, isInt, done;
-        a_.cvttsd2si32(RDX, 0);
-        a_.cvtsi2sd32(1, RDX);
-        a_.ucomisd(0, 1);
-        a_.jcc(CNE, asDouble);
-        a_.jcc(CP, asDouble);
-        a_.test32(RDX, RDX);
-        a_.jcc(CNE, isInt);
-        a_.movqFromX(RAX, 0);  // a zero is an int unless it is a negative zero
-        a_.test(RAX, RAX);
-        a_.jcc(CS, asDouble);
-        a_.bind(isInt);
+        Label asDouble, done;
+        exactInt32(RDX, 0, asDouble);
         a_.mov32(RAX, RDX);
         a_.or_(RAX, R14);
         a_.jmp(done);
@@ -2986,6 +2997,26 @@ private:
     std::vector<std::uint8_t> elim_;
     /// Per value, where it is first and last needed, and per instruction, where its operands are read (the plan's numbering).
     std::vector<std::int32_t> firstPos_, lastPos_, usePos_;
+    /// A value that lives in a slot is in a register too, for instructions of one block that clobber none: from the
+    /// instruction that makes it (`def`) or first reads it there to the last that reads it.
+    struct Keep
+    {
+        std::uint32_t v;
+        std::int32_t from, to;
+        bool def;
+        int reg;
+    };
+    std::vector<Keep> keeps_;          ///< by `from`
+    std::size_t keepNext_ = 0;
+    std::vector<std::size_t> keepOn_;  ///< those in their registers here
+    std::vector<std::int32_t> blockEnd_;
+    void ssaPlanKeeps(const ssa::Graph& g, const std::vector<std::int32_t>& first, const std::vector<std::int32_t>& last,
+                      const std::vector<std::int32_t>& clob, const std::vector<std::pair<std::int32_t, std::int32_t>>& blockPos,
+                      const std::vector<std::vector<std::int32_t>>& uses);
+    void ssaKeepsDrop(std::int32_t pos);
+    void ssaKeepsAt(std::int32_t pos);
+    void ssaKeepsDefined(std::int32_t pos);
+    void ssaKeepsEnd();
     std::uint32_t curIns_ = 0;  ///< the instruction being emitted
     /// Finds those reads, given what `ssaPlan` decided, and makes the earlier values theirs in the graph; false when none.
     bool ssaLoadElim(ssa::Graph& g);
@@ -3011,7 +3042,20 @@ private:
     void storeTagged(std::uint32_t v, Reg src);
     void loadI32(std::uint32_t v, Reg dst, Label* bad);
     void loadF64(std::uint32_t v, int x, Label* bad);
-    void ssaDefI32(std::uint32_t i);
+    /// An overflow of an add made over its first operand: the operand is put back before the exit.
+    struct Undo
+    {
+        Label label;
+        Label* bad;
+        bool add;
+        Reg to;
+        int from;  ///< a register, or -1: `imm`
+        std::int32_t imm;
+    };
+    std::deque<Undo> undos_;
+    void ssaDefI32(std::uint32_t i, Reg from = RAX);
+    Reg defI32Reg(std::uint32_t i) const;
+    int defF64Reg(std::uint32_t i) const;
     void ssaDefF64(std::uint32_t i, int x);
     bool ssaArithF64(std::uint32_t i);
     bool ssaNative(std::uint32_t i);
@@ -3020,6 +3064,10 @@ private:
     bool ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter);
     int ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind);
     bool ssaGetElem(std::uint32_t i);
+    Mem ssaIndexed(Reg base, Reg index, std::uint8_t scale) const;
+    Reg ssaIndex(std::uint32_t v, Label& bad);
+    void ssaNeedTyped(std::uint32_t v, Reg r, ElemKind kind, Label& bad);
+    Mem ssaTypedPlace(std::uint32_t i, std::uint32_t vb, std::uint32_t vi, ElemKind kind, Label& bad);
     bool ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter);
     void ssaNeedArray(std::uint32_t v, Reg r, ObjClass cls, Label& bad);
     void loadToInt32(std::uint32_t v, Reg dst, Label& bad);
@@ -3098,6 +3146,7 @@ private:
         Label* entry;
         Label* join;
         ssa::Bits liveAfter;
+        std::int8_t defReg;  ///< the register `def` is in here (`Keep`)
     };
     std::vector<std::uint8_t> elemNum_;  ///< per GetElem: the elements are taken as int32s (1) or numbers (2)
     std::deque<ColdPath> coldPaths_;
@@ -3113,6 +3162,8 @@ private:
     void ssaEnterBlock(std::uint32_t b);
     void emitSsaTails();
     // M2: what is known of values, exits, and the instructions done in place.
+    /// Per value: the kind of the typed array it is where `kVTyped` is known of it (0xFF: no such place).
+    std::vector<std::uint8_t> typedKind_;
     static constexpr std::uint8_t kVInt = 1, kVObj = 2, kVBool = 4, kVNotCell = 8, kVArray = 16, kVTyped = 32;
     std::vector<std::uint8_t> vDef_;     ///< per value: what its definition proves
     std::vector<std::uint8_t> vKnown_;   ///< per value: what is known of it here (forgotten at block heads)
@@ -3156,9 +3207,10 @@ private:
     bool ssaNew(std::uint32_t i, const ssa::Bits& liveAfter);
     /// `o.#x` (a `GetElem` whose site has found the private name): the name and the shape checked, the slot read.
     bool ssaPrivateSite(std::uint32_t i) const;
-    /// `Math.sqrt(x)` and its kind (a native of one double, `mathUnaryNative`): the function the callee register was read
-    /// as, from a global object's own data property; null when the site is not one.
-    JSFunction* ssaMathCallee(std::uint32_t i);
+    /// Per instruction: a call of `Math.sqrt` and its kind (`mathOp`), the function the callee is, or was read as from a
+    /// global object's own data property; null when the site is not one.
+    std::vector<JSFunction*> mathOf_;
+    JSFunction* ssaMathCallee(std::uint32_t i, std::uint32_t callee);
     /// `x.length` with an empty cache: of a string or an array, read here.
     bool ssaLengthSite(std::uint32_t i) const;
     /// `s.name` of a string, `name` a data property of `String.prototype` (a method): its index there; -1 when not one.
@@ -3184,7 +3236,7 @@ private:
     void needObjV(std::uint32_t v, Reg r, Label& bad);
     void needCellV(std::uint32_t v, Reg r, Label& bad);
     Reg valueReg(std::uint32_t v);
-    Reg i32Reg(std::uint32_t v, Reg tmp);
+    Reg i32Reg(std::uint32_t v, Reg tmp, Label* bad = nullptr);
     Reg defReg(std::uint32_t i) const;
     void ssaDefIn(std::uint32_t i, Reg d, std::uint8_t bits);
     void ssaDef(std::uint32_t i, std::uint8_t bits);
@@ -4066,13 +4118,7 @@ void Baseline::arith(std::uint32_t i, const Ins& in)
             a_.and_(RDX, RCX);
             a_.cmp(RDX, R14);
             a_.jcc(CB, asDouble);
-            a_.cvttsd2si32(RDX, 0);
-            a_.cvtsi2sd32(1, RDX);
-            a_.ucomisd(0, 1);
-            a_.jcc(CNE, asDouble);
-            a_.jcc(CP, asDouble);
-            a_.test32(RDX, RDX);
-            a_.jcc(CE, asDouble);
+            exactInt32(RDX, 0, asDouble);
             a_.mov32(RAX, RDX);
             a_.or_(RAX, R14);
             write(in.a, RAX, in.a == in.b || in.a == in.c);

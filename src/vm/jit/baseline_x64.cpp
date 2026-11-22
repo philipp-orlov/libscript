@@ -1795,7 +1795,7 @@ private:
             a_.mov(RAX, R(reg));
         if (factShape_[reg] == shape)
             return;
-        needObject(RAX, bad);
+        needCell(RAX, bad);
         a_.cmpI32(mem(RAX, 0), std::int32_t(shape));
         a_.jcc(CNE, bad);
         factShape_[reg] = shape;
@@ -2306,6 +2306,13 @@ private:
         a_.cmpI8(mem(v, kHdrKind), kObjectKind);
         a_.jcc(CNE, bad);
     }
+    /// Only that it is a cell: a compare of its first word with a shape's id follows, which only an object passes
+    /// (`VM::newShape`).
+    void needCell(Reg v, Label& bad)
+    {
+        a_.test(v, R15);
+        a_.jcc(CNE, bad);
+    }
     void needArray(Reg v, Label& bad)
     {
         needObject(v, bad);
@@ -2319,16 +2326,18 @@ private:
         return s && s->id == id ? s : nullptr;
     }
     /// Slot `index` of the object in rax, which has shape `shape`: where it is follows from that. May use rdx.
-    Mem slotMem(std::uint32_t shape, std::uint32_t index)
+    Mem slotMem(std::uint32_t shape, std::uint32_t index, Reg o = RAX)
     {
         const Shape* s = liveShape(shape);
         if (!s) {
+            if (o != RAX)
+                a_.mov(RAX, o);
             slotAddress(index);
             return mem(RDX, 0);
         }
         if (index < s->aux)
-            return mem(RAX, kObjInline + std::int32_t(8 * index));
-        a_.mov(RDX, mem(RAX, kObjSlots));
+            return mem(o, kObjInline + std::int32_t(8 * index));
+        a_.mov(RDX, mem(o, kObjSlots));
         return mem(RDX, std::int32_t(8 * (index - s->aux)));
     }
     /// The same, its address in rdx.
@@ -2427,7 +2436,7 @@ private:
                 return;
             }
         }
-        needObject(RAX, bad);
+        needCell(RAX, bad);
         bool one = true;
         for (int k = 1; k < count; ++k)
             one = one && seen[k].shape == seen[0].shape;
@@ -2889,7 +2898,7 @@ private:
     std::vector<LoopGuards> loopGuards_;
     void ssaLoopGuards(std::uint32_t from, std::uint32_t to);
     bool ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter);
-    void ssaEqualsCore(std::uint32_t i, bool loose, Label& bad);
+    void ssaEqualsCore(std::uint32_t i, bool loose, Label& bad, Label& eq, Label& ne);
     bool ssaTypeOf(std::uint32_t i);
     template <typename Then>
     void ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, std::int32_t imm, bool isImm, Label& bad,
@@ -2947,7 +2956,10 @@ private:
     void emitColdPaths();
     void ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter);
     void ssaStepJump(std::uint32_t b, std::uint32_t i);
-    void ssaEdge(std::uint32_t from, std::uint32_t to);
+    void ssaEdge(std::uint32_t from, std::uint32_t to, bool last = false);
+    bool ssaPlainEdge(std::uint32_t from, std::uint32_t to) const;
+    void ssaTakePlainEdge(std::uint32_t to);
+    bool ssaNextBlock(std::uint32_t from, std::uint32_t to) const;
     void ssaEdgeMoves(std::uint32_t from, std::uint32_t to);
     void ssaEnterBlock(std::uint32_t b);
     void emitSsaTails();
@@ -3021,8 +3033,13 @@ private:
     bool known(std::uint32_t v, std::uint8_t bits) const { return (vKnown_[v] & bits) == bits; }
     void needIntV(std::uint32_t v, Reg r, Label& bad);
     void needObjV(std::uint32_t v, Reg r, Label& bad);
+    void needCellV(std::uint32_t v, Reg r, Label& bad);
+    Reg valueReg(std::uint32_t v);
+    Reg i32Reg(std::uint32_t v, Reg tmp);
+    Reg defReg(std::uint32_t i) const;
+    void ssaDefIn(std::uint32_t i, Reg d, std::uint8_t bits);
     void ssaDef(std::uint32_t i, std::uint8_t bits);
-    void ssaCondEdges(std::uint32_t b, Cond taken);
+    void ssaCondEdges(std::uint32_t b, Cond taken, bool last = true);
     bool ssaBranch(std::uint32_t b, std::uint32_t i);
     bool ssaGetProp(std::uint32_t i);
     bool ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter);
@@ -4978,7 +4995,7 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyCache& pc)
     const std::int32_t thisAt = std::int32_t(8 * code_->nregs);
     savePool(i);
     a_.mov(RAX, R(in.b));
-    needObject(RAX, bad);
+    needCell(RAX, bad);
     Label found;
     for (std::uint8_t k = 0; k < pc.n; ++k) {
         const PolyEntry& e = pc.e[k];

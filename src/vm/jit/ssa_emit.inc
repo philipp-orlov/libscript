@@ -622,7 +622,44 @@ void Baseline::ssaLoopGuards(std::uint32_t from, std::uint32_t to)
         }
 }
 
-void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to)
+/// Whether the code of block `to` comes right after that of `from`.
+bool Baseline::ssaNextBlock(std::uint32_t from, std::uint32_t to) const
+{
+    for (std::uint32_t b = from + 1; b < to; ++b)
+        if (ssa_->blocks[b].reached)
+            return false;
+    return to > from;
+}
+
+/// Whether the way from `from` to `to` is a jump and nothing else.
+bool Baseline::ssaPlainEdge(std::uint32_t from, std::uint32_t to) const
+{
+    const ssa::Block& tb = ssa_->blocks[to];
+    if (to <= from || tb.loopHeader || !loopCache_[to].empty())
+        return false;
+    std::size_t k = 0;
+    while (k < tb.preds.size() && tb.preds[k] != from)
+        ++k;
+    for (std::uint32_t p : tb.phis) {
+        const std::uint32_t src = ssa_->values[p].in[k];
+        if (src == p || !hasLoc(p))
+            continue;
+        const SVal& a = sval_[src];
+        const SVal& d = sval_[p];
+        if (a.isConst || a.rep != d.rep || a.reg != d.reg || a.slot != d.slot)
+            return false;
+    }
+    return true;
+}
+
+/// Such a way, its jump made by the caller: the block it leads to learns what holds here.
+void Baseline::ssaTakePlainEdge(std::uint32_t to)
+{
+    edgeIn_[to].push_back(EdgeState{frame_, ssaFacts()});
+}
+
+/// `last`: the last code of block `from`, which may fall into the next one.
+void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to, bool last)
 {
     const ssa::Block& tb = ssa_->blocks[to];
     const unsigned nregs = code_->nregs;
@@ -636,7 +673,8 @@ void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to)
         edgeIn_[to].push_back(EdgeState{frame_, ssaFacts()});
         if (tb.loopHeader)
             vKnown_ = known;
-        a_.jmp(blockLabel_[to]);
+        if (!last || !ssaNextBlock(from, to))
+            a_.jmp(blockLabel_[to]);
         return;
     }
     // A back edge. The names here are the loop's: a register the head takes as in its slot is one the loop does not write.
@@ -952,7 +990,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             }
             if (opt::jumpTarget(*code_, i) >= 0) {
                 if (op == Op::Jmp)
-                    ssaEdge(b, bl.succs[0]);
+                    ssaEdge(b, bl.succs[0], true);
                 else if (!native_[i])
                     ssaStepJump(b, i);
                 else if (!ssaBranch(b, i))
@@ -1095,7 +1133,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             }
         }
         if (!ended && !ssaFailed_)
-            ssaEdge(b, bl.succs[0]);
+            ssaEdge(b, bl.succs[0], true);
         if (b == cacheEnd_ && !cacheSaved_.empty()) {
             for (const auto& [v, r] : cacheSaved_)
                 sval_[v].reg = r;
@@ -1581,6 +1619,53 @@ void Baseline::needIntV(std::uint32_t v, Reg r, Label& bad)
     ssaKnow(v, kVInt | kVNotCell);
 }
 
+/// Only that it is a cell, as before a compare of its first word with a shape's id (`needCell`).
+void Baseline::needCellV(std::uint32_t v, Reg r, Label& bad)
+{
+    if (!known(v, kVObj))
+        needCell(r, bad);
+}
+
+/// The register that holds value `v` boxed: its own, or rax, loaded.
+Reg Baseline::valueReg(std::uint32_t v)
+{
+    const SVal& s = sval_[v];
+    if (!s.isConst && s.rep == kRepTagged && s.reg >= 0)
+        return Reg(s.reg);
+    loadValue(v, RAX);
+    return RAX;
+}
+
+/// A register whose low half is the int32 `v` (known to be one): its own, or `tmp`, loaded.
+Reg Baseline::i32Reg(std::uint32_t v, Reg tmp)
+{
+    const SVal& s = sval_[v];
+    if (!s.isConst && s.rep != kRepF64 && s.reg >= 0)
+        return Reg(s.reg);
+    loadI32(v, tmp, nullptr);
+    return tmp;
+}
+
+/// Where to make the boxed result of instruction `i`: its value's own register, or rax (then `ssaDef`).
+Reg Baseline::defReg(std::uint32_t i) const
+{
+    const SVal& s = sval_[ssa_->defBase[i]];
+    return s.rep == kRepTagged && s.reg >= 0 ? Reg(s.reg) : RAX;
+}
+
+/// As `ssaDef`, of a result made in `defReg`.
+void Baseline::ssaDefIn(std::uint32_t i, Reg d, std::uint8_t bits)
+{
+    if (d == RAX) {
+        ssaDef(i, bits);
+        return;
+    }
+    const std::uint32_t v = ssa_->defBase[i];
+    name_[code_->code[i].a] = v;
+    vDef_[v] = bits;
+    vKnown_[v] = bits;
+}
+
 void Baseline::needObjV(std::uint32_t v, Reg r, Label& bad)
 {
     if (known(v, kVObj))
@@ -1649,16 +1734,29 @@ void Baseline::ssaDefF64(std::uint32_t i, int x)
 }
 
 /// The flags say whether the jump of block `b` is taken: both ways out.
-void Baseline::ssaCondEdges(std::uint32_t b, Cond taken)
+void Baseline::ssaCondEdges(std::uint32_t b, Cond taken, bool last)
 {
     const ssa::Block& bl = ssa_->blocks[b];
+    const std::uint32_t s0 = bl.succs[0], s1 = bl.succs[1];
+    if (s0 != s1 && ssaPlainEdge(b, s1)) {
+        a_.jcc(taken, blockLabel_[s1]);
+        ssaTakePlainEdge(s1);
+        ssaEdge(b, s0, last);
+        return;
+    }
+    if (s0 != s1 && ssaPlainEdge(b, s0)) {
+        a_.jcc(Cond(std::uint8_t(taken) ^ 1), blockLabel_[s0]);
+        ssaTakePlainEdge(s0);
+        ssaEdge(b, s1, last);
+        return;
+    }
     const std::vector<std::uint32_t> st = frame_;
     Label yes;
     a_.jcc(taken, yes);
-    ssaEdge(b, bl.succs[0]);
+    ssaEdge(b, s0);
     a_.bind(yes);
     frame_ = st;
-    ssaEdge(b, bl.succs[1]);
+    ssaEdge(b, s1, last);
 }
 
 namespace {
@@ -1683,51 +1781,73 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
     };
     switch (op) {
     case Op::JNullish: case Op::JNotNullish:
-        loadValue(name_[in.a], RAX);
-        a_.aluI(4, RAX, -9);
-        a_.cmpI(RAX, std::int32_t(kNull));
+        a_.mov(RDX, valueReg(name_[in.a]));
+        a_.aluI(4, RDX, -9);
+        a_.cmpI(RDX, std::int32_t(kNull));
         ssaCondEdges(b, op == Op::JNullish ? CE : CNE);
         return true;
     case Op::JUndefined: case Op::JNotUndefined: case Op::JHole:
-        loadValue(name_[in.a], RAX);
-        a_.cmpI(RAX, std::int32_t(op == Op::JHole ? kHole : kUndefined));
+        a_.cmpI(valueReg(name_[in.a]), std::int32_t(op == Op::JHole ? kHole : kUndefined));
         ssaCondEdges(b, op == Op::JNotUndefined ? CNE : CE);
         return true;
     case Op::JTrue: case Op::JFalse: {
         const std::uint32_t v = name_[in.a];
-        loadValue(v, RAX);
+        const Reg x = valueReg(v);
         const bool onTrue = op == Op::JTrue;
         if (known(v, kVBool)) {
-            a_.cmpI(RAX, std::int32_t(kTrue));
+            a_.cmpI(x, std::int32_t(kTrue));
             ssaCondEdges(b, onTrue ? CE : CNE);
+            return true;
+        }
+        if (known(v, kVInt)) {
+            a_.test32(x, x);
+            ssaCondEdges(b, onTrue ? CNE : CE);
             return true;
         }
         if (failed)
             return false;
         Label& bad = ssaExit(i);
-        Label t, f, notInt;
-        a_.cmpI(RAX, std::int32_t(kTrue));
-        a_.jcc(CE, t);
-        a_.cmpI(RAX, std::int32_t(kFalse));
-        a_.jcc(CE, f);
-        a_.cmp(RAX, R14);
+        const std::uint32_t st = bl.succs[onTrue ? 1 : 0], sf = bl.succs[onTrue ? 0 : 1];
+        const bool td = st != sf && ssaPlainEdge(b, st), fd = st != sf && ssaPlainEdge(b, sf);
+        Label t, f, notCell, notInt;
+        Label& T = td ? blockLabel_[st] : t;
+        Label& F = fd ? blockLabel_[sf] : f;
+        if (!known(v, kVNotCell)) {
+            // An object is true; a string or a double is left to the interpreter.
+            a_.test(x, R15);
+            a_.jcc(CNE, notCell);
+            a_.cmpI8(mem(x, kHdrKind), kObjectKind);
+            a_.jcc(CNE, bad);
+            a_.jmp(T);
+            a_.bind(notCell);
+        }
+        a_.cmpI(x, std::int32_t(kTrue));
+        a_.jcc(CE, T);
+        a_.cmp(x, R14);
         a_.jcc(CB, notInt);
-        a_.test32(RAX, RAX);
-        a_.jcc(CNE, t);
-        a_.jmp(f);
+        a_.test32(x, x);
+        a_.jcc(CE, F);
+        a_.jmp(T);
         a_.bind(notInt);
-        a_.mov(RDX, RAX);
-        a_.aluI(4, RDX, -9);
-        a_.cmpI(RDX, std::int32_t(kNull));
-        a_.jcc(CE, f);
-        needObject(RAX, bad);  // an object is true; a string or a double is left to the interpreter
-        a_.jmp(t);
-        const std::vector<std::uint32_t> st = frame_;
-        a_.bind(f);
-        ssaEdge(b, bl.succs[onTrue ? 0 : 1]);
-        a_.bind(t);
-        frame_ = st;
-        ssaEdge(b, bl.succs[onTrue ? 1 : 0]);
+        a_.test(x, R14);
+        a_.jcc(CNE, bad);
+        // False, null or undefined.
+        const std::vector<std::uint32_t> state = frame_;
+        if (fd) {
+            if (!ssaNextBlock(b, sf) || !td)
+                a_.jmp(F);
+            ssaTakePlainEdge(sf);
+        } else {
+            a_.bind(f);
+            ssaEdge(b, sf, td);
+        }
+        frame_ = state;
+        if (td) {
+            ssaTakePlainEdge(st);
+        } else {
+            a_.bind(t);
+            ssaEdge(b, st, true);
+        }
         return true;
     }
     case Op::JStrictEq: case Op::JStrictNe: case Op::JEq: case Op::JNe: {
@@ -1746,19 +1866,39 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             ssaCondEdges(b, eqTaken ? CE : CNE);
             return true;
         }
-        loadValue(va, RAX);
-        loadValue(vb, RCX);
-        if (pa || pb || (known(va, kVInt) && known(vb, kVInt))) {
-            a_.cmp(RAX, RCX);
+        if (!pa && !pb && known(va, kVInt) && known(vb, kVInt)) {
+            a_.alu32(7, i32Reg(va, RAX), i32Reg(vb, RCX));
             ssaCondEdges(b, eqTaken ? CE : CNE);
             return true;
         }
+        if (pa || pb) {
+            a_.cmpI(valueReg(pa ? vb : va), std::int32_t(sval_[pa ? va : vb].bits));
+            ssaCondEdges(b, eqTaken ? CE : CNE);
+            return true;
+        }
+        loadValue(va, RAX);
+        loadValue(vb, RCX);
         if (failed && loose)
             return false;
         Label& bad = ssaExit(i);
-        ssaEqualsCore(i, loose, bad);
-        a_.test32(RAX, RAX);
-        ssaCondEdges(b, eqTaken ? CNE : CE);
+        const std::uint32_t se = bl.succs[eqTaken ? 1 : 0], sn = bl.succs[eqTaken ? 0 : 1];
+        const bool ed = se != sn && ssaPlainEdge(b, se), nd = se != sn && ssaPlainEdge(b, sn);
+        Label eq, ne;
+        ssaEqualsCore(i, loose, bad, ed ? blockLabel_[se] : eq, nd ? blockLabel_[sn] : ne);
+        const std::vector<std::uint32_t> state = frame_;
+        if (ed) {
+            ssaTakePlainEdge(se);
+        } else {
+            a_.bind(eq);
+            ssaEdge(b, se, nd);
+        }
+        frame_ = state;
+        if (nd) {
+            ssaTakePlainEdge(sn);
+        } else {
+            a_.bind(ne);
+            ssaEdge(b, sn, true);
+        }
         return true;
     }
     case Op::JStrictEqI: case Op::JStrictNeI: {
@@ -1799,7 +1939,7 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             return false;
         Label& bad = ssaExit(i);
         ssaRelation(i, va, vb, imm ? std::int32_t(std::int16_t(in.b)) : 0, imm, bad,
-                    [&](Cond c) { ssaCondEdges(b, c); });
+                    [&](Cond c, bool last) { ssaCondEdges(b, c, last); });
         return true;
     }
     case Op::JNotCallee: {
@@ -1816,7 +1956,9 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         const std::uint64_t uid = want.isInt32() ? std::uint64_t(want.asInt32()) : 0;
         CodeBlock* callee = want.isInt32() ? vm_.codeByUid(uid) : static_cast<JSFunction*>(asObject(want))->code;
         const std::uint32_t vf = name_[in.a], vt = name_[in.a + 1u];
-        Label no, yes;
+        const bool direct = bl.succs[0] != bl.succs[1] && ssaPlainEdge(b, bl.succs[1]);
+        Label away;
+        Label& no = direct ? blockLabel_[bl.succs[1]] : away;
         const JSValue kf = sval_[vf].isConst ? JSValue::raw(sval_[vf].bits) : JSValue::undefined();
         // A constant function of that code: nothing to test.
         const bool sure = want.isInt32() ? isFunction(kf) && callee && static_cast<JSFunction*>(asObject(kf))->code == callee
@@ -1856,12 +1998,16 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
             a_.jcc(CNE, no);
         }
+        if (direct) {
+            ssaTakePlainEdge(bl.succs[1]);
+            ssaEdge(b, bl.succs[0], true);
+            return true;
+        }
         const std::vector<std::uint32_t> st = frame_;
         ssaEdge(b, bl.succs[0]);
         a_.bind(no);
         frame_ = st;
-        ssaEdge(b, bl.succs[1]);
-        (void)yes;
+        ssaEdge(b, bl.succs[1], true);
         return true;
     }
     default:
@@ -1915,27 +2061,26 @@ bool Baseline::ssaGetProp(std::uint32_t i)
         for (const ReadEntry& e : es)
             shapeKnown = shapeKnown || (vShape_[v] && vShape_[v] == e.shape);
         if (!shapeKnown) {
-            loadValue(v, RAX);
-            needObjV(v, RAX, bad);
+            const Reg o = valueReg(v);
+            needCellV(v, o, bad);
             Label ok;
             for (std::size_t k = 0; k < es.size(); ++k) {
-                a_.cmpI32(mem(RAX, 0), std::int32_t(es[k].shape));
+                a_.cmpI32(mem(o, 0), std::int32_t(es[k].shape));
                 if (k + 1 < es.size())
                     a_.jcc(CE, ok);
                 else
                     a_.jcc(CNE, bad);
             }
             a_.bind(ok);
-            if (es.size() == 1)
-                ssaKnow(v, kVObj, es[0].shape);
+            ssaKnow(v, kVObj, es.size() == 1 ? es[0].shape : 0);
         }
         ssaEpochCheck(i);
         name_[in.a] = d;
         return true;
     }
     Label& bad = ssaExit(i);
-    loadValue(v, RAX);
-    needObjV(v, RAX, bad);
+    const Reg o = valueReg(v), d = defReg(i);
+    needCellV(v, o, bad);
     std::vector<std::size_t> emit;
     if (vShape_[v]) {
         for (std::size_t k = 0; k < es.size() && emit.empty(); ++k)
@@ -1951,10 +2096,10 @@ bool Baseline::ssaGetProp(std::uint32_t i)
     Label done;
     if (!vShape_[v]) {
         for (std::size_t n = 0; n + 1 < emit.size(); ++n) {
-            a_.cmpI32(mem(RAX, 0), std::int32_t(es[emit[n]].shape));
+            a_.cmpI32(mem(o, 0), std::int32_t(es[emit[n]].shape));
             a_.jcc(CE, at[emit[n]]);
         }
-        a_.cmpI32(mem(RAX, 0), std::int32_t(es[emit.back()].shape));
+        a_.cmpI32(mem(o, 0), std::int32_t(es[emit.back()].shape));
         a_.jcc(CNE, bad);
         std::rotate(emit.begin(), emit.end() - 1, emit.end());  // the last test falls into its own
     }
@@ -1969,19 +2114,20 @@ bool Baseline::ssaGetProp(std::uint32_t i)
             a_.jcc(CE, bad);
         }
         if (e.absent) {
-            a_.movImm(RAX, kUndefined);
+            a_.movImm(d, kUndefined);
         } else if (e.holder) {
             holderRead(e.holder, e.index);
+            if (d != RAX)
+                a_.mov(d, RAX);
         } else {
-            a_.mov(RAX, slotMem(e.shape, e.index));
+            a_.mov(d, slotMem(e.shape, e.index, o));
         }
         if (n + 1 < emit.size())
             a_.jmp(done);
     }
     a_.bind(done);
-    if (emit.size() == 1)
-        ssaKnow(v, kVObj, es[emit[0]].shape);
-    ssaDef(i, 0);
+    ssaKnow(v, kVObj, emit.size() == 1 ? es[emit[0]].shape : 0);
+    ssaDefIn(i, d, 0);
     return true;
 }
 
@@ -2003,28 +2149,28 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         if (ssaFailed_)
             return true;
         Label& bad = ssaExit(i);
-        loadValue(v, RAX);
-        needObjV(v, RAX, bad);
+        const Reg o = valueReg(v);
+        needCellV(v, o, bad);
         if (!vShape_[v]) {
-            a_.cmpI32(mem(RAX, 0), std::int32_t(ic.shape));
+            a_.cmpI32(mem(o, 0), std::int32_t(ic.shape));
             a_.jcc(CNE, bad);
             ssaKnow(v, kVObj, ic.shape);
         }
-        slotAddress(ic.shape, ic.index);
+        const Mem slot = slotMem(ic.shape, ic.index, o);
         loadValue(x, RCX);
         if (mayBeCell(x))
             retain(RCX);
-        a_.mov(RDI, mem(RDX, 0));
-        a_.mov(mem(RDX, 0), RCX);
+        a_.mov(RDI, slot);
+        a_.mov(slot, RCX);
         release(RDI);
         return true;
     }
+    const Reg o = valueReg(v);
     {
         Label& bad = ssaExit(i);
-        loadValue(v, RAX);
-        needObjV(v, RAX, bad);
+        needCellV(v, o, bad);
         if (!vShape_[v]) {
-            a_.cmpI32(mem(RAX, 0), std::int32_t(ic.shape));
+            a_.cmpI32(mem(o, 0), std::int32_t(ic.shape));
             a_.jcc(CNE, bad);
         }
     }
@@ -2038,14 +2184,14 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         return true;
     const std::vector<std::uint32_t> frameAfter = frame_;
     frame_ = frameBefore;
-    slotAddress(ic.shape, ic.index);
-    a_.mov(RDI, mem(RDX, 0));
+    const Mem slot = slotMem(ic.shape, ic.index, o);
+    a_.mov(RDI, slot);
     a_.test(RDI, R15);
     a_.jcc(CE, cold);  // a cell
     loadValue(x, RCX);
     if (mayBeCell(x))
         retain(RCX);
-    a_.mov(mem(RDX, 0), RCX);
+    a_.mov(slot, RCX);
     a_.bind(join);
     frame_ = frameAfter;  // the runtime's store over a data property of that shape changes no shape
     ssaKnow(v, kVObj, ic.shape);
@@ -2514,20 +2660,23 @@ void Baseline::ssaPrivateRead(std::uint32_t i)
     const JSValue key = JSValue::cell(reinterpret_cast<CellPtr>(const_cast<void*>(pc.key)));
     holdValue(key);
     Label& bad = ssaExit(i);
-    loadValue(name_[in.c], RCX);
-    a_.movImm(RDX, key.bits);
-    a_.cmp(RCX, RDX);
-    a_.jcc(CNE, bad);
-    const std::uint32_t v = name_[in.b];
-    loadValue(v, RAX);
-    needObjV(v, RAX, bad);
-    if (vShape_[v] != pc.shape) {
-        a_.cmpI32(mem(RAX, 0), std::int32_t(pc.shape));
+    const std::uint32_t kv = name_[in.c];
+    if (!sval_[kv].isConst || sval_[kv].bits != key.bits) {
+        loadValue(kv, RCX);
+        a_.movImm(RDX, key.bits);
+        a_.cmp(RCX, RDX);
         a_.jcc(CNE, bad);
     }
-    a_.mov(RAX, slotMem(pc.shape, pc.index));
+    const std::uint32_t v = name_[in.b];
+    const Reg o = valueReg(v), d = defReg(i);
+    needCellV(v, o, bad);
+    if (vShape_[v] != pc.shape) {
+        a_.cmpI32(mem(o, 0), std::int32_t(pc.shape));
+        a_.jcc(CNE, bad);
+    }
+    a_.mov(d, slotMem(pc.shape, pc.index, o));
     ssaKnow(v, kVObj, pc.shape);
-    ssaDef(i, 0);
+    ssaDefIn(i, d, 0);
 }
 
 bool Baseline::ssaAddFast(std::uint32_t i) const
@@ -2550,7 +2699,7 @@ void Baseline::ssaPutAdd(std::uint32_t i)
     const std::uint32_t v = name_[in.a], x = name_[in.c];
     Label& bad = ssaExit(i);
     loadValue(v, RAX);
-    needObjV(v, RAX, bad);
+    needCellV(v, RAX, bad);
     if (vShape_[v] != ic.shape) {
         a_.cmpI32(mem(RAX, 0), std::int32_t(ic.shape));
         a_.jcc(CNE, bad);
@@ -2886,7 +3035,7 @@ bool Baseline::ssaArith(std::uint32_t i)
     if (compare) {
         // Into a boolean: rax 0 or 1, then false or true.
         Label done;
-        ssaRelation(i, va, vb, 0, false, bad, [&](Cond c) {
+        ssaRelation(i, va, vb, 0, false, bad, [&](Cond c, bool) {
             a_.setcc(c, RAX);
             a_.movzx8(RAX, RAX);
             a_.jmp(done);
@@ -4072,7 +4221,14 @@ bool Baseline::ssaEquals(std::uint32_t i)
     Label& bad = ssaExit(i);
     loadValue(va, RAX);
     loadValue(vb, RCX);
-    ssaEqualsCore(i, loose, bad);
+    Label same, differ, done;
+    ssaEqualsCore(i, loose, bad, same, differ);
+    a_.bind(same);
+    a_.movImm(RAX, 1);
+    a_.jmp(done);
+    a_.bind(differ);
+    a_.movImm(RAX, 0);
+    a_.bind(done);
     a_.test32(RAX, RAX);
     finish(eq ? CNE : CE);
     return true;
@@ -4508,17 +4664,17 @@ void Baseline::ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, 
             a_.ucomisd(1, 0);
         else
             a_.ucomisd(0, 1);
-        then(rel.dc);
+        then(rel.dc, true);
     };
     if (aI && bI) {
-        loadI32(va, RAX, nullptr);
-        if (isImm) {
-            a_.aluI32(7, RAX, imm);
-        } else {
-            loadI32(vb, RCX, nullptr);
-            a_.alu32(7, RAX, RCX);
-        }
-        then(rel.ic);
+        const Reg ra = i32Reg(va, RAX);
+        if (isImm)
+            a_.aluI32(7, ra, imm);
+        else if (sval_[vb].isConst)
+            a_.aluI32(7, ra, JSValue::raw(sval_[vb].bits).asInt32());
+        else
+            a_.alu32(7, ra, i32Reg(vb, RCX));
+        then(rel.ic, true);
         return;
     }
     if (isDouble(va) || (!isImm && isDouble(vb))) {
@@ -4531,31 +4687,36 @@ void Baseline::ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, 
     if (!isImm && (aI || bI)) {
         // One is an int32 already: only the other is looked at.
         const std::uint32_t other = aI ? vb : va;
-        loadValue(other, aI ? RCX : RAX);
-        a_.cmp(aI ? RCX : RAX, R14);
+        const Reg o = valueReg(other);
+        a_.cmp(o, R14);
         a_.jcc(CB, dbl);
-        loadI32(aI ? va : vb, aI ? RAX : RCX, nullptr);
-        a_.alu32(7, RAX, RCX);
-        then(rel.ic);
+        const std::uint32_t known = aI ? va : vb;
+        if (bI && sval_[vb].isConst) {
+            a_.aluI32(7, o, JSValue::raw(sval_[vb].bits).asInt32());
+        } else {
+            const Reg k = i32Reg(known, RCX);
+            a_.alu32(7, aI ? k : o, aI ? o : k);
+        }
+        then(rel.ic, false);
         a_.bind(dbl);
         frame_ = st;
         doubles();
         return;
     }
-    loadValue(va, RAX);
+    const Reg ra = valueReg(va);
     if (isImm) {
-        a_.cmp(RAX, R14);
+        a_.cmp(ra, R14);
         a_.jcc(CB, dbl);
-        a_.aluI32(7, RAX, imm);
+        a_.aluI32(7, ra, imm);
     } else {
         loadValue(vb, RCX);
-        a_.mov(RDX, RAX);
+        a_.mov(RDX, ra);
         a_.and_(RDX, RCX);
         a_.cmp(RDX, R14);
         a_.jcc(CB, dbl);
-        a_.alu32(7, RAX, RCX);
+        a_.alu32(7, ra, RCX);
     }
-    then(rel.ic);
+    then(rel.ic, false);
     a_.bind(dbl);
     frame_ = st;
     doubles();
@@ -4675,9 +4836,9 @@ namespace {
 /// rax and rcx (boxed): rax becomes 1 when they are equal (`==` when `loose`, else `===`), else 0. Bits, int32s and
 /// objects are decided here; the rest by the runtime, the registers kept (it runs no script: a loose compare with an
 /// object leaves through `bad` first).
-void Baseline::ssaEqualsCore(std::uint32_t i, bool loose, Label& bad)
+void Baseline::ssaEqualsCore(std::uint32_t i, bool loose, Label& bad, Label& eq, Label& ne)
 {
-    Label eq, ne, slow, differ, notCellA, done;
+    Label slow, differ, notCellA;
     a_.cmp(RAX, RCX);
     a_.jcc(CNE, differ);
     // The same bits: equal, unless a double (a NaN is not itself).
@@ -4695,16 +4856,28 @@ void Baseline::ssaEqualsCore(std::uint32_t i, bool loose, Label& bad)
     a_.jcc(CNE, notCellA);
     // A is a cell.
     if (loose) {
+        // An object equals no other object and neither null nor undefined; a primitive has it converted.
+        Label objectA;
         a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
-        a_.jcc(CE, bad);
-        Label bCell;
+        a_.jcc(CE, objectA);
         a_.test(RCX, R15);
-        a_.jcc(CE, bCell);
-        a_.jmp(slow);
-        a_.bind(bCell);
+        a_.jcc(CNE, slow);
         a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
         a_.jcc(CE, bad);
         a_.jmp(slow);
+        a_.bind(objectA);
+        Label cellB;
+        a_.test(RCX, R15);
+        a_.jcc(CE, cellB);
+        a_.mov(RDX, RCX);
+        a_.aluI(4, RDX, -9);
+        a_.cmpI(RDX, std::int32_t(kNull));
+        a_.jcc(CE, ne);
+        a_.jmp(bad);
+        a_.bind(cellB);
+        a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
+        a_.jcc(CE, ne);
+        a_.jmp(bad);
     } else {
         a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
         a_.jcc(CE, ne);
@@ -4716,12 +4889,15 @@ void Baseline::ssaEqualsCore(std::uint32_t i, bool loose, Label& bad)
     }
     a_.bind(notCellA);
     if (loose) {
-        Label bCell;
         a_.test(RCX, R15);
         a_.jcc(CNE, slow);
         a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
-        a_.jcc(CE, bad);
-        a_.jmp(slow);
+        a_.jcc(CNE, slow);
+        a_.mov(RDX, RAX);
+        a_.aluI(4, RDX, -9);
+        a_.cmpI(RDX, std::int32_t(kNull));
+        a_.jcc(CE, ne);
+        a_.jmp(bad);
     } else {
         // A is no cell: equal only to a number of the same value (an int32 and a double).
         a_.test(RAX, R14);
@@ -4770,13 +4946,9 @@ void Baseline::ssaEqualsCore(std::uint32_t i, bool loose, Label& bad)
         a_.cmpI(RAX, 2);
         a_.jcc(CE, exception(i));
     }
-    a_.jmp(done);
-    a_.bind(eq);
-    a_.movImm(RAX, 1);
-    a_.jmp(done);
-    a_.bind(ne);
-    a_.movImm(RAX, 0);
-    a_.bind(done);
+    a_.test32(RAX, RAX);
+    a_.jcc(CNE, eq);
+    a_.jmp(ne);
 }
 
 /// `typeof v`: one of the names the VM keeps (for its life, so the value is held by nothing here); a bigint or a symbol

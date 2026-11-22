@@ -178,12 +178,16 @@ Shape* VM::newShape()
     } else {
         constexpr std::size_t kCommitStep = std::size_t(64) << 10;
         // The last index is left unused: with the highest count above it, its id would be `kNoShape` of the RegExp slots.
-        if (shapeCount_ >= shapeRegionBytes_ / sizeof(Shape*) - 1)
+        if (shapeCount_ >= shapeRegionBytes_ / sizeof(Shape*) - 2)
             throw Error(ErrorCode::OutOfMemory, "too many shapes");
         if (shapeCount_ >= shapeCommitted_) {
             sys::vmCommit(reinterpret_cast<char*>(shapeRegionBase_) + shapeCommitted_ * sizeof(Shape*), kCommitStep);
             shapeCommitted_ += std::uint32_t(kCommitStep / sizeof(Shape*));
         }
+        // No multiple of 8: the first word of a cell of the old family, the low half of a vtable's address, is one, so a cell
+        // whose first word is a shape's id is an object.
+        if (!(shapeCount_ & 7))
+            ++shapeCount_;
         id = shapeCount_++;
     }
     Shape* s;

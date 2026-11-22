@@ -570,7 +570,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                 a_.cmp(RCX, RDX);
                 a_.jcc(CNE, *bad);
                 inlineBits(recv, RAX);
-                needObject(RAX, *bad);
+                needCell(RAX, *bad);
                 a_.cmpI32(mem(RAX, 0), std::int32_t(pc.shape));
                 a_.jcc(CNE, *bad);
                 slotAddress(pc.shape, pc.index);
@@ -3543,7 +3543,7 @@ void Baseline::emitLoopGuards(std::uint32_t h, bool covered)
         if (ls.from != h || coveredShape(h, ls) != covered)
             continue;
         a_.mov(RAX, R(ls.reg));
-        needObject(RAX, bad);
+        needCell(RAX, bad);
         a_.cmpI32(mem(RAX, 0), std::int32_t(ls.shape));
         a_.jcc(CNE, bad);
         if (ls.atLeast > 0) {

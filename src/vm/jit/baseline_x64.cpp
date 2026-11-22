@@ -2033,6 +2033,15 @@ private:
     void restorePool(std::uint32_t i, bool all = false);
     bool liveAcross(std::uint32_t i, std::int32_t w) const;
     bool plainReadable(std::uint32_t i) const;
+    /// What a read site has found, of the kinds compiled code answers from: data properties, and (`absent`) no property.
+    struct ReadEntry
+    {
+        std::uint32_t shape, index;
+        JSObject* holder;
+        ValidityCell* validity;
+        bool absent;
+    };
+    std::vector<ReadEntry> ssaReadEntries(std::uint32_t i) const;
     Label& exitLabel(std::uint32_t i, int kind);
     Label& exitBefore(std::uint32_t i) { return exitLabel(i, 0); }
     Label& exitAfter(std::uint32_t i) { return exitLabel(i, 1); }
@@ -4429,6 +4438,7 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         std::uint32_t shape, index;
         JSObject* holder;
         ValidityCell* validity;
+        bool absent = false;
     };
     Seen seen[5];
     int count = 0;
@@ -4440,6 +4450,8 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
             const PolyEntry& e = pc.e[k];
             if (e.kind == PolyEntry::OwnData || (e.kind == PolyEntry::ProtoData && e.validity))
                 seen[count++] = Seen{e.shape, e.index, e.holder, e.validity};
+            else if (e.kind == PolyEntry::Absent && !isLength)
+                seen[count++] = Seen{e.shape, 0, nullptr, e.validity, true};
         }
     }
     if (count == 0 && !isLength && ic && ic->shape == 0 && ic->pad && ic->pad <= code_->poly.size()) {
@@ -4522,15 +4534,20 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         // The last entry that does not match goes where a miss goes; a hit falls through to the end.
         a_.cmpI32(mem(RAX, 0), std::int32_t(seen[k].shape));
         a_.jcc(CNE, last ? (isLength ? lengthPath : probe ? cached : bad) : next);
-        if (seen[k].holder) {
+        if (seen[k].holder || (seen[k].absent && seen[k].validity)) {
             hold(seen[k].validity);
             a_.movImm(RCX, reinterpret_cast<std::uint64_t>(seen[k].validity));
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
-            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
+            if (seen[k].holder)
+                a_.movImm(RAX, reinterpret_cast<std::uint64_t>(seen[k].holder));
         }
-        slotAddress(seen[k].index);
-        a_.mov(RAX, mem(RDX, 0));
+        if (seen[k].absent) {
+            a_.movImm(RAX, kUndefined);
+        } else {
+            slotAddress(seen[k].index);
+            a_.mov(RAX, mem(RDX, 0));
+        }
         deliver(i, in.a);
         if (!last || isLength)
             a_.jmp(done);
@@ -4646,6 +4663,10 @@ void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, 
         a_.bind(tree);
     }
     a_.mov(RAX, RCX);
+    a_.mov32(RSI, mem(RDX, kIndex));
+    a_.aluI32(7, RSI, std::int32_t(VM::kMegaAbsent));
+    Label absent;
+    a_.jcc(CE, absent);
     a_.bind(own);
     a_.mov32(RSI, mem(RDX, kIndex));
     Label out, have;
@@ -4658,6 +4679,9 @@ void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, 
     a_.alu32(5, RSI, RDI);
     a_.mov(RDX, mem(RAX, kObjSlots));
     a_.mov(RAX, mem(RDX, RSI, 8));
+    a_.jmp(have);
+    a_.bind(absent);
+    a_.movImm(RAX, kUndefined);
     a_.bind(have);
     deliver(i, in.a);
 }

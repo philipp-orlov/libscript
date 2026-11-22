@@ -3841,8 +3841,16 @@ void megaLearnRead(VM& vm, JSObject* o, Key key) noexcept
                 break;
             }
         }
-        if (!holder)
-            return;
+        if (!holder) {
+            // Nowhere: undefined, as long as the prototypes stay as they are.
+            for (JSObject* p = o; p; p = p->proto(vm))
+                if (answersForKeys(p))
+                    return;
+            if (canonicalNumericIndex(key, &numeric) || !(holder = o->proto(vm)))
+                return;
+            index = std::int32_t(VM::kMegaAbsent);
+            attrs = 0;
+        }
         try {
             cell = vm.validityOf(o->proto(vm));
         } catch (...) {

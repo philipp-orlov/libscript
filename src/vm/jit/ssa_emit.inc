@@ -1554,24 +1554,44 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
     }
 }
 
-bool Baseline::ssaGetProp(std::uint32_t i)
+/// Empty when the site has found nothing, something of another kind, or has made code leave.
+std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i) const
 {
-    const Ins& in = code_->code[i];
-    if (!plainReadable(i))
-        return false;
-    const InlineCache& ic = code_->caches[code_->code[i + 1].a];
-    struct Entry
-    {
-        std::uint32_t shape, index;
-        JSObject* holder;
-        ValidityCell* validity;
-    };
-    std::vector<Entry> es{{ic.shape, ic.index, ic.holder, ic.validity}};
+    std::vector<ReadEntry> es;
+    if (i + 1 >= n_ || code_->code[i + 1].opcode() != Op::Cache)
+        return es;
+    const std::uint16_t cacheId = code_->code[i + 1].a;
+    if (cacheId == kNoCache || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return es;
+    const InlineCache& ic = code_->caches[cacheId];
+    if (ic.next != 0 || (ic.holder && !(ic.validity && ic.validity->valid)) ||
+        (ic.shape == 0 && code_->atoms[code_->code[i].c] == vm_.atoms.length))
+        return es;
+    if (ic.shape != 0)
+        es.push_back({ic.shape, ic.index, ic.holder, ic.validity, false});
     if (ic.pad && ic.pad <= code_->poly.size())
         for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k) {
             const PolyEntry& e = code_->poly[ic.pad - 1].e[k];
-            es.push_back({e.shape, e.index, e.kind == PolyEntry::ProtoData ? e.holder : nullptr, e.validity});
+            if (e.kind == PolyEntry::OwnData) {
+                es.push_back({e.shape, e.index, nullptr, nullptr, false});
+            } else if (e.kind == PolyEntry::ProtoData && e.validity && e.validity->valid) {
+                es.push_back({e.shape, e.index, e.holder, e.validity, false});
+            } else if (e.kind == PolyEntry::Absent && (!e.validity || e.validity->valid)) {
+                es.push_back({e.shape, 0, nullptr, e.validity, true});
+            } else {
+                es.clear();
+                return es;
+            }
         }
+    return es;
+}
+
+bool Baseline::ssaGetProp(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const std::vector<ReadEntry> es = ssaReadEntries(i);
+    if (es.empty())
+        return false;
     const std::uint32_t v = name_[in.b];
     Label& bad = ssaExit(i);
     loadValue(v, RAX);
@@ -1598,12 +1618,16 @@ bool Baseline::ssaGetProp(std::uint32_t i)
     }
     for (std::size_t k : emit) {
         a_.bind(at[k]);
-        const Entry& e = es[k];
-        if (e.holder) {
+        const ReadEntry& e = es[k];
+        if (e.holder || (e.absent && e.validity)) {
             hold(e.validity);
             a_.movImm(RCX, reinterpret_cast<std::uint64_t>(e.validity));
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
+        }
+        if (e.absent) {
+            a_.movImm(RAX, kUndefined);
+        } else if (e.holder) {
             holderRead(e.holder, e.index);
         } else {
             slotAddress(e.index);
@@ -2271,7 +2295,7 @@ bool Baseline::ssaLengthSite(std::uint32_t i) const
 {
     const Ins& in = code_->code[i];
     return ssaOn_ >= 2 && in.opcode() == Op::GetProp && in.c < code_->atoms.size() && code_->atoms[in.c] == vm_.atoms.length &&
-           !plainReadable(i) && !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed));
+           ssaReadEntries(i).empty() && !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed));
 }
 
 void Baseline::ssaLength(std::uint32_t i)
@@ -2308,7 +2332,7 @@ void Baseline::ssaLength(std::uint32_t i)
 std::int32_t Baseline::ssaStringProtoIndex(std::uint32_t i) const
 {
     const Ins& in = code_->code[i];
-    if (ssaOn_ < 2 || in.opcode() != Op::GetProp || plainReadable(i) || !vm_.protos.string ||
+    if (ssaOn_ < 2 || in.opcode() != Op::GetProp || !ssaReadEntries(i).empty() || !vm_.protos.string ||
         (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)) || code_->atoms[in.c] == vm_.atoms.length)
         return -1;
     JSObject* sp = vm_.protos.string;
@@ -2785,7 +2809,7 @@ bool Baseline::ssaNative(std::uint32_t i)
         return !failed;
     };
     switch (op) {
-    case Op::GetProp: return plainReadable(i) || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
+    case Op::GetProp: return !ssaReadEntries(i).empty() || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
     case Op::New: return ssaNewPlan(i, nullptr);
     case Op::Call: return ssaMathCallee(i) != nullptr || ssaCharCodeCallee(i) != nullptr;
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);

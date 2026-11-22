@@ -301,6 +301,8 @@ struct VM : EngineRuntime
     /// shapes it was made for do not match (`megaSlot` places an entry). Filled by the runtime after a read it could cache.
     static constexpr unsigned kMegaBits = 11;
     MegaEntry* megaRead = nullptr;
+    /// `MegaEntry::index` of a key that no object of the shape has, nor its prototypes (`holder` is the first of them).
+    static constexpr std::uint32_t kMegaAbsent = 0xFFFFFFFFu;
     static std::uint32_t megaKeyMix(const void* key) noexcept
     {
         return std::uint32_t((reinterpret_cast<std::uintptr_t>(key) >> 4) * 0x85EBCA6Bu);

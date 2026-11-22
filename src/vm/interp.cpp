@@ -442,11 +442,10 @@ JSValue forInKeys(VM& vm, JSValue value)
 
 // -------------------------------------------------------------- the caches ---
 
-/// Whether a read of a hole of `a`, or past its end, is undefined without a look anywhere: a plain array (no properties
-/// of its own, which an index given attributes would be) whose prototypes are the usual ones, with no elements.
+/// Whether a read of a hole of `a`, or past its end, is undefined without a look anywhere.
 inline bool plainHoleRead(VM& vm, JSArray* a)
 {
-    return a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 && vm.plainHoleStores();
+    return vm.plainHoles(a);
 }
 
 /// Whether `o` may hand out the position of a property: in the shape tree, and not a function whose properties are not
@@ -1017,6 +1016,20 @@ void unwrapBound(JSValue* R, std::uint32_t base) noexcept
             release(oldThis);
         }
     }
+}
+
+/// `f.call(thisArg, ...args)`, the callee `Function.prototype.call` and `f` (its `this`) a function: the window a register
+/// up is the call of `f` with `thisArg` and `args`, and it is run as that (the registers below stay as they are).
+bool unwrapCall(VM& vm, const JSValue* R, std::uint32_t* base, std::uint32_t* argc) noexcept
+{
+    if (*argc == 0 || !isFunction(R[*base]) || !isFunction(R[*base + 1]))
+        return false;
+    auto* f = static_cast<JSFunction*>(asObject(R[*base]));
+    if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != vm.functionCallNative)
+        return false;
+    *base += 1;
+    *argc -= 1;
+    return true;
 }
 
 /// The call's arguments, copied into an array for `arguments` and rest parameters.
@@ -2654,9 +2667,8 @@ L_PutElem: {
             a->append(vm, R[ins->c]);
             NEXT();
         }
-        // A hole of a plain array (no properties of its own, the usual prototype chain): nothing can intercept the store.
-        if (i < a->length && a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 &&
-            vm.plainHoleStores()) {
+        // A hole nothing can intercept the store of.
+        if (i < a->length && vm.plainHoles(a)) {
             retain(R[ins->c]);
             a->elems[i] = R[ins->c];
             a->noteStore(i, R[ins->c]);
@@ -3210,6 +3222,8 @@ L_SuperCall:
     callBase = ins->b;
     callArgc = ins->c;
     callMode = ins->opcode() == Op::New ? 1 : ins->opcode() == Op::SuperCall ? 2 : 0;
+    if (callMode == 0)
+        unwrapCall(vm, R, &callBase, &callArgc);
 do_call: {
     const bool isNew = callMode == 1, isSuper = callMode == 2;
     const std::uint32_t base = callBase, argc = callArgc;
@@ -4659,6 +4673,11 @@ int jitIterClose(VM& vm, std::uint32_t index)
     return isFunction(c.R[c.ins->a + 1]) ? 2 : 1;
 }
 
+bool jitUnwrapCall(VM& vm, JSValue* R, std::uint32_t* base, std::uint32_t* argc) noexcept
+{
+    return unwrapCall(vm, R, base, argc);
+}
+
 void jitUnwrapBound(VM& vm, JSValue* R, std::uint32_t base)
 {
     if (vm.deferred)
@@ -4841,8 +4860,7 @@ int jitPutElem(VM& vm, std::uint32_t index)
             a->append(vm, R[ins->c]);
             return 1;
         }
-        if (i < a->length && a->proto(vm) == vm.protos.array && !a->isDictionary(vm) && a->shapeOf(vm)->count == 0 &&
-            vm.plainHoleStores()) {
+        if (i < a->length && vm.plainHoles(a)) {
             retain(R[ins->c]);
             a->elems[i] = R[ins->c];
             a->noteStore(i, R[ins->c]);

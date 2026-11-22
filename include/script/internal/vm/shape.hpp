@@ -156,6 +156,7 @@ struct Shape
         /// A dictionary an inline cache may hold: its own keys keep their slots for as long as it has this id (a key that
         /// goes, moves or changes its attributes gives the object a new one), and the id is never given out again.
         kCachedDict = 16,
+        kIndexNames = 64,  ///< one of its names is an array index
         kOwnRoot = 32,  ///< the root of one object's own tree (`VM::ownTree`): no other object gets it
     };
 

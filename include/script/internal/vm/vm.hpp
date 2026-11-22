@@ -40,8 +40,9 @@ struct Frame;
 /// and reads `valid` before trusting what it learned. Made by `VM::validityOf`; cleared by `VM::invalidateChain`.
 struct ValidityCell
 {
-    std::uint32_t refs;
+    alignas(8) std::uint32_t refs;
     std::uint32_t valid;
+    std::uint32_t holes = 0;  ///< of a prototype chain (`VM::plainHoles`): 1 no element can be met on it, 2 perhaps one
 };
 
 /// An entry of the megamorphic read cache (`VM::megaRead`): objects of shape `shape` read `key` from slot `index` of
@@ -303,6 +304,9 @@ struct VM : EngineRuntime
     ValidityCell* holeStoreCell();
     /// `holeStoreCell` and an `Array.prototype` with no elements: whether a hole store into a plain array is plain now.
     bool plainHoleStores();
+    /// Whether a hole of `a`, or an index past its end, is met by nothing: no index among its own names, no element and no
+    /// proxy above it.
+    bool plainHoles(JSArray* a);
     void retainValidity(ValidityCell* cell) noexcept { ++cell->refs; }
     /// The megamorphic read cache: one table for every read site, by shape and key, that compiled code probes when the
     /// shapes it was made for do not match (`megaSlot` places an entry). Filled by the runtime after a read it could cache.
@@ -514,6 +518,7 @@ struct VM : EngineRuntime
     JSValue regexpExec = JSValue::undefined();
     JSValue promiseCtor = JSValue::undefined();  ///< the Promise constructor as made
     JSValue arrayConstructor = JSValue::undefined();    ///< the Array constructor as made
+    FastNative functionCallNative = nullptr;  ///< `Function.prototype.call`'s (`unwrapCall`)
     /// What `RegExp.$1`, `RegExp.lastMatch` and the like read: the last successful match of a RegExp made by the constructor.
     JSValue legacyInput = JSValue::undefined();  ///< counted
     std::int32_t legacyBounds[20] = {};

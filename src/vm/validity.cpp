@@ -34,6 +34,7 @@ ValidityCell* VM::allocValidity()
     validityFree_ = *reinterpret_cast<ValidityCell**>(cell);
     cell->refs = 1;
     cell->valid = 1;
+    cell->holes = 0;
     return cell;
 }
 
@@ -134,6 +135,31 @@ bool VM::plainHoleStores()
         return false;
     JSObject* const ap = protos.array;
     return ap->cls() != ObjClass::Array || static_cast<JSArray*>(ap)->length == 0;
+}
+
+bool VM::plainHoles(JSArray* a)
+{
+    const Shape* s = a->shapeOf(*this);
+    if ((s->flags & (Shape::kDictionary | Shape::kIndexNames)) || !s->proto)
+        return false;
+    if (s->proto == protos.array)
+        return plainHoleStores();
+    const Rare* r = s->proto->rare();
+    ValidityCell* c = r && r->validity && r->validity->valid ? r->validity : validityOf(s->proto);
+    if (!c->holes) {
+        bool plain = true;
+        for (JSObject* o = s->proto; o && plain; o = o->proto(*this)) {
+            plain = o == protos.array || o->cls() == ObjClass::Plain;
+            o->forEachOwn(*this, [&](Key key, std::uint8_t, JSValue) {
+                std::uint32_t index;
+                if (arrayIndexOf(key, &index))
+                    plain = false;
+            });
+        }
+        c->holes = plain ? 1 : 2;
+    }
+    JSObject* const ap = protos.array;
+    return c->holes == 1 && (ap->cls() != ObjClass::Array || static_cast<JSArray*>(ap)->length == 0);
 }
 
 void VM::invalidateChain(JSObject* proto)

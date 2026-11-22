@@ -135,6 +135,9 @@ Shape* Shape::after(VM& vm, Key k, std::uint8_t a)
     }
     if ((count == 2 && k == vm.atoms.prototype && !(a & attr::kAccessor)) || (count > 2 && (flags & kProtoAt2)))
         n->flags |= kProtoAt2;
+    std::uint32_t index;
+    if ((flags & kIndexNames) || arrayIndexOf(k, &index))
+        n->flags |= kIndexNames;
     detail::incRef(k);
 
     try {

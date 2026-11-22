@@ -3488,6 +3488,7 @@ void VM::installBuiltins()
     method(*this, objectProto, "valueOf", objectValueOf, 0);
     method(*this, objectProto, "isPrototypeOf", isPrototypeOf, 1);
     method(*this, functionProto, "call", functionCall, 1);
+    functionCallNative = functionCall;
     method(*this, functionProto, "apply", functionApply, 2);
     method(*this, functionProto, "toString", functionToString, 0);
     method(*this, functionProto, "bind", functionBind, 1);

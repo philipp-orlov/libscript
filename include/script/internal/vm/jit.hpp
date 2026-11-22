@@ -151,6 +151,8 @@ int jitBinaryImm(VM& vm, std::uint32_t index);
 int jitInstanceOf(VM& vm, std::uint32_t index);
 /// Replace a bound function (without bound arguments) in a call's window by its target and `this`.
 void jitUnwrapBound(VM& vm, JSValue* R, std::uint32_t base);
+/// `f.call(thisArg, ...)` with `f` a function: the call is the one of `f` a register up (`base` and `argc` move).
+bool jitUnwrapCall(VM& vm, JSValue* R, std::uint32_t* base, std::uint32_t* argc) noexcept;
 /// The call's arguments in an array, for `arguments` and rest parameters.
 JSArray* jitCaptureArguments(VM& vm, const CodeBlock* c, const JSValue* args, std::uint32_t argc);
 int jitIn(VM& vm, std::uint32_t index);

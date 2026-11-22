@@ -712,7 +712,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     CodeBlock* code = fr->code;
     const Ins* ins = code->code.data() + index;
     JSValue* R = fr->R;
-    const std::uint32_t base = ins->b, argc = ins->c;
+    std::uint32_t base = ins->b, argc = ins->c;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     static const bool callDbg = std::getenv("CALLDBG") != nullptr;
     if (callDbg) {
@@ -743,6 +743,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         (*counts)[(code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon")) + buf + " -> " + what]++;
     }
 #endif
+    const bool shifted = ins->opcode() == Op::Call && jitUnwrapCall(vm, R, &base, &argc);
     if (ins->opcode() == Op::Call)
         jitUnwrapBound(vm, R, base);
     const JSValue callee = R[base];
@@ -756,7 +757,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         return {0, 0};
     if (isNew && ((f->flags & JSFunction::kNative) ? !(f->flags & JSFunction::kConstructor) : !f->code->constructor))
         return {0, 0};
-    if (!(f->flags & JSFunction::kNative) && index < code->callProf.size())
+    if (!(f->flags & JSFunction::kNative) && index < code->callProf.size() && !shifted)
         noteCallee(code, index, f->code->uid);
     if (f->flags & JSFunction::kNative) {
         fr->pc = ins + 1;

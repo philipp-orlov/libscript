@@ -708,10 +708,10 @@ bool appendInPlace(VM& vm, JSValue& slot, JSValue y, bool owned)
     return false;
 }
 
-namespace {
-
 double power(double x, double y) noexcept
 {
+    if (y == 2)
+        return x * x;
     if (y != y)
         return std::nan("");
     if (y == 0)
@@ -720,8 +720,6 @@ double power(double x, double y) noexcept
         return std::nan("");
     return std::pow(x, y);
 }
-
-}  // namespace
 
 JSValue arithmetic(VM& vm, Op op, JSValue a, JSValue b)
 {

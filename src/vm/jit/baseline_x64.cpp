@@ -12,6 +12,7 @@
 // A template changes nothing before it knows it will not fall back.
 #include "script/internal/vm/jit.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <string>
@@ -195,6 +196,9 @@ extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
         return 0;
     }
 }
+
+extern "C" double scriptVmJitPower(double x, double y) noexcept { return power(x, y); }
+extern "C" double scriptVmJitMod(double x, double y) noexcept { return std::fmod(x, y); }
 
 extern "C" std::uint64_t scriptVmJitSuspend(VM* vm, std::uint32_t index)
 {
@@ -3235,7 +3239,29 @@ void Baseline::emit(std::uint32_t i)
     }
     case Op::ToString: helperOp(i, &helperThunk<jitToString>); return;
     case Op::ToNumber: helperOp(i, &helperThunk<jitToNumber>); return;
-    case Op::Exp: helperOp(i, &helperThunk<jitBinary>); return;
+    case Op::Exp: {
+        Label& bad = slow(i, &helperThunk<jitBinary>);
+        Label general, done;
+        a_.mov(RAX, R(in.b));
+        a_.mov(RCX, R(in.c));
+        needNumber(RAX, bad);
+        needNumber(RCX, bad);
+        loadNumber(0, RAX, RDX);
+        a_.lea(RDX, mem(R14, 2));
+        a_.cmp(RCX, RDX);
+        a_.jcc(CNE, general);
+        a_.mulsd(0, 0);
+        a_.jmp(done);
+        a_.bind(general);
+        loadNumber(1, RCX, RDX);
+        savePool(i);
+        a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitPower));
+        restorePool(i);
+        a_.bind(done);
+        boxNumber0();
+        write(in.a, RAX, in.a == in.b || in.a == in.c);
+        return;
+    }
     case Op::CopyBox: helperOp(i, &helperThunk<jitCopyBox>); return;
     case Op::RestSlice: helperOp(i, &helperThunk<jitRestSlice>); return;
     case Op::SpreadObj: helperOp(i, &helperThunk<jitSpreadObj>); return;
@@ -3383,19 +3409,32 @@ void Baseline::emit(std::uint32_t i)
     case Op::Mod: {
         // Two int32s, the first not below zero (its remainder may be -0) and the second above.
         Label& bad = slow(i, &helperThunk<jitBinary>);
+        Label general, done;
         a_.mov(RAX, R(in.b));
         a_.mov(RCX, R(in.c));
-        needInts(RAX, RCX, bad);
+        needInts(RAX, RCX, general);
         a_.test32(RAX, RAX);
-        a_.jcc(CS, bad);
+        a_.jcc(CS, general);
         a_.aluI32(7, RCX, 0);
-        a_.jcc(CLE, bad);
+        a_.jcc(CLE, general);
         a_.mov32(RAX, RAX);
         a_.cdq();
         a_.idiv32(RCX);
         a_.mov32(RAX, RDX);
         a_.or_(RAX, R14);
         write(in.a, RAX, in.a == in.b || in.a == in.c);
+        a_.jmp(done);
+        a_.bind(general);
+        needNumber(RAX, bad);
+        needNumber(RCX, bad);
+        loadNumber(0, RAX, RDX);
+        loadNumber(1, RCX, RDX);
+        savePool(i);
+        a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitMod));
+        restorePool(i);
+        boxNumber0();
+        write(in.a, RAX, in.a == in.b || in.a == in.c);
+        a_.bind(done);
         return;
     }
     case Op::Append: append(i, in); return;

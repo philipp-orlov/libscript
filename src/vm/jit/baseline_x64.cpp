@@ -2254,7 +2254,8 @@ private:
     }
     /// `base[#name]` as site `i` last found it: the object in rax, the key in rcx; the slot's address in rdx, else `bad`.
     /// Clobbers rsi, rdi.
-    void privateSlot(std::uint32_t i, Label& bad)
+    /// Another shape than the site found last: `other`, with rax and rcx as they were.
+    void privateSlot(std::uint32_t i, Label& bad, Label* other = nullptr)
     {
         a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&code_->privCaches[i]));
         a_.cmp(RCX, mem(RDX, kPrivKey));
@@ -2262,7 +2263,7 @@ private:
         needObject(RAX, bad);
         a_.mov32(RSI, mem(RDX, kPrivShape));
         a_.alu32(7, RSI, mem(RAX, 0));
-        a_.jcc(CNE, bad);
+        a_.jcc(CNE, other ? *other : bad);
         // A slot in place (objects of one shape can have fewer of those).
         a_.mov32(RSI, mem(RDX, kPrivIndex));
         a_.movzx8(RDI, mem(RAX, kHdrAux));
@@ -5225,16 +5226,20 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.jmp(done);
     a_.bind(notInt);
     if (priv) {
-        privateSlot(i, bad);
+        Label another;
+        privateSlot(i, bad, megaTable() ? &another : nullptr);
         a_.mov(RAX, mem(RDX, 0));
         deliver(i, in.a);
-    } else if (megaTable()) {
+        a_.jmp(done);
+        a_.bind(another);
+    }
+    if (megaTable()) {
         // By a name or a symbol: where the table says objects of the shape find it (its keys are atoms, compared by address).
         needObject(RAX, bad);
         megaFind(nullptr, bad);
         megaLoad();
         deliver(i, in.a);
-    } else {
+    } else if (!priv) {
         a_.jmp(bad);
     }
     a_.jmp(done);

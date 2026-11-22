@@ -3803,7 +3803,7 @@ void megaLearnRead(VM& vm, JSObject* o, Key key) noexcept
         return;
     // (A name that is an index, or a typed array's, is answered by elements on objects of the same shape.)
     double numeric;
-    if (canonicalNumericIndex(key, &numeric))
+    if (key->kind == detail::CellKind::String && canonicalNumericIndex(key, &numeric))
         return;
     if (const MegaEntry& was = vm.megaRead[VM::megaSlot(o->h.shape, key)];
         was.shape == o->h.shape && was.key == key && (!was.validity || was.validity->valid) && (!was.absent || was.absent->valid))
@@ -4568,6 +4568,8 @@ int jitGetElem(VM& vm, std::uint32_t index)
             return 0;
         setReg(vm, R[ins->a], v);
         learnPrivate(vm, pc, base, k, false);
+        if (isObject(R[ins->b]) && R[ins->b] == base)
+            megaLearnRead(vm, asObject(base), k.asCell());
         return 1;
     }
     if (isObject(base) && k.isCell() && (isSymbol(k) || (isString(k) && asString(k)->interned))) {

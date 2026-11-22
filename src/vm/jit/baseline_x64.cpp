@@ -685,6 +685,22 @@ inline void noteCallee(CodeBlock* code, std::uint32_t index, std::uint64_t uid) 
     t.more = 1;
 }
 
+/// The block function `f` is to run: the copy with its calls run in place when another function of its block has one.
+CodeBlock* mergedBlock(VM& vm, JSFunction* f) noexcept
+{
+    CodeBlock* c = f->code;
+    CodeBlock* d = vm.codeByUid(c->mergedInto);
+    if (!d)
+        return c;
+    if (c->only == f)
+        c->only = nullptr;
+    ++d->refs;
+    f->code = d;
+    vm.functionMade(d, f);
+    vm.releaseCode(c);  // (`d` holds it on)
+    return d;
+}
+
 /// A `Call` from compiled code. {0, 0}: not handled here, nothing changed; run the instruction in the interpreter.
 /// {result, 1}: a native function ran; the result is owned, or 0 for an exception. {frame, code}: a script function,
 /// its frame pushed and ready; enter `code` with it.
@@ -776,6 +792,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         return {handOver(vm, res.bits), 1};
     }
     CodeBlock* c = f->code;
+    if (c->mergedInto && !construct) [[unlikely]]
+        c = mergedBlock(vm, f);
     if (c->flags & CodeBlock::kLazy)
         return {0, 0};  // the interpreter compiles it
     if ((c->flags & CodeBlock::kClassConstructor) && !construct)
@@ -1074,6 +1092,8 @@ public:
         return compileOptimized();
     }
 
+    /// The first register that holds nothing of the caller's as the function begins.
+    unsigned firstLocal() const noexcept { return 1u + code_->nparams + ((code_->flags & CodeBlock::kNeedsArgs) ? 1u : 0u); }
     /// A deferred frame's registers that may be read before they are written become undefined.
     void emitEntryUndefs()
     {

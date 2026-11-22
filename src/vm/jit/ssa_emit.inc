@@ -334,7 +334,10 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
     std::vector<std::uint8_t> clobber(nregs, 0);
     for (std::uint16_t r : e.wr)
         clobber[r] = 1;
-    if (in.opcode() == Op::Call || in.opcode() == Op::New)
+    const Op callOp = in.opcode();
+    const bool window = callOp == Op::Call || callOp == Op::New || callOp == Op::SuperCall || callOp == Op::CallSpread ||
+                        callOp == Op::NewSpread || callOp == Op::SuperSpread;
+    if (window)
         for (unsigned r = in.b + 1u; r < nregs; ++r)
             clobber[r] = 1;
     // Live after it and not written by it: these keep their values across.
@@ -364,7 +367,7 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
             const SVal& s = sval_[v];
             const bool plain = s.isConst ? !JSValue::raw(s.bits).isCell()
                                          : s.rep != kRepTagged || (vKnown_[v] & kVNotCell) ||
-                                               (v == r && ssa_->values[v].kind == ssa::Value::Entry && r > code_->nparams);
+                                               (v == r && ssa_->values[v].kind == ssa::Value::Entry && r >= firstLocal());
             ssaPlainWin_[r] = plain || neverCell_[r];
         }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -803,7 +806,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     auto initValues = [&]() {
         // ---- what each value is: a constant, or a slot ----
         sval_.assign(g.values.size(), SVal{});
-        for (unsigned r = 1 + code_->nparams; r < nregs; ++r) {
+        for (unsigned r = firstLocal(); r < nregs; ++r) {
             sval_[r].isConst = true;  // a register no instruction has written yet is undefined
             sval_[r].bits = kUndefined;
         }
@@ -926,7 +929,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             st[r] = r;  // the slots hold the entry values
         name_ = st;
         if (def_)
-            for (unsigned r = 1u + code_->nparams + ((code_->flags & CodeBlock::kNeedsArgs) ? 1 : 0); r < nregs; ++r)
+            for (unsigned r = firstLocal(); r < nregs; ++r)
                 st[r] = ssa::kNone;  // anything
         frame_ = st;
         liveBefore_ = g.blocks[1].liveIn;
@@ -3845,7 +3848,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     // Registers whose slots never hold a cell: above the parameters, every value of them a number or a constant that is
     // no cell, and no call's argument (a callee may assign its parameters).
     neverCell_.assign(code_->nregs, 0);
-    for (unsigned r = 1u + code_->nparams; r < code_->nregs; ++r)
+    for (unsigned r = firstLocal(); r < code_->nregs; ++r)
         neverCell_[r] = 1;
     for (std::uint32_t v = g.nregs; v < nv; ++v) {
         const unsigned r = g.values[v].reg;
@@ -4329,7 +4332,7 @@ void Baseline::ssaRet(std::uint32_t i)
     loadValue(v, RAX);
     int movedFrom = -1;
     if (mayBeCell(v) && !def_) {  // a deferred frame returns its result without a count
-        for (unsigned r = 1u + code_->nparams; r < nregs && movedFrom < 0; ++r)
+        for (unsigned r = firstLocal(); r < nregs && movedFrom < 0; ++r)
             if (frame_[r] == v) {
                 a_.mov(R(r), std::int32_t(kUndefined));
                 movedFrom = int(r);

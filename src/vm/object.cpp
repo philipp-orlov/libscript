@@ -238,12 +238,22 @@ JSFunction* VM::newFunction(JSObject* proto, CodeBlock* code, Box* const* upvalu
         if (kind)
             proto = kind;
     }
-    Shape* root = rootShapeFor(proto, 0);
-    auto* f = static_cast<JSFunction*>(allocCell(bytes, Kind::Object, ObjClass::Function, 0));
-    f->h.shape = root->id;
+    // The copy of the block with its calls run in place, when a function of it has one.
+    if (code->mergedInto) [[unlikely]]
+        if (CodeBlock* d = codeByUid(code->mergedInto))
+            code = d;
+    ++code->refs;  // (what the allocation frees may have held it)
+    JSFunction* f;
+    try {
+        Shape* root = rootShapeFor(proto, 0);
+        f = static_cast<JSFunction*>(allocCell(bytes, Kind::Object, ObjClass::Function, 0));
+        f->h.shape = root->id;
+    } catch (...) {
+        releaseCode(code);
+        throw;
+    }
     f->slots = nullptr;
     f->code = code;
-    ++code->refs;
     f->flags = JSFunction::kLazyProps | (code->constructor ? JSFunction::kConstructor : 0u);
     f->nUpvals = n;
     functionMade(code, f);

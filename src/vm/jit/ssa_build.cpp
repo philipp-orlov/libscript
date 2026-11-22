@@ -36,17 +36,50 @@ std::int32_t windowBase(const Ins& in)
 opt::Effects effects(const CodeBlock& code, std::uint32_t i)
 {
     opt::Effects e = opt::effectsOf(code, i);
-    if (code.code[i].opcode() == Op::JNotCode)
-        e.rd.push_back(std::uint16_t(code.code[i].a + 1u));
+    const Ins& in = code.code[i];
+    const Op op = in.opcode();
+    if (op == Op::JNotCode)
+        e.rd.push_back(std::uint16_t(in.a + 1u));
+    if (e.ok)
+        return e;
+    // What only this tier takes, each done as the baseline code does it.
+    e.rd.clear();
+    e.wr.clear();
+    e.ok = true;
+    switch (op) {
+    case Op::GetSuperCtor: case Op::GetHome: case Op::NewTarget: e.wr = {in.a}; break;
+    case Op::GetSuperCtorOf: e.rd = {in.b}; e.wr = {in.a}; break;
+    case Op::CheckBound: case Op::CheckUnbound: e.rd = {in.a}; break;
+    case Op::CheckDerivedRet: case Op::SetFnName: e.rd = {in.a, in.b}; break;
+    case Op::FreshThisIfBound: e.rd = {in.a, in.b}; e.wr = {in.a}; break;
+    case Op::InitFields: e.rd = {0}; break;
+    case Op::InitFieldsOf: e.rd = {in.a, in.b}; break;
+    case Op::GetSuperElem: e.rd = {in.b, in.c}; e.wr = {in.a}; break;
+    case Op::DefPrivMethod: case Op::DefPrivGetter: case Op::DefPrivSetter: e.rd = {in.a, in.b, in.c}; break;
+    case Op::SuperCall:
+        for (unsigned r = in.b; r < in.b + 2u + in.c; ++r)
+            e.rd.push_back(std::uint16_t(r));
+        e.wr = {in.a};
+        if (in.a != in.b + 1u)
+            e.wr.push_back(std::uint16_t(in.b + 1u));
+        break;
+    case Op::CallSpread: case Op::NewSpread: case Op::SuperSpread:
+        e.rd = {in.b, std::uint16_t(in.b + 1u), std::uint16_t(in.b + 2u)};
+        e.wr = {in.a};
+        if (in.a != in.b + 1u)
+            e.wr.push_back(std::uint16_t(in.b + 1u));
+        break;
+    default: e.ok = false; break;
+    }
     return e;
 }
 
 bool supported(const CodeBlock& code, std::uint32_t i)
 {
     const Op op = code.code[i].opcode();
-    if (op == Op::EnvGet || op == Op::EnvHas)
+    if ((op == Op::EnvGet || op == Op::EnvHas) && !code.evalScopes.empty())
         return false;  // names of a direct eval's scope: the frame is read by name
-    return opt::effectsOf(code, i).ok;
+    return effects(code, i).ok;
 }
 
 std::vector<Bits> Graph::liveAfter(const CodeBlock& code, std::uint32_t b) const
@@ -79,7 +112,7 @@ Graph build(const CodeBlock& code)
         g.why = "size";
         return g;
     }
-    if (code.flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs)) {
+    if (code.flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen)) {
         g.why = "kind";
         return g;
     }

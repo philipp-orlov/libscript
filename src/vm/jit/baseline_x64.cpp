@@ -5930,9 +5930,12 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.testI32(mem(RCX, kCbFlags), (isSuper ? 0 : CodeBlock::kClassConstructor) | CodeBlock::kGenerator | CodeBlock::kAsync |
                                            CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs);
         a_.jcc(CNE, helper);
-        a_.movzx16(RSI, mem(RCX, kCbNparams));
-        a_.aluI32(7, RSI, std::int32_t(argc));
-        a_.jcc(CB, helper);
+        // (Arguments past the parameters: in a deferred frame they sit in registers the callee's code sees to.)
+        if (!def_) {
+            a_.movzx16(RSI, mem(RCX, kCbNparams));
+            a_.aluI32(7, RSI, std::int32_t(argc));
+            a_.jcc(CB, helper);
+        }
         a_.mov32(RSI, mem(RCX, kCbNregs));
         a_.lea(R9, R(base + 1));
         // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
@@ -6015,9 +6018,12 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.testI32(mem(RCX, kCbFlags), CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
                                            CodeBlock::kNeedsArgs);
         a_.jcc(CNE, helper);
-        a_.movzx16(RSI, mem(RCX, kCbNparams));
-        a_.aluI32(7, RSI, std::int32_t(argc));
-        a_.jcc(CB, helper);
+        // (Arguments past the parameters: in a deferred frame they sit in registers the callee's code sees to.)
+        if (!def_) {
+            a_.movzx16(RSI, mem(RCX, kCbNparams));
+            a_.aluI32(7, RSI, std::int32_t(argc));
+            a_.jcc(CB, helper);
+        }
         a_.mov32(RSI, mem(RCX, kCbNregs));
         a_.lea(R9, R(base + 1));
         // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).

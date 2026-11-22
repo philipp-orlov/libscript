@@ -3430,7 +3430,7 @@ CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
     if (ssaOn_ < 2 || in.opcode() != Op::Call || i >= code_->callProf.size() || !code_->callProf[i])
         return nullptr;
     CodeBlock* C = vm_.codeByUid(code_->callProf[i]);
-    if (!C || C->inlinedFrom || in.c > C->nparams ||
+    if (!C || C->inlinedFrom || (!def_ && in.c > C->nparams) ||
         (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
                      CodeBlock::kClassConstructor | CodeBlock::kProgram)))
         return nullptr;

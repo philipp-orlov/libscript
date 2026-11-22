@@ -50,6 +50,8 @@ MathOp mathOp(FastNative native, const void* data) noexcept;
 FastNative stringCharNative() noexcept;
 /// `DataView.prototype.getInt8` and the others: data is the element kind, and 256 for a set.
 FastNative dataViewAccessNative() noexcept;
+/// The getters of `DataView.prototype`: data 0 `buffer`, 1 `byteLength`, 2 `byteOffset`.
+FastNative dataViewGetterNative() noexcept;
 /// `Array.prototype.push` and `pop`: compiled code does the usual case itself.
 FastNative arrayPushNative() noexcept;
 FastNative arrayPopNative() noexcept;

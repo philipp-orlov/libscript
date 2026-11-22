@@ -449,6 +449,8 @@ NATIVE(dataViewCtor)
     return self;
 }
 
+}  // namespace
+
 NATIVE(dataViewGetter)
 {
     UNUSED();
@@ -465,6 +467,8 @@ NATIVE(dataViewGetter)
         return typeError(vm, "the DataView is out of bounds");
     return JSValue::boxNumber(which == 1 ? double(length) : double(v->offset));
 }
+
+namespace {
 
 /// Reverses `n` bytes in place: a DataView access in the other byte order.
 void reverseBytes(std::uint8_t* bytes, std::size_t n) noexcept
@@ -1019,6 +1023,11 @@ void installTypedArrays(VM& vm)
 FastNative dataViewAccessNative() noexcept
 {
     return bi::dataViewAccess;
+}
+
+FastNative dataViewGetterNative() noexcept
+{
+    return bi::dataViewGetter;
 }
 
 }  // namespace vm

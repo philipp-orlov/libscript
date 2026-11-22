@@ -1605,7 +1605,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             bool read = false;
             if (native_[i] && op == Op::GetProp && !sval_[g.defBase[i]].isConst) {
                 const std::vector<ReadEntry> es = ssaReadEntries(i);
-                if (es.size() == 1 && !es[0].holder && !es[0].absent) {
+                if (es.size() == 1 && !es[0].holder && !es[0].absent && !es[0].view) {
                     read = true;
                     obj = names[in.b];
                     shape = es[0].shape;
@@ -2137,6 +2137,27 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
     }
 }
 
+/// A getter of `DataView.prototype` the entry found (watched then): 1 `byteLength`, 2 `byteOffset`; 0 not one.
+std::uint8_t Baseline::ssaViewGetter(const PolyEntry& pe) const
+{
+    const Shape* s = liveShape(pe.shape);
+    if (ssaOn_ < 2 || !Asm::kFpMath || pe.kind != PolyEntry::ProtoAccessor || !s || !s->proto || !pe.holder || s->isDictionary())
+        return 0;
+    const JSValue pair = *pe.holder->slotAt(pe.index);
+    if (!pair.isCell() || isObject(pair) || !isVmCell(pair.asCell()) || kindOf(pair.asCell()) != Kind::GetterSetter)
+        return 0;
+    const JSValue g = reinterpret_cast<const GetterSetter*>(pair.asCell())->getter;
+    if (!isFunction(g))
+        return 0;
+    auto* f = static_cast<JSFunction*>(asObject(g));
+    if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != dataViewGetterNative())
+        return 0;
+    const auto which = reinterpret_cast<std::intptr_t>(f->rare()->nativeData);
+    if ((which != 1 && which != 2) || !vm_.watchMethod(s->proto, pe.holder))
+        return 0;
+    return std::uint8_t(which);
+}
+
 /// Empty when the site has found nothing, something of another kind, or has made code leave.
 bool Baseline::ssaGetterRead(const PolyEntry& pe, std::uint32_t* index) const
 {
@@ -2203,6 +2224,8 @@ std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i) const
                 es.push_back({e.shape, 0, nullptr, e.validity, true});
             } else if (std::uint32_t index = 0; ssaGetterRead(e, &index)) {
                 es.push_back({e.shape, index, nullptr, nullptr, false, true});
+            } else if (const std::uint8_t view = ssaViewGetter(e)) {
+                es.push_back({e.shape, 0, nullptr, nullptr, false, true, view});
             } else {
                 es.clear();
                 return es;
@@ -2282,7 +2305,39 @@ bool Baseline::ssaGetProp(std::uint32_t i)
             a_.cmpI32(mem(RCX, kValidityValid), 0);
             a_.jcc(CE, bad);
         }
-        if (e.absent) {
+        if (e.view) {
+            // A DataView that does not follow its buffer's size, on a buffer that is there and holds it.
+            a_.cmpI8(mem(o, kHdrCls), std::uint8_t(ObjClass::DataView));
+            a_.jcc(CNE, bad);
+            a_.testI8(mem(o, kHdrFlags), cellflags::kHasRare);
+            a_.jcc(CE, bad);
+            a_.mov(RSI, mem(o, kObjSlots));
+            a_.mov(RSI, mem(RSI, -16));
+            a_.mov(RSI, mem(RSI, kRareExt));
+            a_.cmpI8(mem(RSI, kViewTracking), 0);
+            a_.jcc(CNE, bad);
+            a_.mov(RDX, mem(RSI, kViewBuffer));
+            a_.test(RDX, R15);
+            a_.jcc(CNE, bad);
+            a_.mov(RDX, mem(RDX, kObjSlots));
+            a_.mov(RDX, mem(RDX, -16));
+            a_.mov(RDX, mem(RDX, kRareExt));
+            a_.cmpI8(mem(RDX, kBufferDetached), 0);
+            a_.jcc(CNE, bad);
+            a_.mov32(RCX, mem(RSI, kViewLength));
+            a_.mov32(RSI, mem(RSI, kViewOffset));
+            a_.alu(0, RCX, RSI);
+            a_.alu(7, RCX, mem(RDX, kBufferSize));
+            a_.jcc(CA, bad);
+            if (e.view == 1)
+                a_.alu(5, RCX, RSI);
+            else
+                a_.mov(RCX, RSI);
+            a_.test32(RCX, RCX);
+            a_.jcc(CS, bad);  // past int32
+            a_.mov32(d, RCX);
+            a_.or_(d, R14);
+        } else if (e.absent) {
             a_.movImm(d, kUndefined);
         } else if (e.holder) {
             holderRead(e.holder, e.index);

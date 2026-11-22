@@ -2184,7 +2184,9 @@ private:
         ValidityCell* validity;
         bool absent;
         bool watched = false;  ///< good while the epoch stands: what a getter found on a prototype reads (`ssaGetterRead`)
+        std::uint8_t view = 0;  ///< a DataView's native getter, read here: 1 `byteLength`, 2 `byteOffset` (`ssaViewGetter`)
     };
+    std::uint8_t ssaViewGetter(const PolyEntry& pe) const;
     /// Whether the accessor of `pe` is a function that only reads a data property of `this` (or a private field), which objects
     /// of the entry's shape have: the property's index. The accessor is watched then.
     bool ssaGetterRead(const PolyEntry& pe, std::uint32_t* index) const;

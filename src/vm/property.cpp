@@ -360,6 +360,7 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
             retain(value);
             const JSValue old = *slot;
             *slot = value;
+            vm.slotWritten(receiver, slot);
             release(old);
             return true;
         }

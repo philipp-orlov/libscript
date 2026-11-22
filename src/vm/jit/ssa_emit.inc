@@ -782,6 +782,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         case Op::LoadUninit: bits = kUninit; break;
         case Op::LoadInt: bits = kNumberTag | std::uint32_t(std::int32_t(in.imm())); break;
         case Op::LoadK: bits = code_->consts[in.kIndex()].bits; break;  // the block holds it as long as this code
+        case Op::GetGlobal: k = ssaGlobalConst(sv.at, &bits); break;
         default: k = false; break;
         }
         sval_[v].isConst = k;
@@ -792,7 +793,11 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         if (sval_[v].isConst) {
             const JSValue k = JSValue::raw(sval_[v].bits);
             vDef_[v] = k.isInt32() ? std::uint8_t(kVInt | kVNotCell) : k.isBool() ? std::uint8_t(kVBool | kVNotCell)
-                       : !k.isCell() ? kVNotCell : std::uint8_t(0);
+                       : !k.isCell()  ? kVNotCell
+                       : !isObject(k) ? std::uint8_t(0)
+                       : asObject(k)->cls() == ObjClass::Array      ? std::uint8_t(kVObj | kVArray)
+                       : asObject(k)->cls() == ObjClass::TypedArray ? std::uint8_t(kVObj | kVTyped)
+                                                                    : std::uint8_t(kVObj);
         }
     vKnown_ = vDef_;
     vShape_.assign(g.values.size(), 0);
@@ -876,6 +881,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             }
             cacheEnd_ = loopLast_[b];
         }
+        epochSeen_ = false;
         ssaEnterBlock(b);
         ssaResetFacts();
         {
@@ -1256,14 +1262,54 @@ std::vector<Baseline::Fact> Baseline::ssaFacts()
     return out;
 }
 
+bool Baseline::ssaGlobalConst(std::uint32_t i, std::uint64_t* bits)
+{
+    if (ssaOn_ < 2 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return false;
+    std::uint8_t attrs = 0;
+    const JSValue* slot = vm_.global->findOwn(vm_, code_->atoms[code_->code[i].b], &attrs);
+    if (!slot || (attrs & attr::kAccessor) || slot->isUndefined() || slot->isHole() || slot->isUninit() ||
+        !vm_.watchGlobal(vm_.globalSlotIndex(slot)))
+        return false;
+    if (slot->isCell())
+        holdValue(*slot);
+    *bits = slot->bits;
+    return true;
+}
+
+void Baseline::ssaEpochCheck(std::uint32_t i)
+{
+    if (epochSeen_)
+        return;
+    a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
+    a_.jcc(CNE, ssaExit(i));
+    epochSeen_ = true;
+}
+
+JSTypedArray* Baseline::ssaKnownTyped(std::uint32_t v, ElemKind kind) const
+{
+    if (!sval_[v].isConst)
+        return nullptr;
+    const JSValue k = JSValue::raw(sval_[v].bits);
+    if (!isObject(k) || asObject(k)->cls() != ObjClass::TypedArray)
+        return nullptr;
+    auto* t = static_cast<JSTypedArray*>(asObject(k));
+    if (t->kind != kind || !t->data || !t->length || t->tracking || !isObject(t->buffer))
+        return nullptr;
+    const Rare* r = asObject(t->buffer)->rare();
+    return r && r->ext && !static_cast<const BufferState*>(r->ext)->resizable ? t : nullptr;
+}
+
 void Baseline::ssaForgetShapes()
 {
+    epochSeen_ = false;
     for (std::uint32_t v : touched_)
         vShape_[v] = 0;
 }
 
 void Baseline::ssaResetFacts()
 {
+    epochSeen_ = false;
     for (std::uint32_t v : touched_) {
         vKnown_[v] = vDef_[v];
         vShape_[v] = 0;
@@ -2812,7 +2858,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::Call: return ssaMathCallee(i) != nullptr || ssaCharCodeCallee(i) != nullptr;
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
     case Op::InitProp: return ssaAddFast(i);
-    case Op::GetGlobal: return ssaGlobalFast(i);
+    case Op::GetGlobal: return sval_[ssa_->defBase[i]].isConst || ssaGlobalFast(i);
     case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox:
         return true;
     case Op::CheckInit:
@@ -3381,7 +3427,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             continue;
         for (std::uint32_t i = hb.start; i < hb.loopEnd; i = opt::nextOf(*code_, i)) {
             const Ins& in = code_->code[i];
-            if (in.opcode() != Op::GetGlobal || ssaHoisted_[i] || writers[in.a] != 1 || g.defBase[i] == ssa::kNone)
+            if (in.opcode() != Op::GetGlobal || ssaHoisted_[i] || writers[in.a] != 1 || g.defBase[i] == ssa::kNone ||
+                sval_[g.defBase[i]].isConst)
                 continue;
             const std::uint32_t v = g.defBase[i];
             ssaHoisted_[i] = 1;
@@ -3618,6 +3665,11 @@ bool Baseline::ssaGetGlobal(std::uint32_t i)
     // A data property the global object has now stays where it is until something deletes it or changes its attributes,
     // which the epoch counts. The value read is the global object's: borrowed.
     const Ins& in = code_->code[i];
+    if (sval_[ssa_->defBase[i]].isConst) {
+        ssaEpochCheck(i);
+        name_[in.a] = ssa_->defBase[i];
+        return true;
+    }
     if (!ssaGlobalFast(i))
         return false;
     JSObject* g = vm_.global;
@@ -3854,13 +3906,21 @@ bool Baseline::ssaGetElem(std::uint32_t i)
     Label& bad = ssaExit(i);
     loadI32(vi, RCX, &bad);
     a_.mov32(RCX, RCX);
-    loadValue(vb, RAX);
-    ssaNeedArray(vb, RAX, ObjClass::TypedArray, bad);
-    a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
-    a_.jcc(CNE, bad);
-    a_.alu32(7, RCX, mem(RAX, kTypedLength));
-    a_.jcc(CAE, bad);
-    a_.mov(RSI, mem(RAX, kTypedData));
+    if (const JSTypedArray* t = ssaKnownTyped(vb, kind)) {
+        // The array of a global that stays as it is: where its elements are, and how many, is in the code.
+        ssaEpochCheck(i);
+        a_.aluI32(7, RCX, std::int32_t(t->length));
+        a_.jcc(CAE, bad);
+        a_.movImm(RSI, reinterpret_cast<std::uint64_t>(t->data));
+    } else {
+        loadValue(vb, RAX);
+        ssaNeedArray(vb, RAX, ObjClass::TypedArray, bad);
+        a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
+        a_.jcc(CNE, bad);
+        a_.alu32(7, RCX, mem(RAX, kTypedLength));
+        a_.jcc(CAE, bad);
+        a_.mov(RSI, mem(RAX, kTypedData));
+    }
     switch (kind) {
     case ElemKind::Float64:
         a_.movsdLoad(0, mem(RSI, RCX, 8));
@@ -3903,13 +3963,20 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
             loadI32(vx, RDI, &bad);
         loadI32(vi, RCX, &bad);
         a_.mov32(RCX, RCX);
-        loadValue(vb, RAX);
-        ssaNeedArray(vb, RAX, ObjClass::TypedArray, bad);
-        a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
-        a_.jcc(CNE, bad);
-        a_.alu32(7, RCX, mem(RAX, kTypedLength));
-        a_.jcc(CAE, bad);
-        a_.mov(RSI, mem(RAX, kTypedData));
+        if (const JSTypedArray* t = ssaKnownTyped(vb, kind)) {
+            ssaEpochCheck(i);
+            a_.aluI32(7, RCX, std::int32_t(t->length));
+            a_.jcc(CAE, bad);
+            a_.movImm(RSI, reinterpret_cast<std::uint64_t>(t->data));
+        } else {
+            loadValue(vb, RAX);
+            ssaNeedArray(vb, RAX, ObjClass::TypedArray, bad);
+            a_.cmpI8(mem(RAX, kTypedKind), std::uint8_t(kind));
+            a_.jcc(CNE, bad);
+            a_.alu32(7, RCX, mem(RAX, kTypedLength));
+            a_.jcc(CAE, bad);
+            a_.mov(RSI, mem(RAX, kTypedData));
+        }
         switch (kind) {
         case ElemKind::Float64: a_.movsdStore(mem(RSI, RCX, 8), 0); break;
         case ElemKind::Float32: a_.cvtsd2ss(0, 0); a_.movssStore(mem(RSI, RCX, 4), 0); break;

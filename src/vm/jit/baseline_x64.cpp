@@ -2051,6 +2051,13 @@ private:
         bool absent;
     };
     std::vector<ReadEntry> ssaReadEntries(std::uint32_t i) const;
+    /// The value of the global `GetGlobal` `i` reads, when it is taken for a constant (and watched from now on).
+    bool ssaGlobalConst(std::uint32_t i, std::uint64_t* bits);
+    /// What this code takes for constant still is, at instruction `i`: one look between two things that could change it.
+    void ssaEpochCheck(std::uint32_t i);
+    bool epochSeen_ = false;
+    /// The typed array that value `v` is known to be, of kind `kind`, whose memory stays where it is; null when not known.
+    JSTypedArray* ssaKnownTyped(std::uint32_t v, ElemKind kind) const;
     Label& exitLabel(std::uint32_t i, int kind);
     Label& exitBefore(std::uint32_t i) { return exitLabel(i, 0); }
     Label& exitAfter(std::uint32_t i) { return exitLabel(i, 1); }
@@ -2090,7 +2097,7 @@ private:
     void deliverInt(std::uint32_t i, unsigned dst);
     void deliverDouble(std::uint32_t i, unsigned dst);
     void afterGeneric(std::uint32_t i);
-    void globalRecSlot(std::uint32_t i, Label& bad);
+    void globalRecSlot(std::uint32_t i, Label& bad, bool write = false);
     void int32OfWeb(std::int32_t w, Reg dst, std::uint32_t exitAt);
     bool typedSiteKind(std::uint32_t i, bool put, ElemKind* kind);
     void typedAccess(std::uint32_t i, const Ins& in, ElemKind kind, bool put, std::int32_t vw, Label& bad, std::uint32_t exitAt);
@@ -5490,7 +5497,7 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
 
 /// The address of the global object's property the record of instruction `i` names, into rdx; `bad` when the record is
 /// not for the global object as it is now. Clobbers rax and rcx.
-void Baseline::globalRecSlot(std::uint32_t i, Label& bad)
+void Baseline::globalRecSlot(std::uint32_t i, Label& bad, bool write)
 {
     JSObject* g = vm_.global;
     if (code_->globalRecs.empty())
@@ -5500,6 +5507,16 @@ void Baseline::globalRecSlot(std::uint32_t i, Label& bad)
     a_.alu32(7, RAX, mem(R12, kVmGlobalEpoch));
     a_.jcc(CNE, bad);
     a_.mov32(RAX, mem(RCX, 4));
+    if (write && vm_.globalWatch) {
+        // A slot whose value optimized code relies on is written by the runtime.
+        Label plain;
+        a_.aluI32(7, RAX, std::int32_t(VM::kWatchable));
+        a_.jcc(CAE, plain);
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.globalWatch.get()));
+        a_.testI8(mem(RDX, RAX, 1), VM::kWatched);
+        a_.jcc(CNE, bad);
+        a_.bind(plain);
+    }
     Label outside, have;
     a_.movImm(RDX, reinterpret_cast<std::uint64_t>(g));
     a_.aluI32(7, RAX, std::int32_t(g->h.aux));
@@ -5553,7 +5570,7 @@ void Baseline::putGlobal(std::uint32_t i, const Ins& in)
 {
     if (!optimizing()) {
         Label& stale = slow(i, &helperThunk<jitPutGlobal>);
-        globalRecSlot(i, stale);
+        globalRecSlot(i, stale, true);
         a_.mov(RCX, R(in.b));
         retain(RCX);
         a_.mov(RSI, mem(RDX, 0));
@@ -5579,6 +5596,11 @@ void Baseline::putGlobal(std::uint32_t i, const Ins& in)
     Label& bad = slow(i);
     a_.cmpI32(mem(R12, kVmGlobalEpoch), std::int32_t(vm_.globalEpoch));
     a_.jcc(CNE, bad);
+    if (vm_.globalWatch && index < VM::kWatchable) {
+        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&vm_.globalWatch[index]));
+        a_.testI8(mem(RDX, 0), VM::kWatched);
+        a_.jcc(CNE, bad);
+    }
     globalSlot(index);
     a_.mov(RCX, R(in.b));
     retain(RCX);

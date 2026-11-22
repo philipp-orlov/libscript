@@ -390,6 +390,23 @@ struct VM : EngineRuntime
     /// Counts the changes to the global object that can move or remove a property it already has (a delete, new attributes);
     /// compiled code that reads a global from a fixed place checks it.
     std::uint32_t globalEpoch = 0;
+    /// What is known of the global object's slots, a byte for each of the first `kWatchable`: how often it was written
+    /// (`kWatchWrites`, as far as that was seen), that optimized code takes its value for a constant (`kWatched`: the next
+    /// write moves `globalEpoch`), or that one did and was wrong (`kNotConstant`).
+    static constexpr std::uint32_t kWatchable = 8192;
+    static constexpr std::uint8_t kWatchWrites = 3, kWatched = 4, kNotConstant = 8;
+    std::unique_ptr<std::uint8_t[]> globalWatch;
+    /// The index of one of the global object's slots.
+    std::uint32_t globalSlotIndex(const JSValue* slot) const noexcept;
+    /// A write of a slot of `o`, about to be done or just done, wherever the runtime does one.
+    void slotWritten(const JSObject* o, const JSValue* slot) noexcept
+    {
+        if (o == global && globalWatch) [[unlikely]]
+            globalWritten(slot);
+    }
+    void globalWritten(const JSValue* slot) noexcept;
+    /// Optimized code may take the value of the global object's slot `index` for a constant: watched from now on.
+    bool watchGlobal(std::uint32_t index) noexcept;
     /// Install the global object and the built-in functions and prototypes (builtins.cpp).
     void installBuiltins();
 

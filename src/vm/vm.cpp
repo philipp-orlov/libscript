@@ -66,6 +66,8 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     if (const char* t = std::getenv("SCRIPT_VM_TIER2"))
         tier2Threshold = std::atoi(t);
 #endif
+    if (tier2Threshold > 0)
+        globalWatch.reset(new std::uint8_t[kWatchable]());
     selfInlining = tier2Threshold > 0 ? 2 : 0;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_SELFINLINE"))

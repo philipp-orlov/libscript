@@ -328,6 +328,36 @@ bool JSObject::wouldCycle(VM& vm, JSObject* next) const noexcept
     return false;
 }
 
+std::uint32_t VM::globalSlotIndex(const JSValue* slot) const noexcept
+{
+    const JSValue* inl = global->inl();
+    return slot >= inl && slot < inl + global->h.aux ? std::uint32_t(slot - inl) : std::uint32_t(slot - global->slots) + global->h.aux;
+}
+
+void VM::globalWritten(const JSValue* slot) noexcept
+{
+    const std::uint32_t index = globalSlotIndex(slot);
+    if (index >= kWatchable)
+        return;
+    std::uint8_t& w = globalWatch[index];
+    if (w & kWatched) {
+        w = std::uint8_t((w & ~kWatched) | kNotConstant);
+        ++globalEpoch;
+    } else if ((w & kWatchWrites) < kWatchWrites) {
+        ++w;
+    }
+}
+
+bool VM::watchGlobal(std::uint32_t index) noexcept
+{
+    // Written once or twice (a declaration, what initializes it) says nothing; more says it is a variable.
+    if (!globalWatch || index >= kWatchable || (globalWatch[index] & kNotConstant) ||
+        (globalWatch[index] & kWatchWrites) == kWatchWrites)
+        return false;
+    globalWatch[index] |= kWatched;
+    return true;
+}
+
 void JSObject::toDictionary(VM& vm)
 {
     if (this == vm.global)
@@ -508,6 +538,7 @@ void JSObject::putOwn(VM& vm, Key key, JSValue value, std::uint8_t attrs)
         }
         const JSValue previous = *slot;
         *slot = value;
+        vm.slotWritten(this, slot);
         release(previous);
         return;
     }

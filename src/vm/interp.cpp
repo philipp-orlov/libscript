@@ -871,7 +871,7 @@ void promoteStore(CodeBlock* code, InlineCache& ic, std::uint32_t shape) noexcep
 /// `PolyCache` (when `code` is given).
 void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key, CodeBlock* code = nullptr)
 {
-    if (hasElems(o))
+    if (hasElems(o) || o->cls() == ObjClass::Global || o == vm.global)  // (the global object's are watched: `slotWritten`)
         return;
     std::uint8_t attrs = 0;
     const std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
@@ -1424,6 +1424,7 @@ L_PutGlobal: {
         JSValue* slot = g->slotAt(ic.index);
         const JSValue old = *slot;
         *slot = R[ins->b];
+        vm.slotWritten(g, slot);
         retain(*slot);
         release(old);
         ++pc;
@@ -1440,6 +1441,7 @@ L_PutGlobal: {
         }
         const JSValue old = *slot;
         *slot = R[ins->b];
+        vm.slotWritten(g, slot);
         retain(*slot);
         release(old);
         ++pc;
@@ -1474,6 +1476,7 @@ L_DefGlobal: {
     } else if (existing & attr::kWritable) {
         const JSValue old = *slot;
         *slot = R[ins->b];
+        vm.slotWritten(vm.global, slot);
         release(old);
     } else {
         release(R[ins->b]);
@@ -3704,6 +3707,7 @@ int jitPutGlobal(VM& vm, std::uint32_t index)
         noteGlobalSlot(vm, c.code, index, slot);
         const JSValue old = *slot;
         *slot = c.R[ins->b];
+        vm.slotWritten(g, slot);
         retain(*slot);
         release(old);
         return 1;

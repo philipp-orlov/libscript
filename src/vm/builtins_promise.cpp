@@ -146,6 +146,31 @@ void settle(VM& vm, JSValue promise, PromiseData::State state, JSValue value)
         run(r);
 }
 
+/// Whether `p` is a promise with nothing on it, its prototype or its constructor that a `then` could notice: `constructor`,
+/// `then` and the species are as made.
+bool promisePristine(VM& vm, JSValue p)
+{
+    JSObject* proto = vm.protos.promise;
+    if (!dataOf(p) || !proto || asObject(p)->h.shape != vm.rootShapeFor(proto, 3)->id)
+        return false;
+    if (vm.promiseEpoch == vm.globalEpoch)
+        return true;
+    std::uint8_t attrs = 0;
+    const JSValue* slot = proto->findOwn(vm, vm.atoms.constructor, &attrs);
+    if (!slot || (attrs & attr::kAccessor) || slot->bits != vm.promiseCtor.bits)
+        return false;
+    slot = proto->findOwn(vm, vm.atoms.then, &attrs);
+    if (!slot || (attrs & attr::kAccessor) || slot->bits != vm.promiseThen.bits)
+        return false;
+    JSObject* ctor = asObject(vm.promiseCtor);
+    slot = ctor->findOwn(vm, vm.atoms.symSpecies, &attrs);
+    if (!slot || slot->bits != vm.promiseSpecies.bits)
+        return false;
+    if (vm.watchMethod(proto, proto) && vm.watchMethod(ctor, ctor))
+        vm.promiseEpoch = vm.globalEpoch;
+    return true;
+}
+
 void rejectPromise(VM& vm, JSValue promise, JSValue reason) { settle(vm, promise, PromiseData::Rejected, reason); }
 
 /// The resolve function's steps: a thenable is followed, anything else fulfils.
@@ -159,6 +184,10 @@ void resolvePromise(VM& vm, JSValue promise, JSValue resolution)
     }
     if (!isObject(resolution)) {
         settle(vm, promise, PromiseData::Fulfilled, resolution);
+        return;
+    }
+    if (promisePristine(vm, resolution)) {
+        vm.enqueueJob(2, promise, resolution, vm.promiseThen);
         return;
     }
     JSValue then = getProperty(vm, resolution, vm.atoms.then);
@@ -196,11 +225,11 @@ NATIVE(resolverFn)
 {
     UNUSED();
     Rare& r = carried(data);
-    // boundThis is `[settled]`, shared by the pair.
-    auto* flag = static_cast<JSArray*>(asObject(r.boundThis));
-    if (flag->at(0) == JSValue::boolean(true))
+    // boundThis is a box that says whether one of the pair has run.
+    Box* flag = reinterpret_cast<Box*>(r.boundThis.asCell());
+    if (flag->value == JSValue::boolean(true))
         return JSValue::undefined();
-    flag->setAt(vm, 0, JSValue::boolean(true));
+    flag->value = JSValue::boolean(true);
     if (r.fnState == 0)
         resolvePromise(vm, r.boundTarget, arg(args, argc, 0));
     else
@@ -210,9 +239,7 @@ NATIVE(resolverFn)
 
 void makeResolvers(VM& vm, JSValue promise, Handle* resolve, Handle* reject)
 {
-    JSArray* flag = vm.newArray(vm.protos.array);
-    Handle flagKeep = Handle::adopt(toJSValue(flag));
-    flag->append(vm, JSValue::boolean(false));
+    Handle flagKeep = Handle::adopt(JSValue::cell(reinterpret_cast<CellPtr>(vm.newBox(JSValue::boolean(false)))));
     *resolve = Handle::adopt(toJSValue(closureFn(vm, resolverFn, promise, flagKeep.get(), 0)));
     *reject = Handle::adopt(toJSValue(closureFn(vm, resolverFn, promise, flagKeep.get(), 1)));
 }
@@ -305,6 +332,11 @@ void runJob(VM& vm, const MicroJob& job)
             return;
         case 2: {
             // a: the promise, b: the thenable, c: its `then`.
+            if (job.c.bits == vm.promiseThen.bits && promisePristine(vm, job.b)) {
+                // Its `then` with the two functions that settle `a`: the same as a reaction with no handlers.
+                performThen(vm, job.b, JSValue::undefined(), JSValue::undefined(), job.a);
+                return;
+            }
             Handle resolve, reject;
             makeResolvers(vm, job.a, &resolve, &reject);
             JSValue callArgs[2] = {resolve.get(), reject.get()};
@@ -401,7 +433,11 @@ NATIVE(promiseThen)
     UNUSED();
     if (!dataOf(self))
         return typeError(vm, "Promise.prototype.then called on incompatible receiver " + describe(vm, self));
-    Handle ctor = Handle::adopt(speciesConstructor(vm, self, vm.promiseCtor));
+    Handle ctor;
+    if (promisePristine(vm, self))
+        ctor = Handle::retained(vm.promiseCtor);
+    else
+        ctor = Handle::adopt(speciesConstructor(vm, self, vm.promiseCtor));
     if (ctor.get().isException())
         return ctor.get();
     if (ctor.get().bits == vm.promiseCtor.bits) {
@@ -450,6 +486,12 @@ JSValue promiseResolveWith(VM& vm, JSValue c, JSValue x)
             retain(x);
             return x;
         }
+    }
+    if (c.bits == vm.promiseCtor.bits) {
+        // (Nobody sees the functions that would settle it.)
+        Handle promise = Handle::adopt(newPromiseObject(vm));
+        resolvePromise(vm, promise.get(), x);
+        return promise.take();
     }
     Capability cap;
     if (!newCapability(vm, c, &cap))
@@ -520,6 +562,11 @@ NATIVE(promiseResolveStatic)
 NATIVE(promiseRejectStatic)
 {
     UNUSED();
+    if (self.bits == vm.promiseCtor.bits) {
+        Handle promise = Handle::adopt(newPromiseObject(vm));
+        rejectPromise(vm, promise.get(), arg(args, argc, 0));
+        return promise.take();
+    }
     Capability cap;
     if (!newCapability(vm, self, &cap))
         return JSValue::exception();
@@ -1125,6 +1172,8 @@ void installPromise(VM& vm)
     vm.promiseCtor = toJSValue(ctor);
     retain(vm.promiseCtor);
     method(vm, proto, "then", promiseThen, 2);
+    vm.promiseThen = *proto->findOwn(vm, vm.atoms.then);
+    retain(vm.promiseThen);
     method(vm, proto, "catch", promiseCatch, 1);
     method(vm, proto, "finally", promiseFinally, 1);
     proto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("Promise")), attr::kConfigurable);

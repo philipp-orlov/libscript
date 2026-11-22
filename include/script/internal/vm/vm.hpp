@@ -539,6 +539,10 @@ struct VM : EngineRuntime
     /// Where `globalEpoch` was when all of them were found as they were made, and watched; nothing has changed while it stands
     /// there.
     std::uint32_t regexpEpoch = ~0u;
+    /// `Promise.prototype.then` and the slot of `Promise[Symbol.species]` as made, and where `globalEpoch` was when the language
+    /// was found to have them still (`promisePristine`).
+    JSValue promiseThen = JSValue::undefined(), promiseSpecies = JSValue::undefined();
+    std::uint32_t promiseEpoch = ~0u;
     std::size_t jsonRoom = 0;  ///< how many characters the next JSON.stringify starts with room for
     /// A regular expression literal's compiled program, by the string constants of its pattern and flags (each entry holds
     /// a count of both): a literal in a loop makes a RegExp each time round with no parse of its flags and no lookup by text.

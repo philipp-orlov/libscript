@@ -653,6 +653,11 @@ void installExtras(VM& vm)
         Handle keep = Handle::adopt(toJSValue(getter));
         defineAccessor(vm, asObject(*slot), vm.atoms.symSpecies, toJSValue(getter), JSValue::undefined(), attr::kConfigurable);
     }
+    if (isObject(vm.promiseCtor))
+        if (JSValue* slot = asObject(vm.promiseCtor)->findOwn(vm, vm.atoms.symSpecies)) {
+            vm.promiseSpecies = *slot;
+            retain(vm.promiseSpecies);
+        }
     {
         Key k = vm.internKey(std::string_view("console"));
         JSValue* slot = vm.global->findOwn(vm, k);

@@ -1113,6 +1113,9 @@ void VM::releaseRoots() noexcept
     release(regexpCtor);
     release(regexpExec);
     release(promiseCtor);
+    release(promiseThen);
+    release(promiseSpecies);
+    promiseThen = promiseSpecies = JSValue::undefined();
     release(arrayConstructor);
     release(legacyInput);
     legacyInput = JSValue::undefined();

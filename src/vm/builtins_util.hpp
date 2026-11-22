@@ -132,8 +132,24 @@ struct IteratorState : NativeState
 };
 /// Which prototype a native iterator has: its own for each of these, `next` checking the receiver is of its kind.
 enum IteratorFamily : int { kPlainIterator = 0, kArrayIterator, kStringIterator, kMapIterator, kSetIterator, kRegExpStringIterator, kIteratorFamilies };
-/// An iterator object over `state`, which it takes. Owned.
-JSValue newNativeIterator(VM& vm, IteratorState* state, int family = kPlainIterator);
+/// The cell of an iterator object of `family`, with `bytes` of room for its state, which is to be made there. Owned.
+JSObject* newIteratorCell(VM& vm, int family, std::size_t bytes);
+/// An iterator object over a `T` made of `args`, in its cell. Owned.
+template <class T, class... Args>
+JSValue newNativeIterator(VM& vm, int family, Args&&... args)
+{
+    JSObject* o = newIteratorCell(vm, family, sizeof(T));
+    auto* state = ::new (static_cast<void*>(o->embeddedState())) T(std::forward<Args>(args)...);
+    state->family = family;
+    return toJSValue(o);
+}
+/// The state of an iterator object (null for an iterator helper, whose state is of another kind).
+inline IteratorState* iteratorStateOf(JSObject* o) noexcept
+{
+    return static_cast<IteratorState*>(o->embeddedState());
+}
+/// See builtins_collections.cpp.
+bool tableIterate(VM& vm, JSValue src, JSValue* iterator, JSValue* next);
 /// `{ value, done }`, taking the count of `value`. Owned.
 JSValue iterResult(VM& vm, JSValue value, bool done);
 /// Install `Symbol`, the iterator prototypes and the generator prototype; the array and string iterators.

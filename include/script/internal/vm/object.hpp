@@ -82,8 +82,8 @@ struct JSObject
     /// The native state an object keeps in its own cell, after its slots in place (a promise's, a RegExp's), or null.
     NativeState* embeddedState() noexcept
     {
-        if (cls() == ObjClass::Generator) {
-            // (One with too many registers for a cell has its state on the side.)
+        if (cls() == ObjClass::Generator || cls() == ObjClass::Iterator) {
+            // (A generator with too many registers for a cell, and an iterator helper, have their state on the side.)
             Rare* r = rare();
             return r && r->ext ? nullptr : reinterpret_cast<NativeState*>(reinterpret_cast<char*>(this) + bytesFor(h.aux));
         }

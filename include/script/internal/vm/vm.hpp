@@ -543,6 +543,9 @@ struct VM : EngineRuntime
     /// Where `globalEpoch` was when all of them were found as they were made, and watched; nothing has changed while it stands
     /// there.
     std::uint32_t regexpEpoch = ~0u;
+    /// `[Symbol.iterator]` of Set's and Map's prototypes as made, and where `globalEpoch` was when they were found so.
+    JSValue tableIterators[2] = {JSValue::undefined(), JSValue::undefined()};
+    std::uint32_t tableEpoch[2] = {~0u, ~0u};
     /// The slot of `Array[Symbol.species]` as made, and where `globalEpoch` was when arrays were found to make plain arrays.
     JSValue arraySpecies = JSValue::undefined();
     std::uint32_t arraySpeciesEpoch = ~0u;

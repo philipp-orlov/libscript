@@ -120,7 +120,7 @@ std::size_t cellBytesOf(const detail::GCObject* cell) noexcept
                 case ObjClass::Function: return JSFunction::bytesFor(static_cast<const JSFunction*>(o)->nUpvals);
                 case ObjClass::Promise: return JSObject::bytesFor(o->h.aux) + JSObject::kPromiseStateBytes;
                 case ObjClass::RegExpCell: return JSObject::bytesFor(o->h.aux) + JSObject::kRegExpStateBytes;
-                case ObjClass::Generator: {
+                case ObjClass::Generator: case ObjClass::Iterator: {
                     const NativeState* st = const_cast<JSObject*>(o)->embeddedState();
                     return JSObject::bytesFor(o->h.aux) + (st ? st->cellBytes() : 0);
                 }
@@ -1118,6 +1118,10 @@ void VM::releaseRoots() noexcept
     release(regexpExec);
     release(promiseCtor);
     release(promiseThen);
+    for (JSValue& v : tableIterators) {
+        release(v);
+        v = JSValue::undefined();
+    }
     release(arraySpecies);
     arraySpecies = JSValue::undefined();
     release(promiseSpecies);

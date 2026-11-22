@@ -1304,6 +1304,8 @@ bool iteratorOf(VM& vm, JSValue src, JSValue* iterator, JSValue* next)
         retain(*next);
         return true;
     }
+    if (isObject(src) && bi::tableIterate(vm, src, iterator, next))
+        return true;
     JSValue method = getProperty(vm, src, vm.atoms.symIterator);
     if (method.isException())
         return false;

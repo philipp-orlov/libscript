@@ -1555,6 +1555,7 @@ struct MatchAllIter : IteratorState
         retain(text);
     }
     ~MatchAllIter() override { clear_(); }
+    std::size_t cellBytes() const override { return sizeof *this; }
     void clear(VM&) noexcept override { clear_(); }
     void clear_() noexcept
     {
@@ -1619,9 +1620,8 @@ NATIVE(regexpMatchAll)
         return JSValue::exception();
     if (!setProperty(vm, matcher.get(), vm.atoms.lastIndex, JSValue::boxNumber(last), true))
         return JSValue::exception();
-    return newNativeIterator(vm, new MatchAllIter(matcher.get(), text.get(), flags.find(u'g') != String::npos,
-                                                  flags.find(u'u') != String::npos || flags.find(u'v') != String::npos),
-                             kRegExpStringIterator);
+    return newNativeIterator<MatchAllIter>(vm, kRegExpStringIterator, matcher.get(), text.get(), flags.find(u'g') != String::npos,
+                                           flags.find(u'u') != String::npos || flags.find(u'v') != String::npos);
 }
 
 // ------------------------------------------------------------------ String ---

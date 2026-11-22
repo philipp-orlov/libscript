@@ -46,9 +46,7 @@ int iteratorStep(VM& vm, JSValue iterator, JSValue next, JSValue* out)
         }
     } else if (isObject(iterator) && asObject(iterator)->cls() == ObjClass::Iterator) {
         // A built-in iterator's own `next`: it steps without the result object that would be made and read at once.
-        Rare* r = asObject(iterator)->rare();
-        if (r && r->ext) {
-            auto* state = static_cast<IteratorState*>(r->ext);
+        if (IteratorState* state = iteratorStateOf(asObject(iterator))) {
             if (state->family > 0 && state->family < 8 && next.bits == vm.origNativeNext[state->family].bits) {
                 *out = JSValue::undefined();
                 return state->step(vm, out);
@@ -115,9 +113,7 @@ NATIVE(iteratorNext)
 {
     UNUSED();
     if (isObject(self) && asObject(self)->cls() == ObjClass::Iterator) {
-        Rare* r = asObject(self)->rare();
-        if (r && r->ext) {
-            auto* state = static_cast<IteratorState*>(r->ext);
+        if (IteratorState* state = iteratorStateOf(asObject(self))) {
             if (state->family != int(reinterpret_cast<std::intptr_t>(data)))
                 return typeError(vm, "next method called on an incompatible receiver");
             JSValue out = JSValue::undefined();
@@ -148,6 +144,7 @@ struct ArrayIter : IteratorState
 
     ArrayIter(JSValue t, int k) : target(t), kind(k) { retain(target); }
     ~ArrayIter() override { release(target); }
+    std::size_t cellBytes() const override { return sizeof *this; }
     void values(Vec<JSValue>& out) const override { out.push_back(target); }
     void clear(VM&) noexcept override
     {
@@ -222,6 +219,7 @@ struct StringIter : IteratorState
 
     explicit StringIter(JSValue t) : text(t) { retain(text); }
     ~StringIter() override { release(text); }
+    std::size_t cellBytes() const override { return sizeof *this; }
     void values(Vec<JSValue>& out) const override { out.push_back(text); }
     void clear(VM&) noexcept override
     {
@@ -250,7 +248,7 @@ NATIVE(arrayIterator)
     UNUSED();
     if (self.isNullish())
         return typeError(vm, "Array.prototype iterator called on null or undefined");
-    return newNativeIterator(vm, new ArrayIter(self, int(reinterpret_cast<std::intptr_t>(data))), kArrayIterator);
+    return newNativeIterator<ArrayIter>(vm, kArrayIterator, self, int(reinterpret_cast<std::intptr_t>(data)));
 }
 
 NATIVE(stringIterator)
@@ -262,7 +260,7 @@ NATIVE(stringIterator)
     if (text.isException())
         return text;
     Handle keep = Handle::adopt(text);
-    return newNativeIterator(vm, new StringIter(text), kStringIterator);
+    return newNativeIterator<StringIter>(vm, kStringIterator, text);
 }
 
 NATIVE(generatorResume)
@@ -361,18 +359,17 @@ NATIVE(symbolKeyFor)
 
 JSValue makeArrayIterator(VM& vm, JSValue target, int kind)
 {
-    return newNativeIterator(vm, new ArrayIter(target, kind), kArrayIterator);
+    return newNativeIterator<ArrayIter>(vm, kArrayIterator, target, kind);
 }
 
-JSValue newNativeIterator(VM& vm, IteratorState* state, int family)
+JSObject* newIteratorCell(VM& vm, int family, std::size_t bytes)
 {
-    std::unique_ptr<IteratorState> owned(state);
-    owned->family = family;
-    JSObject* o = vm.newObject(vm.protos.iteratorFamilies[family] ? vm.protos.iteratorFamilies[family] : vm.protos.nativeIterator);
-    Handle keep = Handle::adopt(toJSValue(o));
-    o->h.cls = std::uint8_t(ObjClass::Iterator);
-    o->rareOf(vm).ext = owned.release();
-    return keep.take();
+    JSObject* proto = vm.protos.iteratorFamilies[family] ? vm.protos.iteratorFamilies[family] : vm.protos.nativeIterator;
+    const std::uint32_t shape = vm.rootShapeFor(proto, 0)->id;
+    auto* o = static_cast<JSObject*>(vm.allocCell(JSObject::bytesFor(0) + bytes, Kind::Object, ObjClass::Iterator, 0));
+    o->h.shape = shape;
+    o->slots = nullptr;
+    return o;
 }
 
 void installSymbolAndIterators(VM& vm)

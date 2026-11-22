@@ -270,6 +270,7 @@ struct TableIter : IteratorState
 
     TableIter(JSValue t, int k) : table(t), kind(k) { retain(table); }
     ~TableIter() override { release(table); }
+    std::size_t cellBytes() const override { return sizeof *this; }
     void values(Vec<JSValue>& out) const override { out.push_back(table); }
     void clear(VM&) noexcept override
     {
@@ -510,8 +511,44 @@ NATIVE(tableIterator)
     const Kind& k = kKinds[packed & 3];
     if (!thisTable(vm, self, k.cls, "iterator"))
         return JSValue::exception();
-    return newNativeIterator(vm, new TableIter(self, int(packed >> 2)), k.cls == ObjClass::Map ? kMapIterator : kSetIterator);
+    return newNativeIterator<TableIter>(vm, k.cls == ObjClass::Map ? kMapIterator : kSetIterator, self, int(packed >> 2));
 }
+
+}  // namespace
+
+/// The iterator of a Map or Set as made, whose prototype gives the iterator it was made with: that iterator and its `next`,
+/// owned, with nothing looked up or called.
+bool tableIterate(VM& vm, JSValue src, JSValue* iterator, JSValue* next)
+{
+    JSObject* o = asObject(src);
+    const bool map = o->cls() == ObjClass::Map;
+    if (!map && o->cls() != ObjClass::Set)
+        return false;
+    JSObject* proto = map ? vm.protos.map : vm.protos.set;
+    const int family = map ? kMapIterator : kSetIterator;
+    JSObject* ip = vm.protos.iteratorFamilies[family];
+    Rare* r = o->rare();
+    if (!proto || !ip || !r || !r->ext || o->isDictionary(vm) || o->shapeOf(vm)->count != 0 || o->proto(vm) != proto)
+        return false;
+    std::uint32_t& epoch = vm.tableEpoch[map];
+    if (epoch != vm.globalEpoch) {
+        std::uint8_t attrs = 0;
+        const JSValue* slot = proto->findOwn(vm, vm.atoms.symIterator, &attrs);
+        if (!slot || (attrs & attr::kAccessor) || slot->bits != vm.tableIterators[map].bits)
+            return false;
+        slot = ip->findOwn(vm, vm.atoms.next, &attrs);
+        if (!slot || (attrs & attr::kAccessor) || slot->bits != vm.origNativeNext[family].bits)
+            return false;
+        if (vm.watchMethod(proto, proto) && vm.watchMethod(ip, ip))
+            epoch = vm.globalEpoch;
+    }
+    *iterator = newNativeIterator<TableIter>(vm, family, src, map ? 2 : 1);
+    *next = vm.origNativeNext[family];
+    retain(*next);
+    return true;
+}
+
+namespace {
 
 // ---------------------------------------------------------- WeakRef and friends ---
 
@@ -746,6 +783,10 @@ void installCollections(VM& vm)
         JSFunction* iter = k.isMap ? entries : values;
         retain(toJSValue(iter));
         proto->putOwn(vm, vm.atoms.symIterator, toJSValue(iter), attr::kWritable | attr::kConfigurable);
+        if (!k.weak) {
+            vm.tableIterators[k.isMap] = toJSValue(iter);
+            retain(toJSValue(iter));
+        }
     }
 }
 

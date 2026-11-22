@@ -1295,6 +1295,26 @@ NATIVE(regexpReplace)
 
 /// `match` of a plain global RegExp: each match's text goes straight into the array, with no match array made for it. What
 /// the generic steps leave behind is left: `lastIndex` is 0 at the end, and the legacy `RegExp.$1` kin read the last match.
+/// The one character a pattern matches when it is that character and nothing else (`a`, `\n`, `\.`), else -1.
+int literalChar(StringView source, unsigned flags)
+{
+    if (flags & (regex::kIgnoreCase | regex::kSticky))
+        return -1;
+    static constexpr std::u16string_view kMeta = u"^$\\.*+?()[]{}|/";
+    if (source.size() == 1 && kMeta.find(source[0]) == std::u16string_view::npos && (source[0] < 0xD800 || source[0] > 0xDFFF))
+        return source[0];
+    if (source.size() != 2 || source[0] != u'\\')
+        return -1;
+    switch (source[1]) {
+    case u'n': return '\n';
+    case u'r': return '\r';
+    case u't': return '\t';
+    case u'f': return '\f';
+    case u'v': return '\v';
+    default: return source[1] < 128 && kMeta.find(source[1]) != std::u16string_view::npos ? int(source[1]) : -1;
+    }
+}
+
 JSValue globalMatch(VM& vm, JSValue re, JSValue text)
 {
     RegExpData* d = dataOf(re);
@@ -1307,6 +1327,26 @@ JSValue globalMatch(VM& vm, JSValue re, JSValue text)
     std::size_t last = 0;
     bool any = false;
     Bounds lastMatch;  // a failing attempt at the end leaves the registers in no state to read
+    if (const int c = groups == 1 ? literalChar(StringView(d->source()), d->flags()) : -1; c >= 0) {
+        // One character: each match is that character, found by a scan.
+        const Char one[1] = {Char(c)};
+        Handle piece = Handle::adopt(makeString(vm, StringView(one, 1)));
+        std::int32_t at = -1;
+        for (std::size_t k = 0; k < s.size(); ++k)
+            if (s[k] == Char(c)) {
+                retain(piece.get());
+                out->append(vm, piece.get());
+                at = std::int32_t(k);
+            }
+        if (at >= 0) {
+            const std::int32_t bounds[2] = {at, at + 1};
+            lastMatch.assign(bounds, 2);
+            noteLegacyBounds(vm, d, text, lastMatch.data(), groups);
+        }
+        if (!writeLastIndex(vm, o, 0))
+            return JSValue::exception();
+        return at >= 0 ? keep.take() : JSValue::null();
+    }
     regex::Matcher& matcher = scratch();
     while (last <= s.size() && execProgram(vm, d->program(), s, last, matcher)) {
         const std::int32_t from = matcher.registers[0], to = matcher.registers[1];

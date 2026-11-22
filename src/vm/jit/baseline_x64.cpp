@@ -3240,14 +3240,93 @@ void Baseline::emit(std::uint32_t i)
     case Op::LoadCallee: helperOp(i, &helperThunk<jitLoadCallee>); return;
     case Op::NewTarget: helperOp(i, &helperThunk<jitNewTarget>); return;
     case Op::CallSpread: helperOrStep(i, &helperThunk<jitCallSpread>); return;
-    case Op::IterNext: helperOp(i, &helperThunk<jitIterNext>); return;
-    case Op::IterInit: helperOrStep(i, &helperThunk<jitIterInit>); return;
+    case Op::IterNext: {
+        // Along an array (its state is an index): in line.
+        Label& bad = slow(i, &helperThunk<jitIterNext>);
+        Label end, some, done;
+        a_.mov(RCX, R(in.b + 1u));
+        needInt(RCX, bad);
+        a_.mov(RSI, R(in.b));
+        needObject(RSI, bad);
+        a_.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, bad);
+        a_.mov32(RCX, RCX);
+        a_.alu32(7, RCX, mem(RSI, kArrayLength));
+        a_.jcc(CAE, end);
+        a_.mov(RDX, mem(RSI, kArrayElems));
+        a_.mov(RAX, mem(RDX, RCX, 8));
+        a_.cmpI(RAX, std::int32_t(kHole));
+        a_.jcc(CNE, some);
+        a_.movImm(RAX, kUndefined);
+        a_.bind(some);
+        a_.aluI32(0, RCX, 1);
+        a_.or_(RCX, R14);
+        a_.mov(R(in.b + 1u), RCX);
+        retainF(RAX);
+        write(in.a, RAX);
+        a_.jmp(done);
+        a_.bind(end);
+        a_.movImm(RAX, in.c ? kUndefined : kHole);
+        write(in.a, RAX);
+        a_.bind(done);
+        return;
+    }
+    case Op::IterInit: {
+        // Of a plain array that iterates as arrays do.
+        std::uint8_t attrs = 0;
+        const JSValue* iter = vm_.protos.array->findOwn(vm_, vm_.atoms.symIterator, &attrs);
+        const JSValue* next = vm_.protos.nativeIterator->findOwn(vm_, vm_.atoms.next, &attrs);
+        ValidityCell* const ofArray = vm_.validityOf(vm_.protos.array);
+        ValidityCell* const ofNext = vm_.validityOf(vm_.protos.nativeIterator);
+        if (!iter || !next || *iter != vm_.origArrayValues || *next != vm_.origIteratorNext || !ofArray->valid || !ofNext->valid) {
+            helperOrStep(i, &helperThunk<jitIterInit>);
+            return;
+        }
+        if (!vm_.arrayRootShape)
+            vm_.arrayRootShape = vm_.rootShapeFor(vm_.protos.array)->id;
+        Label bad, done;
+        a_.mov(RAX, R(in.b));
+        needObject(RAX, bad);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, bad);
+        a_.cmpI32(mem(RAX, 0), std::int32_t(vm_.arrayRootShape));
+        a_.jcc(CNE, bad);
+        const auto still = [&](ValidityCell* cell, const JSValue* slot, JSValue value) {
+            hold(cell);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(cell));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(slot));
+            a_.movImm(RDX, value.bits);
+            a_.cmp(RDX, mem(RCX, 0));
+            a_.jcc(CNE, bad);
+        };
+        still(ofArray, iter, vm_.origArrayValues);
+        still(ofNext, next, vm_.origIteratorNext);
+        retainF(RAX);
+        write(in.a, RAX);  // (letting go of an old value keeps no register)
+        a_.mov(RCX, R14);  // the int32 zero
+        write(in.a + 1u, RCX);
+        a_.jmp(done);
+        a_.bind(bad);
+        helperOrStep(i, &helperThunk<jitIterInit>);
+        a_.bind(done);
+        return;
+    }
     case Op::NewRegExp: helperOp(i, &helperThunk<jitNewRegExp>); return;
     case Op::EnvHas: helperOp(i, &helperThunk<jitEnvHas>); return;
     case Op::DefPrivMethod: case Op::DefPrivGetter: case Op::DefPrivSetter:
         helperOp(i, &helperThunk<jitDefPrivMethod>);
         return;
-    case Op::IterClose: helperOrStep(i, &helperThunk<jitIterClose>); return;
+    case Op::IterClose: {
+        Label done;
+        a_.mov(RAX, R(in.a + 1u));
+        a_.test(RAX, R15);
+        a_.jcc(CNE, done);  // along an array, or at its end
+        helperOrStep(i, &helperThunk<jitIterClose>);
+        a_.bind(done);
+        return;
+    }
     case Op::CheckInit: case Op::CheckBound: case Op::CheckUnbound: {
         // A compare; the interpreter throws, from the step the out-of-line path runs.
         Label& bad = slow(i);

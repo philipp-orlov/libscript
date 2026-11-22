@@ -2855,9 +2855,13 @@ struct JsonReader
     StringView s;
     std::size_t i = 0;
     int depth = 0;
+    /// Source text of an `eval`, read here if it happens to be JSON: what is not says so and throws nothing.
+    bool quiet = false;
 
     JSValue fail(const char* what)
     {
+        if (quiet)
+            return JSValue::exception();
         std::string message = std::string("JSON.parse: ") + what + " at position " + std::to_string(i);
         return vm.throwError(ErrorCode::SyntaxError, message);
     }
@@ -3136,6 +3140,8 @@ struct JsonReader
                 StringView name;
                 if (!text(&name, scratch))
                     return JSValue::exception();
+                if (quiet && name == u"__proto__")
+                    return JSValue::exception();  // the prototype, in a literal
                 skip();
                 if (i >= s.size() || s[i] != u':')
                     return fail("expected ':'");
@@ -3180,6 +3186,37 @@ struct JsonReader
         return fail("unexpected token");
     }
 };
+
+/// The value of `eval(source)` where the source is `(literal)` or `[...]` and the literal is JSON, which means the same in
+/// the language; owned, or a hole for anything else.
+JSValue evalLiteral(VM& vm, StringView source)
+{
+    JsonReader reader{vm, source};
+    reader.quiet = true;
+    reader.skip();
+    const bool paren = reader.i < source.size() && source[reader.i] == u'(';
+    if (paren) {
+        ++reader.i;
+        reader.skip();
+    }
+    if (reader.i >= source.size() || !(source[reader.i] == u'[' || (paren && source[reader.i] == u'{')))
+        return JSValue::hole();
+    Handle value = Handle::adopt(reader.value());
+    if (value.get().isException())
+        return JSValue::hole();
+    reader.skip();
+    if (paren) {
+        if (reader.i >= source.size() || source[reader.i] != u')')
+            return JSValue::hole();
+        ++reader.i;
+        reader.skip();
+    }
+    if (reader.i < source.size() && source[reader.i] == u';') {
+        ++reader.i;
+        reader.skip();
+    }
+    return reader.i == source.size() ? value.take() : JSValue::hole();
+}
 
 // The reviver walks the parsed value bottom-up. Owned result, or the exception sentinel.
 JSValue jsonRevive(VM& vm, JSValue holder, Key key, JSValue reviver)
@@ -3512,6 +3549,8 @@ void VM::installBuiltins()
                 retain(x);
                 return x;
             }
+            if (const JSValue literal = evalLiteral(vm, asString(x)->text()); !literal.isHole())
+                return literal;
             if (direct)
                 return vm.evalDirect(x);
             return vm.evalSource(toUtf8(asString(x)->text()), "<eval>");

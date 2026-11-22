@@ -272,6 +272,9 @@ TEST(whereTheDynamicEngineDeviatesFromTheLanguage)
         // Code made at run time, when the host allows it.
         {"var f = new Function('a', 'b', 'return a * b'); String(f(3, 4))", "12"},
         {"String(eval('1 + 2') + eval('var zz = 5; zz * 2'))", "13"},
+        // An eval of a literal that is JSON is read as JSON, and means the same; anything near it is compiled.
+        {"var r = []; function E(s) { try { var v = eval(s); r.push(typeof v === 'object' ? JSON.stringify(v) : String(v)); } catch (e) { r.push(e.name); } } ['({\"a\":1,\"b\":[1,2,{\"c\":null}]})', '[1,2,3]', ' [ 1 , \"x\" ] ; ', '({\"a\":1}', '({a:1})', '{\"a\":1}', '[-0]', '[1e400]', '[\"\\\\u0041\\\\n\"]', '()', '[', '([\"a\"])[0]', '[1]//c', '[true,false,null]'].forEach(E); r.push(Object.getPrototypeOf(eval('({\"__proto__\":null})')) === null, 1 / eval('[-0]')[0]); r.join('|')",
+         "{\"a\":1,\"b\":[1,2,{\"c\":null}]}|[1,2,3]|[1,\"x\"]|SyntaxError|{\"a\":1}|SyntaxError|[0]|[null]|[\"A\\n\"]|SyntaxError|SyntaxError|a|[1]|[true,false,null]|true|-Infinity"},
         // Names a direct eval may declare are looked up in its scope first, in optimized code too (EnvHas).
         {"function outer(code) { eval(code); function inner(n) { var s = 0; for (var i = 0; i < n; i++) s += typeof maybe === "
          "'undefined' ? i : maybe + i; return s + (typeof Math.max); } var r = []; for (var k = 0; k < 4000; k++) r[0] = inner(20); "

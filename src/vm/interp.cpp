@@ -370,6 +370,43 @@ JSValue forInKeys(VM& vm, JSValue value)
         }
         remember(level);
     };
+    if (isObject(value) && asObject(value)->cls() == ObjClass::Plain && !asObject(value)->isDictionary(vm)) {
+        // A plain object under prototypes with no name to list: its own names, in order.
+        JSObject* o = asObject(value);
+        bool clean = true;
+        for (JSObject* p = o->proto(vm); p && clean; p = p->proto(vm)) {
+            VM::ForInProto& known = vm.forInProtos[(reinterpret_cast<std::uintptr_t>(p) >> 5) % VM::kForInProtos];
+            if (known.object == p && known.shape == p->h.shape && p->cls() == ObjClass::Plain)
+                continue;
+            clean = p->cls() == ObjClass::Plain && !proxyOf(p);
+            if (clean)
+                p->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue) {
+                    clean = clean && !(k->kind == detail::CellKind::String && (attrs & attr::kEnumerable));
+                });
+            if (clean) {
+                known.object = p;
+                known.shape = p->h.shape;
+            }
+        }
+        Shape* shape = o->shapeOf(vm);
+        const std::uint32_t count = shape->count;
+        if (clean) {
+            result->reserve(vm, count);
+            for (std::uint32_t i = 0; i < count && clean; ++i) {
+                const Entry e = shape->entryAt(i);
+                if (e.key->kind != detail::CellKind::String || !(e.attrs & attr::kEnumerable))
+                    continue;
+                std::uint32_t index;
+                if (arrayIndexOf(e.key, &index))
+                    clean = false;
+                else
+                    add(e.key);
+            }
+            if (clean)
+                return keep.take();
+            result->resize(vm, 0);
+        }
+    }
     if (isObject(value)) {
         Handle cur = Handle::retained(value);
         while (isObject(cur.get())) {
@@ -3715,6 +3752,15 @@ std::uint64_t stepInstruction(VM& vm, std::uint32_t index)
     Frame* fr = vm.frameTop - 1;
     const Ins* at = fr->code->code.data() + index;
     const Ins* fall = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
+    // A comparison of two strings runs nothing.
+    const Op op = at->opcode();
+    if (op >= Op::JLt && op <= Op::JNotGe && isString(fr->R[at->a]) && isString(fr->R[at->b])) {
+        const bool negated = op >= Op::JNotLt;
+        const Op rel = Op(int(Op::Lt) + int(op) - int(negated ? Op::JNotLt : Op::JLt));
+        const bool holds = relational(vm, rel, fr->R[at->a], fr->R[at->b]) != 0;
+        fr->pc = holds == negated ? at + 1 : at + 1 + at->jump16();
+        return holds == negated ? kStepFall : kStepJump;
+    }
     fr->pc = at;
     return (vm.deferred ? runImpl<true, true>(vm, fall) : runImpl<true, false>(vm, fall)).bits;
 }

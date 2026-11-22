@@ -1085,6 +1085,34 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
             return JSValue::exception();
         at = last > double(s.size()) ? s.size() + 1 : std::size_t(last);
     }
+    if (!functional && global && asString(templValue)->text().find(u'$') == StringView::npos) {
+        // The same text for every match: written as the matches are found.
+        const StringView with = asString(templValue)->text();
+        String out;
+        std::size_t copied = 0;
+        bool any = false;
+        Bounds lastMatch;
+        regex::Matcher& matcher = scratch();
+        const std::size_t groups = regex::groupCount(d->program());
+        while (at <= s.size() && execProgram(vm, d->program(), s, at, matcher)) {
+            const std::size_t ms = std::size_t(matcher.registers[0]), me = std::size_t(matcher.registers[1]);
+            lastMatch.assign(matcher.registers.data(), 2 * groups);
+            any = true;
+            out.append(s.data() + copied, ms - copied);
+            out.append(with.data(), with.size());
+            copied = me;
+            at = me == ms ? advance(s, me, unicode) : me;
+        }
+        if (!writeLastIndex(vm, o, 0))
+            return JSValue::exception();
+        if (!any) {
+            retain(textValue);
+            return textValue;
+        }
+        noteLegacyBounds(vm, d, textValue, lastMatch.data(), groups);
+        out.append(s.data() + copied, s.size() - copied);
+        return makeString(vm, StringView(out));
+    }
     std::vector<Match> found;
     for (;;) {
         Match m;

@@ -545,6 +545,14 @@ struct VM : EngineRuntime
     /// was found to have them still (`promisePristine`).
     JSValue promiseThen = JSValue::undefined(), promiseSpecies = JSValue::undefined();
     std::uint32_t promiseEpoch = ~0u;
+    /// Prototypes found to have no enumerable name, and the shape they had then (compared, not followed).
+    struct ForInProto
+    {
+        const JSObject* object = nullptr;
+        std::uint32_t shape = 0;
+    };
+    static constexpr std::size_t kForInProtos = 8;
+    ForInProto forInProtos[kForInProtos];
     std::size_t jsonRoom = 0;  ///< how many characters the next JSON.stringify starts with room for
     /// A regular expression literal's compiled program, by the string constants of its pattern and flags (each entry holds
     /// a count of both): a literal in a loop makes a RegExp each time round with no parse of its flags and no lookup by text.

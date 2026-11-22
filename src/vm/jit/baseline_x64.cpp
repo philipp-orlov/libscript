@@ -906,7 +906,7 @@ constexpr std::int32_t kObjInline = 24;
 constexpr std::int32_t kBoxValue = 16;
 constexpr std::int32_t kFnUpvals = std::int32_t(sizeof(JSFunction));
 constexpr std::uint8_t kObjectKind = 0x80 | std::uint8_t(Kind::Object);
-constexpr std::int32_t kHdrCls = 4, kHdrFlags = 5, kHdrAux = 6, kHdrKind = 7, kHdrRc = 8;
+constexpr std::int32_t kHdrCls = 4, kHdrFlags = 5, kHdrAux = 6, kHdrKind = 7, kHdrRc = 8, kHdrGc = 12;
 constexpr std::int32_t kValidityValid = 4;
 
 /// A value of an inlined function (opt_inline.inc): a typed variable of the caller, a register of the caller's frame, a
@@ -2111,10 +2111,32 @@ private:
         a_.jcc(CNE, done);
         a_.dec32(mem(r, kHdrRc));
         a_.jcc(CNE, done);
+        if (def_ && r != RDI) {
+            // Deferred: a cell of this family into the zero-count table in line, unless it is there or the table is full.
+            Label slowFree;
+            a_.testI8(mem(r, kHdrKind), 0x80);
+            a_.jcc(CE, slowFree);
+            a_.cmpI32(mem(r, kHdrGc), std::int32_t(VM::kInZct));
+            a_.jcc(CE, done);
+            a_.mov(RDI, mem(R12, vmOffset(&vm_.zctTop_)));
+            a_.cmp(RDI, mem(R12, vmOffset(&vm_.zctEnd_)));
+            a_.jcc(CAE, slowFree);
+            a_.mov(mem(RDI, 0), r);
+            a_.aluI(0, RDI, 8);
+            a_.mov(mem(R12, vmOffset(&vm_.zctTop_)), RDI);
+            a_.mov32(mem(r, kHdrGc), std::int32_t(VM::kInZct));
+            a_.jmp(done);
+            a_.bind(slowFree);
+        }
         if (r != RDI)
             a_.mov(RDI, r);
         a_.call(free_);
         a_.bind(done);
+    }
+    /// Where a field of the VM is from r12.
+    std::int32_t vmOffset(const void* field) const
+    {
+        return std::int32_t(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&vm_));
     }
     /// The count a frame register holds of the value in `r`, about to go there: none in a deferred frame (`def_`).
     void retainF(Reg r)

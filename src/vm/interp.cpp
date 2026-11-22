@@ -2976,6 +2976,7 @@ L_SuperSpread: {
         FAIL();
     }
     spreadOverWindow(vm, window, list, n);
+    vm.stackTop = std::max(vm.stackTop, window + n);  // the window may reach past this frame's registers
     callBase = at;
     callArgc = n;
     callMode = ins->opcode() == Op::NewSpread ? 1 : ins->opcode() == Op::SuperSpread ? 2 : 0;
@@ -3031,11 +3032,12 @@ do_call: {
     }
     if (f->flags & JSFunction::kNative) {
         Rare* r = f->rare();
-        vm.stackTop = R + code->nregs;
+        vm.stackTop = std::max(R + code->nregs, R + base + 2 + argc);
         JSValue saved = vm.newTarget;
         vm.newTarget = isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined();
         JSValue res = r->native(vm, R[base + 1], &R[base + 2], argc, r->nativeData);
         vm.newTarget = saved;
+        vm.stackTop = R + code->nregs;
         if (res.isException())
             FAIL();
         if ((isNew || isSuper) && !isObject(res)) {
@@ -4692,7 +4694,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
             stackTop = R;
             clearRegs(*this, R, 0, 1 + n);
             if (deferred && frameTop == frameBase)
-                scanZct();
+                scanAtHost();
             return result;
         }
     }
@@ -4715,7 +4717,12 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     for (std::uint32_t i = 0; i <= argc; ++i)
         retainReg(*this, R[i]);
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
-    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArgumentsFor(*this, c, R + 1, argc) : nullptr;
+    JSArray* argsArray = nullptr;
+    if (c->flags & CodeBlock::kNeedsArgs) {
+        stackTop = R + 1 + argc;  // what is above the top is nobody's
+        argsArray = captureArgumentsFor(*this, c, R + 1, argc);
+        stackTop = R;
+    }
     // The callee's registers above its parameters start undefined. What can be there instead: an argument past the
     // parameters, and dead temporaries of a frame below when this one sits on them (a native called from a function
     // whose own frame began inside its caller's).
@@ -4735,7 +4742,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     clearRegs(*this, R, 0, 1 + argc);
     // Back to the host: what the program left behind goes now, while no frame is there to scan.
     if (deferred && frameTop == frameBase)
-        scanZct();
+        scanAtHost();
     return result;
 }
 
@@ -4854,7 +4861,10 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         const JSValue old = R[i];
         R[i] = g->regs()[i];
         g->regs()[i] = JSValue::undefined();
-        release(deferred ? R[i] : old);  // deferred: the register holds it without the count the generator held
+        if (deferred)
+            releaseDeferred(R[i]);  // the register holds it without the count the generator held
+        else
+            release(old);
     }
     if (g->state == GenState::Suspended && g->delegating) {
         // At a `yield*`: what came in goes to the inner iterator, with what kind of resumption it was.

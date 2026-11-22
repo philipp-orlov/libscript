@@ -198,6 +198,15 @@ struct VM : EngineRuntime
     bool deferred = false;
     /// Free every cell of the zero-count table that no frame holds.
     void scanZct() noexcept;
+    /// The same when no frame is left: the registers are nobody's, and are filled again as they are used again.
+    void scanAtHost() noexcept
+    {
+        if (!zctCount())
+            return;
+        if (stackInit > stackTop)
+            stackInit = stackTop;
+        scanZct();
+    }
     /// The `gc` word of a cell in the zero-count table. A collection rewrites the word of every cell it looks at, and
     /// leaves 0 behind; it never runs with cells in the table.
     static constexpr std::uint32_t kInZct = 1;
@@ -216,7 +225,10 @@ struct VM : EngineRuntime
             cell->inZct = 1;
             return;
         }
+        // On its way into a register, whose frame may not be there yet: into the table in any case, not freed.
+        parking_ = true;
         detail::destroyUnreferenced(cell);
+        parking_ = false;
     }
     /// `release` of a value a deferred frame let go of.
     [[gnu::always_inline]] void releaseDeferred(JSValue v) noexcept
@@ -562,6 +574,8 @@ private:
     void auditCounts() noexcept;
     void freeZct() noexcept;
     bool rootsCounted_ = false;
+    bool parking_ = false;
+    std::size_t scanned_ = 0;  ///< registers the last scan went over
     void restoreCellBudget() noexcept;
     static constexpr std::size_t kZctMin = 4096;
     std::size_t zctMin_ = kZctMin;

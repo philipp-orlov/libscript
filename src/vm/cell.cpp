@@ -353,7 +353,7 @@ void VM::destroy(CellPtr cell) noexcept
     if (tearingDown)
         return;
     // A frame may hold it without a count: it waits in the zero-count table for the next scan.
-    if (deferred && !immediate_) {
+    if (deferred && !immediate_ && (frameTop != frameBase || parking_ || headerOf(cell)->gc == kInZct)) {
         if (headerOf(cell)->gc != kInZct) {
             zctPush(cell);
             if (zctCount() >= zctLimit_) [[unlikely]]
@@ -543,7 +543,7 @@ void VM::restoreCellBudget() noexcept
 /// The table has grown to its limit: compiled code allocates through `allocCell` (cell budget 0), which scans.
 void VM::noteZct() noexcept
 {
-    if (zctCount() >= zctLimit_ && cellBudget_) [[unlikely]] {
+    if (zctLimit_ && zctCount() >= zctLimit_ && cellBudget_) [[unlikely]] {
         savedCellBudget_ = cellBudget_;
         cellBudget_ = 0;
     }
@@ -555,10 +555,12 @@ bool VM::deferOld(detail::GCObject* cell) noexcept
         return false;
     if (cell->inZct)
         return true;
+    if (frameTop == frameBase && !parking_)
+        return false;  // no frame to hold it
     try {
         zctOld_.push_back(cell);
     } catch (...) {
-        return false;  // out of memory: freed now, as in a context that counts its frames
+        return true;  // out of memory: a frame may hold it, so it stays (a collection or the context's end frees it)
     }
     cell->inZct = 1;
     if (zctCount() >= zctLimit_) [[unlikely]]
@@ -576,6 +578,13 @@ void VM::countRoots(int delta) noexcept
             hi = f->R + f->code->nregs;
     if (hi > stackInit)
         hi = stackInit;
+    if (delta > 0) {
+        // A register above them (an argument of a spread call that is over) may hold what goes now: no later frame finds
+        // it there. What this costs is weighed into the table's next limit.
+        for (JSValue* r = hi; r < stackInit; ++r)
+            *r = JSValue::undefined();
+        scanned_ = std::size_t(stackInit - stackBase);
+    }
     for (JSValue* r = stackBase; r < hi; ++r) {
         if (!r->isCell())
             continue;
@@ -711,7 +720,11 @@ void VM::zctPush(CellPtr cell) noexcept
 
 void VM::setZctLimit() noexcept
 {
-    zctLimit_ = std::max<std::size_t>(zctMin_, 2 * zctCount());
+    zctLimit_ = std::max<std::size_t>({zctMin_, 2 * zctCount(), scanned_ / 4});
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (!zctMin_)
+        zctLimit_ = 0;  // testing: every allocation scans
+#endif
     if (std::size_t(zctCap_ - zctBase_) < zctLimit_) {
         // Room up to the limit, so that compiled code finds its end where the limit is.
         CellPtr* grown;

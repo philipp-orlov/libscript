@@ -181,3 +181,30 @@ TEST(manualCyclesWaitForTheHost)
     CHECK(after.gcFreed >= 20000);
     CHECK(after.liveObjects < before.liveObjects);
 }
+
+TEST(spreadArgumentsLiveUntilTheirCallIsOver)
+{
+    // Their registers reach past the caller's, and the list they came from has lost its own: a native that runs other
+    // code before it reads them, an arguments object, a rest parameter.
+    const char* program =
+        "var out = []; "
+        "function mk(i) { return { i: i, toString() { var g = []; for (var k = 0; k < 300; k++) g.push({ k: k, s: 'x' + k }); return 's' + i; } }; } "
+        "function list(n) { var a = []; for (var i = 0; i < n; i++) a.push(mk(i)); return a; } "
+        "function go(n) { return String.prototype.concat.call('', ...list(n)); } "
+        "for (var r = 0; r < 60; r++) { var s = go(40); if (r % 20 == 0) out.push(s.length); } "
+        "function direct(n) { return ''.concat(...list(n)); } "
+        "for (var r = 0; r < 60; r++) { var s = direct(40); if (r % 20 == 0) out.push(s.length, s.slice(0, 12)); } "
+        "function take(a, b) { var g = []; for (var k = 0; k < 200; k++) g.push({ k }); return arguments.length + ':' + arguments[35].i + ':' + a.i + b.i; } "
+        "for (var r = 0; r < 60; r++) { var s = take(...list(40)); if (r % 20 == 0) out.push(s); } "
+        "class A { constructor(...xs) { var g = []; for (var k = 0; k < 200; k++) g.push({ k }); this.n = xs.length + xs[xs.length - 1].i; } } "
+        "for (var r = 0; r < 60; r++) { var s = new A(...list(40)).n; if (r % 20 == 0) out.push(s); } "
+        "out.join(' ') ";
+    for (int mode = 0; mode < 2; ++mode) {
+        script::Context::Options options;
+        options.language = script::Language::JavaScript;
+        options.memory = mode ? script::Context::Options::Memory::Deferred : script::Context::Options::Memory::Counted;
+        script::Context ctx(options);
+        CHECK_EQ(ctx.eval(program, "<test>").toString(),
+                 std::string("110 110 110 110 s0s1s2s3s4s5 110 s0s1s2s3s4s5 110 s0s1s2s3s4s5 40:35:01 40:35:01 40:35:01 79 79 79"));
+    }
+}

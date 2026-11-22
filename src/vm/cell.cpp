@@ -239,8 +239,11 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
             for (std::uint32_t i = 0; i < f->nUpvals; ++i)
                 if (f->upvals()[i])
                     detail::decRef(reinterpret_cast<CellPtr>(f->upvals()[i]));
-            if (f->code)
+            if (f->code) {
+                if (f->code->only == f)
+                    f->code->only = nullptr;
                 vm.releaseCode(f->code);
+            }
             break;
         }
         default: break;

@@ -785,6 +785,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             case Op::LoadK: bits = code_->consts[in.kIndex()].bits; break;  // the block holds it as long as this code
             case Op::GetGlobal: k = ssaGlobalConst(sv.at, &bits); break;
             case Op::GetProp: k = ssaMethodConst(sv.at, &bits); break;
+        case Op::GetUpval: k = ssaUpvalConst(sv.at, &bits); break;
             default: k = false; break;
             }
             sval_[v].isConst = k;
@@ -993,7 +994,10 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                     ssaTypeOf(i);
                 break;
             case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox: case Op::ToNumeric: case Op::Not:
-                if (!native_[i])
+                if (op == Op::GetUpval && sval_[g.defBase[i]].isConst) {
+                    ssaEpochCheck(i);
+                    name_[in.a] = g.defBase[i];
+                } else if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
                 else if (!ssaSmall(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
@@ -1327,6 +1331,25 @@ bool Baseline::ssaMethodConst(std::uint32_t i, std::uint64_t* bits)
     // (Watching moves a holder to another shape, not a property of it to another slot.)
     holdValue(f);
     *bits = f.bits;
+    return true;
+}
+
+bool Baseline::ssaUpvalConst(std::uint32_t i, std::uint64_t* bits)
+{
+    JSFunction* f = code_->only;
+    const std::uint32_t k = code_->code[i].b;
+    if (ssaOn_ < 2 || code_->made != 1 || !f || f->code != code_ || k >= f->nUpvals ||
+        (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return false;
+    Box* box = f->upvals()[k];
+    const JSValue v = box->value;
+    if ((box->h.aux & Box::kNotConstant) || (box->h.aux & Box::kWrites) == Box::kWrites || v.isUndefined() || v.isHole() || v.isUninit())
+        return false;
+    box->h.aux |= Box::kWatched;
+    code_->singleAssumed = true;
+    if (v.isCell())
+        holdValue(v);
+    *bits = v.bits;
     return true;
 }
 
@@ -4544,6 +4567,8 @@ bool Baseline::ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter)
         } else {
             loadValue(name_[in.a], RAX);
         }
+        boxWrite(RAX);
+        epochSeen_ = false;
         loadValue(name_[in.b], RCX);
         if (mayBeCell(name_[in.b]))
             retain(RCX);

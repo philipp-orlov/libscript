@@ -551,6 +551,9 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             if (CodeBlock* d = mergeInline(*vm, code, header)) {
                 compileTier1(*vm, d);
                 if (d->tier1) {
+                    if (code->only == fr->fn)
+                        code->only = nullptr;
+                    vm->functionMade(d, fr->fn);
                     fr->fn->code = d;  // the function's count of `code` is now `d`'s
                     if (header == 0xFFFFFFFFu) {
                         code->tier2Counter = vm->tier2Threshold > 0 ? vm->tier2Threshold : 0x40000000;
@@ -876,6 +879,7 @@ constexpr std::int32_t kVmFrameCapacity = std::int32_t(offsetof(VM, frameCapacit
 constexpr std::int32_t kVmFrameBase = std::int32_t(offsetof(VM, frameBase));
 constexpr std::int32_t kVmGlobalEpoch = std::int32_t(offsetof(VM, globalEpoch));
 constexpr std::int32_t kVmStackFloor = std::int32_t(offsetof(VM, jitStackFloor));
+constexpr std::int32_t kCbMade = std::int32_t(offsetof(CodeBlock, made));
 constexpr std::int32_t kCbRefs = std::int32_t(offsetof(CodeBlock, refs));
 constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
 constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
@@ -2026,6 +2030,8 @@ private:
     bool ssaGlobalConst(std::uint32_t i, std::uint64_t* bits);
     /// The method `GetProp` `i` always finds on a prototype, when it is taken for a constant (and watched from now on).
     bool ssaMethodConst(std::uint32_t i, std::uint64_t* bits);
+    /// The same of a captured variable, in the code of one function only.
+    bool ssaUpvalConst(std::uint32_t i, std::uint64_t* bits);
     /// What this code takes for constant still is, at instruction `i`: one look between two things that could change it.
     void ssaEpochCheck(std::uint32_t i);
     bool epochSeen_ = false;
@@ -2254,6 +2260,17 @@ private:
         a_.alu32(7, RSI, RDI);
         a_.jcc(CAE, bad);
         a_.lea(RDX, mem(RAX, RSI, 8, kObjInline));
+    }
+    /// The variable whose box is in `box` is about to be written: optimized code that takes it for a constant is done for.
+    void boxWrite(Reg box)
+    {
+        Label plain;
+        a_.testI8(mem(box, kHdrAux), Box::kWatched);
+        a_.jcc(CE, plain);
+        a_.andI8(mem(box, kHdrAux), std::uint8_t(~Box::kWatched));
+        a_.orI8(mem(box, kHdrAux), Box::kNotConstant);
+        a_.inc32(mem(R12, kVmGlobalEpoch));
+        a_.bind(plain);
     }
     void needInt(Reg v, Label& bad)
     {
@@ -3535,6 +3552,7 @@ void Baseline::emit(std::uint32_t i)
     }
     case Op::PutBox:
         a_.mov(RAX, R(in.a));
+        boxWrite(RAX);
         a_.mov(RCX, R(in.b));
         retain(RCX);
         a_.mov(RSI, mem(RAX, kBoxValue));
@@ -3550,6 +3568,7 @@ void Baseline::emit(std::uint32_t i)
     case Op::PutUpval:
         a_.mov(RAX, mem(R13, kFrameFn));
         a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * in.a)));
+        boxWrite(RAX);
         a_.mov(RCX, R(in.b));
         retain(RCX);
         a_.mov(RSI, mem(RAX, kBoxValue));
@@ -3624,6 +3643,11 @@ void Baseline::emit(std::uint32_t i)
             helperOp(i, &helperThunk<jitClosure>);
             return;
         }
+        // (The first two functions of the code are counted by the runtime.)
+        Label& first = slow(i, &helperThunk<jitClosure>);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(child));
+        a_.cmpI8(mem(RCX, kCbMade), 2);
+        a_.jcc(CNE, first);
         CellHeader h{};
         h.shape = vm_.rootShapeFor(vm_.protos.function, 0)->id;
         h.cls = std::uint8_t(ObjClass::Function);

@@ -1562,6 +1562,7 @@ L_GetBox:
 L_PutBox: {
     Box* box = reinterpret_cast<Box*>(R[ins->a].asCell());
     const JSValue old = box->value;
+    vm.boxWritten(box);
     box->value = R[ins->b];
     retain(box->value);
     release(old);
@@ -1580,6 +1581,7 @@ L_GetUpval:
 L_PutUpval: {
     Box* box = fn->upvals()[ins->a];
     const JSValue old = box->value;
+    vm.boxWritten(box);
     box->value = R[ins->b];
     retain(box->value);
     release(old);

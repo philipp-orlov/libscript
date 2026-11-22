@@ -316,6 +316,9 @@ CodeBlock* tierUpBlock(VM& vm, JSFunction* f, CodeBlock* c)
     if (!d)
         return c;
     ++d->refs;
+    if (c->only == f)
+        c->only = nullptr;
+    vm.functionMade(d, f);
     f->code = d;
     vm.releaseCode(c);
     return d;

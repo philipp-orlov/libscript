@@ -699,6 +699,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                 inlineBoxed(v);
                 if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
                     retain(RAX);
+                boxWrite(RDI);
                 if (upNumber[ci.a] == std::int64_t(cx.epoch)) {
                     a_.mov(mem(RDI, kBoxValue), RAX);  // over a number seen since the last effect
                 } else {
@@ -713,6 +714,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                     retain(RCX);
                 loadCallee();
                 a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * ci.a)));
+                boxWrite(RAX);
                 if (upNumber[ci.a] == std::int64_t(cx.epoch)) {
                     a_.mov(mem(RAX, kBoxValue), RCX);  // over a number seen since the last effect
                 } else {

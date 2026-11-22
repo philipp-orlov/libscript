@@ -407,6 +407,10 @@ struct VM : EngineRuntime
             protoWritten(o);
     }
     void protoWritten(const JSObject* o) noexcept;
+    /// The same for a captured variable's box.
+    void boxWritten(Box* box) noexcept;
+    /// Another function, `f`, has the code `code`.
+    void functionMade(CodeBlock* code, JSFunction* f) noexcept;
     /// Optimized code may take the method found on `holder`, through the prototypes from `first` on, for a constant: any
     /// change of those moves `globalEpoch` from now on. False when they have changed too often.
     bool watchMethod(JSObject* first, JSObject* holder);

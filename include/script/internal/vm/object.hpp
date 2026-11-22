@@ -331,6 +331,9 @@ void forgetView(JSTypedArray* view) noexcept;
 
 struct Box
 {
+    /// In `h.aux`: how often the variable was written (`kWrites`, as far as the runtime saw it), that optimized code takes its
+    /// value for a constant (`kWatched`: the next write moves `VM::globalEpoch`), or that one did and was wrong.
+    static constexpr std::uint8_t kWrites = 3, kWatched = 4, kNotConstant = 8;
     CellHeader h;
     JSValue value;
 };

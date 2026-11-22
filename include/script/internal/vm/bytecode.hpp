@@ -231,6 +231,12 @@ struct CodeBlock
     std::uint16_t nparams = 0;
     std::uint32_t nregs = 1;
 
+    /// The function this is the code of, while there has been one only (`made`: none, one, more), so that its variables are
+    /// always the same; not counted. `singleAssumed`: optimized code relies on that.
+    struct JSFunction* only = nullptr;
+    std::uint8_t made = 0;
+    bool singleAssumed = false;
+
     Vec<Ins> code;
     Vec<JSValue> consts;  ///< owned; strings are interned
     Vec<Key> atoms;       ///< property and global names; each holds a count

@@ -244,6 +244,7 @@ JSFunction* VM::newFunction(JSObject* proto, CodeBlock* code, Box* const* upvalu
     ++code->refs;
     f->flags = JSFunction::kLazyProps | (code->constructor ? JSFunction::kConstructor : 0u);
     f->nUpvals = n;
+    functionMade(code, f);
     for (std::uint32_t i = 0; i < n; ++i) {
         f->upvals()[i] = upvalues[i];
         detail::incRef(reinterpret_cast<CellPtr>(upvalues[i]));
@@ -375,6 +376,32 @@ void VM::globalWritten(const JSValue* slot) noexcept
         ++globalEpoch;
     } else if ((w & kWatchWrites) < kWatchWrites) {
         ++w;
+    }
+}
+
+void VM::boxWritten(Box* box) noexcept
+{
+    std::uint8_t& w = box->h.aux;
+    if (w & Box::kWatched) {
+        w = std::uint8_t((w & ~Box::kWatched) | Box::kNotConstant);
+        ++globalEpoch;
+    } else if ((w & Box::kWrites) < Box::kWrites) {
+        ++w;
+    }
+}
+
+void VM::functionMade(CodeBlock* code, JSFunction* f) noexcept
+{
+    if (code->made == 0) {
+        code->made = 1;
+        code->only = f;
+        return;
+    }
+    code->made = 2;
+    code->only = nullptr;
+    if (code->singleAssumed) {
+        code->singleAssumed = false;
+        ++globalEpoch;
     }
 }
 

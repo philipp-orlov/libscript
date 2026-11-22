@@ -793,7 +793,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         }
         return {handOver(vm, res.bits), 1};
     }
-    CodeBlock* c = f->code;
+    JSFunction* const runs = construct && (f->code->flags & CodeBlock::kImplicit) ? constructorToRun(vm, f) : f;
+    CodeBlock* c = runs->code;
     if (c->mergedInto && !construct) [[unlikely]]
         c = mergedBlock(vm, f);
     if (c->flags & CodeBlock::kLazy)
@@ -811,7 +812,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     if (!c->tier1) {
         if (c->tier1Failed || !vm.tier1Threshold || ++c->hotness < vm.tier1Threshold)
             return {0, 0};
-        if (tierUpBlock(vm, f, c) != c)
+        if (tierUpBlock(vm, runs, c) != c)
             return {0, 0};
         compileTier1(vm, c);
         if (!c->tier1)
@@ -854,7 +855,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         setRegister(vm, newR[1 + c->nparams], toJSValue(argsArray));
     }
     *vm.frameTop++ =
-        Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, construct, true,
+        Frame{c, runs, nullptr, newR, std::uint16_t(ins->a), 0, argc, construct, true,
               isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
     // `new` runs the baseline code: optimized code is made for calls only.
     return {reinterpret_cast<std::uint64_t>(vm.frameTop - 1),

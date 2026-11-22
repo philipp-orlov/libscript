@@ -367,7 +367,6 @@ S("var p = {}; p.__proto__ = {z: 9}; p.z + ':' + ({}.__proto__ === Object.protot
 S("var o = {}; Object.defineProperty(o, 'a', {value: 1}); Object.isFrozen(Object.freeze({})) + ':' + Object.isSealed(Object.seal({a: 1})) + ':' + Object.hasOwn(o, 'a') + ':' + o.propertyIsEnumerable('a')")
 S("(function f(a, b) { return a + b; }).toString()")
 S("class K { m() { return 1; } } K.toString()")
-
 S("var m = /(\\d+)-(?<y>\\d+)/.exec('ab 12-34 cd'); [m[0], m[1], m.index, m.groups.y, m.input].join()")
 S("'a1b22c333'.replace(/\\d+/g, '#') + 'a1b22'.replace(/(\\d)(\\d)?/g, '[$1|$2]') + 'x'.replace(/x/, function(a) { return a + a; })")
 S("['a,b;c'.split(/[,;]/).join('|'), 'abc'.split(/(b)/).join('|'), 'abc'.split(/(?:)/).join('|'), 'a1b'.split(/\\d/, 1).join('|')].join()")
@@ -383,7 +382,6 @@ S("/^\\s*$/.test('  ') + ':' + /[a-z]+/i.exec('12Ab')[0] + ':' + 'x-y_z'.split(/
 S("var re = /a/g; re.lastIndex = 5; re.test('aaa') + ':' + re.lastIndex")
 S("'abc'.replace(/(?:)/g, '-')")
 S("'aaa'.lastIndexOf('a') + ':' + ' x '.replace(/^\\s+|\\s+$/g, '').length")
-
 S("class A { #x = 1; static #c = 10; #m() { return this.#x * 2; } get #g() { return this.#x + 100; } set #g(v) { this.#x = v; } static #sm() { return A.#c; } inc() { this.#x++; return this.#x; } call() { return this.#m(); } viaG() { this.#g = 7; return this.#g; } static has(o) { return #x in o; } static sm() { return A.#sm(); } } var a = new A(); [a.inc(), a.call(), a.viaG(), A.has(a), A.has({}), A.sm()].join()")
 S("class A { #x = 1; inc() { return this.#x; } } var r; try { A.prototype.inc.call({}); } catch (e) { r = e.name; } r")
 S("class A { #x = 1; y = 2; } var a = new A(); JSON.stringify(a) + Object.keys(a).length + Object.getOwnPropertyNames(a).length")
@@ -393,10 +391,8 @@ S("class A { m() { return 'A'; } get g() { return 5; } } class B extends A { m()
 S("var o = { __proto__: { hi() { return 'hi'; } }, hi() { return (() => super.hi())() + '!'; } }; o.hi()")
 S("class A { static #count = 0; static next() { return ++A.#count; } } A.next() + A.next()")
 S("class A { #a = 1; #b = this.#a + 1; get() { return this.#a + this.#b; } } new A().get()")
-
 S("function mk(x) { class K { constructor() { this.v = x; } get() { return x + 1; } } return new K(); } var k = mk(5); k.v + ':' + k.get()")
 S("function mk(x) { return class extends Object { constructor() { super(); this.v = x; } }; } new (mk(3))().v")
-
 S("var a = 2n ** 100n; [a, a + 1n, a * a, a / 3n, a % 7n, -a, ~5n, 5n << 70n, a >> 90n, typeof a].join()")
 S("[1n < 2n, 2n > 1, 1n == 1, 1n === 1, '5' == 5n, 10n > 9.5, 0n ? 't' : 'f', BigInt(10) + BigInt('20'), BigInt.asUintN(8, 257n)].join()")
 S("var x = 5n; x++; x += 2n; [x, x.toString(2), (255n).toString(16), Number(2n ** 53n), String(7n), `${8n}`, 0x1fn, 1_000n].join()")
@@ -407,7 +403,6 @@ S("var m = new Map([[1n, 'a']]); m.get(1n) + [3n, 1n, 2n].sort().join()")
 S("(2n ** 64n - 1n === BigInt.asUintN(64, -1n)) + ':' + BigInt.asIntN(8, 255n)")
 S("var f = 1n; for (var i = 1n; i <= 25n; i++) f *= i; f.toString()")
 S("-(2n ** 63n) < 0 && 0n === -0n && (3n > 2n) && (2n >= 2n) && !(2n < 2n)")
-
 S("var d = new Date(2020, 1, 29, 12, 30, 45, 123); [d.getFullYear(), d.getMonth(), d.getDate(), d.getDay(), d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds()].join()")
 S("var d = new Date(Date.UTC(2020, 1, 29, 12, 30, 45, 123)); [d.toISOString(), d.toUTCString(), JSON.stringify(d), d.getTime() === +d].join()")
 S("[new Date('2021-03-04T05:06:07Z').getTime(), Date.UTC(2000, 0, 1), new Date(NaN).getTime(), String(new Date(NaN))].join()")
@@ -416,7 +411,6 @@ S("[Date.parse('Thu, 01 Jan 1970 00:00:00 GMT'), typeof Date.now(), Date.length,
 S("var d = new Date(2020, 0, 31); d.setMonth(1); [d.getMonth(), d.getDate()].join()")
 S("var r; try { new Date(NaN).toISOString(); } catch (e) { r = e.name; } r")
 S("typeof Date() + ':' + (new Date(5) < new Date(6)) + ':' + (new Date(5) == new Date(5))")
-
 S("var b = new ArrayBuffer(8); var i = new Int32Array(b); i[1] = -1; var u = new Uint8Array(b, 4, 2); u[0] + ',' + u.length + ',' + new DataView(b).getInt32(4, true)")
 S("var f = new Float64Array([1.5, 2.5, 3.5]); [f.length, f[1], f.map(function(x) { return x * 2; }).join(), f.subarray(1).join(), Array.from(f).join(), [...f].join()].join('|')")
 S("var c = new Uint8ClampedArray([300, -5, 1.5, 2.5]); [c.join(), new Int8Array([200]).join(), new Uint16Array(3).fill(7).join()].join('|')")
@@ -433,7 +427,6 @@ S("var r; try { new Uint8Array(-1); } catch (e) { r = e.name; } try { new Int32A
 S("var x = new Uint8Array(3); x[5] = 1; x['1'] = 7; x.foo = 2; [x.join(), x.length, x.foo].join()")
 S("new Uint8Array([3, 1, 2]).sort(function(a, b) { return b - a; }).join()")
 S("var a = new Uint8Array([1, 2, 3, 4]); var r = []; for (var k in a) r.push(k); r.join() + a.filter(function(x) { return x % 2; }).join()")
-
 S("var log = []; var itb = {[Symbol.iterator]() { return {next() { return {value: 1, done: false}; }, return() { log.push('r'); return {}; }}; }}; for (var v of itb) break; var [q] = itb; function f() { for (var v of itb) { return 5; } } f(); try { for (var v of itb) { throw new Error('x'); } } catch (e) { log.push(e.message); } log.join()")
 S("function* f() { try { yield 1; } finally { yield 2; } } var i = f(); i.next(); var a = i.return(9); var b = i.next(); a.value + ':' + b.value + ':' + b.done + ':' + i.next().done")
 S("function* f() { try { yield 1; } catch (e) { yield 'caught'; } finally { } } var i = f(); i.next(); var r = i.return(3); r.value + ':' + r.done")
@@ -442,7 +435,6 @@ S("[[1, 2, 3, 1].lastIndexOf(1, -2), [1, 2, 3, 1].lastIndexOf(1, 0), [1, 2, 3].l
 S("Array.prototype.slice.call({length: 3, 0: 'a', 1: 'b', 2: 'c'}, 1).join() + Array.prototype.map.call('abc', function(c) { return c + c; }).join()")
 S("var fe = function me() { me = 1; return typeof me; }; fe()")
 S("var fe = function me() { 'use strict'; try { me = 1; } catch (e) { return e.name; } return 'no'; }; fe()")
-
 S("var p = new Proxy({a: 1}, {get(t, k) { return k in t ? t[k] : 42; }, set(t, k, v) { t[k] = v * 2; return true; }}); p.b = 5; [p.a, p.x, p.b].join()")
 S("var f = new Proxy(function(a, b) { return a + b; }, {apply(t, self, args) { return t(...args) * 10; }}); typeof f + f(1, 2)")
 S("var r = Proxy.revocable({}, {}); r.revoke(); var n; try { r.proxy.x; } catch (e) { n = e.name; } n")
@@ -586,3 +578,4 @@ S("class A { #x = 1; constructor(v) { this._y = v; } get x() { return this.#x; }
 S("function thrower(i) { if (i % 7 === 3) throw i; return i; } function f(n) { var s = 0, last = 'none', d = 0.5; for (var i = 0; i < n; i++) { try { d = d + 1.5; last = 'a' + i; s += thrower(i); last = 'ok' + i; } catch (e) { s += e * 100; last = last + '!' + d; } } return s + last; } function g(n) { var out = []; for (var i = 0; i < n; i++) { var x = i, y = { v: i }; try { x = x * 2; y = thrower(i); x = x + 1; } catch (e) { out.push(x, y.v); } finally { x++; } out.push(x); } return out.join(); } function h(o) { try { return o.a.b.c; } catch (e) { return e.name; } } function nest(n) { var r = []; for (var i = 0; i < n; i++) { try { try { r.push(thrower(i)); } finally { r.push('f' + i); } } catch (e) { r.push('c' + e); } } return r.join(); } function loop(n) { var k = 0; try { for (var i = 0; i < n; i++) { k = i; if (i === 50) null.x; } } catch (e) { return k + ':' + i; } return k; } function ret(n) { for (var i = 0; i < n; i++) { try { if (i > 5) return i; } finally { if (i === 6) n = 100; } } } function cls(n) { var fs = []; for (let i = 0; i < n; i++) { try { fs.push(function () { return i; }); if (i === 2) throw 1; } catch (e) { fs.push(function () { return -i; }); } } return fs.map(function (q) { return q(); }).join(); } function args() { var t = 0; for (var i = 0; i < arguments.length; i++) t += arguments[i]; arguments[0] = 9; return t + arguments.length; } function sargs(a, b) { arguments[0] = 5; return a + '|' + b + '|' + arguments.length; } function rest(a, ...r) { return a + r.length; } class A { constructor(x) { this.x = x; } m() { return this.x; } static s() { return 's'; } } class B extends A { constructor(x) { super(x + 1); this.y = 2; } m() { return super.m() * 2; } static s() { return super.s() + 'b'; } g(k) { return super['m']() + k; } } class C extends B { constructor(...a) { super(...a); } } class D extends A {} function sp(a) { return Math.max(...a) + new A(...a).x + args(...a); } var res = []; for (var j = 0; j < 400; j++) { res = [f(20), g(10), h({ a: { b: { c: 1 } } }), h({}), nest(12), loop(60), loop(40), ret(10), cls(4), args(1, 2, 3), rest(1, 2, 3), new B(3).m(), B.s(), new C(4).g(1), new D(7).m(), sp([1, 5, 3])]; } res.join('|') ")
 S("function thrower(i, m) { if (i % m === 3) throw { v: i }; return i; } function f(n) { var c = 0, s = '', d = 0, o = null, u, b = true; for (var i = 0; i < n; i++) { try { d += thrower(i, 7); } catch (e) { c++; s = s + 'x'; o = e; u = i; b = !b; d = d + 0.5; } } return [c, s.length, d, o && o.v, u, b].join(); } function g(n) { var c = 0; for (var i = 0; i < n; i++) { for (var j = 0; j < 5; j++) { try { thrower(j, 5); } catch (e) { c += e.v; continue; } finally { c += 1; } if (j === 4) break; } } return c; } function h(n) { var c = 0; for (var i = 0; i < n; i++) { c = 0; try { c = 1; thrower(i, 4); c = 2; } catch (e) { c = c + 10; } } return c; } function k(a) { var r = []; for (var i = 0; i < a.length; i++) { var t = 'n'; try { t = a[i].p.q; } catch (e) { t = e.name; } r.push(t); } return r.join(); } var out = []; for (var q = 0; q < 300; q++) out = [f(40), g(10), h(8), h(7), k([{ p: { q: 1 } }, {}, null, { p: {} }])]; out.join('|') + '|' + [f(3000), g(1000), h(3004)].join('|') ")
 S("function pick(a, b) { if (a > 1000) throw new Error('big ' + a); return a - b; } function run(n) { var caught = 0, objs = 0;  for (var i = 0; i < n; i++) { try { objs += pick(i & 2047, 1); } catch (e) { caught++; } }  return [caught, objs].join(','); } var out = []; for (var k = 0; k < 6; k++) out.push(run(3000)); out.join('|') ")
+S("function P(a, b) { this.a = a; this.b = b; if (a > 1000) return { alt: a }; if (a === 999) return 5; } class Q { constructor(x) { this.x = x; for (var i = 0; i < 3; i++) this.x += i; } } class R extends Q { constructor(x, r) { super(x); this.y = this.x * 2; if (r) return { odd: 1 }; } } class S extends R { } class T extends Q { constructor(n) { if (n < 0) return Object.create(T.prototype); super(n); } } class F extends Q { z = 5; #w = 7; constructor(x) { super(x); this.k = this.#w + this.z; } } function N() { if (!new.target) return new N(); this.n = 1; } function sub() { return Reflect.construct(Q, [1], R).constructor.name; } function bad() { class B extends Q { constructor() { } } try { new B(); } catch (e) { return e.name; } } function bad2() { class B extends Q { constructor() { super(1); super(2); } } try { new B(); } catch (e) { return e.name; } } function bad3() { class B extends Q { constructor() { super(1); return 4; } } try { new B(); } catch (e) { return e.name; } } function th(i) { class U { constructor() { this.v = i; if (i % 50 === 49) throw new Error('u' + i); } } try { return new U().v; } catch (e) { return e.message; } } var r; for (var i = 0; i < 3000; i++) { var p = new P(i, 2), q = new Q(i), s = new R(i), u = new S(i, i % 7 === 0), t = new T(i % 2 ? i : -1), f = new F(i), n = N(); r = [p.a, p.alt, p.b, new P(999, 1).a, q.x, s.y, u.odd, u.y, t.x, f.k, f.z, n.n, new R(1, 1).odd, P.call({}, 1001, 2).alt]; } [r.join(), sub(), bad(), bad2(), bad3(), th(1), th(49), new P(1001, 1).alt, new S(3) instanceof S, new T(-1) instanceof T].join('|') ")

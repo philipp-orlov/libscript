@@ -220,6 +220,7 @@ struct CodeBlock
         kNoThis = 1024,   ///< never reads `this` (found when the baseline code is made): a call need not make one
         kRestOnly = 4096,  ///< with `kNeedsArgs`: the register holds the rest parameter's array itself (nothing else uses `arguments`)
         kPrivate = 2048,  ///< names a private member: its element sites keep a `PrivateCache` each
+        kImplicit = 16384,  ///< the constructor a class with `extends` gets without writing one: it passes its arguments on
         kLazy = 8192,     ///< a stub: the header and the upvalues are made, `code` is empty until `ensureCompiled` compiles it
     };
 

@@ -1934,7 +1934,8 @@ std::uint16_t Compiler::classExpr(const Node& cls, int dst, const String& inferr
     }
     if (ctorFn->isAsync || ctorFn->isGenerator)
         unsupported(*ctorFn, "this constructor");
-    pendingFlags_ = std::uint32_t(CodeBlock::kClassConstructor) | (derived ? std::uint32_t(CodeBlock::kDerived) : 0u);
+    pendingFlags_ = std::uint32_t(CodeBlock::kClassConstructor) | (derived ? std::uint32_t(CodeBlock::kDerived) : 0u) |
+                    (derived && !ctor ? std::uint32_t(CodeBlock::kImplicit) : 0u);
     CodeBlock* ctorCode = compileFunction(*ctorFn, name);
     if (cls.srcEnd) {
         // A class's text is its constructor's.

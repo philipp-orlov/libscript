@@ -3273,6 +3273,11 @@ do_call: {
     }
     TICK();
     SCRIPT_VM_CENSUS(ScriptCalls);
+    if ((isNew || isSuper) && (f->code->flags & CodeBlock::kImplicit)) {
+        f = constructorToRun(vm, f);
+        if ((f->code->flags & CodeBlock::kLazy) && !vm.ensureCompiled(f->code))
+            FAIL();
+    }
     CodeBlock* c = f->code;
     if ((c->flags & CodeBlock::kClassConstructor) && !isNew && !isSuper) [[unlikely]] {
         vm.throwError(ErrorCode::TypeError, "class constructor " + (c->name ? toUtf8(static_cast<StringCell*>(c->name)->text()) : std::string()) +
@@ -4032,6 +4037,22 @@ bool megaGet(VM& vm, JSObject* o, Key key, JSValue* out) noexcept
         return false;
     *out = e.index == VM::kMegaAbsent ? JSValue::undefined() : *(e.holder ? e.holder : o)->slotAt(e.index);
     return true;
+}
+
+JSFunction* constructorToRun(VM& vm, JSFunction* f)
+{
+    while (!(f->flags & JSFunction::kNative) && (f->code->flags & CodeBlock::kImplicit)) {
+        if (Rare* r = f->rare(); r && isFunction(r->fieldInit))
+            break;
+        JSObject* p = f->proto(vm);
+        if (!p || !isFunction(toJSValue(p)) || proxyOf(p))
+            break;
+        auto* up = static_cast<JSFunction*>(p);
+        if ((up->flags & JSFunction::kNative) || !up->code->constructor)
+            break;
+        f = up;
+    }
+    return f;
 }
 
 JSValue getPropertyMega(VM& vm, JSValue base, Key key)

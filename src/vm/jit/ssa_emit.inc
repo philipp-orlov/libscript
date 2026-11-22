@@ -1656,13 +1656,16 @@ bool Baseline::ssaGetProp(std::uint32_t i)
     std::vector<Label> at(es.size());
     Label done;
     if (!vShape_[v]) {
-        for (std::size_t k : emit) {
-            a_.cmpI32(mem(RAX, 0), std::int32_t(es[k].shape));
-            a_.jcc(CE, at[k]);
+        for (std::size_t n = 0; n + 1 < emit.size(); ++n) {
+            a_.cmpI32(mem(RAX, 0), std::int32_t(es[emit[n]].shape));
+            a_.jcc(CE, at[emit[n]]);
         }
-        a_.jmp(bad);
+        a_.cmpI32(mem(RAX, 0), std::int32_t(es[emit.back()].shape));
+        a_.jcc(CNE, bad);
+        std::rotate(emit.begin(), emit.end() - 1, emit.end());  // the last test falls into its own
     }
-    for (std::size_t k : emit) {
+    for (std::size_t n = 0; n < emit.size(); ++n) {
+        const std::size_t k = emit[n];
         a_.bind(at[k]);
         const ReadEntry& e = es[k];
         if (e.holder || (e.absent && e.validity)) {
@@ -1679,7 +1682,8 @@ bool Baseline::ssaGetProp(std::uint32_t i)
             slotAddress(e.index);
             a_.mov(RAX, mem(RDX, 0));
         }
-        a_.jmp(done);
+        if (n + 1 < emit.size())
+            a_.jmp(done);
     }
     a_.bind(done);
     if (emit.size() == 1)

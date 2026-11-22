@@ -2779,7 +2779,7 @@ private:
     void putProp(std::uint32_t i, const Ins& in);
     void getElem(std::uint32_t i, const Ins& in);
     void getSuperProp(std::uint32_t i, const Ins& in);
-    void getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e);
+    void getterCall(std::uint32_t i, const Ins& in, const PolyCache& e);
     void putElem(std::uint32_t i, const Ins& in);
     void defPrivate(std::uint32_t i, const Ins& in);
     void cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
@@ -4612,10 +4612,13 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         }
     }
     if (count == 0 && !isLength && ic && ic->shape == 0 && ic->pad && ic->pad <= code_->poly.size()) {
-        // A getter the site always finds in the same place: called like a script function, without the runtime.
+        // Getters, found where the site has found them: called like script functions, without the runtime.
         const PolyCache& pc = code_->poly[ic->pad - 1];
-        if (pc.n == 1 && (pc.e[0].kind == PolyEntry::OwnAccessor || (pc.e[0].kind == PolyEntry::ProtoAccessor && pc.e[0].validity))) {
-            getterCall(i, in, pc.e[0]);
+        bool getters = pc.n > 0;
+        for (std::uint8_t k = 0; k < pc.n; ++k)
+            getters = getters && (pc.e[k].kind == PolyEntry::OwnAccessor || (pc.e[k].kind == PolyEntry::ProtoAccessor && pc.e[k].validity));
+        if (getters) {
+            getterCall(i, in, pc);
             return;
         }
     }
@@ -4890,7 +4893,7 @@ void Baseline::cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic,
     deliver(i, in.a);
 }
 
-void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
+void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyCache& pc)
 {
     sideDoor();
     // The getter's frame goes above this function's registers: `this` (not counted: the receiver register holds it until
@@ -4902,17 +4905,27 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyEntry& e)
     savePool(i);
     a_.mov(RAX, R(in.b));
     needObject(RAX, bad);
-    a_.cmpI32(mem(RAX, 0), std::int32_t(e.shape));
-    a_.jcc(CNE, bad);
-    if (e.holder) {
-        hold(e.validity);
-        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(e.validity));
-        a_.cmpI32(mem(RCX, kValidityValid), 0);
-        a_.jcc(CE, bad);
-        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(e.holder));
+    Label found;
+    for (std::uint8_t k = 0; k < pc.n; ++k) {
+        const PolyEntry& e = pc.e[k];
+        Label next;
+        const bool last = k + 1 == pc.n;
+        a_.cmpI32(mem(RAX, 0), std::int32_t(e.shape));
+        a_.jcc(CNE, last ? bad : next);
+        if (e.holder) {
+            hold(e.validity);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(e.validity));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, bad);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(e.holder));
+        }
+        slotAddress(e.index);
+        a_.mov(RAX, mem(RDX, 0));
+        if (!last)
+            a_.jmp(found);
+        a_.bind(next);
     }
-    slotAddress(e.index);
-    a_.mov(RAX, mem(RDX, 0));
+    a_.bind(found);
     a_.mov(RAX, mem(RAX, kGsGetter));
     needObject(RAX, bad);
     a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));

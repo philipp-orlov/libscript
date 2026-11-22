@@ -376,9 +376,25 @@ void VM::destroy(CellPtr cell) noexcept
         return;
     }
     destroying_ = true;
+    Freed freed;
+    destroyFrom(cell, freed);
+    countFreed(freed);
+    destroying_ = false;
+}
+
+void VM::countFreed(const Freed& f) noexcept
+{
+    ctx.heapBytes -= f.bytes;
+    ownedBytes_ -= f.bytes;
+    ctx.liveObjects -= f.cells;
+    liveCells -= f.cells;
+}
+
+inline void VM::destroyFrom(CellPtr cell, Freed& total) noexcept
+{
     // A plain object whose properties are all in its cell -- a tree's node, a record -- is freed here, its counters summed
     // and set once at the end, and the first of its values it frees is freed next without going through `pending_`.
-    std::size_t bytesFreed = 0, cellsFreed = 0, freed = 0;
+    std::size_t freed = 0;
     CellPtr next = cell;
     for (;;) {
         CellPtr follow = nullptr;
@@ -409,8 +425,8 @@ void VM::destroy(CellPtr cell) noexcept
             }
             const std::size_t bytes = JSObject::bytesFor(hd->aux);
             heap.deallocate(next, bytes);
-            bytesFreed += bytes;
-            ++cellsFreed;
+            total.bytes += bytes;
+            ++total.cells;
         } else {
             destroyNow(next);
         }
@@ -441,11 +457,6 @@ void VM::destroy(CellPtr cell) noexcept
         next = pending_.back();
         pending_.pop_back();
     }
-    ctx.heapBytes -= bytesFreed;
-    ownedBytes_ -= bytesFreed;
-    ctx.liveObjects -= cellsFreed;
-    liveCells -= cellsFreed;
-    destroying_ = false;
 }
 
 namespace {
@@ -774,8 +785,17 @@ void VM::freeZct() noexcept
         if (detail::cellCount(c) == 0)
             zctOld_[keptOld++] = c;
     }
-    for (std::size_t k = 0; k < kept; ++k)
-        destroy(zctBase_[k]);
+    if (kept && !destroying_ && !tearingDown) {
+        destroying_ = true;
+        Freed freed;
+        for (std::size_t k = 0; k < kept; ++k)
+            destroyFrom(zctBase_[k], freed);
+        countFreed(freed);
+        destroying_ = false;
+    } else {
+        for (std::size_t k = 0; k < kept; ++k)
+            destroy(zctBase_[k]);
+    }
     for (std::size_t k = 0; k < keptOld; ++k)
         detail::destroyUnreferenced(zctOld_[k]);
     zctOld_.clear();

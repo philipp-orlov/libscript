@@ -645,6 +645,14 @@ private:
     void releaseShapeId(std::uint32_t id) noexcept;
 
     void destroyNow(CellPtr cell) noexcept;
+    /// What a run of frees let go of, summed and counted once at its end.
+    struct Freed
+    {
+        std::size_t bytes = 0, cells = 0;
+    };
+    /// Frees `cell` and what it alone held.
+    void destroyFrom(CellPtr cell, Freed& total) noexcept;
+    void countFreed(const Freed& f) noexcept;
     friend struct Shape;
 };
 

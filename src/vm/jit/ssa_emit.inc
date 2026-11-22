@@ -1133,6 +1133,8 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                     ssaGeneric(i, liveAfter[b][k]);
                 } else if (JSFunction* f = mathOf_[i]) {
                     ssaMathCall(i, f);
+                } else if (JSFunction* f = viewOf_[i]) {
+                    ssaViewCall(i, f);
                 } else if (JSFunction* f = ssaCharCodeCallee(i)) {
                     ssaCharCode(i, f);
                 } else {
@@ -3037,6 +3039,210 @@ void Baseline::ssaMathCall(std::uint32_t i, JSFunction* f)
     defDouble();
 }
 
+JSFunction* Baseline::ssaViewCallee(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || in.opcode() != Op::Call || in.c < 1 || in.c > 3 || !Asm::kFpMath ||
+        (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return nullptr;
+    for (std::uint32_t j = i; j-- > 0;) {
+        if (code_->code[j].opcode() == Op::Cache)
+            continue;
+        const opt::Effects e = opt::effectsOf(*code_, j);
+        if (std::find(e.wr.begin(), e.wr.end(), std::uint16_t(in.b)) == e.wr.end())
+            continue;
+        const Ins& r = code_->code[j];
+        if (r.opcode() != Op::GetProp || r.a != in.b)
+            return nullptr;
+        // The method the read found on a prototype (its cache), or on the prototype of a DataView it ran on.
+        JSValue fv = JSValue::undefined();
+        for (const ReadEntry& e : ssaReadEntries(j)) {
+            if (!e.holder || e.absent)
+                return nullptr;
+            const JSValue v = *e.holder->slotAt(e.index);
+            if (!fv.isUndefined() && v != fv)
+                return nullptr;
+            fv = v;
+        }
+        if (fv.isUndefined()) {
+            const JSValue base = guessBefore(j, r.b);
+            if (!isObject(base) || asObject(base)->cls() != ObjClass::DataView)
+                return nullptr;
+            JSObject* p = asObject(base)->proto(vm_);
+            std::uint8_t attrs = 0;
+            JSValue* slot = p ? p->findOwn(vm_, code_->atoms[r.c], &attrs) : nullptr;
+            if (!slot || (attrs & attr::kAccessor))
+                return nullptr;
+            fv = *slot;
+        }
+        if (!isFunction(fv))
+            return nullptr;
+        auto* f = static_cast<JSFunction*>(asObject(fv));
+        if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != dataViewAccessNative())
+            return nullptr;
+        const auto bits = reinterpret_cast<std::intptr_t>(f->rare()->nativeData);
+        const ElemKind k = ElemKind(bits & 255);
+        const bool set = (bits & 256) != 0;
+        if (k == ElemKind::BigInt64 || k == ElemKind::BigUint64 || k == ElemKind::Float16 || in.c < (set ? 2u : 1u))
+            return nullptr;
+        return f;
+    }
+    return nullptr;
+}
+
+/// `view.getFloat64(i, little)` and the others (`ssaViewCallee`): the callee checked, a DataView that does not follow its
+/// buffer's size, an index in it, the bytes read or written here. Anything else leaves.
+void Baseline::ssaViewCall(std::uint32_t i, JSFunction* f)
+{
+    const Ins& in = code_->code[i];
+    holdValue(toJSValue(f));
+    Label& bad = ssaExit(i);
+    const auto bits = reinterpret_cast<std::intptr_t>(f->rare()->nativeData);
+    const ElemKind kind = ElemKind(bits & 255);
+    const bool set = (bits & 256) != 0;
+    const int size = int(kElemSize[std::size_t(kind)]);
+    const bool flt = kind == ElemKind::Float32 || kind == ElemKind::Float64;
+    const std::uint32_t vf = name_[in.b], vo = name_[in.b + 1u], vi = name_[in.b + 2u];
+    const std::uint32_t vx = set ? name_[in.b + 3u] : ssa::kNone;
+    const unsigned littleAt = set ? 3u : 2u;
+    const std::uint32_t vl = in.c > littleAt - 1 ? name_[in.b + 1u + littleAt] : ssa::kNone;
+    if (!(sval_[vf].isConst && sval_[vf].bits == toJSValue(f).bits)) {
+        loadValue(vf, RAX);
+        a_.movImm(RCX, toJSValue(f).bits);
+        a_.cmp(RAX, RCX);
+        a_.jcc(CNE, bad);
+    }
+    // The order: a constant, or a boolean at run time (anything else leaves).
+    int little = 0;  // 1 little, -1 big, 0 in rdi (0 big)
+    if (vl == ssa::kNone) {
+        little = -1;
+    } else if (sval_[vl].isConst) {
+        const JSValue k = JSValue::raw(sval_[vl].bits);
+        if (!k.isBool()) {
+            a_.jmp(bad);
+            return;
+        }
+        little = k.asBool() ? 1 : -1;
+    } else {
+        loadValue(vl, RDI);
+        a_.mov(RDX, RDI);
+        a_.aluI(4, RDX, -2);
+        a_.cmpI(RDX, std::int32_t(kFalse));
+        a_.jcc(CNE, bad);
+        a_.aluI32(4, RDI, 1);
+    }
+    // The value to store, first (it may leave), kept in xmm0 meanwhile.
+    if (set) {
+        if (flt) {
+            loadF64(vx, 0, &bad);
+            if (kind == ElemKind::Float32)
+                a_.cvtsd2ss(0, 0);
+        } else {
+            loadToInt32(vx, RAX, bad);
+            a_.movqToX(0, RAX);
+        }
+    }
+    const Reg index = i32Reg(vi, RCX, &bad);
+    a_.test32(index, index);
+    a_.jcc(CS, bad);
+    const Reg o = valueReg(vo);
+    needObjV(vo, o, bad);
+    a_.cmpI8(mem(o, kHdrCls), std::uint8_t(ObjClass::DataView));
+    a_.jcc(CNE, bad);
+    a_.testI8(mem(o, kHdrFlags), cellflags::kHasRare);
+    a_.jcc(CE, bad);
+    a_.mov(RSI, mem(o, kObjSlots));
+    a_.mov(RSI, mem(RSI, -16));
+    a_.mov(RSI, mem(RSI, kRareExt));  // the ViewState
+    a_.cmpI8(mem(RSI, kViewTracking), 0);
+    a_.jcc(CNE, bad);
+    // index + size <= length, the view within its buffer, the buffer there.
+    a_.mov32(RDX, index);
+    a_.aluI(0, RDX, size);
+    a_.mov32(RAX, mem(RSI, kViewLength));
+    a_.cmp(RDX, RAX);
+    a_.jcc(CA, bad);
+    a_.mov(RDX, mem(RSI, kViewBuffer));
+    a_.test(RDX, R15);
+    a_.jcc(CNE, bad);
+    a_.mov(RDX, mem(RDX, kObjSlots));
+    a_.mov(RDX, mem(RDX, -16));
+    a_.mov(RDX, mem(RDX, kRareExt));  // the BufferState
+    a_.cmpI8(mem(RDX, kBufferDetached), 0);
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RSI, kViewOffset));
+    a_.alu(0, RAX, RSI);
+    a_.alu(7, RAX, mem(RDX, kBufferSize));
+    a_.jcc(CA, bad);
+    a_.mov(RDX, mem(RDX, kBufferData));
+    a_.alu(0, RDX, RSI);
+    const Mem place = ssaIndexed(RDX, index, 1);
+    auto order = [&](Reg r) {
+        if (size == 1 || little == 1)
+            return;
+        if (little == -1) {
+            a_.bswap(r, size);
+            return;
+        }
+        Label keep;
+        a_.test32(RDI, RDI);
+        a_.jcc(CNE, keep);
+        a_.bswap(r, size);
+        a_.bind(keep);
+    };
+    if (set) {
+        if (size == 4)
+            a_.movdFromX(RAX, 0);
+        else
+            a_.movqFromX(RAX, 0);
+        order(RAX);
+        switch (size) {
+        case 1: a_.mov8(place, RAX); break;
+        case 2: a_.mov16(place, RAX); break;
+        case 4: a_.mov32(place, RAX); break;
+        default: a_.mov(place, RAX); break;
+        }
+        a_.movImm(RAX, kUndefined);
+        ssaDef(i, kVNotCell);
+        return;
+    }
+    switch (size) {
+    case 1: if (kind == ElemKind::Int8) a_.movsx8(RAX, place); else a_.movzx8(RAX, place); break;
+    case 2: a_.movzx16(RAX, place); break;
+    case 4: a_.mov32(RAX, place); break;
+    default: a_.mov(RAX, place); break;
+    }
+    order(RAX);
+    const std::uint32_t def = ssa_->defBase[i];
+    if (flt) {
+        if (kind == ElemKind::Float32) {
+            a_.movdToX(0, RAX);
+            a_.cvtss2sd(0, 0);
+        } else {
+            a_.movqToX(0, RAX);
+        }
+        boxNumber0();
+        ssaDef(i, kVNotCell);
+        return;
+    }
+    if (kind == ElemKind::Uint32) {
+        a_.mov32(RAX, RAX);
+        a_.cvtsi2sd64(0, RAX);
+        boxNumber0();
+        ssaDef(i, kVNotCell);
+        return;
+    }
+    if (kind == ElemKind::Int16)
+        a_.sext16(RAX);
+    if (sval_[def].rep == kRepI32) {
+        ssaDefI32(i);
+    } else {
+        a_.mov32(RAX, RAX);
+        a_.or_(RAX, R14);
+        ssaDef(i, kVInt | kVNotCell);
+    }
+}
+
 bool Baseline::ssaLengthSite(std::uint32_t i) const
 {
     const Ins& in = code_->code[i];
@@ -3642,7 +3848,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     switch (op) {
     case Op::GetProp: return !ssaReadEntries(i).empty() || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
     case Op::New: return ssaNewPlan(i, nullptr);
-    case Op::Call: return mathOf_[i] != nullptr || ssaCharCodeCallee(i) != nullptr;
+    case Op::Call: return mathOf_[i] != nullptr || viewOf_[i] != nullptr || ssaCharCodeCallee(i) != nullptr;
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
     case Op::InitProp: return ssaAddFast(i);
     case Op::GetGlobal: return sval_[ssa_->defBase[i]].isConst || ssaGlobalFast(i);
@@ -3757,6 +3963,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     }
     // The kind a value that is a base of typed elements has (the first place that says decides); calls of `Math`.
     mathOf_.assign(n_, nullptr);
+    viewOf_.assign(n_, nullptr);
     for (std::uint32_t b = 1; b < nb; ++b) {
         const ssa::Block& bl = g.blocks[b];
         if (!bl.reached)
@@ -3771,8 +3978,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 if (v != ssa::kNone && typedKind_[v] == 0xFF)
                     typedKind_[v] = std::uint8_t(kind);
             }
-            if (op == Op::Call)
+            if (op == Op::Call) {
                 mathOf_[i] = ssaMathCallee(i, names[in.b]);
+                viewOf_[i] = mathOf_[i] ? nullptr : ssaViewCallee(i);
+            }
             if (op == Op::Mov) {
                 names[in.a] = names[in.b];
                 continue;
@@ -3850,6 +4059,12 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : elemRep[sv.at];
             if (ssaOn_ >= 2 && cls[v] == 3 && (ssaLengthSite(sv.at) || ssaCharCodeCallee(sv.at)))
                 cls[v] = 1;  // an int32 when it does not leave
+            if (JSFunction* f = viewOf_[sv.at]) {
+                const auto bits = reinterpret_cast<std::intptr_t>(f->rare()->nativeData);
+                const ElemKind k = ElemKind(bits & 255);
+                const std::uint8_t p = sv.at < code_->prof.size() ? code_->prof[sv.at] : 0;
+                cls[v] = (bits & 256) ? 3 : k == ElemKind::Float32 || k == ElemKind::Float64 || k == ElemKind::Uint32 ? 3 : p == 1 || p == 0 ? 1 : 3;
+            }
             if (JSFunction* f = mathOf_[sv.at]) {
                 // A double only where results are seldom integers: a boxed double that is one would make int32 sites leave.
                 const std::uint8_t p = sv.at < code_->prof.size() ? code_->prof[sv.at] : 0;

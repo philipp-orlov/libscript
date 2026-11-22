@@ -1355,6 +1355,18 @@ public:
     }
     /// Whether the machine rounds, and takes the less or the greater of two doubles, as JavaScript does.
     static constexpr bool kFpMath = true;
+    /// The low `bytes` (2, 4 or 8) of `r` in the other order; above them, zero (2, 4) .
+    void bswap(Reg r, int bytes)
+    {
+        const std::uint32_t x = std::uint32_t(X(r));
+        ins((bytes == 8 ? 0xDAC00C00u : bytes == 4 ? 0x5AC00800u : 0x5AC00400u) | (x << 5) | x);
+        if (bytes == 2)
+            ins(0x12003C00u | (x << 5) | x);  // and w, w, #0xffff
+    }
+    void sext16(Reg r) { ins(0x13003C00u | (std::uint32_t(X(r)) << 5) | std::uint32_t(X(r))); }
+    void sext8(Reg r) { ins(0x13001C00u | (std::uint32_t(X(r)) << 5) | std::uint32_t(X(r))); }
+    void movdToX(int x, Reg r) { ins(0x1E270000u | (std::uint32_t(X(r)) << 5) | std::uint32_t(V(x))); }
+    void movdFromX(Reg r, int x) { ins(0x1E260000u | (std::uint32_t(V(x)) << 5) | std::uint32_t(X(r))); }
     void floorsd(int x, int y) { ins(0x1E654000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
     void ceilsd(int x, int y) { ins(0x1E64C000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }
     void truncsd(int x, int y) { ins(0x1E65C000u | (std::uint32_t(V(y)) << 5) | std::uint32_t(V(x))); }

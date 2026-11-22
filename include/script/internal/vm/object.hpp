@@ -333,6 +333,22 @@ struct BufferState : NativeState
     void refreshViews() noexcept;
 };
 
+/// A DataView's (`Rare::ext`).
+struct ViewState : NativeState
+{
+    JSValue buffer = JSValue::undefined();
+    std::uint32_t offset = 0, length = 0;
+    bool tracking = false;  ///< made without a length on a resizable buffer: it follows the buffer's size
+    ~ViewState() override { release(buffer); }
+    void clear(VM&) noexcept override
+    {
+        release(buffer);
+        buffer = JSValue::undefined();
+        length = 0;
+    }
+    void values(Vec<JSValue>& out) const override { out.push_back(buffer); }
+};
+
 /// Take a typed array off its buffer's list of views.
 void forgetView(JSTypedArray* view) noexcept;
 

@@ -381,20 +381,6 @@ NATIVE(typedGetter)
 
 // ----------------------------------------------------------------- DataView ---
 
-struct ViewState : NativeState
-{
-    JSValue buffer = JSValue::undefined();
-    std::uint32_t offset = 0, length = 0;
-    bool tracking = false;  ///< made without a length on a resizable buffer: it follows the buffer's size
-    ~ViewState() override { release(buffer); }
-    void clear(VM&) noexcept override
-    {
-        release(buffer);
-        buffer = JSValue::undefined();
-        length = 0;
-    }
-    void values(Vec<JSValue>& out) const override { out.push_back(buffer); }
-};
 
 /// The view as the buffer is now: false when it no longer fits (or the buffer is gone).
 bool viewBounds(const ViewState* v, std::size_t* length)
@@ -1029,6 +1015,12 @@ void installTypedArrays(VM& vm)
 }
 
 }  // namespace bi
+
+FastNative dataViewAccessNative() noexcept
+{
+    return bi::dataViewAccess;
+}
+
 }  // namespace vm
 }  // namespace internal
 }  // namespace script

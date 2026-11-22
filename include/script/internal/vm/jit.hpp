@@ -48,6 +48,8 @@ enum class MathOp : std::uint8_t { None, Unary, Floor, Ceil, Trunc, Round, Sqrt,
 MathOp mathOp(FastNative native, const void* data) noexcept;
 /// `String.prototype.charAt`, and with data 1 `charCodeAt`: compiled code reads a character itself.
 FastNative stringCharNative() noexcept;
+/// `DataView.prototype.getInt8` and the others: data is the element kind, and 256 for a set.
+FastNative dataViewAccessNative() noexcept;
 /// `Array.prototype.push` and `pop`: compiled code does the usual case itself.
 FastNative arrayPushNative() noexcept;
 FastNative arrayPopNative() noexcept;

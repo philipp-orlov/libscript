@@ -1045,6 +1045,14 @@ constexpr std::int32_t kStrLength = std::int32_t(offsetof(StringCell, length));
 constexpr std::int32_t kStrInterned = std::int32_t(offsetof(StringCell, interned));
 constexpr std::int32_t kStrChars = std::int32_t(sizeof(StringCell));
 constexpr std::int32_t kRareChildRoot = std::int32_t(offsetof(Rare, childRoot));
+constexpr std::int32_t kRareExt = std::int32_t(offsetof(Rare, ext));
+constexpr std::int32_t kViewBuffer = std::int32_t(offsetof(ViewState, buffer));
+constexpr std::int32_t kViewOffset = std::int32_t(offsetof(ViewState, offset));
+constexpr std::int32_t kViewLength = std::int32_t(offsetof(ViewState, length));
+constexpr std::int32_t kViewTracking = std::int32_t(offsetof(ViewState, tracking));
+constexpr std::int32_t kBufferData = std::int32_t(offsetof(BufferState, data));
+constexpr std::int32_t kBufferSize = std::int32_t(offsetof(BufferState, size));
+constexpr std::int32_t kBufferDetached = std::int32_t(offsetof(BufferState, detached));
 constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
 constexpr std::int32_t kShapeAuxIds = std::int32_t(offsetof(Shape, auxIds));
 constexpr std::int32_t kShapeSlotHint = std::int32_t(offsetof(Shape, slotHint));
@@ -3221,6 +3229,10 @@ private:
     /// Per instruction: a call of `Math.sqrt` and its kind (`mathOp`), the function the callee is, or was read as from a
     /// global object's own data property; null when the site is not one.
     std::vector<JSFunction*> mathOf_;
+    /// Per instruction: a call of a `DataView` method done in place (`ssaViewCall`), the method.
+    std::vector<JSFunction*> viewOf_;
+    JSFunction* ssaViewCallee(std::uint32_t i);
+    void ssaViewCall(std::uint32_t i, JSFunction* f);
     JSFunction* ssaMathCallee(std::uint32_t i, std::uint32_t callee);
     /// `x.length` with an empty cache: of a string or an array, read here.
     bool ssaLengthSite(std::uint32_t i) const;

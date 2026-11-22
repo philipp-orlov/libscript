@@ -429,6 +429,11 @@ public:
     void toInt32(Reg, int) {}
     void toInt32Exact(Reg, int) {}
     static constexpr bool kFpMath = false;
+    void bswap(Reg, int) {}
+    void sext16(Reg) {}
+    void sext8(Reg) {}
+    void movdToX(int, Reg) {}
+    void movdFromX(Reg, int) {}
     void floorsd(int, int) {}
     void ceilsd(int, int) {}
     void truncsd(int, int) {}

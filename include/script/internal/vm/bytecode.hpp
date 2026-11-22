@@ -313,24 +313,35 @@ struct CodeBlock
 /// The instructions of a block, one per line, with its constants and children after them.
 std::string dump(const CodeBlock& block);
 
-inline std::uint8_t thisSlotsOf(CodeBlock* c) noexcept
+/// How many properties the code gives `this`, as far as its text says (25: more than 24).
+inline unsigned thisStoresOf(const CodeBlock* c) noexcept
 {
-    if (c->thisSlots)
-        return c->thisSlots;
-    Key seen[9];
-    unsigned n = 0;
-    for (std::size_t j = 0; j < c->code.size() && n < 9; ++j) {
+    Key seen[25];
+    unsigned n = 0, privates = 0;
+    for (std::size_t j = 0; j < c->code.size() && n + privates < 25; ++j) {
         const Ins& in = c->code[j];
         const Op op = in.opcode();
-        if ((op == Op::PutProp || op == Op::InitProp) && in.a == 0) {
+        if (in.a != 0)
+            continue;
+        if (op == Op::PutProp || op == Op::InitProp) {
             const Key k = c->atoms[in.b];
             bool dup = false;
             for (unsigned m = 0; m < n; ++m)
                 dup = dup || seen[m] == k;
             if (!dup)
                 seen[n++] = k;
+        } else if (op == Op::DefPrivate || op == Op::DefPrivMethod) {
+            ++privates;
         }
     }
+    return n + privates;
+}
+
+inline std::uint8_t thisSlotsOf(CodeBlock* c) noexcept
+{
+    if (c->thisSlots)
+        return c->thisSlots;
+    const unsigned n = thisStoresOf(c);
     c->thisSlots = n <= 3 ? 3 : 8;
     return c->thisSlots;
 }
@@ -340,8 +351,12 @@ inline std::uint8_t thisSlotsOf(CodeBlock* c) noexcept
 inline std::uint8_t newSlotsOf(CodeBlock* c, const Shape* root) noexcept
 {
     const std::uint8_t own = thisSlotsOf(c);
-    return root && root->slotHint > own ? root->slotHint : own;
+    return root && root->base && root->base->slotHint > own ? root->base->slotHint : own;
 }
+
+/// The same for `new f`, where the tree's hint comes from the text at first: of what `f` and the classes it extends give
+/// `this`, their fields with it.
+std::uint8_t newSlotsOf(VM& vm, struct JSFunction* f, Shape* root) noexcept;
 
 }  // namespace vm
 }  // namespace internal

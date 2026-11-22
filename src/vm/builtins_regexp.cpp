@@ -174,7 +174,7 @@ JSObject* newRegExpCell(VM& vm, RegExpText* text)
         text->release();
         throw;
     }
-    o->h.shape = vm.rootShapeFor(vm.protos.regexp)->id;
+    o->h.shape = vm.rootShapeFor(vm.protos.regexp, aux)->id;
     o->slots = nullptr;
     ::new (static_cast<void*>(o->embeddedState())) RegExpData(text);
     return o;

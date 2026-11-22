@@ -383,7 +383,7 @@ bool arrayIterationIntact(VM& vm, JSValue v)
     if (a->cls() != ObjClass::Array || a->proto(vm) != vm.protos.array)
         return false;
     if (!vm.arrayRootShape)
-        vm.arrayRootShape = vm.rootShapeFor(vm.protos.array)->id;
+        vm.arrayRootShape = vm.rootShapeFor(vm.protos.array, 0)->id;
     if (a->h.shape != vm.arrayRootShape && a->findOwn(vm, vm.atoms.symIterator))
         return false;
     JSValue* it = vm.protos.array->findOwn(vm, vm.atoms.symIterator);

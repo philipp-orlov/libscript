@@ -573,7 +573,7 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                 needObject(RAX, *bad);
                 a_.cmpI32(mem(RAX, 0), std::int32_t(pc.shape));
                 a_.jcc(CNE, *bad);
-                slotAddress(pc.index);
+                slotAddress(pc.shape, pc.index);
                 a_.mov(RAX, mem(RDX, 0));
             }
             IVal out;
@@ -2126,8 +2126,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
     std::vector<std::int8_t> selfReg(C->nregs, 0);
     std::vector<JSValue*> ownReg(C->nregs, nullptr);
     std::vector<std::uint16_t> selfUpvals;
-    const std::uint8_t aux = newSlotsOf(C, vm_.rootShapeFor(proto));
-    std::uint32_t shape = vm_.rootShapeFor(proto)->id;
+    const std::uint8_t aux = newSlotsOf(C, vm_.rootShapeFor(proto, 3));
+    std::uint32_t shape = vm_.rootShapeFor(proto, aux)->id;
     std::vector<std::int8_t> constReg(C->nregs, 0);
     std::vector<JSValue> constVal(C->nregs, JSValue::undefined());
     // Upvalues (their boxes) that must hold these private names when the code runs.

@@ -253,7 +253,7 @@ struct VM : EngineRuntime
     void freeShape(Shape* shape) noexcept;
     /// The root of the tree for objects with this prototype (null for none); made on first use, and it holds a count of
     /// the prototype.
-    Shape* rootShapeFor(JSObject* proto);
+    Shape* rootShapeFor(JSObject* proto, std::uint8_t aux);
     std::uint32_t maxShapes = kDefaultMaxShapes;
     /// Dictionary shapes inline caches were let hold: their ids are never reused, so there is a budget.
     std::uint32_t cachedDictionaries = 0;

@@ -23,7 +23,7 @@ std::int32_t bruteForce(Shape* s, Key k)
 TEST(sameKeysInTheSameOrderShareAShape)
 {
     Fixture f;
-    Shape* root = f.vm.rootShapeFor(nullptr);
+    Shape* root = f.vm.rootShapeFor(nullptr, 3);
     Key a = f.key("a"), b = f.key("b");
     Shape* ab1 = root->after(f.vm, a, attr::kDefault)->after(f.vm, b, attr::kDefault);
     Shape* ab2 = root->after(f.vm, a, attr::kDefault)->after(f.vm, b, attr::kDefault);
@@ -49,10 +49,10 @@ TEST(shapesAreFoundByIdAndHoldThePrototype)
 {
     Fixture f;
     JSObject* proto = f.vm.newObject(static_cast<JSObject*>(nullptr));
-    Shape* root = f.vm.rootShapeFor(proto);
+    Shape* root = f.vm.rootShapeFor(proto, 3);
     CHECK(root->proto == proto);
-    CHECK(f.vm.rootShapeFor(proto) == root);
-    CHECK(f.vm.rootShapeFor(nullptr) != root);
+    CHECK(f.vm.rootShapeFor(proto, 3) == root);
+    CHECK(f.vm.rootShapeFor(nullptr, 3) != root);
     CHECK(f.vm.shapeById(root->id) == root);
     CHECK(proto->isProto());
     Shape* child = root->after(f.vm, f.key("x"), attr::kDefault);
@@ -61,7 +61,7 @@ TEST(shapesAreFoundByIdAndHoldThePrototype)
     // The root holds a count of its prototype.
     CHECK_EQ(headerOf(reinterpret_cast<CellPtr>(proto))->rc, std::uint32_t(2));
     release(toJSValue(proto));
-    CHECK(f.vm.rootShapeFor(proto) == root);
+    CHECK(f.vm.rootShapeFor(proto, 3) == root);
 }
 
 TEST(indexOfAgreesWithABruteForceScanForOneTo300Properties)
@@ -70,7 +70,7 @@ TEST(indexOfAgreesWithABruteForceScanForOneTo300Properties)
     std::vector<Key> keys;
     for (int i = 0; i < 400; ++i)
         keys.push_back(f.key("k" + std::to_string(i)));
-    Shape* s = f.vm.rootShapeFor(nullptr);
+    Shape* s = f.vm.rootShapeFor(nullptr, 3);
     std::mt19937 rng(5);
     for (std::uint32_t n = 1; n <= 300; ++n) {
         s = s->after(f.vm, keys[n - 1], std::uint8_t(1 + rng() % 7));
@@ -96,7 +96,7 @@ TEST(aNameMadeAtRunTimeIsLimitedToThirtyTwoTransitionsPerShape)
 {
     Fixture f;
     JSObject* proto = f.vm.newObject(static_cast<JSObject*>(nullptr));
-    Shape* root = f.vm.rootShapeFor(proto);  // a root of its own: the built-ins used up the shared one's names
+    Shape* root = f.vm.rootShapeFor(proto, 3);  // a root of its own: the built-ins used up the shared one's names
     std::uint32_t made = 0;
     for (int i = 0; i < 40; ++i) {
         StringCell* name = f.ctx.impl()->intern(script::internal::fromUtf8("dyn" + std::to_string(i)));
@@ -115,7 +115,7 @@ TEST(aNameMadeAtRunTimeIsLimitedToThirtyTwoTransitionsPerShape)
 TEST(manyTransitionsFromOneShapeAreAllFound)
 {
     Fixture f;
-    Shape* root = f.vm.rootShapeFor(nullptr);
+    Shape* root = f.vm.rootShapeFor(nullptr, 3);
     std::vector<std::pair<Key, Shape*>> made;
     for (int i = 0; i < 200; ++i) {
         StringCell* name = f.ctx.impl()->intern(script::internal::fromUtf8("t" + std::to_string(i)));

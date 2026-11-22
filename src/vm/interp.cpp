@@ -3092,14 +3092,14 @@ do_call: {
         if (vm.prototypeAt2(f)) [[likely]] {
             // Every ordinary function once its `prototype` is made, and every class: `length`, `name`, `prototype`, ...
             const JSValue pv = *f->slotAt(2);
-            Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
-            made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(f->code, root));
+            Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object, 3);
+            made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(vm, f, root));
         } else {
             JSValue protoValue = getProperty(vm, callee, vm.atoms.prototype);
             if (protoValue.isException())
                 FAIL();
-            Shape* root = vm.rootShapeFor(isObject(protoValue) ? asObject(protoValue) : vm.protos.object);
-            made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(f->code, root));
+            Shape* root = vm.rootShapeFor(isObject(protoValue) ? asObject(protoValue) : vm.protos.object, 3);
+            made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(vm, f, root));
             release(protoValue);
         }
         setReg<Def>(vm, R[base + 1], toJSValue(made));

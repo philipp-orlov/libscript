@@ -85,7 +85,7 @@ JSValue newPromiseObject(VM& vm, JSObject* proto = nullptr)
     constexpr std::uint8_t aux = 3;
     auto* o = static_cast<JSObject*>(
         vm.allocCell(JSObject::bytesFor(aux) + JSObject::kPromiseStateBytes, Kind::Object, ObjClass::Promise, aux));
-    o->h.shape = vm.rootShapeFor(proto ? proto : vm.protos.promise)->id;
+    o->h.shape = vm.rootShapeFor(proto ? proto : vm.protos.promise, aux)->id;
     o->slots = nullptr;
     ::new (static_cast<void*>(o->embeddedState())) PromiseData();
     return toJSValue(o);

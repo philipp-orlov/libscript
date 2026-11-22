@@ -18,6 +18,8 @@ namespace vm {
 
 JSObject* VM::newObject(Shape* root, std::uint8_t aux)
 {
+    if (root->aux != aux)
+        root = rootShapeFor(root->proto, aux);
     auto* o = static_cast<JSObject*>(allocCell(JSObject::bytesFor(aux), Kind::Object, ObjClass::Plain, aux));
     o->h.shape = root->id;
     o->slots = nullptr;
@@ -26,7 +28,7 @@ JSObject* VM::newObject(Shape* root, std::uint8_t aux)
 
 JSObject* VM::newObject(JSObject* proto, std::uint8_t aux)
 {
-    return newObject(rootShapeFor(proto), aux);
+    return newObject(rootShapeFor(proto, aux), aux);
 }
 
 BufferState::~BufferState()
@@ -95,7 +97,7 @@ JSObject* VM::newArrayBuffer(std::size_t bytes, std::size_t maxBytes, bool resiz
 
 JSTypedArray* VM::newTypedArray(JSObject* proto, ElemKind kind, JSObject* buffer, std::uint32_t byteOffset, std::uint32_t length)
 {
-    Shape* root = rootShapeFor(proto);
+    Shape* root = rootShapeFor(proto, 0);
     auto* t = static_cast<JSTypedArray*>(allocCell(sizeof(JSTypedArray), Kind::Object, ObjClass::TypedArray, 0));
     t->h.shape = root->id;
     t->slots = nullptr;
@@ -114,7 +116,7 @@ JSTypedArray* VM::newTypedArray(JSObject* proto, ElemKind kind, JSObject* buffer
 
 JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capacity)
 {
-    Shape* root = rootShapeFor(proto);
+    Shape* root = rootShapeFor(proto, 0);
     if (capacity < length)
         capacity = length;
     auto* a = static_cast<JSArray*>(allocCell(sizeof(JSArray), Kind::Object, ObjClass::Array, 0));
@@ -234,7 +236,7 @@ JSFunction* VM::newFunction(JSObject* proto, CodeBlock* code, Box* const* upvalu
         if (kind)
             proto = kind;
     }
-    Shape* root = rootShapeFor(proto);
+    Shape* root = rootShapeFor(proto, 0);
     auto* f = static_cast<JSFunction*>(allocCell(bytes, Kind::Object, ObjClass::Function, 0));
     f->h.shape = root->id;
     f->slots = nullptr;
@@ -249,9 +251,37 @@ JSFunction* VM::newFunction(JSObject* proto, CodeBlock* code, Box* const* upvalu
     return f;
 }
 
+std::uint8_t newSlotsOf(VM& vm, JSFunction* f, Shape* root) noexcept
+{
+    Shape* base = root->base;
+    if (!base->hintTried) {
+        unsigned n = 0;
+        bool all = true;
+        for (JSObject* g = f; g && g->cls() == ObjClass::Function; g = g->proto(vm)) {
+            auto* fn = static_cast<JSFunction*>(g);
+            if ((fn->flags & JSFunction::kNative) || !fn->code)
+                break;
+            all = all && !(fn->code->flags & CodeBlock::kLazy);
+            n += thisStoresOf(fn->code);
+            if (Rare* r = fn->rare(); r && isFunction(r->fieldInit)) {
+                auto* init = static_cast<JSFunction*>(asObject(r->fieldInit));
+                if (init->code && !(init->flags & JSFunction::kNative)) {
+                    all = all && !(init->code->flags & CodeBlock::kLazy);
+                    n += thisStoresOf(init->code);
+                }
+            }
+        }
+        base->hintTried = all;
+        const std::uint8_t hint = n <= 3 ? 0 : n <= 8 ? 8 : n <= 16 ? 16 : 24;
+        if (base->slotHint < hint)
+            base->slotHint = hint;
+    }
+    return newSlotsOf(f->code, root);
+}
+
 JSFunction* VM::newNativeFunction(JSObject* proto, FastNative fn, void* data, Key name, std::uint32_t length)
 {
-    Shape* root = rootShapeFor(proto);
+    Shape* root = rootShapeFor(proto, 0);
     auto* f = static_cast<JSFunction*>(allocCell(sizeof(JSFunction), Kind::Object, ObjClass::Function, 0));
     f->h.shape = root->id;
     f->slots = nullptr;
@@ -384,6 +414,7 @@ void JSObject::toDictionary(VM& vm)
     }
     ds->flags = Shape::kDictionary;
     ds->proto = s->proto;
+    ds->aux = h.aux;
     r.dict = d;
     h.shape = ds->id;
 }
@@ -396,6 +427,7 @@ void JSObject::dictionaryChanging(VM& vm)
     Shape* n = vm.newShape();
     n->flags = Shape::kDictionary;
     n->proto = s->proto;
+    n->aux = h.aux;
     h.shape = n->id;
     vm.freeShape(s);
     Dictionary& d = *rare()->dict;
@@ -432,13 +464,13 @@ void JSObject::setProto(VM& vm, JSObject* next)
         s = shapeOf(vm);
     }
     if (s->isDictionary()) {
-        vm.rootShapeFor(next);  // makes `next` a prototype that something holds a count of, for as long as the VM lives
+        vm.rootShapeFor(next, h.aux);  // makes `next` a prototype that something holds a count of, for as long as the VM lives
         vm.dictionaryGains(*rare()->dict);
         dictionaryChanging(vm);
         s = shapeOf(vm);
         s->proto = next;
     } else {
-        Shape* t = vm.rootShapeFor(next);
+        Shape* t = vm.rootShapeFor(next, h.aux);
         for (std::uint32_t i = 0; t && i < s->count; ++i) {
             const Entry e = s->entryAt(i);
             t = t->after(vm, e.key, e.attrs);
@@ -516,8 +548,8 @@ void JSObject::addProperty(VM& vm, Key key, JSValue value, std::uint8_t attrs)
             // Past the slots in place: `new` gives the next objects of this tree more (an add then stays a cached one).
             const std::uint32_t want = s->count + 1;
             const std::uint8_t hint = want <= 8 ? 8 : want <= 16 ? 16 : 24;
-            if (s->root && s->root->slotHint < hint)
-                s->root->slotHint = hint;
+            if (s->root && s->root->base && s->root->base->slotHint < hint)
+                s->root->base->slotHint = hint;
         }
         reserveSlot(vm, s->count);
         *slotAt(s->count) = value;

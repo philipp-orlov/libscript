@@ -651,7 +651,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
             // As the interpreter's `new` of a native: `this` inherits from its `prototype`, and an answer that is no object
             // is that `this`.
             const JSValue pv = *f->slotAt(2);
-            Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
+            Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object, 3);
             JSObject* made = vm.newObject(root, 3);
             setRegister(vm, R[base + 1], toJSValue(made));
         }
@@ -701,8 +701,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     --vm.ticks;
     if (isNew) {
         const JSValue pv = *f->slotAt(2);
-        Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
-        JSObject* made = vm.newObject(root, newSlotsOf(f->code, root));
+        Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object, 3);
+        JSObject* made = vm.newObject(root, newSlotsOf(vm, f, root));
         setRegister(vm, R[base + 1], toJSValue(made));
     }
     if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && newR[0].isNullish())
@@ -742,8 +742,8 @@ extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
 {
     try {
         const JSValue pv = *f->slotAt(2);
-        Shape* root = vm->rootShapeFor(isObject(pv) ? asObject(pv) : vm->protos.object);
-        return handOver(*vm, toJSValue(vm->newObject(root, newSlotsOf(f->code, root))).bits);
+        Shape* root = vm->rootShapeFor(isObject(pv) ? asObject(pv) : vm->protos.object, 3);
+        return handOver(*vm, toJSValue(vm->newObject(root, newSlotsOf(*vm, f, root))).bits);
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -908,6 +908,7 @@ constexpr std::int32_t kStrInterned = std::int32_t(offsetof(StringCell, interned
 constexpr std::int32_t kStrChars = std::int32_t(sizeof(StringCell));
 constexpr std::int32_t kRareChildRoot = std::int32_t(offsetof(Rare, childRoot));
 constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
+constexpr std::int32_t kShapeAuxIds = std::int32_t(offsetof(Shape, auxIds));
 constexpr std::int32_t kShapeSlotHint = std::int32_t(offsetof(Shape, slotHint));
 constexpr std::int32_t kShapeFlags = std::int32_t(offsetof(Shape, flags));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
@@ -1127,7 +1128,7 @@ private:
         if (!cell)
             return false;
         hold(cell);
-        a_.cmpI32(mem(RAX, 0), std::int32_t(vm_.rootShapeFor(ap)->id));
+        a_.cmpI32(mem(RAX, 0), std::int32_t(vm_.rootShapeFor(ap, 0)->id));
         a_.jcc(CNE, fail);
         a_.movImm(tmp, reinterpret_cast<std::uint64_t>(cell));
         a_.cmpI32(mem(tmp, kValidityValid), 0);
@@ -1168,7 +1169,7 @@ private:
         if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit)
             return false;
         CellHeader h{};
-        h.shape = vm_.rootShapeFor(vm_.protos.array)->id;
+        h.shape = vm_.rootShapeFor(vm_.protos.array, 0)->id;
         h.cls = std::uint8_t(ObjClass::Array);
         h.flags = cellflags::kYoung | cellflags::kAllNumbers;
         h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
@@ -1780,52 +1781,15 @@ private:
     /// As `provenSlot`, for a read: the slot as a memory operand (on rax or rdx) instead of its address.
     Mem provenSlotMem(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
+        (void)aux;
         provenShape(reg, shape, bad);
-        if (aux == 0) {
-            slotAddress(index);
-            return mem(RDX, 0);
-        }
-        const std::int32_t inl = std::int32_t(aux) - 1;
-        if (std::int32_t(index) < inl) {
-            // In place in the objects the site learned on. Objects of one shape can be made with more slots in place, or
-            // fewer: unless enough are known to be there, found from the object's own count.
-            if (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index))
-                return mem(RAX, kObjInline + std::int32_t(8 * index));
-            slotAddress(index);
-            return mem(RDX, 0);
-        }
-        if (factAux_[reg] != inl) {
-            // Out of place in the objects the site learned on; objects of the shape made with more slots in place have
-            // it there: found from the object's own count.
-            slotAddress(index);
-            return mem(RDX, 0);
-        }
-        a_.mov(RDX, mem(RAX, kObjSlots));
-        return mem(RDX, std::int32_t(8 * (std::int32_t(index) - inl)));
+        return slotMem(shape, index);
     }
     void provenSlot(unsigned reg, std::uint32_t shape, std::uint32_t index, std::uint8_t aux, Label& bad)
     {
+        (void)aux;
         provenShape(reg, shape, bad);
-        if (aux == 0) {
-            slotAddress(index);
-            return;
-        }
-        const std::int32_t inl = std::int32_t(aux) - 1;
-        if (std::int32_t(index) < inl) {
-            if (factAux_[reg] > std::int32_t(index) || factInl_[reg] > std::int32_t(index))
-                a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
-            else
-                slotAddress(index);
-            return;
-        }
-        if (factAux_[reg] != inl) {
-            slotAddress(index);
-            return;
-        }
-        {
-            a_.mov(RDX, mem(RAX, kObjSlots));
-            a_.lea(RDX, mem(RDX, std::int32_t(8 * (std::int32_t(index) - inl))));
-        }
+        slotAddress(shape, index);
     }
     bool delivered_ = false;           ///< the template just emitted put a typed destination in its variable
     /// The int32 web whose value rax still holds from the instruction just emitted (-1: none); `carried_` is it as the
@@ -2308,6 +2272,30 @@ private:
         a_.cmpI8(mem(v, kHdrCls), std::uint8_t(ObjClass::Array));
         a_.jcc(CNE, bad);
     }
+    /// The shape with that id, if there is one now.
+    const Shape* liveShape(std::uint32_t id) const
+    {
+        const Shape* s = vm_.shapeById(id);
+        return s && s->id == id ? s : nullptr;
+    }
+    /// Slot `index` of the object in rax, which has shape `shape`: where it is follows from that. May use rdx.
+    Mem slotMem(std::uint32_t shape, std::uint32_t index)
+    {
+        const Shape* s = liveShape(shape);
+        if (!s) {
+            slotAddress(index);
+            return mem(RDX, 0);
+        }
+        if (index < s->aux)
+            return mem(RAX, kObjInline + std::int32_t(8 * index));
+        a_.mov(RDX, mem(RAX, kObjSlots));
+        return mem(RDX, std::int32_t(8 * (index - s->aux)));
+    }
+    /// The same, its address in rdx.
+    void slotAddress(std::uint32_t shape, std::uint32_t index)
+    {
+        a_.lea(RDX, slotMem(shape, index));
+    }
     /// The address of slot `index` of the object in rax, into rdx. Clobbers rcx, rsi.
     void slotAddress(std::uint32_t index)
     {
@@ -2353,32 +2341,7 @@ private:
             holderRead(s.holder, s.index);
             return;
         }
-        if (!s.aux) {
-            slotAddress(s.index);
-            a_.mov(RAX, mem(RDX, 0));
-            return;
-        }
-        const std::int32_t inl = std::int32_t(s.aux) - 1;
-        const bool knownAux = factReg >= 0 && factAux_[unsigned(factReg)] == inl;
-        if (std::int32_t(s.index) < inl) {
-            // An inline slot: any object with more inline slots than the index has it there. One of the shape made with
-            // fewer has it out of place: found from its own count.
-            if (!knownAux && !(factReg >= 0 && std::int32_t(s.index) < factInl_[unsigned(factReg)])) {
-                slotAddress(s.index);
-                a_.mov(RAX, mem(RDX, 0));
-                return;
-            }
-            a_.mov(RAX, mem(RAX, kObjInline + std::int32_t(8 * s.index)));
-            return;
-        }
-        if (!knownAux) {
-            // Out of place in the objects the site learned on: found from the object's own count.
-            slotAddress(s.index);
-            a_.mov(RAX, mem(RDX, 0));
-            return;
-        }
-        a_.mov(RDX, mem(RAX, kObjSlots));
-        a_.mov(RAX, mem(RDX, std::int32_t(8 * (std::int32_t(s.index) - inl))));
+        a_.mov(RAX, slotMem(s.shape, s.index));
     }
     /// The slot one of `seen` names, of the value in rax, into rax; `bad` when it is not an object of one of their shapes.
     /// Shapes reached the same way (an own slot at the same place) share one load. `factReg` is the frame register the
@@ -2800,8 +2763,8 @@ private:
     void megaFind(const std::uint32_t* mix, Label& bad);
     void megaLoad();
     void cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
-    void putPropKnown(const Ins& in, std::uint32_t index, std::uint32_t next, ValidityCell* validity, Label& bad);
-    void addSlot(std::uint32_t index, Label& bad);
+    void putPropKnown(const Ins& in, std::uint32_t shape, std::uint32_t index, std::uint32_t next, ValidityCell* validity, Label& bad);
+    void addSlot(std::uint32_t shape, std::uint32_t index, Label& bad);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
     void retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, bool constructs, const std::vector<std::uint64_t>* dirty);
     /// Per instruction: the registers that may have been written since the frame began (one bit each), or empty when
@@ -3319,7 +3282,7 @@ void Baseline::emit(std::uint32_t i)
             return;
         }
         if (!vm_.arrayRootShape)
-            vm_.arrayRootShape = vm_.rootShapeFor(vm_.protos.array)->id;
+            vm_.arrayRootShape = vm_.rootShapeFor(vm_.protos.array, 0)->id;
         Label bad, done;
         a_.mov(RAX, R(in.b));
         needObject(RAX, bad);
@@ -3646,7 +3609,7 @@ void Baseline::emit(std::uint32_t i)
             return;
         }
         CellHeader h{};
-        h.shape = vm_.rootShapeFor(vm_.protos.function)->id;
+        h.shape = vm_.rootShapeFor(vm_.protos.function, 0)->id;
         h.cls = std::uint8_t(ObjClass::Function);
         h.flags = cellflags::kYoung;
         h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
@@ -3693,7 +3656,7 @@ void Baseline::emit(std::uint32_t i)
     }
     case Op::NewObject: {
         Label& bad = slow(i, &helperThunk<jitNewObject>);
-        if (!allocObject(vm_.rootShapeFor(vm_.protos.object)->id, std::uint8_t(in.b), bad)) {
+        if (!allocObject(vm_.rootShapeFor(vm_.protos.object, std::uint8_t(in.b))->id, std::uint8_t(in.b), bad)) {
             a_.jmp(bad);
             return;
         }
@@ -4751,9 +4714,11 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         }
         if (seen[k].absent) {
             a_.movImm(RAX, kUndefined);
-        } else {
+        } else if (seen[k].holder) {
             slotAddress(seen[k].index);
             a_.mov(RAX, mem(RDX, 0));
+        } else {
+            a_.mov(RAX, slotMem(seen[k].shape, seen[k].index));
         }
         deliver(i, in.a);
         if (!last || isLength)
@@ -4966,7 +4931,10 @@ void Baseline::getterCall(std::uint32_t i, const Ins& in, const PolyCache& pc)
             a_.jcc(CE, bad);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(e.holder));
         }
-        slotAddress(e.index);
+        if (e.holder)
+            slotAddress(e.index);
+        else
+            slotAddress(e.shape, e.index);
         a_.mov(RAX, mem(RDX, 0));
         if (!last)
             a_.jmp(found);
@@ -5064,7 +5032,7 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
         Label next;
         a_.cmpI32(mem(RAX, 0), std::int32_t(s.shape));
         a_.jcc(CNE, next);
-        putPropKnown(in, s.index, s.next, s.validity, bad);
+        putPropKnown(in, s.shape, s.index, s.next, s.validity, bad);
         a_.jmp(done);
         a_.bind(next);
     }
@@ -5113,12 +5081,12 @@ void Baseline::cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic
 
 /// The store of `in` to the object in rax, whose shape is known: to its slot `index`, or (`next`) as the property that moves it
 /// to that shape.
-void Baseline::putPropKnown(const Ins& in, std::uint32_t index, std::uint32_t next, ValidityCell* validity, Label& bad)
+void Baseline::putPropKnown(const Ins& in, std::uint32_t shape, std::uint32_t index, std::uint32_t next, ValidityCell* validity, Label& bad)
 {
     if (next == 0) {
         // A store of what the slot holds already changes nothing and counts nothing.
         Label same;
-        slotAddress(index);
+        slotAddress(shape, index);
         a_.mov(RCX, R(in.c));
         a_.mov(RSI, mem(RDX, 0));
         a_.cmp(RSI, RCX);
@@ -5137,33 +5105,32 @@ void Baseline::putPropKnown(const Ins& in, std::uint32_t index, std::uint32_t ne
     }
     a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto | cellflags::kNotExtensible));
     a_.jcc(CNE, bad);
-    addSlot(index, bad);
+    addSlot(shape, index, bad);
     a_.mov(RCX, R(in.c));
     retain(RCX);
     a_.mov(mem(RDX, 0), RCX);
     a_.mov32(mem(RAX, 0), std::int32_t(next));
 }
 
-/// The address of the slot a property added to the object in rax gets, in rdx: in place (objects of one shape can have
-/// different inline counts) or in the buffer it has, if that has room; else `bad`. Uses rcx.
-void Baseline::addSlot(std::uint32_t index, Label& bad)
+/// The address of the slot a property added to the object in rax, of shape `shape`, gets, in rdx: in place, or in the buffer
+/// it has, if that has room; else `bad`.
+void Baseline::addSlot(std::uint32_t shape, std::uint32_t index, Label& bad)
 {
-    Label out, have;
-    a_.movzx8(RCX, mem(RAX, kHdrAux));
-    a_.aluI32(7, RCX, std::int32_t(index));
-    a_.jcc(CBE, out);
-    a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
-    a_.jmp(have);
-    a_.bind(out);
+    const Shape* s = liveShape(shape);
+    if (!s) {
+        a_.jmp(bad);
+        return;
+    }
+    if (index < s->aux) {
+        a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
+        return;
+    }
     a_.mov(RDX, mem(RAX, kObjSlots));
     a_.test(RDX, RDX);
     a_.jcc(CE, bad);
-    a_.neg32(RCX);
-    a_.aluI32(0, RCX, std::int32_t(index));
-    a_.alu32(7, RCX, mem(RDX, -8));
-    a_.jcc(CAE, bad);
-    a_.lea(RDX, mem(RDX, RCX, 8));
-    a_.bind(have);
+    a_.cmpI32(mem(RDX, -8), std::int32_t(index - s->aux));
+    a_.jcc(CBE, bad);
+    a_.lea(RDX, mem(RDX, std::int32_t(8 * (index - s->aux))));
 }
 
 void Baseline::getSuperProp(std::uint32_t i, const Ins& in)
@@ -5483,15 +5450,10 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
     a_.mov(RAX, R(in.a));
     a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
     a_.jcc(CNE, bad);
-    if (ic->index >= 200) {
-        a_.jmp(bad);
-        return;
-    }
-    a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic->index));
-    a_.jcc(CBE, bad);
+    addSlot(ic->shape, ic->index, bad);
     a_.mov(RCX, R(in.c));
     retain(RCX);
-    a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic->index)), RCX);
+    a_.mov(mem(RDX, 0), RCX);
     a_.mov32(mem(RAX, 0), std::int32_t(ic->next));
 }
 
@@ -5772,13 +5734,15 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.mov(RSI, mem(RSI, kRareChildRoot));
             a_.test(RSI, RSI);
             a_.jcc(CE, viaRuntime);
-            a_.mov32(R8, mem(RSI, kShapeId));
             // The tree's hint (8, 16 or 24) when objects of it have grown, else what the code stores (3 or 8).
             Label big, hinted, h16, h24;
             a_.cmpI8(mem(RSI, kShapeSlotHint), 0);
             a_.jcc(CNE, hinted);
             a_.cmpI8(mem(RCX, kCbThisSlots), 3);
             a_.jcc(CNE, big);
+            a_.mov32(R8, mem(RSI, kShapeAuxIds + 0));
+            a_.test32(R8, R8);
+            a_.jcc(CE, viaRuntime);
             if (allocObject(0, 3, viaRuntime, true))
                 a_.jmp(made);
             else
@@ -5787,6 +5751,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.cmpI8(mem(RSI, kShapeSlotHint), 8);
             a_.jcc(CNE, h16);
             a_.bind(big);
+            a_.mov32(R8, mem(RSI, kShapeAuxIds + 4));
+            a_.test32(R8, R8);
+            a_.jcc(CE, viaRuntime);
             if (allocObject(0, 8, viaRuntime, true))
                 a_.jmp(made);
             else
@@ -5794,11 +5761,17 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.bind(h16);
             a_.cmpI8(mem(RSI, kShapeSlotHint), 16);
             a_.jcc(CNE, h24);
+            a_.mov32(R8, mem(RSI, kShapeAuxIds + 8));
+            a_.test32(R8, R8);
+            a_.jcc(CE, viaRuntime);
             if (allocObject(0, 16, viaRuntime, true))
                 a_.jmp(made);
             else
                 a_.jmp(viaRuntime);
             a_.bind(h24);
+            a_.mov32(R8, mem(RSI, kShapeAuxIds + 12));
+            a_.test32(R8, R8);
+            a_.jcc(CE, viaRuntime);
             if (allocObject(0, 24, viaRuntime, true))
                 a_.jmp(made);
             a_.bind(viaRuntime);

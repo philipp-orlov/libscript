@@ -863,8 +863,9 @@ void VM::collectCycles(bool minor) noexcept
                 continue;
             Rare* r = reinterpret_cast<JSObject*>(cell)->rare();
             CellHeader* h = headerOf(cell);
-            if (r && r->childRoot && r->childRoot->proto == reinterpret_cast<JSObject*>(cell) && (h->gc & kCountMask))
-                --h->gc;
+            for (const Shape* s = r ? r->childRoot : nullptr; s; s = s->nextAux)
+                if (s->proto == reinterpret_cast<JSObject*>(cell) && (h->gc & kCountMask))
+                    --h->gc;
         }
     }
     // A plain object with its values all in its cell (no `Rare`): its values are its children, read in place.
@@ -1001,13 +1002,15 @@ void VM::collectCycles(bool minor) noexcept
         invalidateChain(o);
         Rare* r = o->rare();
         if (r && r->childRoot && r->childRoot->proto == o) {
-            r->childRoot->proto = nullptr;
-            detail::decRef(cell);
-            try {
-                deadRoots.push_back(r->childRoot);
-                r->childRoot = nullptr;
-            } catch (...) {
+            for (Shape* s = r->childRoot; s; s = s->nextAux) {
+                s->proto = nullptr;
+                detail::decRef(cell);
+                try {
+                    deadRoots.push_back(s);
+                } catch (...) {
+                }
             }
+            r->childRoot = nullptr;
         }
     }
     for (CellPtr cell : garbage)

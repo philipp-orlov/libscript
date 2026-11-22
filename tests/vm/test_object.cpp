@@ -26,7 +26,7 @@ TEST(anObjectWithTwoPropertiesIsFortyEightBytes)
 {
     Fixture f;
     Key x = f.key("x"), y = f.key("y");  // names are strings, which are charged too
-    f.vm.rootShapeFor(nullptr);
+    f.vm.rootShapeFor(nullptr, 3);
     const std::uint64_t before = f.heapBytes();
     JSObject* o = plain(f);
     o->putOwn(f.vm, x, num(1));

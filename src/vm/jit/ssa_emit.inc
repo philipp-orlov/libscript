@@ -1679,8 +1679,7 @@ bool Baseline::ssaGetProp(std::uint32_t i)
         } else if (e.holder) {
             holderRead(e.holder, e.index);
         } else {
-            slotAddress(e.index);
-            a_.mov(RAX, mem(RDX, 0));
+            a_.mov(RAX, slotMem(e.shape, e.index));
         }
         if (n + 1 < emit.size())
             a_.jmp(done);
@@ -1717,7 +1716,7 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
             a_.jcc(CNE, bad);
             ssaKnow(v, kVObj, ic.shape);
         }
-        slotAddress(ic.index);
+        slotAddress(ic.shape, ic.index);
         loadValue(x, RCX);
         if (mayBeCell(x))
             retain(RCX);
@@ -1745,7 +1744,7 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         return true;
     const std::vector<std::uint32_t> frameAfter = frame_;
     frame_ = frameBefore;
-    slotAddress(ic.index);
+    slotAddress(ic.shape, ic.index);
     a_.mov(RDI, mem(RDX, 0));
     a_.test(RDI, R15);
     a_.jcc(CE, cold);  // a cell
@@ -1794,13 +1793,13 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
     const JSValue pv = *f->slotAt(2);
     if (!isObject(pv))
         return false;
-    const Shape* root = vm_.rootShapeFor(asObject(pv));
+    const Shape* root = vm_.rootShapeFor(asObject(pv), 3);
     SsaNew p;
     p.fn = known;
     p.proto = pv;
     p.fnShape = f->h.shape;
     p.aux = newSlotsOf(C, root);
-    p.shape = root->id;
+    p.shape = vm_.rootShapeFor(asObject(pv), p.aux)->id;
     if (!canAllocObject(p.aux))
         return false;
     std::vector<std::int8_t> isConst(C->nregs, 0), isSelf(C->nregs, 0);
@@ -2232,8 +2231,7 @@ void Baseline::ssaPrivateRead(std::uint32_t i)
         a_.cmpI32(mem(RAX, 0), std::int32_t(pc.shape));
         a_.jcc(CNE, bad);
     }
-    slotAddress(pc.index);
-    a_.mov(RAX, mem(RDX, 0));
+    a_.mov(RAX, slotMem(pc.shape, pc.index));
     ssaKnow(v, kVObj, pc.shape);
     ssaDef(i, 0);
 }
@@ -2274,7 +2272,7 @@ void Baseline::ssaPutAdd(std::uint32_t i)
         a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto | cellflags::kNotExtensible));
         a_.jcc(CNE, bad);
     }
-    addSlot(ic.index, bad);
+    addSlot(ic.shape, ic.index, bad);
     loadValue(x, RCX);
     if (mayBeCell(x))
         retain(RCX);
@@ -2406,8 +2404,7 @@ void Baseline::ssaStringProtoRead(std::uint32_t i, std::uint32_t index)
     a_.movImm(RAX, toJSValue(sp).bits);
     a_.cmpI32(mem(RAX, 0), std::int32_t(sp->h.shape));
     a_.jcc(CNE, bad);
-    slotAddress(index);
-    a_.mov(RAX, mem(RDX, 0));
+    a_.mov(RAX, slotMem(sp->h.shape, index));
     ssaDef(i, kVObj);
 }
 

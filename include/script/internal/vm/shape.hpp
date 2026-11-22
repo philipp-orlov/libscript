@@ -170,6 +170,17 @@ struct Shape
     /// A root's: the inline slots `new` gives an object of its tree, once one has grown past those it was made with (8, 16
     /// or 24; 0 before).
     std::uint8_t slotHint = 0;
+    /// The inline slots every object of the shape has: a shape says where each of its properties is. Objects with one
+    /// prototype and different numbers of inline slots are in different trees.
+    std::uint8_t aux = 0;
+    /// A root's: the first root made for its prototype (`Rare::childRoot`, which has the hint and the ids for all), and the
+    /// next one of that prototype.
+    bool hintTried = false;  ///< a first root's: `newSlotsOf` has looked at the text
+    Shape* base = nullptr;
+    Shape* nextAux = nullptr;
+    /// A first root's: the ids of the roots for 3, 8, 16 and 24 inline slots (0: none yet), where `new` finds them.
+    std::uint32_t auxIds[4] = {};
+    static constexpr int auxIndex(std::uint8_t aux) noexcept { return aux == 3 ? 0 : aux == 8 ? 1 : aux == 16 ? 2 : aux == 24 ? 3 : -1; }
     std::uint64_t keyBits = 0;  ///< a bit per key hash: a clear bit means absent
     Vec<Transition> transitions;
     IndexTable transitionIndex;

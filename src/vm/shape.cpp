@@ -125,6 +125,7 @@ Shape* Shape::after(VM& vm, Key k, std::uint8_t a)
     n->proto = proto;
     n->parent = this;
     n->root = root;
+    n->aux = aux;
     n->key = k;
     n->attrs = a;
     n->keyBits = keyBits | keyBit(k);
@@ -265,27 +266,37 @@ void VM::noteProtoChain(JSObject* proto)
         }
 }
 
-Shape* VM::rootShapeFor(JSObject* proto)
+Shape* VM::rootShapeFor(JSObject* proto, std::uint8_t aux)
 {
-    if (!proto) {
-        if (!nullRoot_) {
-            nullRoot_ = newShape();
-            nullRoot_->root = nullRoot_;
-            nullRoot_->flags = Shape::kRoot;
-        }
-        return nullRoot_;
-    }
-    Rare& r = proto->rareOf(*this);
-    if (r.childRoot)
-        return r.childRoot;
+    Shape** first = &nullRoot_;
+    if (proto)
+        first = &proto->rareOf(*this).childRoot;
+    for (Shape* s = *first; s; s = s->nextAux)
+        if (s->aux == aux)
+            return s;
     Shape* root = newShape();
     root->root = root;
     root->flags = Shape::kRoot;
-    root->proto = proto;
-    detail::incRef(reinterpret_cast<CellPtr>(proto));
-    proto->h.flags |= cellflags::kIsProto;
-    noteProtoChain(proto->proto(*this));  // a proxy as `proto` itself is met by the walks that fill the cache
-    r.childRoot = root;
+    root->aux = aux;
+    if (proto) {
+        root->proto = proto;
+        detail::incRef(reinterpret_cast<CellPtr>(proto));
+    }
+    if (*first) {
+        root->base = *first;
+        root->nextAux = (*first)->nextAux;
+        (*first)->nextAux = root;
+    } else {
+        root->base = root;
+        if (proto) {
+            proto->h.flags |= cellflags::kIsProto;
+            noteProtoChain(proto->proto(*this));  // a proxy as `proto` itself is met by the walks that fill the cache
+            first = &proto->rareOf(*this).childRoot;
+        }
+        *first = root;
+    }
+    if (const int k = Shape::auxIndex(aux); k >= 0)
+        root->base->auxIds[k] = root->id;
     return root;
 }
 

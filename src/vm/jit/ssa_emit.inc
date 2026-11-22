@@ -3936,8 +3936,9 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
     }
     a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
     a_.jcc(CNE, bad);
+    Label append;
     a_.alu32(7, RCX, mem(RAX, kArrayLength));
-    a_.jcc(CAE, bad);
+    a_.jcc(CAE, append);
     a_.mov(RDX, mem(RAX, kArrayElems));
     a_.lea(RDX, mem(RDX, RCX, 8));
     // A hole of a plain array whose prototypes nothing can intercept a store with (`plainHoleGuard`): filled here.
@@ -3981,6 +3982,12 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
         }
         a_.mov(mem(RDX, 0), RSI);
     };
+    auto appendHere = [&]() {
+        a_.jmp(join);
+        a_.bind(append);
+        loadValue(vx, RSI);
+        appendAt(number, bad);
+    };
     if (number) {
         // A number over a number: `packed` (a lower bound) stays right as it is.
         a_.bind(overNumber);
@@ -3988,6 +3995,7 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
         a_.mov(mem(RDX, 0), RSI);
         a_.jmp(join);
         fillHole();
+        appendHere();
         return true;
     }
     retain(RSI);
@@ -4005,6 +4013,7 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
     release(RDI);
     a_.jmp(join);
     fillHole();
+    appendHere();
     return true;
 }
 

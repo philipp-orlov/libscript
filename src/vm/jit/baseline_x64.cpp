@@ -1185,6 +1185,31 @@ private:
     }
     /// `JSArray::noteStore` for a number stored at the index in `index` of an array that is not frozen: one more number
     /// when it comes right after those known.
+    /// The value in rsi, counted, behind the last element of the array in rax, whose index rcx is that of; no room: `bad`.
+    /// Uses rdx.
+    void appendAt(bool number, Label& bad)
+    {
+        a_.alu32(7, RCX, mem(RAX, kArrayLength));
+        a_.jcc(CNE, bad);
+        a_.alu32(7, RCX, mem(RAX, kArrayCapacity));
+        a_.jcc(CAE, bad);
+        if (number) {
+            packAt(RAX, RCX);
+        } else {
+            retain(RSI);
+            Label isNumber, stored;
+            a_.test(RSI, R14);
+            a_.jcc(CNE, isNumber);
+            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+            a_.jmp(stored);
+            a_.bind(isNumber);
+            packAt(RAX, RCX);
+            a_.bind(stored);
+        }
+        a_.mov(RDX, mem(RAX, kArrayElems));
+        a_.mov(mem(RDX, RCX, 8), RSI);
+        a_.inc32(mem(RAX, kArrayLength));
+    }
     void packAt(Reg array, Reg index)
     {
         Label keep;
@@ -5017,7 +5042,8 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     a_.jcc(CNE, bad);
     a_.mov32(RCX, RCX);
     a_.alu32(7, RCX, mem(RAX, kArrayLength));
-    a_.jcc(CAE, bad);  // an append goes the long way
+    Label append;
+    a_.jcc(CAE, append);
     a_.mov(RDX, mem(RAX, kArrayElems));
     a_.lea(RDX, mem(RDX, RCX, 8));
     a_.mov(RDI, mem(RDX, 0));
@@ -5068,6 +5094,12 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
             a_.jmp(done);
         }
     }
+
+    a_.bind(append);
+    a_.mov(RSI, R(in.c));
+    appendAt(false, bad);
+    noteElem(i, elemprof::kArray, RSI);
+    a_.jmp(done);
 
     // A typed array takes a number; one past its end is ignored.
     a_.bind(typed);

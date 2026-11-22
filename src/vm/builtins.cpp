@@ -4,6 +4,9 @@
 // The built-in objects the new core ships with so far: enough of Object, Function, Array, String, Number, Boolean, Math
 // and the error classes to run the language's own tests. The rest of the standard library is ported from
 // src/dyn/builtins (ls-jsc.md, 9.4) one file at a time.
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -2263,6 +2266,130 @@ NATIVE(booleanToString)
 
 // --------------------------------------------------------------------- JSON ---
 
+/// The text being written: room is made ahead, and characters go straight into it.
+struct JsonOut
+{
+    char16_t* data = nullptr;
+    std::size_t size = 0, cap = 0;
+    ~JsonOut()
+    {
+        if (data)
+            PoolAlloc<char16_t>().deallocate(data, cap);
+    }
+    JsonOut() = default;
+    JsonOut(const JsonOut&) = delete;
+    JsonOut& operator=(const JsonOut&) = delete;
+    void grow(std::size_t more)
+    {
+        const std::size_t to = std::max<std::size_t>(256, std::max(size + more, 2 * cap));
+        auto* d = PoolAlloc<char16_t>().allocate(to);
+        if (size)
+            std::memcpy(d, data, size * sizeof(char16_t));
+        if (data)
+            PoolAlloc<char16_t>().deallocate(data, cap);
+        data = d;
+        cap = to;
+    }
+    /// Room for `more` characters.
+    char16_t* room(std::size_t more)
+    {
+        if (cap - size < more) [[unlikely]]
+            grow(more);
+        return data + size;
+    }
+    void push_back(char16_t c)
+    {
+        *room(1) = c;
+        ++size;
+    }
+    void append(const char16_t* p, std::size_t n)
+    {
+        char16_t* to = room(n);
+        if (n <= 16) {
+            for (std::size_t k = 0; k < n; ++k)
+                to[k] = p[k];
+        } else {
+            std::memcpy(to, p, n * sizeof(char16_t));
+        }
+        size += n;
+    }
+    void operator+=(StringView s) { append(s.data(), s.size()); }
+};
+
+/// How many of the characters at the start of `s` stand as they are in a JSON string; they are written to `to`, which has room
+/// for all of `s` (and may be written past them).
+std::size_t jsonPlainRun(const char16_t* s, std::size_t n, char16_t* to)
+{
+    std::size_t i = 0;
+#if defined(__aarch64__)
+    const uint16x8_t space = vdupq_n_u16(0x20), quote = vdupq_n_u16(u'"'), slash = vdupq_n_u16(u'\\'), high = vdupq_n_u16(0xF800),
+                     surrogate = vdupq_n_u16(0xD800);
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t c = vld1q_u16(reinterpret_cast<const std::uint16_t*>(s + i));
+        const uint16x8_t odd = vorrq_u16(vorrq_u16(vcltq_u16(c, space), vceqq_u16(c, quote)),
+                                         vorrq_u16(vceqq_u16(c, slash), vceqq_u16(vandq_u16(c, high), surrogate)));
+        vst1q_u16(reinterpret_cast<std::uint16_t*>(to + i), c);
+        if (vmaxvq_u16(odd))
+            break;
+    }
+#endif
+    for (; i < n; ++i) {
+        const char16_t c = s[i];
+        if (c < 0x20 || c == u'"' || c == u'\\' || (c & 0xF800) == 0xD800)
+            break;
+        to[i] = c;
+    }
+    return i;
+}
+
+void jsonQuote(JsonOut& out, StringView s)
+{
+    static const char16_t hex[] = u"0123456789abcdef";
+    char16_t* to = out.room(s.size() + 2);
+    *to++ = u'"';
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        // A run of characters that stand as they are, in one go.
+        const std::size_t run = jsonPlainRun(s.data() + i, s.size() - i, to);
+        to += run;
+        i += run;
+        if (i >= s.size())
+            break;
+        // Anything else is at most six characters.
+        out.size = std::size_t(to - out.data);
+        to = out.room(6 + (s.size() - i) + 1);
+        const char16_t c = s[i];
+        auto escape = [&](char16_t e) {
+            *to++ = u'\\';
+            *to++ = e;
+        };
+        switch (c) {
+            case u'"': escape(u'"'); break;
+            case u'\\': escape(u'\\'); break;
+            case u'\b': escape(u'b'); break;
+            case u'\f': escape(u'f'); break;
+            case u'\n': escape(u'n'); break;
+            case u'\r': escape(u'r'); break;
+            case u'\t': escape(u't'); break;
+            default: {
+                // A lone surrogate is written as an escape; a pair stands as it is.
+                const bool high = c >= 0xd800 && c < 0xdc00, low = c >= 0xdc00 && c <= 0xdfff;
+                if ((high && i + 1 < s.size() && s[i + 1] >= 0xdc00 && s[i + 1] <= 0xdfff) ||
+                    (low && i > 0 && s[i - 1] >= 0xd800 && s[i - 1] < 0xdc00)) {
+                    *to++ = c;
+                    break;
+                }
+                escape(u'u');
+                *to++ = hex[c >> 12];
+                *to++ = hex[(c >> 8) & 15];
+                *to++ = hex[(c >> 4) & 15];
+                *to++ = hex[c & 15];
+            }
+        }
+    }
+    *to++ = u'"';
+    out.size = std::size_t(to - out.data);
+}
+
 struct JsonWriter
 {
     VM& vm;
@@ -2271,7 +2398,7 @@ struct JsonWriter
     bool hasAllow = false;
     String gap;
     String indent;
-    String out;
+    JsonOut out;
     Vec<JSObject*> stack;
     Key toJson = nullptr;  ///< held for the length of the call
     /// Whether Array.prototype and Object.prototype have no `toJSON`, as of `protoCell` (held while it is valid).
@@ -2300,8 +2427,8 @@ struct JsonWriter
         }
         ~ShapeKeys() { clear(); }
     };
-    ShapeKeys shapeKeys[4]{};
-    std::uint32_t nextShapeKeys = 0;
+    static constexpr std::uint32_t kShapeKeys = 32;
+    ShapeKeys shapeKeys[kShapeKeys]{};
     ~JsonWriter()
     {
         if (protoCell)
@@ -2338,55 +2465,49 @@ struct JsonWriter
     }
 };
 
-void jsonQuote(String& out, StringView s)
+/// A value that is no object, where nothing looks at it first: 1 when it was written, 2 for nothing to write (undefined, a
+/// symbol), 0 for what is not for here.
+int jsonLeaf(JsonWriter& j, JSValue v)
 {
-    static const char16_t hex[] = u"0123456789abcdef";
-    out.push_back(u'"');
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        // A run of characters that stand as they are, in one go.
-        std::size_t run = i;
-        while (run < s.size() && s[run] >= 0x20 && s[run] != u'"' && s[run] != u'\\' && (s[run] < 0xd800 || s[run] > 0xdfff))
-            ++run;
-        if (run > i) {
-            out.append(s.data() + i, run - i);
-            i = run;
-            if (i >= s.size())
-                break;
-        }
-        const char16_t c = s[i];
-        switch (c) {
-            case u'"': out += u"\\\""; break;
-            case u'\\': out += u"\\\\"; break;
-            case u'\b': out += u"\\b"; break;
-            case u'\f': out += u"\\f"; break;
-            case u'\n': out += u"\\n"; break;
-            case u'\r': out += u"\\r"; break;
-            case u'\t': out += u"\\t"; break;
-            default:
-                if (c < 0x20) {
-                    out += u"\\u00";
-                    out.push_back(hex[c >> 4]);
-                    out.push_back(hex[c & 15]);
-                } else if (c >= 0xd800 && c <= 0xdfff) {
-                    // A lone surrogate is written as an escape; a pair stands as it is.
-                    const bool high = c < 0xdc00;
-                    const bool paired = high ? (i + 1 < s.size() && s[i + 1] >= 0xdc00 && s[i + 1] <= 0xdfff)
-                                             : (i > 0 && s[i - 1] >= 0xd800 && s[i - 1] < 0xdc00);
-                    if (paired) {
-                        out.push_back(c);
-                    } else {
-                        out += u"\\u";
-                        out.push_back(hex[c >> 12]);
-                        out.push_back(hex[(c >> 8) & 15]);
-                        out.push_back(hex[(c >> 4) & 15]);
-                        out.push_back(hex[c & 15]);
-                    }
-                } else {
-                    out.push_back(c);
-                }
-        }
+    if (isString(v)) {
+        jsonQuote(j.out, asString(v)->text());
+        return 1;
     }
-    out.push_back(u'"');
+    if (v.isInt32()) {
+        char16_t digits[12];
+        std::int64_t n = v.asInt32();
+        const bool negative = n < 0;
+        if (negative)
+            n = -n;
+        int at = 12;
+        do {
+            digits[--at] = char16_t(u'0' + n % 10);
+            n /= 10;
+        } while (n);
+        if (negative)
+            digits[--at] = u'-';
+        j.out.append(digits + at, std::size_t(12 - at));
+        return 1;
+    }
+    if (v.isNumber()) {
+        const double d = v.asNumber();
+        if (std::isfinite(d)) {
+            const auto text = script::internal::numberToString(d);
+            j.out += text;
+        } else {
+            j.out += u"null";
+        }
+        return 1;
+    }
+    if (v.isNull()) {
+        j.out += u"null";
+        return 1;
+    }
+    if (v.isBool()) {
+        j.out += v == JSValue::boolean(true) ? StringView(u"true") : StringView(u"false");
+        return 1;
+    }
+    return v.isUndefined() ? 2 : 0;
 }
 
 // 0 for an exception, 1 for text written, 2 for nothing to write (undefined, a function, a symbol).
@@ -2455,39 +2576,8 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         }
     }
     const JSValue v = value.get();
-    if (v.isNull()) {
-        j.out += u"null";
-        return 1;
-    }
-    if (v.isBool()) {
-        j.out += v == JSValue::boolean(true) ? u"true" : u"false";
-        return 1;
-    }
-    if (isString(v)) {
-        jsonQuote(j.out, asString(v)->text());
-        return 1;
-    }
-    if (v.isInt32()) {
-        char16_t digits[12];
-        std::int64_t n = v.asInt32();
-        const bool negative = n < 0;
-        if (negative)
-            n = -n;
-        int at = 12;
-        do {
-            digits[--at] = char16_t(u'0' + n % 10);
-            n /= 10;
-        } while (n);
-        if (negative)
-            digits[--at] = u'-';
-        j.out.append(digits + at, std::size_t(12 - at));
-        return 1;
-    }
-    if (v.isNumber()) {
-        const double d = v.asNumber();
-        j.out += std::isfinite(d) ? script::internal::numberToString(d) : String(u"null");
-        return 1;
-    }
+    if (const int leaf = jsonLeaf(j, v))
+        return leaf;
     if (isBigInt(v)) {
         typeError(vm, "Do not know how to serialize a BigInt");
         return 0;
@@ -2516,19 +2606,12 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
     JsonWriter::ShapeKeys* fastKeys = nullptr;
     JsonWriter::ShapeKeys spare;
     if (!array && !j.hasAllow && o->cls() == ObjClass::Plain && !proxyOf(o) && !o->isDictionary(vm)) {
-        for (JsonWriter::ShapeKeys& e : j.shapeKeys)
-            if (e.shape == o->h.shape && e.runs == j.scriptRuns)
-                fastKeys = &e;
+        JsonWriter::ShapeKeys& entry = j.shapeKeys[o->h.shape % JsonWriter::kShapeKeys];
+        if (entry.shape == o->h.shape && entry.runs == j.scriptRuns)
+            fastKeys = &entry;
         if (!fastKeys) {
-            // Into an entry no object being written uses, else one of its own.
-            JsonWriter::ShapeKeys* into = &spare;
-            for (int tries = 0; tries < 4; ++tries) {
-                JsonWriter::ShapeKeys& e = j.shapeKeys[j.nextShapeKeys++ & 3];
-                if (!e.busy) {
-                    into = &e;
-                    break;
-                }
-            }
+            // Into the shape's entry if no object being written uses it, else one of its own.
+            JsonWriter::ShapeKeys* into = entry.busy ? &spare : &entry;
             into->clear();
             Shape* shape0 = o->shapeOf(vm);
             bool ok = true;
@@ -2548,12 +2631,12 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
                         detail::incRef(e.key);
                         into->names.push_back(e.key);
                         into->slots.push_back(i);
-                        String q;
+                        JsonOut q;
                         jsonQuote(q, static_cast<StringCell*>(e.key)->text());
                         q.push_back(u':');
                         if (!j.gap.empty())
                             q.push_back(u' ');
-                        into->quoted.push_back(std::move(q));
+                        into->quoted.emplace_back(q.data, q.size);
                     }
                 }
             }
@@ -2567,6 +2650,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         }
     }
     const bool fast = fastKeys != nullptr;
+    const bool plain = j.replacerFn.get() == JSValue::undefined();  // nothing looks at a value that is no object
     if (array || fast) {
         // Elements are read through `length`, as the spec says.
     } else if (j.hasAllow) {
@@ -2597,6 +2681,12 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         for (std::uint32_t i = 0; i < length; ++i) {
             Handle elementKeep;
             auto* arr = static_cast<JSArray*>(asObject(v));
+            if (plain && plainArray && i < arr->length && !arr->at(i).isHole() && !isObject(arr->at(i)) && !isBigInt(arr->at(i))) {
+                separator();
+                if (jsonLeaf(j, arr->at(i)) != 1)
+                    j.out += u"null";
+                continue;
+            }
             if (plainArray && i < arr->length && !arr->at(i).isHole()) {
                 elementKeep = Handle::retained(arr->at(i));
             } else {
@@ -2629,6 +2719,20 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
         const std::uint32_t runs0 = j.scriptRuns;
         for (std::size_t n = 0; n < fastKeys->names.size(); ++n) {
             const Key name = fastKeys->names[n];
+            if (plain && o->h.shape == shape0 && j.scriptRuns == runs0) {
+                const JSValue pv = *o->slotAt(fastKeys->slots[n]);
+                if (!isObject(pv) && !isBigInt(pv)) {
+                    const std::size_t before = j.out.size;
+                    const bool hadAny = wroteAny;
+                    separator();
+                    j.out += fastKeys->quoted[n];
+                    if (jsonLeaf(j, pv) != 1) {
+                        j.out.size = before;
+                        wroteAny = hadAny;
+                    }
+                    continue;
+                }
+            }
             Handle propKeep;
             if (o->h.shape == shape0 && j.scriptRuns == runs0) {
                 propKeep = Handle::retained(*o->slotAt(fastKeys->slots[n]));
@@ -2639,7 +2743,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
                     return 0;
                 propKeep = Handle::adopt(prop);
             }
-            const std::size_t before = j.out.size();
+            const std::size_t before = j.out.size;
             const bool hadAny = wroteAny;
             separator();
             j.out += fastKeys->quoted[n];
@@ -2647,7 +2751,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
             if (r == 0)
                 return 0;
             if (r == 2) {
-                j.out.resize(before);
+                j.out.size = before;
                 wroteAny = hadAny;
             }
         }
@@ -2661,7 +2765,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
             if (prop.isException())
                 return 0;
             Handle propKeep = Handle::adopt(prop);
-            const std::size_t before = j.out.size();
+            const std::size_t before = j.out.size;
             const bool hadAny = wroteAny;
             separator();
             jsonQuote(j.out, asString(name.get())->text());
@@ -2672,7 +2776,7 @@ int jsonSerialize(JsonWriter& j, JSValue holder, JSValue key, JSValue input, std
             if (r == 0)
                 return 0;
             if (r == 2) {
-                j.out.resize(before);
+                j.out.size = before;
                 wroteAny = hadAny;
             }
         }
@@ -2738,7 +2842,7 @@ NATIVE(jsonStringify)
         return JSValue::exception();
     if (r == 2)
         return JSValue::undefined();
-    return makeString(vm, StringView(j.out));
+    return makeString(vm, StringView(j.out.data, j.out.size));
 }
 
 struct JsonReader

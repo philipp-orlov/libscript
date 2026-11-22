@@ -144,10 +144,11 @@ TEST(aBoundedFreeLeavesTheRestForLater)
     // `freeBudget`: letting go of a long list frees a part of it at a time; the rest goes as the program allocates, and
     // all of it when the host collects.
     js::Context::Options options;
-    options.core = js::Context::Options::Core::Vm;
     options.memory = js::Context::Options::Memory::Counted;
     options.freeBudget = 1000;
     js::Context ctx(options);
+    if (ctx.core() != script::Context::Options::Core::Vm)
+        return;  // the vm core's memory options
     ctx.eval("0");
     const auto base = ctx.stats().liveObjects;
     ctx.eval("globalThis.l = null; for (let i = 0; i < 200000; i++) l = { next: l };");
@@ -167,10 +168,11 @@ TEST(aBoundedFreeLeavesTheRestForLater)
 TEST(manualCyclesWaitForTheHost)
 {
     js::Context::Options options;
-    options.core = js::Context::Options::Core::Vm;
     options.cycles = js::Context::Options::Cycles::Manual;
     options.gcThreshold = 1u << 12;
     js::Context ctx(options);
+    if (ctx.core() != script::Context::Options::Core::Vm)
+        return;  // the vm core's memory options
     ctx.eval("function makeCycle() { const a = {}; const b = { a }; a.b = b; return null; }"
              "for (let i = 0; i < 20000; i++) makeCycle();");
     const auto before = ctx.stats();
@@ -207,4 +209,32 @@ TEST(spreadArgumentsLiveUntilTheirCallIsOver)
         CHECK_EQ(ctx.eval(program, "<test>").toString(),
                  std::string("110 110 110 110 s0s1s2s3s4s5 110 s0s1s2s3s4s5 110 s0s1s2s3s4s5 40:35:01 40:35:01 40:35:01 79 79 79"));
     }
+}
+
+TEST(deferredGarbageIsBoundedAndGoneWhenTheHostIsBack)
+{
+    // Frames hold values without counts: garbage waits for a scan, but not for a collection, and none waits once no script
+    // runs. Values the host drops then go at once.
+    script::Context::Options options;
+    options.language = script::Language::JavaScript;
+    options.memory = script::Context::Options::Memory::Deferred;
+    options.cycles = script::Context::Options::Cycles::Manual;
+    script::Context ctx(options);
+    if (ctx.core() != script::Context::Options::Core::Vm)
+        return;  // the vm core's memory options
+    ctx.eval("0");
+    const auto before = ctx.stats();
+    ctx.eval("var s = 0; for (let i = 0; i < 200000; i++) { const o = { a: [i], b: 'k' + i + '-' }; s += o.a[0] + o.b.length; }");
+    ctx.eval("function nest(n) { const o = { n, s: 'deep' + n }; return n ? nest(n - 1) + o.n + o.s.length : 0; } nest(300);");
+    const auto after = ctx.stats();
+    CHECK(after.gcRuns == before.gcRuns);
+    CHECK(after.liveObjects < before.liveObjects + 200);
+    CHECK(after.liveStrings < before.liveStrings + 200);
+    {
+        std::vector<script::Value> held;
+        for (int i = 0; i < 5000; ++i)
+            held.push_back(ctx.eval("({ x: [1, 2, 3] })"));
+        CHECK(ctx.stats().liveObjects > after.liveObjects + 9000);
+    }
+    CHECK(ctx.stats().liveObjects < after.liveObjects + 200);
 }

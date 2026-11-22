@@ -264,6 +264,29 @@ reads once on the way in. Values known never to be below zero (`nonNeg_`) need n
 `CALLDBG` (calls that reach `callPrepare`, per site), `WINDBG` (the call windows), `RETDBG` (what a return clears).
 `T2EXITS` names the exits of both tiers, with the opcode and, for element exits, the caller.
 
+## Deferred frames
+
+`Context::Options::memory` picks how frames hold values (`VM::deferred`; docs/memory.md has the host's view). A counted frame
+owns a count of each value in its registers. A deferred frame owns none. These rules keep a deferred frame sound:
+
+1. Only cells, handles and the runtime's own variables hold counts. A count that reaches zero puts the cell in the zero-count
+   table (`zctBase_`..`zctTop_`, marked by `gc == kInZct`; strings, symbols and bigints in `zctOld_`, marked by `inZct`).
+2. `scanZct` adds a count for each cell in a live register, frees what is still at zero, and takes the counts away. What falls
+   back to zero returns to the table. Live registers are those of every frame, and those below `stackTop`. The scan writes
+   undefined in the registers above them.
+3. A collection adds those counts for its whole run (`rootsBegin`, `rootsEnd`), and the table is empty while it runs.
+4. A scan starts only in C++: an allocation, a budget, a collection, the return of a call from the host. Compiled code stores
+   each live cell in a frame slot before it calls C++.
+5. Compiled code owns no counts. It counts what it stores into cells. A value from C++ has lost its count (`handOver`), and
+   nothing runs before that value is in a frame slot. A compiled `Ret` returns its result without a count, and `enterTier1`
+   takes one for C++.
+6. C++ code that puts an owned value in a register uses `setReg` or `setRegister`. Code that copies a value there uses `copyReg`
+   or `copyRegister`. Code that hands a register to a native covers it with `stackTop`.
+7. A count of 1 does not mean one holder. `s += t` grows a buffer that only slices show (`appendShared`).
+
+Tests run in both modes: `SCRIPT_VM_DEFERRED=0` and `=1` set the mode in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
+`SCRIPT_VM_AUDIT=1` checks every count at each scan. `SCRIPT_VM_ZCT=n` sets the table's least limit (0: every allocation scans).
+
 ## Arrays of numbers
 
 An array knows how many of its first elements are numbers (`JSArray::packed`: no hole and no cell below it). It is a

@@ -228,9 +228,15 @@ options.freeBudget = 1000;                                       // Counted: cel
 options.cycles     = script::Context::Options::Cycles::Manual;   // or Auto (the default)
 ```
 
-* **`memory`.** `Counted` frees a cell at its last release. `Deferred` will let
-  frames hold values without counts and free them at stack scans. For now,
-  `Deferred` manages memory as `Counted` does.
+* **`memory`.** `Counted` frees a cell at its last release. In `Deferred`, the
+  registers of script frames hold values without counts. A cell whose count
+  reaches zero waits in a zero-count table. A scan of the frames frees the cells
+  in the table that no frame holds. Scans run when the table is full (at least
+  256 cells) at an allocation, before a collection, before a budget or
+  `memoryLimit` is found crossed, and when a call from the host returns with no
+  script running. `Deferred` runs compiled code faster. A dead cell is freed
+  later, and a generator keeps what its registers held at its last suspension
+  until the next one. On x86-64, `Deferred` manages memory as `Counted` does.
 * **`freeBudget`.** A release that frees a large structure frees at most this
   many cells. The rest go on a list, and each later allocation frees up to this
   many more from it. A cycle collection frees all of the list. A real-time host

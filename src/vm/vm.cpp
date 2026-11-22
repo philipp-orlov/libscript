@@ -81,16 +81,24 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
         ctx.options.freeBudget = std::size_t(std::atoi(t));
 #endif
 
+    // Frames without counts. Compiled code for x86-64 has the paths but has not been run with them: there, `Deferred`
+    // manages memory as `Counted` does.
+    deferred = ctx.options.memory == Context::Options::Memory::Deferred;
+#if !defined(__aarch64__)
+    deferred = false;
+#endif
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
-    // Frames without counts (`Options::Memory::Deferred`), while the runtime learns it.
-    if (const char* t = std::getenv("SCRIPT_VM_DEFERRED"); t && std::atoi(t) && ctx.options.memory == Context::Options::Memory::Deferred) {
-        deferred = true;
+    // Testing: the mode of every context that does not ask for `Counted`, and the zero-count table's least limit (0: every
+    // allocation scans).
+    if (const char* t = std::getenv("SCRIPT_VM_DEFERRED"); t && ctx.options.memory == Context::Options::Memory::Deferred)
+        deferred = std::atoi(t) != 0;
+    if (const char* z = std::getenv("SCRIPT_VM_ZCT"))
+        zctMin_ = std::size_t(std::atoi(z));
+#endif
+    if (deferred) {
         ctx.deferredVm = this;
-        if (const char* z = std::getenv("SCRIPT_VM_ZCT"))
-            zctMin_ = std::size_t(std::atoi(z));
         setZctLimit();
     }
-#endif
 
     mergeInlining = tier2Threshold > 0;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)

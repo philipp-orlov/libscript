@@ -203,9 +203,9 @@ public:
         /// host hands it, and both are a TypeError.
         bool runtimeCode = false;
         /// How memory is managed. `Counted`: every reference holds a count, and a value is freed the moment its last
-        /// reference goes; for tight memory and real-time hosts. `Deferred`: references from the stack and registers hold
-        /// none (the collector scans them), which makes compiled code faster; a value is freed at the next scan. Fixed for
-        /// the life of the context. (For now `Deferred` manages memory as `Counted` does.)
+        /// reference goes; for tight memory and real-time hosts. `Deferred`: references from script frames hold none
+        /// (scans of the frames find them), which makes compiled code faster; a value is freed at the next scan. Fixed for
+        /// the life of the context. (On x86-64, `Deferred` manages memory as `Counted` does; the vm core's values.)
         enum class Memory : std::uint8_t
         {
             Counted,

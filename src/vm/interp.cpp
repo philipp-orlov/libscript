@@ -4994,7 +4994,9 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
                 R[1 + i] = args[i];
             for (std::uint32_t i = 0; i <= n; ++i)
                 retainReg(*this, R[i]);
-            for (std::uint32_t i = 1 + n; i < c->nregs; ++i)
+            // (A deferred frame: the parameters there is no argument for. The callee's code sees to its other registers.)
+            const std::uint32_t end = deferred ? 1u + c->nparams : c->nregs;
+            for (std::uint32_t i = 1 + n; i < end; ++i)
                 if (!R[i].isUndefined()) [[unlikely]]
                     clearReg(*this, R[i]);
             *frameTop++ = Frame{c, f, nullptr, R, 0, 0, n, false, true, JSValue::undefined()};

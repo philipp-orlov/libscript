@@ -251,13 +251,17 @@ struct TableState : NativeState
         dead = 0;
         index.rebuild(entries);
     }
-    /// The first live entry after sequence `after`.
-    const Entry_* after(std::uint64_t seq) const
+    /// The first live entry after sequence `after`. `hint`: where the entry of `seq` was last (an iterator's), kept up.
+    const Entry_* after(std::uint64_t seq, std::uint32_t* hint = nullptr) const
     {
-        auto it = std::upper_bound(entries.begin(), entries.end(), seq,
-                                   [](std::uint64_t s, const Entry_& e) { return s < e.seq; });
+        auto it = hint && *hint < entries.size() && entries[*hint].seq == seq
+                      ? entries.begin() + std::ptrdiff_t(*hint) + 1
+                      : std::upper_bound(entries.begin(), entries.end(), seq,
+                                         [](std::uint64_t s, const Entry_& e) { return s < e.seq; });
         while (it != entries.end() && !it->live)
             ++it;
+        if (hint && it != entries.end())
+            *hint = std::uint32_t(it - entries.begin());
         return it == entries.end() ? nullptr : &*it;
     }
 };
@@ -266,6 +270,7 @@ struct TableIter : IteratorState
 {
     JSValue table;
     std::uint64_t last = 0;
+    std::uint32_t at = ~0u;  ///< where the entry of `last` is (`TableState::after`)
     int kind;  // 0 keys, 1 values, 2 entries
 
     TableIter(JSValue t, int k) : table(t), kind(k) { retain(table); }
@@ -282,7 +287,7 @@ struct TableIter : IteratorState
         if (!isObject(table))
             return 0;
         auto* t = static_cast<TableState*>(asObject(table)->rare()->ext);
-        const Entry_* e = t->after(last);
+        const Entry_* e = t->after(last, &at);
         if (!e) {
             release(table);
             table = JSValue::undefined();
@@ -491,7 +496,8 @@ NATIVE(tableForEach)
         return typeError(vm, describe(vm, callback) + " is not a function");
     Handle keep = Handle::retained(self);
     std::uint64_t last = 0;
-    while (const Entry_* e = t->after(last)) {
+    std::uint32_t at = ~0u;
+    while (const Entry_* e = t->after(last, &at)) {
         last = e->seq;
         Handle key = Handle::retained(e->key);
         Handle value = Handle::retained(k.isMap ? e->value : e->key);

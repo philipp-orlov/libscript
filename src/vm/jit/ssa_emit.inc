@@ -925,6 +925,9 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
         for (unsigned r = 0; r < nregs; ++r)
             st[r] = r;  // the slots hold the entry values
         name_ = st;
+        if (def_)
+            for (unsigned r = 1u + code_->nparams + ((code_->flags & CodeBlock::kNeedsArgs) ? 1 : 0); r < nregs; ++r)
+                st[r] = ssa::kNone;  // anything
         frame_ = st;
         liveBefore_ = g.blocks[1].liveIn;
         ssaResetFacts();
@@ -2973,7 +2976,11 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     // Caller registers the callee's frame covers past the arguments: a plain one is overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     // (A deferred frame has nothing to let go of there. Past the callee's registers, a call it makes may reach them.)
-    for (unsigned r = 1 + argc; r < window; ++r) {
+    // (A deferred frame: the parameters there is no argument for. The callee's code sees to its other registers.)
+    if (def_)
+        for (unsigned r = 1 + argc; r <= C->nparams; ++r)
+            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+    for (unsigned r = 1 + argc; !def_ && r < window; ++r) {
         const std::uint32_t at = frame_[base + 1 + r];
         if (at != ssa::kNone && sval_[at].isConst && sval_[at].bits == kUndefined)
             continue;  // as it is
@@ -3513,6 +3520,9 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     };
     // Whether forward input `in` of a phi can be checked to be an int32 on its way in (a boxed value that is not a constant).
     auto checkable = [&](std::uint32_t in) { return !sval_[in].isConst && (cls[in] == 0 || cls[in] == 1 || cls[in] == 3); };
+    auto doubleOp = [](Op op) {
+        return op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI || op == Op::MulI || op == Op::Neg;
+    };
     for (bool changed = true; changed;) {
         changed = false;
         for (std::uint32_t v = 0; v < nv; ++v) {
@@ -3525,7 +3535,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                     oc = 1;  // profiled int32: a boxed operand is taken as the profile says
                 m = std::max(m, oc);
             }
-            const std::uint8_t c = std::max(cls[v], m);
+            std::uint8_t c = std::max(cls[v], m);
+            // Doubles only where the double path has the operation (not `ModI`, `Inc`, `Dec`): else the template.
+            if (c == 2 && !doubleOp(code_->code[g.values[v].at].opcode()))
+                c = 3;
             if (c != cls[v]) {
                 cls[v] = c;
                 changed = true;
@@ -3561,11 +3574,6 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     for (std::uint32_t v = 0; v < nv; ++v)
         if (byOperands[v]) {
             const std::uint32_t at = g.values[v].at;
-            const Op op = code_->code[at].opcode();
-            // Doubles only where the double path has the operation (not `ModI`, `Inc`, `Dec`): else the template.
-            if (cls[v] == 2 && !(op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI ||
-                                 op == Op::MulI || op == Op::Neg))
-                cls[v] = 3;
             intArith_[at] = cls[v] == 1 || cls[v] == 0;
             dblArith_[at] = cls[v] == 2;
             if (cls[v] == 0)

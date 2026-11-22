@@ -73,6 +73,9 @@ struct Stubs
 {
     Stub run = nullptr;
     void* osrEnter = nullptr;
+    /// Another function than the last is called from a site: rdi its uid, rsi the site's `callProf`, rdx its `callTargets`.
+    /// Clobbers rsi.
+    void* noteCallee = nullptr;
 };
 
 /// A function's way in: the frame in rsi, its registers (the frame's `R`) in rdi, so that nothing waits on the frame's
@@ -113,12 +116,32 @@ const Stubs& stubs()
         const std::int32_t osr = a.here();
         emitPrologue(a);
         a.jmp(RDX);
+        a.align(16);
+        const std::int32_t note = a.here();
+        a.mov(mem(RSI, 0), RDI);
+        Label out, put[4];
+        for (std::int32_t k = 0; k < 4; ++k) {
+            a.mov(RSI, mem(RDX, 8 * k));
+            a.cmp(RSI, RDI);
+            a.jcc(CE, out);
+            a.test(RSI, RSI);
+            a.jcc(CE, put[k]);
+        }
+        a.mov(mem(RDX, 32), 1);
+        a.bind(out);
+        a.ret();
+        for (std::int32_t k = 0; k < 4; ++k) {
+            a.bind(put[k]);
+            a.mov(mem(RDX, 8 * k), RDI);
+            a.ret();
+        }
         CodeSpan span = allocateCode(a.buf.size());
         if (!span)
             return st;
         commitCode(span, a.buf.data(), a.buf.size());
         st.run = reinterpret_cast<Stub>(span.rx);
         st.osrEnter = span.rx + osr;
+        st.noteCallee = span.rx + note;
         return st;
     }();
     return result;
@@ -552,6 +575,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
                     if (code->only == fr->fn)
                         code->only = nullptr;
                     vm->functionMade(d, fr->fn);
+                    code->mergedInto = d->uid;
                     fr->fn->code = d;  // the function's count of `code` is now `d`'s
                     // A small one, with the profile of what was hot already, is optimized soon.
                     if (vm->tier2Threshold > 0 && d->code.size() <= 200)
@@ -599,6 +623,26 @@ struct CallResult
 {
     std::uint64_t a, b;
 };
+
+/// `callProf` and `callTargets` of a call the runtime makes (compiled code does the same, `Stubs::noteCallee`).
+inline void noteCallee(CodeBlock* code, std::uint32_t index, std::uint64_t uid) noexcept
+{
+    if (code->callProf[index] == uid)
+        return;
+    code->callProf[index] = uid;
+    if (index >= code->callTargetAt.size() || !code->callTargetAt[index])
+        return;
+    CodeBlock::CallTargets& t = code->callTargets[code->callTargetAt[index] - 1];
+    for (std::uint64_t& u : t.uid) {
+        if (u == uid)
+            return;
+        if (!u) {
+            u = uid;
+            return;
+        }
+    }
+    t.more = 1;
+}
 
 /// A `Call` from compiled code. {0, 0}: not handled here, nothing changed; run the instruction in the interpreter.
 /// {result, 1}: a native function ran; the result is owned, or 0 for an exception. {frame, code}: a script function,
@@ -654,7 +698,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     if (isNew && ((f->flags & JSFunction::kNative) ? !(f->flags & JSFunction::kConstructor) : !f->code->constructor))
         return {0, 0};
     if (!(f->flags & JSFunction::kNative) && index < code->callProf.size())
-        code->callProf[index] = f->code->uid;
+        noteCallee(code, index, f->code->uid);
     if (f->flags & JSFunction::kNative) {
         fr->pc = ins + 1;
         if (!isSuper && callee.bits == vm.arrayConstructor.bits &&
@@ -733,12 +777,14 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         // What the frame sits on may be the caller's dead temporaries, or arguments the callee has no parameter for.
         // All of the caller's registers above the arguments (as the compiled call sequence clears them): a call the new
         // frame makes in turn may reach past its end into them.
+        // (A deferred frame: the parameters there is no argument for. The callee's code sees to its other registers.)
         JSValue* callerEnd = R + code->nregs;
-        const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
+        const std::uint32_t overlap = vm.deferred ? 1u + c->nparams : callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
         for (std::uint32_t i = keep; i < overlap; ++i)
             clearRegister(vm, newR[i]);
-        for (std::uint32_t i = std::max(keep, overlap); i < 1 + argc && i < c->nregs; ++i)
-            clearRegister(vm, newR[i]);
+        if (!vm.deferred)
+            for (std::uint32_t i = std::max(keep, overlap); i < 1 + argc && i < c->nregs; ++i)
+                clearRegister(vm, newR[i]);
     }
     if (argsArray) {
         // In the register after the parameters, which the clearing above left empty.
@@ -987,11 +1033,20 @@ public:
         return compileOptimized();
     }
 
+    /// A deferred frame's registers that may be read before they are written become undefined.
+    void emitEntryUndefs()
+    {
+        if (!def_)
+            return;
+        for (std::uint16_t r : entryUndefs(*code_))
+            a_.mov(R(r), std::int32_t(kUndefined));
+    }
     /// The most instructions of a function whose code may load constants from behind it (a load reaches a megabyte).
     static constexpr std::uint32_t kPoolCode = 4000;
     Tier1Code* compile()
     {
         emitPrologue(a_);
+        emitEntryUndefs();
         if (vm_.tier2Threshold > 0)
             emitCounter(0, -1);
         for (std::uint32_t i = 0; i < n_;) {
@@ -2754,9 +2809,17 @@ private:
     void clearWindow(std::uint32_t i, unsigned base, unsigned argc, unsigned window, Label& helper)
     {
         if (def_) {
-            // Dead temporaries of the caller: nothing counted to let go of.
-            for (unsigned r = 1 + argc; r < window; ++r)
-                a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+            // Dead temporaries of the caller: nothing counted to let go of. The parameters there is no argument for (`rcx`
+            // the callee's block) become undefined; its code sees to its other registers.
+            Label next, done;
+            a_.movzx16(RDI, mem(RCX, kCbNparams));
+            a_.bind(next);
+            a_.aluI32(7, RDI, std::int32_t(argc));
+            a_.jcc(CBE, done);
+            a_.mov(mem(R9, RDI, 8), std::int32_t(kUndefined));
+            a_.aluI32(5, RDI, 1);
+            a_.jmp(next);
+            a_.bind(done);
             return;
         }
         for (unsigned r = 1 + argc; r < window; ++r) {
@@ -5685,9 +5748,28 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         if (!isSuper) {
             if (code_->callProf.empty())
                 code_->callProf.assign(code_->code.size(), 0);
+            if (code_->callTargetAt.empty()) {
+                // One place for each call (made whole now: the code has their addresses).
+                code_->callTargetAt.assign(code_->code.size(), 0);
+                std::uint32_t calls = 0;
+                for (std::uint32_t j = 0; j < n_; j += length(j))
+                    if (code_->code[j].opcode() == Op::Call)
+                        code_->callTargetAt[j] = ++calls;
+                code_->callTargets.resize(calls);
+            }
             a_.mov(RDI, mem(RCX, kCbUid));
             a_.movImm(RSI, reinterpret_cast<std::uint64_t>(&code_->callProf[i]));
-            a_.mov(mem(RSI, 0), RDI);
+            Label same;
+            a_.cmp(RDI, mem(RSI, 0));
+            a_.jcc(CE, same);
+            if (code_->callTargetAt[i]) {
+                a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&code_->callTargets[code_->callTargetAt[i] - 1]));
+                a_.movImm(R9, reinterpret_cast<std::uint64_t>(stubs().noteCallee));
+                a_.callReg(R9);
+            } else {
+                a_.mov(mem(RSI, 0), RDI);
+            }
+            a_.bind(same);
         }
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.test(RDX, RDX);
@@ -6086,17 +6168,13 @@ void Baseline::call(std::uint32_t i, const Ins& in)
 }
 
 /// `ret` of a deferred frame: the result goes back as the frame holds it, without a count (`enterTier1` takes one for C++),
-/// and the registers are cleared without a look.
+/// and the registers stay as they are: a stale one names no cell that is gone (only a scan frees, and it clears what is above
+/// the frames first).
 void Baseline::retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, bool constructs,
                            const std::vector<std::uint64_t>* dirty)
 {
     (void)i;
-    // Registers no path to here has written are undefined still. (The arguments object is put in its register by the
-    // call, not by an instruction.)
-    const unsigned argsReg = (code_->flags & CodeBlock::kNeedsArgs) ? 1u + code_->nparams : ~0u;
-    auto needs = [&](unsigned r) {
-        return !dirty || r == argsReg || (r / 64 < dirty->size() && ((*dirty)[r / 64] >> (r % 64) & 1));
-    };
+    (void)dirty;
     if (!numberInRax)
         a_.mov(RAX, R(in.a));
     if (constructs) {
@@ -6113,34 +6191,6 @@ void Baseline::retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, boo
         a_.bind(useThis);
         a_.mov(RAX, R(0));
         a_.bind(have);
-    }
-    // A parameter the caller gave no argument for is this frame's; the arguments are the caller's.
-    const unsigned first = 1 + code_->nparams;
-    for (unsigned p = 1; p <= code_->nparams; ++p) {
-        if (!needs(p))
-            continue;
-        Label skip;
-        a_.cmpI32(mem(R13, kFrameArgc), std::int32_t(p));
-        a_.jcc(CAE, skip);
-        a_.mov(R(p), std::int32_t(kUndefined));
-        a_.bind(skip);
-    }
-    if (code_->nregs > first) {
-        const unsigned count = code_->nregs - first;
-        unsigned written = 0;
-        for (unsigned r = first; r < code_->nregs; ++r)
-            written += needs(r) ? 1 : 0;
-        if (written <= 48) {
-            for (unsigned r = first; r < code_->nregs; ++r)
-                if (needs(r))
-                    a_.mov(R(r), std::int32_t(kUndefined));
-        } else {
-            a_.mov(mem(RSP, 0), RAX);
-            a_.lea(RDI, R(first));
-            a_.movImm(RSI, count);
-            a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitClearPlain));
-            a_.mov(RAX, mem(RSP, 0));
-        }
     }
     a_.mov(mem(R12, kVmFrameTop), R13);
     a_.leave(RBX, R13, 8 + spill_);

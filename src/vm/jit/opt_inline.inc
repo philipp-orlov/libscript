@@ -1623,7 +1623,10 @@ void Baseline::emitDirectCall(std::uint32_t i)
     a_.dec32(mem(R12, kVmTicks));
     // Caller registers the callee's frame covers past the arguments: plain values are overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
-    for (unsigned r = 1 + argc; r < window && r < C->nregs; ++r) {
+    if (def_)
+        for (unsigned r = 1 + argc; r <= C->nparams; ++r)
+            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+    for (unsigned r = 1 + argc; !def_ && r < window && r < C->nregs; ++r) {
         const unsigned reg = base + 1 + r;
         if (!dirtyIn_.empty() && !(dirtyIn_[i][reg / 64] >> (reg % 64) & 1))
             continue;  // no way here wrote it: undefined still

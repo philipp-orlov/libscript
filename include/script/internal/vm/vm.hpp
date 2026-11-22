@@ -201,10 +201,11 @@ struct VM : EngineRuntime
     /// The same when no frame is left: the registers are nobody's, and are filled again as they are used again.
     void scanAtHost() noexcept
     {
-        if (!zctCount() || (runningJobs_ && zctCount() < zctLimit_))  // (at the end of the jobs)
-            return;
+        // (First of all: with no frame left a free is done at once, and what is above the top may name what it frees.)
         if (stackInit > stackTop)
             stackInit = stackTop;
+        if (!zctCount() || (runningJobs_ && zctCount() < zctLimit_))  // (at the end of the jobs)
+            return;
         scanZct();
     }
     /// The `gc` word of a cell in the zero-count table. A collection rewrites the word of every cell it looks at, and

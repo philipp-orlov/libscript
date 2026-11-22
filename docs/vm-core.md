@@ -286,6 +286,10 @@ owns a count of each value in its registers. A deferred frame owns none. These r
    holds it, and nothing else. The bytecode compiler emits `Append` for `s += t` and `s = s + t`, where `s` is a local that the
    text gives strings (`appendedNames`). It emits `Unshare`, which clears the bit, before each instruction that copies `s`.
    Any other sum into its own left operand grows a buffer that only slices show (`appendShared`).
+8. A deferred frame sits on whatever the stack holds. The interpreter makes its registers undefined. Compiled code makes undefined
+   those it may read before it writes them (`entryUndefs`). A caller makes undefined the parameters it has no argument for. No
+   return and no call clears registers. A stale register never names a cell that is gone: only a scan frees, and it clears what
+   is above the frames first. When no frame is left a free is immediate, and `stackInit` goes down to `stackTop`.
 
 Tests run in both modes: `SCRIPT_VM_DEFERRED=0` and `=1` set the mode in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
 `SCRIPT_VM_AUDIT=1` checks every count at each scan. `SCRIPT_VM_ZCT=n` sets the table's least limit (0: every allocation scans).

@@ -258,6 +258,16 @@ struct CodeBlock
     /// The `uid` of the function the baseline code last called from each `Call` (0 for none): the optimizing compiler's hint
     /// for what to inline. One per instruction once the baseline code is made.
     Vec<std::uint64_t> callProf;
+    /// The same for the functions such a call has called, up to four, and whether there were more: where in `callTargets` an
+    /// instruction's are (one more than the index; 0: none). Made with the baseline code, and not moved after.
+    struct CallTargets
+    {
+        std::uint64_t uid[4] = {0, 0, 0, 0};
+        std::uint64_t more = 0;
+    };
+    Vec<CallTargets> callTargets;
+    Vec<std::uint32_t> callTargetAt;
+    std::uint64_t mergedInto = 0;  ///< the uid of the block a function of this one runs instead (`mergeInline`)
     /// Where the baseline code of a `GetGlobal`/`PutGlobal` finds its data property of the global object: the slot's index,
     /// good while `epoch` is the VM's `globalEpoch`; the helper that runs when it is not writes it again. One per
     /// instruction once the baseline code is made.

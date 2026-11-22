@@ -102,6 +102,9 @@ std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reach
         const std::int64_t t = opt::jumpTarget(c, j);
         if (t >= 0)
             flow(std::uint32_t(t), w);
+        for (const Handler& h : c.handlers)
+            if (j >= h.start && j < h.end)
+                flow(h.target, written[j]);
         if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
             flow(opt::nextOf(c, j), w);
     }
@@ -109,6 +112,64 @@ std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reach
     for (std::uint32_t j = 0; j < n; ++j)
         reached[j] = !written[j].empty();
     return need;
+}
+
+std::vector<std::uint16_t> entryUndefs(const CodeBlock& c)
+{
+    // What is live as the function begins.
+    const std::uint32_t n = std::uint32_t(c.code.size());
+    const unsigned first = 1u + c.nparams + ((c.flags & CodeBlock::kNeedsArgs) ? 1 : 0);
+    std::vector<std::uint16_t> out;
+    if (c.nregs <= first)
+        return out;
+    const std::size_t words = (c.nregs + 63) / 64;
+    std::vector<std::uint64_t> live(words * n, 0), use(words * n, 0), keep(words * n, ~std::uint64_t(0)), w(words);
+    std::vector<std::uint32_t> at;
+    for (std::uint32_t j = 0; j < n; j = opt::nextOf(c, j)) {
+        at.push_back(j);
+        const opt::Effects e = opt::effectsOf(c, j);
+        if (!e.ok) {
+            for (unsigned r = first; r < c.nregs; ++r)
+                out.push_back(std::uint16_t(r));
+            return out;
+        }
+        for (std::uint16_t r : e.rd)
+            if (r < c.nregs)
+                use[words * j + r / 64] |= std::uint64_t(1) << (r % 64);
+        for (std::uint16_t r : e.wr)
+            if (r < c.nregs)
+                keep[words * j + r / 64] &= ~(std::uint64_t(1) << (r % 64));
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t k = at.size(); k-- > 0;) {
+            const std::uint32_t j = at[k];
+            const Op op = c.code[j].opcode();
+            std::fill(w.begin(), w.end(), 0);
+            auto from = [&](std::uint32_t to) {
+                for (std::size_t x = 0; to < n && x < words; ++x)
+                    w[x] |= live[words * to + x];
+            };
+            if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+                from(opt::nextOf(c, j));
+            if (const std::int64_t t = opt::jumpTarget(c, j); t >= 0)
+                from(std::uint32_t(t));
+            for (std::size_t x = 0; x < words; ++x)
+                w[x] = use[words * j + x] | (w[x] & keep[words * j + x]);
+            for (const Handler& h : c.handlers)
+                if (j >= h.start && j < h.end)
+                    from(h.target);
+            for (std::size_t x = 0; x < words; ++x)
+                if (live[words * j + x] != w[x]) {
+                    live[words * j + x] = w[x];
+                    changed = true;
+                }
+        }
+    }
+    for (unsigned r = first; r < c.nregs && n; ++r)
+        if (live[r / 64] >> (r % 64) & 1)
+            out.push_back(std::uint16_t(r));
+    return out;
 }
 
 CodeBlock* selfInline(VM& vm, CodeBlock* c)

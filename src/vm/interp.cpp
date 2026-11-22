@@ -3178,8 +3178,10 @@ do_call: {
     {
         // All of the caller's registers above the arguments, not only those the callee's frame covers: a call this frame
         // makes in turn may reach past its end, and must find undefined there, not a dead temporary of this caller.
+        // (A deferred frame: its own, as what is above it is not known to be undefined; a scan frees nothing a stale
+        // register names.)
         JSValue* callerEnd = R + code->nregs;
-        const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
+        const std::uint32_t overlap = Def ? c->nregs : callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
         for (std::uint32_t i = keep; i < overlap; ++i) {
             clearReg<Def>(newR[i]);
         }

@@ -95,6 +95,9 @@ CodeBlock* selfInline(VM& vm, CodeBlock* code);
 /// The registers of `c` some path from the entry reads before writing, past `this` and the parameters; `reached` gets which
 /// instructions a path from the entry reaches.
 std::vector<bool> readBeforeWritten(const CodeBlock& c, std::vector<bool>& reached);
+/// The registers above the parameters of any function that an instruction may read before one has written them: compiled
+/// code of a deferred frame makes them undefined on its way in (what a frame sits on is whatever was there).
+std::vector<std::uint16_t> entryUndefs(const CodeBlock& c);
 /// A copy of `code` with the code of the functions its calls have reached (by the uid each `Call` last saw) in place, each
 /// behind a guard on that uid, the call the long way after it. Null when no call qualifies. The copy has the profile of
 /// what it was made from, and no count of its own. See merge_inline.cpp.

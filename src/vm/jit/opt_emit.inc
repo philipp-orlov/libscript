@@ -2493,6 +2493,7 @@ Tier2Code* Baseline::compileOptimized()
     a_.enter(RBX, R13, 8 + spill_);
     a_.mov(R13, RSI);
     a_.mov(RBX, RDI);  // the frame's registers, as every way in passes them
+    emitEntryUndefs();
     for (const opt::LiveWeb& lw : plan_->liveBefore[0])
         loadFromFrame(lw.reg, std::int32_t(lw.web), entryFail_);
     if (fnAtEntry_) {

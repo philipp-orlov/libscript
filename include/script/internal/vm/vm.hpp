@@ -192,12 +192,39 @@ struct VM : EngineRuntime
     void freePayload(void* p, std::size_t bytes) noexcept;
     /// Called by `detail::destroyUnreferenced` when a count reached zero.
     void destroy(CellPtr cell) noexcept;
-    /// `Options::Memory::Deferred`: frames hold cells of this family without counts (strings, symbols and bigints keep
-    /// theirs). A count that reaches zero puts the cell in the zero-count table, and `scanZct` frees what in it no frame
-    /// holds.
+    /// `Options::Memory::Deferred`: frames hold their values without counts. A count that reaches zero puts the cell in
+    /// the zero-count table, and `scanZct` frees what in it no frame holds.
     bool deferred = false;
     /// Free every cell of the zero-count table that no frame holds.
     void scanZct() noexcept;
+    /// The `gc` word of a cell in the zero-count table. A collection rewrites the word of every cell it looks at, and
+    /// leaves 0 behind; it never runs with cells in the table.
+    static constexpr std::uint32_t kInZct = 1;
+    /// What a deferred frame does with a count that reached zero: the cell into the table (the interpreter's way, in line).
+    [[gnu::always_inline]] void zeroCount(detail::GCObject* cell) noexcept
+    {
+        if (isVmCell(cell)) [[likely]] {
+            CellHeader* h = headerOf(cell);
+            if (h->gc != kInZct && zctTop_ < zctEnd_) [[likely]] {
+                *zctTop_++ = cell;
+                h->gc = kInZct;
+                return;
+            }
+        } else if (!cell->pinned && !cell->inZct && zctOld_.size() < zctOld_.capacity() && zctCount() < zctLimit_) {
+            zctOld_.push_back(cell);  // within its capacity: nothing to allocate
+            cell->inZct = 1;
+            return;
+        }
+        detail::destroyUnreferenced(cell);
+    }
+    /// `release` of a value a deferred frame let go of.
+    [[gnu::always_inline]] void releaseDeferred(JSValue v) noexcept
+    {
+        if (v.isCell() && --detail::cellCount(v.asCell()) == 0)
+            zeroCount(v.asCell());
+    }
+    /// An old-family cell (a string, symbol or bigint) whose count reached zero: true when it waits in the table.
+    bool deferOld(detail::GCObject* cell) noexcept;
     /// How many cells of the new family are alive.
     std::uint64_t liveCells = 0;
     bool tearingDown = false;
@@ -508,12 +535,27 @@ private:
     Vec<CellPtr> deferredFree_;
     std::uint64_t savedCellBudget_ = 0;
     void freeDeferred(std::size_t max) noexcept;
-    /// The zero-count table (`deferred`), each cell in it marked by `gc == kInZct`.
-    Vec<CellPtr> zct_;
+public:
+    /// The zero-count table (`deferred`): cells of this family in [zctBase_, zctTop_), each marked by `gc == kInZct`.
+    /// Compiled code adds a cell it makes while `zctTop_` is below `zctEnd_`, the table's limit; past that, an
+    /// allocation goes through `allocCell`, which scans. Room past the limit up to `zctCap_` is for the runtime.
+    CellPtr* zctBase_ = nullptr;
+    CellPtr* zctTop_ = nullptr;
+    CellPtr* zctEnd_ = nullptr;
+
+private:
+    CellPtr* zctCap_ = nullptr;
+    /// Old-family cells of the table, which may be in it more than once.
+    Vec<detail::GCObject*> zctOld_;
     std::size_t zctLimit_ = 0;
+    std::size_t zctCount() const noexcept { return std::size_t(zctTop_ - zctBase_) + zctOld_.size(); }
+    /// Into the table, marked; out of memory, left to a collection (a cell with no count).
+    void zctPush(CellPtr cell) noexcept;
+    /// The limit after a scan: what stayed, weighed against what a scan costs.
+    void setZctLimit() noexcept;
     /// Above 0, a count that reaches zero frees at once: a scan or a collection runs, with the frames' cells counted.
     std::uint32_t immediate_ = 0;
-    /// One count more (`delta` 1) or fewer (-1) for every cell of this family a frame's register holds.
+    /// One count more (`delta` 1) or fewer (-1) for every cell a frame's register holds.
     void countRoots(int delta) noexcept;
     void noteZct() noexcept;
     void auditCounts() noexcept;

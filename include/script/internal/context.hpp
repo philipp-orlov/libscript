@@ -112,6 +112,8 @@ struct ContextImpl
     /// rather than a recursion deep enough to overflow the C++ stack.
     GCObject* pendingFree = nullptr;
     bool destroying = false;
+    /// The new core's runtime when its frames hold values without counts: a string whose count reaches zero waits there.
+    vm::VM* deferredVm = nullptr;
 
     /// Allocate a cell from the pool and register it with the heap. Budgets
     /// are checked first, so a refused allocation leaves nothing half-made.

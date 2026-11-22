@@ -77,6 +77,8 @@ struct GCObject
     std::uint8_t pinned : 1;
     /// Made since the last collection: what a minor collection looks at.
     std::uint8_t young : 1;
+    /// In the zero-count table of a deferred vm core (`vm::VM::deferred`), whose frames hold it without a count.
+    std::uint8_t inZct : 1;
     /// Last, so that the first thing a derived class keeps here comes right after it: native code reads both at once.
     CellKind kind = CellKind::Object;
 
@@ -89,7 +91,7 @@ struct GCObject
         }
     }
 
-    GCObject() : gcColor(0), pinned(0), young(1) {}
+    GCObject() : gcColor(0), pinned(0), young(1), inZct(0) {}
     GCObject(const GCObject&) = delete;
     GCObject& operator=(const GCObject&) = delete;
     virtual ~GCObject();
@@ -151,6 +153,9 @@ struct StringCell : GCObject
         kRope = 2,       ///< two halves follow the cell, not yet joined
         kFlattened = 4,  ///< a rope whose characters are in a buffer of its own
         kSlice = 8,      ///< part of another string, whose characters it points into and which it holds a count of
+        /// A buffer that only slices show (a string appended to piece by piece): its `length` is how much of its room is
+        /// written, and grows with each piece. A slice that ends there is extended by writing past its end.
+        kAppendable = 16,
         kOutOfLine = kRope | kFlattened | kSlice,  ///< the characters are not after the cell: what native code tests
     };
     bool interned = false;  ///< also present in the context's string table

@@ -98,19 +98,20 @@ constexpr std::uint32_t kOsrAfter = 1000;
     return strictEquals(a, b);
 }
 
-// Registers and counts. `Def` is `VM::deferred`: a register holds a cell of the new family without a count, and what no
-// register holds any more waits for the next scan of the frames. Strings, symbols and bigints are counted as before.
+// Registers and counts. `Def` is `VM::deferred`: a register holds its value without a count, and what no register holds
+// any more waits for the next scan of the frames.
 
 /// A register = `value`, whose count the caller has taken: the register keeps it (`Def`: lets go of it).
 template <bool Def>
-[[gnu::always_inline]] inline void setReg(JSValue& slot, JSValue value) noexcept
+[[gnu::always_inline]] inline void setReg(VM& vm, JSValue& slot, JSValue value) noexcept
 {
-    const JSValue old = slot;
-    slot = value;
     if constexpr (Def) {
-        releaseVm(value);
-        releaseOld(old);
+        slot = value;
+        vm.releaseDeferred(value);
     } else {
+        (void)vm;
+        const JSValue old = slot;
+        slot = value;
         release(old);
     }
 }
@@ -120,13 +121,12 @@ template <bool Def>
 [[gnu::always_inline]] inline void copyReg(JSValue& slot, JSValue value) noexcept
 {
     if constexpr (Def) {
-        retainOld(value);
-        const JSValue old = slot;
         slot = value;
-        releaseOld(old);
     } else {
         retain(value);
-        setReg<false>(slot, value);
+        const JSValue old = slot;
+        slot = value;
+        release(old);
     }
 }
 
@@ -136,9 +136,7 @@ template <bool Def>
 {
     const JSValue v = slot;
     slot = JSValue::undefined();
-    if constexpr (Def)
-        releaseOld(v);
-    else
+    if constexpr (!Def)
         release(v);
 }
 
@@ -157,23 +155,21 @@ template <bool Def>
     const JSValue v = slot;
     slot = JSValue::undefined();
     if constexpr (Def)
-        retainVm(v);
+        retain(v);
     return v;
 }
 
-/// One count of a register's value, as a register of the mode holds it: counted, or (`deferred`) an old-family cell.
+/// The count a register of the mode holds: none in a deferred frame.
 inline void retainReg(VM& vm, JSValue v) noexcept
 {
-    if (vm.deferred)
-        retainOld(v);
-    else
+    if (!vm.deferred)
         retain(v);
 }
 
 // The same, for code that runs in either mode.
 inline void setReg(VM& vm, JSValue& slot, JSValue value) noexcept
 {
-    vm.deferred ? setReg<true>(slot, value) : setReg<false>(slot, value);
+    vm.deferred ? setReg<true>(vm, slot, value) : setReg<false>(vm, slot, value);
 }
 inline void copyReg(VM& vm, JSValue& slot, JSValue value) noexcept
 {
@@ -976,10 +972,19 @@ void unwrapBound(JSValue* R, std::uint32_t base) noexcept
         if (!r || !isFunction(r->boundTarget) || (r->boundArgs && r->boundArgs->length))
             return;
         const JSValue target = r->boundTarget, thisValue = r->boundThis;
-        retain(target);
-        retain(thisValue);
-        setReg<Def>(R[base], target);  // may be the last count of the bound function: all is read from it already
-        setReg<Def>(R[base + 1], thisValue);
+        // The bound function's place may hold its last count: all is read from it already, and counted first.
+        if constexpr (Def) {
+            R[base] = target;
+            R[base + 1] = thisValue;
+        } else {
+            retain(target);
+            retain(thisValue);
+            const JSValue oldCallee = R[base], oldThis = R[base + 1];
+            R[base] = target;
+            R[base + 1] = thisValue;
+            release(oldCallee);
+            release(oldThis);
+        }
     }
 }
 
@@ -1238,13 +1243,13 @@ Frame* fr = vm.frameTop - 1;
         if (o_ < 0)               \
             LOOP_TICK();          \
     } while (0)
-#define SET(r, v) setReg<Def>(R[r], v)
+#define SET(r, v) setReg<Def>(vm, R[r], v)
 /// SET and COPY that also note what kind of value the instruction made (the baseline compiler's type feedback).
 #define SETP(r, v)                                                         \
     do {                                                                    \
         const JSValue pv_ = (v);                                            \
         code->prof[std::size_t(ins - codeStart)] |= profBit(pv_);           \
-        setReg<Def>(R[r], pv_);                                             \
+        setReg<Def>(vm, R[r], pv_);                                             \
     } while (0)
 #define COPYP(r, v)                                                         \
     do {                                                                    \
@@ -1478,7 +1483,7 @@ L_DefEnv: {
 
 L_NewBox: {
     if constexpr (Def)
-        retainVm(R[ins->a]);  // the box's own count, where the register held none
+        retain(R[ins->a]);  // the box's own count, where the register held none
     Box* box = vm.newBox(R[ins->a]);  // takes the register's count
     R[ins->a] = JSValue::cell(reinterpret_cast<CellPtr>(box));
     if constexpr (Def)
@@ -2779,8 +2784,8 @@ L_GetIteratorObj: {
         release(iterator);
         FAIL();
     }
-    setReg<Def>(R[ins->a + 1], next);
-    setReg<Def>(R[ins->a], iterator);
+    setReg<Def>(vm, R[ins->a + 1], next);
+    setReg<Def>(vm, R[ins->a], iterator);
     NEXT();
 }
 L_DelegateCallAsync:
@@ -2823,7 +2828,7 @@ L_DelegateCall: {
                     FAIL();
                 if (asyncDelegate) {
                     // What `return` gives is awaited first; the code after the await raises the TypeError (mode 3).
-                    setReg<Def>(R[ins->c + 1], JSValue::int32(3));
+                    setReg<Def>(vm, R[ins->c + 1], JSValue::int32(3));
                     SET(ins->a, r);
                     NEXT();
                 }
@@ -2923,7 +2928,7 @@ L_CheckUnbound:
 L_FreshThisIfBound:
     // A second `super()` still runs the parent constructor, on an object of its own, before it fails.
     if (R[ins->b] == JSValue::boolean(true)) [[unlikely]]
-        setReg<Def>(R[ins->a], toJSValue(vm.newObject(vm.protos.object)));
+        setReg<Def>(vm, R[ins->a], toJSValue(vm.newObject(vm.protos.object)));
     NEXT();
 L_CheckDerivedRet:
     if (!isObject(R[ins->a])) {
@@ -3022,7 +3027,7 @@ do_call: {
             made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(f->code, root));
             release(protoValue);
         }
-        setReg<Def>(R[base + 1], toJSValue(made));
+        setReg<Def>(vm, R[base + 1], toJSValue(made));
     }
     if (f->flags & JSFunction::kNative) {
         Rare* r = f->rare();
@@ -3104,7 +3109,7 @@ do_call: {
         // The array goes in the register after the parameters, which the clearing above left empty.
         if (newR + 1 + c->nparams >= vm.stackInit)
             vm.fillStack(newR + 2 + c->nparams);
-        setReg<Def>(newR[1 + c->nparams], toJSValue(argsArray));
+        setReg<Def>(vm, newR[1 + c->nparams], toJSValue(argsArray));
     }
     *vm.frameTop++ = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, isNew || isSuper, false,
                                           isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
@@ -3202,15 +3207,15 @@ L_IterInit: {
             FAIL();
         }
         // Registers a and a+1: the iterator and its `next`; the pair is an index for an array or a string.
-        setReg<Def>(R[ins->a + 1], next);
-        setReg<Def>(R[ins->a], iterator);
+        setReg<Def>(vm, R[ins->a + 1], next);
+        setReg<Def>(vm, R[ins->a], iterator);
         NEXT();
     }
     // Registers a and a+1: the sequence and the next index.
     const JSValue keep = src;
     retain(keep);
-    setReg<Def>(R[ins->a + 1], JSValue::int32(0));
-    setReg<Def>(R[ins->a], keep);
+    setReg<Def>(vm, R[ins->a + 1], JSValue::int32(0));
+    setReg<Def>(vm, R[ins->a], keep);
     NEXT();
 }
 L_IterNext: {
@@ -3390,8 +3395,8 @@ L_AsyncIterInit: {
             FAIL();
         }
     }
-    setReg<Def>(R[ins->a + 1], next);
-    setReg<Def>(R[ins->a], iterator);
+    setReg<Def>(vm, R[ins->a + 1], next);
+    setReg<Def>(vm, R[ins->a], iterator);
     NEXT();
 }
 L_AsyncIterNext: {
@@ -3504,7 +3509,7 @@ throw_: {
             const JSValue thrown = vm.exception;
             vm.exception = JSValue::undefined();
             vm.exceptionCode = ErrorCode::Ok;
-            setReg<Def>(R[found->reg], thrown);
+            setReg<Def>(vm, R[found->reg], thrown);
             pc = codeStart + found->target;
             NEXT();
         }
@@ -4609,7 +4614,7 @@ int jitNewBox(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     if (vm.deferred)
-        retainVm(c.R[c.ins->a]);  // the box's own count, where the register held none
+        retain(c.R[c.ins->a]);  // the box's own count, where the register held none
     Box* box = vm.newBox(c.R[c.ins->a]);  // takes the register's count
     c.R[c.ins->a] = JSValue::cell(reinterpret_cast<CellPtr>(box));
     if (vm.deferred)
@@ -4846,12 +4851,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         const JSValue old = R[i];
         R[i] = g->regs()[i];
         g->regs()[i] = JSValue::undefined();
-        if (deferred) {
-            releaseVm(R[i]);  // the register holds it without the count the generator held
-            releaseOld(old);
-        } else {
-            release(old);
-        }
+        release(deferred ? R[i] : old);  // deferred: the register holds it without the count the generator held
     }
     if (g->state == GenState::Suspended && g->delegating) {
         // At a `yield*`: what came in goes to the inner iterator, with what kind of resumption it was.

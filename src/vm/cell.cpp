@@ -28,10 +28,6 @@ namespace {
     std::abort();
 }
 
-/// The `gc` word of a cell in the zero-count table. A collection rewrites the word of every cell it looks at, and leaves 0
-/// behind; it never runs with cells in the table.
-constexpr std::uint32_t kInZct = 1;
-
 }  // namespace
 
 // ---------------------------------------------------------------- allocation ---
@@ -47,7 +43,7 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
         --immediate_;
     }
     // The zero-count table is full (`deferred`): what no frame holds goes.
-    if (deferred && zct_.size() >= zctLimit_ && !destroying_ && !immediate_ && !ctx.tearingDown) [[unlikely]]
+    if (deferred && zctCount() >= zctLimit_ && !destroying_ && !immediate_ && !ctx.tearingDown) [[unlikely]]
         scanZct();
     ctx.maybeCollect();
     // The context's budget counts heap bytes, which the buffers of arrays and strings do not add to: a program that makes
@@ -357,15 +353,10 @@ void VM::destroy(CellPtr cell) noexcept
         return;
     // A frame may hold it without a count: it waits in the zero-count table for the next scan.
     if (deferred && !immediate_) {
-        CellHeader* h = headerOf(cell);
-        if (h->gc != kInZct) {
-            try {
-                zct_.push_back(cell);
-                h->gc = kInZct;
-            } catch (...) {
-                // Out of memory: a collection finds it, as one with no count.
-            }
-            noteZct();
+        if (headerOf(cell)->gc != kInZct) {
+            zctPush(cell);
+            if (zctCount() >= zctLimit_) [[unlikely]]
+                noteZct();
         }
         return;
     }
@@ -542,7 +533,7 @@ void VM::freeDeferred(std::size_t max) noexcept
 
 void VM::restoreCellBudget() noexcept
 {
-    if (!deferredFree_.empty() || (deferred && zct_.size() >= zctLimit_) || cellBudget_)
+    if (!deferredFree_.empty() || (deferred && zctCount() >= zctLimit_) || cellBudget_)
         return;
     cellBudget_ = savedCellBudget_ ? savedCellBudget_ : 64 * kMinCellBudget;
     savedCellBudget_ = 0;
@@ -551,10 +542,27 @@ void VM::restoreCellBudget() noexcept
 /// The table has grown to its limit: compiled code allocates through `allocCell` (cell budget 0), which scans.
 void VM::noteZct() noexcept
 {
-    if (zct_.size() >= zctLimit_ && cellBudget_) [[unlikely]] {
+    if (zctCount() >= zctLimit_ && cellBudget_) [[unlikely]] {
         savedCellBudget_ = cellBudget_;
         cellBudget_ = 0;
     }
+}
+
+bool VM::deferOld(detail::GCObject* cell) noexcept
+{
+    if (!deferred || immediate_)
+        return false;
+    if (cell->inZct)
+        return true;
+    try {
+        zctOld_.push_back(cell);
+    } catch (...) {
+        return false;  // out of memory: freed now, as in a context that counts its frames
+    }
+    cell->inZct = 1;
+    if (zctCount() >= zctLimit_) [[unlikely]]
+        noteZct();
+    return true;
 }
 
 void VM::countRoots(int delta) noexcept
@@ -568,20 +576,24 @@ void VM::countRoots(int delta) noexcept
     if (hi > stackInit)
         hi = stackInit;
     for (JSValue* r = stackBase; r < hi; ++r) {
-        if (!r->isCell() || !isVmCell(r->asCell()))
+        if (!r->isCell())
             continue;
-        CellHeader* h = headerOf(r->asCell());
+        detail::GCObject* c = r->asCell();
         if (delta > 0) {
-            ++h->rc;
+            ++detail::cellCount(c);
             continue;
         }
-        // Held by a frame only: back in the table.
-        if (--h->rc == 0 && h->gc != kInZct) {
+        if (--detail::cellCount(c) != 0)
+            continue;
+        // Held by a frame only: back in the table. Out of memory, it is left to a collection, as a cell with no count.
+        if (isVmCell(c)) {
+            if (headerOf(c)->gc != kInZct)
+                zctPush(c);
+        } else if (!c->inZct) {
             try {
-                zct_.push_back(r->asCell());
-                h->gc = kInZct;
+                zctOld_.push_back(c);
+                c->inZct = 1;
             } catch (...) {
-                // Out of memory: a collection finds it, as one with no count.
             }
         }
     }
@@ -659,9 +671,56 @@ void VM::scanZct() noexcept
     countRoots(1);
     freeZct();
     countRoots(-1);
-    // What stays (held by frames) and what the frames are, weighed against what a scan costs.
-    zctLimit_ = std::max<std::size_t>(zctMin_, 2 * (zct_.size()));
+    setZctLimit();
     restoreCellBudget();
+}
+
+void VM::zctPush(CellPtr cell) noexcept
+{
+    if (zctTop_ == zctCap_) {
+        const std::size_t used = std::size_t(zctTop_ - zctBase_);
+        const std::size_t cap = std::max<std::size_t>(2 * used, std::max<std::size_t>(zctLimit_, 1024));
+        CellPtr* grown;
+        try {
+            grown = static_cast<CellPtr*>(allocPayload(cap * sizeof(CellPtr)));
+        } catch (...) {
+            return;
+        }
+        if (used)
+            std::memcpy(grown, zctBase_, used * sizeof(CellPtr));
+        if (zctBase_)
+            freePayload(zctBase_, std::size_t(zctCap_ - zctBase_) * sizeof(CellPtr));
+        zctBase_ = grown;
+        zctTop_ = grown + used;
+        zctCap_ = grown + cap;
+        zctEnd_ = zctBase_ + std::min(zctLimit_, cap);
+    }
+    *zctTop_++ = cell;
+    headerOf(cell)->gc = kInZct;
+}
+
+void VM::setZctLimit() noexcept
+{
+    zctLimit_ = std::max<std::size_t>(zctMin_, 2 * zctCount());
+    if (std::size_t(zctCap_ - zctBase_) < zctLimit_) {
+        // Room up to the limit, so that compiled code finds its end where the limit is.
+        CellPtr* grown;
+        try {
+            grown = static_cast<CellPtr*>(allocPayload(zctLimit_ * sizeof(CellPtr)));
+        } catch (...) {
+            zctEnd_ = zctCap_;
+            return;
+        }
+        const std::size_t used = std::size_t(zctTop_ - zctBase_);
+        if (used)
+            std::memcpy(grown, zctBase_, used * sizeof(CellPtr));
+        if (zctBase_)
+            freePayload(zctBase_, std::size_t(zctCap_ - zctBase_) * sizeof(CellPtr));
+        zctBase_ = grown;
+        zctTop_ = grown + used;
+        zctCap_ = grown + zctLimit_;
+    }
+    zctEnd_ = zctBase_ + zctLimit_;
 }
 
 void VM::freeZct() noexcept
@@ -671,19 +730,27 @@ void VM::freeZct() noexcept
 #endif
     ++immediate_;
     // Every entry leaves the table. A cell at zero now is held by nothing: freeing it frees only what it alone held, none
-    // of which is in the table at zero (it had this cell's count).
-    Vec<CellPtr> cells;
-    cells.swap(zct_);
+    // of which is in the table at zero (it had this cell's count). Nothing is added while this runs (`immediate_`).
     std::size_t kept = 0;
-    for (CellPtr c : cells) {
-        CellHeader* h = headerOf(c);
+    for (CellPtr* p = zctBase_; p < zctTop_; ++p) {
+        CellHeader* h = headerOf(*p);
         h->gc = 0;
         if (h->rc == 0)
-            cells[kept++] = c;
+            zctBase_[kept++] = *p;
     }
-    cells.resize(kept);
-    for (CellPtr c : cells)
-        destroy(c);
+    zctTop_ = zctBase_;
+    // The old-family part keeps its room, for `zeroCount` to add to in line.
+    std::size_t keptOld = 0;
+    for (detail::GCObject* c : zctOld_) {
+        c->inZct = 0;
+        if (detail::cellCount(c) == 0)
+            zctOld_[keptOld++] = c;
+    }
+    for (std::size_t k = 0; k < kept; ++k)
+        destroy(zctBase_[k]);
+    for (std::size_t k = 0; k < keptOld; ++k)
+        detail::destroyUnreferenced(zctOld_[k]);
+    zctOld_.clear();
     --immediate_;
 }
 
@@ -705,7 +772,7 @@ void VM::rootsEnd() noexcept
     rootsCounted_ = false;
     --immediate_;
     countRoots(-1);
-    zctLimit_ = std::max<std::size_t>(zctMin_, 2 * (zct_.size()));
+    setZctLimit();
     restoreCellBudget();
 }
 

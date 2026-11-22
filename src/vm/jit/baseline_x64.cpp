@@ -739,6 +739,8 @@ extern "C" bool scriptVmJitAppendInPlace(JSValue* slot, std::uint64_t yBits) noe
         return false;
     StringCell* s = asString(*slot);
     StringCell* t = asString(y);
+    if (s->rt && s->rt->deferredVm)
+        return false;  // a deferred frame holds it without a count: one count says nothing
     if (s->interned || s->rc != 1 || (s->bits & StringCell::kOutOfLine) || (t->bits & StringCell::kOutOfLine))
         return false;
     const std::size_t length = std::size_t(s->length) + t->length;

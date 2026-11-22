@@ -612,6 +612,38 @@ JSValue add(VM& vm, JSValue a, JSValue b)
     return result;
 }
 
+namespace {
+
+/// `s += tail` in a deferred frame, which cannot tell whether one register holds `s`: the characters go into a buffer
+/// that only slices show, past the slice that ends where the buffer's written part does (`StringCell::kAppendable`).
+/// The register gets a new slice; `s` stays what it was.
+bool appendShared(VM& vm, JSValue& slot, StringCell* s, StringView tail, std::size_t length)
+{
+    if (length > 0xFFFFFFF0u)
+        return false;
+    StringCell* base = s->whole();
+    StringCell* slice;
+    if (base != s && (base->bits & StringCell::kAppendable) && s->text().data() == base->mutableChars() &&
+        s->length == base->length && base->capacity() >= length) {
+        std::memmove(base->mutableChars() + base->length, tail.data(), tail.size() * sizeof(Char));
+        base->length = std::uint32_t(length);
+        slice = vm.ctx.newCellSized<StringCell>(StringCell::kRopeBytes, base, base->mutableChars(), std::uint32_t(length));
+    } else if (length >= 32) {
+        vm.ctx.reserve(length * 2 * sizeof(Char));
+        base = vm.ctx.newStringRoom(s->text(), tail, length * 2);
+        base->bits |= StringCell::kAppendable;
+        slice = vm.ctx.newCellSized<StringCell>(StringCell::kRopeBytes, base, base->mutableChars(), std::uint32_t(length));
+        detail::decRef(base);  // the slice holds it
+    } else {
+        return false;
+    }
+    slot = JSValue::cell(slice);
+    vm.releaseDeferred(slot);  // a register holds it without a count
+    return true;
+}
+
+}  // namespace
+
 bool appendInPlace(VM& vm, JSValue& slot, JSValue y)
 {
     if (slot == y)
@@ -628,6 +660,8 @@ bool appendInPlace(VM& vm, JSValue& slot, JSValue y)
         return false;
     }
     const std::size_t length = std::size_t(s->length) + tail.size();
+    if (vm.deferred)
+        return appendShared(vm, slot, s, tail, length);
     if (length > 0xFFFFFFF0u || (s->bits & StringCell::kOutOfLine))
         return false;
     // Only this register holds the cell, so nothing sees the old text.

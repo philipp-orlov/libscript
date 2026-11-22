@@ -88,10 +88,10 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
         tier1Threshold = 0;
         tier2Threshold = 0;
         selfInlining = 0;
-        zctLimit_ = kZctMin;
+        ctx.deferredVm = this;
         if (const char* z = std::getenv("SCRIPT_VM_ZCT"))
             zctMin_ = std::size_t(std::atoi(z));
-        zctLimit_ = zctMin_;
+        setZctLimit();
     }
 #endif
 
@@ -169,6 +169,8 @@ VM::~VM()
         releaseRoots();
     for (void* chunk : validityChunks_)
         freePayload(chunk, kValidityChunkBytes);
+    if (zctBase_)
+        freePayload(zctBase_, std::size_t(zctCap_ - zctBase_) * sizeof(CellPtr));
     if (shapeRegionBase_)
         sys::vmUnmap(shapeRegionBase_, shapeRegionBytes_);
     if (stackRegionBase_)

@@ -85,6 +85,11 @@ void destroyUnreferenced(GCObject* cell) noexcept
     }
     if (rt->tearingDown)
         return;  // the teardown loop owns every remaining cell
+#if SCRIPT_VM
+    // A frame of the new core may hold it without a count: it waits for the next scan of the frames.
+    if (rt->deferredVm && rt->deferredVm->deferOld(cell))
+        return;
+#endif
     if (rt->destroying) {
         rt->unlink(cell);
         cell->pendingNext = rt->pendingFree;

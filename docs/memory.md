@@ -218,6 +218,31 @@ Neither can be caught by a program -- a `catch` around a runaway loop would
 otherwise swallow the very thing trying to stop it -- so both unwind straight
 to the host.
 
+## Memory modes
+
+The vm core takes three more options. They are fixed when the context is made.
+
+```cpp
+options.memory     = script::Context::Options::Memory::Counted;   // or Deferred (the default)
+options.freeBudget = 1000;                                       // Counted: cells freed at a time; 0 means all
+options.cycles     = script::Context::Options::Cycles::Manual;   // or Auto (the default)
+```
+
+* **`memory`.** `Counted` frees a cell at its last release. `Deferred` will let
+  frames hold values without counts and free them at stack scans. For now,
+  `Deferred` manages memory as `Counted` does.
+* **`freeBudget`.** A release that frees a large structure frees at most this
+  many cells. The rest go on a list, and each later allocation frees up to this
+  many more from it. A cycle collection frees all of the list. A real-time host
+  uses this to bound the pause of one release.
+* **`cycles`.** `Auto` collects cycles when a budget is crossed. `Manual`
+  collects only when the host calls `collectGarbage`. Over `memoryLimit`, an
+  allocation then raises `ErrorCode::OutOfMemory` without a collection.
+
+`SCRIPT_VM_FREE_BUDGET` sets `freeBudget` in a build with
+`SCRIPT_JIT_ENV_OVERRIDE`, for tests. Tests that expect a structure to be freed
+at its last release fail under it, by design.
+
 ## What to expect
 
 | Operation | Cost |

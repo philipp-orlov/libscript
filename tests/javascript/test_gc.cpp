@@ -138,3 +138,46 @@ TEST(nativeInstancesAreFinalized)
     }
     CHECK_EQ(destroyed, 10);
 }
+
+TEST(aBoundedFreeLeavesTheRestForLater)
+{
+    // `freeBudget`: letting go of a long list frees a part of it at a time; the rest goes as the program allocates, and
+    // all of it when the host collects.
+    js::Context::Options options;
+    options.core = js::Context::Options::Core::Vm;
+    options.memory = js::Context::Options::Memory::Counted;
+    options.freeBudget = 1000;
+    js::Context ctx(options);
+    ctx.eval("0");
+    const auto base = ctx.stats().liveObjects;
+    ctx.eval("globalThis.l = null; for (let i = 0; i < 200000; i++) l = { next: l };");
+    CHECK(ctx.stats().liveObjects >= base + 200000);
+    ctx.eval("l = null");
+    CHECK(ctx.stats().liveObjects >= base + 150000);  // most of it waits
+    ctx.eval("for (let i = 0; i < 50; i++) ({ i });");  // each allocation frees a part
+    const auto after = ctx.stats().liveObjects;
+    CHECK(after < base + 200000);
+    ctx.collectGarbage();
+    CHECK(ctx.stats().liveObjects < base + 100);
+    // Still correct afterwards: what is made and dropped again goes the same way.
+    CHECK_EQ(ctx.eval("let s = 0; for (let k = 0; k < 3; k++) { let m = null; for (let i = 0; i < 20000; i++) m = { v: i, n: m };"
+                      " for (let p = m; p; p = p.n) s += p.v; m = null; } s").toDouble(), 3.0 * 199990000.0);
+}
+
+TEST(manualCyclesWaitForTheHost)
+{
+    js::Context::Options options;
+    options.core = js::Context::Options::Core::Vm;
+    options.cycles = js::Context::Options::Cycles::Manual;
+    options.gcThreshold = 1u << 12;
+    js::Context ctx(options);
+    ctx.eval("function makeCycle() { const a = {}; const b = { a }; a.b = b; return null; }"
+             "for (let i = 0; i < 20000; i++) makeCycle();");
+    const auto before = ctx.stats();
+    CHECK(before.gcRuns == 0);
+    ctx.collectGarbage();
+    const auto after = ctx.stats();
+    CHECK(after.gcRuns == 1);
+    CHECK(after.gcFreed >= 20000);
+    CHECK(after.liveObjects < before.liveObjects);
+}

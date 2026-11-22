@@ -495,6 +495,11 @@ private:
 
     Vec<CellPtr> pending_;
     bool destroying_ = false;
+    /// `Options::freeBudget`: cells whose count reached zero, left for later. While there are any, the cell budget is 0,
+    /// so every allocation (compiled code's too) goes through `allocCell`, which frees some of them first.
+    Vec<CellPtr> deferredFree_;
+    std::uint64_t savedCellBudget_ = 0;
+    void freeDeferred(std::size_t max) noexcept;
 
 public:
     static constexpr std::size_t kValidityChunkBytes = std::size_t(64) << 10;

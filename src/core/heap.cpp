@@ -465,8 +465,8 @@ void ContextImpl::recharge(GCObject* cell) noexcept
 
 void ContextImpl::reserveSlow(std::size_t bytes)
 {
-    // Garbage in unreachable cycles may be what stands in the way.
-    if (!tearingDown && !destroying && bytes <= options.memoryLimit)
+    // Garbage in unreachable cycles may be what stands in the way (unless the host collects them itself).
+    if (!tearingDown && !destroying && bytes <= options.memoryLimit && options.cycles == Context::Options::Cycles::Auto)
         collectCycles();
     if (bytes > options.memoryLimit || heapBytes + bytes > options.memoryLimit)
         throw Error(ErrorCode::OutOfMemory, "the context exceeded its memory limit");
@@ -482,9 +482,11 @@ void ContextImpl::collectIfDue()
         return;
 
     // Mostly the cells made since the last time: cycles of a closure and its own cell die young. All of it when the heap
-    // has doubled since it last was looked at whole, or is over its limit.
-    const bool full = overBudget || heapBytes > std::max<std::uint64_t>(bytesAfterFull * 2, 4u << 20);
-    collectCycles(!full);
+    // has doubled since it last was looked at whole, or is over its limit. A host that collects itself: nothing here.
+    if (options.cycles == Context::Options::Cycles::Auto) {
+        const bool full = overBudget || heapBytes > std::max<std::uint64_t>(bytesAfterFull * 2, 4u << 20);
+        collectCycles(!full);
+    }
 
     // Both budgets are re-armed from the size that survived, so a program that
     // legitimately grows is not punished with ever more frequent collections.

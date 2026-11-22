@@ -75,6 +75,12 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     }
 #endif
 
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    // Testing: every cascade of frees bounded (`Options::freeBudget`), in programs that do not ask for it.
+    if (const char* t = std::getenv("SCRIPT_VM_FREE_BUDGET"))
+        ctx.options.freeBudget = std::size_t(std::atoi(t));
+#endif
+
     mergeInlining = tier2Threshold > 0;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_MERGE"))

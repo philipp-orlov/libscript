@@ -202,6 +202,28 @@ public:
         /// `eval` and `new Function` compile and run strings a program makes. Off, the engine runs only the source its
         /// host hands it, and both are a TypeError.
         bool runtimeCode = false;
+        /// How memory is managed. `Counted`: every reference holds a count, and a value is freed the moment its last
+        /// reference goes; for tight memory and real-time hosts. `Deferred`: references from the stack and registers hold
+        /// none (the collector scans them), which makes compiled code faster; a value is freed at the next scan. Fixed for
+        /// the life of the context. (For now `Deferred` manages memory as `Counted` does.)
+        enum class Memory : std::uint8_t
+        {
+            Counted,
+            Deferred,
+        };
+        Memory memory = Memory::Deferred;
+        /// `Counted`: at most this many values freed at a time, so the pause of letting go of a large structure is
+        /// bounded; the rest wait and are freed a part at a time as the program allocates, or by `collectGarbage`. 0: no
+        /// bound. (The vm core's values.)
+        std::size_t freeBudget = 0;
+        /// When unreachable cycles are collected. `Auto`: as the heap grows. `Manual`: only when the host calls
+        /// `collectGarbage` (a program over `memoryLimit` fails with `OutOfMemory` instead of collecting).
+        enum class Cycles : std::uint8_t
+        {
+            Auto,
+            Manual,
+        };
+        Cycles cycles = Cycles::Auto;
     };
 
     struct Stats

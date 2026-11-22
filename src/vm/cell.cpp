@@ -33,13 +33,17 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
 {
     if (bytes > mem::LocalHeap::kMaxSmall) [[unlikely]]
         throw Error(ErrorCode::OutOfMemory, "a cell of the vm core is larger than the heap's small limit");
+    // Cells left to free (`Options::freeBudget`): some of them first.
+    if (!deferredFree_.empty() && !destroying_ && !ctx.tearingDown) [[unlikely]]
+        freeDeferred(ctx.options.freeBudget);
     ctx.maybeCollect();
     // The context's budget counts heap bytes, which the buffers of arrays and strings do not add to: a program that makes
     // little garbage of cells with large buffers would hold on to a lot of memory. Cells are counted as well.
-    if (liveCells >= cellBudget_ && !ctx.tearingDown && !ctx.destroying) [[unlikely]] {
+    if (liveCells >= cellBudget_ && deferredFree_.empty() && !ctx.tearingDown && !ctx.destroying) [[unlikely]] {
         // A minor collection frees young cycles only; once the cells have more than doubled since a whole look, take one.
         const bool full = liveCells > cellsAfterFull_ * 2 + kMinCellBudget;
-        ctx.collectCycles(!full);
+        if (ctx.options.cycles == Context::Options::Cycles::Auto)
+            ctx.collectCycles(!full);
         if (liveCells >= cellBudget_)  // the collection did not run its engine's part
             cellBudget_ = liveCells * 2;
     }
@@ -351,7 +355,7 @@ void VM::destroy(CellPtr cell) noexcept
     destroying_ = true;
     // A plain object whose properties are all in its cell -- a tree's node, a record -- is freed here, its counters summed
     // and set once at the end, and the first of its values it frees is freed next without going through `pending_`.
-    std::size_t bytesFreed = 0, cellsFreed = 0;
+    std::size_t bytesFreed = 0, cellsFreed = 0, freed = 0;
     CellPtr next = cell;
     for (;;) {
         CellPtr follow = nullptr;
@@ -386,6 +390,24 @@ void VM::destroy(CellPtr cell) noexcept
             ++cellsFreed;
         } else {
             destroyNow(next);
+        }
+        ++freed;
+        // A bounded pause (`Options::freeBudget`): what is left waits, freed a part at a time as the program allocates.
+        if (const std::size_t budget = ctx.options.freeBudget; budget && freed >= budget) [[unlikely]] {
+            try {
+                if (follow)
+                    deferredFree_.push_back(follow);
+                for (CellPtr c : pending_)
+                    deferredFree_.push_back(c);
+            } catch (...) {
+                // Out of memory while freeing: those cells stay, as a leak and not a crash.
+            }
+            pending_.clear();
+            if (cellBudget_) {
+                savedCellBudget_ = cellBudget_;
+                cellBudget_ = 0;
+            }
+            break;
         }
         if (follow) {
             next = follow;
@@ -477,10 +499,30 @@ constexpr std::uint32_t kInSet = 0x80000000u, kReached = 0x40000000u, kCountMask
 
 }  // namespace
 
+/// Up to `max` (0: all) of the cells left to free (`Options::freeBudget`); the cell budget back once none are left.
+void VM::freeDeferred(std::size_t max) noexcept
+{
+    std::size_t n = 0;
+    while (!deferredFree_.empty() && (!max || n < max)) {
+        const CellPtr c = deferredFree_.back();
+        deferredFree_.pop_back();
+        const std::uint64_t before = liveCells;
+        destroy(c);  // frees up to the budget, and leaves the rest here again
+        n += before > liveCells ? before - liveCells : 1;
+    }
+    if (deferredFree_.empty() && !cellBudget_) {
+        cellBudget_ = savedCellBudget_ ? savedCellBudget_ : 64 * kMinCellBudget;
+        savedCellBudget_ = 0;
+    }
+}
+
 void VM::collectCycles(bool minor) noexcept
 {
     if (destroying_ || tearingDown)
         return;
+    // A cell left to free has no count: it is no garbage of a cycle, and goes first.
+    if (!deferredFree_.empty())
+        freeDeferred(0);
     // The world: the young cells of a minor collection, every cell otherwise. What lies outside it, and a cell that is never
     // freed, counts as a reference from outside.
     Vec<CellPtr> set;

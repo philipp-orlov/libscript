@@ -201,7 +201,7 @@ struct VM : EngineRuntime
     /// The same when no frame is left: the registers are nobody's, and are filled again as they are used again.
     void scanAtHost() noexcept
     {
-        if (!zctCount())
+        if (!zctCount() || (runningJobs_ && zctCount() < zctLimit_))  // (at the end of the jobs)
             return;
         if (stackInit > stackTop)
             stackInit = stackTop;
@@ -575,9 +575,10 @@ private:
     void freeZct() noexcept;
     bool rootsCounted_ = false;
     bool parking_ = false;
+    bool runningJobs_ = false;
     std::size_t scanned_ = 0;  ///< registers the last scan went over
     void restoreCellBudget() noexcept;
-    static constexpr std::size_t kZctMin = 4096;
+    static constexpr std::size_t kZctMin = 256;
     std::size_t zctMin_ = kZctMin;
 
 public:

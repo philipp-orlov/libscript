@@ -148,15 +148,22 @@ inline void clearRegs(JSValue* R, std::uint32_t from, std::uint32_t to) noexcept
         clearReg<Def>(R[i]);
 }
 
-/// A register's value as one the caller holds a count of, for a holder outside the frames (`Def`: one more count).
+/// A register's value goes to the suspended generator that keeps it in `kept`, with its count. `Def`: the generator has
+/// kept counts of what its registers held when it was resumed; only what has changed since is counted.
 template <bool Def>
-[[gnu::always_inline]] inline JSValue takeReg(JSValue& slot) noexcept
+[[gnu::always_inline]] inline void saveReg(JSValue& kept, JSValue& slot) noexcept
 {
-    const JSValue v = slot;
+    const JSValue v = slot, old = kept;
     slot = JSValue::undefined();
-    if constexpr (Def)
+    if constexpr (Def) {
+        if (v == old)
+            return;
         retain(v);
-    return v;
+        kept = v;
+        release(old);
+    } else {
+        kept = v;
+    }
 }
 
 /// The count a register of the mode holds: none in a deferred frame.
@@ -2880,9 +2887,8 @@ L_GenStart: {
     g->prologue = false;
     g->pcIndex = std::uint32_t(pc - codeStart);
     g->state = GenState::Start;
-    for (std::uint32_t i = 0; i < code->nregs; ++i) {
-        g->regs()[i] = takeReg<Def>(R[i]);
-    }
+    for (std::uint32_t i = 0; i < code->nregs; ++i)
+        saveReg<Def>(g->regs()[i], R[i]);
     --vm.frameTop;
     return JSValue::undefined();
 }
@@ -3490,9 +3496,8 @@ L_Yield: {
     g->pcIndex = std::uint32_t(pc - codeStart);
     g->resumeDst = ins->a;
     g->state = GenState::Suspended;
-    for (std::uint32_t i = 0; i < code->nregs; ++i) {
-        g->regs()[i] = takeReg<Def>(R[i]);
-    }
+    for (std::uint32_t i = 0; i < code->nregs; ++i)
+        saveReg<Def>(g->regs()[i], R[i]);
     --vm.frameTop;
     return out;
 }
@@ -4860,11 +4865,10 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     for (std::uint32_t i = 0; i < c->nregs; ++i) {
         const JSValue old = R[i];
         R[i] = g->regs()[i];
-        g->regs()[i] = JSValue::undefined();
         if (deferred)
-            releaseDeferred(R[i]);  // the register holds it without the count the generator held
-        else
-            release(old);
+            continue;  // the generator keeps its counts; a deferred register has none (`saveReg`)
+        g->regs()[i] = JSValue::undefined();
+        release(old);
     }
     if (g->state == GenState::Suspended && g->delegating) {
         // At a `yield*`: what came in goes to the inner iterator, with what kind of resumption it was.

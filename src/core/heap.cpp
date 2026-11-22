@@ -491,17 +491,16 @@ void ContextImpl::collectIfDue()
         return;
     std::uint64_t cells = liveObjects + liveStrings;
     bool overBudget = options.memoryLimit && heapBytes > options.memoryLimit;
+    if (!overBudget && heapBytes < nextGcBytes && cells < nextGcCells && !heldBackDue)
+        return;
+    // What an engine holds back may be all that is over.
+    heldBackDue = false;
+    for (std::size_t i = 0; i < runtimeCount_; ++i)
+        runtimes_[i]->freeHeldBack();
+    cells = liveObjects + liveStrings;
+    overBudget = options.memoryLimit && heapBytes > options.memoryLimit;
     if (!overBudget && heapBytes < nextGcBytes && cells < nextGcCells)
         return;
-    bool heldBack = false;
-    for (std::size_t i = 0; i < runtimeCount_; ++i)
-        heldBack = runtimes_[i]->freeHeldBack() || heldBack;
-    if (heldBack) {
-        cells = liveObjects + liveStrings;
-        overBudget = options.memoryLimit && heapBytes > options.memoryLimit;
-        if (!overBudget && heapBytes < nextGcBytes && cells < nextGcCells)
-            return;
-    }
 
     // Mostly the cells made since the last time: cycles of a closure and its own cell die young. All of it when the heap
     // has doubled since it last was looked at whole, or is over its limit. A host that collects itself: nothing here.

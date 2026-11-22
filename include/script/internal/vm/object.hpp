@@ -26,6 +26,9 @@ static_assert(sizeof(SlotsHeader) == 16, "slots stay 16-byte aligned behind thei
 struct NativeState
 {
     virtual ~NativeState() = default;
+    // From the pool the other buffers of a cell come from.
+    static void* operator new(std::size_t bytes) { return PoolAlloc<char>().allocate(bytes); }
+    static void operator delete(void* p, std::size_t bytes) noexcept { PoolAlloc<char>().deallocate(static_cast<char*>(p), bytes); }
     /// The values it holds, for the walk that finds cycles at teardown.
     virtual void values(Vec<JSValue>& out) const { (void)out; }
     /// Let go of every value it holds, now; safe to call twice.

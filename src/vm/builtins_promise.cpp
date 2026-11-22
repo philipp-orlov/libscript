@@ -1116,6 +1116,19 @@ void installPromise(VM& vm)
 std::size_t VM::runJobs()
 {
     std::size_t ran = 0;
+    struct Running
+    {
+        bool& flag;
+        const bool outer;
+        explicit Running(bool& f) noexcept : flag(f), outer(!f) { flag = true; }
+        ~Running()
+        {
+            if (outer)
+                flag = false;
+        }
+    };
+    {
+    const Running running(runningJobs_);
     while (!jobs.empty()) {
         MicroJob job = jobs.front();
         jobs.pop_front();
@@ -1125,6 +1138,9 @@ std::size_t VM::runJobs()
         release(job.c);
         ++ran;
     }
+    }
+    if (deferred && frameTop == frameBase)
+        scanAtHost();
     return ran;
 }
 

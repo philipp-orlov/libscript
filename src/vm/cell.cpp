@@ -43,7 +43,7 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
         --immediate_;
     }
     // The zero-count table is full (`deferred`): what no frame holds goes.
-    if (deferred && zctCount() >= zctLimit_ && !destroying_ && !immediate_ && !ctx.tearingDown) [[unlikely]]
+    if (deferred && zctCount() >= zctLimit_ && zctCount() && !destroying_ && !immediate_ && !ctx.tearingDown) [[unlikely]]
         scanZct();
     ctx.maybeCollect();
     // The context's budget counts heap bytes, which the buffers of arrays and strings do not add to: a program that makes
@@ -543,6 +543,7 @@ void VM::restoreCellBudget() noexcept
 /// The table has grown to its limit: compiled code allocates through `allocCell` (cell budget 0), which scans.
 void VM::noteZct() noexcept
 {
+    ctx.heldBackDue = true;
     if (zctLimit_ && zctCount() >= zctLimit_ && cellBudget_) [[unlikely]] {
         savedCellBudget_ = cellBudget_;
         cellBudget_ = 0;

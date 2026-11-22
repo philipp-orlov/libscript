@@ -115,6 +115,8 @@ struct ContextImpl
     /// rather than a recursion deep enough to overflow the C++ stack.
     GCObject* pendingFree = nullptr;
     bool destroying = false;
+    /// An engine holds back as much garbage as it means to (`EngineRuntime::freeHeldBack`).
+    bool heldBackDue = false;
     /// The new core's runtime when its frames hold values without counts: a string whose count reaches zero waits there.
     vm::VM* deferredVm = nullptr;
 
@@ -181,7 +183,7 @@ struct ContextImpl
     void maybeCollect()
     {
         // Nothing here for a program whose garbage reference counting already took care of.
-        if (heapBytes < nextGcBytes && liveObjects + liveStrings < nextGcCells &&
+        if (heapBytes < nextGcBytes && liveObjects + liveStrings < nextGcCells && !heldBackDue &&
             !(options.memoryLimit && heapBytes > options.memoryLimit))
             return;
         collectIfDue();

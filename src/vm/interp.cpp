@@ -21,6 +21,7 @@
 #include "script/internal/vm/operators.hpp"
 #include "script/internal/vm/typed.hpp"
 #include "builtins_util.hpp"
+#include "jit/opt_analysis.hpp"
 
 #if defined(__GNUC__)
 // The interpreter dispatches through the address of a label (computed goto), a GNU extension.
@@ -146,24 +147,6 @@ inline void clearRegs(JSValue* R, std::uint32_t from, std::uint32_t to) noexcept
 {
     for (std::uint32_t i = from; i < to; ++i)
         clearReg<Def>(R[i]);
-}
-
-/// A register's value goes to the suspended generator that keeps it in `kept`, with its count. `Def`: the generator has
-/// kept counts of what its registers held when it was resumed; only what has changed since is counted.
-template <bool Def>
-[[gnu::always_inline]] inline void saveReg(JSValue& kept, JSValue& slot) noexcept
-{
-    const JSValue v = slot, old = kept;
-    slot = JSValue::undefined();
-    if constexpr (Def) {
-        if (v == old)
-            return;
-        retain(v);
-        kept = v;
-        release(old);
-    } else {
-        kept = v;
-    }
 }
 
 /// The count a register of the mode holds: none in a deferred frame.
@@ -1106,17 +1089,51 @@ namespace {
 struct GenState : NativeState
 {
     enum State : std::uint8_t { Start, Suspended, Running, Done };
-    /// The frame's registers, in the same allocation as the state (`new (count) GenState`).
+    /// What a suspended frame keeps of its registers, in the same allocation as the state (`new (room) GenState`): the first
+    /// `count` values are those of the registers that `planSuspends` lists for where it resumes; at the start, of the first
+    /// registers. A running generator of a deferred frame keeps them, with the counts its registers do not have.
     std::uint32_t count = 0;
     JSValue* regs() noexcept { return reinterpret_cast<JSValue*>(this + 1); }
     const JSValue* regs() const noexcept { return reinterpret_cast<const JSValue*>(this + 1); }
     static void* operator new(std::size_t size, std::uint32_t registers) { return ::operator new(size + std::size_t(registers) * sizeof(JSValue)); }
     static void operator delete(void* p) { ::operator delete(p); }
     static void operator delete(void* p, std::uint32_t) { ::operator delete(p); }
-    explicit GenState(std::uint32_t registers) : count(registers)
+    /// Keep the live registers `R` of the frame, which stops before instruction `pc` of `code`; the registers are undefined then.
+    template <bool Def>
+    void suspend(const CodeBlock* code, JSValue* R, std::uint32_t pc) noexcept
     {
-        for (std::uint32_t i = 0; i < registers; ++i)
-            regs()[i] = JSValue::undefined();
+        const std::uint16_t* live = code->suspendRegs.data() + code->suspendAt[pc];
+        const std::uint32_t n = *live++;
+        const std::uint32_t had = count;
+        JSValue* kept = regs();
+        for (std::uint32_t k = 0; k < n; ++k) {
+            JSValue& slot = R[live[k]];
+            const JSValue v = slot, old = k < had ? kept[k] : JSValue::undefined();
+            slot = JSValue::undefined();
+            if constexpr (Def) {
+                kept[k] = v;
+                if (v == old)
+                    continue;
+                retain(v);
+                release(old);
+            } else {
+                kept[k] = v;
+            }
+        }
+        count = std::max(n, had);
+        for (std::uint32_t k = n; k < had; ++k) {
+            const JSValue old = kept[k];
+            kept[k] = JSValue::undefined();
+            release(old);
+        }
+        count = n;
+        for (std::uint32_t r = 0; r < code->nregs; ++r) {
+            const JSValue old = R[r];
+            R[r] = JSValue::undefined();
+            if constexpr (!Def)
+                release(old);
+        }
+        pcIndex = pc;
     }
     JSValue callee = JSValue::undefined();
     std::uint32_t pcIndex = 0;
@@ -1145,6 +1162,41 @@ struct GenState : NativeState
 };
 
 using bi::iteratorStep;
+
+/// A generator object, owned, whose state keeps no registers yet.
+JSValue newGenerator(VM& vm, JSFunction* f, CodeBlock* c, JSObject* proto)
+{
+    if (!c->suspendMax)
+        opt::planSuspends(*c);
+    Handle keep = Handle::adopt(toJSValue(vm.newObject(proto)));
+    JSObject* o = asObject(keep.get());
+    Rare& r = o->rareOf(vm);
+    auto* g = new (c->suspendMax) GenState();
+    o->h.cls = std::uint8_t(ObjClass::Generator);
+    r.ext = g;
+    g->callee = toJSValue(f);
+    retain(g->callee);
+    return keep.take();
+}
+
+/// `yield` and `await`: the frame `fr` stops after `ins`, and what it yields (owned) goes to whoever resumed it.
+template <bool Def>
+JSValue suspendFrame(VM& vm, Frame* fr, const Ins* ins)
+{
+    vm.suspendedOnAwait = ins->opcode() == Op::Await;
+    if (fr->gen.isUndefined())
+        fr->gen = vm.becameGenerator = newGenerator(vm, fr->fn, fr->code, vm.protos.generator);
+    auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
+    g->delegating = ins->opcode() == Op::YieldDelegate;
+    g->raw = g->delegating && ins->c == 0;  // an async generator's `yield*` yields the value, not the inner result
+    const JSValue out = fr->R[ins->b];
+    retain(out);
+    g->resumeDst = ins->a;
+    g->state = GenState::Suspended;
+    g->suspend<Def>(fr->code, fr->R, std::uint32_t(ins + 1 - fr->code->code.data()));
+    --vm.frameTop;
+    return out;
+}
 
 /// The interpreter. With `Step`, it runs the top frame's one instruction (and whatever that calls) and then returns
 /// `kStepFall` or `kStepJump` instead of going on; see jit.hpp.
@@ -2900,10 +2952,8 @@ L_GenStart: {
     if (!g->prologue)
         NEXT();
     g->prologue = false;
-    g->pcIndex = std::uint32_t(pc - codeStart);
     g->state = GenState::Start;
-    for (std::uint32_t i = 0; i < code->nregs; ++i)
-        saveReg<Def>(g->regs()[i], R[i]);
+    g->suspend<Def>(code, R, std::uint32_t(pc - codeStart));
     --vm.frameTop;
     return JSValue::undefined();
 }
@@ -3501,21 +3551,8 @@ L_IterClose: {
 }
 L_Await:
 L_YieldDelegate:
-L_Yield: {
-    vm.suspendedOnAwait = ins->opcode() == Op::Await;
-    auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
-    g->delegating = ins->opcode() == Op::YieldDelegate;
-    g->raw = g->delegating && ins->c == 0;  // an async generator's `yield*` yields the value, not the inner result
-    JSValue out = R[ins->b];
-    retain(out);
-    g->pcIndex = std::uint32_t(pc - codeStart);
-    g->resumeDst = ins->a;
-    g->state = GenState::Suspended;
-    for (std::uint32_t i = 0; i < code->nregs; ++i)
-        saveReg<Def>(g->regs()[i], R[i]);
-    --vm.frameTop;
-    return out;
-}
+L_Yield:
+    return suspendFrame<Def>(vm, fr, ins);
 
 throw_: {
     // Unwind: the innermost handler that covers the instruction that threw, in this frame or the callers'.
@@ -4043,6 +4080,13 @@ int jitArrayPush(VM& vm, std::uint32_t index)
     return 1;
 }
 
+
+JSValue jitSuspend(VM& vm, std::uint32_t index)
+{
+    Frame* fr = vm.frameTop - 1;
+    const Ins* ins = fr->code->code.data() + index;
+    return vm.deferred ? suspendFrame<true>(vm, fr, ins) : suspendFrame<false>(vm, fr, ins);
+}
 
 int jitBinary(VM& vm, std::uint32_t index)
 {
@@ -4789,15 +4833,16 @@ bool VM::ensureCompiled(CodeBlock* c)
 JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args, std::uint32_t argc)
 {
     CodeBlock* c = f->code;
+    if ((c->flags & CodeBlock::kAsync) && !(c->flags & CodeBlock::kAsyncGen))
+        return startAsync(f, thisValue, args, argc);
     // The generator's prototype is read once the parameters have been worked out, and falls back to its realm's.
     JSObject* fallback = (c->flags & CodeBlock::kAsyncGen) ? protos.asyncGenerator : protos.generator;
-    JSObject* o = newObject(fallback);
-    Handle keep = Handle::adopt(toJSValue(o));
-    auto* g = new (c->nregs) GenState(c->nregs);
-    o->h.cls = std::uint8_t(ObjClass::Generator);
-    o->rareOf(*this).ext = g;
-    g->callee = toJSValue(f);
-    retain(g->callee);
+    Handle keep = Handle::adopt(newGenerator(*this, f, c, fallback));
+    JSObject* o = asObject(keep.get());
+    auto* g = static_cast<GenState*>(o->rare()->ext);
+    g->count = 1u + c->nparams + (c->flags & CodeBlock::kNeedsArgs ? 1 : 0);
+    for (std::uint32_t i = 0; i < g->count; ++i)
+        g->regs()[i] = JSValue::undefined();
     JSValue self = thisValue;
     if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self.isNullish())
         self = toJSValue(global);
@@ -4810,8 +4855,6 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     }
     if (c->flags & CodeBlock::kNeedsArgs)
         g->regs()[1 + c->nparams] = toJSValue(captureArgumentsFor(*this, c, args, argc));
-    if ((c->flags & CodeBlock::kAsync) && !(c->flags & CodeBlock::kAsyncGen))
-        return bi::asyncStart(*this, keep.take());
     // The parameters (their defaults may throw) and the declarations run now.
     g->prologue = true;
     JSValue ignored;
@@ -4829,6 +4872,36 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
     if (c->flags & CodeBlock::kAsyncGen)
         return bi::asyncGeneratorStart(*this, keep.take(), proto);
     return keep.take();
+}
+
+/// A call of an async function. Its body runs in an ordinary frame, which becomes a generator if it comes to an `await`.
+JSValue VM::startAsync(JSFunction* f, JSValue thisValue, const JSValue* args, std::uint32_t argc)
+{
+    CodeBlock* c = f->code;
+    JSValue* R = stackTop;
+    if (frameTop >= frameLimit || R + c->nregs + 8 > stackEnd || nativeStackLow()) {
+        throwError(ErrorCode::StackOverflow, "Maximum call stack size exceeded");
+        return bi::asyncStarted(*this, JSValue::undefined(), JSValue::exception());
+    }
+    fillStack(R + c->nregs + 1);
+    JSValue self = thisValue;
+    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self.isNullish())
+        self = toJSValue(global);
+    JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArgumentsFor(*this, c, args, argc) : nullptr;
+    const std::uint32_t n = argc < c->nparams ? argc : c->nparams;
+    for (std::uint32_t i = 0; i < c->nregs; ++i)
+        copyReg(*this, R[i], i == 0 ? self : i <= n ? args[i - 1] : JSValue::undefined());
+    if (argsArray)
+        setReg(*this, R[1 + c->nparams], toJSValue(argsArray));
+    *frameTop++ = Frame{c, f, nullptr, R, 0, 0, argc, false, true, JSValue::undefined()};
+    if (!c->tier1 && !c->tier1Failed && tier1Threshold && ++c->hotness >= tier1Threshold)
+        compileTier1(*this, c);
+    const JSValue result = c->tier1 ? enterTier1(*this, c->tier1, 0) : run(*this);
+    stackTop = R;
+    clearRegs(*this, R, 0, 1 + n);
+    const JSValue generator = becameGenerator;
+    becameGenerator = JSValue::undefined();
+    return bi::asyncStarted(*this, generator, result);
 }
 
 JSValue VM::resumeGenerator(JSValue generator, int mode, JSValue sent)
@@ -4886,11 +4959,20 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     fillStack(R + c->nregs + 1);
     for (std::uint32_t i = 0; i < c->nregs; ++i) {
         const JSValue old = R[i];
-        R[i] = g->regs()[i];
-        if (deferred)
-            continue;  // the generator keeps its counts; a deferred register has none (`saveReg`)
-        g->regs()[i] = JSValue::undefined();
-        release(old);
+        R[i] = JSValue::undefined();
+        if (!deferred)
+            release(old);
+    }
+    {
+        // A deferred register has no count: the generator keeps the value with its own (`GenState::suspend`).
+        const std::uint16_t* live = g->pcIndex ? c->suspendRegs.data() + c->suspendAt[g->pcIndex] + 1 : nullptr;
+        for (std::uint32_t k = 0; k < g->count; ++k) {
+            R[live ? live[k] : k] = g->regs()[k];
+            if (!deferred)
+                g->regs()[k] = JSValue::undefined();
+        }
+        if (!deferred)
+            g->count = 0;
     }
     if (g->state == GenState::Suspended && g->delegating) {
         // At a `yield*`: what came in goes to the inner iterator, with what kind of resumption it was.

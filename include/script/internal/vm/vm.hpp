@@ -519,6 +519,7 @@ struct VM : EngineRuntime
     std::size_t runJobs();
     /// `resumeGenerator` without the result object: `*out` is the value (owned), `*done` whether it returned.
     /// `rawResult`, when given, receives the iterator result a `yield*` passes on as it is (owned), and `*out` is then unset.
+    JSValue startAsync(JSFunction* f, JSValue thisValue, const JSValue* args, std::uint32_t argc);
     bool resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool* done, JSValue* rawResult = nullptr);
     /// What a generator'"'"'s `return(v)` throws at the `yield` it waits in, so that `finally` blocks run and `catch` blocks do
     /// not; `returnValue` is `v`. Both owned.
@@ -526,6 +527,8 @@ struct VM : EngineRuntime
     JSValue returnValue = JSValue::undefined();
     /// Set while a `throw` is being delivered to a suspended generator.
     bool resumeThrow = false;
+    /// The generator (owned) that an async function became when it came to its first `await`, for `startAsync`.
+    JSValue becameGenerator = JSValue::undefined();
     /// Whether the last suspension of a generator frame was an `await` rather than a `yield`.
     bool suspendedOnAwait = false;
 

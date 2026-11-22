@@ -172,6 +172,96 @@ inline bool orInto(Bits& dst, const Bits& src)
     return changed;
 }
 
+}  // namespace
+
+void planSuspends(CodeBlock& code)
+{
+    const std::uint32_t n = std::uint32_t(code.code.size());
+    const std::uint32_t nregs = code.nregs;
+    const std::size_t words = (nregs + 63) / 64;
+    // The registers live before each instruction, and those a handler that covers it finds live.
+    std::vector<Bits> live(n + 1, Bits(words, 0));
+    std::vector<std::vector<std::uint32_t>> handlersOf(n);
+    for (std::uint32_t h = 0; h < code.handlers.size(); ++h)
+        for (std::uint32_t i = code.handlers[h].start; i < code.handlers[h].end && i < n; ++i)
+            handlersOf[i].push_back(h);
+    auto intoHandlers = [&](std::uint32_t i, Bits& out) {
+        for (std::uint32_t h : handlersOf[i]) {
+            Bits in = live[code.handlers[h].target];
+            bitClear(in, code.handlers[h].reg);
+            orInto(out, in);
+        }
+    };
+    auto after = [&](std::uint32_t i) {
+        const Op op = code.code[i].opcode();
+        Bits out(words, 0);
+        if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+            out = live[std::min(nextOf(code, i), n)];
+        if (const std::int64_t t = jumpTarget(code, i); t >= 0 && t <= std::int64_t(n))
+            orInto(out, live[std::size_t(t)]);
+        return out;
+    };
+    std::vector<Effects> effects(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        effects[i] = effectsOf(code, i);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::uint32_t i = n; i-- > 0;) {
+            const Ins& in = code.code[i];
+            const Op op = in.opcode();
+            if (op == Op::Cache)
+                continue;
+            Bits b = after(i);
+            if (op == Op::Yield || op == Op::Await) {
+                bitClear(b, in.a);
+                bitSet(b, in.b);
+            } else if (op == Op::YieldDelegate) {
+                bitClear(b, in.a);
+                bitClear(b, in.a + 1u);
+                bitSet(b, in.b);
+            } else if (op != Op::GenStart) {
+                const Effects& e = effects[i];
+                if (e.ok) {
+                    for (std::uint16_t r : e.wr)
+                        bitClear(b, r);
+                    for (std::uint16_t r : e.rd)
+                        bitSet(b, r);
+                } else {
+                    std::fill(b.begin(), b.end(), ~std::uint64_t(0));  // not modeled: it may look at any register
+                }
+            }
+            intoHandlers(i, b);
+            changed |= orInto(live[i], b);
+        }
+    }
+    code.suspendAt.assign(n + 1, 0);
+    std::uint32_t most = 1u + code.nparams + (code.flags & CodeBlock::kNeedsArgs ? 1 : 0);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const Ins& in = code.code[i];
+        const Op op = in.opcode();
+        if (op != Op::Yield && op != Op::Await && op != Op::YieldDelegate && op != Op::GenStart)
+            continue;
+        Bits b = after(i);
+        if (op != Op::GenStart)
+            bitClear(b, in.a);
+        if (op == Op::YieldDelegate)
+            bitClear(b, in.a + 1u);
+        intoHandlers(i, b);
+        code.suspendAt[i + 1] = std::uint32_t(code.suspendRegs.size());
+        const std::size_t count = code.suspendRegs.size();
+        code.suspendRegs.push_back(0);
+        for (std::uint32_t r = 0; r < nregs; ++r)
+            if (bitTest(b, r))
+                code.suspendRegs.push_back(std::uint16_t(r));
+        const std::size_t kept = code.suspendRegs.size() - count - 1;
+        code.suspendRegs[count] = std::uint16_t(kept);
+        most = std::max(most, std::uint32_t(kept));
+    }
+    code.suspendMax = most;
+}
+
+namespace {
+
 struct UnionFind
 {
     std::vector<std::uint32_t> parent;

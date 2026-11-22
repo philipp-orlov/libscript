@@ -196,6 +196,16 @@ extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
     }
 }
 
+extern "C" std::uint64_t scriptVmJitSuspend(VM* vm, std::uint32_t index)
+{
+    try {
+        return handOver(*vm, jitSuspend(*vm, index).bits);
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
 /// A call made from compiled code came back with the exception sentinel.
 extern "C" std::uint64_t scriptVmJitThrow(VM* vm, std::uint32_t index)
 {
@@ -661,9 +671,16 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     CodeBlock* c = f->code;
     if (c->flags & CodeBlock::kLazy)
         return {0, 0};  // the interpreter compiles it
-    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen) ||
-        ((c->flags & CodeBlock::kClassConstructor) && !construct))
+    if ((c->flags & CodeBlock::kClassConstructor) && !construct)
         return {0, 0};
+    if (c->flags & CodeBlock::kGenerator) {
+        if (construct || vm.ticks <= 1 || vm.frameTop >= vm.frameLimit)
+            return {0, 0};
+        --vm.ticks;
+        fr->pc = ins + 1;
+        vm.stackTop = R + code->nregs;
+        return {handOver(vm, vm.makeGenerator(f, R[base + 1], &R[base + 2], argc).bits), 1};
+    }
     if (!c->tier1) {
         if (c->tier1Failed || !vm.tier1Threshold || ++c->hotness < vm.tier1Threshold)
             return {0, 0};
@@ -3161,6 +3178,14 @@ void Baseline::emit(std::uint32_t i)
         a_.jcc(in.opcode() == Op::CheckBound ? CNE : CE, bad);
         return;
     }
+    case Op::Yield: case Op::Await: case Op::YieldDelegate:
+        sideDoor();
+        a_.mov(RDI, R12);
+        a_.movImm(RSI, i);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitSuspend));
+        a_.callC(RAX);
+        a_.jmp(tail_);
+        return;
     case Op::Append: append(i, in); return;
     case Op::Unshare: {
         if (!def_)
@@ -5925,9 +5950,6 @@ bool tier1Available() noexcept
 void compileTier1(VM& vm, CodeBlock* code)
 {
     code->tier1Failed = true;
-    // Async functions are resumed for a few instructions each time: they stay in the interpreter.
-    if (code->flags & (CodeBlock::kAsync | CodeBlock::kAsyncGen))
-        return;
     const std::size_t limit = vm.ctx.options.jit.codeCacheLimit;
     if (code->code.size() > 20000 || !entryStub())
         return;

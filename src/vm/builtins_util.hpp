@@ -234,7 +234,9 @@ JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, co
                          bool* handled);
 /// Begin an async function whose frame is in `generator` (taking its count): runs to the first `await` and gives back the
 /// promise of the result. Owned.
-JSValue asyncStart(VM& vm, JSValue generator);
+/// The promise of an async function that has run to its first `await`, where it suspended as `generator` and awaits `out`, or
+/// without one (`generator` undefined) to its result or the pending exception, `out`. Both are owned.
+JSValue asyncStarted(VM& vm, JSValue generator, JSValue out);
 void installPromise(VM& vm);
 /// The object an async generator function's call makes: it queues `next`, `throw` and `return` and drives the frame in
 /// `generator` (which it takes). Owned.

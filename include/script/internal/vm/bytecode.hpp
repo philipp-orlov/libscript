@@ -298,6 +298,11 @@ struct CodeBlock
     CodeBlock* mergedFrom = nullptr;
     bool mergeTried = false;
     Vec<InlineSite> inlineSites;
+    /// A generator's suspensions (`planSuspends`): for the instruction it resumes at, where in `suspendRegs` its live registers
+    /// are: how many, then which. `suspendMax`: the most values a suspended frame keeps; 0 until planned.
+    Vec<std::uint32_t> suspendAt;
+    Vec<std::uint16_t> suspendRegs;
+    std::uint32_t suspendMax = 0;
 
     CodeBlock() = default;
     ~CodeBlock();

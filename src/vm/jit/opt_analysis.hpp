@@ -38,6 +38,8 @@ struct Effects
 };
 
 Effects effectsOf(const CodeBlock& code, std::uint32_t i);
+/// Fills in `CodeBlock::suspendAt` and the rest of a generator's block: which registers each suspension has to keep.
+void planSuspends(CodeBlock& code);
 /// Instruction index after `i` (skips the cache word).
 std::uint32_t nextOf(const CodeBlock& code, std::uint32_t i);
 /// Where the jump instruction at `i` goes, or -1 when `i` is not a jump.

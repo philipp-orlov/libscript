@@ -23,8 +23,10 @@ namespace {
 struct Reaction
 {
     Handle derived;  ///< the promise `then` made, or undefined for an internal reaction
-    Handle handler;  ///< a function, or undefined to pass the outcome on
-    bool await = false;  ///< an `await`: `handler` is the generator that waits, `derived` the promise of its function
+    Handle onFulfilled, onRejected;  ///< functions, or undefined to pass the outcome on
+    /// An `await`: `onFulfilled` is the generator that waits, `derived` the promise of its function.
+    bool await = false;
+    bool set = false;
 };
 
 struct PromiseData : NativeState
@@ -33,25 +35,37 @@ struct PromiseData : NativeState
     State state = Pending;
     bool handled = false;
     JSValue result = JSValue::undefined();
-    std::vector<Reaction> onFulfilled, onRejected;
+    Reaction first;  ///< most promises have one; the ones after it are in `more`
+    std::vector<Reaction> more;
 
+    void add(Reaction r)
+    {
+        r.set = true;
+        if (first.set)
+            more.push_back(std::move(r));
+        else
+            first = std::move(r);
+    }
     ~PromiseData() override { clear_(); }
     void clear(VM&) noexcept override { clear_(); }
     void clear_() noexcept
     {
         release(result);
         result = JSValue::undefined();
-        onFulfilled.clear();
-        onRejected.clear();
+        first = Reaction();
+        more.clear();
     }
     void values(Vec<JSValue>& out) const override
     {
         out.push_back(result);
-        for (const auto* list : {&onFulfilled, &onRejected})
-            for (const Reaction& r : *list) {
-                out.push_back(r.derived.get());
-                out.push_back(r.handler.get());
-            }
+        auto push = [&](const Reaction& r) {
+            out.push_back(r.derived.get());
+            out.push_back(r.onFulfilled.get());
+            out.push_back(r.onRejected.get());
+        };
+        push(first);
+        for (const Reaction& r : more)
+            push(r);
     }
 };
 
@@ -116,12 +130,20 @@ void settle(VM& vm, JSValue promise, PromiseData::State state, JSValue value)
     retain(value);
     d->result = value;
     d->state = state;
-    std::vector<Reaction> reactions;
-    reactions.swap(state == PromiseData::Fulfilled ? d->onFulfilled : d->onRejected);
-    d->onFulfilled.clear();
-    d->onRejected.clear();
-    for (const Reaction& r : reactions)
-        vm.enqueueJob((r.await ? 4 : 0) + (state == PromiseData::Fulfilled ? 0 : 1), r.handler.get(), r.derived.get(), value);
+    if (!d->first.set)
+        return;
+    const Reaction first = std::move(d->first);
+    std::vector<Reaction> more;
+    more.swap(d->more);
+    d->first = Reaction();
+    auto run = [&](const Reaction& r) {
+        const bool fulfilled = state == PromiseData::Fulfilled;
+        vm.enqueueJob((r.await ? 4 : 0) + (fulfilled ? 0 : 1), (r.await || fulfilled ? r.onFulfilled : r.onRejected).get(),
+                      r.derived.get(), value);
+    };
+    run(first);
+    for (const Reaction& r : more)
+        run(r);
 }
 
 void rejectPromise(VM& vm, JSValue promise, JSValue reason) { settle(vm, promise, PromiseData::Rejected, reason); }
@@ -198,17 +220,15 @@ void makeResolvers(VM& vm, JSValue promise, Handle* resolve, Handle* reject)
 void performThen(VM& vm, JSValue promise, JSValue onFulfilled, JSValue onRejected, JSValue derived)
 {
     PromiseData* d = dataOf(promise);
-    Reaction f{Handle::retained(derived), Handle::retained(isFunction(onFulfilled) ? onFulfilled : JSValue::undefined())};
-    Reaction r{Handle::retained(derived), Handle::retained(isFunction(onRejected) ? onRejected : JSValue::undefined())};
+    const JSValue f = isFunction(onFulfilled) ? onFulfilled : JSValue::undefined();
+    const JSValue r = isFunction(onRejected) ? onRejected : JSValue::undefined();
     d->handled = true;
-    if (d->state == PromiseData::Pending) {
-        d->onFulfilled.push_back(std::move(f));
-        d->onRejected.push_back(std::move(r));
-    } else if (d->state == PromiseData::Fulfilled) {
-        vm.enqueueJob(0, f.handler.get(), f.derived.get(), d->result);
-    } else {
-        vm.enqueueJob(1, r.handler.get(), r.derived.get(), d->result);
-    }
+    if (d->state == PromiseData::Pending)
+        d->add(Reaction{Handle::retained(derived), Handle::retained(f), Handle::retained(r)});
+    else if (d->state == PromiseData::Fulfilled)
+        vm.enqueueJob(0, f, derived, d->result);
+    else
+        vm.enqueueJob(1, r, derived, d->result);
 }
 
 /// An `await` of `promise`: the generator goes on when it settles, with no function made for it.
@@ -217,8 +237,7 @@ void performAwait(VM& vm, JSValue promise, JSValue generator, JSValue result)
     PromiseData* d = dataOf(promise);
     d->handled = true;
     if (d->state == PromiseData::Pending) {
-        d->onFulfilled.push_back(Reaction{Handle::retained(result), Handle::retained(generator), true});
-        d->onRejected.push_back(Reaction{Handle::retained(result), Handle::retained(generator), true});
+        d->add(Reaction{Handle::retained(result), Handle::retained(generator), Handle(), true});
     } else {
         vm.enqueueJob(d->state == PromiseData::Fulfilled ? 4 : 5, generator, result, d->result);
     }
@@ -752,6 +771,18 @@ NATIVE(promiseCombinator)
     }
 }
 
+/// An `await`: go on when what was awaited settles. Something that is no object is fulfilled at once; nothing is made.
+void awaitValue(VM& vm, JSValue out, JSValue generator, JSValue promise)
+{
+    if (!isObject(out)) {
+        vm.enqueueJob(4, generator, promise, out);
+        return;
+    }
+    JSValue awaited = promiseResolve(vm, out);
+    Handle awaitedKeep = Handle::adopt(awaited);
+    performAwait(vm, awaited, generator, promise);
+}
+
 void asyncStep(VM& vm, JSValue generator, JSValue promise, int mode, JSValue sent)
 {
     JSValue out;
@@ -763,18 +794,10 @@ void asyncStep(VM& vm, JSValue generator, JSValue promise, int mode, JSValue sen
         return;
     }
     Handle outKeep = Handle::adopt(out);
-    if (done) {
+    if (done)
         resolvePromise(vm, promise, out);
-        return;
-    }
-    // An `await`: go on when what was awaited settles. Something that is no object is fulfilled at once; nothing is made.
-    if (!isObject(out)) {
-        vm.enqueueJob(4, generator, promise, out);
-        return;
-    }
-    JSValue awaited = promiseResolve(vm, out);
-    Handle awaitedKeep = Handle::adopt(awaited);
-    performAwait(vm, awaited, generator, promise);
+    else
+        awaitValue(vm, out, generator, promise);
 }
 
 void asyncResume(VM& vm, JSValue generator, JSValue promise, int mode, JSValue sent)
@@ -1029,12 +1052,22 @@ NATIVE(syncWrapStep)
 
 }  // namespace
 
-JSValue asyncStart(VM& vm, JSValue generator)
+JSValue asyncStarted(VM& vm, JSValue generator, JSValue out)
 {
     Handle gen = Handle::adopt(generator);
+    Handle outKeep = Handle::adopt(out);
     JSValue promise = newPromiseObject(vm);
     Handle promiseKeep = Handle::adopt(promise);
-    asyncStep(vm, gen.get(), promise, 0, JSValue::undefined());
+    if (out.isException()) {
+        outKeep.take();
+        JSValue e = takeException(vm);
+        rejectPromise(vm, promise, e);
+        release(e);
+    } else if (generator.isUndefined()) {
+        resolvePromise(vm, promise, out);
+    } else {
+        awaitValue(vm, out, generator, promise);
+    }
     return promiseKeep.take();
 }
 

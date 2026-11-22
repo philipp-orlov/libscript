@@ -865,6 +865,7 @@ constexpr std::int32_t kVmFrameCapacity = std::int32_t(offsetof(VM, frameCapacit
 constexpr std::int32_t kVmFrameBase = std::int32_t(offsetof(VM, frameBase));
 constexpr std::int32_t kVmGlobalEpoch = std::int32_t(offsetof(VM, globalEpoch));
 constexpr std::int32_t kVmStackFloor = std::int32_t(offsetof(VM, jitStackFloor));
+constexpr std::int32_t kCbRefs = std::int32_t(offsetof(CodeBlock, refs));
 constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
 constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
 constexpr std::int32_t kCbTier1 = std::int32_t(offsetof(CodeBlock, tier1));
@@ -3588,12 +3589,60 @@ void Baseline::emit(std::uint32_t i)
     case Op::DefPrivate:
         defPrivate(i, in);
         return;
-    case Op::Closure:
-        helperOp(i, &helperThunk<jitClosure>);
+    case Op::Closure: {
+        const CodeBlock* child = code_->children[in.b];
+        const std::uint32_t n = std::uint32_t(child->upvals.size());
+        const std::size_t bytes = JSFunction::bytesFor(n);
+        if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit || bytes > 128 || (child->flags & CodeBlock::kGenerator)) {
+            helperOp(i, &helperThunk<jitClosure>);
+            return;
+        }
+        CellHeader h{};
+        h.shape = vm_.rootShapeFor(vm_.protos.function)->id;
+        h.cls = std::uint8_t(ObjClass::Function);
+        h.flags = cellflags::kYoung;
+        h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
+        allocCellHere(bytes, h, slow(i, &helperThunk<jitClosure>), false);
+        a_.mov(mem(RAX, kObjSlots), 0);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(child));
+        a_.mov(mem(RAX, kFnCode), RCX);
+        a_.inc32(mem(RCX, kCbRefs));
+        a_.movImm(RCX, (JSFunction::kLazyProps | (child->constructor ? JSFunction::kConstructor : 0u)) | (std::uint64_t(n) << 32));
+        static_assert(offsetof(JSFunction, nUpvals) == offsetof(JSFunction, flags) + 4, "written together");
+        a_.mov(mem(RAX, kFnFlags), RCX);
+        bool outer = false;
+        for (std::uint32_t k = 0; k < n; ++k) {
+            const UpvalDesc& d = child->upvals[k];
+            if (d.fromParentLocal) {
+                a_.mov(RCX, R(d.index));
+            } else {
+                if (!outer)
+                    a_.mov(RDX, mem(R13, kFrameFn));
+                outer = true;
+                a_.mov(RCX, mem(RDX, std::int32_t(sizeof(JSFunction) + 8 * d.index)));
+            }
+            a_.inc32(mem(RCX, std::int32_t(detail::kCellCountOffset)));
+            a_.mov(mem(RAX, std::int32_t(sizeof(JSFunction) + 8 * k)), RCX);
+        }
+        write(in.a, RAX);
         return;
-    case Op::NewBox:
-        helperOp(i, &helperThunk<jitNewBox>);
+    }
+    case Op::NewBox: {
+        if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit) {
+            helperOp(i, &helperThunk<jitNewBox>);
+            return;
+        }
+        CellHeader h{};
+        h.flags = cellflags::kYoung;
+        h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Box));
+        allocCellHere(sizeof(Box), h, slow(i, &helperThunk<jitNewBox>), false);
+        a_.mov(RCX, R(in.a));
+        if (def_)
+            retain(RCX);  // the box's own; a counted register's count becomes the box's
+        a_.mov(mem(RAX, std::int32_t(offsetof(Box, value))), RCX);
+        a_.mov(R(in.a), RAX);
         return;
+    }
     case Op::NewObject: {
         Label& bad = slow(i, &helperThunk<jitNewObject>);
         if (!allocObject(vm_.rootShapeFor(vm_.protos.object)->id, std::uint8_t(in.b), bad)) {

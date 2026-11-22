@@ -1022,10 +1022,10 @@ void unwrapBound(JSValue* R, std::uint32_t base) noexcept
 /// up is the call of `f` with `thisArg` and `args`, and it is run as that (the registers below stay as they are).
 bool unwrapCall(VM& vm, const JSValue* R, std::uint32_t* base, std::uint32_t* argc) noexcept
 {
-    if (*argc == 0 || !isFunction(R[*base]) || !isFunction(R[*base + 1]))
+    if (*argc == 0 || !isFunction(R[*base]))
         return false;
     auto* f = static_cast<JSFunction*>(asObject(R[*base]));
-    if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != vm.functionCallNative)
+    if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != vm.functionCallNative || !isFunction(R[*base + 1]))
         return false;
     *base += 1;
     *argc -= 1;

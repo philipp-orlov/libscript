@@ -413,6 +413,13 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                                   long(up.pc - up.code->code.data()));
                     what += buf;
                 }
+            } else {
+                const JSValue x = fr->R[at.b], y = fr->R[at.c < code->nregs ? at.c : 0];
+                char buf[96];
+                std::snprintf(buf, sizeof buf, " b %s %g c %s %g", x.isInt32() ? "int" : x.isDouble() ? "dbl" : "other",
+                              x.isNumber() ? x.asNumber() : 0.0, y.isInt32() ? "int" : y.isDouble() ? "dbl" : "other",
+                              y.isNumber() ? y.asNumber() : 0.0);
+                what = buf;
             }
             std::fprintf(stderr, "tier2 exit %s @%u %s kind %d (n=%zu tries %d)%s\n", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", index,
                          opName(code->code[index].opcode()), kind, code->code.size(), int(code->tier2Tries), what.c_str());
@@ -743,9 +750,12 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         (*counts)[(code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon")) + buf + " -> " + what]++;
     }
 #endif
-    const bool shifted = ins->opcode() == Op::Call && jitUnwrapCall(vm, R, &base, &argc);
-    if (ins->opcode() == Op::Call)
+    // (A native callee only: `Function.prototype.call`, a bound function.)
+    bool shifted = false;
+    if (ins->opcode() == Op::Call && isFunction(R[base]) && (static_cast<JSFunction*>(asObject(R[base]))->flags & JSFunction::kNative)) {
+        shifted = jitUnwrapCall(vm, R, &base, &argc);
         jitUnwrapBound(vm, R, base);
+    }
     const JSValue callee = R[base];
     const bool isNew = ins->opcode() == Op::New;
     const bool isSuper = ins->opcode() == Op::SuperCall;  // the parent's constructor, on the `this` the derived one holds

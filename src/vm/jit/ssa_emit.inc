@@ -3851,8 +3851,12 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             if (ssaOn_ >= 2 && cls[v] == 3 && (ssaLengthSite(sv.at) || ssaCharCodeCallee(sv.at)))
                 cls[v] = 1;  // an int32 when it does not leave
             if (JSFunction* f = mathOf_[sv.at]) {
+                // A double only where results are seldom integers: a boxed double that is one would make int32 sites leave.
                 const std::uint8_t p = sv.at < code_->prof.size() ? code_->prof[sv.at] : 0;
-                cls[v] = p == 1 || mathOp(f->rare()->native, f->rare()->nativeData) == MathOp::Imul ? 1 : (p & 2) && !(p & ~3) ? 2 : 3;
+                const MathOp m = mathOp(f->rare()->native, f->rare()->nativeData);
+                cls[v] = p == 1 || m == MathOp::Imul                                                       ? 1
+                         : (p & 2) && !(p & ~3) && (m == MathOp::Sqrt || m == MathOp::Fround || m == MathOp::Unary) ? 2
+                                                                                                    : 3;
             }
         } else if (sv.kind == ssa::Value::Entry) {
             cls[v] = 3;

@@ -2439,6 +2439,8 @@ void Baseline::findCells()
 
 Tier2Code* Baseline::compileOptimized()
 {
+    if (n_ <= kPoolCode)
+        a_.usePool();
     const std::uint32_t W = plan_->typedWebs;
     bool calls = false;
     for (std::uint32_t j = 0; j < n_; j += length(j))
@@ -2585,6 +2587,7 @@ Tier2Code* Baseline::compileOptimized()
         a_.jmp(preLoop_.at(h));
     }
     emitTails();
+    a_.finishPool();
     CodeSpan span = hoistBroken_.empty() && !a_.failed() ? allocateCode(a_.buf.size()) : CodeSpan{};
     if (!span) {
         for (ValidityCell* v : validities_)

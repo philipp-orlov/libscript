@@ -786,6 +786,8 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
 {
     ssa_ = &g;
     base_ = base;
+    if (n_ <= kPoolCode)
+        a_.usePool();
     auto fail = [&]() -> Tier2Code* {
         for (ValidityCell* v : validities_)
             vm_.releaseValidity(v);
@@ -1254,6 +1256,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
         a_.jmp(RAX);
     }
     emitTails();
+    a_.finishPool();
     CodeSpan span = a_.failed() ? CodeSpan{} : allocateCode(a_.buf.size());
     if (!span)
         return fail();

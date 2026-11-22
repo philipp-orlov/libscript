@@ -982,6 +982,8 @@ public:
         return compileOptimized();
     }
 
+    /// The most instructions of a function whose code may load constants from behind it (a load reaches a megabyte).
+    static constexpr std::uint32_t kPoolCode = 4000;
     Tier1Code* compile()
     {
         emitPrologue(a_);

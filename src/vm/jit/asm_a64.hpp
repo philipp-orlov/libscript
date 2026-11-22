@@ -33,6 +33,7 @@
 #include <sys/auxv.h>
 #endif
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace script {
@@ -177,6 +178,17 @@ private:
     /// The registers whose upper half is known to be zero: written last by a 32-bit operation, with no label and no
     /// call since. A 64-bit use of one reads what its 32 bits say.
     mutable std::uint32_t zext_ = 0;
+    // The last instruction, when it is a load or a store of a 64-bit register that the next may join.
+    mutable std::size_t pairAt_ = ~std::size_t(0);
+    std::uint32_t pairOp_ = 0;
+    int pairBase_ = 0, pairReg_ = 0;
+    std::int32_t pairDisp_ = 0;
+    // Where the last instruction, a store of x17 with the immediate `immVal_` in it, ends.
+    mutable std::size_t immAt_ = ~std::size_t(0);
+    std::uint64_t immVal_ = 0;
+    // Constants loaded from behind the code (`usePool`): the instruction's place and the value.
+    bool pool_ = false;
+    std::vector<std::pair<std::size_t, std::uint64_t>> literals_;
     /// Keeps `zext_` through instruction `v`. Whatever is not known to leave a register zero-extended takes it off.
     void track(std::uint32_t v) noexcept
     {
@@ -232,6 +244,20 @@ private:
     // ---- immediates ----
     void imm(int rd, std::uint64_t v)
     {
+        if (pool_ && v > 0xFFFFFFFFull) {
+            unsigned parts = 0, inverted = 0;
+            for (int i = 0; i < 4; ++i) {
+                const std::uint32_t c = std::uint32_t(v >> (16 * i)) & 0xFFFF;
+                parts += c != 0;
+                inverted += c != 0xFFFF;
+            }
+            if (parts > 2 && inverted > 2) {
+                // Three instructions or more: loaded from behind the code.
+                literals_.emplace_back(buf.size(), v);
+                ins(0x58000000u | std::uint32_t(rd));
+                return;
+            }
+        }
         if (v <= 0xFFFFFFFFull) {
             const std::uint32_t lo = std::uint32_t(v) & 0xFFFF, hi = std::uint32_t(v >> 16);
             if (hi == 0) {
@@ -356,6 +382,38 @@ private:
     void access(std::uint32_t unscaled, int size, int rt, const Ea& a)
     {
         const std::uint32_t t = std::uint32_t(rt), b = std::uint32_t(a.base) << 5;
+        const bool fp = unscaled == kStrD || unscaled == kLdrD;
+        if (a.index < 0 && (fp || unscaled == kStrX || unscaled == kLdrX)) {
+            const bool store = unscaled == kStrX || unscaled == kStrD;
+            const std::size_t at = buf.size();
+            if (pairAt_ == at && pairOp_ == unscaled && pairBase_ == a.base) {
+                // Beside the last instruction's place: both at once. (A load must not change the address or the other.)
+                const bool up = a.disp == pairDisp_ + 8, down = a.disp == pairDisp_ - 8;
+                const std::int32_t lo = up ? pairDisp_ : a.disp;
+                if ((up || down) && lo % 8 == 0 && lo >= -512 && lo <= 504 &&
+                    (store || (pairReg_ != rt && (fp || pairReg_ != a.base)))) {
+                    const std::uint32_t t1 = std::uint32_t(up ? pairReg_ : rt), t2 = std::uint32_t(up ? rt : pairReg_);
+                    const std::uint32_t v = (fp ? 0x6D000000u : 0xA9000000u) | (store ? 0u : 0x400000u) |
+                                            ((std::uint32_t(lo / 8) & 0x7F) << 15) | (t2 << 10) | b | t1;
+                    std::memcpy(&buf[at - 4], &v, 4);
+                    if (!store && !fp)
+                        zext_ &= ~(1u << rt);
+                    pairAt_ = ~std::size_t(0);
+                    return;
+                }
+            }
+            single(unscaled, size, t, b, a);
+            pairAt_ = buf.size();
+            pairOp_ = unscaled;
+            pairBase_ = a.base;
+            pairReg_ = rt;
+            pairDisp_ = a.disp;
+            return;
+        }
+        single(unscaled, size, t, b, a);
+    }
+    void single(std::uint32_t unscaled, int size, std::uint32_t t, std::uint32_t b, const Ea& a)
+    {
         if (a.index >= 0) {
             ins(unscaled | 0x00206800u | (a.shift ? 0x1000u : 0u) | (std::uint32_t(a.index) << 16) | b | t);
         } else if (a.disp >= 0 && (a.disp & ((1 << size) - 1)) == 0 && (a.disp >> size) < 4096) {
@@ -617,7 +675,37 @@ public:
         movedAt_ = ~std::size_t(0);
         zext_ = 0;  // the position may be entered from elsewhere
         valAt_ = ~std::size_t(0);
+        pairAt_ = ~std::size_t(0);
+        immAt_ = ~std::size_t(0);
         return std::int32_t(buf.size());
+    }
+
+    /// From here on, constants of three instructions or more are loaded from a pool behind the code (`finishPool`).
+    void usePool() noexcept { pool_ = true; }
+    /// The pool, once the code is all there.
+    void finishPool()
+    {
+        if (literals_.empty())
+            return;
+        align(8);
+        std::unordered_map<std::uint64_t, std::size_t> places;
+        for (const auto& [at, v] : literals_) {
+            auto [it, fresh] = places.emplace(v, buf.size());
+            if (fresh) {
+                buf.resize(buf.size() + 8);
+                std::memcpy(&buf[it->second], &v, 8);
+            }
+            const std::size_t delta = (it->second - at) >> 2;
+            if (delta >= (std::size_t(1) << 18)) {
+                failed_ = true;
+                return;
+            }
+            std::uint32_t w;
+            std::memcpy(&w, &buf[at], 4);
+            w |= std::uint32_t(delta) << 5;
+            std::memcpy(&buf[at], &w, 4);
+        }
+        literals_.clear();
     }
 
     void align(int n)
@@ -749,8 +837,12 @@ public:
             access(kStrX, 3, kZr, a);
             return;
         }
-        imm(kVal, std::uint64_t(std::int64_t(v)));
+        const std::uint64_t bits = std::uint64_t(std::int64_t(v));
+        if (immAt_ != buf.size() || immVal_ != bits)
+            imm(kVal, bits);
         access(kStrX, 3, kVal, a);
+        immAt_ = buf.size();
+        immVal_ = bits;
     }
     void mov32(const Mem& m, std::int32_t v)
     {

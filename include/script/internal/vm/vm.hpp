@@ -519,8 +519,8 @@ struct VM : EngineRuntime
     std::int32_t legacyBounds[20] = {};
     std::uint8_t legacyGroups = 0;
     bool legacyInvalid = false;                  ///< a subclass instance matched since: the accessors throw
-    static constexpr std::uint64_t kMinCellBudget = 2048;
-    std::uint64_t cellBudget_ = 64 * kMinCellBudget;  ///< collect cycles when this many cells are alive
+    static constexpr std::uint64_t kMinCellBudget = 16384;
+    std::uint64_t cellBudget_ = 8 * kMinCellBudget;  ///< collect cycles when this many cells are alive
     std::uint64_t cellsAfterFull_ = 0;           ///< cells alive after the last whole collection
     std::uint32_t evalEnvSerial = 0;             ///< numbers the hidden variables that hold eval objects, so no two share a name
     bool overflowing = false;                    ///< raising a stack overflow right now

@@ -567,7 +567,7 @@ void VM::restoreCellBudget() noexcept
 {
     if (!deferredFree_.empty() || (deferred && zctCount() >= zctLimit_) || cellBudget_)
         return;
-    cellBudget_ = savedCellBudget_ ? savedCellBudget_ : 64 * kMinCellBudget;
+    cellBudget_ = savedCellBudget_ ? savedCellBudget_ : 8 * kMinCellBudget;
     savedCellBudget_ = 0;
 }
 

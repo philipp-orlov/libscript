@@ -2224,13 +2224,11 @@ void Baseline::ssaPutAdd(std::uint32_t i)
         a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto | cellflags::kNotExtensible));
         a_.jcc(CNE, bad);
     }
-    // Objects of one shape can have fewer inline slots than the one the cache learned from.
-    a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic.index));
-    a_.jcc(CBE, bad);
+    addSlot(ic.index, bad);
     loadValue(x, RCX);
     if (mayBeCell(x))
         retain(RCX);
-    a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic.index)), RCX);
+    a_.mov(mem(RDX, 0), RCX);
     a_.mov32(mem(RAX, 0), std::int32_t(ic.next));
     ssaKnow(v, kVObj, ic.next);
 }

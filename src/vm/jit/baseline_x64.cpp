@@ -2788,7 +2788,8 @@ private:
     void megaFind(const std::uint32_t* mix, Label& bad);
     void megaLoad();
     void cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
-    void putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
+    void putPropKnown(const Ins& in, std::uint32_t index, std::uint32_t next, ValidityCell* validity, Label& bad);
+    void addSlot(std::uint32_t index, Label& bad);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
     void retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, bool constructs, const std::vector<std::uint64_t>* dirty);
     /// Per instruction: the registers that may have been written since the frame began (one bit each), or empty when
@@ -4983,30 +4984,41 @@ void Baseline::putProp(std::uint32_t i, const Ins& in)
         return;
     }
     Label& bad = slow(i, &helperThunk<jitPutProp>);
-    Label other, done;
-    const bool probe = true;
+    Label done;
     a_.mov(RAX, R(in.a));
     needObject(RAX, bad);
-    a_.cmpI32(mem(RAX, 0), std::int32_t(ic->shape));
-    a_.jcc(CNE, probe ? other : bad);
-    if (probe) {
-        // Another shape: where the site's cache says now, out of line.
-        Label& probeIn = coldLabels_.emplace_back();
-        Label& back = coldLabels_.emplace_back();
-        putPropKnown(i, in, ic, bad);
-        a_.jmp(done);
-        a_.bind(other);
-        a_.jmp(probeIn);
-        deferCold(i, [this, i, in, ic, &probeIn, &back, &bad]() {
-            a_.bind(probeIn);
-            cachedWrite(i, in, ic, bad);
-            a_.jmp(back);
-        });
-        a_.bind(done);
-        a_.bind(back);
-        return;
+    // The shapes the site has seen: its inline cache, then the entries of its `PolyCache`.
+    struct Seen
+    {
+        std::uint32_t shape, index, next;
+        ValidityCell* validity;
+    };
+    std::vector<Seen> seen{{ic->shape, ic->index, ic->next, ic->validity}};
+    if (ic->pad && ic->pad <= code_->poly.size()) {
+        const PolyCache& pc = code_->poly[ic->pad - 1];
+        for (std::uint8_t k = 0; k < pc.n; ++k)
+            if (pc.e[k].kind == PolyEntry::Write || pc.e[k].kind == PolyEntry::Add)
+                seen.push_back({pc.e[k].shape, pc.e[k].index, pc.e[k].kind == PolyEntry::Add ? pc.e[k].next : 0u, pc.e[k].validity});
     }
-    putPropKnown(i, in, ic, bad);
+    for (const Seen& s : seen) {
+        Label next;
+        a_.cmpI32(mem(RAX, 0), std::int32_t(s.shape));
+        a_.jcc(CNE, next);
+        putPropKnown(in, s.index, s.next, s.validity, bad);
+        a_.jmp(done);
+        a_.bind(next);
+    }
+    // Another shape: where the site's cache says now, out of line.
+    Label& probeIn = coldLabels_.emplace_back();
+    Label& back = coldLabels_.emplace_back();
+    a_.jmp(probeIn);
+    deferCold(i, [this, i, in, ic, &probeIn, &back, &bad]() {
+        a_.bind(probeIn);
+        cachedWrite(i, in, ic, bad);
+        a_.jmp(back);
+    });
+    a_.bind(done);
+    a_.bind(back);
 }
 
 void Baseline::cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad)
@@ -5039,13 +5051,14 @@ void Baseline::cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic
     release(RSI);
 }
 
-void Baseline::putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad)
+/// The store of `in` to the object in rax, whose shape is known: to its slot `index`, or (`next`) as the property that moves it
+/// to that shape.
+void Baseline::putPropKnown(const Ins& in, std::uint32_t index, std::uint32_t next, ValidityCell* validity, Label& bad)
 {
-    (void)i;
-    if (ic->next == 0) {
+    if (next == 0) {
         // A store of what the slot holds already changes nothing and counts nothing.
         Label same;
-        slotAddress(ic->index);
+        slotAddress(index);
         a_.mov(RCX, R(in.c));
         a_.mov(RSI, mem(RDX, 0));
         a_.cmp(RSI, RCX);
@@ -5056,26 +5069,41 @@ void Baseline::putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* i
         a_.bind(same);
         return;
     }
-    if (ic->validity) {
-        hold(ic->validity);
-        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic->validity));
+    if (validity) {
+        hold(validity);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(validity));
         a_.cmpI32(mem(RCX, kValidityValid), 0);
         a_.jcc(CE, bad);
     }
     a_.testI8(mem(RAX, kHdrFlags), std::uint8_t(cellflags::kIsProto | cellflags::kNotExtensible));
     a_.jcc(CNE, bad);
-    // The slot in place: objects of one shape can have fewer inline slots than the one the cache learned from. A property
-    // past the inline slots (an index that is no byte) is stored by the helper, which makes room for it.
-    if (ic->index >= 200) {
-        a_.jmp(bad);
-        return;
-    }
-    a_.cmpI8(mem(RAX, kHdrAux), std::uint8_t(ic->index));
-    a_.jcc(CBE, bad);
+    addSlot(index, bad);
     a_.mov(RCX, R(in.c));
     retain(RCX);
-    a_.mov(mem(RAX, kObjInline + std::int32_t(8 * ic->index)), RCX);
-    a_.mov32(mem(RAX, 0), std::int32_t(ic->next));
+    a_.mov(mem(RDX, 0), RCX);
+    a_.mov32(mem(RAX, 0), std::int32_t(next));
+}
+
+/// The address of the slot a property added to the object in rax gets, in rdx: in place (objects of one shape can have
+/// different inline counts) or in the buffer it has, if that has room; else `bad`. Uses rcx.
+void Baseline::addSlot(std::uint32_t index, Label& bad)
+{
+    Label out, have;
+    a_.movzx8(RCX, mem(RAX, kHdrAux));
+    a_.aluI32(7, RCX, std::int32_t(index));
+    a_.jcc(CBE, out);
+    a_.lea(RDX, mem(RAX, kObjInline + std::int32_t(8 * index)));
+    a_.jmp(have);
+    a_.bind(out);
+    a_.mov(RDX, mem(RAX, kObjSlots));
+    a_.test(RDX, RDX);
+    a_.jcc(CE, bad);
+    a_.neg32(RCX);
+    a_.aluI32(0, RCX, std::int32_t(index));
+    a_.alu32(7, RCX, mem(RDX, -8));
+    a_.jcc(CAE, bad);
+    a_.lea(RDX, mem(RDX, RCX, 8));
+    a_.bind(have);
 }
 
 void Baseline::getSuperProp(std::uint32_t i, const Ins& in)

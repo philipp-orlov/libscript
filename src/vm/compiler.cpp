@@ -148,6 +148,7 @@ struct Fn
     Fn* parent = nullptr;
     CodeBlock* block = nullptr;
     std::set<String> captured;
+    std::set<String> appended;  ///< the variables that build a string piece by piece (`appendedNames`)
     std::vector<Scope> scopes;
     std::uint16_t top = 1;
     bool isArrow = false;
@@ -599,6 +600,40 @@ bool stableAcross(const Node& first, const Node& later)
     return first.kind == NK::Identifier ? !assignsName(later, first.text) : !hasAssignment(later);
 }
 
+/// Whether the text says that a node makes a string: a string literal, a template, or a sum with one of them.
+bool makesString(const Node& n)
+{
+    if (n.kind == NK::Binary && n.op == Tok::Plus)
+        return makesString(*n.a) || makesString(*n.b);
+    return n.kind == NK::StringLit || n.kind == NK::TemplateLit;
+}
+
+/// The names this function's own code adds to (`s += x`, `s = s + x`), and those it gives a string.
+void appendedNames(const Node& n, std::set<String>& added, std::set<String>& strings)
+{
+    checkNativeStack();
+    if (n.kind == NK::Assign && n.a->kind == NK::Identifier) {
+        const bool plain = n.op == Tok::Assign;
+        if (n.op == Tok::PlusAssign ||
+            (plain && n.b->kind == NK::Binary && n.b->op == Tok::Plus && n.b->a->kind == NK::Identifier && n.b->a->text == n.a->text))
+            added.insert(n.a->text);
+        if ((plain || n.op == Tok::PlusAssign) && makesString(*n.b))
+            strings.insert(n.a->text);
+    }
+    if (n.kind == NK::VarDecl)
+        for (const dyn::NodePtr& d : n.list)
+            if (d->a && d->a->kind == NK::Identifier && d->b && makesString(*d->b))
+                strings.insert(d->a->text);
+    if (isFunctionNode(n))
+        return;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child)
+            appendedNames(**child, added, strings);
+    for (const dyn::NodePtr& child : n.list)
+        if (child)
+            appendedNames(*child, added, strings);
+}
+
 /// Whether a direct `eval` call is in this function's own code: its parameters and body, not a function inside them.
 bool containsDirectEval(const Node& n)
 {
@@ -719,6 +754,7 @@ private:
     Label* chain_ = nullptr;
     bool chainUsed_ = false;
     bool noFuse_ = false;
+    bool looked_ = false;  ///< the variable about to be read is only looked at (`exprLooked`)
     bool lazy_ = false;                ///< functions that qualify are left as stubs (`lazyStub`)
     std::unordered_set<const Node*> calledAtOnce_;  ///< function expressions called where they stand: compiled at once
     bool discard_ = false;  ///< the expression about to be compiled has its value thrown away
@@ -1020,7 +1056,10 @@ private:
     std::uint16_t loadVar(const String& name, int dst, const Node& at, bool forTypeof = false)
     {
         Ref r = resolve(name);
+        const bool looked = std::exchange(looked_, false);
         if (r.kind == Ref::Local && !r.binding->boxed) {
+            if (dst != r.binding->reg && !looked && !forTypeof && fn_->appended.count(name))
+                emit(Op::Unshare, r.binding->reg);
             if (r.checked) {
                 const std::uint16_t d = dst >= 0 ? std::uint16_t(dst) : r.binding->reg;
                 emit(Op::CheckInit, r.binding->reg, atom(name));
@@ -1146,6 +1185,14 @@ private:
     }
     /// A register holding the value, which may be a local's own register: not to be kept across code that can assign.
     std::uint16_t exprAny(const Node& n) { return expr(n, -1); }
+    /// The same for an instruction that only looks at the value: no other register gets it (`Op::Unshare`).
+    std::uint16_t exprLooked(const Node& n)
+    {
+        looked_ = n.kind == NK::Identifier;
+        const std::uint16_t r = exprAny(n);
+        looked_ = false;
+        return r;
+    }
     /// `null`, the global `undefined` or `void 0`: what a loose compare with is a test for null or undefined.
     bool nullishLiteral(const Node& n)
     {
@@ -2171,7 +2218,7 @@ std::uint16_t Compiler::unary(const Node& n, int dst)
                 loadNumber(d, -n.a->number);
                 return d;
             }
-            const std::uint16_t v = exprAny(*n.a);
+            const std::uint16_t v = exprLooked(*n.a);
             fn_->top = mark;
             const std::uint16_t d = dest(dst);
             emit(n.op == Tok::Bang ? Op::Not : n.op == Tok::Minus ? Op::Neg : n.op == Tok::Plus ? Op::ToNumber : Op::BitNot, d, v);
@@ -2397,8 +2444,22 @@ std::uint16_t Compiler::binaryStep(const Node& n, int dst, int left)
         emit(immediateOp(op), d, a, std::uint16_t(std::int16_t(int(n.b->number))));
         return d;
     }
-    const std::uint16_t a = leftOperand(stableAcross(*n.a, *n.b));
-    const std::uint16_t b = exprAny(*n.b);
+    const bool stable = stableAcross(*n.a, *n.b);
+    if (op == Op::Add && dst >= 0 && left < 0 && stable && n.a->kind == NK::Identifier && fn_->appended.count(n.a->text)) {
+        // `s = s + x`
+        const Ref r = resolve(n.a->text);
+        if (r.kind == Ref::Local && !r.binding->boxed && !r.checked && r.binding->reg == dst) {
+            const std::uint16_t v = exprAny(*n.b);
+            fn_->top = mark;
+            emit(Op::Append, std::uint16_t(dst), v);
+            return std::uint16_t(dst);
+        }
+    }
+    // A comparison takes no value anywhere; a sum with an empty string is the other operand.
+    const bool looks = op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge || op == Op::Eq || op == Op::Ne ||
+                       op == Op::StrictEq || op == Op::StrictNe;
+    const std::uint16_t a = looks && left < 0 && stable ? exprLooked(*n.a) : leftOperand(stable);
+    const std::uint16_t b = looks ? exprLooked(*n.b) : exprAny(*n.b);
     fn_->top = mark;
     const std::uint16_t d = dest(dst);
     emit(op, d, a, b);
@@ -2473,7 +2534,7 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
         (nullishLiteral(*cond.b) || nullishLiteral(*cond.a))) {
         // `x == null` and `x != null` (or `undefined`, either side): one test of the value, no boolean.
         const std::uint16_t mark = fn_->top;
-        const std::uint16_t a = exprAny(nullishLiteral(*cond.b) ? *cond.a : *cond.b);
+        const std::uint16_t a = exprLooked(nullishLiteral(*cond.b) ? *cond.a : *cond.b);
         emitJump(cond.op == Tok::EqEq ? Op::JNullish : Op::JNotNullish, a, whenTrue);
         fn_->top = mark;
         return;
@@ -2494,21 +2555,21 @@ void Compiler::condJumpTrue(const Node& cond, Label& whenTrue)
         if (fused != Op::Nop) {
             const std::uint16_t mark = fn_->top;
             if (smallInt(*cond.b) && immediateJump(fused) != Op::Nop) {
-                const std::uint16_t a = exprAny(*cond.a);
+                const std::uint16_t a = exprLooked(*cond.a);
                 emitFusedJump(immediateJump(fused), a, std::uint16_t(std::int16_t(int(cond.b->number))), whenTrue);
                 fn_->top = mark;
                 return;
             }
             const std::uint16_t a = isPure(*cond.b) || (cond.a->kind == NK::Identifier && stableAcross(*cond.a, *cond.b))
-                                        ? exprAny(*cond.a) : exprTemp(*cond.a);
-            const std::uint16_t b = exprAny(*cond.b);
+                                        ? exprLooked(*cond.a) : exprTemp(*cond.a);
+            const std::uint16_t b = exprLooked(*cond.b);
             emitFusedJump(fused, a, b, whenTrue);
             fn_->top = mark;
             return;
         }
     }
     const std::uint16_t mark = fn_->top;
-    const std::uint16_t r = exprAny(cond);
+    const std::uint16_t r = exprLooked(cond);
     emitJump(Op::JTrue, r, whenTrue);
     fn_->top = mark;
 }
@@ -2541,7 +2602,7 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
         (nullishLiteral(*cond.b) || nullishLiteral(*cond.a))) {
         // `x == null` and `x != null` (or `undefined`, either side): one test of the value, no boolean.
         const std::uint16_t mark = fn_->top;
-        const std::uint16_t a = exprAny(nullishLiteral(*cond.b) ? *cond.a : *cond.b);
+        const std::uint16_t a = exprLooked(nullishLiteral(*cond.b) ? *cond.a : *cond.b);
         emitJump(cond.op == Tok::EqEq ? Op::JNotNullish : Op::JNullish, a, whenFalse);
         fn_->top = mark;
         return;
@@ -2562,21 +2623,21 @@ void Compiler::condJump(const Node& cond, Label& whenFalse)
         if (fused != Op::Nop) {
             const std::uint16_t mark = fn_->top;
             if (smallInt(*cond.b) && immediateJump(fused) != Op::Nop) {
-                const std::uint16_t a = exprAny(*cond.a);
+                const std::uint16_t a = exprLooked(*cond.a);
                 emitFusedJump(immediateJump(fused), a, std::uint16_t(std::int16_t(int(cond.b->number))), whenFalse);
                 fn_->top = mark;
                 return;
             }
             const std::uint16_t a = isPure(*cond.b) || (cond.a->kind == NK::Identifier && stableAcross(*cond.a, *cond.b))
-                                        ? exprAny(*cond.a) : exprTemp(*cond.a);
-            const std::uint16_t b = exprAny(*cond.b);
+                                        ? exprLooked(*cond.a) : exprTemp(*cond.a);
+            const std::uint16_t b = exprLooked(*cond.b);
             emitFusedJump(fused, a, b, whenFalse);
             fn_->top = mark;
             return;
         }
     }
     const std::uint16_t mark = fn_->top;
-    const std::uint16_t r = exprAny(cond);
+    const std::uint16_t r = exprLooked(cond);
     emitJump(Op::JFalse, r, whenFalse);
     fn_->top = mark;
 }
@@ -2691,6 +2752,8 @@ std::uint16_t Compiler::assign(const Node& n, int dst, bool unused)
                  n.b->kind == NK::BoolLit || n.b->kind == NK::NullLit || n.b->kind == NK::NewExpr)) {
                 const std::uint16_t reg = r.binding->reg;
                 exprNamed(*n.b, reg, target.text);
+                if (!(unused && dst < 0) && fn_->appended.count(target.text))
+                    emit(Op::Unshare, reg);
                 return finish(reg);
             }
             const std::uint16_t v = isAnonymousFunction(*n.b) ? function(*n.b, target.text, -1) : exprAny(*n.b);
@@ -2720,7 +2783,13 @@ std::uint16_t Compiler::assign(const Node& n, int dst, bool unused)
                     emit(immediateOp(op), reg, reg, std::uint16_t(std::int16_t(n.b->number)));
                 else {
                     const std::uint16_t v = exprAny(*n.b);
-                    emit(op, reg, reg, v);
+                    if (op == Op::Add && fn_->appended.count(target.text)) {
+                        emit(Op::Append, reg, v);
+                        if (!(unused && dst < 0))
+                            emit(Op::Unshare, reg);
+                    } else {
+                        emit(op, reg, reg, v);
+                    }
                 }
                 return finish(reg);
             }
@@ -2858,7 +2927,9 @@ std::uint16_t Compiler::member(const Node& n, int dst)
     const bool constantKey = n.computed && n.b->kind == NK::StringLit;
     const bool indexAssigns = n.computed && !constantKey &&
                               (n.a->kind == NK::Identifier ? assignsName(*n.b, n.a->text) : hasAssignment(*n.b));
-    const std::uint16_t o = indexAssigns ? exprTemp(*n.a) : exprAny(*n.a);
+    const std::uint16_t o = indexAssigns                                                       ? exprTemp(*n.a)
+                            : !n.computed && !n.bindMethod && !n.optional && n.text == u"length" ? exprLooked(*n.a)
+                                                                                               : exprAny(*n.a);
     if (n.optional) {
         emitJump(Op::JNullish, o, *chain_);
         chainUsed_ = true;
@@ -4197,6 +4268,12 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     const bool arrow = fn_->isArrow;
     const std::size_t nparams = n.list.size();
     const std::size_t fixed = block->nparams;
+    {
+        std::set<String> strings;
+        appendedNames(*n.d, fn_->appended, strings);
+        for (auto it = fn_->appended.begin(); it != fn_->appended.end();)
+            it = strings.count(*it) ? std::next(it) : fn_->appended.erase(it);
+    }
     const bool hasRest = fixed < nparams;
     const bool needsArgs = hasRest || (!arrow && (usesArguments(*n.d) || fn_->captured.count(String(u"%all"))));
     // `this`, the fixed parameters, then (if any) the arguments array.

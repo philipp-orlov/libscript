@@ -76,7 +76,7 @@ class Gen:
 
     def stmt(self, s, ind, loop):
         p = '    ' * ind
-        k = self.r.randint(0, 35)
+        k = self.r.randint(0, 38)
         self.depth += 1
         deep = self.depth > 3
         try:
@@ -164,6 +164,8 @@ class Gen:
                         f"{p}log(String.fromCharCode({self.pick('65', '300', '-1', '1e10', self.expr(s, 1))}));"]
             if k in (29, 30, 31):
                 return self.hotElements(s, p, k)
+            if k in (36, 37, 38):
+                return self.hotStrings(s, p)
             if k in (32, 33, 34, 35):
                 return self.hotCalls(s, p, k)
             if k == 25:
@@ -197,6 +199,35 @@ class Gen:
                 f"{p}var k{v} = {v}.x;",
                 f"{p}for (var {i} = 0; {i} < 500; {i}++) {{ {v}.x = {i}; {r} += {v}.x; {v}.y = {self.pick(i, chr(39) + 's' + chr(39))}; }}",
                 f"{p}log(typeof k{v}); log({r}); log({v}.y);"]
+
+    def hotStrings(self, s, p):
+        """Strings built piece by piece, and what else comes to hold them on the way."""
+        v = self.var(); i = self.var()
+        names = ['s', 't', 'u']
+        def piece():
+            return self.pick("'x'", "String.fromCharCode(97 + i % 26)", "'abcdefgh'", 'i', "''", 's.length', 't', 's', "'p' + i", 'null', '1.5')
+        def step(d=0):
+            x = self.r.choice(names); y = self.r.choice(names)
+            forms = [f"{x} += {piece()};", f"{x} += {piece()};", f"{x} += {piece()};", f"{x} = {x} + {piece()};", f"{x} = {y};", f"keep[i & 3] = {x};",
+                     f"keep.p = {x};", f"{y} = id({x});", f"{y} = ({x} += {piece()});", f"{y} = {x} + '';", f"{y} = '' + {x};", f"{y} = {x} || 'e';",
+                     f"{y} = i & 1 ? {x} : {y};", f"{x} = '';", f"{x} = 'base';", f"log({x}.length);", f"log({x} < {y});", f"log({x} == {y});",
+                     f"{y} = {x}.substring(1);", f"{y} = {x}.slice(0, 40);", f"{y} = [{x}][0];", f"{y} = `${{{x}}}`;", f"{x} = keep.p || '';", f"{x} = keep[i & 3] || 'k';",
+                     f"try {{ {x} += {piece()}; if (i % 7 == 3) throw {x}; }} catch (e) {{ {y} = e; }}", f"{x} = fin({x});", f"keep.f = keep[{x}]; keep[{x}] = 1;",
+                     f"{y} = dup({x}, {x});", f"{x} = app({x}, {piece()});", f"{y} = app({x}, 'q');", f"for (const c of {x}.slice(0, 3)) {y} += c;",
+                     f"{y} = {x}.valueOf();", f"{y} = {x}.self();", f"{y} = (0, {x});", f"{y} = {x} ?? 'n';", f"if ({x}) {y} += 'T';", f"({x} += 'w') && ({y} += 'v');"]
+            if d < 1 and self.r.random() < 0.25:
+                return f"for (var j{d} = 0; j{d} < {self.r.randint(2, 30)}; j{d}++) {{ {step(d + 1)} {step(d + 1)} }}"
+            return self.r.choice(forms)
+        body = ' '.join(step() for _ in range(self.r.randint(3, 9)))
+        cap = "if (s.length > 2000) s = s.slice(0, 5); if (t.length > 2000) t = t.slice(0, 7); if (u.length > 2000) u = '';"
+        star, run = ('*', f"[...{v}(60)].join('')") if self.r.random() < 0.2 else ('', f"{v}(60)")
+        end = "yield s; yield t; yield u;" if star else "return s + '/' + t + '/' + u;"
+        mid = self.pick('', 'yield s;') if star else ''
+        return [f"{p}String.prototype.self = function () {{ 'use strict'; return this; }};",
+                f"{p}var id = function (x) {{ return x; }}, dup = function (x, y) {{ x += 'd'; return x.length > 50 ? y : x + y; }}, app = function (x, y) {{ x += 'A'; var z = x; x += y; return x.length & 1 ? z : x; }},",
+                f"{p}    fin = function (x) {{ var r = ''; r += x; try {{ r += 'f'; return r; }} finally {{ r += 'g'; }} }};",
+                f"{p}var {v} = function{star} (n) {{ var s = '', t = 'tt', u = '', keep = {{}}; for (var i = 0; i < n; i++) {{ {body} {mid} {cap} }} s += 'E'; t += 'E'; u += 'E'; {end} }};",
+                f"{p}for (var {i} = 0; {i} < 12; {i}++) var r{v} = {run}; log(r{v}.length + ':' + r{v}.slice(-60));"]
 
     def hotCalls(self, s, p, k):
         """Built-ins done in place, `.call`, and stores that add properties, hot, with the odd value to surprise them."""

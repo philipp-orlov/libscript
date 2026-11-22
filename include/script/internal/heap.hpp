@@ -156,6 +156,9 @@ struct StringCell : GCObject
         /// A buffer that only slices show (a string appended to piece by piece): its `length` is how much of its room is
         /// written, and grows with each piece. A slice that ends there is extended by writing past its end.
         kAppendable = 16,
+        /// One register of a deferred frame holds it, and nothing else: `Op::Append` may write past its end. Every copy of
+        /// that register clears this first (`Op::Unshare`).
+        kSole = 32,
         kOutOfLine = kRope | kFlattened | kSlice,  ///< the characters are not after the cell: what native code tests
     };
     bool interned = false;  ///< also present in the context's string table

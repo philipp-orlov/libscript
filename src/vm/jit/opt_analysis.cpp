@@ -63,8 +63,11 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
     case Op::LoadCallee: case Op::NewObject: case Op::NewArray: case Op::NewRegExp: case Op::FieldInit:
         wr(in.a);
         break;
-    case Op::CheckInit:
+    case Op::CheckInit: case Op::Unshare:
         rd(in.a);
+        break;
+    case Op::Append:
+        rd(in.a); rd(in.b); wr(in.a);
         break;
     case Op::PutGlobal: case Op::DefGlobal:
         rd(in.b);

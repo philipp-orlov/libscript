@@ -2689,6 +2689,7 @@ private:
     void emit(std::uint32_t i);
     void emitTails();
     void arith(std::uint32_t i, const Ins& in);
+    void append(std::uint32_t i, const Ins& in);
     bool truncatedUse(std::uint32_t i);
     void arithImm(std::uint32_t i, const Ins& in);
     void compare(std::uint32_t i, const Ins& in);
@@ -3160,6 +3161,19 @@ void Baseline::emit(std::uint32_t i)
         a_.jcc(in.opcode() == Op::CheckBound ? CNE : CE, bad);
         return;
     }
+    case Op::Append: append(i, in); return;
+    case Op::Unshare: {
+        if (!def_)
+            return;
+        Label done;
+        a_.mov(RAX, R(in.a));
+        needString(RAX, done);
+        a_.testI8(mem(RAX, kStrBits), StringCell::kSole);
+        a_.jcc(CE, done);
+        a_.andI8(mem(RAX, kStrBits), std::uint8_t(~StringCell::kSole));
+        a_.bind(done);
+        return;
+    }
     case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::BitAnd: case Op::BitOr: case Op::BitXor:
     case Op::Shl: case Op::Shr: case Op::UShr:
         arith(i, in);
@@ -3422,6 +3436,42 @@ bool Baseline::truncatedUse(std::uint32_t i)
         return false;
     }
     return x.a == r || regDeadAfter(next, r);
+}
+
+/// `s += t` where `s` builds a string: one character to a string that is this register's own and has room, in line.
+void Baseline::append(std::uint32_t i, const Ins& in)
+{
+    Label& bad = slow(i, &helperThunk<jitBinary>);
+    a_.mov(RAX, R(in.a));
+    needString(RAX, bad);
+    if (def_) {
+        a_.testI8(mem(RAX, kStrBits), StringCell::kSole);
+        a_.jcc(CE, bad);
+    } else {
+        a_.testI8(mem(RAX, kStrBits), StringCell::kOutOfLine);
+        a_.jcc(CNE, bad);
+        a_.cmpI8(mem(RAX, kStrInterned), 0);
+        a_.jcc(CNE, bad);
+    }
+    a_.cmpI32(mem(RAX, std::int32_t(detail::kCellCountOffset)), def_ ? 0 : 1);
+    a_.jcc(CNE, bad);
+    a_.mov(RCX, R(in.b));
+    needString(RCX, bad);
+    a_.testI8(mem(RCX, kStrBits), StringCell::kOutOfLine);
+    a_.jcc(CNE, bad);
+    a_.cmpI32(mem(RCX, kStrLength), 1);
+    a_.jcc(CNE, bad);
+    a_.mov32(RSI, mem(RAX, kStrLength));
+    a_.lea(RDX, mem(RSI, RSI, 1, kStrChars + 2));
+    a_.mov32(RDI, mem(RAX, std::int32_t(offsetof(detail::GCObject, cellBytes))));
+    a_.cmp(RDX, RDI);
+    a_.jcc(CA, bad);
+    a_.movzx16(RCX, mem(RCX, kStrChars));
+    a_.mov16(mem(RAX, RDX, 1, -2), RCX);
+    a_.aluI32(0, RSI, 1);
+    a_.mov32(mem(RAX, kStrLength), RSI);
+    a_.movImm(RCX, 0);
+    a_.mov(mem(RAX, std::int32_t(offsetof(StringCell, hash_))), RCX);
 }
 
 void Baseline::arith(std::uint32_t i, const Ins& in)

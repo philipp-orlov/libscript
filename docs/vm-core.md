@@ -282,7 +282,10 @@ owns a count of each value in its registers. A deferred frame owns none. These r
    takes one for C++.
 6. C++ code that puts an owned value in a register uses `setReg` or `setRegister`. Code that copies a value there uses `copyReg`
    or `copyRegister`. Code that hands a register to a native covers it with `stackTop`.
-7. A count of 1 does not mean one holder. `s += t` grows a buffer that only slices show (`appendShared`).
+7. A count of 1 does not mean one holder. A string is appended to in place only when it has `StringCell::kSole`: one register
+   holds it, and nothing else. The bytecode compiler emits `Append` for `s += t` and `s = s + t`, where `s` is a local that the
+   text gives strings (`appendedNames`). It emits `Unshare`, which clears the bit, before each instruction that copies `s`.
+   Any other sum into its own left operand grows a buffer that only slices show (`appendShared`).
 
 Tests run in both modes: `SCRIPT_VM_DEFERRED=0` and `=1` set the mode in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
 `SCRIPT_VM_AUDIT=1` checks every count at each scan. `SCRIPT_VM_ZCT=n` sets the table's least limit (0: every allocation scans).

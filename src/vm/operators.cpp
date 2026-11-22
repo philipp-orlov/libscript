@@ -614,6 +614,9 @@ JSValue add(VM& vm, JSValue a, JSValue b)
 
 namespace {
 
+/// Where a string that more than one may hold starts to grow in a shared buffer: short of it, a copy costs less.
+constexpr std::size_t kSharedLength = 256;
+
 /// `s += tail` in a deferred frame, which cannot tell whether one register holds `s`: the characters go into a buffer
 /// that only slices show, past the slice that ends where the buffer's written part does (`StringCell::kAppendable`).
 /// The register gets a new slice; `s` stays what it was.
@@ -628,7 +631,7 @@ bool appendShared(VM& vm, JSValue& slot, StringCell* s, StringView tail, std::si
         std::memmove(base->mutableChars() + base->length, tail.data(), tail.size() * sizeof(Char));
         base->length = std::uint32_t(length);
         slice = vm.ctx.newCellSized<StringCell>(StringCell::kRopeBytes, base, base->mutableChars(), std::uint32_t(length));
-    } else if (length >= 32) {
+    } else if (length >= kSharedLength) {
         vm.ctx.reserve(length * 2 * sizeof(Char));
         base = vm.ctx.newStringRoom(s->text(), tail, length * 2);
         base->bits |= StringCell::kAppendable;
@@ -644,7 +647,7 @@ bool appendShared(VM& vm, JSValue& slot, StringCell* s, StringView tail, std::si
 
 }  // namespace
 
-bool appendInPlace(VM& vm, JSValue& slot, JSValue y)
+bool appendInPlace(VM& vm, JSValue& slot, JSValue y, bool owned)
 {
     if (slot == y)
         return false;
@@ -660,8 +663,31 @@ bool appendInPlace(VM& vm, JSValue& slot, JSValue y)
         return false;
     }
     const std::size_t length = std::size_t(s->length) + tail.size();
-    if (vm.deferred)
-        return appendShared(vm, slot, s, tail, length);
+    if (vm.deferred) {
+        if (!owned)
+            return appendShared(vm, slot, s, tail, length);
+        if (length > 0xFFFFFFF0u)
+            return false;
+        const bool sole = (s->bits & StringCell::kSole) && s->rc == 0 && !s->interned;
+        if (sole && s->capacity() >= length) {
+            std::memmove(s->mutableChars() + s->length, tail.data(), tail.size() * sizeof(Char));
+            s->length = std::uint32_t(length);
+            s->hash_ = 0;
+            return true;
+        }
+        // A copy that is this register's own, where it stays so or is short; what is looked at between one piece and the
+        // next grows in a shared buffer.
+        if (!sole && length >= kSharedLength)
+            return appendShared(vm, slot, s, tail, length);
+        if (length < 32)
+            return false;
+        vm.ctx.reserve(length * 2 * sizeof(Char));
+        StringCell* grown = vm.ctx.newStringRoom(s->text(), tail, length * 2);
+        grown->bits |= StringCell::kSole;
+        slot = JSValue::cell(grown);
+        vm.releaseDeferred(slot);  // a register holds it without a count
+        return true;
+    }
     if (length > 0xFFFFFFF0u || (s->bits & StringCell::kOutOfLine))
         return false;
     // Only this register holds the cell, so nothing sees the old text.

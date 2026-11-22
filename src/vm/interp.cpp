@@ -1562,7 +1562,7 @@ L_Add: {
         SETP(ins->a, JSValue::boxDouble(a.asNumber() + b.asNumber()));
         NEXT();
     }
-    if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b))
+    if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b, false))
         NEXT();
     fr->pc = pc;
     const JSValue r = add(vm, a, b);
@@ -1571,6 +1571,21 @@ L_Add: {
     SETP(ins->a, r);
     NEXT();
 }
+L_Append: {
+    const JSValue a = R[ins->a], b = R[ins->b];
+    if (isString(a) && appendInPlace(vm, R[ins->a], b, true))
+        NEXT();
+    fr->pc = pc;
+    const JSValue r = add(vm, a, b);
+    if (r.isException())
+        FAIL();
+    SETP(ins->a, r);
+    NEXT();
+}
+L_Unshare:
+    if (isString(R[ins->a]))
+        asString(R[ins->a])->bits &= std::uint8_t(~StringCell::kSole);
+    NEXT();
 L_AddI: {
     const JSValue a = R[ins->b];
     if (a.isInt32()) {
@@ -4039,10 +4054,17 @@ int jitBinary(VM& vm, std::uint32_t index)
     JSValue r;
     switch (op) {
     case Op::Add:
-        if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b))
+        if (ins->a == ins->b && isString(a) && appendInPlace(vm, R[ins->a], b, false))
             return 1;
         r = add(vm, a, b);
         break;
+    case Op::Append: {
+        const JSValue to = R[ins->a];
+        if (isString(to) && appendInPlace(vm, R[ins->a], a, true))
+            return 1;
+        r = add(vm, to, a);
+        break;
+    }
     case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: {
         const int rel = relational(vm, op, a, b);
         if (rel < 0)

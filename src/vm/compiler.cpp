@@ -2666,11 +2666,14 @@ std::uint16_t Compiler::update(const Node& n, int dst, bool discard)
         }
         const std::uint16_t old = temp();
         loadVar(target.text, old, target);
-        emit(Op::ToNumeric, old, old);
+        if (!n.prefix && !discard)
+            emit(Op::ToNumeric, old, old);
         const std::uint16_t fresh = temp();
         emit(step, fresh, old);
         storeVar(target.text, fresh, false, target);
         fn_->top = mark;
+        if (discard && dst < 0)
+            return fresh;
         const std::uint16_t d = dest(dst);
         emit(Op::Mov, d, n.prefix ? fresh : old);
         return d;
@@ -2687,7 +2690,8 @@ std::uint16_t Compiler::update(const Node& n, int dst, bool discard)
             emit(Op::GetElem, old, o, k);
         else
             emitCached(Op::GetProp, old, o, atom(target.text));
-        emit(Op::ToNumeric, old, old);
+        if (!n.prefix && !discard)
+            emit(Op::ToNumeric, old, old);
         const std::uint16_t fresh = temp();
         emit(step, fresh, old);
         if (target.computed)
@@ -2695,6 +2699,8 @@ std::uint16_t Compiler::update(const Node& n, int dst, bool discard)
         else
             emitCached(Op::PutProp, o, atom(target.text), fresh);
         fn_->top = mark;
+        if (discard && dst < 0)
+            return fresh;
         const std::uint16_t d = dest(dst);
         emit(Op::Mov, d, n.prefix ? fresh : old);
         return d;

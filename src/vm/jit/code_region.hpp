@@ -27,6 +27,8 @@ CodeSpan allocateCode(std::size_t bytes) noexcept;
 void releaseCode(const CodeSpan& span) noexcept;
 /// Put `bytes` of code into `span` and make it ready to run (where instructions are cached apart from data, the cache
 /// is told).
+/// Writes the instruction at `rx`, in code committed before.
+void patchCode(std::uint8_t* rx, std::uint32_t word) noexcept;
 void commitCode(const CodeSpan& span, const void* code, std::size_t bytes) noexcept;
 /// Bytes of code space in use.
 std::size_t codeInUse() noexcept;

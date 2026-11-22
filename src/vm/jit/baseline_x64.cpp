@@ -76,7 +76,14 @@ struct Stubs
     /// Another function than the last is called from a site: rdi its uid, rsi the site's `callProf`, rdx its `callTargets`.
     /// Clobbers rsi.
     void* noteCallee = nullptr;
+    /// `VM::epochMoved`, all registers kept.
+    void* epochMoved = nullptr;
 };
+
+extern "C" void scriptVmJitEpochMoved(VM* vm)
+{
+    vm->epochMoved();
+}
 
 /// A function's way in: the frame in rsi, its registers (the frame's `R`) in rdi, so that nothing waits on the frame's
 /// store of them.
@@ -135,10 +142,35 @@ const Stubs& stubs()
             a.mov(mem(RDX, 8 * k), RDI);
             a.ret();
         }
+        a.align(16);
+        const std::int32_t moved = a.here();
+        const Reg kept[] = {RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11};
+        for (Reg r : kept)
+            a.push(r);
+        for (int k = 0; k < Asm::kExtraGpr; ++k)
+            a.push(Reg(16 + k));
+        const int doubles = 16 + Asm::kExtraXmm;
+        // (With the pushes and the return address, a multiple of sixteen bytes.)
+        const std::int32_t room = 8 * doubles + (((doubles + 10 + Asm::kExtraGpr) & 1) ? 8 : 0);
+        a.aluI(5, RSP, room);
+        for (int k = 0; k < doubles; ++k)
+            a.movsdStore(mem(RSP, 8 * k), k);
+        a.mov(RDI, R12);
+        a.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitEpochMoved));
+        a.callC(RAX);
+        for (int k = 0; k < doubles; ++k)
+            a.movsdLoad(k, mem(RSP, 8 * k));
+        a.aluI(0, RSP, room);
+        for (int k = Asm::kExtraGpr; k-- > 0;)
+            a.pop(Reg(16 + k));
+        for (int k = 9; k-- > 0;)
+            a.pop(kept[k]);
+        a.ret();
         CodeSpan span = allocateCode(a.buf.size());
         if (!span)
             return st;
         commitCode(span, a.buf.data(), a.buf.size());
+        st.epochMoved = span.rx + moved;
         st.run = reinterpret_cast<Stub>(span.rx);
         st.osrEnter = span.rx + osr;
         st.noteCallee = span.rx + note;
@@ -506,6 +538,15 @@ bool installTier2(VM* vm, CodeBlock* code)
     if (!t)
         return false;
     t->epoch = epoch;
+    if (!t->epochSites.empty()) {
+        try {
+            vm->epochCodes.push_back(t);
+        } catch (...) {
+            releaseTier2(t, vm);
+            return false;
+        }
+        t->listed = vm;
+    }
     t->older = code->tier2;
     code->tier2 = t;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -2110,6 +2151,8 @@ private:
     bool ssaUpvalConst(std::uint32_t i, std::uint64_t* bits);
     /// What this code takes for constant still is, at instruction `i`: one look between two things that could change it.
     void ssaEpochCheck(std::uint32_t i);
+    void ssaEpochSite(Label& bad);
+    std::vector<std::pair<std::int32_t, Label*>> epochSites_;
     bool epochSeen_ = false;
     /// The typed array that value `v` is known to be, of kind `kind`, whose memory stays where it is; null when not known.
     JSTypedArray* ssaKnownTyped(std::uint32_t v, ElemKind kind) const;
@@ -2345,7 +2388,10 @@ private:
         a_.jcc(CE, plain);
         a_.andI8(mem(box, kHdrAux), std::uint8_t(~Box::kWatched));
         a_.orI8(mem(box, kHdrAux), Box::kNotConstant);
-        a_.inc32(mem(R12, kVmGlobalEpoch));
+        if (Asm::kPatches)
+            a_.callStub(stubs().epochMoved);
+        else
+            a_.inc32(mem(R12, kVmGlobalEpoch));
         a_.bind(plain);
     }
     void needInt(Reg v, Label& bad)
@@ -2969,6 +3015,10 @@ private:
     void ssaLoopGuards(std::uint32_t from, std::uint32_t to);
     bool ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter);
     void ssaEqualsCore(std::uint32_t i, bool loose, Label& bad, Label& eq, Label& ne);
+    void ssaEqualsInt(std::uint32_t i, Reg x, std::int32_t k, bool loose, Label& bad, Label& eq, Label& ne);
+    template <class Emit>
+    void ssaEqualEdges(std::uint32_t b, bool eqTaken, Emit emit);
+    bool intConst(std::uint32_t v) const { return sval_[v].isConst && JSValue::raw(sval_[v].bits).isInt32(); }
     bool ssaTypeOf(std::uint32_t i);
     template <typename Then>
     void ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, std::int32_t imm, bool isImm, Label& bad,
@@ -6464,6 +6514,10 @@ void releaseTier2(Tier2Code* code, VM* vm) noexcept
             if (!vm->tearingDown)
                 for (JSValue v : code->held)
                     release(v);
+        }
+        if (code->listed) {
+            std::vector<Tier2Code*>& list = code->listed->epochCodes;
+            list.erase(std::find(list.begin(), list.end(), code));
         }
         CodeSpan span;
         span.rx = code->rx;

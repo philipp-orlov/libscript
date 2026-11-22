@@ -66,6 +66,9 @@ struct Tier2Code
 {
     BorrowInfo* borrow = nullptr;                                 ///< owned
     std::uint32_t epoch = 0;                                      ///< `VM::globalEpoch` as it was made
+    /// Where it relies on that: the offset of an instruction, and of the way out a jump there goes to once the epoch moves.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> epochSites;
+    VM* listed = nullptr;                                         ///< whose `epochCodes` it is in
     std::uint8_t* rx = nullptr;
     std::size_t bytes = 0;
     void* entry = nullptr;                                        ///< the function's entry, as the baseline code's

@@ -21,6 +21,9 @@ namespace script {
 namespace internal {
 namespace vm {
 
+struct Tier2Code;
+
+
 struct JSObject;
 struct JSArray;
 struct JSFunction;
@@ -391,6 +394,9 @@ struct VM : EngineRuntime
     /// Counts the changes to the global object that can move or remove a property it already has (a delete, new attributes);
     /// compiled code that reads a global from a fixed place checks it.
     std::uint32_t globalEpoch = 0;
+    /// Moves it: optimized code that relies on it (`epochCodes`) is made to leave where it next would.
+    void epochMoved() noexcept;
+    std::vector<Tier2Code*> epochCodes;
     /// What is known of the global object's slots, a byte for each of the first `kWatchable`: how often it was written
     /// (`kWatchWrites`, as far as that was seen), that optimized code takes its value for a constant (`kWatched`: the next
     /// write moves `globalEpoch`), or that one did and was wrong (`kNotConstant`).

@@ -179,7 +179,7 @@ NATIVE(arrayBufferResize)
         std::memset(b->data + n, 0, b->size - n);
     b->size = n;
     b->refreshViews();
-    ++vm.globalEpoch;  // optimized code may know the array of a global
+    vm.epochMoved();  // optimized code may know the array of a global
     return JSValue::undefined();
 }
 
@@ -207,7 +207,7 @@ NATIVE(arrayBufferTransfer)
     b->capacity = 0;
     b->detached = true;
     b->refreshViews();
-    ++vm.globalEpoch;  // optimized code may know the array of a global
+    vm.epochMoved();  // optimized code may know the array of a global
     return toJSValue(o);
 }
 

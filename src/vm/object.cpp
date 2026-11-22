@@ -8,6 +8,8 @@
 
 #include <cstring>
 
+#include "jit/code_region.hpp"
+
 #include "script/internal/heap.hpp"
 
 namespace script {
@@ -373,7 +375,7 @@ void VM::globalWritten(const JSValue* slot) noexcept
     std::uint8_t& w = globalWatch[index];
     if (w & kWatched) {
         w = std::uint8_t((w & ~kWatched) | kNotConstant);
-        ++globalEpoch;
+        epochMoved();
     } else if ((w & kWatchWrites) < kWatchWrites) {
         ++w;
     }
@@ -384,10 +386,21 @@ void VM::boxWritten(Box* box) noexcept
     std::uint8_t& w = box->h.aux;
     if (w & Box::kWatched) {
         w = std::uint8_t((w & ~Box::kWatched) | Box::kNotConstant);
-        ++globalEpoch;
+        epochMoved();
     } else if ((w & Box::kWrites) < Box::kWrites) {
         ++w;
     }
+}
+
+void VM::epochMoved() noexcept
+{
+    ++globalEpoch;
+    for (Tier2Code* t : epochCodes) {
+        for (const auto& [at, to] : t->epochSites)
+            jit::patchCode(t->rx + at, 0x14000000u | ((std::uint32_t(std::int32_t(to - at) >> 2)) & 0x03FFFFFFu));
+        t->listed = nullptr;
+    }
+    epochCodes.clear();
 }
 
 void VM::functionMade(CodeBlock* code, JSFunction* f) noexcept
@@ -401,7 +414,7 @@ void VM::functionMade(CodeBlock* code, JSFunction* f) noexcept
     code->only = nullptr;
     if (code->singleAssumed) {
         code->singleAssumed = false;
-        ++globalEpoch;
+        epochMoved();
     }
 }
 
@@ -424,7 +437,7 @@ bool VM::watchGlobal(std::uint32_t index) noexcept
 void JSObject::toDictionary(VM& vm)
 {
     if (this == vm.global)
-        ++vm.globalEpoch;
+        vm.epochMoved();
     Shape* s = shapeOf(vm);
     if (s->isDictionary())
         return;
@@ -613,7 +626,7 @@ void JSObject::putOwn(VM& vm, Key key, JSValue value, std::uint8_t attrs)
 bool JSObject::setAttrs(VM& vm, Key key, std::uint8_t attrs)
 {
     if (this == vm.global)
-        ++vm.globalEpoch;
+        vm.epochMoved();
     materialize(vm);
     Shape* s = shapeOf(vm);
     if (s->isDictionary()) {
@@ -665,7 +678,7 @@ void JSObject::compactDictionary(VM& vm)
 bool JSObject::deleteOwn(VM& vm, Key key)
 {
     if (this == vm.global)
-        ++vm.globalEpoch;
+        vm.epochMoved();
     materialize(vm);
     Shape* s = shapeOf(vm);
     JSValue removed;

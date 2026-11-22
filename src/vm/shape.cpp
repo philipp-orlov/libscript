@@ -359,7 +359,7 @@ void VM::watchedChanged(Rare& r) noexcept
     r.watched = false;
     if (r.watchBroken < 255)
         ++r.watchBroken;
-    ++globalEpoch;
+    epochMoved();
 }
 
 }  // namespace vm

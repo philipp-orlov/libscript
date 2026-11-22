@@ -159,6 +159,12 @@ void commitCode(const CodeSpan& span, const void* code, std::size_t bytes) noexc
 #endif
 }
 
+void patchCode(std::uint8_t* rx, std::uint32_t word) noexcept
+{
+    Region& r = region();
+    commitCode(CodeSpan{r.rw + (rx - r.rx), rx, 4}, &word, 4);
+}
+
 std::size_t codeInUse() noexcept
 {
     Region& r = region();
@@ -171,6 +177,7 @@ std::size_t codeInUse() noexcept
 CodeSpan allocateCode(std::size_t) noexcept { return {}; }
 void releaseCode(const CodeSpan&) noexcept {}
 void commitCode(const CodeSpan&, const void*, std::size_t) noexcept {}
+void patchCode(std::uint8_t*, std::uint32_t) noexcept {}
 std::size_t codeInUse() noexcept { return 0; }
 
 #endif

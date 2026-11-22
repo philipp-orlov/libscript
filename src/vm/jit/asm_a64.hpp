@@ -1213,6 +1213,16 @@ public:
         ins(0xD63F0000u | (std::uint32_t(X(r)) << 5));
         popX(30);
     }
+    /// Whether code made before may be changed (`patchCode`): a jump over an instruction.
+    static constexpr bool kPatches = true;
+    /// A call of a stub, through no register code has.
+    void callStub(const void* stub)
+    {
+        pushX(30);
+        imm(kAddr, reinterpret_cast<std::uint64_t>(stub));
+        ins(0xD63F0000u | (std::uint32_t(kAddr) << 5));
+        popX(30);
+    }
     /// A call into the runtime: the arguments are where its convention wants them; the result goes to rax (and rdx, for a
     /// function that returns two words).
     void callC(Reg r) { callRuntime(X(r)); }
@@ -1248,6 +1258,7 @@ public:
     }
     void push(Reg r) { pushX(X(r)); }
     void pop(Reg r) { popX(X(r)); }
+    void nop() { ins(0xD503201Fu); }
     void int3() { ins(0xD4200000u); }
     /// What a function called from C++ does first and last: the registers the assembler itself relies on, and the stack as
     /// the templates expect it on entry (as if a return address had been pushed).

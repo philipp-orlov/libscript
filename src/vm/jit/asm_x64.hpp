@@ -418,6 +418,9 @@ public:
         pop(b);
         pop(a);
     }
+    void nop() {}
+    static constexpr bool kPatches = false;
+    void callStub(const void*) {}
     void usePool() noexcept {}
     void finishPool() {}
     static bool hasToInt32() noexcept { return false; }

@@ -31,12 +31,14 @@ namespace {
 constexpr std::uint32_t kMergeMaxCallee = 80;
 constexpr std::uint32_t kMergeMaxAdded = 600;
 constexpr unsigned kMergeMaxSites = 8;
+constexpr unsigned kMergeMaxLevels = 3;  ///< with the SSA tier: calls in functions run in place, run in place
 constexpr std::size_t kMergeMaxTotal = 1500;
 constexpr std::uint32_t kMergeMaxLooping = 200;
 constexpr std::uint32_t kMergeTinyCallee = 12;    ///< with the SSA tier: a callee this small is taken in at more sites
 constexpr unsigned kMergeMaxTinySites = 64;
 constexpr std::uint32_t kMergeMaxTinyAdded = 2000;
 constexpr std::size_t kMergeMaxTotalSsa = 8000;
+constexpr std::uint32_t kMergeLarge = 1000;
 
 /// The instructions a callee run in place may hold: none looks at the frame beyond its registers (the closures and the home
 /// object are the callee's own, which the copy has no way to name; `needsSelf` has those that take the function itself).
@@ -90,23 +92,20 @@ bool mergeable(const CodeBlock* C, unsigned argc)
         if (!opt::effectsOf(*C, j).ok)
             return false;
         const std::int64_t t = opt::jumpTarget(*C, j);
-        // A loop is no small method: its own optimized code runs it better than a copy in each caller.
-        if (t > std::int64_t(n) || (t >= 0 && t <= std::int64_t(j)))
+        // (Without the SSA tier a loop is no small method: its own optimized code runs it better than a copy in each caller.)
+        if (t > std::int64_t(n) || (t >= 0 && t <= std::int64_t(j) && ssaTierMode() < 2))
             return false;
     }
     return C->code[n - 1].opcode() == Op::Ret || C->code[n - 1].opcode() == Op::Throw;
 }
 
-}  // namespace
-
-CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
+/// A copy of `c` with its calls of small functions run in place; with `deeper`, the calls in what `c` itself already runs in
+/// place. Null when there are none.
+CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
 {
-    if (c->mergeTried)
-        return nullptr;
-    c->mergeTried = true;
     const std::uint32_t n = std::uint32_t(c->code.size());
     if (!n || c->callProf.size() != n || c->prof.empty() || c->lines.size() != n || !c->evalScopes.empty() ||
-        c->inlinedFrom || c->mergedFrom || !c->inlineSites.empty())
+        c->inlinedFrom || c->mergedFrom || c->inlineSites.empty() == deeper)
         return nullptr;
     if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
                     CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
@@ -132,6 +131,20 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
         CodeBlock* C = vm.codeByUid(c->callProf[j]);
         if (!C || C == c || !mergeable(C, in.c))
             continue;
+        if (deeper) {
+            // In a function run in place, and none it is in is that function (whose block may be another by now).
+            auto same = [&](const CodeBlock* b) { return b == C || (b->source == C->source && b->srcStart == C->srcStart && b->srcEnd == C->srcEnd); };
+            bool within = false, again = same(c);
+            for (const InlineSite& s : c->inlineSites) {
+                again = again || s.end == j;  // the long way of one run in place
+                if (j >= s.start && j < s.end) {
+                    within = true;
+                    again = again || (s.callee && same(s.callee));
+                }
+            }
+            if (!within || again)
+                continue;
+        }
         const std::uint32_t cost = std::uint32_t(C->code.size()) + C->nregs + 4;
         if (tiny(C)) {
             if (sites.size() >= kMergeMaxTinySites || addedTiny + cost > kMergeMaxTinyAdded)
@@ -146,7 +159,8 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
         ++normal;
         sites.push_back(Site{j, C});
     }
-    if (sites.empty())
+    // A large function is not copied, compiled again and warmed up again for little.
+    if (sites.empty() || (n > kMergeLarge && (added + addedTiny) < n / 16))
         return nullptr;
     if (loop != ~0u) {
         // A large function that loops is copied and compiled again for little: only small ones, or (with the SSA tier)
@@ -454,17 +468,41 @@ CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
         vm.releaseCode(d);
         return nullptr;
     }
-    d->mergedFrom = c;
+    for (const InlineSite& s : c->inlineSites) {
+        d->inlineSites.push_back(InlineSite{moved[s.start], moved[s.end], moved[s.site], s.callee});
+        if (s.callee)
+            ++s.callee->refs;
+    }
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("T2INL")) {
         auto nm = [](const CodeBlock* b) { return b->name ? toUtf8(static_cast<StringCell*>(b->name)->text()) : std::string("anon"); };
         std::fprintf(stderr, "merge %s line %u: %zu -> %zu instructions, sites:", nm(c).c_str(),
                      c->lines.empty() ? 0u : unsigned(c->lines[0]), c->code.size(), d->code.size());
         for (const Site& s : sites)
-            std::fprintf(stderr, " %s@%u", nm(s.callee).c_str(), s.at);
+            std::fprintf(stderr, " %s:%u@%u", nm(s.callee).c_str(), s.callee->lines.empty() ? 0u : unsigned(s.callee->lines[0]), s.at);
         std::fprintf(stderr, "\n");
     }
 #endif
+    return d;
+}
+
+}  // namespace
+
+CodeBlock* mergeInline(VM& vm, CodeBlock* c, std::uint32_t loop)
+{
+    if (c->mergeTried)
+        return nullptr;
+    c->mergeTried = true;
+    CodeBlock* d = mergeOnce(vm, c, loop, false);
+    for (unsigned level = 1; d && level < kMergeMaxLevels && ssaTierMode() >= 2; ++level) {
+        CodeBlock* e = mergeOnce(vm, d, ~0u, true);
+        if (!e)
+            break;
+        vm.releaseCode(d);
+        d = e;
+    }
+    if (d)
+        d->mergedFrom = c;
     return d;
 }
 

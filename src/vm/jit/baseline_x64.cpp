@@ -555,6 +555,9 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
                         code->only = nullptr;
                     vm->functionMade(d, fr->fn);
                     fr->fn->code = d;  // the function's count of `code` is now `d`'s
+                    // A small one, with the profile of what was hot already, is optimized soon.
+                    if (vm->tier2Threshold > 0 && d->code.size() <= 200)
+                        d->tier2Counter = vm->tier2Threshold / 8 + 1;
                     if (header == 0xFFFFFFFFu) {
                         code->tier2Counter = vm->tier2Threshold > 0 ? vm->tier2Threshold : 0x40000000;
                         return nullptr;
@@ -5647,7 +5650,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     unsigned looked = 0;
     for (unsigned r = 1 + argc; r < window; ++r)
         looked += windowPlain(i, base + 1 + r) ? 0 : 1;
-    const bool roomy = window <= 1 + argc + 6 || (looked <= 6 && window <= 1 + argc + 40);
+    const bool roomy = window <= 1 + argc + 6 || ((def_ || looked <= 6) && window <= 1 + argc + 40);
     // `super(...)` is such a call too, as a construction: the frame says so, and its `new.target` is this frame's.
     const bool isSuper = in.opcode() == Op::SuperCall;
     const bool fast = (in.opcode() == Op::Call || isSuper) && roomy;

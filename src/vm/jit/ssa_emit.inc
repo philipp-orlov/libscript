@@ -2817,8 +2817,12 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     a_.dec32(mem(R12, kVmTicks));
     // Caller registers the callee's frame covers past the arguments: a plain one is overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
-    for (unsigned r = 1 + argc; r < window && r < C->nregs; ++r) {
-        if (!windowPlain(i, base + 1 + r)) {
+    // (A deferred frame has nothing to let go of there. Past the callee's registers, a call it makes may reach them.)
+    for (unsigned r = 1 + argc; r < window; ++r) {
+        const std::uint32_t at = frame_[base + 1 + r];
+        if (at != ssa::kNone && sval_[at].isConst && sval_[at].bits == kUndefined)
+            continue;  // as it is
+        if (!def_ && !windowPlain(i, base + 1 + r)) {
             a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
             a_.test(RDI, R15);
             a_.jcc(CE, slow);

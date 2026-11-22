@@ -29,6 +29,8 @@ struct NativeState
     // From the pool the other buffers of a cell come from.
     static void* operator new(std::size_t bytes) { return PoolAlloc<char>().allocate(bytes); }
     static void operator delete(void* p, std::size_t bytes) noexcept { PoolAlloc<char>().deallocate(static_cast<char*>(p), bytes); }
+    /// Of a state in its object's own cell whose size is its own: that size (a generator's).
+    virtual std::size_t cellBytes() const { return 0; }
     /// The values it holds, for the walk that finds cycles at teardown.
     virtual void values(Vec<JSValue>& out) const { (void)out; }
     /// Let go of every value it holds, now; safe to call twice.
@@ -80,6 +82,11 @@ struct JSObject
     /// The native state an object keeps in its own cell, after its slots in place (a promise's, a RegExp's), or null.
     NativeState* embeddedState() noexcept
     {
+        if (cls() == ObjClass::Generator) {
+            // (One with too many registers for a cell has its state on the side.)
+            Rare* r = rare();
+            return r && r->ext ? nullptr : reinterpret_cast<NativeState*>(reinterpret_cast<char*>(this) + bytesFor(h.aux));
+        }
         return cls() == ObjClass::Promise || cls() == ObjClass::RegExpCell ? reinterpret_cast<NativeState*>(reinterpret_cast<char*>(this) + bytesFor(h.aux))
                                           : nullptr;
     }

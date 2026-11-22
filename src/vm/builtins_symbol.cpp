@@ -409,6 +409,8 @@ void installSymbolAndIterators(VM& vm)
     method(vm, generatorProto, "next", generatorResume, 1, reinterpret_cast<void*>(0));
     if (JSValue* genNext = generatorProto->findOwn(vm, vm.atoms.next))
         vm.origGeneratorNext = *genNext;
+    if (JSValue* self = vm.protos.iterator->findOwn(vm, vm.atoms.symIterator))
+        vm.origIteratorSelf = *self;
     method(vm, generatorProto, "throw", generatorResume, 1, reinterpret_cast<void*>(1));
     method(vm, generatorProto, "return", generatorResume, 1, reinterpret_cast<void*>(2));
     generatorProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("Generator")), attr::kConfigurable);

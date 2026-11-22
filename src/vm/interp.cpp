@@ -1113,7 +1113,8 @@ struct GenState : NativeState
         for (std::uint32_t k = 0; k < n; ++k) {
             JSValue& slot = R[live[k]];
             const JSValue v = slot, old = k < had ? kept[k] : JSValue::undefined();
-            slot = JSValue::undefined();
+            if constexpr (!Def)
+                slot = JSValue::undefined();
             if constexpr (Def) {
                 kept[k] = v;
                 if (v == old)
@@ -1131,12 +1132,12 @@ struct GenState : NativeState
             release(old);
         }
         count = n;
-        for (std::uint32_t r = 0; r < code->nregs; ++r) {
-            const JSValue old = R[r];
-            R[r] = JSValue::undefined();
-            if constexpr (!Def)
+        if constexpr (!Def)  // (a deferred frame's registers stay as they are)
+            for (std::uint32_t r = 0; r < code->nregs; ++r) {
+                const JSValue old = R[r];
+                R[r] = JSValue::undefined();
                 release(old);
-        }
+            }
         pcIndex = pc;
     }
     JSValue callee = JSValue::undefined();
@@ -1146,6 +1147,9 @@ struct GenState : NativeState
     bool prologue = false;  ///< running the parameters and declarations, up to `GenStart`
     bool delegating = false;  ///< suspended at a `yield*`: a resumption is handed to the inner iterator
     bool raw = false;         ///< what it yielded is an inner iterator result, to be given out as it is
+    bool unboxed = false;     ///< what a `yield*` got is an inner generator's value, with no result object made for it
+    std::uint32_t room = 0;   ///< registers there is room for, where the state is in the generator's cell
+    std::size_t cellBytes() const override { return sizeof(GenState) + 8u * std::size_t(room); }
 
     ~GenState() override { clear_(); }
     void values(Vec<JSValue>& out) const override
@@ -1167,11 +1171,29 @@ struct GenState : NativeState
 
 using bi::iteratorStep;
 
+GenState* genStateOf(JSObject* o) noexcept
+{
+    Rare* r = o->rare();
+    return static_cast<GenState*>(r && r->ext ? r->ext : o->embeddedState());
+}
+
 /// A generator object, owned, whose state keeps no registers yet.
 JSValue newGenerator(VM& vm, JSFunction* f, CodeBlock* c, JSObject* proto)
 {
     if (!c->suspendMax)
         opt::planSuspends(*c);
+    const std::size_t bytes = JSObject::bytesFor(0) + sizeof(GenState) + 8u * std::size_t(c->suspendMax);
+    if (bytes <= mem::LocalHeap::kMaxSmall) {
+        const std::uint32_t shape = vm.rootShapeFor(proto, 0)->id;
+        auto* o = static_cast<JSObject*>(vm.allocCell(bytes, Kind::Object, ObjClass::Generator, 0));
+        o->h.shape = shape;
+        o->slots = nullptr;
+        auto* g = ::new (static_cast<void*>(o->embeddedState())) GenState();
+        g->room = c->suspendMax;
+        g->callee = toJSValue(f);
+        retain(g->callee);
+        return toJSValue(o);
+    }
     Handle keep = Handle::adopt(toJSValue(vm.newObject(proto)));
     JSObject* o = asObject(keep.get());
     Rare& r = o->rareOf(vm);
@@ -1190,9 +1212,10 @@ JSValue suspendFrame(VM& vm, Frame* fr, const Ins* ins)
     vm.suspendedOnAwait = ins->opcode() == Op::Await;
     if (fr->gen.isUndefined())
         fr->gen = vm.becameGenerator = newGenerator(vm, fr->fn, fr->code, vm.protos.generator);
-    auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
+    GenState* g = genStateOf(asObject(fr->gen));
     g->delegating = ins->opcode() == Op::YieldDelegate;
-    g->raw = g->delegating && ins->c == 0;  // an async generator's `yield*` yields the value, not the inner result
+    g->raw = g->delegating && ins->c == 0 && !g->unboxed;  // an async generator's `yield*` yields the value, not the inner result
+    g->unboxed = false;
     const JSValue out = fr->R[ins->b];
     retain(out);
     g->resumeDst = ins->a;
@@ -1200,6 +1223,182 @@ JSValue suspendFrame(VM& vm, Frame* fr, const Ins* ins)
     g->suspend<Def>(fr->code, fr->R, std::uint32_t(ins + 1 - fr->code->code.data()));
     --vm.frameTop;
     return out;
+}
+
+/// Whether `o` is a generator whose `Symbol.iterator` and `next` are the language's own, as made.
+bool generatorPristine(VM& vm, JSObject* o)
+{
+    JSObject* gp = vm.protos.generator;
+    auto bare = [&](JSObject* x) {
+        const Shape* shape = x->shapeOf(vm);
+        return !shape->isDictionary() && shape->count == 0;
+    };
+    if (o->cls() != ObjClass::Generator || !gp || !bare(o))
+        return false;
+    JSObject* p = o->proto(vm);
+    if (p != gp && (!p || !bare(p) || p->cls() != ObjClass::Plain || proxyOf(p) || p->proto(vm) != gp))
+        return false;
+    if (vm.generatorEpoch == vm.globalEpoch)
+        return true;
+    JSObject* ip = gp->proto(vm);
+    std::uint8_t attrs = 0;
+    const JSValue* slot = gp->findOwn(vm, vm.atoms.next, &attrs);
+    if (!ip || !slot || (attrs & attr::kAccessor) || slot->bits != vm.origGeneratorNext.bits || gp->findOwn(vm, vm.atoms.symIterator))
+        return false;
+    slot = ip->findOwn(vm, vm.atoms.symIterator, &attrs);
+    if (!slot || (attrs & attr::kAccessor) || slot->bits != vm.origIteratorSelf.bits)
+        return false;
+    if (vm.watchMethod(gp, gp) && vm.watchMethod(ip, ip))
+        vm.generatorEpoch = vm.globalEpoch;
+    return true;
+}
+
+/// GetIterator(src): the iterator and its `next`, owned; false with an exception pending.
+bool iteratorOf(VM& vm, JSValue src, JSValue* iterator, JSValue* next)
+{
+    if (src.isNullish()) {
+        vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+        return false;
+    }
+    if (isObject(src) && generatorPristine(vm, asObject(src))) {
+        retain(src);
+        *iterator = src;
+        *next = vm.origGeneratorNext;
+        retain(*next);
+        return true;
+    }
+    JSValue method = getProperty(vm, src, vm.atoms.symIterator);
+    if (method.isException())
+        return false;
+    if (!isFunction(method)) {
+        release(method);
+        vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+        return false;
+    }
+    JSValue it = vm.call(method, src, nullptr, 0);
+    release(method);
+    if (it.isException())
+        return false;
+    if (!isObject(it)) {
+        release(it);
+        vm.throwError(ErrorCode::TypeError, "Result of the Symbol.iterator method is not an object");
+        return false;
+    }
+    JSValue n = getProperty(vm, it, vm.atoms.next);
+    if (n.isException()) {
+        release(it);
+        return false;
+    }
+    *iterator = it;
+    *next = n;
+    return true;
+}
+
+int delegateCall(VM& vm, Frame* fr, const Ins* ins)
+{
+    JSValue* R = fr->R;
+    // One step of `yield*`: what the generator was resumed with goes to the inner iterator's next, throw or return.
+    // In an async generator the results are promises, awaited by the code that follows.
+    const bool asyncDelegate = ins->opcode() == Op::DelegateCallAsync;
+    const JSValue iterator = R[ins->b], nextFn = R[ins->b + 1];
+    const int mode = R[ins->c + 1].asInt32();
+    JSValue sent = R[ins->c];
+    JSValue res;
+    if (mode == 0) {
+        if (!isFunction(nextFn)) {
+            vm.throwError(ErrorCode::TypeError, describe(vm, nextFn) + " is not a function");
+            return 0;
+        }
+        if (!asyncDelegate && nextFn.bits == vm.origGeneratorNext.bits && isObject(iterator) &&
+            asObject(iterator)->cls() == ObjClass::Generator && !fr->gen.isUndefined()) {
+            // A generator's own `next`: its value as it is, with no result object that the `yield` would give out to be read.
+            JSValue value, raw = JSValue::undefined();
+            bool done = false;
+            if (!vm.resumeRaw(iterator, 0, sent, &value, &done, &raw))
+                return 0;
+            if (!isObject(raw) && !done) {
+                genStateOf(asObject(fr->gen))->unboxed = true;
+                setReg(vm, R[ins->a], value);
+                return 1;
+            }
+            res = isObject(raw) ? raw : bi::iterResult(vm, value, true);
+        } else {
+            res = vm.call(nextFn, iterator, &sent, 1);
+        }
+    } else {
+        Key k = vm.internKey(std::string_view(mode == 1 ? "throw" : "return"));
+        JSValue m = getProperty(vm, iterator, k);
+        detail::decRef(k);
+        if (m.isException())
+            return 0;
+        if (m.isNullish()) {
+            release(m);
+            if (mode == 2) {
+                // No `return` there: the generator returns what it was given.
+                setReg(vm, R[ins->a], JSValue::hole());
+                return 1;
+            }
+            // No `throw`: the iterator is closed, and that is a TypeError.
+            JSValue closer = getProperty(vm, iterator, vm.atoms.return_);
+            if (closer.isException())
+                return 0;
+            if (!closer.isNullish()) {
+                JSValue r = isFunction(closer) ? vm.call(closer, iterator, nullptr, 0) : JSValue::undefined();
+                release(closer);
+                if (r.isException())
+                    return 0;
+                if (asyncDelegate) {
+                    // What `return` gives is awaited first; the code after the await raises the TypeError (mode 3).
+                    setReg(vm, R[ins->c + 1], JSValue::int32(3));
+                    setReg(vm, R[ins->a], r);
+                    return 1;
+                }
+                release(r);
+            } else {
+                release(closer);
+            }
+            vm.throwError(ErrorCode::TypeError, "The iterator does not provide a 'throw' method");
+            return 0;
+        }
+        if (!isFunction(m)) {
+            release(m);
+            vm.throwError(ErrorCode::TypeError, "iterator method is not a function");
+            return 0;
+        }
+        res = vm.call(m, iterator, &sent, 1);
+        release(m);
+    }
+    if (res.isException())
+        return 0;
+    if (!asyncDelegate && !isObject(res)) {
+        const std::string text = describe(vm, res);
+        release(res);
+        vm.throwError(ErrorCode::TypeError, "Iterator result " + text + " is not an object");
+        return 0;
+    }
+    setReg(vm, R[ins->a], res);
+    return 1;
+}
+
+/// Whether the result a `yield*` got says it is done.
+int delegateDone(VM& vm, Frame* fr, const Ins* ins)
+{
+    JSValue* R = fr->R;
+    if (!fr->gen.isUndefined() && genStateOf(asObject(fr->gen))->unboxed) {
+        setReg(vm, R[ins->a], JSValue::boolean(false));
+        return 1;
+    }
+    if (!isObject(R[ins->b])) {
+        vm.throwError(ErrorCode::TypeError, "Iterator result " + describe(vm, R[ins->b]) + " is not an object");
+        return 0;
+    }
+    JSValue d = getProperty(vm, R[ins->b], vm.atoms.done);
+    if (d.isException())
+        return 0;
+    const bool done = toBoolean(d);
+    release(d);
+    setReg(vm, R[ins->a], JSValue::boolean(done));
+    return 1;
 }
 
 /// The interpreter. With `Step`, it runs the top frame's one instruction (and whatever that calls) and then returns
@@ -2840,125 +3039,28 @@ L_SetEvalScope:
     vm.evalFrames = vm.frameCount();
     NEXT();
 L_GetIteratorObj: {
-    const JSValue src = R[ins->b];
     fr->pc = pc;
-    if (src.isNullish()) {
-        vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+    JSValue iterator, next;
+    if (!iteratorOf(vm, R[ins->b], &iterator, &next))
         FAIL();
-    }
-    JSValue method = getProperty(vm, src, vm.atoms.symIterator);
-    if (method.isException())
-        FAIL();
-    if (!isFunction(method)) {
-        release(method);
-        vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
-        FAIL();
-    }
-    JSValue iterator = vm.call(method, src, nullptr, 0);
-    release(method);
-    if (iterator.isException())
-        FAIL();
-    if (!isObject(iterator)) {
-        release(iterator);
-        vm.throwError(ErrorCode::TypeError, "Result of the Symbol.iterator method is not an object");
-        FAIL();
-    }
-    JSValue next = getProperty(vm, iterator, vm.atoms.next);
-    if (next.isException()) {
-        release(iterator);
-        FAIL();
-    }
     setReg<Def>(vm, R[ins->a + 1], next);
     setReg<Def>(vm, R[ins->a], iterator);
     NEXT();
 }
 L_DelegateCallAsync:
-L_DelegateCall: {
-    // One step of `yield*`: what the generator was resumed with goes to the inner iterator's next, throw or return.
-    // In an async generator the results are promises, awaited by the code that follows.
-    const bool asyncDelegate = ins->opcode() == Op::DelegateCallAsync;
+L_DelegateCall:
     fr->pc = pc;
-    const JSValue iterator = R[ins->b], nextFn = R[ins->b + 1];
-    const int mode = R[ins->c + 1].asInt32();
-    JSValue sent = R[ins->c];
-    JSValue res;
-    if (mode == 0) {
-        if (!isFunction(nextFn)) {
-            vm.throwError(ErrorCode::TypeError, describe(vm, nextFn) + " is not a function");
-            FAIL();
-        }
-        res = vm.call(nextFn, iterator, &sent, 1);
-    } else {
-        Key k = vm.internKey(std::string_view(mode == 1 ? "throw" : "return"));
-        JSValue m = getProperty(vm, iterator, k);
-        detail::decRef(k);
-        if (m.isException())
-            FAIL();
-        if (m.isNullish()) {
-            release(m);
-            if (mode == 2) {
-                // No `return` there: the generator returns what it was given.
-                SET(ins->a, JSValue::hole());
-                NEXT();
-            }
-            // No `throw`: the iterator is closed, and that is a TypeError.
-            JSValue closer = getProperty(vm, iterator, vm.atoms.return_);
-            if (closer.isException())
-                FAIL();
-            if (!closer.isNullish()) {
-                JSValue r = isFunction(closer) ? vm.call(closer, iterator, nullptr, 0) : JSValue::undefined();
-                release(closer);
-                if (r.isException())
-                    FAIL();
-                if (asyncDelegate) {
-                    // What `return` gives is awaited first; the code after the await raises the TypeError (mode 3).
-                    setReg<Def>(vm, R[ins->c + 1], JSValue::int32(3));
-                    SET(ins->a, r);
-                    NEXT();
-                }
-                release(r);
-            } else {
-                release(closer);
-            }
-            vm.throwError(ErrorCode::TypeError, "The iterator does not provide a 'throw' method");
-            FAIL();
-        }
-        if (!isFunction(m)) {
-            release(m);
-            vm.throwError(ErrorCode::TypeError, "iterator method is not a function");
-            FAIL();
-        }
-        res = vm.call(m, iterator, &sent, 1);
-        release(m);
-    }
-    if (res.isException())
+    if (!delegateCall(vm, fr, ins))
         FAIL();
-    if (!asyncDelegate && !isObject(res)) {
-        const std::string text = describe(vm, res);
-        release(res);
-        vm.throwError(ErrorCode::TypeError, "Iterator result " + text + " is not an object");
-        FAIL();
-    }
-    SET(ins->a, res);
     NEXT();
-}
-L_DelegateDone: {
+L_DelegateDone:
     fr->pc = pc;
-    if (!isObject(R[ins->b])) {
-        vm.throwError(ErrorCode::TypeError, "Iterator result " + describe(vm, R[ins->b]) + " is not an object");
+    if (!delegateDone(vm, fr, ins))
         FAIL();
-    }
-    JSValue d = getProperty(vm, R[ins->b], vm.atoms.done);
-    if (d.isException())
-        FAIL();
-    const bool done = toBoolean(d);
-    release(d);
-    SET(ins->a, JSValue::boolean(done));
     NEXT();
-}
 L_GenStart: {
     // The end of what a call of a generator function does: it stands at the start of the body until resumed.
-    auto* g = static_cast<GenState*>(asObject(fr->gen)->rare()->ext);
+    GenState* g = genStateOf(asObject(fr->gen));
     if (!g->prologue)
         NEXT();
     g->prologue = false;
@@ -3265,32 +3367,9 @@ L_IterInit: {
     const JSValue src = R[ins->b];
     if (!arrayIterationIntact(vm, src) && !isString(src)) {
         fr->pc = pc;
-        if (src.isNullish()) {
-            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+        JSValue iterator, next;
+        if (!iteratorOf(vm, src, &iterator, &next))
             FAIL();
-        }
-        JSValue method = getProperty(vm, src, vm.atoms.symIterator);
-        if (method.isException())
-            FAIL();
-        if (!isFunction(method)) {
-            release(method);
-            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
-            FAIL();
-        }
-        JSValue iterator = vm.call(method, src, nullptr, 0);
-        release(method);
-        if (iterator.isException())
-            FAIL();
-        if (!isObject(iterator)) {
-            release(iterator);
-            vm.throwError(ErrorCode::TypeError, "Result of the Symbol.iterator method is not an object");
-            FAIL();
-        }
-        JSValue next = getProperty(vm, iterator, vm.atoms.next);
-        if (next.isException()) {
-            release(iterator);
-            FAIL();
-        }
         // Registers a and a+1: the iterator and its `next`; the pair is an index for an array or a string.
         setReg<Def>(vm, R[ins->a + 1], next);
         setReg<Def>(vm, R[ins->a], iterator);
@@ -4103,6 +4182,29 @@ int jitArrayPush(VM& vm, std::uint32_t index)
 }
 
 
+int jitDelegateCall(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    return delegateCall(vm, vm.frameTop - 1, c.ins);
+}
+
+int jitDelegateDone(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    return delegateDone(vm, vm.frameTop - 1, c.ins);
+}
+
+int jitGetIteratorObj(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    JSValue iterator, next;
+    if (!iteratorOf(vm, c.R[c.ins->b], &iterator, &next))
+        return 0;
+    setReg(vm, c.R[c.ins->a + 1], next);
+    setReg(vm, c.R[c.ins->a], iterator);
+    return 1;
+}
+
 JSValue jitSuspend(VM& vm, std::uint32_t index)
 {
     Frame* fr = vm.frameTop - 1;
@@ -4331,33 +4433,10 @@ int jitIterInit(VM& vm, std::uint32_t index)
     JSValue* R = c.R;
     const JSValue src = R[ins->b];
     if (!arrayIterationIntact(vm, src) && !isString(src)) {
-        // Any other iterable: its `Symbol.iterator` and the iterator's `next`, as the interpreter takes them.
-        if (src.isNullish()) {
-            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
+        // Any other iterable.
+        JSValue iterator, next;
+        if (!iteratorOf(vm, src, &iterator, &next))
             return 0;
-        }
-        JSValue method = getProperty(vm, src, vm.atoms.symIterator);
-        if (method.isException())
-            return 0;
-        if (!isFunction(method)) {
-            release(method);
-            vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not iterable");
-            return 0;
-        }
-        JSValue iterator = vm.call(method, src, nullptr, 0);
-        release(method);
-        if (iterator.isException())
-            return 0;
-        if (!isObject(iterator)) {
-            release(iterator);
-            vm.throwError(ErrorCode::TypeError, "Result of the Symbol.iterator method is not an object");
-            return 0;
-        }
-        JSValue next = getProperty(vm, iterator, vm.atoms.next);
-        if (next.isException()) {
-            release(iterator);
-            return 0;
-        }
         setReg(vm, R[ins->a + 1], next);
         setReg(vm, R[ins->a], iterator);
         return 1;
@@ -4867,17 +4946,53 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
         return startAsync(f, thisValue, args, argc);
     // The generator's prototype is read once the parameters have been worked out, and falls back to its realm's.
     JSObject* fallback = (c->flags & CodeBlock::kAsyncGen) ? protos.asyncGenerator : protos.generator;
+    JSValue self0 = thisValue;
+    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self0.isNullish())
+        self0 = toJSValue(global);
+    if (c->code[0].opcode() == Op::GenStart) {
+        // Nothing runs before the body: the state it would stop in is made without a frame.
+        JSObject* proto = fallback;
+        Handle read;
+        if (prototypeAt2(f) && isObject(*f->slotAt(2))) {
+            proto = asObject(*f->slotAt(2));
+        } else {
+            read = Handle::adopt(getProperty(*this, toJSValue(f), atoms.prototype));
+            if (read.get().isException())
+                return read.get();
+            if (isObject(read.get()))
+                proto = asObject(read.get());
+        }
+        Handle keep = Handle::adopt(newGenerator(*this, f, c, proto));
+        GenState* g = genStateOf(asObject(keep.get()));
+        const std::uint16_t* live = c->suspendRegs.data() + c->suspendAt[1];
+        const std::uint32_t n = *live++;
+        for (std::uint32_t k = 0; k < n; ++k) {
+            const std::uint32_t r = live[k];
+            JSValue v = JSValue::undefined();
+            if (r == 0)
+                v = self0;
+            else if (r <= c->nparams)
+                v = r <= argc ? args[r - 1] : v;
+            else if (r == 1u + c->nparams && (c->flags & CodeBlock::kNeedsArgs))
+                v = toJSValue(captureArgumentsFor(*this, c, args, argc));
+            if (r <= c->nparams)
+                retain(v);
+            g->regs()[k] = v;
+            g->count = k + 1;
+        }
+        g->pcIndex = 1;
+        if (c->flags & CodeBlock::kAsyncGen)
+            return bi::asyncGeneratorStart(*this, keep.take(), proto);
+        return keep.take();
+    }
     Handle keep = Handle::adopt(newGenerator(*this, f, c, fallback));
     JSObject* o = asObject(keep.get());
-    auto* g = static_cast<GenState*>(o->rare()->ext);
+    GenState* g = genStateOf(o);
     g->count = 1u + c->nparams + (c->flags & CodeBlock::kNeedsArgs ? 1 : 0);
     for (std::uint32_t i = 0; i < g->count; ++i)
         g->regs()[i] = JSValue::undefined();
-    JSValue self = thisValue;
-    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self.isNullish())
-        self = toJSValue(global);
-    retain(self);
-    g->regs()[0] = self;
+    retain(self0);
+    g->regs()[0] = self0;
     const std::uint32_t keep_ = argc < c->nparams ? argc : c->nparams;
     for (std::uint32_t i = 0; i < keep_; ++i) {
         retain(args[i]);
@@ -4929,6 +5044,8 @@ JSValue VM::startAsync(JSFunction* f, JSValue thisValue, const JSValue* args, st
     const JSValue result = c->tier1 ? enterTier1(*this, c->tier1, 0) : run(*this);
     stackTop = R;
     clearRegs(*this, R, 0, 1 + n);
+    if (deferred && frameTop == frameBase)
+        scanAtHost();
     const JSValue generator = becameGenerator;
     becameGenerator = JSValue::undefined();
     return bi::asyncStarted(*this, generator, result);
@@ -4949,8 +5066,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
 {
     GenState* g = nullptr;
     if (isObject(generator) && asObject(generator)->cls() == ObjClass::Generator)
-        if (Rare* r = asObject(generator)->rare())
-            g = static_cast<GenState*>(r->ext);
+        g = genStateOf(asObject(generator));
     if (!g) {
         throwError(ErrorCode::TypeError, "next method called on an incompatible receiver");
         return false;
@@ -4987,12 +5103,14 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         return false;
     }
     fillStack(R + c->nregs + 1);
-    for (std::uint32_t i = 0; i < c->nregs; ++i) {
-        const JSValue old = R[i];
-        R[i] = JSValue::undefined();
-        if (!deferred)
-            release(old);
-    }
+    // (A deferred frame that goes on: only what is live there is read.)
+    if (!deferred || !g->pcIndex)
+        for (std::uint32_t i = 0; i < c->nregs; ++i) {
+            const JSValue old = R[i];
+            R[i] = JSValue::undefined();
+            if (!deferred)
+                release(old);
+        }
     {
         // A deferred register has no count: the generator keeps the value with its own (`GenState::suspend`).
         const std::uint16_t* live = g->pcIndex ? c->suspendRegs.data() + c->suspendAt[g->pcIndex] + 1 : nullptr;
@@ -5040,6 +5158,8 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         compileTier1(*this, c);
     const JSValue result = c->tier1 && !resumeThrow ? enterTier1(*this, c->tier1, g->pcIndex) : run(*this);
     stackTop = savedTop;
+    if (deferred && frameTop == frameBase)
+        scanAtHost();
     const bool finished = g->state == GenState::Running;
     g->prologue = false;
     if (finished) {

@@ -3448,6 +3448,9 @@ void Baseline::emit(std::uint32_t i)
         a_.bind(done);
         return;
     }
+    case Op::DelegateCall: case Op::DelegateCallAsync: helperOrStep(i, &helperThunk<jitDelegateCall>); return;
+    case Op::DelegateDone: helperOrStep(i, &helperThunk<jitDelegateDone>); return;
+    case Op::GetIteratorObj: helperOrStep(i, &helperThunk<jitGetIteratorObj>); return;
     case Op::IterInit: {
         // Of a plain array that iterates as arrays do.
         std::uint8_t attrs = 0;

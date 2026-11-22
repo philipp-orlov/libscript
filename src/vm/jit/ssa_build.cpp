@@ -97,6 +97,8 @@ std::vector<Bits> Graph::liveAfter(const CodeBlock& code, std::uint32_t b) const
             bitClear(live, r);
         for (std::uint16_t r : e.rd)
             bitSet(live, r);
+        for (std::uint16_t r : held(ins[k]))
+            bitSet(live, r);
     }
     return out;
 }
@@ -116,10 +118,7 @@ Graph build(const CodeBlock& code)
         g.why = "kind";
         return g;
     }
-    if (!code.handlers.empty()) {
-        g.why = "handlers";
-        return g;
-    }
+    g.heldSets.emplace_back();
     const std::size_t words = (nregs + 63) / 64;
 
     // ---- instructions and their effects ----
@@ -142,6 +141,32 @@ Graph build(const CodeBlock& code)
                 g.why = "reg";
                 return g;
             }
+    }
+
+    if (!code.handlers.empty()) {
+        std::vector<std::uint64_t> live;
+        std::size_t w = 0;
+        if (!opt::liveBefore(code, effects, live, w)) {
+            g.why = "handlers";
+            return g;
+        }
+        g.heldAt.assign(n, 0);
+        std::map<std::vector<std::uint16_t>, std::uint32_t> sets;
+        for (std::uint32_t i = 0; i < n; i = opt::nextOf(code, i)) {
+            std::vector<std::uint16_t> regs;
+            for (std::uint32_t r = 0; r < nregs; ++r)
+                for (const Handler& h : code.handlers)
+                    if (i >= h.start && i < h.end && r != h.reg && (live[w * h.target + r / 64] >> (r % 64) & 1)) {
+                        regs.push_back(std::uint16_t(r));
+                        break;
+                    }
+            if (regs.empty())
+                continue;
+            auto [it, fresh] = sets.emplace(regs, std::uint32_t(g.heldSets.size()));
+            if (fresh)
+                g.heldSets.push_back(regs);
+            g.heldAt[i] = it->second;
+        }
     }
 
     // ---- blocks ----
@@ -240,6 +265,9 @@ Graph build(const CodeBlock& code)
             for (std::uint16_t r : eff[i].rd)
                 if (!bitTest(def[b], r))
                     bitSet(use[b], r);
+            for (std::uint16_t r : g.held(i))
+                if (!bitTest(def[b], r))
+                    bitSet(use[b], r);
             for (std::uint16_t r : eff[i].wr)
                 bitSet(def[b], r);
         }
@@ -280,6 +308,27 @@ Graph build(const CodeBlock& code)
                 bitSet(w, std::size_t(r));
         }
         g.loopWrites[h] = std::move(w);
+    }
+    Bits outside(words, 0);
+    if (!code.handlers.empty()) {
+        // What the handlers write, and the code only they lead to: the baseline code has run it when it comes in at a loop's
+        // head.
+        Bits& w = outside;
+        for (const Block& bl : g.blocks)
+            if (!bl.reached)
+                for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(code, i)) {
+                    for (std::uint16_t r : eff[i].wr)
+                        bitSet(w, r);
+                    const std::int32_t base = windowBase(code.code[i]);
+                    for (std::int32_t r = base; base >= 0 && r < std::int32_t(nregs); ++r)
+                        bitSet(w, std::size_t(r));
+                }
+        for (const Handler& h : code.handlers)
+            bitSet(w, h.reg);
+        for (std::uint32_t h = 0; h < nb; ++h)
+            if (g.blocks[h].loopHeader)
+                for (std::size_t k = 0; k < words; ++k)
+                    g.loopWrites[h][k] |= w[k];
     }
 
     // ---- values ----
@@ -389,7 +438,8 @@ Graph build(const CodeBlock& code)
         changed = false;
         for (std::uint32_t b = 0; b < nb; ++b)
             for (std::uint32_t v : g.blocks[b].phis) {
-                if (repl[v] != v)
+                // (One the code outside the graph may have changed stays.)
+                if (repl[v] != v || (g.blocks[b].loopHeader && bitTest(outside, g.values[v].reg)))
                     continue;
                 std::uint32_t one = kNone;
                 bool many = false;

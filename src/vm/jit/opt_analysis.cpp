@@ -174,6 +174,55 @@ inline bool orInto(Bits& dst, const Bits& src)
 
 }  // namespace
 
+bool liveBefore(const CodeBlock& c, Effects (*effects)(const CodeBlock&, std::uint32_t), std::vector<std::uint64_t>& live,
+                std::size_t& words)
+{
+    const std::uint32_t n = std::uint32_t(c.code.size());
+    words = (c.nregs + 63) / 64;
+    live.assign(words * n, 0);
+    std::vector<std::uint64_t> use(words * n, 0), keep(words * n, ~std::uint64_t(0)), w(words);
+    std::vector<std::uint32_t> at;
+    for (std::uint32_t j = 0; j < n; j = nextOf(c, j)) {
+        at.push_back(j);
+        const Effects e = effects(c, j);
+        if (!e.ok)
+            return false;
+        for (std::uint16_t r : e.rd)
+            if (r < c.nregs)
+                use[words * j + r / 64] |= std::uint64_t(1) << (r % 64);
+        for (std::uint16_t r : e.wr)
+            if (r < c.nregs)
+                keep[words * j + r / 64] &= ~(std::uint64_t(1) << (r % 64));
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t k = at.size(); k-- > 0;) {
+            const std::uint32_t j = at[k];
+            const Op op = c.code[j].opcode();
+            std::fill(w.begin(), w.end(), 0);
+            auto from = [&](std::uint32_t to) {
+                for (std::size_t x = 0; to < n && x < words; ++x)
+                    w[x] |= live[words * to + x];
+            };
+            if (op != Op::Jmp && op != Op::Ret && op != Op::Throw && op != Op::ThrowError)
+                from(nextOf(c, j));
+            if (const std::int64_t t = jumpTarget(c, j); t >= 0)
+                from(std::uint32_t(t));
+            for (std::size_t x = 0; x < words; ++x)
+                w[x] = use[words * j + x] | (w[x] & keep[words * j + x]);
+            for (const Handler& h : c.handlers)
+                if (j >= h.start && j < h.end)
+                    from(h.target);
+            for (std::size_t x = 0; x < words; ++x)
+                if (live[words * j + x] != w[x]) {
+                    live[words * j + x] = w[x];
+                    changed = true;
+                }
+        }
+    }
+    return true;
+}
+
 void planSuspends(CodeBlock& code)
 {
     const std::uint32_t n = std::uint32_t(code.code.size());

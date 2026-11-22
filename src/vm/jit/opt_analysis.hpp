@@ -38,6 +38,10 @@ struct Effects
 };
 
 Effects effectsOf(const CodeBlock& code, std::uint32_t i);
+/// The registers live before each instruction of any function (`words` words to an instruction), what its handlers find
+/// counted; false when `effects` does not know an instruction.
+bool liveBefore(const CodeBlock& code, Effects (*effects)(const CodeBlock&, std::uint32_t), std::vector<std::uint64_t>& live,
+                std::size_t& words);
 /// Fills in `CodeBlock::suspendAt` and the rest of a generator's block: which registers each suspension has to keep.
 void planSuspends(CodeBlock& code);
 /// Instruction index after `i` (skips the cache word).

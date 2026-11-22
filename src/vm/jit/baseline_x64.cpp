@@ -2174,6 +2174,7 @@ private:
     /// The same of a captured variable, in the code of one function only.
     bool ssaUpvalConst(std::uint32_t i, std::uint64_t* bits);
     /// What this code takes for constant still is, at instruction `i`: one look between two things that could change it.
+    void ssaAddHeld(std::uint32_t i, std::vector<unsigned>& regs) const;
     void ssaEpochCheck(std::uint32_t i);
     void ssaEpochSite(Label& bad);
     std::vector<std::pair<std::int32_t, Label*>> epochSites_;

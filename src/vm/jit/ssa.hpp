@@ -59,6 +59,15 @@ struct Graph
     std::vector<std::uint8_t> isIns;
     /// Per loop header block: registers some instruction of the loop writes, or whose frame slot a call there covers.
     std::vector<Bits> loopWrites;
+    /// What a handler that covers an instruction finds live there (one that throws goes on in the baseline code, at the
+    /// handler): for each instruction, where in `heldSets` its registers are (0: the empty first). Nothing here compiles the
+    /// handlers themselves.
+    std::vector<std::uint32_t> heldAt;
+    std::vector<std::vector<std::uint16_t>> heldSets;
+    const std::vector<std::uint16_t>& held(std::uint32_t i) const
+    {
+        return heldSets[heldAt.empty() ? 0 : heldAt[i]];
+    }
 
     std::uint32_t entryValue(unsigned reg) const { return reg; }  ///< values 0 .. nregs-1 are the entry values
     /// For each instruction of block `b`, in order: the registers live after it.

@@ -231,6 +231,14 @@ void Baseline::ssaSync(std::vector<unsigned> regs, const ssa::Bits& live, const 
         ssaSyncEmit(set);
 }
 
+/// What a handler over instruction `i` finds live is in its slots before the instruction can throw.
+void Baseline::ssaAddHeld(std::uint32_t i, std::vector<unsigned>& regs) const
+{
+    for (std::uint16_t r : ssa_->held(i))
+        if (std::find(regs.begin(), regs.end(), unsigned(r)) == regs.end())
+            regs.push_back(r);
+}
+
 /// The long way of an instruction done in place: out of line, the frame as the helper wants it (what it reads, every
 /// live value owned), the registers kept, the helper called; back at `join`. The slots it writes are "not known" after
 /// the instruction on both ways, which is true of either. `dst`: the register the helper writes (ssa::kNone: none),
@@ -244,7 +252,9 @@ void Baseline::ssaColdCall(std::uint32_t i, HelperFn helper, const ssa::Bits& li
     ssa::Bits keep = liveAfter;
     for (std::uint16_t r : e.wr)
         ssa::bitClear(keep, r);
-    const std::vector<unsigned> set = ssaSyncSet(std::vector<unsigned>(e.rd.begin(), e.rd.end()), keep, clobber);
+    std::vector<unsigned> reads(e.rd.begin(), e.rd.end());
+    ssaAddHeld(i, reads);
+    const std::vector<unsigned> set = ssaSyncSet(std::move(reads), keep, clobber);
     if (ssaFailed_)
         return;
     const std::uint32_t def = e.wr.empty() ? ssa::kNone : ssa_->defBase[i];
@@ -352,6 +362,7 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
             if (ssa::bitTest(keep, r) && !clobber[r])
                 reads.push_back(r);
 #endif
+    ssaAddHeld(i, reads);
     ssaSync(reads, keep, clobber);
     if (ssaFailed_)
         return;
@@ -713,6 +724,7 @@ void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to, bool last)
     for (unsigned r = 0; r < nregs; ++r)
         if (ssa::bitTest(tb.liveIn, r))
             all.push_back(r);
+    ssaAddHeld(ssa_->blocks[from].last, all);
     ssaSync(all, tb.liveIn, std::vector<std::uint8_t>(nregs, 0));
     ssaSaveRegs();
     a_.mov(RDI, R12);
@@ -729,6 +741,7 @@ void Baseline::ssaStepJump(std::uint32_t b, std::uint32_t i)
     const ssa::Block& bl = ssa_->blocks[b];
     const opt::Effects e = ssa::effects(*code_, i);
     std::vector<unsigned> reads(e.rd.begin(), e.rd.end());
+    ssaAddHeld(i, reads);
     ssaSync(reads, bl.liveOut, std::vector<std::uint8_t>(code_->nregs, 0));
     if (ssaFailed_)
         return;
@@ -999,6 +1012,8 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                 for (std::uint16_t r : e.wr)
                     ssa::bitClear(liveBefore_, r);
                 for (std::uint16_t r : e.rd)
+                    ssa::bitSet(liveBefore_, r);
+                for (std::uint16_t r : g.held(i))
                     ssa::bitSet(liveBefore_, r);
             }
             if (opt::jumpTarget(*code_, i) >= 0) {
@@ -1934,6 +1949,13 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         if (failed && loose)
             return false;
         Label& bad = ssaExit(i);
+        if (loose && !ssa_->held(i).empty()) {
+            std::vector<unsigned> regs;
+            ssaAddHeld(i, regs);
+            ssaSync(std::move(regs), liveBefore_, std::vector<std::uint8_t>(code_->nregs, 0));
+            if (ssaFailed_)
+                return true;
+        }
         const bool ka = intConst(va), kb = intConst(vb);
         if (ka || kb) {
             const Reg x = valueReg(ka ? vb : va);
@@ -3914,6 +3936,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             const std::int32_t use = pos++, def = pos++;
             usePos_[i] = use;
             const opt::Effects e = ssa::effects(*code_, i);
+            for (std::uint16_t r : g.held(i))
+                touch(name_[r], use);
             for (std::uint16_t r : e.rd)
             {
                 touch(name_[r], use);
@@ -4301,6 +4325,13 @@ bool Baseline::ssaEquals(std::uint32_t i)
     if (failed && loose)
         return false;
     Label& bad = ssaExit(i);
+    if (loose && !ssa_->held(i).empty()) {
+        std::vector<unsigned> regs;
+        ssaAddHeld(i, regs);
+        ssaSync(std::move(regs), liveBefore_, std::vector<std::uint8_t>(code_->nregs, 0));
+        if (ssaFailed_)
+            return true;
+    }
     Label same, differ, done;
     const bool ka = intConst(va), kb = intConst(vb);
     if (ka || kb) {

@@ -217,8 +217,21 @@ bool toLengthOf(VM& vm, JSValue v, double* out)
 }
 
 /// `ToLength(rx.lastIndex)`; false with an exception pending.
+/// Where a RegExp whose one property is `lastIndex` keeps it, if it is writable; else null.
+JSValue* ownLastIndex(VM& vm, JSObject* o)
+{
+    if (o->cls() != ObjClass::RegExpCell)
+        return nullptr;
+    const Shape* own = vm.shapeById(o->h.shape);
+    return own->count == 1 && own->key == vm.atoms.lastIndex && own->attrs == attr::kWritable ? o->slotAt(0) : nullptr;
+}
+
 bool readLastIndex(VM& vm, JSObject* o, double* out)
 {
+    if (JSValue* slot = ownLastIndex(vm, o); slot && slot->isInt32()) {
+        *out = slot->asInt32() < 0 ? 0 : double(slot->asInt32());
+        return true;
+    }
     JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex);
     return toLengthOf(vm, slot ? *slot : JSValue::undefined(), out);
 }
@@ -227,6 +240,10 @@ bool readLastIndex(VM& vm, JSObject* o, double* out)
 bool writeLastIndex(VM& vm, JSObject* o, double v)
 {
     // A RegExp's own writable `lastIndex` (as it always starts): stored in place.
+    if (JSValue* slot = ownLastIndex(vm, o); slot && slot->isNumber()) {
+        *slot = JSValue::boxNumber(v);
+        return true;
+    }
     std::uint8_t attrs = 0;
     if ((o->cls() == ObjClass::RegExp || o->cls() == ObjClass::RegExpCell) && !proxyOf(o))
         if (JSValue* slot = o->findOwn(vm, vm.atoms.lastIndex, &attrs); slot && !(attrs & attr::kAccessor) && (attrs & attr::kWritable)) {
@@ -316,10 +333,25 @@ JSValue matchArray(VM& vm, RegExpData* d, JSValue input, StringView s, const Mat
     Handle keep = Handle::adopt(toJSValue(a));
     for (std::size_t g = 0; g < m.groups(); ++g)
         a->append(vm, captureString(vm, s, m, g));
-    a->putOwn(vm, vm.atoms.index, JSValue::int32(m.start()), attr::kDefault);
+    Handle groupsObject = Handle::adopt(namedGroupsObject(vm, d, s, m));
     retain(input);
-    a->putOwn(vm, vm.atoms.input, input, attr::kDefault);
-    a->putOwn(vm, vm.atoms.groups, namedGroupsObject(vm, d, s, m), attr::kDefault);
+    const std::uint32_t root = a->h.shape;
+    if (root == vm.matchRoot) {
+        // The same three properties in the same order: the shape they made before.
+        a->reserveSlot(vm, 2);
+        a->slots[0] = JSValue::int32(m.start());
+        a->slots[1] = input;
+        a->slots[2] = groupsObject.take();
+        a->h.shape = vm.matchShape;
+    } else {
+        a->putOwn(vm, vm.atoms.index, JSValue::int32(m.start()), attr::kDefault);
+        a->putOwn(vm, vm.atoms.input, input, attr::kDefault);
+        a->putOwn(vm, vm.atoms.groups, groupsObject.take(), attr::kDefault);
+        if (a->h.aux == 0 && !a->isDictionary(vm)) {
+            vm.matchRoot = root;
+            vm.matchShape = a->h.shape;
+        }
+    }
     if (d->flags() & regex::kHasIndices) {
         JSArray* idx = vm.newArray(vm.protos.array, 0, std::uint32_t(m.groups()));
         Handle idxKeep = Handle::adopt(toJSValue(idx));
@@ -613,7 +645,18 @@ bool pristine(VM& vm, JSValue rx)
     if ((r && r->dict) || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
         !o->slotAt(0)->isNumber())
         return false;
+    const JSObject* owner = nullptr;
+    const Dictionary* dict = nullptr;
     for (VM::RegExpSlot& s : vm.regexpSlots) {
+        if (s.owner != owner) {
+            owner = s.owner;
+            Rare* r = s.owner->rare();
+            dict = r ? r->dict : nullptr;
+        }
+        // Where it was the last time, mostly.
+        if (dict ? s.index < dict->entries.size() && dict->entries[s.index].key == s.key : s.owner->h.shape == s.shape)
+            if (s.owner->slotAt(s.index)->bits == s.value.bits)
+                continue;
         JSValue* now = recordedSlot(vm, s);
         if (!now || now->bits != s.value.bits)
             return false;
@@ -1611,6 +1654,20 @@ JSValue callSymbolMethod(VM& vm, JSValue pattern, Key symbol, JSValue string, co
     *handled = false;
     if (!isObject(pattern))
         return JSValue::undefined();
+    if (pristine(vm, pattern)) {
+        // A RegExp as they come: its methods are the originals, called without a look for them.
+        *handled = true;
+        const JSValue callArgs[3] = {string, extraCount > 0 ? extra[0] : JSValue::undefined(), extraCount > 1 ? extra[1] : JSValue::undefined()};
+        FastNative fn = symbol == vm.atoms.symMatch      ? regexpMatch
+                        : symbol == vm.atoms.symReplace  ? regexpReplace
+                        : symbol == vm.atoms.symSplit    ? regexpSplit
+                        : symbol == vm.atoms.symSearch   ? regexpSearch
+                        : symbol == vm.atoms.symMatchAll ? regexpMatchAll
+                                                         : nullptr;
+        if (fn)
+            return fn(vm, pattern, callArgs, 1 + extraCount, nullptr);
+        *handled = false;
+    }
     JSValue method = getProperty(vm, pattern, symbol);
     if (method.isException()) {
         *handled = true;

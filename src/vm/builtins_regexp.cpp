@@ -26,8 +26,20 @@ struct RegExpData : NativeState
     String source;
     unsigned flags = 0;
     bool legacy = true;  ///< made by the RegExp constructor itself, so it may be recompiled
-    regex::Matcher matcher;
 };
+
+/// What matches run in: its registers are read before anything else can match. Shared, since a literal in a loop makes a
+/// RegExp every time round.
+regex::Matcher& scratch()
+{
+    thread_local regex::Matcher matcher;
+    constexpr std::size_t kKept = std::size_t(1) << 18;
+    if (matcher.stack.size() > kKept) {
+        matcher.stack.resize(kKept);  // what one hard match needed is not kept for good
+        matcher.stack.shrink_to_fit();
+    }
+    return matcher;
+}
 
 std::shared_ptr<const regex::Program> programForShared(StringView source, unsigned flags, std::string& error);
 
@@ -202,10 +214,11 @@ struct Match
 
 bool runExec(RegExpData* d, StringView s, std::size_t start, Match* out)
 {
-    if (!regex::exec(*d->program, s, start, d->matcher))
+    regex::Matcher& matcher = scratch();
+    if (!regex::exec(*d->program, s, start, matcher))
         return false;
     const std::size_t n = regex::groupCount(*d->program);
-    out->bounds.assign(d->matcher.registers.data(), 2 * n);
+    out->bounds.assign(matcher.registers.data(), 2 * n);
     return true;
 }
 
@@ -357,14 +370,15 @@ int builtinTest(VM& vm, JSValue re, JSValue input)
         return -1;
     if (!useIndex)
         last = 0;
-    if (last > double(s.size()) || !regex::exec(*d->program, s, std::size_t(last), d->matcher)) {
+    regex::Matcher& matcher = scratch();
+    if (last > double(s.size()) || !regex::exec(*d->program, s, std::size_t(last), matcher)) {
         if (useIndex && !writeLastIndex(vm, o, 0))
             return -1;
         return 0;
     }
-    if (useIndex && !writeLastIndex(vm, o, d->matcher.registers[1]))
+    if (useIndex && !writeLastIndex(vm, o, matcher.registers[1]))
         return -1;
-    noteLegacyBounds(vm, d, text.get(), d->matcher.registers.data(), regex::groupCount(*d->program));
+    noteLegacyBounds(vm, d, text.get(), matcher.registers.data(), regex::groupCount(*d->program));
     return 1;
 }
 
@@ -1157,10 +1171,11 @@ JSValue globalMatch(VM& vm, JSValue re, JSValue text)
     std::size_t last = 0;
     bool any = false;
     Bounds lastMatch;  // a failing attempt at the end leaves the registers in no state to read
-    while (last <= s.size() && regex::exec(*d->program, s, last, d->matcher)) {
-        const std::int32_t from = d->matcher.registers[0], to = d->matcher.registers[1];
+    regex::Matcher& matcher = scratch();
+    while (last <= s.size() && regex::exec(*d->program, s, last, matcher)) {
+        const std::int32_t from = matcher.registers[0], to = matcher.registers[1];
         out->append(vm, makeString(vm, s.substr(std::size_t(from), std::size_t(to - from))));
-        lastMatch.assign(d->matcher.registers.data(), 2 * groups);
+        lastMatch.assign(matcher.registers.data(), 2 * groups);
         any = true;
         last = to == from ? advance(s, std::size_t(to), unicode) : std::size_t(to);
     }

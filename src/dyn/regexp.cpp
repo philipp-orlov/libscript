@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
-#include "script/internal/dyn/regexp.hpp"
+#include "script/internal/dyn/regexp_program.hpp"
 
 #include <algorithm>
 #if defined(__SSE2__)
@@ -21,9 +21,7 @@ namespace regex {
 
 namespace {
 
-using unicode::Ranges;
-
-constexpr std::uint32_t kInfinity = 0xffffffffu;
+constexpr std::uint32_t kInfinity = kUnbounded;
 constexpr int kMaxNesting = 400;
 
 bool isHigh(char32_t c) noexcept { return c >= 0xd800 && c <= 0xdbff; }
@@ -187,104 +185,7 @@ struct ClassValue
 
 }  // namespace
 
-// ---- the program ----------------------------------------------------------------------------------------------------
-
-namespace {
-
-enum Op : std::uint32_t
-{
-    OpMatch,
-    OpLit,        // unit
-    OpLitBack,    // unit
-    OpLit2,       // unit unit
-    OpLit2Back,   // unit unit
-    OpStr,        // offset length
-    OpSet,        // set
-    OpSetBack,    // set
-    OpSetU,       // set
-    OpSetUBack,   // set
-    OpGreedy,     // set min max: the whole loop of a set, one unit at a time
-    OpGreedyU,    // set min max: the same, a code point at a time
-    OpSplit,      // target: try on, and that if it fails
-    OpSplitLazy,  // target: try that, and on if it fails
-    OpJump,       // target
-    OpSave,       // register
-    OpClear,      // first end: registers
-    OpMark,       // register: the position, to know a loop's pass took nothing
-    OpCheckProgress,  // register
-    OpCheckCounted,   // register counter min: the same, once the minimum is done
-    OpLoopInit,   // counter
-    OpLoopEnter,  // counter min max greedy exit
-    OpLoopNext,   // counter
-    OpLineStart,
-    OpLineStartM,
-    OpLineEnd,
-    OpLineEndM,
-    OpWord,       // negated folds
-    OpBackRef,    // group
-    OpBackRefBack,
-    OpBackRefFold,  // group: ignoring case
-    OpBackRefFoldBack,
-    OpLookBegin,  // register
-    OpLookEnd,    // register
-    OpNegBegin,   // register target
-    OpNegEnd,     // register
-};
-
-struct CodeSet
-{
-    std::uint32_t low[8] = {};  ///< below 256
-    Ranges high;                ///< the rest, as bare pairs to search
-    char32_t highLo = 0, highHi = 0;  ///< the span of `high` (empty: 0, 0)
-    bool has(std::uint32_t c) const noexcept
-    {
-        if (c < 256)
-            return low[c >> 5] >> (c & 31) & 1;
-        if (c < highLo || c > highHi)
-            return false;
-        if (high.size() <= 8) {
-            // A few ranges (a class of some characters): looked at in turn.
-            for (const auto& [lo, hi] : high)
-                if (c >= lo && c <= hi)
-                    return true;
-            return false;
-        }
-        return contains(high, c);
-    }
-    explicit CodeSet(const Ranges& r)
-    {
-        for (const auto& [lo, hi] : r) {
-            for (char32_t c = lo; c <= hi && c < 256; ++c)
-                low[c >> 5] |= 1u << (c & 31);
-            if (hi >= 256)
-                high.emplace_back(std::max<char32_t>(lo, 256), hi);
-        }
-        if (!high.empty()) {
-            highLo = high.front().first;
-            highHi = high.front().second;
-            for (const auto& [lo, hi] : high) {
-                highLo = std::min(highLo, lo);
-                highHi = std::max(highHi, hi);
-            }
-        }
-    }
-};
-
-}  // namespace
-
-struct Program
-{
-    std::vector<std::uint32_t> code;
-    std::vector<CodeSet> sets;
-    std::u16string literals;
-    std::uint32_t groups = 1;
-    std::uint32_t registers = 2;
-    std::vector<NamedGroup> names;
-    unsigned flags = 0;
-    bool anchored = false;       ///< only the start of the input can begin a match
-    std::int32_t firstSet = -1;  ///< every match begins with one of these units
-    std::int32_t firstUnit = -1; ///< when that is one unit, the unit
-};
+Program::~Program() { delete native.load(std::memory_order_relaxed); }
 
 std::uint32_t groupCount(const Program& program) { return program.groups; }
 const std::vector<NamedGroup>& namedGroups(const Program& program) { return program.names; }
@@ -1763,6 +1664,8 @@ constexpr std::uint32_t kGreedyTag = 0x40000000u;  // [lowest, position, pc | ta
 constexpr std::uint32_t kGreedyUTag = 0x20000000u; // the same, a code point at a time
 constexpr std::uint32_t kPcMask = 0x1fffffffu;
 
+}  // namespace
+
 /// Where `unit` is first found in [at, length), or `length`: eight units at a time where the machine can.
 std::int32_t findUnit(const char16_t* s, std::int32_t at, std::int32_t length, char16_t unit) noexcept
 {
@@ -1793,6 +1696,8 @@ std::int32_t findUnit(const char16_t* s, std::int32_t at, std::int32_t length, c
         ++at;
     return at;
 }
+
+namespace {
 
 bool wordAt(const char16_t* s, std::int32_t i, std::int32_t length, bool folds) noexcept
 {
@@ -1889,6 +1794,43 @@ struct Run
         }
         pos = back ? from : from + size;
         return true;
+    }
+
+    /// The end of a lookaround that matched: its choices go, what it set stays, and undoing that stays possible.
+    void lookEnd(std::int32_t* regs, std::uint32_t r, std::int32_t& pos)
+    {
+        const std::size_t height = std::size_t(regs[r]);
+        pos = regs[r + 1];
+        std::size_t read = sp;
+        std::size_t write = sp;
+        while (read > height) {
+            const std::uint32_t tag = stack[read - 1];
+            if (tag & kUndoTag) {
+                stack[--write] = tag;
+                stack[--write] = stack[read - 2];
+                read -= 2;
+            } else {
+                read -= (tag & (kGreedyTag | kGreedyUTag)) ? 3 : 2;
+            }
+        }
+        const std::size_t kept = sp - write;
+        if (write != height)
+            std::memmove(stack + height, stack + write, kept * sizeof(std::uint32_t));
+        sp = height + kept;
+    }
+    /// The inside of a negative lookaround matched: back to before it, and the choice to go on without it goes too.
+    void dropTo(std::int32_t* regs, std::uint32_t r)
+    {
+        const std::size_t height = std::size_t(regs[r]);
+        while (sp > height) {
+            const std::uint32_t tag = stack[sp - 1];
+            if (tag & kUndoTag) {
+                regs[tag & ~kUndoTag] = std::int32_t(stack[sp - 2]);
+                sp -= 2;
+            } else {
+                sp -= (tag & (kGreedyTag | kGreedyUTag)) ? 3 : 2;
+            }
+        }
     }
 
     bool match(std::int32_t start, std::int32_t* regs)
@@ -2130,26 +2072,7 @@ struct Run
                     continue;
                 }
                 case OpLookEnd: {
-                    // Inside is settled: its choices go, what it set stays, and undoing that stays possible.
-                    const std::uint32_t r = code[pc + 1];
-                    const std::size_t height = std::size_t(regs[r]);
-                    pos = regs[r + 1];
-                    std::size_t read = sp;
-                    std::size_t write = sp;
-                    while (read > height) {
-                        const std::uint32_t tag = stack[read - 1];
-                        if (tag & kUndoTag) {
-                            stack[--write] = tag;
-                            stack[--write] = stack[read - 2];
-                            read -= 2;
-                        } else {
-                            read -= (tag & (kGreedyTag | kGreedyUTag)) ? 3 : 2;
-                        }
-                    }
-                    const std::size_t kept = sp - write;
-                    if (write != height)
-                        std::memmove(stack + height, stack + write, kept * sizeof(std::uint32_t));
-                    sp = height + kept;
+                    lookEnd(regs, code[pc + 1], pos);
                     pc += 2;
                     continue;
                 }
@@ -2161,17 +2084,7 @@ struct Run
                     continue;
                 }
                 case OpNegEnd: {
-                    // Inside matched, so this fails: back to before it, and the choice to go on without it goes too.
-                    const std::size_t height = std::size_t(regs[code[pc + 1]]);
-                    while (sp > height) {
-                        const std::uint32_t tag = stack[sp - 1];
-                        if (tag & kUndoTag) {
-                            regs[tag & ~kUndoTag] = std::int32_t(stack[sp - 2]);
-                            sp -= 2;
-                        } else {
-                            sp -= (tag & (kGreedyTag | kGreedyUTag)) ? 3 : 2;
-                        }
-                    }
+                    dropTo(regs, code[pc + 1]);
                     goto fail;
                 }
             }
@@ -2221,6 +2134,74 @@ struct Run
 };
 
 }  // namespace
+
+bool step(StepState& st, std::uint32_t pc)
+{
+    const Program& program = *st.program;
+    const std::uint32_t* const code = program.code.data();
+    Run run{program, *st.matcher, st.s, st.length, (program.flags & (kUnicode | kUnicodeSets)) != 0, st.stack, 0};
+    std::int32_t& pos = st.pos;
+    std::int32_t* const regs = st.regs;
+    const auto set = [&]() -> const CodeSet& { return program.sets[code[pc + 1]]; };
+    char32_t c;
+    switch (code[pc]) {
+        case OpLitBack:
+            return pos > 0 && st.s[--pos] == code[pc + 1];
+        case OpLit2Back:
+            --pos;
+            return pos >= 0 && (st.s[pos] == code[pc + 1] || st.s[pos] == code[pc + 2]);
+        case OpSet:
+            return pos < st.length && set().has(st.s[pos++]);
+        case OpSetBack:
+            return pos > 0 && set().has(st.s[--pos]);
+        case OpSetU:
+            return run.nextCode(pos, c) && set().has(c);
+        case OpSetUBack:
+            return run.previousCode(pos, c) && set().has(c);
+        case OpWord: {
+            const bool folds = code[pc + 2];
+            return (wordAt(st.s, pos - 1, st.length, folds) != wordAt(st.s, pos, st.length, folds)) != bool(code[pc + 1]);
+        }
+        case OpBackRef: return run.backRef(regs, code[pc + 1], pos, false, false);
+        case OpBackRefBack: return run.backRef(regs, code[pc + 1], pos, false, true);
+        case OpBackRefFold: return run.backRef(regs, code[pc + 1], pos, true, false);
+        case OpBackRefFoldBack: return run.backRef(regs, code[pc + 1], pos, true, true);
+        case OpLookEnd:
+            run.sp = st.sp;
+            run.lookEnd(regs, code[pc + 1], pos);
+            st.sp = run.sp;
+            return true;
+        case OpNegEnd:
+            run.sp = st.sp;
+            run.dropTo(regs, code[pc + 1]);
+            st.sp = run.sp;
+            return false;
+        case OpGreedyU: {
+            const std::uint32_t min = code[pc + 2];
+            const std::uint32_t max = code[pc + 3];
+            std::uint32_t count = 0;
+            std::int32_t lowest = pos;
+            while (count < max) {
+                std::int32_t next = pos;
+                if (!run.nextCode(next, c) || !set().has(c))
+                    break;
+                pos = next;
+                ++count;
+                if (count == min)
+                    lowest = pos;
+            }
+            if (count < min)
+                return false;
+            if (count > min) {  // (the caller has seen to the room)
+                st.stack[st.sp++] = std::uint32_t(lowest);
+                st.stack[st.sp++] = std::uint32_t(pos);
+                st.stack[st.sp++] = (pc + 4) | kGreedyUTag;
+            }
+            return true;
+        }
+        default: return false;
+    }
+}
 
 std::shared_ptr<const Program> compile(std::u16string_view pattern, unsigned flags, std::string& error)
 {

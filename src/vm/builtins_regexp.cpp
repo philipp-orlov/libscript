@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "builtins_util.hpp"
+#include "jit/regexp_jit.hpp"
 
 namespace script {
 namespace internal {
@@ -27,6 +28,12 @@ struct RegExpData : NativeState
     unsigned flags = 0;
     bool legacy = true;  ///< made by the RegExp constructor itself, so it may be recompiled
 };
+
+/// `regex::exec`, natively where the context lets code be compiled.
+bool execProgram(VM& vm, const regex::Program& program, StringView s, std::size_t start, regex::Matcher& matcher)
+{
+    return vm.tier1Threshold ? jit::regexExec(program, s, start, matcher) : regex::exec(program, s, start, matcher);
+}
 
 /// What matches run in: its registers are read before anything else can match. Shared, since a literal in a loop makes a
 /// RegExp every time round.
@@ -212,10 +219,10 @@ struct Match
     std::int32_t end() const { return bounds[1]; }
 };
 
-bool runExec(RegExpData* d, StringView s, std::size_t start, Match* out)
+bool runExec(VM& vm, RegExpData* d, StringView s, std::size_t start, Match* out)
 {
     regex::Matcher& matcher = scratch();
-    if (!regex::exec(*d->program, s, start, matcher))
+    if (!execProgram(vm, *d->program, s, start, matcher))
         return false;
     const std::size_t n = regex::groupCount(*d->program);
     out->bounds.assign(matcher.registers.data(), 2 * n);
@@ -343,7 +350,7 @@ JSValue builtinExec(VM& vm, JSValue re, JSValue input)
         return JSValue::null();
     }
     Match m;
-    if (!runExec(d, s, std::size_t(last), &m)) {
+    if (!runExec(vm, d, s, std::size_t(last), &m)) {
         if (useIndex && !writeLastIndex(vm, o, 0))
             return JSValue::exception();
         return JSValue::null();
@@ -371,7 +378,7 @@ int builtinTest(VM& vm, JSValue re, JSValue input)
     if (!useIndex)
         last = 0;
     regex::Matcher& matcher = scratch();
-    if (last > double(s.size()) || !regex::exec(*d->program, s, std::size_t(last), matcher)) {
+    if (last > double(s.size()) || !execProgram(vm, *d->program, s, std::size_t(last), matcher)) {
         if (useIndex && !writeLastIndex(vm, o, 0))
             return -1;
         return 0;
@@ -980,7 +987,7 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
     std::vector<Match> found;
     for (;;) {
         Match m;
-        if (at > s.size() || !runExec(d, s, at, &m)) {
+        if (at > s.size() || !runExec(vm, d, s, at, &m)) {
             if ((sticky || global) && !writeLastIndex(vm, o, 0))
                 return JSValue::exception();
             break;
@@ -1172,7 +1179,7 @@ JSValue globalMatch(VM& vm, JSValue re, JSValue text)
     bool any = false;
     Bounds lastMatch;  // a failing attempt at the end leaves the registers in no state to read
     regex::Matcher& matcher = scratch();
-    while (last <= s.size() && regex::exec(*d->program, s, last, matcher)) {
+    while (last <= s.size() && execProgram(vm, *d->program, s, last, matcher)) {
         const std::int32_t from = matcher.registers[0], to = matcher.registers[1];
         out->append(vm, makeString(vm, s.substr(std::size_t(from), std::size_t(to - from))));
         lastMatch.assign(matcher.registers.data(), 2 * groups);
@@ -1274,13 +1281,13 @@ JSValue fastSplit(VM& vm, RegExpData* d, StringView s, double limit)
     const bool unicode = (d->flags & (regex::kUnicode | regex::kUnicodeSets)) != 0;
     Match m;
     if (s.empty()) {
-        if (!runExec(e, s, 0, &m) || m.end() != 0)
+        if (!runExec(vm, e, s, 0, &m) || m.end() != 0)
             out->append(vm, makeString(vm, s));
         return keep.take();
     }
     std::size_t p = 0, q = 0;
     while (q < s.size()) {
-        if (!runExec(e, s, q, &m))
+        if (!runExec(vm, e, s, q, &m))
             break;
         const std::size_t ms = std::size_t(m.start());
         const std::size_t end = std::min<std::size_t>(std::size_t(m.end()), s.size());

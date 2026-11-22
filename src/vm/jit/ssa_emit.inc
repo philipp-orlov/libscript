@@ -1034,6 +1034,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
             case Op::ShlI: case Op::ShrI: case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr:
             case Op::BitXor: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Div: case Op::MulI: case Op::ModI:
+            case Op::Mod: case Op::Neg: case Op::BitNot: case Op::Shl: case Op::Shr: case Op::UShr: case Op::UShrI:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
                 else if (!(dblArith_[i] ? ssaArithF64(i) : ssaArith(i)))
@@ -2499,8 +2500,9 @@ bool Baseline::ssaArith(std::uint32_t i)
     const bool compare = op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge;
     if (!compare && !intArith_[i])
         return false;
+    const bool shift = op == Op::Shl || op == Op::Shr || op == Op::UShr;
     const bool rr = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::BitAnd || op == Op::BitOr ||
-                    op == Op::BitXor || compare;
+                    op == Op::BitXor || op == Op::Mod || shift || compare;
     const std::uint32_t va = name_[in.b];
     const std::uint32_t vb = rr ? name_[in.c] : ssa::kNone;
     Label& bad = ssaExit(i);
@@ -2518,7 +2520,8 @@ bool Baseline::ssaArith(std::uint32_t i)
         return true;
     }
     const bool bitwise = op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor || op == Op::BitAndI ||
-                         op == Op::BitOrI || op == Op::BitXorI || op == Op::ShlI || op == Op::ShrI;
+                         op == Op::BitOrI || op == Op::BitXorI || op == Op::ShlI || op == Op::ShrI || op == Op::UShrI ||
+                         op == Op::BitNot || shift;
     // Made in the result's own register when it has one that holds no operand (an exit reads the operands), else in
     // rax; an int32 operand in a register is read where it is.
     auto regOf = [&](std::uint32_t v) {
@@ -2529,7 +2532,8 @@ bool Baseline::ssaArith(std::uint32_t i)
     const int rb = regOf(vb);
     // An operation that cannot fail once its operands are read (bitwise, or an add that may wrap) may also write over its
     // first operand's register, which no exit reads after it.
-    const bool noFailAfter = bitwise || (wrapOk_[def] && (op == Op::Add || op == Op::Sub || op == Op::AddI ||
+    const bool noFailAfter = (bitwise && op != Op::UShr && !(op == Op::UShrI && !(in.c & 31))) ||
+                             (wrapOk_[def] && (op == Op::Add || op == Op::Sub || op == Op::AddI ||
                                                           op == Op::SubI || op == Op::Inc || op == Op::Dec));
     Reg t = RAX;
     if (sval_[def].rep == kRepI32 && sval_[def].reg >= 0 && sval_[def].reg != anyReg(vb) &&
@@ -2541,10 +2545,10 @@ bool Baseline::ssaArith(std::uint32_t i)
         loadI32(va, t, &bad);
     Reg b = RCX;
     if (rr) {
-        if (rb >= 0)
+        if (rb >= 0 && !shift)
             b = Reg(rb);
         else if (bitwise)
-            loadToInt32(vb, RCX, bad);
+            loadToInt32(vb, RCX, bad);  // (a shift's count is in rcx)
         else
             loadI32(vb, RCX, &bad);
     }
@@ -2567,6 +2571,43 @@ bool Baseline::ssaArith(std::uint32_t i)
     case Op::BitAnd: a_.alu32(4, t, b); break;
     case Op::BitOr: a_.alu32(1, t, b); break;
     case Op::BitXor: a_.alu32(6, t, b); break;
+    case Op::UShrI:
+        a_.shiftI32(5, t, imm & 31);
+        if ((imm & 31) == 0 && !nonNeg_[va]) {
+            a_.test32(t, t);
+            a_.jcc(CS, bad);
+        }
+        break;
+    case Op::Shl: a_.shiftCl32(4, t); break;
+    case Op::Shr: a_.shiftCl32(7, t); break;
+    case Op::UShr:  // a result past int32 is a double
+        a_.shiftCl32(5, t);
+        a_.test32(t, t);
+        a_.jcc(CS, bad);
+        break;
+    case Op::BitNot: a_.not32(t); break;
+    case Op::Neg:
+        // Zero is -0 then, and the least int32 has no opposite: the interpreter's.
+        a_.test32(t, t);
+        a_.jcc(CE, bad);
+        a_.aluI32(7, t, INT32_MIN);
+        a_.jcc(CE, bad);
+        a_.neg32(t);
+        break;
+    case Op::Mod:
+        if (!nonNeg_[va]) {
+            a_.test32(t, t);
+            a_.jcc(CS, bad);
+        }
+        a_.aluI32(7, b, 0);
+        a_.jcc(CLE, bad);
+        if (b != RCX)
+            a_.mov32(RCX, b);
+        a_.mov32(RAX, t);
+        a_.cdq();
+        a_.idiv32(RCX);
+        a_.mov32(t, RDX);
+        break;
     case Op::ModI: {
         // A dividend below zero: the interpreter's (its remainder may be -0). A power of two is a mask.
         if (!nonNeg_[va]) {
@@ -2644,6 +2685,16 @@ bool Baseline::ssaArithF64(std::uint32_t i)
     const Op op = in.opcode();
     const bool rr = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Div;
     Label& bad = ssaExit(i);
+    if (op == Op::Neg) {
+        const std::uint32_t def = ssa_->defBase[i];
+        const int x = sval_[def].reg >= 0 && sval_[def].rep == kRepF64 ? sval_[def].reg : 0;
+        loadF64(name_[in.b], 1, &bad);
+        a_.movImm(RDX, std::uint64_t(1) << 63);
+        a_.movqToX(x, RDX);
+        a_.xorps(x, 1);
+        ssaDefF64(i, x);
+        return true;
+    }
     // In the result's own register when it has one that is not the second operand's; the second operand where it is.
     const std::uint32_t def = ssa_->defBase[i];
     const std::uint32_t vb = rr ? name_[in.c] : ssa::kNone;
@@ -2756,7 +2807,8 @@ bool Baseline::ssaNative(std::uint32_t i)
         return equalsNative(name_[in.b], name_[in.c], op == Op::Eq || op == Op::Ne);
     case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
     case Op::ShlI: case Op::ShrI: case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr:
-    case Op::BitXor: case Op::Div: case Op::MulI:
+    case Op::BitXor: case Op::Div: case Op::MulI: case Op::Mod: case Op::Neg: case Op::BitNot: case Op::Shl: case Op::Shr:
+    case Op::UShr: case Op::UShrI:
         return intArith_[i] || dblArith_[i];
     case Op::ModI:  // a positive divisor only
         return intArith_[i] && std::int16_t(in.c) > 0;
@@ -2812,19 +2864,22 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         switch (op) {
         case Op::AddI: case Op::SubI: case Op::Inc: case Op::Dec: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
         case Op::ShlI: case Op::ShrI: case Op::MulI: case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd:
-        case Op::BitOr: case Op::BitXor: case Op::ModI:
+        case Op::BitOr: case Op::BitXor: case Op::ModI: case Op::Mod: case Op::Neg: case Op::BitNot: case Op::Shl:
+        case Op::Shr: case Op::UShr: case Op::UShrI:
             // A bitwise operation with nothing noted (0: the interpreter has not run it; the baseline code notes
             // nothing): its result is an int32 whatever the operands (a double truncates). A template there would make
             // every value across it live in a slot, in the hot code around it too.
             if (prof == 1 || (prof == 0 && (op == Op::BitAndI || op == Op::BitOrI || op == Op::BitXorI || op == Op::ShlI ||
-                                            op == Op::ShrI || op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor)))
+                                            op == Op::ShrI || op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor ||
+                                            op == Op::BitNot || op == Op::Shl || op == Op::Shr ||
+                                            (op == Op::UShrI && (code_->code[i].c & 31)))))
                 intArith_[i] = 1;
             break;
         default:
             break;
         }
         switch (op) {
-        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::AddI: case Op::SubI: case Op::MulI:
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::AddI: case Op::SubI: case Op::MulI: case Op::Neg:
             if ((prof & 2) && !(prof & 8))
                 dblArith_[i] = 1;
             break;
@@ -2863,7 +2918,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 const Op op = in.opcode();
                 const opt::Effects e = ssa::effects(*code_, i);
                 const bool arith = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI ||
-                                   op == Op::MulI || op == Op::Inc || op == Op::Dec || op == Op::ModI;
+                                   op == Op::MulI || op == Op::Inc || op == Op::Dec || op == Op::ModI || op == Op::Mod ||
+                                   op == Op::Neg;
                 if (op == Op::GetElem && names[in.b] != ssa::kNone) {
                     const std::uint8_t pe = i < code_->prof.size() ? code_->prof[i] : 0;
                     if (elemRep[i] == 1)
@@ -2974,7 +3030,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             const Op op = code_->code[at].opcode();
             // Doubles only where the double path has the operation (not `ModI`, `Inc`, `Dec`): else the template.
             if (cls[v] == 2 && !(op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI ||
-                                 op == Op::MulI))
+                                 op == Op::MulI || op == Op::Neg))
                 cls[v] = 3;
             intArith_[at] = cls[v] == 1 || cls[v] == 0;
             dblArith_[at] = cls[v] == 2;
@@ -3134,7 +3190,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 if (d != ssa::kNone && sval_[d].rep == kRepI32) {
                     const std::int32_t imm = std::int32_t(std::int16_t(in.c));
                     std::uint8_t k = 0;
-                    if (op == Op::ModI || op == Op::UShrI || ssaLengthSite(i) || (op == Op::BitAndI && imm >= 0))
+                    if (op == Op::ModI || op == Op::Mod || op == Op::UShrI || op == Op::UShr || ssaLengthSite(i) || (op == Op::BitAndI && imm >= 0))
                         k = 1;
                     else if (((op == Op::Inc || (op == Op::AddI && imm >= 0) || op == Op::Add) && !wrapOk_[d]) ||
                              (op == Op::MulI && imm >= 0) || (op == Op::ShrI && (imm & 31) != 0) || op == Op::Mul)
@@ -3983,12 +4039,22 @@ void Baseline::loadToInt32(std::uint32_t v, Reg dst, Label& bad)
             a_.cmp(dst, R14);
             a_.jcc(CB, dbl);
             a_.jmp(done);
+            Label number;
             a_.bind(dbl);
             a_.test(dst, R14);
-            a_.jcc(CE, bad);
+            a_.jcc(CNE, number);
+            boolToInt32(dst, dst, bad);
+            a_.jmp(done);
+            a_.bind(number);
             a_.mov(RDX, dst);
             a_.sub(RDX, RBP);
             a_.movqToX(0, RDX);
+        }
+        if (Asm::hasToInt32()) {
+            a_.toInt32(dst, 0);
+            a_.bind(done);
+            a_.mov32(dst, dst);
+            return;
         }
         // The low half of the truncation, for a double that fits 64 bits; else the interpreter's.
         a_.cvttsd2si64(dst, 0);

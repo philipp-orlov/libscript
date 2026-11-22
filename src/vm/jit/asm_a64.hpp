@@ -29,6 +29,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
 #include <utility>
 #include <vector>
 
@@ -1204,6 +1207,22 @@ public:
         ins(0x1A800000u | (std::uint32_t(kVal) << 16) | (std::uint32_t(EQ) << 12) | (std::uint32_t(kAddr) << 5) |
             std::uint32_t(X(r)));                                                               // csel wr, w16, w17, eq
         flags_ = Flags::None;
+    }
+    /// Whether the machine has ToInt32 as one instruction (`toInt32`).
+    static bool hasToInt32() noexcept
+    {
+#if defined(__linux__)
+        static const bool has = (getauxval(AT_HWCAP) & (1u << 13)) != 0;  // HWCAP_JSCVT
+        return has;
+#else
+        return false;
+#endif
+    }
+    void toInt32(Reg r, int x)
+    {
+        ins(0x1E7E0000u | (std::uint32_t(V(x)) << 5) | std::uint32_t(X(r)));
+        flags_ = Flags::None;
+        zext_ |= 1u << X(r);
     }
     void cvttsd2si64(Reg r, int x)
     {

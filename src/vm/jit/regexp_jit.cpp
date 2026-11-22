@@ -17,7 +17,9 @@
 #include "regexp_jit.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -25,6 +27,8 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <string>
+#include <unistd.h>
 
 #include "script/internal/dyn/regexp_program.hpp"
 
@@ -195,6 +199,15 @@ public:
         for (std::uint64_t& t : out_->table)
             t += reinterpret_cast<std::uint64_t>(out_->span.rx);
         commitCode(out_->span, a_.buf.data(), a_.buf.size());
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (std::getenv("SCRIPT_VM_PERFMAP"))
+            if (std::FILE* map = std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "a")) {
+                static std::atomic<int> serial{0};
+                std::fprintf(map, "%llx %zx regexp:%d:ops%u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(out_->span.rx)),
+                             a_.buf.size(), ++serial, n_);
+                std::fclose(map);
+            }
+#endif
         out_->run = reinterpret_cast<std::uint32_t (*)(Ctx*)>(out_->span.rx);
         return out_.release();
     }

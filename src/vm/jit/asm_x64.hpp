@@ -405,6 +405,8 @@ public:
     void shiftCl32(int kind, Reg r) { opReg(false, 0xD3, kind, r); }
     void shiftCl(int kind, Reg r) { opReg(true, 0xD3, kind, r); }
     void cdq() { b(0x99); }
+    static bool hasToInt32() noexcept { return false; }
+    void toInt32(Reg, int) {}
     void idiv32(Reg r) { opReg(false, 0xF7, 7, r); }
     void setcc(Cond c, Reg r)
     {

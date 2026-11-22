@@ -453,7 +453,7 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code);
 void perfMapNote(const void* rx, std::size_t bytes, const CodeBlock* code, const char* tier)
 {
     static std::FILE* map = std::getenv("SCRIPT_VM_PERFMAP")
-                                ? std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "w")
+                                ? std::fopen(("/tmp/perf-" + std::to_string(getpid()) + ".map").c_str(), "a")
                                 : nullptr;
     if (!map)
         return;
@@ -2511,17 +2511,25 @@ private:
     /// range (NaN and the rest go to `bad`). Clobbers rdx and xmm0.
     void int32From(Reg dst, Reg src, Label& bad)
     {
-        Label dbl, done;
+        Label dbl, done, other;
         a_.cmp(src, R14);
         a_.jcc(CB, dbl);
         a_.mov32(dst, src);
         a_.jmp(done);
+        a_.bind(other);
+        boolToInt32(dst, src, bad);
+        a_.jmp(done);
         a_.bind(dbl);
         a_.test(src, R14);
-        a_.jcc(CE, bad);
+        a_.jcc(CE, other);
         a_.mov(RDX, src);
         a_.sub(RDX, RBP);
         a_.movqToX(0, RDX);
+        if (Asm::hasToInt32()) {
+            a_.toInt32(dst, 0);
+            a_.bind(done);
+            return;
+        }
         // ToInt32 of a double that fits 64 bits is the low half of its truncation; NaN, infinities and what does not fit give
         // the "indefinite" value and are left to the helper.
         a_.cvttsd2si64(dst, 0);
@@ -2530,6 +2538,16 @@ private:
         a_.jcc(CE, bad);
         a_.mov32(dst, dst);
         a_.bind(done);
+    }
+    /// `src`, which is no number, as an int32 in `dst` when it is a boolean; else `bad`.
+    void boolToInt32(Reg dst, Reg src, Label& bad)
+    {
+        a_.mov(RDX, src);
+        a_.aluI(1, RDX, 1);
+        a_.cmpI(RDX, std::int32_t(kTrue));
+        a_.jcc(CNE, bad);
+        a_.mov32(dst, src);
+        a_.aluI32(4, dst, 1);
     }
     /// xmm0 as the number `JSValue::boxNumber` makes of it, in rax: an int32 when it is one, else a double.
     void boxNumber0()
@@ -3152,8 +3170,7 @@ void Baseline::emit(std::uint32_t i)
     case Op::In: helperOp(i, &helperThunk<jitIn>); return;
     case Op::ToString: helperOp(i, &helperThunk<jitToString>); return;
     case Op::ToNumber: helperOp(i, &helperThunk<jitToNumber>); return;
-    case Op::Neg: case Op::BitNot: helperOp(i, &helperThunk<jitUnary>); return;
-    case Op::Mod: case Op::Exp: helperOp(i, &helperThunk<jitBinary>); return;
+    case Op::Exp: helperOp(i, &helperThunk<jitBinary>); return;
     case Op::CopyBox: helperOp(i, &helperThunk<jitCopyBox>); return;
     case Op::RestSlice: helperOp(i, &helperThunk<jitRestSlice>); return;
     case Op::SpreadObj: helperOp(i, &helperThunk<jitSpreadObj>); return;
@@ -3186,6 +3203,57 @@ void Baseline::emit(std::uint32_t i)
         a_.callC(RAX);
         a_.jmp(tail_);
         return;
+    case Op::Neg: case Op::BitNot: {
+        Label& bad = slow(i, &helperThunk<jitUnary>);
+        a_.mov(RAX, R(in.b));
+        if (in.opcode() == Op::BitNot) {
+            int32From(RAX, RAX, bad);
+            a_.not32(RAX);
+            a_.or_(RAX, R14);
+            write(in.a, RAX, in.a == in.b);
+            return;
+        }
+        Label dbl, done;
+        a_.cmp(RAX, R14);
+        a_.jcc(CB, dbl);
+        a_.test32(RAX, RAX);
+        a_.jcc(CE, bad);
+        a_.aluI32(7, RAX, INT32_MIN);
+        a_.jcc(CE, bad);
+        a_.neg32(RAX);
+        a_.or_(RAX, R14);
+        write(in.a, RAX, in.a == in.b);
+        a_.jmp(done);
+        a_.bind(dbl);
+        a_.test(RAX, R14);
+        a_.jcc(CE, bad);
+        loadNumber(1, RAX, RDX);
+        a_.movImm(RDX, std::uint64_t(1) << 63);
+        a_.movqToX(0, RDX);
+        a_.xorps(0, 1);
+        boxDouble0();
+        write(in.a, RAX, in.a == in.b);
+        a_.bind(done);
+        return;
+    }
+    case Op::Mod: {
+        // Two int32s, the first not below zero (its remainder may be -0) and the second above.
+        Label& bad = slow(i, &helperThunk<jitBinary>);
+        a_.mov(RAX, R(in.b));
+        a_.mov(RCX, R(in.c));
+        needInts(RAX, RCX, bad);
+        a_.test32(RAX, RAX);
+        a_.jcc(CS, bad);
+        a_.aluI32(7, RCX, 0);
+        a_.jcc(CLE, bad);
+        a_.mov32(RAX, RAX);
+        a_.cdq();
+        a_.idiv32(RCX);
+        a_.mov32(RAX, RDX);
+        a_.or_(RAX, R14);
+        write(in.a, RAX, in.a == in.b || in.a == in.c);
+        return;
+    }
     case Op::Append: append(i, in); return;
     case Op::Unshare: {
         if (!def_)

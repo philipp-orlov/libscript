@@ -2863,8 +2863,8 @@ bool Baseline::ssaArith(std::uint32_t i)
     const std::uint32_t def = ssa_->defBase[i];
     const int rb = regOf(vb);
     // An operation that cannot fail once its operands are read (bitwise, or an add that may wrap) may also write over its
-    // first operand's register, which no exit reads after it.
-    const bool noFailAfter = (bitwise && op != Op::UShr && !(op == Op::UShrI && !(in.c & 31))) ||
+    // first operand's register, which no exit reads after it. (Not one that is converted there: the second may leave yet.)
+    const bool noFailAfter = (bitwise && regOf(va) >= 0 && op != Op::UShr && !(op == Op::UShrI && !(in.c & 31))) ||
                              (wrapOk_[def] && (op == Op::Add || op == Op::Sub || op == Op::AddI ||
                                                           op == Op::SubI || op == Op::Inc || op == Op::Dec));
     Reg t = RAX;

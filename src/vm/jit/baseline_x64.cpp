@@ -2791,12 +2791,19 @@ private:
 
     // ---- the SSA tier (ssa_emit.inc); `ssa_` is null otherwise ----
 public:
-    Tier2Code* compileSsa(const ssa::Graph& g, Tier1Code* base);
+    Tier2Code* compileSsa(ssa::Graph& g, Tier1Code* base);
     const char* ssaWhy_ = "";
     int ssaOn_ = 2;  ///< SCRIPT_VM_SSA: 1 every instruction through the frame, 2 the fast paths too
 
 private:
     const ssa::Graph* ssa_ = nullptr;
+    /// Per instruction: a read whose value is known from one before it (`ssaLoadElim`), which is its value then.
+    std::vector<std::uint8_t> elim_;
+    /// Per value, where it is first and last needed, and per instruction, where its operands are read (the plan's numbering).
+    std::vector<std::int32_t> firstPos_, lastPos_, usePos_;
+    std::uint32_t curIns_ = 0;  ///< the instruction being emitted
+    /// Finds those reads, given what `ssaPlan` decided, and makes the earlier values theirs in the graph; false when none.
+    bool ssaLoadElim(ssa::Graph& g);
     /// Where an SSA value is: a constant (no code makes it), or a stack slot of this code's frame.
     struct SVal
     {
@@ -6264,7 +6271,7 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
                          code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon", preferWhy);
 #endif
     } else if (ssaTierMode() != 0) {
-        const ssa::Graph g = ssa::build(*code);
+        ssa::Graph g = ssa::build(*code);
         const char* why = g.why;
         if (g.ok) {
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)

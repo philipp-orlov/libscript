@@ -744,7 +744,7 @@ void Baseline::ssaEnterBlock(std::uint32_t b)
     frame_ = std::move(st);
 }
 
-Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
+Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
 {
     ssa_ = &g;
     base_ = base;
@@ -760,55 +760,76 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
     const unsigned nregs = code_->nregs;
     const std::uint32_t nb = std::uint32_t(g.blocks.size());
 
-    // ---- what each value is: a constant, or a slot ----
-    sval_.assign(g.values.size(), SVal{});
-    for (unsigned r = 1 + code_->nparams; r < nregs; ++r) {
-        sval_[r].isConst = true;  // a register no instruction has written yet is undefined
-        sval_[r].bits = kUndefined;
-    }
-    for (std::uint32_t v = nregs; v < g.values.size(); ++v) {
-        const ssa::Value& sv = g.values[v];
-        if (sv.kind != ssa::Value::Def)
-            continue;
-        const Ins& in = code_->code[sv.at];
-        std::uint64_t bits = 0;
-        bool k = true;
-        switch (in.opcode()) {
-        case Op::LoadUndef: bits = kUndefined; break;
-        case Op::LoadNull: bits = kNull; break;
-        case Op::LoadTrue: bits = kTrue; break;
-        case Op::LoadFalse: bits = kFalse; break;
-        case Op::LoadHole: bits = kHole; break;
-        case Op::LoadUninit: bits = kUninit; break;
-        case Op::LoadInt: bits = kNumberTag | std::uint32_t(std::int32_t(in.imm())); break;
-        case Op::LoadK: bits = code_->consts[in.kIndex()].bits; break;  // the block holds it as long as this code
-        case Op::GetGlobal: k = ssaGlobalConst(sv.at, &bits); break;
-        case Op::GetProp: k = ssaMethodConst(sv.at, &bits); break;
-        default: k = false; break;
+    auto initValues = [&]() {
+        // ---- what each value is: a constant, or a slot ----
+        sval_.assign(g.values.size(), SVal{});
+        for (unsigned r = 1 + code_->nparams; r < nregs; ++r) {
+            sval_[r].isConst = true;  // a register no instruction has written yet is undefined
+            sval_[r].bits = kUndefined;
         }
-        sval_[v].isConst = k;
-        sval_[v].bits = bits;
-    }
-    vDef_.assign(g.values.size(), 0);
-    for (std::uint32_t v = 0; v < g.values.size(); ++v)
-        if (sval_[v].isConst) {
-            const JSValue k = JSValue::raw(sval_[v].bits);
-            vDef_[v] = k.isInt32() ? std::uint8_t(kVInt | kVNotCell) : k.isBool() ? std::uint8_t(kVBool | kVNotCell)
-                       : !k.isCell()  ? kVNotCell
-                       : !isObject(k) ? std::uint8_t(0)
-                       : asObject(k)->cls() == ObjClass::Array      ? std::uint8_t(kVObj | kVArray)
-                       : asObject(k)->cls() == ObjClass::TypedArray ? std::uint8_t(kVObj | kVTyped)
-                                                                    : std::uint8_t(kVObj);
+        for (std::uint32_t v = nregs; v < g.values.size(); ++v) {
+            const ssa::Value& sv = g.values[v];
+            if (sv.kind != ssa::Value::Def)
+                continue;
+            const Ins& in = code_->code[sv.at];
+            std::uint64_t bits = 0;
+            bool k = true;
+            switch (in.opcode()) {
+            case Op::LoadUndef: bits = kUndefined; break;
+            case Op::LoadNull: bits = kNull; break;
+            case Op::LoadTrue: bits = kTrue; break;
+            case Op::LoadFalse: bits = kFalse; break;
+            case Op::LoadHole: bits = kHole; break;
+            case Op::LoadUninit: bits = kUninit; break;
+            case Op::LoadInt: bits = kNumberTag | std::uint32_t(std::int32_t(in.imm())); break;
+            case Op::LoadK: bits = code_->consts[in.kIndex()].bits; break;  // the block holds it as long as this code
+            case Op::GetGlobal: k = ssaGlobalConst(sv.at, &bits); break;
+            case Op::GetProp: k = ssaMethodConst(sv.at, &bits); break;
+            default: k = false; break;
+            }
+            sval_[v].isConst = k;
+            sval_[v].bits = bits;
         }
-    vKnown_ = vDef_;
-    vShape_.assign(g.values.size(), 0);
-    touched_.clear();
+        vDef_.assign(g.values.size(), 0);
+        for (std::uint32_t v = 0; v < g.values.size(); ++v)
+            if (sval_[v].isConst) {
+                const JSValue k = JSValue::raw(sval_[v].bits);
+                vDef_[v] = k.isInt32() ? std::uint8_t(kVInt | kVNotCell) : k.isBool() ? std::uint8_t(kVBool | kVNotCell)
+                           : !k.isCell()  ? kVNotCell
+                           : !isObject(k) ? std::uint8_t(0)
+                           : asObject(k)->cls() == ObjClass::Array      ? std::uint8_t(kVObj | kVArray)
+                           : asObject(k)->cls() == ObjClass::TypedArray ? std::uint8_t(kVObj | kVTyped)
+                                                                        : std::uint8_t(kVObj);
+            }
+        vKnown_ = vDef_;
+        vShape_.assign(g.values.size(), 0);
+        touched_.clear();
+    };
     std::vector<std::vector<ssa::Bits>> liveAfter(nb);
     for (std::uint32_t b = 1; b < nb; ++b)
         if (g.blocks[b].reached)
             liveAfter[b] = g.liveAfter(*code_, b);
+    elim_.assign(n_, 0);
+    initValues();
     if (!ssaPlan(liveAfter))
         return fail();
+    if (ssaOn_ >= 2) {
+        const std::vector<std::uint8_t> before = native_;
+        if (ssaLoadElim(g)) {
+            // Planned again with the reads gone. What was done in place and is not now could change what they read: without.
+            initValues();
+            bool ok = ssaPlan(liveAfter);
+            for (std::uint32_t i = 0; i < n_ && ok; ++i)
+                ok = !before[i] || native_[i];
+            if (!ok) {
+                g = ssa::build(*code_);
+                elim_.assign(n_, 0);
+                initValues();
+                if (!ssaPlan(liveAfter))
+                    return fail();
+            }
+        }
+    }
 
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("SSA_DUMP")) {
@@ -916,6 +937,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
             const Ins& in = code_->code[i];
             const Op op = in.opcode();
             offsets_[i] = std::uint32_t(a_.here());
+            curIns_ = i;
             exitAt_ = -1;
             curLiveAfter_ = liveAfter[b][k];
             {
@@ -935,6 +957,10 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
                     a_.jmp(ssaExit(i));
                 ended = true;
                 break;
+            }
+            if (elim_[i]) {
+                name_[in.a] = g.defBase[i];
+                continue;
             }
             switch (op) {
             case Op::GetProp:
@@ -1325,6 +1351,176 @@ JSTypedArray* Baseline::ssaKnownTyped(std::uint32_t v, ElemKind kind) const
         return nullptr;
     const Rare* r = asObject(t->buffer)->rare();
     return r && r->ext && !static_cast<const BufferState*>(r->ext)->resizable ? t : nullptr;
+}
+
+bool Baseline::ssaLoadElim(ssa::Graph& g)
+{
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    if (std::getenv("SSA_NOELIM"))
+        return false;
+    static int left = std::getenv("SSA_ELIM") ? std::atoi(std::getenv("SSA_ELIM")) : 0x7fffffff;
+    if (left-- <= 0)
+        return false;
+#endif
+    const std::uint32_t nb = std::uint32_t(g.blocks.size());
+    // What is known to be in a slot: `obj` the value of the object (or a box, or none for an upvalue), `shape` the shape it
+    // was found to have (1: a box's value, 0: an upvalue).
+    struct Known
+    {
+        std::uint32_t obj, shape, index, value;
+    };
+    std::vector<std::vector<Known>> out(nb);
+    std::vector<std::uint8_t> done(nb, 0);
+    std::vector<std::uint32_t> alias(g.values.size());
+    for (std::uint32_t v = 0; v < alias.size(); ++v)
+        alias[v] = v;
+    auto real = [&](std::uint32_t v) {
+        while (v != ssa::kNone && alias[v] != v)
+            v = alias[v];
+        return v;
+    };
+    bool any = false;
+    for (std::uint32_t b = 1; b < nb; ++b) {
+        const ssa::Block& bl = g.blocks[b];
+        if (!bl.reached)
+            continue;
+        std::vector<Known> k;
+        bool first = true;
+        if (!bl.loopHeader)
+            for (std::uint32_t p : bl.preds) {
+                if (p >= b || !done[p]) {
+                    k.clear();
+                    break;
+                }
+                if (first) {
+                    k = out[p];
+                } else {
+                    for (std::size_t x = 0; x < k.size();) {
+                        bool same = false;
+                        for (const Known& o : out[p])
+                            same = same || (o.obj == k[x].obj && o.shape == k[x].shape && o.index == k[x].index && o.value == k[x].value);
+                        if (same) {
+                            ++x;
+                        } else {
+                            k[x] = k.back();
+                            k.pop_back();
+                        }
+                    }
+                }
+                first = false;
+            }
+        std::vector<std::uint32_t> names = bl.nameIn;
+        for (std::uint32_t& v : names)
+            v = real(v);
+        auto find = [&](std::uint32_t obj, std::uint32_t shape, std::uint32_t index) {
+            for (const Known& x : k)
+                if (x.obj == obj && x.shape == shape && x.index == index)
+                    return x.value;
+            return ssa::kNone;
+        };
+        auto forget = [&](std::uint32_t shape, std::uint32_t index) {
+            for (std::size_t x = 0; x < k.size();) {
+                if (k[x].shape == shape && (shape <= 1 || k[x].index == index)) {
+                    k[x] = k.back();
+                    k.pop_back();
+                } else {
+                    ++x;
+                }
+            }
+        };
+        for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(*code_, i)) {
+            const Ins& in = code_->code[i];
+            const Op op = in.opcode();
+            const opt::Effects e = ssa::effects(*code_, i);
+            ElemKind kind;
+            // Whatever could run other code, or write what is not known here: all of it is forgotten. (An element of a plain
+            // array may be the runtime's to find.)
+            const bool quiet = native_[i] && !((op == Op::GetElem || op == Op::PutElem) && !(op == Op::GetElem && ssaPrivateSite(i)) &&
+                                               ssaElemPlan(i, op == Op::PutElem, &kind) == 1);
+            // A value kept past the register it was read into has no owner of its own: an allocation may scan the frames, and a
+            // store of a counted frame may free what held it.
+            if (!quiet || op == Op::New || (!def_ && (op == Op::PutProp || op == Op::PutUpval || op == Op::PutBox || op == Op::PutElem)))
+                k.clear();
+            std::uint32_t found = ssa::kNone, obj = ssa::kNone, shape = 0, index = 0;
+            bool read = false;
+            if (native_[i] && op == Op::GetProp && !sval_[g.defBase[i]].isConst) {
+                const std::vector<ReadEntry> es = ssaReadEntries(i);
+                if (es.size() == 1 && !es[0].holder && !es[0].absent) {
+                    read = true;
+                    obj = names[in.b];
+                    shape = es[0].shape;
+                    index = es[0].index;
+                }
+            } else if (native_[i] && op == Op::GetUpval) {
+                read = true;
+                index = in.b;
+            } else if (native_[i] && op == Op::GetBox) {
+                read = true;
+                obj = names[in.b];
+                shape = 1;
+            }
+            if (read)
+                found = find(obj, shape, index);
+            if (found != ssa::kNone) {
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+                if (std::getenv("SSA_ELIMDBG"))
+                    std::fprintf(stderr, "elim %s @%u %s v%u := v%u\n", code_->name ? toUtf8(static_cast<StringCell*>(code_->name)->text()).c_str() : "anon", i, opName(op), g.defBase[i], found);
+#endif
+                alias[g.defBase[i]] = found;
+                g.defBase[i] = found;
+                elim_[i] = 1;
+                any = true;
+                names[in.a] = found;
+                continue;
+            }
+            if (native_[i] && (op == Op::PutProp || op == Op::InitProp)) {
+                const InlineCache& ic = code_->caches[code_->code[i + 1].a];
+                const std::uint32_t o = names[in.a];
+                if (ic.next == 0) {
+                    forget(ic.shape, ic.index);
+                    k.push_back({o, ic.shape, ic.index, names[in.c]});
+                } else {
+                    const std::size_t had = k.size();
+                    for (std::size_t x = 0; x < had; ++x)
+                        if (k[x].obj == o && k[x].shape == ic.shape)
+                            k.push_back({o, ic.next, k[x].index, k[x].value});
+                    k.push_back({o, ic.next, ic.index, names[in.c]});
+                }
+            } else if (op == Op::PutUpval || op == Op::PutBox) {
+                // A box and an upvalue may be the same variable.
+                forget(0, 0);
+                forget(1, 0);
+                if (native_[i] && op == Op::PutUpval)
+                    k.push_back({ssa::kNone, 0, in.a, names[in.b]});
+                else if (native_[i])
+                    k.push_back({names[in.a], 1, 0, names[in.b]});
+            }
+            if (op == Op::Mov) {
+                names[in.a] = names[in.b];
+                continue;
+            }
+            for (std::size_t w = 0; w < e.wr.size(); ++w)
+                names[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
+            if (read)
+                k.push_back({obj, shape, index, g.defBase[i]});
+            if (k.size() > 64)
+                k.clear();
+        }
+        out[b] = std::move(k);
+        done[b] = 1;
+    }
+    if (!any)
+        return false;
+    for (ssa::Block& bl : g.blocks) {
+        for (std::uint32_t& v : bl.nameIn)
+            v = real(v);
+        for (std::uint32_t& v : bl.nameOut)
+            v = real(v);
+    }
+    for (ssa::Value& sv : g.values)
+        for (std::uint32_t& v : sv.in)
+            v = real(v);
+    return true;
 }
 
 void Baseline::ssaForgetShapes()
@@ -2905,6 +3101,8 @@ bool Baseline::ssaNative(std::uint32_t i)
     }
     if (ssaOn_ < 2)
         return false;
+    if (elim_[i])
+        return true;
     const bool failed = i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed);
     auto plainConst = [&](std::uint32_t v) {
         if (!sval_[v].isConst)
@@ -3412,6 +3610,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         last[v] = std::max(last[v], at);
     };
     std::int32_t pos = 0;
+    usePos_.assign(n_, 0);
     std::vector<std::pair<std::int32_t, std::int32_t>> blockPos(nb, {-1, -1});
     std::vector<std::vector<std::int32_t>> uses(nv);
     for (std::uint32_t b = 1; b < nb; ++b) {
@@ -3436,6 +3635,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(*code_, i), ++k) {
             const Ins& in = code_->code[i];
             const std::int32_t use = pos++, def = pos++;
+            usePos_[i] = use;
             const opt::Effects e = ssa::effects(*code_, i);
             for (std::uint16_t r : e.rd)
             {
@@ -3582,6 +3782,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             sval_[v].slot = slots++;
         }
     }
+    firstPos_ = first;
+    lastPos_ = last;
     if (slots > 2048) {
         ssaWhy_ = "slots";
         return false;
@@ -3673,6 +3875,10 @@ std::vector<int> Baseline::ssaLiveRegs() const
             continue;
         out.push_back(sval_[v].rep == kRepF64 ? 100 + sval_[v].reg : sval_[v].reg);
     }
+    // A value kept for a later read of what it was read from (`ssaLoadElim`) is in no register's name meanwhile.
+    for (std::uint32_t v = 0; v < firstPos_.size(); ++v)
+        if (sval_[v].reg >= 0 && !sval_[v].isConst && firstPos_[v] <= usePos_[curIns_] && lastPos_[v] > usePos_[curIns_])
+            out.push_back(sval_[v].rep == kRepF64 ? 100 + sval_[v].reg : sval_[v].reg);
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;

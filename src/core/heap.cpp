@@ -470,6 +470,14 @@ void ContextImpl::recharge(GCObject* cell) noexcept
 
 void ContextImpl::reserveSlow(std::size_t bytes)
 {
+    // Garbage an engine holds back first, which costs no collection.
+    if (!tearingDown && !destroying && bytes <= options.memoryLimit) {
+        bool heldBack = false;
+        for (std::size_t i = 0; i < runtimeCount_; ++i)
+            heldBack = runtimes_[i]->freeHeldBack() || heldBack;
+        if (heldBack && heapBytes + bytes <= options.memoryLimit)
+            return;
+    }
     // Garbage in unreachable cycles may be what stands in the way (unless the host collects them itself).
     if (!tearingDown && !destroying && bytes <= options.memoryLimit && options.cycles == Context::Options::Cycles::Auto)
         collectCycles();
@@ -481,10 +489,19 @@ void ContextImpl::collectIfDue()
 {
     if (tearingDown || destroying)
         return;
-    const std::uint64_t cells = liveObjects + liveStrings;
-    const bool overBudget = options.memoryLimit && heapBytes > options.memoryLimit;
+    std::uint64_t cells = liveObjects + liveStrings;
+    bool overBudget = options.memoryLimit && heapBytes > options.memoryLimit;
     if (!overBudget && heapBytes < nextGcBytes && cells < nextGcCells)
         return;
+    bool heldBack = false;
+    for (std::size_t i = 0; i < runtimeCount_; ++i)
+        heldBack = runtimes_[i]->freeHeldBack() || heldBack;
+    if (heldBack) {
+        cells = liveObjects + liveStrings;
+        overBudget = options.memoryLimit && heapBytes > options.memoryLimit;
+        if (!overBudget && heapBytes < nextGcBytes && cells < nextGcCells)
+            return;
+    }
 
     // Mostly the cells made since the last time: cycles of a closure and its own cell die young. All of it when the heap
     // has doubled since it last was looked at whole, or is over its limit. A host that collects itself: nothing here.

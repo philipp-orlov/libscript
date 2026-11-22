@@ -196,6 +196,15 @@ void Baseline::ssaSyncEmit(const std::vector<unsigned>& set)
     for (unsigned r : set)
         if (frame_[r] != name_[r])
             todo.push_back(r);
+    if (def_) {
+        // A deferred frame: the slots hold their values without counts.
+        for (unsigned r : todo) {
+            loadValue(name_[r], RAX);
+            a_.mov(R(r), RAX);
+            frame_[r] = name_[r];
+        }
+        return;
+    }
     for (unsigned r : todo)
         if (mayBeCell(name_[r])) {
             loadValue(name_[r], RAX);
@@ -1070,6 +1079,10 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         // A slot the code takes to hold no cell, dead here: what the baseline code left there goes.
         for (unsigned r = 0; r < nregs; ++r)
             if (neverCell_[r] && !ssa::bitTest(bl.liveIn, r)) {
+                if (def_) {
+                    a_.mov(R(r), std::int32_t(kUndefined));
+                    continue;
+                }
                 a_.mov(RDX, R(r));
                 a_.mov(R(r), std::int32_t(kUndefined));
                 release(RDX);
@@ -2089,10 +2102,14 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
             retain(RCX);
         a_.mov(slot, RCX);
     }
-    // Into the result's slot, which owns it.
-    a_.mov(RDI, R(in.a));
-    a_.mov(R(in.a), RAX);
-    release(RDI);
+    // Into the result's slot, which owns it (a deferred one holds it without a count, as the table does).
+    if (def_) {
+        a_.mov(R(in.a), RAX);
+    } else {
+        a_.mov(RDI, R(in.a));
+        a_.mov(R(in.a), RAX);
+        release(RDI);
+    }
     a_.mov(RAX, R(in.a));
     a_.jmp(after);
     a_.bind(slowAlloc);
@@ -2442,7 +2459,8 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
         a_.cmpI(RDI, std::int32_t(kNull));
         a_.jcc(CNE, thisOk);
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
-        a_.inc32(mem(RDI, kHdrRc));
+        if (!def_)
+            a_.inc32(mem(RDI, kHdrRc));
         a_.mov(R(base + 1), RDI);
         a_.bind(thisOk);
     }
@@ -3621,7 +3639,7 @@ void Baseline::ssaRet(std::uint32_t i)
     const std::uint32_t v = name_[in.a];
     loadValue(v, RAX);
     int movedFrom = -1;
-    if (mayBeCell(v)) {
+    if (mayBeCell(v) && !def_) {  // a deferred frame returns its result without a count
         for (unsigned r = 1u + code_->nparams; r < nregs && movedFrom < 0; ++r)
             if (frame_[r] == v) {
                 a_.mov(R(r), std::int32_t(kUndefined));

@@ -49,6 +49,9 @@ struct EngineRuntime
     /// Break the reference cycles among the cells this engine owns that nothing outside them refers to. `minor`: only
     /// the cells made since the last collection are looked at.
     virtual void collectCycles(bool minor) noexcept { (void)minor; }
+    /// Free garbage the engine holds back (a zero-count table): true when there was some. A budget that is crossed asks
+    /// this first, and collects only if it is crossed still.
+    virtual bool freeHeldBack() noexcept { return false; }
     /// Around a collection: an engine whose stack holds values without counts counts them for the time it runs.
     virtual void rootsBegin() noexcept {}
     virtual void rootsEnd() noexcept {}

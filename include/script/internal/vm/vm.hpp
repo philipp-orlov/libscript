@@ -174,6 +174,7 @@ struct VM : EngineRuntime
     void afterCollect() noexcept override;
     void collectCycles(bool minor) noexcept override;
     void rootsBegin() noexcept override;
+    bool freeHeldBack() noexcept override;
     void rootsEnd() noexcept override;
     std::uint64_t ownedBytes() const noexcept override { return ownedBytes_; }
     std::uint64_t ownedBytes_ = 0;
@@ -592,6 +593,38 @@ private:
     void destroyNow(CellPtr cell) noexcept;
     friend struct Shape;
 };
+
+// A frame register written by the runtime in either mode (`VM::deferred`: frames hold values without counts).
+/// = `value`, whose count the caller has taken.
+inline void setRegister(VM& vm, JSValue& slot, JSValue value) noexcept
+{
+    if (vm.deferred) {
+        slot = value;
+        vm.releaseDeferred(value);
+        return;
+    }
+    const JSValue old = slot;
+    slot = value;
+    release(old);
+}
+/// = `value`, which the caller holds.
+inline void copyRegister(VM& vm, JSValue& slot, JSValue value) noexcept
+{
+    if (!vm.deferred)
+        retain(value);
+    const JSValue old = slot;
+    slot = value;
+    if (!vm.deferred)
+        release(old);
+}
+/// Undefined, what it held let go of.
+inline void clearRegister(VM& vm, JSValue& slot) noexcept
+{
+    const JSValue old = slot;
+    slot = JSValue::undefined();
+    if (!vm.deferred)
+        release(old);
+}
 
 /// The language registration of JavaScript on this core.
 const LanguageInfo& javascriptLanguage() noexcept;

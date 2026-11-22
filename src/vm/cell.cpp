@@ -48,7 +48,8 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
     ctx.maybeCollect();
     // The context's budget counts heap bytes, which the buffers of arrays and strings do not add to: a program that makes
     // little garbage of cells with large buffers would hold on to a lot of memory. Cells are counted as well.
-    if (liveCells >= cellBudget_ && deferredFree_.empty() && !ctx.tearingDown && !ctx.destroying) [[unlikely]] {
+    if (liveCells >= cellBudget_ && deferredFree_.empty() && !ctx.tearingDown && !ctx.destroying &&
+        !(freeHeldBack() && liveCells < cellBudget_)) [[unlikely]] {
         // A minor collection frees young cycles only; once the cells have more than doubled since a whole look, take one.
         const bool full = liveCells > cellsAfterFull_ * 2 + kMinCellBudget;
         if (ctx.options.cycles == Context::Options::Cycles::Auto)
@@ -655,8 +656,17 @@ void VM::auditCounts() noexcept
         const CellHeader* h = headerOf(c);
         if ((h->flags & cellflags::kImmortal) || h->rc >= n)
             continue;
-        std::fprintf(stderr, "audit: cell %p kind %d class %d count %u, held %u times\n", static_cast<void*>(c), int(kindOf(c)),
+        std::fprintf(stderr, "audit: cell %p kind %d class %d count %u, held %u times", static_cast<void*>(c), int(kindOf(c)),
                      int(h->cls), h->rc, n);
+        if (holder.count(c))
+            std::fprintf(stderr, " (by %p kind %d class %d)", static_cast<void*>(holder[c]), int(kindOf(holder[c])),
+                         int(headerOf(holder[c])->cls));
+        if (frameTop > frameBase) {
+            const Frame* f = frameTop - 1;
+            std::fprintf(stderr, " in %s at %ld", f->code->name ? toUtf8(static_cast<StringCell*>(f->code->name)->text()).c_str() : "anon",
+                         f->pc ? long(f->pc - f->code->code.data()) : -1L);
+        }
+        std::fprintf(stderr, "\n");
         ++bad;
     }
     if (bad)
@@ -752,6 +762,14 @@ void VM::freeZct() noexcept
         detail::destroyUnreferenced(zctOld_[k]);
     zctOld_.clear();
     --immediate_;
+}
+
+bool VM::freeHeldBack() noexcept
+{
+    if (!deferred || !zctCount() || immediate_ || destroying_ || tearingDown)
+        return false;
+    scanZct();
+    return true;
 }
 
 void VM::rootsBegin() noexcept

@@ -4385,9 +4385,12 @@ int jitIterClose(VM& vm, std::uint32_t index)
     return isFunction(c.R[c.ins->a + 1]) ? 2 : 1;
 }
 
-void jitUnwrapBound(JSValue* R, std::uint32_t base)
+void jitUnwrapBound(VM& vm, JSValue* R, std::uint32_t base)
 {
-    unwrapBound<false>(R, base);  // compiled code runs in contexts that count their frames
+    if (vm.deferred)
+        unwrapBound<true>(R, base);
+    else
+        unwrapBound<false>(R, base);
 }
 
 JSArray* jitCaptureArguments(VM& vm, const CodeBlock* c, const JSValue* args, std::uint32_t argc)

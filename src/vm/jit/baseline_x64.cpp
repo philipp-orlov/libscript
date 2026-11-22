@@ -163,6 +163,21 @@ const bool stepCensus = [] {
 }();
 #endif
 
+/// What compiled code is handed in a deferred frame: a value it does not own. The runtime's answer, owned, loses its count
+/// (and waits in the zero-count table if that was the last); nothing runs before compiled code stores it in a frame.
+inline std::uint64_t handOver(VM& vm, std::uint64_t bits) noexcept
+{
+    if (vm.deferred && bits)
+        vm.releaseDeferred(JSValue::raw(bits));
+    return bits;
+}
+
+/// `handOver` of a step's answer: the result of a frame the interpreter returned from, or a step code.
+inline std::uint64_t handOverStep(VM& vm, std::uint64_t r) noexcept
+{
+    return r == kStepFall || r == kStepJump ? r : handOver(vm, r);
+}
+
 extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
 {
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -174,7 +189,7 @@ extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
     }
 #endif
     try {
-        return stepInstruction(*vm, index);
+        return handOverStep(*vm, stepInstruction(*vm, index));
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -187,7 +202,7 @@ extern "C" std::uint64_t scriptVmJitThrow(VM* vm, std::uint32_t index)
     if (pendingException)
         return 0;
     try {
-        return stepThrow(*vm, index);
+        return handOverStep(*vm, stepThrow(*vm, index));
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -287,7 +302,7 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
             retireTier2(*vm, code);
             if (code->tier2Tries)
                 --code->tier2Tries;
-            return stepInstruction(*vm, index);
+            return handOverStep(*vm, stepInstruction(*vm, index));
         }
         // A global read or write leaves when the global object has changed since the code was made, which the next compile
         // takes in; it is marked as one that cannot be guarded only when that keeps happening.
@@ -380,7 +395,7 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
             if (code->tier2Tries)
                 --code->tier2Tries;
         }
-        return r;
+        return handOverStep(*vm, r);
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -601,7 +616,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     }
 #endif
     if (ins->opcode() == Op::Call)
-        jitUnwrapBound(R, base);
+        jitUnwrapBound(vm, R, base);
     const JSValue callee = R[base];
     const bool isNew = ins->opcode() == Op::New;
     const bool isSuper = ins->opcode() == Op::SuperCall;  // the parent's constructor, on the `this` the derived one holds
@@ -624,9 +639,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
             const JSValue pv = *f->slotAt(2);
             Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
             JSObject* made = vm.newObject(root, 3);
-            const JSValue old = R[base + 1];
-            R[base + 1] = toJSValue(made);
-            release(old);
+            setRegister(vm, R[base + 1], toJSValue(made));
         }
         vm.stackTop = R + code->nregs;
         const JSValue saved = vm.newTarget;
@@ -643,7 +656,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
                 asObject(res)->setProto(vm, asObject(R[base + 1])->proto(vm));
             }
         }
-        return {res.bits, 1};
+        return {handOver(vm, res.bits), 1};
     }
     CodeBlock* c = f->code;
     if (c->flags & CodeBlock::kLazy)
@@ -669,16 +682,10 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         const JSValue pv = *f->slotAt(2);
         Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object);
         JSObject* made = vm.newObject(root, newSlotsOf(f->code, root));
-        const JSValue old = R[base + 1];
-        R[base + 1] = toJSValue(made);
-        release(old);
+        setRegister(vm, R[base + 1], toJSValue(made));
     }
-    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && newR[0].isNullish()) {
-        const JSValue old = newR[0];
-        newR[0] = toJSValue(vm.global);
-        retain(newR[0]);
-        release(old);
-    }
+    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && newR[0].isNullish())
+        copyRegister(vm, newR[0], toJSValue(vm.global));
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
     JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? jitCaptureArguments(vm, c, newR + 1, argc) : nullptr;
     if (newR + c->nregs + 1 > vm.stackInit) [[unlikely]]
@@ -689,24 +696,16 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         // frame makes in turn may reach past its end into them.
         JSValue* callerEnd = R + code->nregs;
         const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
-        for (std::uint32_t i = keep; i < overlap; ++i) {
-            const JSValue v = newR[i];
-            newR[i] = JSValue::undefined();
-            release(v);
-        }
-        for (std::uint32_t i = std::max(keep, overlap); i < 1 + argc && i < c->nregs; ++i) {
-            const JSValue v = newR[i];
-            newR[i] = JSValue::undefined();
-            release(v);
-        }
+        for (std::uint32_t i = keep; i < overlap; ++i)
+            clearRegister(vm, newR[i]);
+        for (std::uint32_t i = std::max(keep, overlap); i < 1 + argc && i < c->nregs; ++i)
+            clearRegister(vm, newR[i]);
     }
     if (argsArray) {
         // In the register after the parameters, which the clearing above left empty.
         if (newR + 1 + c->nparams >= vm.stackInit)
             vm.fillStack(newR + 2 + c->nparams);
-        const JSValue old = newR[1 + c->nparams];
-        newR[1 + c->nparams] = toJSValue(argsArray);
-        release(old);
+        setRegister(vm, newR[1 + c->nparams], toJSValue(argsArray));
     }
     *vm.frameTop++ =
         Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, construct, true,
@@ -723,7 +722,7 @@ extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
     try {
         const JSValue pv = *f->slotAt(2);
         Shape* root = vm->rootShapeFor(isObject(pv) ? asObject(pv) : vm->protos.object);
-        return toJSValue(vm->newObject(root, newSlotsOf(f->code, root))).bits;
+        return handOver(*vm, toJSValue(vm->newObject(root, newSlotsOf(f->code, root))).bits);
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -770,7 +769,7 @@ extern "C" std::uint64_t scriptVmJitNative(VM* vm, JSFunction* f, JSValue* thisA
         vm->newTarget = JSValue::undefined();
         const JSValue res = r->native(*vm, thisAndArgs[0], thisAndArgs + 1, argc, r->nativeData);
         vm->newTarget = saved;
-        return res.bits;
+        return handOver(*vm, res.bits);
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -803,10 +802,18 @@ extern "C" JSObject* scriptVmSsaNewObject(VM* vm, std::uint32_t shape, std::uint
                                                        std::uint8_t(aux)));
         o->h.shape = shape;
         o->slots = nullptr;
+        handOver(*vm, toJSValue(o).bits);
         return o;
     } catch (...) {
         return nullptr;
     }
+}
+
+/// Undefined in `count` registers from `first`, which hold no count (a deferred frame).
+extern "C" void scriptVmJitClearPlain(JSValue* first, std::uint32_t count)
+{
+    for (std::uint32_t i = 0; i < count; ++i)
+        first[i] = JSValue::undefined();
 }
 
 /// Let go of `count` registers from `first` and leave undefined in them.
@@ -923,6 +930,7 @@ public:
     Baseline(VM& vm, CodeBlock* code)
         : vm_(vm), code_(code), n_(std::uint32_t(code->code.size())), at_(n_ + 1), offsets_(n_ + 1, ~0u)
     {
+        def_ = vm.deferred;
     }
 
     /// The optimizing tier for the function this was made for, given the analysis of it; null when there is no room.
@@ -965,6 +973,9 @@ public:
 
 private:
     VM& vm_;
+    /// `VM::deferred`: frame registers hold values without counts, and so does this code in its machine registers. It
+    /// counts only what it stores into cells; a value a call into the runtime hands it is one it does not own.
+    bool def_ = false;
     CodeBlock* code_;
     std::uint32_t n_;
     Asm a_;
@@ -1189,6 +1200,12 @@ private:
         a_.mov(RAX, mem(R12, atVm(&vm_.liveCells)));
         a_.cmp(RAX, mem(R12, atVm(&vm_.cellBudget_)));
         a_.jcc(CAE, slow);
+        if (def_) {
+            // Held by a frame only, the cell goes into the zero-count table: the runtime's way when that is full.
+            a_.mov(RSI, mem(R12, atVm(&vm_.zctTop_)));
+            a_.cmp(RSI, mem(R12, atVm(&vm_.zctEnd_)));
+            a_.jcc(CAE, slow);
+        }
         // A slot of the current block: a free one, or one not carved yet.
         Label carve, got;
         a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.heap.currentBlockOf(bytes)));
@@ -1213,7 +1230,16 @@ private:
         if (shapeInR8)
             a_.or_(RSI, R8);
         a_.mov(mem(RAX, 0), RSI);
-        a_.mov(mem(RAX, 8), 1);
+        if (def_) {
+            a_.movImm(RSI, std::uint64_t(VM::kInZct) << 32);  // no count, and in the table
+            a_.mov(mem(RAX, 8), RSI);
+            a_.mov(RSI, mem(R12, atVm(&vm_.zctTop_)));
+            a_.mov(mem(RSI, 0), RAX);
+            a_.aluI(0, RSI, 8);
+            a_.mov(mem(R12, atVm(&vm_.zctTop_)), RSI);
+        } else {
+            a_.mov(mem(RAX, 8), 1);
+        }
         a_.aluI(0, mem(RCX, at(&ctx.heapBytes)), std::int32_t(bytes));
         a_.aluI(0, mem(RCX, at(&ctx.totalAllocated)), std::int32_t(bytes));
         a_.aluI(0, mem(RCX, at(&ctx.liveObjects)), 1);
@@ -1610,6 +1636,8 @@ private:
     }
     void ownRegs(const std::vector<unsigned>& regs)
     {
+        if (def_)
+            return;  // no frame holds a count
         for (unsigned r : regs) {
             a_.mov(RAX, R(r));
             retain(RAX);
@@ -2088,10 +2116,20 @@ private:
         a_.call(free_);
         a_.bind(done);
     }
+    /// The count a frame register holds of the value in `r`, about to go there: none in a deferred frame (`def_`).
+    void retainF(Reg r)
+    {
+        if (!def_)
+            retain(r);
+    }
     /// R[dst] = the value in rax, not yet counted: counted, and the old value let go, unless the register holds the same
     /// value already (a read of what it read before), which then has its count. Clobbers rdx, rdi.
     void writeCounting(unsigned dst)
     {
+        if (def_) {
+            a_.mov(R(dst), RAX);
+            return;
+        }
         if (fnBorrowed(dst)) {
             write(dst, RAX);
             return;
@@ -2113,6 +2151,10 @@ private:
     /// R[dst] = the value in `v`, whose count the caller has taken; the old value is let go. Clobbers rdx, rdi.
     void write(unsigned dst, Reg v, bool oldIsNumber = false)
     {
+        if (def_) {
+            a_.mov(R(dst), v);
+            return;
+        }
         if (oldIsNumber || (dst < plainRegs_.size() && plainRegs_[dst]) || fnBorrowed(dst)) {
             a_.mov(R(dst), v);
             return;
@@ -2584,6 +2626,12 @@ private:
     /// covered or not.
     void clearWindow(std::uint32_t i, unsigned base, unsigned argc, unsigned window, Label& helper)
     {
+        if (def_) {
+            // Dead temporaries of the caller: nothing counted to let go of.
+            for (unsigned r = 1 + argc; r < window; ++r)
+                a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+            return;
+        }
         for (unsigned r = 1 + argc; r < window; ++r) {
             if (windowPlain(i, base + 1 + r)) {
                 a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
@@ -2607,7 +2655,7 @@ private:
     }
     void clearReg(unsigned r)
     {
-        if (r < plainRegs_.size() && plainRegs_[r]) {
+        if (def_ || (r < plainRegs_.size() && plainRegs_[r])) {
             a_.mov(R(r), std::int32_t(kUndefined));  // never a cell here (`plainRegs_`)
             return;
         }
@@ -2642,6 +2690,7 @@ private:
     void cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void putPropKnown(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
     void ret(std::uint32_t i, const Ins& in, bool numberInRax = false, const std::vector<std::uint64_t>* dirty = nullptr);
+    void retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, bool constructs, const std::vector<std::uint64_t>* dirty);
     /// Per instruction: the registers that may have been written since the frame began (one bit each), or empty when
     /// that is not known (`planDirty`). Those that were not are undefined still, and a return leaves them be.
     std::vector<std::vector<std::uint64_t>> dirtyIn_;
@@ -3038,7 +3087,7 @@ void Baseline::emit(std::uint32_t i)
     case Op::LoadK: {
         const JSValue k = code_->consts[in.kIndex()];
         a_.movImm(RAX, k.bits);
-        if (k.isCell())
+        if (k.isCell() && !def_)
             a_.inc32(mem(RAX, kHdrRc));
         write(in.a, RAX);
         return;
@@ -3787,7 +3836,7 @@ void Baseline::typeOf(std::uint32_t i, const Ins& in)
         a_.jmp(done);
     }
     a_.bind(done);
-    retain(RAX);
+    retainF(RAX);
     write(in.a, RAX);
 }
 
@@ -5101,7 +5150,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.cmpI(RDI, std::int32_t(kNull));
             a_.jcc(CNE, thisOk);
             a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
-            a_.inc32(mem(RDI, kHdrRc));
+            if (!def_)
+                a_.inc32(mem(RDI, kHdrRc));
             a_.mov(R(base + 1), RDI);
             a_.bind(thisOk);
         }
@@ -5229,9 +5279,13 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.jcc(CE, exc);
             a_.bind(made);
         }
-        a_.mov(RDI, R(base + 1));
-        a_.mov(R(base + 1), RAX);
-        release(RDI);
+        if (def_) {
+            a_.mov(R(base + 1), RAX);
+        } else {
+            a_.mov(RDI, R(base + 1));
+            a_.mov(R(base + 1), RAX);
+            release(RDI);
+        }
         a_.mov(RAX, R(base));
         a_.mov(RCX, mem(RAX, kFnCode));
         a_.mov(RDX, mem(RCX, kCbTier1));
@@ -5311,6 +5365,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             unpackAt(RSI, RCX);
         }
         write(in.a, RAX);
+        if (def_ && argc == 0)
+            release(RAX);  // the array's count of what it held: the frame holds it without one
         a_.jmp(afterCall);
         a_.bind(generic);
     }
@@ -5367,7 +5423,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RAX, mem(RCX, RDX, 8));
         a_.cmpI(RAX, std::int32_t(kUndefined));
         a_.jcc(CE, generic);
-        retain(RAX);
+        retainF(RAX);
         write(in.a, RAX);
         a_.jmp(afterCall);
         a_.bind(generic);
@@ -5444,6 +5500,70 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     restorePool(i);
 }
 
+/// `ret` of a deferred frame: the result goes back as the frame holds it, without a count (`enterTier1` takes one for C++),
+/// and the registers are cleared without a look.
+void Baseline::retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, bool constructs,
+                           const std::vector<std::uint64_t>* dirty)
+{
+    (void)i;
+    // Registers no path to here has written are undefined still. (The arguments object is put in its register by the
+    // call, not by an instruction.)
+    const unsigned argsReg = (code_->flags & CodeBlock::kNeedsArgs) ? 1u + code_->nparams : ~0u;
+    auto needs = [&](unsigned r) {
+        return !dirty || r == argsReg || (r / 64 < dirty->size() && ((*dirty)[r / 64] >> (r % 64) & 1));
+    };
+    if (!numberInRax)
+        a_.mov(RAX, R(in.a));
+    if (constructs) {
+        // A constructor's result that is not an object is `this`.
+        Label have, useThis;
+        a_.cmpI8(mem(R13, kFrameConstruct), 0);
+        a_.jcc(CE, have);
+        if (!numberInRax) {
+            a_.test(RAX, R15);
+            a_.jcc(CNE, useThis);
+            a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+            a_.jcc(CE, have);
+        }
+        a_.bind(useThis);
+        a_.mov(RAX, R(0));
+        a_.bind(have);
+    }
+    // A parameter the caller gave no argument for is this frame's; the arguments are the caller's.
+    const unsigned first = 1 + code_->nparams;
+    for (unsigned p = 1; p <= code_->nparams; ++p) {
+        if (!needs(p))
+            continue;
+        Label skip;
+        a_.cmpI32(mem(R13, kFrameArgc), std::int32_t(p));
+        a_.jcc(CAE, skip);
+        a_.mov(R(p), std::int32_t(kUndefined));
+        a_.bind(skip);
+    }
+    if (code_->nregs > first) {
+        const unsigned count = code_->nregs - first;
+        unsigned written = 0;
+        for (unsigned r = first; r < code_->nregs; ++r)
+            written += needs(r) ? 1 : 0;
+        if (written <= 48) {
+            for (unsigned r = first; r < code_->nregs; ++r)
+                if (needs(r))
+                    a_.mov(R(r), std::int32_t(kUndefined));
+        } else {
+            a_.mov(mem(RSP, 0), RAX);
+            a_.lea(RDI, R(first));
+            a_.movImm(RSI, count);
+            a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitClearPlain));
+            a_.mov(RAX, mem(RSP, 0));
+        }
+    }
+    a_.mov(mem(R12, kVmFrameTop), R13);
+    a_.aluI(0, RSP, 8 + spill_);
+    a_.pop(R13);
+    a_.pop(RBX);
+    a_.ret();
+}
+
 void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::vector<std::uint64_t>* dirty)
 {
     // Registers no path to here has written are undefined still: nothing to clear.
@@ -5458,6 +5578,10 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
     const bool taken = optimizing() && !numberInRax && in.a >= first && in.a < code_->nregs;
     // Optimized code runs no frame `new` made (it enters the baseline code), so its result is what it returns.
     const bool constructs = !optimizing() && (code_->constructor || (code_->flags & CodeBlock::kClassConstructor));
+    if (def_) {
+        retDeferred(i, in, numberInRax, constructs, dirty);
+        return;
+    }
     Label have;
     if (!numberInRax)
         a_.mov(RAX, R(in.a));
@@ -5836,6 +5960,9 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
         pendingException = nullptr;
         std::rethrow_exception(e);
     }
+    // Compiled code of a deferred frame returns what it does not own: C++ gets a count of its own.
+    if (vm.deferred && bits)
+        retain(JSValue::raw(bits));
     return JSValue::raw(bits);
 }
 

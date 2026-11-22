@@ -359,7 +359,7 @@ bool Baseline::inlineDeliver(InlineCtx& cx, const IVal& v, unsigned dst)
     if (emit) {
         inlineBoxed(v);
         if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
-            retain(RAX);
+            retainF(RAX);
         write(dst, RAX);
     }
     return true;
@@ -1328,7 +1328,7 @@ void Baseline::planFnBorrows()
         }
     }
     for (unsigned r = first; r < code_->nregs; ++r)
-        if (cand[r] && !bad[r])
+        if (cand[r] && !bad[r] && !def_)  // a deferred frame holds every register without a count anyway
             fnBorrow_.insert(r);
     gated_ = !fnBorrow_.empty() || !calleeReads_.empty();
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -1542,7 +1542,7 @@ void Baseline::writePending(std::uint32_t point)
         return;
     for (const auto& [reg, v] : it->second) {
         a_.movImm(RAX, v.bits);
-        if (v.isCell())
+        if (v.isCell() && !def_)
             a_.inc32(mem(RAX, kHdrRc));
         write(reg, RAX);
     }
@@ -1639,7 +1639,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
         a_.cmpI(RDI, std::int32_t(kNull));
         a_.jcc(CNE, thisOk);
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
-        a_.inc32(mem(RDI, kHdrRc));
+        if (!def_)
+            a_.inc32(mem(RDI, kHdrRc));
         a_.mov(R(base + 1), RDI);
         a_.bind(thisOk);
     }
@@ -1735,11 +1736,8 @@ void Baseline::emitDirectCall(std::uint32_t i)
     call(i, in);
     if (auto wc = windowCleanup_.find(i); wc != windowCleanup_.end()) {
         // What another callee may have left in its parameters, which this code takes for plain values.
-        for (unsigned r : wc->second) {
-            a_.mov(RDX, R(r));
-            a_.mov(R(r), std::int32_t(kUndefined));
-            release(RDX);
-        }
+        for (unsigned r : wc->second)
+            clearReg(r);
     }
     if (borrowing) {
         restorePool(i);
@@ -2514,7 +2512,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             continue;
         }
         int from = -1;
-        if (v.kind == IVal::Box && v.frameReg > int(code_->nparams) && v.slot > -2 && !movedFrom.count(v.frameReg) &&
+        // (A deferred register has no count for the object to take.)
+        if (!def_ && v.kind == IVal::Box && v.frameReg > int(code_->nparams) && v.slot > -2 && !movedFrom.count(v.frameReg) &&
             !fnBorrowed(unsigned(v.frameReg)) &&
             regDeadAfter(i, unsigned(v.frameReg))) {
             // The register dies here: the object takes its value with its count, and the register holds undefined.
@@ -2585,7 +2584,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                 continue;
             inlineBoxed(v);
             if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
-                retain(RAX);
+                retainF(RAX);
             write(base + unsigned(k), RAX);
         }
     }
@@ -2600,11 +2599,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             for (const auto& [k, v] : windowVal_.at(i))
                 if (k != 0)
                     regs.insert(base + unsigned(k));
-        for (unsigned r : regs) {
-            a_.mov(RDX, R(r));
-            a_.mov(R(r), std::int32_t(kUndefined));
-            release(RDX);
-        }
+        for (unsigned r : regs)
+            clearReg(r);
     }
     a_.jmp(done);  // where the typed result, if any, is loaded as on the way in place
     });
@@ -3348,6 +3344,8 @@ void Baseline::planLoopFacts()
 void Baseline::planBorrows()
 {
     borrows_.clear();
+    if (def_)
+        return;  // a deferred frame holds no count to let go of in a loop
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (std::getenv("T2NOBORROW"))
         return;

@@ -403,7 +403,16 @@ struct VM : EngineRuntime
     {
         if (o == global && globalWatch) [[unlikely]]
             globalWritten(slot);
+        else if (reinterpret_cast<const CellHeader*>(o)->flags & cellflags::kIsProto) [[unlikely]]
+            protoWritten(o);
     }
+    void protoWritten(const JSObject* o) noexcept;
+    /// Optimized code may take the method found on `holder`, through the prototypes from `first` on, for a constant: any
+    /// change of those moves `globalEpoch` from now on. False when they have changed too often.
+    bool watchMethod(JSObject* first, JSObject* holder);
+    /// Moves an object to shapes no inline cache has seen, so that every write of it goes through the runtime.
+    bool ownTree(JSObject* o);
+    void watchedChanged(Rare& r) noexcept;
     void globalWritten(const JSValue* slot) noexcept;
     /// Optimized code may take the value of the global object's slot `index` for a constant: watched from now on.
     bool watchGlobal(std::uint32_t index) noexcept;

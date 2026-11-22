@@ -871,8 +871,12 @@ void promoteStore(CodeBlock* code, InlineCache& ic, std::uint32_t shape) noexcep
 /// `PolyCache` (when `code` is given).
 void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key, CodeBlock* code = nullptr)
 {
-    if (hasElems(o) || o->cls() == ObjClass::Global || o == vm.global)  // (the global object's are watched: `slotWritten`)
+    // (The global object's and watched prototypes' writes are the runtime's: `slotWritten`.)
+    if (hasElems(o) || o->cls() == ObjClass::Global || o == vm.global)
         return;
+    if (o->isProto())
+        if (Rare* r = o->rare(); r && r->watched)
+            return;
     std::uint8_t attrs = 0;
     const std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
     if (index < 0 || !(attrs & attr::kWritable) || (attrs & attr::kAccessor))

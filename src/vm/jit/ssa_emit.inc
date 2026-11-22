@@ -783,6 +783,7 @@ Tier2Code* Baseline::compileSsa(const ssa::Graph& g, Tier1Code* base)
         case Op::LoadInt: bits = kNumberTag | std::uint32_t(std::int32_t(in.imm())); break;
         case Op::LoadK: bits = code_->consts[in.kIndex()].bits; break;  // the block holds it as long as this code
         case Op::GetGlobal: k = ssaGlobalConst(sv.at, &bits); break;
+        case Op::GetProp: k = ssaMethodConst(sv.at, &bits); break;
         default: k = false; break;
         }
         sval_[v].isConst = k;
@@ -1277,6 +1278,32 @@ bool Baseline::ssaGlobalConst(std::uint32_t i, std::uint64_t* bits)
     return true;
 }
 
+bool Baseline::ssaMethodConst(std::uint32_t i, std::uint64_t* bits)
+{
+    if (ssaOn_ < 2)
+        return false;
+    const std::vector<ReadEntry> es = ssaReadEntries(i);
+    JSValue f = JSValue::undefined();
+    for (const ReadEntry& e : es) {
+        const Shape* s = liveShape(e.shape);
+        if (!e.holder || e.absent || !s || !s->proto)
+            return false;
+        const JSValue v = *e.holder->slotAt(e.index);
+        if (!isFunction(v) || (!f.isUndefined() && v != f))
+            return false;
+        f = v;
+    }
+    if (f.isUndefined())
+        return false;
+    for (const ReadEntry& e : es)
+        if (!vm_.watchMethod(liveShape(e.shape)->proto, e.holder))
+            return false;
+    // (Watching moves a holder to another shape, not a property of it to another slot.)
+    holdValue(f);
+    *bits = f.bits;
+    return true;
+}
+
 void Baseline::ssaEpochCheck(std::uint32_t i)
 {
     if (epochSeen_)
@@ -1559,6 +1586,10 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         CodeBlock* callee = vm_.codeByUid(uid);
         const std::uint32_t vf = name_[in.a], vt = name_[in.a + 1u];
         Label no, yes;
+        const JSValue kf = sval_[vf].isConst ? JSValue::raw(sval_[vf].bits) : JSValue::undefined();
+        // A constant function of that code: nothing to test.
+        const bool sure = isFunction(kf) && callee && static_cast<JSFunction*>(asObject(kf))->code == callee;
+        if (!sure) {
         loadValue(vf, RAX);
         if (!known(vf, kVObj)) {
             a_.test(RAX, R15);
@@ -1579,6 +1610,7 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             a_.cmp(RDX, mem(RCX, kCbUid));
         }
         a_.jcc(CNE, no);
+        }
         if ((!callee || !(callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) &&
             !known(vt, kVObj)) {
             loadValue(vt, RAX);
@@ -1639,6 +1671,31 @@ bool Baseline::ssaGetProp(std::uint32_t i)
     if (es.empty())
         return false;
     const std::uint32_t v = name_[in.b];
+    if (const std::uint32_t d = ssa_->defBase[i]; sval_[d].isConst) {
+        // A method that stays as it is: what is left is the test that the receiver still inherits it.
+        Label& bad = ssaExit(i);
+        bool shapeKnown = false;
+        for (const ReadEntry& e : es)
+            shapeKnown = shapeKnown || (vShape_[v] && vShape_[v] == e.shape);
+        if (!shapeKnown) {
+            loadValue(v, RAX);
+            needObjV(v, RAX, bad);
+            Label ok;
+            for (std::size_t k = 0; k < es.size(); ++k) {
+                a_.cmpI32(mem(RAX, 0), std::int32_t(es[k].shape));
+                if (k + 1 < es.size())
+                    a_.jcc(CE, ok);
+                else
+                    a_.jcc(CNE, bad);
+            }
+            a_.bind(ok);
+            if (es.size() == 1)
+                ssaKnow(v, kVObj, es[0].shape);
+        }
+        ssaEpochCheck(i);
+        name_[in.a] = d;
+        return true;
+    }
     Label& bad = ssaExit(i);
     loadValue(v, RAX);
     needObjV(v, RAX, bad);
@@ -2485,16 +2542,26 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     throws_.emplace_back(i, Label{});
     Label& exc = throws_.back().second;
     // The register holds a function of that code (compared by uid: a block that died leaves no stale match).
-    a_.mov(RAX, R(base));
-    needObject(RAX, slow);
-    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
-    a_.jcc(CNE, slow);
-    a_.mov(RCX, mem(RAX, kFnCode));
-    a_.test(RCX, RCX);
-    a_.jcc(CE, slow);
-    a_.movImm(RDX, C->uid);
-    a_.cmp(RDX, mem(RCX, kCbUid));
-    a_.jcc(CNE, slow);
+    const std::uint32_t vf = name_[base];
+    const JSValue kf = vf != ssa::kNone && sval_[vf].isConst ? JSValue::raw(sval_[vf].bits) : JSValue::undefined();
+    if (isFunction(kf) && static_cast<JSFunction*>(asObject(kf))->code == C) {
+        // A constant one, of that code as long as it has not been given other code to run.
+        a_.movImm(RAX, kf.bits);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(C));
+        a_.cmp(RCX, mem(RAX, kFnCode));
+        a_.jcc(CNE, slow);
+    } else {
+        a_.mov(RAX, R(base));
+        needObject(RAX, slow);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+        a_.jcc(CNE, slow);
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.test(RCX, RCX);
+        a_.jcc(CE, slow);
+        a_.movImm(RDX, C->uid);
+        a_.cmp(RDX, mem(RCX, kCbUid));
+        a_.jcc(CNE, slow);
+    }
     a_.mov(RDX, mem(RCX, kCbTier1));
     a_.test(RDX, RDX);
     a_.jcc(CE, slow);

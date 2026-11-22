@@ -53,6 +53,9 @@ struct Rare
     Key fnName = nullptr;                 ///< holds a count
     std::uint32_t fnLength = 0;
     std::uint32_t fnState = 0;            ///< a native closure's own number, apart from its `length`
+    /// Optimized code takes a method found here, or past here, for a constant: a change of the object moves `globalEpoch`.
+    bool watched = false;
+    std::uint8_t watchBroken = 0;         ///< how often that has happened
     // A bound function: what it calls, with what `this` and what leading arguments. Each holds a count.
     JSValue boundTarget = JSValue::undefined();
     JSValue boundThis = JSValue::undefined();

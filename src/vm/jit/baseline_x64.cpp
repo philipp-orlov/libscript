@@ -310,6 +310,11 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                 kind = 2;
             }
         }
+        if (kind == 0 && code->tier2 && code->tier2->epoch != vm->globalEpoch) {
+            // Something it took for constant has changed: no site is to blame, and the next compile takes it in.
+            retireTier2(*vm, code);
+            return handOverStep(*vm, stepInstruction(*vm, index));
+        }
         if (kind == 2) {
             // Sites this code knew nothing of have run long enough: a new compile will know them (not a failure: no try
             // is used up).
@@ -475,9 +480,11 @@ int tier2Compiles = 0;
 /// Compile `code`'s optimized code and make it the function's entry; false when it could not be made.
 bool installTier2(VM* vm, CodeBlock* code)
 {
+    const std::uint32_t epoch = vm->globalEpoch;
     Tier2Code* t = compileOptimizedCode(*vm, code);
     if (!t)
         return false;
+    t->epoch = epoch;
     t->older = code->tier2;
     code->tier2 = t;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -2017,6 +2024,8 @@ private:
     std::vector<ReadEntry> ssaReadEntries(std::uint32_t i) const;
     /// The value of the global `GetGlobal` `i` reads, when it is taken for a constant (and watched from now on).
     bool ssaGlobalConst(std::uint32_t i, std::uint64_t* bits);
+    /// The method `GetProp` `i` always finds on a prototype, when it is taken for a constant (and watched from now on).
+    bool ssaMethodConst(std::uint32_t i, std::uint64_t* bits);
     /// What this code takes for constant still is, at instruction `i`: one look between two things that could change it.
     void ssaEpochCheck(std::uint32_t i);
     bool epochSeen_ = false;

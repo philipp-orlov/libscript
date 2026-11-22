@@ -144,6 +144,8 @@ void VM::invalidateChain(JSObject* proto)
     if (!r)
         return;
     SCRIPT_VM_CENSUS(ChainInvalidated);
+    if (r->watched)
+        watchedChanged(*r);
     if (r->validity) {
         r->validity->valid = 0;
         releaseValidity(r->validity);

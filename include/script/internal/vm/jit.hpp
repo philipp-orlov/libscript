@@ -65,6 +65,7 @@ struct BorrowInfo
 struct Tier2Code
 {
     BorrowInfo* borrow = nullptr;                                 ///< owned
+    std::uint32_t epoch = 0;                                      ///< `VM::globalEpoch` as it was made
     std::uint8_t* rx = nullptr;
     std::size_t bytes = 0;
     void* entry = nullptr;                                        ///< the function's entry, as the baseline code's

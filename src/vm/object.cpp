@@ -378,6 +378,12 @@ void VM::globalWritten(const JSValue* slot) noexcept
     }
 }
 
+void VM::protoWritten(const JSObject* o) noexcept
+{
+    if (Rare* r = const_cast<JSObject*>(o)->rare(); r && r->watched)
+        watchedChanged(*r);
+}
+
 bool VM::watchGlobal(std::uint32_t index) noexcept
 {
     // Written once or twice (a declaration, what initializes it) says nothing; more says it is a variable.

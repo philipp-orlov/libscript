@@ -272,7 +272,7 @@ Shape* VM::rootShapeFor(JSObject* proto, std::uint8_t aux)
     if (proto)
         first = &proto->rareOf(*this).childRoot;
     for (Shape* s = *first; s; s = s->nextAux)
-        if (s->aux == aux)
+        if (s->aux == aux && !(s->flags & Shape::kOwnRoot))
             return s;
     Shape* root = newShape();
     root->root = root;
@@ -298,6 +298,64 @@ Shape* VM::rootShapeFor(JSObject* proto, std::uint8_t aux)
     if (const int k = Shape::auxIndex(aux); k >= 0)
         root->base->auxIds[k] = root->id;
     return root;
+}
+
+bool VM::ownTree(JSObject* o)
+{
+    Shape* s = o->shapeOf(*this);
+    if (s->isDictionary()) {
+        o->dictionaryChanging(*this);  // a shape no cache has
+        return true;
+    }
+    // (A new tree each time: the write that ended the watch before may have put the shapes of the last one in a cache.)
+    Shape* first = rootShapeFor(s->proto, o->h.aux);
+    Shape* root = newShape();
+    root->root = root;
+    root->flags = Shape::kRoot | Shape::kOwnRoot;
+    root->aux = o->h.aux;
+    if (s->proto) {
+        root->proto = s->proto;
+        detail::incRef(reinterpret_cast<CellPtr>(s->proto));
+    }
+    root->base = first->base;
+    root->nextAux = first->base->nextAux;
+    first->base->nextAux = root;
+    Shape* t = root;
+    for (std::uint32_t i = 0; t && i < s->count; ++i) {
+        const Entry e = s->entryAt(i);
+        t = t->after(*this, e.key, e.attrs);
+    }
+    if (!t)
+        return false;
+    o->h.shape = t->id;
+    return true;
+}
+
+bool VM::watchMethod(JSObject* first, JSObject* holder)
+{
+    for (JSObject* p = first; p; p = p->proto(*this)) {
+        if (p->rareOf(*this).watchBroken >= 3)
+            return false;
+        if (p == holder)
+            break;
+    }
+    if (!holder->rare()->watched && !ownTree(holder))
+        return false;
+    for (JSObject* p = first; p; p = p->proto(*this)) {
+        p->rareOf(*this).watched = true;
+        p->h.flags |= cellflags::kIsProto;
+        if (p == holder)
+            break;
+    }
+    return true;
+}
+
+void VM::watchedChanged(Rare& r) noexcept
+{
+    r.watched = false;
+    if (r.watchBroken < 255)
+        ++r.watchBroken;
+    ++globalEpoch;
 }
 
 }  // namespace vm

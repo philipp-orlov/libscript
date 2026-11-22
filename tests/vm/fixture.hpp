@@ -36,6 +36,7 @@ struct Fixture
         script::Context::Options o;
         o.language = script::Language::JavaScript;
         o.core = script::Context::Options::Core::Vm;
+        o.memory = script::Context::Options::Memory::Counted;  // these tests watch counts and frees as they happen
         return o;
     }
 

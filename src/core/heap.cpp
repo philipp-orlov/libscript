@@ -499,6 +499,21 @@ void ContextImpl::collectIfDue()
 
 void ContextImpl::collectCycles(bool minor)
 {
+    // What the stacks of the engines hold counts as held from outside for the whole collection.
+    struct Roots
+    {
+        ContextImpl* cx;
+        explicit Roots(ContextImpl* c) noexcept : cx(c)
+        {
+            for (std::size_t i = 0; i < cx->runtimeCount_; ++i)
+                cx->runtimes_[i]->rootsBegin();
+        }
+        ~Roots()
+        {
+            for (std::size_t i = 0; i < cx->runtimeCount_; ++i)
+                cx->runtimes_[i]->rootsEnd();
+        }
+    } roots(this);
     ++gcRuns;
     // An engine with cells of its own looks at them first: what it frees may leave strings nothing names.
     for (std::size_t i = 0; i < runtimeCount_; ++i)

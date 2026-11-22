@@ -3,11 +3,14 @@
 
 // Allocating, sizing and destroying the cells of the new family. There are no virtual functions: each of these is a
 // switch on the cell's kind and class.
+#include <algorithm>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "script/internal/vm/census.hpp"
+#include "script/internal/vm/bytecode.hpp"
 #include "script/internal/vm/object.hpp"
 
 namespace script {
@@ -25,6 +28,10 @@ namespace {
     std::abort();
 }
 
+/// The `gc` word of a cell in the zero-count table. A collection rewrites the word of every cell it looks at, and leaves 0
+/// behind; it never runs with cells in the table.
+constexpr std::uint32_t kInZct = 1;
+
 }  // namespace
 
 // ---------------------------------------------------------------- allocation ---
@@ -34,8 +41,14 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
     if (bytes > mem::LocalHeap::kMaxSmall) [[unlikely]]
         throw Error(ErrorCode::OutOfMemory, "a cell of the vm core is larger than the heap's small limit");
     // Cells left to free (`Options::freeBudget`): some of them first.
-    if (!deferredFree_.empty() && !destroying_ && !ctx.tearingDown) [[unlikely]]
+    if (!deferredFree_.empty() && !destroying_ && !ctx.tearingDown) [[unlikely]] {
+        ++immediate_;
         freeDeferred(ctx.options.freeBudget);
+        --immediate_;
+    }
+    // The zero-count table is full (`deferred`): what no frame holds goes.
+    if (deferred && zct_.size() >= zctLimit_ && !destroying_ && !immediate_ && !ctx.tearingDown) [[unlikely]]
+        scanZct();
     ctx.maybeCollect();
     // The context's budget counts heap bytes, which the buffers of arrays and strings do not add to: a program that makes
     // little garbage of cells with large buffers would hold on to a lot of memory. Cells are counted as well.
@@ -342,6 +355,20 @@ void VM::destroy(CellPtr cell) noexcept
 {
     if (tearingDown)
         return;
+    // A frame may hold it without a count: it waits in the zero-count table for the next scan.
+    if (deferred && !immediate_) {
+        CellHeader* h = headerOf(cell);
+        if (h->gc != kInZct) {
+            try {
+                zct_.push_back(cell);
+                h->gc = kInZct;
+            } catch (...) {
+                // Out of memory: a collection finds it, as one with no count.
+            }
+            noteZct();
+        }
+        return;
+    }
     // A cell that frees a chain of cells does not recurse: what reaches zero meanwhile waits here.
     if (destroying_) {
         SCRIPT_VM_CENSUS(FreeDeferred);
@@ -510,10 +537,176 @@ void VM::freeDeferred(std::size_t max) noexcept
         destroy(c);  // frees up to the budget, and leaves the rest here again
         n += before > liveCells ? before - liveCells : 1;
     }
-    if (deferredFree_.empty() && !cellBudget_) {
-        cellBudget_ = savedCellBudget_ ? savedCellBudget_ : 64 * kMinCellBudget;
-        savedCellBudget_ = 0;
+    restoreCellBudget();
+}
+
+void VM::restoreCellBudget() noexcept
+{
+    if (!deferredFree_.empty() || (deferred && zct_.size() >= zctLimit_) || cellBudget_)
+        return;
+    cellBudget_ = savedCellBudget_ ? savedCellBudget_ : 64 * kMinCellBudget;
+    savedCellBudget_ = 0;
+}
+
+/// The table has grown to its limit: compiled code allocates through `allocCell` (cell budget 0), which scans.
+void VM::noteZct() noexcept
+{
+    if (zct_.size() >= zctLimit_ && cellBudget_) [[unlikely]] {
+        savedCellBudget_ = cellBudget_;
+        cellBudget_ = 0;
     }
+}
+
+void VM::countRoots(int delta) noexcept
+{
+    // Every register of a live frame, and those up to `stackTop`. Above them the stack holds undefined: what returns or
+    // unwinds clears its registers.
+    JSValue* hi = stackTop;
+    for (Frame* f = frameBase; f < frameTop; ++f)
+        if (f->R + f->code->nregs > hi)
+            hi = f->R + f->code->nregs;
+    if (hi > stackInit)
+        hi = stackInit;
+    for (JSValue* r = stackBase; r < hi; ++r) {
+        if (!r->isCell() || !isVmCell(r->asCell()))
+            continue;
+        CellHeader* h = headerOf(r->asCell());
+        if (delta > 0) {
+            ++h->rc;
+            continue;
+        }
+        // Held by a frame only: back in the table.
+        if (--h->rc == 0 && h->gc != kInZct) {
+            try {
+                zct_.push_back(r->asCell());
+                h->gc = kInZct;
+            } catch (...) {
+                // Out of memory: a collection finds it, as one with no count.
+            }
+        }
+    }
+}
+
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+/// Testing (`SCRIPT_VM_AUDIT`), with the frames' cells counted: every cell of this family has at least as many counts as
+/// cells and registers hold it. A cell with fewer is reported, and the process stops.
+void VM::auditCounts() noexcept
+{
+    static const bool on = std::getenv("SCRIPT_VM_AUDIT") != nullptr;
+    if (!on)
+        return;
+    std::unordered_map<CellPtr, std::uint32_t> refs;
+    std::unordered_map<CellPtr, CellPtr> holder;
+    std::unordered_map<CellPtr, bool> live;
+    heap.forEachSlot([](void* context, void* slot) { (*static_cast<std::unordered_map<CellPtr, bool>*>(context))[static_cast<CellPtr>(slot)] = true; },
+                     &live);
+    struct State
+    {
+        std::unordered_map<CellPtr, std::uint32_t>* refs;
+        std::unordered_map<CellPtr, CellPtr>* holder;
+        detail::GcList kids;
+    } st{&refs, &holder, {}};
+    heap.forEachSlot(
+        [](void* context, void* slot) {
+            auto& s = *static_cast<State*>(context);
+            s.kids.clear();
+            children(static_cast<CellPtr>(slot), s.kids);
+            for (detail::GCObject* k : s.kids)
+                if (k && isVmCell(k)) {
+                    ++(*s.refs)[k];
+                    (*s.holder)[k] = static_cast<CellPtr>(slot);
+                }
+        },
+        &st);
+    JSValue* hi = stackTop;
+    for (Frame* f = frameBase; f < frameTop; ++f)
+        if (f->R + f->code->nregs > hi)
+            hi = f->R + f->code->nregs;
+    if (hi > stackInit)
+        hi = stackInit;
+    for (JSValue* r = stackBase; r < hi; ++r)
+        if (r->isCell() && isVmCell(r->asCell()))
+            ++refs[r->asCell()];
+    int bad = 0;
+    for (JSValue* r = stackBase; r < hi; ++r)
+        if (r->isCell() && isVmCell(r->asCell()) && !live.count(r->asCell())) {
+            std::fprintf(stderr, "audit: register %ld holds freed cell %p\n", long(r - stackBase), static_cast<void*>(r->asCell()));
+            ++bad;
+        }
+    for (const auto& [c, n] : refs) {
+        if (!live.count(c)) {
+            std::fprintf(stderr, "audit: cell %p (kind %d) holds freed cell %p\n", static_cast<void*>(holder[c]),
+                         int(kindOf(holder[c])), static_cast<void*>(c));
+            ++bad;
+            continue;
+        }
+        const CellHeader* h = headerOf(c);
+        if ((h->flags & cellflags::kImmortal) || h->rc >= n)
+            continue;
+        std::fprintf(stderr, "audit: cell %p kind %d class %d count %u, held %u times\n", static_cast<void*>(c), int(kindOf(c)),
+                     int(h->cls), h->rc, n);
+        ++bad;
+    }
+    if (bad)
+        std::abort();
+}
+#endif
+
+void VM::scanZct() noexcept
+{
+    if (immediate_ || tearingDown || ctx.tearingDown)
+        return;
+    countRoots(1);
+    freeZct();
+    countRoots(-1);
+    // What stays (held by frames) and what the frames are, weighed against what a scan costs.
+    zctLimit_ = std::max<std::size_t>(zctMin_, 2 * (zct_.size()));
+    restoreCellBudget();
+}
+
+void VM::freeZct() noexcept
+{
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    auditCounts();
+#endif
+    ++immediate_;
+    // Every entry leaves the table. A cell at zero now is held by nothing: freeing it frees only what it alone held, none
+    // of which is in the table at zero (it had this cell's count).
+    Vec<CellPtr> cells;
+    cells.swap(zct_);
+    std::size_t kept = 0;
+    for (CellPtr c : cells) {
+        CellHeader* h = headerOf(c);
+        h->gc = 0;
+        if (h->rc == 0)
+            cells[kept++] = c;
+    }
+    cells.resize(kept);
+    for (CellPtr c : cells)
+        destroy(c);
+    --immediate_;
+}
+
+void VM::rootsBegin() noexcept
+{
+    if (!deferred || immediate_ || tearingDown)
+        return;
+    // The table is empty for the whole collection, which writes the `gc` word of every cell it looks at.
+    countRoots(1);
+    freeZct();
+    ++immediate_;
+    rootsCounted_ = true;
+}
+
+void VM::rootsEnd() noexcept
+{
+    if (!rootsCounted_)
+        return;
+    rootsCounted_ = false;
+    --immediate_;
+    countRoots(-1);
+    zctLimit_ = std::max<std::size_t>(zctMin_, 2 * (zct_.size()));
+    restoreCellBudget();
 }
 
 void VM::collectCycles(bool minor) noexcept
@@ -521,8 +714,11 @@ void VM::collectCycles(bool minor) noexcept
     if (destroying_ || tearingDown)
         return;
     // A cell left to free has no count: it is no garbage of a cycle, and goes first.
-    if (!deferredFree_.empty())
+    if (!deferredFree_.empty()) {
+        ++immediate_;
         freeDeferred(0);
+        --immediate_;
+    }
     // The world: the young cells of a minor collection, every cell otherwise. What lies outside it, and a cell that is never
     // freed, counts as a reference from outside.
     Vec<CellPtr> set;

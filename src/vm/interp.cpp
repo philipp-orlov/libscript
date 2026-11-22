@@ -98,27 +98,94 @@ constexpr std::uint32_t kOsrAfter = 1000;
     return strictEquals(a, b);
 }
 
+// Registers and counts. `Def` is `VM::deferred`: a register holds a cell of the new family without a count, and what no
+// register holds any more waits for the next scan of the frames. Strings, symbols and bigints are counted as before.
+
+/// A register = `value`, whose count the caller has taken: the register keeps it (`Def`: lets go of it).
+template <bool Def>
 [[gnu::always_inline]] inline void setReg(JSValue& slot, JSValue value) noexcept
 {
     const JSValue old = slot;
     slot = value;
-    release(old);
+    if constexpr (Def) {
+        releaseVm(value);
+        releaseOld(old);
+    } else {
+        release(old);
+    }
 }
 
+/// A register = `value`, which the caller holds.
+template <bool Def>
 [[gnu::always_inline]] inline void copyReg(JSValue& slot, JSValue value) noexcept
 {
-    retain(value);
-    setReg(slot, value);
+    if constexpr (Def) {
+        retainOld(value);
+        const JSValue old = slot;
+        slot = value;
+        releaseOld(old);
+    } else {
+        retain(value);
+        setReg<false>(slot, value);
+    }
 }
 
-/// Let go of registers [from, to) and leave undefined in them.
+/// Let go of what a register holds and leave undefined in it.
+template <bool Def>
+[[gnu::always_inline]] inline void clearReg(JSValue& slot) noexcept
+{
+    const JSValue v = slot;
+    slot = JSValue::undefined();
+    if constexpr (Def)
+        releaseOld(v);
+    else
+        release(v);
+}
+
+/// `clearReg` of registers [from, to).
+template <bool Def>
 inline void clearRegs(JSValue* R, std::uint32_t from, std::uint32_t to) noexcept
 {
-    for (std::uint32_t i = from; i < to; ++i) {
-        const JSValue v = R[i];
-        R[i] = JSValue::undefined();
-        release(v);
-    }
+    for (std::uint32_t i = from; i < to; ++i)
+        clearReg<Def>(R[i]);
+}
+
+/// A register's value as one the caller holds a count of, for a holder outside the frames (`Def`: one more count).
+template <bool Def>
+[[gnu::always_inline]] inline JSValue takeReg(JSValue& slot) noexcept
+{
+    const JSValue v = slot;
+    slot = JSValue::undefined();
+    if constexpr (Def)
+        retainVm(v);
+    return v;
+}
+
+/// One count of a register's value, as a register of the mode holds it: counted, or (`deferred`) an old-family cell.
+inline void retainReg(VM& vm, JSValue v) noexcept
+{
+    if (vm.deferred)
+        retainOld(v);
+    else
+        retain(v);
+}
+
+// The same, for code that runs in either mode.
+inline void setReg(VM& vm, JSValue& slot, JSValue value) noexcept
+{
+    vm.deferred ? setReg<true>(slot, value) : setReg<false>(slot, value);
+}
+inline void copyReg(VM& vm, JSValue& slot, JSValue value) noexcept
+{
+    vm.deferred ? copyReg<true>(slot, value) : copyReg<false>(slot, value);
+}
+inline void clearReg(VM& vm, JSValue& slot) noexcept
+{
+    vm.deferred ? clearReg<true>(slot) : clearReg<false>(slot);
+}
+inline void clearRegs(VM& vm, JSValue* R, std::uint32_t from, std::uint32_t to) noexcept
+{
+    vm.deferred ? clearRegs<true>(R, from, to) : clearRegs<false>(R, from, to);
 }
 
 JSValue notCallable(VM& vm, JSValue callee)
@@ -888,7 +955,7 @@ void spreadOverWindow(VM& vm, JSValue* window, JSArray* list, std::uint32_t n)
         if (v.isHole())
             v = JSValue::undefined();
         retain(v);
-        setReg(window[i], v);
+        setReg(vm, window[i], v);
     }
     release(keep);
 }
@@ -896,6 +963,7 @@ void spreadOverWindow(VM& vm, JSValue* window, JSArray* list, std::uint32_t n)
 /// A call of a function bound to a target and a `this` and no arguments is a call of the target with that `this`: the bound
 /// function's place in the window is taken by them, as often as it is bound again. (Bound arguments, `new` and the rest
 /// go through the native.)
+template <bool Def>
 void unwrapBound(JSValue* R, std::uint32_t base) noexcept
 {
     for (;;) {
@@ -910,8 +978,8 @@ void unwrapBound(JSValue* R, std::uint32_t base) noexcept
         const JSValue target = r->boundTarget, thisValue = r->boundThis;
         retain(target);
         retain(thisValue);
-        setReg(R[base], target);  // may be the last count of the bound function: all is read from it already
-        setReg(R[base + 1], thisValue);
+        setReg<Def>(R[base], target);  // may be the last count of the bound function: all is read from it already
+        setReg<Def>(R[base + 1], thisValue);
     }
 }
 
@@ -1068,7 +1136,7 @@ using bi::iteratorStep;
 
 /// The interpreter. With `Step`, it runs the top frame's one instruction (and whatever that calls) and then returns
 /// `kStepFall` or `kStepJump` instead of going on; see jit.hpp.
-template <bool Step>
+template <bool Step, bool Def>
 JSValue runImpl(VM& vm, const Ins* stepFall)
 {
     static const void* const kLabels[] = {
@@ -1170,21 +1238,21 @@ Frame* fr = vm.frameTop - 1;
         if (o_ < 0)               \
             LOOP_TICK();          \
     } while (0)
-#define SET(r, v) setReg(R[r], v)
+#define SET(r, v) setReg<Def>(R[r], v)
 /// SET and COPY that also note what kind of value the instruction made (the baseline compiler's type feedback).
 #define SETP(r, v)                                                         \
     do {                                                                    \
         const JSValue pv_ = (v);                                            \
         code->prof[std::size_t(ins - codeStart)] |= profBit(pv_);           \
-        setReg(R[r], pv_);                                                  \
+        setReg<Def>(R[r], pv_);                                             \
     } while (0)
 #define COPYP(r, v)                                                         \
     do {                                                                    \
         const JSValue pv_ = (v);                                            \
         code->prof[std::size_t(ins - codeStart)] |= profBit(pv_);           \
-        copyReg(R[r], pv_);                                                 \
+        copyReg<Def>(R[r], pv_);                                            \
     } while (0)
-#define COPY(r, v) copyReg(R[r], v)
+#define COPY(r, v) copyReg<Def>(R[r], v)
 #define FAIL()  \
     do {         \
         fr->pc = pc; \
@@ -1409,8 +1477,12 @@ L_DefEnv: {
 }
 
 L_NewBox: {
+    if constexpr (Def)
+        retainVm(R[ins->a]);  // the box's own count, where the register held none
     Box* box = vm.newBox(R[ins->a]);  // takes the register's count
     R[ins->a] = JSValue::cell(reinterpret_cast<CellPtr>(box));
+    if constexpr (Def)
+        release(R[ins->a]);
     NEXT();
 }
 L_GetBox:
@@ -2440,9 +2512,7 @@ L_IterRest: {
             JSValue value;
             const int step = iteratorStep(vm, R[it], R[it + 1], &value);
             if (step <= 0) {
-                const JSValue old = R[it + 1];
-                R[it + 1] = JSValue::undefined();
-                release(old);
+                clearReg<Def>(R[it + 1]);
                 if (step < 0)
                     FAIL();
                 break;
@@ -2709,8 +2779,8 @@ L_GetIteratorObj: {
         release(iterator);
         FAIL();
     }
-    setReg(R[ins->a + 1], next);
-    setReg(R[ins->a], iterator);
+    setReg<Def>(R[ins->a + 1], next);
+    setReg<Def>(R[ins->a], iterator);
     NEXT();
 }
 L_DelegateCallAsync:
@@ -2753,7 +2823,7 @@ L_DelegateCall: {
                     FAIL();
                 if (asyncDelegate) {
                     // What `return` gives is awaited first; the code after the await raises the TypeError (mode 3).
-                    setReg(R[ins->c + 1], JSValue::int32(3));
+                    setReg<Def>(R[ins->c + 1], JSValue::int32(3));
                     SET(ins->a, r);
                     NEXT();
                 }
@@ -2806,8 +2876,7 @@ L_GenStart: {
     g->pcIndex = std::uint32_t(pc - codeStart);
     g->state = GenState::Start;
     for (std::uint32_t i = 0; i < code->nregs; ++i) {
-        g->regs()[i] = R[i];
-        R[i] = JSValue::undefined();
+        g->regs()[i] = takeReg<Def>(R[i]);
     }
     --vm.frameTop;
     return JSValue::undefined();
@@ -2854,7 +2923,7 @@ L_CheckUnbound:
 L_FreshThisIfBound:
     // A second `super()` still runs the parent constructor, on an object of its own, before it fails.
     if (R[ins->b] == JSValue::boolean(true)) [[unlikely]]
-        setReg(R[ins->a], toJSValue(vm.newObject(vm.protos.object)));
+        setReg<Def>(R[ins->a], toJSValue(vm.newObject(vm.protos.object)));
     NEXT();
 L_CheckDerivedRet:
     if (!isObject(R[ins->a])) {
@@ -2917,7 +2986,7 @@ do_call: {
     const bool isNew = callMode == 1, isSuper = callMode == 2;
     const std::uint32_t base = callBase, argc = callArgc;
     if (!isNew && !isSuper)
-        unwrapBound(R, base);
+        unwrapBound<Def>(R, base);
     const JSValue callee = R[base];
     fr->pc = pc;
     if (!isFunction(callee)) [[unlikely]] {
@@ -2953,7 +3022,7 @@ do_call: {
             made = vm.newObject(root, (f->flags & JSFunction::kNative) ? 3 : newSlotsOf(f->code, root));
             release(protoValue);
         }
-        setReg(R[base + 1], toJSValue(made));
+        setReg<Def>(R[base + 1], toJSValue(made));
     }
     if (f->flags & JSFunction::kNative) {
         Rare* r = f->rare();
@@ -3010,7 +3079,7 @@ do_call: {
         FAIL();
     }
     if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && newR[0].isNullish()) {
-        copyReg(newR[0], toJSValue(vm.global));
+        copyReg<Def>(newR[0], toJSValue(vm.global));
     }
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
     JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArgumentsFor(vm, c, newR + 1, argc) : nullptr;
@@ -3024,22 +3093,18 @@ do_call: {
         JSValue* callerEnd = R + code->nregs;
         const std::uint32_t overlap = callerEnd > newR ? std::uint32_t(callerEnd - newR) : 0;
         for (std::uint32_t i = keep; i < overlap; ++i) {
-            const JSValue v = newR[i];
-            newR[i] = JSValue::undefined();
-            release(v);
+            clearReg<Def>(newR[i]);
         }
         // Arguments past the parameters, if they sit beyond the caller's own registers.
         for (std::uint32_t i = std::max(keep, overlap); i < 1 + argc && i < c->nregs; ++i) {
-            const JSValue v = newR[i];
-            newR[i] = JSValue::undefined();
-            release(v);
+            clearReg<Def>(newR[i]);
         }
     }
     if (argsArray) {
         // The array goes in the register after the parameters, which the clearing above left empty.
         if (newR + 1 + c->nparams >= vm.stackInit)
             vm.fillStack(newR + 2 + c->nparams);
-        setReg(newR[1 + c->nparams], toJSValue(argsArray));
+        setReg<Def>(newR[1 + c->nparams], toJSValue(argsArray));
     }
     *vm.frameTop++ = Frame{c, f, nullptr, newR, std::uint16_t(ins->a), 0, argc, isNew || isSuper, false,
                                           isNew ? callee : isSuper ? fr->newTarget : JSValue::undefined()};
@@ -3067,7 +3132,7 @@ L_Ret: {
         retain(result);
     }
     const std::uint32_t keep = 1 + (fr->argc < code->nparams ? fr->argc : code->nparams);
-    clearRegs(R, keep, code->nregs);
+    clearRegs<Def>(R, keep, code->nregs);
     const bool entry = fr->entry;
     const std::uint16_t dst = fr->retDst;
     JSValue* calleeR = R;
@@ -3137,15 +3202,15 @@ L_IterInit: {
             FAIL();
         }
         // Registers a and a+1: the iterator and its `next`; the pair is an index for an array or a string.
-        setReg(R[ins->a + 1], next);
-        setReg(R[ins->a], iterator);
+        setReg<Def>(R[ins->a + 1], next);
+        setReg<Def>(R[ins->a], iterator);
         NEXT();
     }
     // Registers a and a+1: the sequence and the next index.
     const JSValue keep = src;
     retain(keep);
-    setReg(R[ins->a + 1], JSValue::int32(0));
-    setReg(R[ins->a], keep);
+    setReg<Def>(R[ins->a + 1], JSValue::int32(0));
+    setReg<Def>(R[ins->a], keep);
     NEXT();
 }
 L_IterNext: {
@@ -3161,9 +3226,7 @@ L_IterNext: {
         const int step = iteratorStep(vm, R[it], R[it + 1], &value);
         if (step <= 0) {
             // Done, or `next` itself failed: either way the iterator is not closed afterwards.
-            const JSValue old = R[it + 1];
-            R[it + 1] = JSValue::undefined();
-            release(old);
+            clearReg<Def>(R[it + 1]);
             if (step < 0)
                 FAIL();
             COPY(ins->a, ins->c ? JSValue::undefined() : JSValue::hole());
@@ -3327,8 +3390,8 @@ L_AsyncIterInit: {
             FAIL();
         }
     }
-    setReg(R[ins->a + 1], next);
-    setReg(R[ins->a], iterator);
+    setReg<Def>(R[ins->a + 1], next);
+    setReg<Def>(R[ins->a], iterator);
     NEXT();
 }
 L_AsyncIterNext: {
@@ -3371,9 +3434,7 @@ L_IterClose: {
     const bool quiet = ins->b != 0;
     const JSValue iterator = R[it];
     {
-        const JSValue old = R[it + 1];
-        R[it + 1] = JSValue::undefined();
-        release(old);
+        clearReg<Def>(R[it + 1]);
     }
     fr->pc = pc;
     JSValue f = getProperty(vm, iterator, vm.atoms.return_);
@@ -3423,8 +3484,7 @@ L_Yield: {
     g->resumeDst = ins->a;
     g->state = GenState::Suspended;
     for (std::uint32_t i = 0; i < code->nregs; ++i) {
-        g->regs()[i] = R[i];
-        R[i] = JSValue::undefined();
+        g->regs()[i] = takeReg<Def>(R[i]);
     }
     --vm.frameTop;
     return out;
@@ -3444,12 +3504,12 @@ throw_: {
             const JSValue thrown = vm.exception;
             vm.exception = JSValue::undefined();
             vm.exceptionCode = ErrorCode::Ok;
-            setReg(R[found->reg], thrown);
+            setReg<Def>(R[found->reg], thrown);
             pc = codeStart + found->target;
             NEXT();
         }
         const std::uint32_t keep = 1 + (fr->argc < code->nparams ? fr->argc : code->nparams);
-        clearRegs(R, keep, code->nregs);
+        clearRegs<Def>(R, keep, code->nregs);
         const bool entry = fr->entry;
         --vm.frameTop;
         if (entry)
@@ -3481,7 +3541,7 @@ throw_: {
 
 JSValue run(VM& vm)
 {
-    return runImpl<false>(vm, nullptr);
+    return vm.deferred ? runImpl<false, true>(vm, nullptr) : runImpl<false, false>(vm, nullptr);
 }
 
 }  // namespace
@@ -3501,7 +3561,7 @@ std::uint64_t stepInstruction(VM& vm, std::uint32_t index)
     const Ins* at = fr->code->code.data() + index;
     const Ins* fall = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
     fr->pc = at;
-    return runImpl<true>(vm, fall).bits;
+    return (vm.deferred ? runImpl<true, true>(vm, fall) : runImpl<true, false>(vm, fall)).bits;
 }
 
 
@@ -3612,12 +3672,12 @@ int jitGetGlobal(VM& vm, std::uint32_t index)
             }
         }
         noteGlobalSlot(vm, c.code, index, slot);
-        copyReg(c.R[ins->a], *slot);
+        copyReg(vm, c.R[ins->a], *slot);
         return 1;
     }
     if (!hasProperty(vm, toJSValue(g), key)) {
         if (ins->opcode() == Op::GetGlobalOrUndef) {
-            setReg(c.R[ins->a], JSValue::undefined());
+            setReg(vm, c.R[ins->a], JSValue::undefined());
             return 1;
         }
         vm.throwError(ErrorCode::ReferenceError, toUtf8(static_cast<StringCell*>(key)->text()) + " is not defined");
@@ -3626,7 +3686,7 @@ int jitGetGlobal(VM& vm, std::uint32_t index)
     JSValue v = getProperty(vm, toJSValue(g), key);
     if (v.isException())
         return 0;
-    setReg(c.R[ins->a], v);
+    setReg(vm, c.R[ins->a], v);
     return 1;
 }
 
@@ -3659,7 +3719,7 @@ int jitGetSuperProp(VM& vm, std::uint32_t index)
                 if (sc.validity)
                     vm.releaseValidity(sc.validity);
                 sc = SuperCache{home, slot, cell};
-                copyReg(c.R[ins->a], *slot);
+                copyReg(vm, c.R[ins->a], *slot);
                 return 1;
             }
             break;
@@ -3668,7 +3728,7 @@ int jitGetSuperProp(VM& vm, std::uint32_t index)
     JSValue v = getPropertyFrom(vm, start, c.R[ins->c], key);
     if (v.isException())
         return 0;
-    setReg(c.R[ins->a], v);
+    setReg(vm, c.R[ins->a], v);
     return 1;
 }
 
@@ -3764,22 +3824,22 @@ int jitGetProp(VM& vm, std::uint32_t index)
         JSObject* o = asObject(base);
         if (o->h.shape == ic.shape) {
             if (!ic.holder) {
-                copyReg(R[ins->a], *o->slotAt(ic.index));
+                copyReg(vm, R[ins->a], *o->slotAt(ic.index));
                 return 1;
             }
             if (ic.validity->valid) {
-                copyReg(R[ins->a], *ic.holder->slotAt(ic.index));
+                copyReg(vm, R[ins->a], *ic.holder->slotAt(ic.index));
                 return 1;
             }
         }
         if (key == vm.atoms.length && hasElems(o)) {
             const std::uint32_t n = static_cast<JSArray*>(o)->length;
-            setReg(R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            setReg(vm, R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             return 1;
         }
         if (key == vm.atoms.length && o->cls() == ObjClass::TypedArray) {
             const std::uint32_t n = static_cast<JSTypedArray*>(o)->length;
-            setReg(R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
+            setReg(vm, R[ins->a], n <= 0x7FFFFFFFu ? JSValue::int32(std::int32_t(n)) : JSValue::boxDouble(double(n)));
             return 1;
         }
         // A getter may let go of the object (writing the register it came from): it is held until it is learned from.
@@ -3798,7 +3858,7 @@ int jitGetProp(VM& vm, std::uint32_t index)
             if (r < 0)
                 return 0;
             if (r > 0) {
-                setReg(R[ins->a], got);
+                setReg(vm, R[ins->a], got);
                 if (full) {
                     ic.flags |= InlineCache::kMegaSite;
                     megaLearnRead(vm, o, key);
@@ -3810,23 +3870,23 @@ int jitGetProp(VM& vm, std::uint32_t index)
         const JSValue v = getProperty(vm, base, key);
         if (v.isException())
             return 0;
-        setReg(R[ins->a], v);
+        setReg(vm, R[ins->a], v);
         if (ic.flags & InlineCache::kMegaSite)
             megaLearnRead(vm, o, key);
         return 1;
     } else if (isString(base) && key == vm.atoms.length) {
-        setReg(R[ins->a], JSValue::int32(std::int32_t(asString(base)->length)));
+        setReg(vm, R[ins->a], JSValue::int32(std::int32_t(asString(base)->length)));
         return 1;
     } else if (isString(base) && c.cacheId != kNoCache) {
         if (JSValue* slot = stringMethodRead(vm, ic, key)) {
-            copyReg(R[ins->a], *slot);
+            copyReg(vm, R[ins->a], *slot);
             return 1;
         }
     }
     const JSValue v = getProperty(vm, base, key);
     if (v.isException())
         return 0;
-    setReg(R[ins->a], v);
+    setReg(vm, R[ins->a], v);
     return 1;
 }
 
@@ -3935,7 +3995,7 @@ int jitNewObject(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     JSObject* o = vm.newObject(vm.protos.object, std::uint8_t(c.ins->b));
-    setReg(c.R[c.ins->a], toJSValue(o));
+    setReg(vm, c.R[c.ins->a], toJSValue(o));
     return 1;
 }
 
@@ -3943,7 +4003,7 @@ int jitNewArray(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     JSArray* a = vm.newArray(vm.protos.array, 0, c.ins->b);
-    setReg(c.R[c.ins->a], toJSValue(a));
+    setReg(vm, c.R[c.ins->a], toJSValue(a));
     return 1;
 }
 
@@ -3997,7 +4057,7 @@ int jitBinary(VM& vm, std::uint32_t index)
     }
     if (r.isException())
         return 0;
-    setReg(R[ins->a], r);
+    setReg(vm, R[ins->a], r);
     return 1;
 }
 
@@ -4010,7 +4070,7 @@ int jitIn(VM& vm, std::uint32_t index)
     const int r = inOperator(vm, c.R[c.ins->b], c.R[c.ins->c]);
     if (r < 0)
         return 0;
-    setReg(c.R[c.ins->a], JSValue::boolean(r != 0));
+    setReg(vm, c.R[c.ins->a], JSValue::boolean(r != 0));
     return 1;
 }
 
@@ -4020,7 +4080,7 @@ int jitToString(VM& vm, std::uint32_t index)
     const JSValue r = toStringValue(vm, c.R[c.ins->b]);
     if (r.isException())
         return 0;
-    setReg(c.R[c.ins->a], r);
+    setReg(vm, c.R[c.ins->a], r);
     return 1;
 }
 
@@ -4029,13 +4089,13 @@ int jitToNumber(VM& vm, std::uint32_t index)
     JitCtx c = jitCtx(vm, index, false);
     const JSValue a = c.R[c.ins->b];
     if (a.isNumber()) {
-        copyReg(c.R[c.ins->a], a);
+        copyReg(vm, c.R[c.ins->a], a);
         return 1;
     }
     double d;
     if (!toNumber(vm, a, &d))
         return 0;
-    setReg(c.R[c.ins->a], JSValue::boxNumber(d));
+    setReg(vm, c.R[c.ins->a], JSValue::boxNumber(d));
     return 1;
 }
 
@@ -4046,7 +4106,7 @@ int jitUnary(VM& vm, std::uint32_t index)
     const JSValue a = c.R[ins->b];
     const bool neg = ins->opcode() == Op::Neg;
     if (a.isInt32() && (!neg || (a.asInt32() != 0 && a.asInt32() != INT32_MIN))) {
-        setReg(c.R[ins->a], JSValue::int32(neg ? -a.asInt32() : ~a.asInt32()));
+        setReg(vm, c.R[ins->a], JSValue::int32(neg ? -a.asInt32() : ~a.asInt32()));
         return 1;
     }
     JSValue n = toNumeric(vm, a);
@@ -4057,10 +4117,10 @@ int jitUnary(VM& vm, std::uint32_t index)
         release(n);
         if (r.isException())
             return 0;
-        setReg(c.R[ins->a], r);
+        setReg(vm, c.R[ins->a], r);
         return 1;
     }
-    setReg(c.R[ins->a], neg ? JSValue::boxNumber(-n.asNumber()) : JSValue::int32(~toInt32(n.asNumber())));
+    setReg(vm, c.R[ins->a], neg ? JSValue::boxNumber(-n.asNumber()) : JSValue::int32(~toInt32(n.asNumber())));
     return 1;
 }
 
@@ -4070,7 +4130,7 @@ int jitCopyBox(VM& vm, std::uint32_t index)
     Box* box = reinterpret_cast<Box*>(c.R[c.ins->a].asCell());
     retain(box->value);
     Box* fresh = vm.newBox(box->value);
-    setReg(c.R[c.ins->a], JSValue::cell(reinterpret_cast<CellPtr>(fresh)));
+    setReg(vm, c.R[c.ins->a], JSValue::cell(reinterpret_cast<CellPtr>(fresh)));
     return 1;
 }
 
@@ -4082,7 +4142,7 @@ int jitRestSlice(VM& vm, std::uint32_t index)
     JSArray* rest = vm.newArray(vm.protos.array, 0, all->length > from ? all->length - from : 0);
     if (all->length > from)
         rest->appendAll(vm, all->elems + from, all->length - from);
-    setReg(c.R[c.ins->a], toJSValue(rest));
+    setReg(vm, c.R[c.ins->a], toJSValue(rest));
     return 1;
 }
 
@@ -4098,21 +4158,21 @@ int jitKeysOf(VM& vm, std::uint32_t index)
     const JSValue keys = forInKeys(vm, c.R[c.ins->b]);
     if (keys.isException())
         return 0;
-    setReg(c.R[c.ins->a], keys);
+    setReg(vm, c.R[c.ins->a], keys);
     return 1;
 }
 
 int jitLoadCallee(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
-    copyReg(c.R[c.ins->a], toJSValue(c.fr->fn));
+    copyReg(vm, c.R[c.ins->a], toJSValue(c.fr->fn));
     return 1;
 }
 
 int jitNewTarget(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
-    copyReg(c.R[c.ins->a], c.fr->newTarget);
+    copyReg(vm, c.R[c.ins->a], c.fr->newTarget);
     return 1;
 }
 
@@ -4124,7 +4184,7 @@ int jitGetSuperCtor(VM& vm, std::uint32_t index)
         vm.throwError(ErrorCode::TypeError, "the super class is not a constructor");
         return 0;
     }
-    copyReg(c.R[c.ins->a], toJSValue(p));
+    copyReg(vm, c.R[c.ins->a], toJSValue(p));
     return 1;
 }
 
@@ -4132,7 +4192,7 @@ int jitFreshThisIfBound(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     if (c.R[c.ins->b] == JSValue::boolean(true))
-        setReg(c.R[c.ins->a], toJSValue(vm.newObject(vm.protos.object)));
+        setReg(vm, c.R[c.ins->a], toJSValue(vm.newObject(vm.protos.object)));
     return 1;
 }
 
@@ -4157,7 +4217,7 @@ int jitCallSpread(VM& vm, std::uint32_t index)
     const JSValue res = vm.call(callee, R[at + 1], window, n);
     if (res.isException())
         return 0;
-    setReg(R[ins->a], res);
+    setReg(vm, R[ins->a], res);
     return 1;
 }
 
@@ -4195,13 +4255,13 @@ int jitIterInit(VM& vm, std::uint32_t index)
             release(iterator);
             return 0;
         }
-        setReg(R[ins->a + 1], next);
-        setReg(R[ins->a], iterator);
+        setReg(vm, R[ins->a + 1], next);
+        setReg(vm, R[ins->a], iterator);
         return 1;
     }
     retain(src);
-    setReg(R[ins->a + 1], JSValue::int32(0));
-    setReg(R[ins->a], src);
+    setReg(vm, R[ins->a + 1], JSValue::int32(0));
+    setReg(vm, R[ins->a], src);
     return 1;
 }
 
@@ -4212,7 +4272,7 @@ int jitNewRegExp(VM& vm, std::uint32_t index)
     JSValue r = bi::newRegExpLiteral(vm, c.code->consts[ins->b], c.code->consts[ins->c]);
     if (r.isException())
         return 0;
-    setReg(c.R[ins->a], r);
+    setReg(vm, c.R[ins->a], r);
     return 1;
 }
 
@@ -4221,7 +4281,7 @@ int jitEnvHas(VM& vm, std::uint32_t index)
     JitCtx c = jitCtx(vm, index, false);
     const Ins* ins = c.ins;
     const JSValue env = c.R[ins->b];
-    setReg(c.R[ins->a], JSValue::boolean(isObject(env) && asObject(env)->findOwn(vm, c.atoms[ins->c]) != nullptr));
+    setReg(vm, c.R[ins->a], JSValue::boolean(isObject(env) && asObject(env)->findOwn(vm, c.atoms[ins->c]) != nullptr));
     return 1;
 }
 
@@ -4262,20 +4322,18 @@ int jitIterNext(VM& vm, std::uint32_t index)
     const std::uint32_t it = ins->b;
     if (!R[it + 1].isInt32()) {
         if (!isFunction(R[it + 1])) {
-            copyReg(R[ins->a], ins->c ? JSValue::undefined() : JSValue::hole());
+            copyReg(vm, R[ins->a], ins->c ? JSValue::undefined() : JSValue::hole());
             return 1;
         }
         JSValue value;
         const int step = iteratorStep(vm, R[it], R[it + 1], &value);
         if (step <= 0) {
-            const JSValue old = R[it + 1];
-            R[it + 1] = JSValue::undefined();
-            release(old);
+            clearReg(vm, R[it + 1]);
             if (step < 0)
                 return 0;
-            copyReg(R[ins->a], ins->c ? JSValue::undefined() : JSValue::hole());
+            copyReg(vm, R[ins->a], ins->c ? JSValue::undefined() : JSValue::hole());
         } else {
-            setReg(R[ins->a], value);
+            setReg(vm, R[ins->a], value);
         }
         return 1;
     }
@@ -4310,9 +4368,9 @@ int jitIterNext(VM& vm, std::uint32_t index)
         R[it + 1] = JSValue::int32(at + step);
     }
     if (owned)
-        setReg(R[ins->a], out);
+        setReg(vm, R[ins->a], out);
     else
-        copyReg(R[ins->a], out);
+        copyReg(vm, R[ins->a], out);
     return 1;
 }
 
@@ -4324,7 +4382,7 @@ int jitIterClose(VM& vm, std::uint32_t index)
 
 void jitUnwrapBound(JSValue* R, std::uint32_t base)
 {
-    unwrapBound(R, base);
+    unwrapBound<false>(R, base);  // compiled code runs in contexts that count their frames
 }
 
 JSArray* jitCaptureArguments(VM& vm, const CodeBlock* c, const JSValue* args, std::uint32_t argc)
@@ -4338,7 +4396,7 @@ int jitInstanceOf(VM& vm, std::uint32_t index)
     const int r = instanceOf(vm, c.R[c.ins->b], c.R[c.ins->c]);
     if (r < 0)
         return 0;
-    setReg(c.R[c.ins->a], JSValue::boolean(r != 0));
+    setReg(vm, c.R[c.ins->a], JSValue::boolean(r != 0));
     return 1;
 }
 
@@ -4356,7 +4414,7 @@ int jitBinaryImm(VM& vm, std::uint32_t index)
     const JSValue r = generic == Op::Add ? add(vm, a, y) : arithmetic(vm, generic, a, y);
     if (r.isException())
         return 0;
-    setReg(R[ins->a], r);
+    setReg(vm, R[ins->a], r);
     return 1;
 }
 
@@ -4378,18 +4436,18 @@ int jitGetElem(VM& vm, std::uint32_t index)
             auto* a = static_cast<JSArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < a->length && !a->elems[i].isHole()) {
-                copyReg(R[ins->a], a->elems[i]);
+                copyReg(vm, R[ins->a], a->elems[i]);
                 return 1;
             }
             if (plainHoleRead(vm, a)) {
-                setReg(R[ins->a], JSValue::undefined());
+                setReg(vm, R[ins->a], JSValue::undefined());
                 return 1;
             }
         } else if (isObject(base) && asObject(base)->cls() == ObjClass::TypedArray) {
             auto* t = static_cast<JSTypedArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < t->length && !isBigKind(t->kind)) {
-                setReg(R[ins->a], loadNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)]));
+                setReg(vm, R[ins->a], loadNumber(t->kind, t->data + std::size_t(i) * kElemSize[std::size_t(t->kind)]));
                 return 1;
             }
         } else if (isString(base)) {
@@ -4397,7 +4455,7 @@ int jitGetElem(VM& vm, std::uint32_t index)
             const std::uint32_t i = std::uint32_t(k.asInt32());
             if (i < s->length) {
                 const JSValue ch = makeString(vm, s->text().substr(i, 1));
-                setReg(R[ins->a], ch);
+                setReg(vm, R[ins->a], ch);
                 return 1;
             }
         }
@@ -4409,19 +4467,19 @@ int jitGetElem(VM& vm, std::uint32_t index)
     if (isPrivateKey(k)) {
         PrivateCache* pc = privateCacheAt(c.code, index);
         if (JSValue* slot = privateCached(pc, base, k)) {
-            copyReg(R[ins->a], *slot);
+            copyReg(vm, R[ins->a], *slot);
             return 1;
         }
         const JSValue v = privateGet(vm, base, k);
         if (v.isException())
             return 0;
-        setReg(R[ins->a], v);
+        setReg(vm, R[ins->a], v);
         learnPrivate(vm, pc, base, k, false);
         return 1;
     }
     if (isObject(base) && k.isCell() && (isSymbol(k) || (isString(k) && asString(k)->interned))) {
         if (JSValue* slot = elemCached(c.code, index, asObject(base), k.asCell())) {
-            copyReg(R[ins->a], *slot);
+            copyReg(vm, R[ins->a], *slot);
             return 1;
         }
     }
@@ -4438,7 +4496,7 @@ int jitGetElem(VM& vm, std::uint32_t index)
     release(JSValue::cell(key));
     if (v.isException())
         return 0;
-    setReg(R[ins->a], v);
+    setReg(vm, R[ins->a], v);
     return 1;
 }
 
@@ -4543,15 +4601,19 @@ int jitClosure(VM& vm, std::uint32_t index)
         boxes[i] = d.fromParentLocal ? reinterpret_cast<Box*>(R[d.index].asCell()) : c.fr->fn->upvals()[d.index];
     }
     JSFunction* f = vm.newFunction(vm.protos.function, child, boxes, n);
-    setReg(R[ins->a], toJSValue(f));
+    setReg(vm, R[ins->a], toJSValue(f));
     return 1;
 }
 
 int jitNewBox(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
-    Box* box = vm.newBox(c.R[c.ins->a]);
+    if (vm.deferred)
+        retainVm(c.R[c.ins->a]);  // the box's own count, where the register held none
+    Box* box = vm.newBox(c.R[c.ins->a]);  // takes the register's count
     c.R[c.ins->a] = JSValue::cell(reinterpret_cast<CellPtr>(box));
+    if (vm.deferred)
+        release(c.R[c.ins->a]);
     return 1;
 }
 
@@ -4561,7 +4623,7 @@ std::uint64_t stepThrow(VM& vm, std::uint32_t index)
     const Ins* at = fr->code->code.data() + index;
     fr->pc = at + ((index + 1 < fr->code->code.size() && at[1].opcode() == Op::Cache) ? 2 : 1);
     vm.resumeThrow = true;
-    return runImpl<true>(vm, nullptr).bits;
+    return (vm.deferred ? runImpl<true, true>(vm, nullptr) : runImpl<true, false>(vm, nullptr)).bits;
 }
 
 // ----------------------------------------------------------------- calling ---
@@ -4608,23 +4670,21 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
             JSValue self = thisValue;
             if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && self.isNullish())
                 self = toJSValue(global);
-            retain(self);
-            R[0] = self;
             const std::uint32_t n = argc < c->nparams ? argc : c->nparams;
-            for (std::uint32_t i = 0; i < n; ++i) {
-                retain(args[i]);
+            R[0] = self;
+            for (std::uint32_t i = 0; i < n; ++i)
                 R[1 + i] = args[i];
-            }
+            for (std::uint32_t i = 0; i <= n; ++i)
+                retainReg(*this, R[i]);
             for (std::uint32_t i = 1 + n; i < c->nregs; ++i)
-                if (!R[i].isUndefined()) [[unlikely]] {
-                    const JSValue v = R[i];
-                    R[i] = JSValue::undefined();
-                    release(v);
-                }
+                if (!R[i].isUndefined()) [[unlikely]]
+                    clearReg(*this, R[i]);
             *frameTop++ = Frame{c, f, nullptr, R, 0, 0, n, false, true, JSValue::undefined()};
             const JSValue result = enterTier1(*this, c->tier1, 0);
             stackTop = R;
-            clearRegs(R, 0, 1 + n);
+            clearRegs(*this, R, 0, 1 + n);
+            if (deferred && frameTop == frameBase)
+                scanZct();
             return result;
         }
     }
@@ -4641,25 +4701,21 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     JSValue self = thisValue;
     if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow)) && self.isNullish())
         self = toJSValue(global);
-    retain(self);
     R[0] = self;
-    for (std::uint32_t i = 0; i < argc; ++i) {
-        retain(args[i]);
+    for (std::uint32_t i = 0; i < argc; ++i)
         R[1 + i] = args[i];
-    }
+    for (std::uint32_t i = 0; i <= argc; ++i)
+        retainReg(*this, R[i]);
     const std::uint32_t keep = 1 + (argc < c->nparams ? argc : c->nparams);
     JSArray* argsArray = (c->flags & CodeBlock::kNeedsArgs) ? captureArgumentsFor(*this, c, R + 1, argc) : nullptr;
     // The callee's registers above its parameters start undefined. What can be there instead: an argument past the
     // parameters, and dead temporaries of a frame below when this one sits on them (a native called from a function
     // whose own frame began inside its caller's).
     for (std::uint32_t i = keep; i < c->nregs; ++i)
-        if (!R[i].isUndefined()) {
-            const JSValue v = R[i];
-            R[i] = JSValue::undefined();
-            release(v);
-        }
+        if (!R[i].isUndefined())
+            clearReg(*this, R[i]);
     if (argsArray)
-        setReg(R[1 + c->nparams], toJSValue(argsArray));
+        setReg(*this, R[1 + c->nparams], toJSValue(argsArray));
     JSValue* savedTop = stackTop;
     *frameTop++ = Frame{c, f, nullptr, R, 0, 0, argc, construct, true,
                                           construct ? (target.isUndefined() ? callee : target) : JSValue::undefined()};
@@ -4668,7 +4724,10 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
     const JSValue result = c->tier1 ? enterTier1(*this, c->tier1, 0) : run(*this);
     stackTop = savedTop;
     // The frame let go of its own registers; `this` and the arguments are ours.
-    clearRegs(R, 0, 1 + argc);
+    clearRegs(*this, R, 0, 1 + argc);
+    // Back to the host: what the program left behind goes now, while no frame is there to scan.
+    if (deferred && frameTop == frameBase)
+        scanZct();
     return result;
 }
 
@@ -4787,16 +4846,21 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         const JSValue old = R[i];
         R[i] = g->regs()[i];
         g->regs()[i] = JSValue::undefined();
-        release(old);
+        if (deferred) {
+            releaseVm(R[i]);  // the register holds it without the count the generator held
+            releaseOld(old);
+        } else {
+            release(old);
+        }
     }
     if (g->state == GenState::Suspended && g->delegating) {
         // At a `yield*`: what came in goes to the inner iterator, with what kind of resumption it was.
-        setReg(R[g->resumeDst], sent);
+        setReg(*this, R[g->resumeDst], sent);
         retain(sent);
-        setReg(R[g->resumeDst + 1], JSValue::int32(mode));
+        setReg(*this, R[g->resumeDst + 1], JSValue::int32(mode));
     } else if (g->state == GenState::Suspended) {
         if (mode == 0) {
-            setReg(R[g->resumeDst], sent);
+            setReg(*this, R[g->resumeDst], sent);
             retain(sent);
         } else if (mode == 1) {
             release(exception);
@@ -4830,7 +4894,7 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
     if (finished) {
         g->state = GenState::Done;
         g->clear(*this);
-        clearRegs(R, 0, 1);
+        clearRegs(*this, R, 0, 1);
     }
     if (result.isException()) {
         if (finished && exception == returnMarker) {

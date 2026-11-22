@@ -88,6 +88,28 @@ inline bool isVmCell(const detail::GCObject* cell) noexcept
 {
     return (reinterpret_cast<const std::uint8_t*>(cell)[7] & 0x80) != 0;
 }
+/// Counting a frame does in either mode: `Vm` for a cell of the new family, `Old` for any other (a string, symbol or
+/// bigint). A deferred frame counts only the second.
+[[gnu::always_inline]] inline void retainVm(JSValue v) noexcept
+{
+    if (v.isCell() && isVmCell(v.asCell()))
+        detail::incRef(v.asCell());
+}
+[[gnu::always_inline]] inline void releaseVm(JSValue v) noexcept
+{
+    if (v.isCell() && isVmCell(v.asCell()))
+        detail::decRef(v.asCell());
+}
+[[gnu::always_inline]] inline void retainOld(JSValue v) noexcept
+{
+    if (v.isCell() && !isVmCell(v.asCell()))
+        detail::incRef(v.asCell());
+}
+[[gnu::always_inline]] inline void releaseOld(JSValue v) noexcept
+{
+    if (v.isCell() && !isVmCell(v.asCell()))
+        detail::decRef(v.asCell());
+}
 inline CellHeader* headerOf(CellPtr cell) noexcept
 {
     return reinterpret_cast<CellHeader*>(cell);

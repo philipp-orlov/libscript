@@ -49,6 +49,9 @@ struct EngineRuntime
     /// Break the reference cycles among the cells this engine owns that nothing outside them refers to. `minor`: only
     /// the cells made since the last collection are looked at.
     virtual void collectCycles(bool minor) noexcept { (void)minor; }
+    /// Around a collection: an engine whose stack holds values without counts counts them for the time it runs.
+    virtual void rootsBegin() noexcept {}
+    virtual void rootsEnd() noexcept {}
     /// Bytes of the heap's total that this engine's own cells and payloads account for.
     virtual std::uint64_t ownedBytes() const noexcept { return 0; }
     /// "   at ..." lines for the frames of this engine that are live.

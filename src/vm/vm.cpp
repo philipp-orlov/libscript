@@ -81,6 +81,20 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
         ctx.options.freeBudget = std::size_t(std::atoi(t));
 #endif
 
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    // Frames without counts (`Options::Memory::Deferred`), while the runtime learns it: the interpreter only.
+    if (const char* t = std::getenv("SCRIPT_VM_DEFERRED"); t && std::atoi(t) && ctx.options.memory == Context::Options::Memory::Deferred) {
+        deferred = true;
+        tier1Threshold = 0;
+        tier2Threshold = 0;
+        selfInlining = 0;
+        zctLimit_ = kZctMin;
+        if (const char* z = std::getenv("SCRIPT_VM_ZCT"))
+            zctMin_ = std::size_t(std::atoi(z));
+        zctLimit_ = zctMin_;
+    }
+#endif
+
     mergeInlining = tier2Threshold > 0;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* t = std::getenv("SCRIPT_VM_MERGE"))

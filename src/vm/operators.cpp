@@ -215,7 +215,7 @@ JSValue toPrimitiveHint(VM& vm, JSValue v, int hint)
         return v;
     }
     // `v[Symbol.toPrimitive]`, when it has one, decides.
-    JSValue exotic = getProperty(vm, v, vm.atoms.symToPrimitive);
+    JSValue exotic = getPropertyMega(vm, v, vm.atoms.symToPrimitive);
     if (exotic.isException())
         return exotic;
     if (isFunction(exotic)) {
@@ -236,12 +236,10 @@ JSValue toPrimitiveHint(VM& vm, JSValue v, int hint)
     if (present)
         return vm.throwError(ErrorCode::TypeError, "Symbol.toPrimitive is not a function");
     const bool preferString = hint == 2;
-    const char* first = preferString ? "toString" : "valueOf";
-    const char* second = preferString ? "valueOf" : "toString";
-    for (const char* name : {first, second}) {
-        Key key = vm.internKey(std::string_view(name));
-        JSValue method = getProperty(vm, v, key);
-        release(JSValue::cell(key));
+    const Key first = preferString ? vm.atoms.toString_ : vm.atoms.valueOf_;
+    const Key second = preferString ? vm.atoms.valueOf_ : vm.atoms.toString_;
+    for (const Key key : {first, second}) {
+        JSValue method = getPropertyMega(vm, v, key);
         if (method.isException())
             return method;
         if (isFunction(method)) {

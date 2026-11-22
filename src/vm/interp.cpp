@@ -4022,6 +4022,34 @@ void megaLearnRead(VM& vm, JSObject* o, Key key) noexcept
     e = MegaEntry{o->h.shape, std::uint32_t(index), key, holder, cell, absent, {}};
 }
 
+/// The value `key` reads on `o` by the megamorphic table, when it says.
+bool megaGet(VM& vm, JSObject* o, Key key, JSValue* out) noexcept
+{
+    if (!vm.megaRead)
+        return false;
+    const MegaEntry& e = vm.megaRead[VM::megaSlot(o->h.shape, key)];
+    if (e.shape != o->h.shape || e.key != key || (e.validity && !e.validity->valid) || (e.absent && !e.absent->valid))
+        return false;
+    *out = e.index == VM::kMegaAbsent ? JSValue::undefined() : *(e.holder ? e.holder : o)->slotAt(e.index);
+    return true;
+}
+
+JSValue getPropertyMega(VM& vm, JSValue base, Key key)
+{
+    if (!isObject(base))
+        return getProperty(vm, base, key);
+    JSValue v;
+    if (megaGet(vm, asObject(base), key, &v)) {
+        retain(v);
+        return v;
+    }
+    const Handle keep = Handle::retained(base);
+    v = getProperty(vm, base, key);
+    if (!v.isException())
+        megaLearnRead(vm, asObject(base), key);
+    return v;
+}
+
 int jitGetProp(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, true);
@@ -4723,8 +4751,21 @@ int jitGetElem(VM& vm, std::uint32_t index)
     release(prim);
     if (!key)
         return 0;
-    if (isObject(base) && prim.isCell() && (isSymbol(prim) || isString(prim)))
+    if (isObject(base) && prim.isCell() && (isSymbol(prim) || isString(prim))) {
+        // (A name made just now: the caches know its atom.)
+        JSValue found;
+        if (JSValue* slot = elemCached(c.code, index, asObject(base), key)) {
+            copyReg(vm, R[ins->a], *slot);
+            release(JSValue::cell(key));
+            return 1;
+        }
+        if (megaGet(vm, asObject(base), key, &found)) {
+            copyReg(vm, R[ins->a], found);
+            release(JSValue::cell(key));
+            return 1;
+        }
         learnElem(vm, c.code, index, asObject(base), key);
+    }
     const JSValue v = getProperty(vm, base, key);
     if (!v.isException()) {
         // (A getter may have let go of the object.)

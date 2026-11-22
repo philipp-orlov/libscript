@@ -114,6 +114,8 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     atoms.name = internKey("name");
     atoms.value = internKey("value");
     atoms.done = internKey("done");
+    atoms.toString_ = internKey("toString");
+    atoms.valueOf_ = internKey("valueOf");
     atoms.next = internKey("next");
     atoms.lastIndex = internKey("lastIndex");
     atoms.index = internKey("index");

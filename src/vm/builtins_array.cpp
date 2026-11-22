@@ -124,8 +124,32 @@ JSValue arrayCreate(VM& vm, double length)
 
 }  // namespace
 
+/// Whether `a` is a plain array whose `constructor` is Array, with the species as made: what it makes is a plain array.
+static bool arraySpeciesPristine(VM& vm, JSValue v)
+{
+    JSObject* a = asObject(v);
+    JSObject* ap = vm.protos.array;
+    if (a->cls() != ObjClass::Array || !ap || a->h.shape != vm.rootShapeFor(ap, 0)->id)
+        return false;
+    if (vm.arraySpeciesEpoch == vm.globalEpoch)
+        return true;
+    std::uint8_t attrs = 0;
+    const JSValue* slot = ap->findOwn(vm, vm.atoms.constructor, &attrs);
+    if (!slot || (attrs & attr::kAccessor) || slot->bits != vm.arrayConstructor.bits)
+        return false;
+    JSObject* ctor = asObject(vm.arrayConstructor);
+    slot = ctor->findOwn(vm, vm.atoms.symSpecies, &attrs);
+    if (!slot || slot->bits != vm.arraySpecies.bits)
+        return false;
+    if (vm.watchMethod(ap, ap) && vm.watchMethod(ctor, ctor))
+        vm.arraySpeciesEpoch = vm.globalEpoch;
+    return true;
+}
+
 JSValue arraySpeciesCreate(VM& vm, JSValue original, double length)
 {
+    if (isObject(original) && arraySpeciesPristine(vm, original))
+        return arrayCreate(vm, length);
     JSValue probe = original;
     while (isObject(probe) && proxyOf(asObject(probe))) {
         ProxyState* ps = proxyOf(asObject(probe));

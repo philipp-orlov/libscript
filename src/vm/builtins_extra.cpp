@@ -653,6 +653,11 @@ void installExtras(VM& vm)
         Handle keep = Handle::adopt(toJSValue(getter));
         defineAccessor(vm, asObject(*slot), vm.atoms.symSpecies, toJSValue(getter), JSValue::undefined(), attr::kConfigurable);
     }
+    if (isObject(vm.arrayConstructor))
+        if (JSValue* slot = asObject(vm.arrayConstructor)->findOwn(vm, vm.atoms.symSpecies)) {
+            vm.arraySpecies = *slot;
+            retain(vm.arraySpecies);
+        }
     if (isObject(vm.promiseCtor))
         if (JSValue* slot = asObject(vm.promiseCtor)->findOwn(vm, vm.atoms.symSpecies)) {
             vm.promiseSpecies = *slot;

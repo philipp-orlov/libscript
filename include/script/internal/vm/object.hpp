@@ -417,6 +417,8 @@ inline JSValue toJSValue(const JSObject* o) noexcept
 /// `base[key]`, as an owned value. Primitives read through their prototypes; an accessor is called through
 /// `VM::callHook`. The exception sentinel, with `vm.exception` set, when a getter throws or `base` is nullish.
 JSValue getProperty(VM& vm, JSValue base, Key key);
+/// The same by the megamorphic table where that knows: for a read the runtime makes often of few names.
+JSValue getPropertyMega(VM& vm, JSValue base, Key key);
 /// The message of a read of a property of null or undefined, naming the property as V8 does: "Cannot read properties of
 /// undefined (reading 'x')". `key` is a property key or the value an element read was given.
 std::string nullishReadMessage(JSValue base, JSValue key);

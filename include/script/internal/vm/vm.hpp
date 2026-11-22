@@ -73,6 +73,8 @@ struct Atoms
     Key constructor = nullptr;
     Key name = nullptr;
     Key value = nullptr;
+    Key toString_ = nullptr;
+    Key valueOf_ = nullptr;
     Key done = nullptr;
     Key next = nullptr;
     Key lastIndex = nullptr;
@@ -541,6 +543,9 @@ struct VM : EngineRuntime
     /// Where `globalEpoch` was when all of them were found as they were made, and watched; nothing has changed while it stands
     /// there.
     std::uint32_t regexpEpoch = ~0u;
+    /// The slot of `Array[Symbol.species]` as made, and where `globalEpoch` was when arrays were found to make plain arrays.
+    JSValue arraySpecies = JSValue::undefined();
+    std::uint32_t arraySpeciesEpoch = ~0u;
     /// `Promise.prototype.then` and the slot of `Promise[Symbol.species]` as made, and where `globalEpoch` was when the language
     /// was found to have them still (`promisePristine`).
     JSValue promiseThen = JSValue::undefined(), promiseSpecies = JSValue::undefined();

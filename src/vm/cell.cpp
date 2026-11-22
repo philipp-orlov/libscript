@@ -1086,7 +1086,7 @@ void VM::releaseRoots() noexcept
     for (auto& entry : symbolRegistry)
         detail::decRef(entry.second);
     symbolRegistry.clear();
-    for (Key* k : {&atoms.length, &atoms.prototype, &atoms.constructor, &atoms.name, &atoms.value, &atoms.done, &atoms.next,
+    for (Key* k : {&atoms.length, &atoms.prototype, &atoms.constructor, &atoms.name, &atoms.value, &atoms.toString_, &atoms.valueOf_, &atoms.done, &atoms.next,
                    &atoms.symIterator, &atoms.symAsyncIterator, &atoms.symToPrimitive, &atoms.symToStringTag,
                    &atoms.symHasInstance, &atoms.symSpecies, &atoms.lastIndex, &atoms.index, &atoms.input,
                    &atoms.groups, &atoms.indices, &atoms.symMatch, &atoms.symMatchAll, &atoms.symReplace, &atoms.symSearch,
@@ -1118,6 +1118,8 @@ void VM::releaseRoots() noexcept
     release(regexpExec);
     release(promiseCtor);
     release(promiseThen);
+    release(arraySpecies);
+    arraySpecies = JSValue::undefined();
     release(promiseSpecies);
     promiseThen = promiseSpecies = JSValue::undefined();
     release(arrayConstructor);

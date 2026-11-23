@@ -50,8 +50,14 @@ opt::Effects effects(const CodeBlock& code, std::uint32_t i)
     opt::Effects e = opt::effectsOf(code, i);
     const Ins& in = code.code[i];
     const Op op = in.opcode();
-    if (op == Op::JNotCode)
+    if (op == Op::JNotCode) {
         e.rd.push_back(std::uint16_t(in.a + 1u));
+        // One that leaves goes on in the baseline code at the call it guards: what that call reads is live here.
+        if (guardExits(code, i))
+            for (std::uint16_t r : opt::effectsOf(code, std::uint32_t(opt::jumpTarget(code, i))).rd)
+                if (std::find(e.rd.begin(), e.rd.end(), r) == e.rd.end())
+                    e.rd.push_back(r);
+    }
     if (op == Op::Ret && in.a != 0 && constructs(code))
         e.rd.push_back(0);
     if (e.ok)

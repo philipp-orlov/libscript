@@ -6025,6 +6025,15 @@ void Baseline::ssaEqualsCore(std::uint32_t i, bool loose, Label& bad, Label& eq,
         a_.jcc(CNE, ne);
         a_.cmpI8(mem(RCX, kHdrKind), kObjectKind);
         a_.jcc(CE, ne);
+        // A symbol is equal only to itself.
+        a_.testI8(mem(RAX, 7), 0x80);
+        a_.jcc(CNE, slow);
+        a_.testI8(mem(RCX, 7), 0x80);
+        a_.jcc(CNE, slow);
+        a_.cmpI8(mem(RAX, kGcKind), std::uint8_t(detail::CellKind::Symbol));
+        a_.jcc(CE, ne);
+        a_.cmpI8(mem(RCX, kGcKind), std::uint8_t(detail::CellKind::Symbol));
+        a_.jcc(CE, ne);
         a_.jmp(slow);  // two strings, two bigints
     }
     a_.bind(notCellA);

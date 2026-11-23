@@ -243,6 +243,22 @@ extern "C" std::uint64_t scriptVmJitStep(VM* vm, std::uint32_t index)
             ++stepSites[{fr->code, index}];
     }
 #endif
+    {
+        // A forward jump on two strings compared: nothing runs and nothing throws, so the interpreter is not needed.
+        Frame* fr = vm->frameTop - 1;
+        const Ins& in = fr->code->code[index];
+        const Op op = in.opcode();
+        const bool less = op == Op::JLt || op == Op::JNotLt, lessEq = op == Op::JLe || op == Op::JNotLe;
+        const bool greater = op == Op::JGt || op == Op::JNotGt, greaterEq = op == Op::JGe || op == Op::JNotGe;
+        if ((less || lessEq || greater || greaterEq) && in.jump16() >= 0 && isString(fr->R[in.a]) && isString(fr->R[in.b])) {
+            const int c = compareStrings(fr->R[in.a], fr->R[in.b]);
+            const bool holds = less ? c < 0 : lessEq ? c <= 0 : greater ? c > 0 : c >= 0;
+            const bool negated = op == Op::JNotLt || op == Op::JNotLe || op == Op::JNotGt || op == Op::JNotGe;
+            const bool taken = holds != negated;
+            fr->pc = &in + 1 + (taken ? in.jump16() : 0);  // where the baseline code goes on, as the interpreter leaves it
+            return taken ? kStepJump : kStepFall;
+        }
+    }
     try {
         return handOverStep(*vm, stepInstruction(*vm, index));
     } catch (...) {

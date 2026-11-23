@@ -5,6 +5,8 @@
 
 #include "script/internal/heap.hpp"
 
+#include <cstring>
+
 namespace script {
 namespace internal {
 namespace vm {
@@ -113,7 +115,20 @@ int compareStrings(JSValue a, JSValue b) noexcept
 {
     const StringView x = asString(a)->text();
     const StringView y = asString(b)->text();
-    return x.compare(y) < 0 ? -1 : x == y ? 0 : 1;
+    // One pass to the first unit that differs, four at a time while they agree.
+    const std::size_t n = x.size() < y.size() ? x.size() : y.size();
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        std::uint64_t p, q;
+        std::memcpy(&p, x.data() + i, 8);
+        std::memcpy(&q, y.data() + i, 8);
+        if (p != q)
+            break;
+    }
+    for (; i < n; ++i)
+        if (x[i] != y[i])
+            return x[i] < y[i] ? -1 : 1;
+    return x.size() < y.size() ? -1 : x.size() > y.size() ? 1 : 0;
 }
 
 bool stringsEqual(JSValue a, JSValue b) noexcept

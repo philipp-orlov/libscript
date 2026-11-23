@@ -3086,6 +3086,8 @@ private:
     bool ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter);
     int ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind);
     bool ssaGetElem(std::uint32_t i);
+    bool ssaArrayIterPristine();
+    void ssaIter(std::uint32_t i);
     Mem ssaIndexed(Reg base, Reg index, std::uint8_t scale) const;
     Reg ssaIndex(std::uint32_t v, Label& bad);
     void ssaNeedTyped(std::uint32_t v, Reg r, ElemKind kind, Label& bad);
@@ -3169,6 +3171,9 @@ private:
         Label* join;
         ssa::Bits liveAfter;
         std::int8_t defReg;  ///< the register `def` is in here (`Keep`)
+        std::uint32_t def2 = ssa::kNone;  ///< a second register's value the helper writes (boxed), and that register
+        unsigned dst2 = 0;
+        std::int8_t def2Reg = -1;
     };
     std::vector<std::uint8_t> elemNum_;  ///< per GetElem: the elements are taken as int32s (1) or numbers (2)
     std::deque<ColdPath> coldPaths_;

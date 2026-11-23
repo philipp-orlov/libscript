@@ -260,6 +260,11 @@ void Baseline::ssaColdCall(std::uint32_t i, HelperFn helper, const ssa::Bits& li
     const std::uint32_t def = e.wr.empty() ? ssa::kNone : ssa_->defBase[i];
     const unsigned dst = e.wr.empty() ? 0 : e.wr[0];
     ColdPath c{i, helper, name_, frame_, set, def, dst, &entry, &join, liveAfter, std::int8_t(def == ssa::kNone ? -1 : sval_[def].reg)};
+    if (e.wr.size() == 2) {
+        c.def2 = def + 1;
+        c.dst2 = e.wr[1];
+        c.def2Reg = sval_[c.def2].reg;
+    }
     coldPaths_.push_back(std::move(c));
     // After the instruction, either way: those slots hold what the way taken left there.
     for (unsigned r : set)
@@ -285,6 +290,14 @@ void Baseline::emitColdPaths()
         a_.aluI32(7, RAX, 1);
         a_.jcc(CNE, exception(c.i));
         const std::int8_t defHome = c.def == ssa::kNone ? std::int8_t(-1) : sval_[c.def].reg;
+        if (c.def2 != ssa::kNone && hasLoc(c.def2)) {
+            // (Only boxed: `ssaIter` takes no other.)
+            const std::int8_t home = sval_[c.def2].reg;
+            sval_[c.def2].reg = c.def2Reg;
+            a_.mov(RAX, R(c.dst2));
+            storeTagged(c.def2, RAX);
+            sval_[c.def2].reg = home;
+        }
         if (c.def != ssa::kNone && hasLoc(c.def)) {
             sval_[c.def].reg = c.defReg;
             a_.mov(RAX, R(c.dst));
@@ -1097,6 +1110,12 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                     ssaGeneric(i, liveAfter[b][k]);
                 else if (!ssaSmall(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
+                break;
+            case Op::IterInit: case Op::IterNext: case Op::IterClose:
+                if (!native_[i])
+                    ssaGeneric(i, liveAfter[b][k]);
+                else
+                    ssaIter(i);
                 break;
             case Op::GetElem:
                 if (!native_[i])
@@ -3938,6 +3957,10 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined: case Op::JHole:
     case Op::JNotCode: case Op::JNotCallee:
         return true;
+    case Op::IterInit:
+        return !failed && ssaArrayIterPristine();
+    case Op::IterNext: case Op::IterClose:
+        return !failed;
     case Op::JTrue: case Op::JFalse:
         return known(name_[in.a], kVBool) || !failed;
     case Op::JStrictEq: case Op::JStrictNe: case Op::JEq: case Op::JNe:
@@ -5289,6 +5312,129 @@ Mem Baseline::ssaTypedPlace(std::uint32_t i, std::uint32_t vb, std::uint32_t vi,
         a_.mov(RSI, mem(o, kTypedData));
     }
     return ssaIndexed(RSI, index, size);
+}
+
+/// Whether arrays iterate as made (`Symbol.iterator` of `Array.prototype` and `next` of their iterators the language's own).
+bool Baseline::ssaArrayIterPristine()
+{
+    std::uint8_t attrs = 0;
+    const JSValue* iter = vm_.protos.array->findOwn(vm_, vm_.atoms.symIterator, &attrs);
+    const JSValue* next = vm_.protos.iteratorFamilies[bi::kArrayIterator]->findOwn(vm_, vm_.atoms.next, &attrs);
+    return iter && next && *iter == vm_.origArrayValues && *next == vm_.origIteratorNext &&
+           vm_.validityOf(vm_.protos.array)->valid && vm_.validityOf(vm_.protos.iteratorFamilies[bi::kArrayIterator])->valid;
+}
+
+/// `IterInit`, `IterNext`, `IterClose` along a plain array (its state an index) in place, as the baseline code does them;
+/// another iterator through the helper, out of line (`IterClose` of one leaves).
+void Baseline::ssaIter(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const Op op = in.opcode();
+    const std::uint32_t def = ssa_->defBase[i];
+    const bool two = op != Op::IterClose;
+    if (sval_[def].rep != kRepTagged || (two && sval_[def + 1].rep != kRepTagged)) {
+        a_.jmp(ssaExit(i));
+        return;
+    }
+    if (op == Op::IterClose) {
+        // Along an array, or at its end: nothing to close.
+        const std::uint32_t vs = name_[in.a + 1u];
+        loadValue(vs, RAX);
+        if (mayBeCell(vs)) {
+            a_.test(RAX, R15);
+            a_.jcc(CE, ssaExit(i));
+        }
+        name_[in.a + 1u] = def;
+        vDef_[def] = vKnown_[def] = 0;
+        storeTagged(def, RAX);
+        return;
+    }
+    Label& cold = coldLabels_.emplace_back();
+    Label& join = coldLabels_.emplace_back();
+    const std::vector<std::uint32_t> frameBefore = frame_;
+    ssaColdCall(i, op == Op::IterInit ? &helperThunk<jitIterInit> : &helperThunk<jitIterNext>, curLiveAfter_, cold, join);
+    if (ssaFailed_)
+        return;
+    const std::vector<std::uint32_t> frameAfter = frame_;
+    frame_ = frameBefore;
+    const std::uint32_t vb = name_[in.b];
+    const unsigned stateReg = op == Op::IterInit ? in.a + 1u : in.b + 1u;
+    vDef_[def] = vKnown_[def] = 0;
+    vDef_[def + 1] = vKnown_[def + 1] = 0;
+    if (op == Op::IterInit) {
+        // A plain array of the shape arrays start with, while arrays iterate as made.
+        loadValue(vb, RAX);
+        if (!known(vb, kVObj)) {
+            a_.test(RAX, R15);
+            a_.jcc(CNE, cold);
+            a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+            a_.jcc(CNE, cold);
+        }
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, cold);
+        if (!vm_.arrayRootShape)
+            vm_.arrayRootShape = vm_.rootShapeFor(vm_.protos.array, 0)->id;
+        a_.cmpI32(mem(RAX, 0), std::int32_t(vm_.arrayRootShape));
+        a_.jcc(CNE, cold);
+        std::uint8_t attrs = 0;
+        const JSValue* iter = vm_.protos.array->findOwn(vm_, vm_.atoms.symIterator, &attrs);
+        const JSValue* next = vm_.protos.iteratorFamilies[bi::kArrayIterator]->findOwn(vm_, vm_.atoms.next, &attrs);
+        const auto still = [&](ValidityCell* cell, const JSValue* slot, JSValue value) {
+            hold(cell);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(cell));
+            a_.cmpI32(mem(RCX, kValidityValid), 0);
+            a_.jcc(CE, cold);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(slot));
+            a_.movImm(RDX, value.bits);
+            a_.cmp(RDX, mem(RCX, 0));
+            a_.jcc(CNE, cold);
+        };
+        still(vm_.validityOf(vm_.protos.array), iter, vm_.origArrayValues);
+        still(vm_.validityOf(vm_.protos.iteratorFamilies[bi::kArrayIterator]), next, vm_.origIteratorNext);
+        name_[in.a] = def;
+        storeTagged(def, RAX);
+        a_.mov(RAX, R14);  // the int32 zero
+        name_[stateReg] = def + 1;
+        storeTagged(def + 1, RAX);
+    } else {
+        // The state an index: the element at it (undefined for a hole), and the next index; past the end, the end's mark.
+        const std::uint32_t vs = name_[in.b + 1u];
+        Label end, some, done;
+        loadValue(vs, RCX);
+        a_.cmp(RCX, R14);
+        a_.jcc(CB, cold);
+        loadValue(vb, RSI);
+        if (!known(vb, kVObj)) {
+            a_.test(RSI, R15);
+            a_.jcc(CNE, cold);
+            a_.cmpI8(mem(RSI, kHdrKind), kObjectKind);
+            a_.jcc(CNE, cold);
+        }
+        a_.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, cold);
+        a_.mov32(RCX, RCX);
+        a_.alu32(7, RCX, mem(RSI, kArrayLength));
+        a_.jcc(CAE, end);
+        a_.mov(RDX, mem(RSI, kArrayElems));
+        a_.mov(RAX, ssaIndexed(RDX, RCX, 8));
+        a_.cmpI(RAX, std::int32_t(kHole));
+        a_.jcc(CNE, some);
+        a_.movImm(RAX, kUndefined);
+        a_.bind(some);
+        a_.aluI32(0, RCX, 1);
+        a_.or_(RCX, R14);
+        a_.jmp(done);
+        a_.bind(end);
+        a_.or_(RCX, R14);  // as it was
+        a_.movImm(RAX, in.c ? kUndefined : kHole);
+        a_.bind(done);
+        name_[in.a] = def;
+        storeTagged(def, RAX);
+        name_[stateReg] = def + 1;
+        storeTagged(def + 1, RCX);
+    }
+    a_.bind(join);
+    frame_ = frameAfter;
 }
 
 bool Baseline::ssaGetElem(std::uint32_t i)

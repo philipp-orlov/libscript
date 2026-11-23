@@ -5238,7 +5238,19 @@ bool VM::resumeRaw(JSValue generator, int mode, JSValue sent, JSValue* out, bool
         throwError(ErrorCode::TypeError, "Generator is already running");
         return false;
     }
-    Handle keepGenerator = Handle::retained(generator);
+    // A count on the generator while it runs. Most often only frames hold it, so its count goes back to zero with it
+    // already in the zero-count table: then nothing is left to do, and `destroy` is not called.
+    struct KeepGenerator
+    {
+        VM& vm;
+        CellPtr cell;
+        ~KeepGenerator()
+        {
+            if (--detail::cellCount(cell) == 0 && !(vm.deferred && headerOf(cell)->gc == kInZct))
+                detail::destroyUnreferenced(cell);
+        }
+    } keepGenerator{*this, generator.asCell()};
+    ++detail::cellCount(keepGenerator.cell);
     Handle keepSent = Handle::retained(sent);
     if (g->state == GenState::Start && mode != 0) {
         g->state = GenState::Done;

@@ -39,7 +39,7 @@ bool Baseline::inlinable(const CodeBlock* C) const
 {
     if (!C || C == code_ || (C->flags & CodeBlock::kLazy) || C->prof.size() < C->code.size() + C->nparams || C->code.size() > kInlineMaxCode)
         return false;
-    if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+    if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
                     CodeBlock::kClassConstructor))
         return false;
     if ((C->flags & CodeBlock::kArrow) && readsThis(*C))
@@ -1044,7 +1044,7 @@ void Baseline::planDirectCalls()
             continue;
         CodeBlock* C = fn->code;
         if (!C || argc > C->nparams ||
-            (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+            (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
                          CodeBlock::kClassConstructor)))
             continue;
         if (inlineCall(i, true))
@@ -1113,7 +1113,7 @@ void Baseline::planCodeCall(std::uint32_t i)
     CodeBlock* C = vm_.codeByUid(code_->callProf[i]);
     const unsigned argc = in.c;
     if (!C || C == code_ || C->inlinedFrom || argc > C->nparams ||
-        (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+        (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
                      CodeBlock::kClassConstructor | CodeBlock::kProgram)))
         return;
     if (inlineCall(i, true))
@@ -2101,7 +2101,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         return false;
     CodeBlock* C = f->code;
     if (!C || !C->constructor || (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                                              CodeBlock::kNeedsArgs | CodeBlock::kDerived)))
+                                              CodeBlock::kNeedsArgs | CodeBlock::kArgCount | CodeBlock::kDerived)))
         return false;
     // A base class's constructor as a function's. Its field initialiser (fixed when the class is made) is undefined, and
     // the call of it jumped over; or one that only defines private fields as constants, which is taken in too.

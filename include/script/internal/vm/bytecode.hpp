@@ -222,6 +222,7 @@ struct CodeBlock
         kPrivate = 2048,  ///< names a private member: its element sites keep a `PrivateCache` each
         kImplicit = 16384,  ///< the constructor a class with `extends` gets without writing one: it passes its arguments on
         kLazy = 8192,     ///< a stub: the header and the upvalues are made, `code` is empty until `ensureCompiled` compiles it
+        kArgCount = 32768,  ///< reads `arguments.length` and nothing else of `arguments`: the frame's count (`Op::ArgCount`)
     };
 
     std::uint32_t refs = 1;

@@ -81,7 +81,7 @@ bool mergeable(const CodeBlock* C, unsigned argc)
     if (!n || n > kMergeMaxCallee || !C->handlers.empty() || !C->evalScopes.empty() || C->lines.size() != n ||
         C->prof.empty() || argc > C->nparams || C->uid > 0x7fffffffu || C->inlinedFrom)
         return false;
-    if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+    if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
                     CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
                     CodeBlock::kPrivate))
         return false;
@@ -132,7 +132,7 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
     if (!n || c->callProf.size() != n || c->prof.empty() || c->lines.size() != n || !c->evalScopes.empty() ||
         c->inlinedFrom || c->mergedFrom || c->inlineSites.empty() == deeper)
         return nullptr;
-    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
                     CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
                     CodeBlock::kPrivate))
         return nullptr;

@@ -670,6 +670,39 @@ bool usesArguments(const Node& n)
     return false;
 }
 
+/// `arguments.length`, read as written: no computed key, no `?.`.
+bool isArgumentsLength(const Node& n)
+{
+    return n.kind == NK::Member && !n.computed && !n.optional && n.a && n.a->kind == NK::Identifier &&
+           n.a->text == u"arguments" && n.text == u"length";
+}
+
+/// Whether every `arguments` a function's body names (outside the functions inside it) is a read of `arguments.length`:
+/// none in an arrow or a pattern (`nested`), none written, deleted or counted up.
+bool onlyArgumentsLength(const Node& n, bool nested)
+{
+    checkNativeStack();
+    if (n.kind == NK::FunctionExpr)
+        return true;
+    if (n.kind == NK::Identifier)
+        return n.text != u"arguments";
+    if (isArgumentsLength(n))
+        return !nested;
+    if ((n.kind == NK::Assign || n.kind == NK::Update || n.kind == NK::ForIn || n.kind == NK::ForOf ||
+         (n.kind == NK::Unary && n.op == Tok::Delete)) &&
+        n.a && isArgumentsLength(*n.a))
+        return false;
+    const bool inner = nested || n.kind == NK::ArrowExpr || n.kind == NK::ArrayPattern || n.kind == NK::ObjectPattern ||
+                       n.kind == NK::AssignPattern || n.kind == NK::RestElement;
+    for (const dyn::NodePtr* child : {&n.a, &n.b, &n.c, &n.d})
+        if (*child && !onlyArgumentsLength(**child, inner))
+            return false;
+    for (const dyn::NodePtr& child : n.list)
+        if (child && !onlyArgumentsLength(*child, inner))
+            return false;
+    return true;
+}
+
 bool usesSuper(const Node& n)
 {
     checkNativeStack();
@@ -1442,7 +1475,16 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         case NK::Conditional: return conditional(n, dst);
         case NK::Call: return chainRoot(n, dst, false);
         case NK::NewExpr: return call(n, dst, true);
-        case NK::Member: return chainRoot(n, dst, false);
+        case NK::Member:
+            // (Its own `arguments`, unless a variable or parameter of this function has the name; an outer function's
+            // `arguments` is no other's.)
+            if ((fn_->block->flags & CodeBlock::kArgCount) && isArgumentsLength(n) &&
+                resolve(String(u"arguments")).kind != Ref::Local) {
+                const std::uint16_t d = dest(dst);
+                emit(Op::ArgCount, d);
+                return d;
+            }
+            return chainRoot(n, dst, false);
         case NK::Sequence: {
             const std::uint16_t mark = fn_->top;
             for (std::size_t i = 0; i + 1 < n.list.size(); ++i) {
@@ -4282,7 +4324,14 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
             it = strings.count(*it) ? std::next(it) : fn_->appended.erase(it);
     }
     const bool hasRest = fixed < nparams;
-    const bool needsArgs = hasRest || (!arrow && (usesArguments(*n.d) || fn_->captured.count(String(u"%all"))));
+    // Only `arguments.length`, in a function that a call starts (no generator) and no direct `eval` reaches: the frame's
+    // count, and no array.
+    const bool countOnly = !hasRest && !arrow && !fn_->captured.count(String(u"%all")) &&
+                           !(block->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen)) &&
+                           usesArguments(*n.d) && onlyArgumentsLength(*n.d, false);
+    if (countOnly)
+        block->flags |= CodeBlock::kArgCount;
+    const bool needsArgs = hasRest || (!arrow && !countOnly && (usesArguments(*n.d) || fn_->captured.count(String(u"%all"))));
     // `this`, the fixed parameters, then (if any) the arguments array.
     fn_->top = std::uint16_t(1 + fixed + (needsArgs ? 1 : 0));
     block->nregs = fn_->top;

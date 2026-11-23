@@ -142,7 +142,7 @@ CodeBlock* selfInline(VM& vm, CodeBlock* c)
     if (!c->name || n == 0 || n > kSelfInlineMaxCode || !c->handlers.empty() || !c->evalScopes.empty() ||
         c->lines.size() != n)
         return nullptr;
-    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+    if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
                     CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived))
         return nullptr;
     std::vector<bool> target(n + 1, false);

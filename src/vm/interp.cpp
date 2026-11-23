@@ -1854,6 +1854,9 @@ L_PutUpval: {
 L_LoadCallee:
     COPY(ins->a, toJSValue(fn));
     NEXT();
+L_ArgCount:
+    COPY(ins->a, JSValue::int32(std::int32_t(fr->argc)));
+    NEXT();
 L_JNotCallee:
     if (R[ins->a].bits != toJSValue(fn).bits)
         pc += ins->jump();
@@ -1865,7 +1868,10 @@ L_JNotCode: {
     bool same = false;
     if (isFunction(v)) {
         const CodeBlock* callee = static_cast<JSFunction*>(asObject(v))->code;
-        same = callee && (want.isInt32() ? callee->uid == std::uint64_t(want.asInt32()) : v.bits == want.bits) &&
+        same = callee &&
+               (want.isInt32() ? callee->uid == std::uint64_t(want.asInt32()) ||
+                                     (callee->mergedFrom && callee->mergedFrom->uid == std::uint64_t(want.asInt32()))
+                               : v.bits == want.bits) &&
                ((callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) || isObject(R[ins->a + 1]));
     }
     if (!same)
@@ -5026,7 +5032,7 @@ JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args,
             for (std::uint32_t i = 1 + n; i < end; ++i)
                 if (!R[i].isUndefined()) [[unlikely]]
                     clearReg(*this, R[i]);
-            *frameTop++ = Frame{c, f, nullptr, R, 0, 0, n, false, true, JSValue::undefined()};
+            *frameTop++ = Frame{c, f, nullptr, R, 0, 0, argc, false, true, JSValue::undefined()};
             const JSValue result = enterTier1(*this, c->tier1, 0);
             stackTop = R;
             clearRegs(*this, R, 0, 1 + n);

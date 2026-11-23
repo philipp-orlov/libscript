@@ -1071,6 +1071,7 @@ constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
 constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
 constexpr std::int32_t kCbTier1 = std::int32_t(offsetof(CodeBlock, tier1));
 constexpr std::int32_t kCbUid = std::int32_t(offsetof(CodeBlock, uid));
+constexpr std::int32_t kCbMergedFrom = std::int32_t(offsetof(CodeBlock, mergedFrom));
 constexpr std::int32_t kCbConstructor = std::int32_t(offsetof(CodeBlock, constructor));
 constexpr std::int32_t kCbThisSlots = std::int32_t(offsetof(CodeBlock, thisSlots));
 constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
@@ -3667,6 +3668,11 @@ void Baseline::emit(std::uint32_t i)
     case Op::SpreadObj: helperOp(i, &helperThunk<jitSpreadObj>); return;
     case Op::KeysOf: helperOp(i, &helperThunk<jitKeysOf>); return;
     case Op::LoadCallee: helperOp(i, &helperThunk<jitLoadCallee>); return;
+    case Op::ArgCount:
+        a_.mov32(RAX, mem(R13, kFrameArgc));
+        a_.or_(RAX, R14);
+        deliver(i, in.a);
+        return;
     case Op::NewTarget: helperOp(i, &helperThunk<jitNewTarget>); return;
     case Op::CallSpread: helperOrStep(i, &helperThunk<jitCallSpread>); return;
     case Op::IterNext: {
@@ -4951,8 +4957,15 @@ void Baseline::jumps(std::uint32_t i, const Ins& in)
         a_.jcc(CNE, no);
         a_.mov(RCX, mem(RAX, kFnCode));
         if (callee) {
+            // That block, or a copy of it with calls run in place that its function runs now (`mergeInline`).
+            Label same;
             a_.movImm(RDX, reinterpret_cast<std::uint64_t>(callee));
             a_.cmp(RDX, RCX);
+            a_.jcc(CE, same);
+            a_.test(RCX, RCX);  // (a native function has no block)
+            a_.jcc(CE, no);
+            a_.cmp(RDX, mem(RCX, kCbMergedFrom));
+            a_.bind(same);
         } else {
             a_.test(RCX, RCX);
             a_.jcc(CE, no);

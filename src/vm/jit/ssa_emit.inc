@@ -2152,8 +2152,15 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         a_.jcc(CNE, no);
         a_.mov(RCX, mem(RAX, kFnCode));
         if (callee) {
+            // That block, or a copy of it with calls run in place that its function runs now (`mergeInline`).
+            Label same;
             a_.movImm(RDX, reinterpret_cast<std::uint64_t>(callee));
             a_.cmp(RDX, RCX);
+            a_.jcc(CE, same);
+            a_.test(RCX, RCX);  // (a native function has no block)
+            a_.jcc(CE, no);
+            a_.cmp(RDX, mem(RCX, kCbMergedFrom));
+            a_.bind(same);
         } else {
             a_.test(RCX, RCX);
             a_.jcc(CE, no);
@@ -2509,7 +2516,7 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
     CodeBlock* C = f->code;
     if (!C || !C->constructor ||
         (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                     CodeBlock::kNeedsArgs | CodeBlock::kDerived)))
+                     CodeBlock::kNeedsArgs | CodeBlock::kArgCount | CodeBlock::kDerived)))
         return false;
     // A base class's constructor. Its field initialiser is fixed when the class is made: undefined (the call of it jumped
     // over), or one that only defines fields as constants, which is taken in too.
@@ -3635,7 +3642,7 @@ CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
         return nullptr;
     CodeBlock* C = vm_.codeByUid(code_->callProf[i]);
     if (!C || C->inlinedFrom || (!def_ && in.c > C->nparams) ||
-        (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs |
+        (C->flags & (CodeBlock::kLazy | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
                      CodeBlock::kClassConstructor | CodeBlock::kProgram)))
         return nullptr;
     return C;

@@ -60,7 +60,7 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
         break;
     case Op::LoadK: case Op::LoadInt: case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse:
     case Op::LoadHole: case Op::LoadUninit: case Op::GetGlobal: case Op::GetGlobalOrUndef: case Op::GetUpval:
-    case Op::LoadCallee: case Op::NewObject: case Op::NewArray: case Op::NewRegExp: case Op::FieldInit:
+    case Op::LoadCallee: case Op::NewObject: case Op::NewArray: case Op::NewRegExp: case Op::FieldInit: case Op::ArgCount:
         wr(in.a);
         break;
     case Op::CheckInit: case Op::Unshare:

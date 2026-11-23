@@ -2054,6 +2054,15 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             ssaCondEdges(b, eqTaken ? CE : CNE);
             return true;
         }
+        std::uint32_t vt;
+        std::uint64_t name;
+        if (ssaTypeofConst(va, vb, &vt, &name)) {
+            loadValue(vt, RAX);
+            a_.movImm(RCX, name);
+            a_.cmp(RAX, RCX);
+            ssaCondEdges(b, eqTaken ? CE : CNE);
+            return true;
+        }
         if (failed && loose)
             return false;
         Label& bad = ssaExit(i);
@@ -5106,6 +5115,37 @@ void Baseline::ssaGlobalRead(std::uint32_t i, Label& bad)
 
 /// `==`, `!=`, `===`, `!==` into a boolean, where they compare bits: against null or undefined (loose), against a constant
 /// that is no number and no cell, two int32s, two objects; anything else leaves.
+/// `typeof x` against a constant string: the result is always one of the VM's names (`VM::typeofName`, kept for its life),
+/// so the test is one of bits. False when the operands are not such a pair; `*bits` is that name (0, which no value is: the
+/// constant is none of them).
+bool Baseline::ssaTypeofConst(std::uint32_t va, std::uint32_t vb, std::uint32_t* v, std::uint64_t* bits)
+{
+    auto isTypeof = [&](std::uint32_t x) {
+        const ssa::Value& sv = ssa_->values[x];
+        return !sval_[x].isConst && sv.kind == ssa::Value::Def && code_->code[sv.at].opcode() == Op::TypeOf;
+    };
+    auto constString = [&](std::uint32_t x) { return sval_[x].isConst && isString(JSValue::raw(sval_[x].bits)); };
+    std::uint32_t k;
+    if (isTypeof(va) && constString(vb)) {
+        *v = va;
+        k = vb;
+    } else if (isTypeof(vb) && constString(va)) {
+        *v = vb;
+        k = va;
+    } else {
+        return false;
+    }
+    *bits = 0;
+    const StringView text = asString(JSValue::raw(sval_[k].bits))->text();
+    for (unsigned w = 0; w < 8 && !*bits; ++w) {
+        const JSValue n = vm_.typeofName(w);
+        if (asString(n)->text() == text)
+            *bits = n.bits;
+        vm::release(n);
+    }
+    return true;
+}
+
 bool Baseline::ssaEquals(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
@@ -5140,6 +5180,15 @@ bool Baseline::ssaEquals(std::uint32_t i)
     if (pa || pb || (known(va, kVInt) && known(vb, kVInt))) {
         loadValue(va, RAX);
         loadValue(vb, RCX);
+        a_.cmp(RAX, RCX);
+        finish(eq ? CE : CNE);
+        return true;
+    }
+    std::uint32_t vt;
+    std::uint64_t name;
+    if (ssaTypeofConst(va, vb, &vt, &name)) {
+        loadValue(vt, RAX);
+        a_.movImm(RCX, name);
         a_.cmp(RAX, RCX);
         finish(eq ? CE : CNE);
         return true;

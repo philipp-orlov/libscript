@@ -3122,6 +3122,7 @@ private:
     void ssaEqualEdges(std::uint32_t b, bool eqTaken, Emit emit);
     bool intConst(std::uint32_t v) const { return sval_[v].isConst && JSValue::raw(sval_[v].bits).isInt32(); }
     bool ssaTypeOf(std::uint32_t i);
+    bool ssaTypeofConst(std::uint32_t va, std::uint32_t vb, std::uint32_t* v, std::uint64_t* bits);
     template <typename Then>
     void ssaRelation(std::uint32_t i, std::uint32_t va, std::uint32_t vb, std::int32_t imm, bool isImm, Label& bad,
                      Then then);

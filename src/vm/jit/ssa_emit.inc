@@ -3506,7 +3506,7 @@ JSFunction* Baseline::ssaCharCodeCallee(std::uint32_t i)
             return nullptr;
         auto* f = static_cast<JSFunction*>(asObject(*slot));
         if (!(f->flags & JSFunction::kNative) || !f->rare() ||
-            !(f->rare()->native == stringCodePointNative() ||
+            !(f->rare()->native == stringCodePointNative() || f->rare()->native == stringCompareNative() ||
               (f->rare()->native == stringCharNative() && f->rare()->nativeData == reinterpret_cast<void*>(1))))
             return nullptr;
         return f;
@@ -3527,6 +3527,20 @@ void Baseline::ssaCharCode(std::uint32_t i, JSFunction* f)
     a_.jcc(CNE, bad);
     loadValue(name_[in.b + 1u], RSI);
     needString(RSI, bad);
+    if (f->rare()->native == stringCompareNative()) {
+        // `localeCompare`: two flat strings compared by their units, the live registers saved.
+        stringChars(RSI, RCX, bad);
+        loadValue(name_[in.b + 2u], RDX);
+        needString(RDX, bad);
+        stringChars(RDX, RCX, bad);
+        const std::vector<int> keep = ssaLiveRegs();
+        ssaSaveRegs(keep);
+        a_.mov(RDI, RSI);
+        a_.mov(RSI, RDX);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaCompareStrings));
+        a_.callC(RAX);
+        ssaRestoreRegs(keep);
+    } else {
     loadI32(name_[in.b + 2u], RDX, &bad);
     a_.mov32(RDX, RDX);
     a_.alu32(7, RDX, mem(RSI, kStrLength));
@@ -3553,6 +3567,7 @@ void Baseline::ssaCharCode(std::uint32_t i, JSFunction* f)
         a_.alu32(0, RAX, RDI);
         a_.aluI32(0, RAX, 0x10000 - 0xDC00 - (0xD800 << 10));
         a_.bind(done);
+    }
     }
     if (sval_[ssa_->defBase[i]].rep == kRepI32) {
         ssaDefI32(i);

@@ -3833,6 +3833,11 @@ FastNative stringCharNative() noexcept
     return stringCharAt;
 }
 
+FastNative stringCompareNative() noexcept
+{
+    return stringLocaleCompare;
+}
+
 FastNative arrayPushNative() noexcept
 {
     return arrayPush;

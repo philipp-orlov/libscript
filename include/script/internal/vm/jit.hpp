@@ -50,6 +50,8 @@ MathOp mathOp(FastNative native, const void* data) noexcept;
 FastNative stringCharNative() noexcept;
 /// `String.prototype.codePointAt`: compiled code reads a character, or a pair of surrogates, itself.
 FastNative stringCodePointNative() noexcept;
+/// `String.prototype.localeCompare`: compiled code compares two flat strings itself.
+FastNative stringCompareNative() noexcept;
 /// `DataView.prototype.getInt8` and the others: data is the element kind, and 256 for a set.
 FastNative dataViewAccessNative() noexcept;
 /// The getters of `DataView.prototype`: data 0 `buffer`, 1 `byteLength`, 2 `byteOffset`.

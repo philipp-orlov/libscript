@@ -1985,6 +1985,10 @@ Context::Stats Context::stats() const
     out.liveStrings = impl_->liveStrings;
     out.heapBytes = impl_->heapBytes;
     out.reservedBytes = impl_->heap.stats().committedBytes;
+#if SCRIPT_VM
+    if (vm::VM* vm = impl_->vmIfAny())
+        out.reservedBytes += vm->heap.stats().committedBytes;
+#endif
     out.totalAllocated = impl_->totalAllocated;
     out.gcRuns = impl_->gcRuns;
     out.gcFreed = impl_->gcFreed;

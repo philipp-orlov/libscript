@@ -203,7 +203,10 @@ VM::~VM()
     std::free(megaRead);
 }
 
-void VM::afterCollect() noexcept {}
+void VM::afterCollect() noexcept
+{
+    heap.trim();
+}
 
 void VM::addCodeRoot(CodeBlock** slot)
 {

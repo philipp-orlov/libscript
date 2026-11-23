@@ -202,7 +202,10 @@ TEST(poolReservationStabilises)
     // blocks the heap keeps for the next burst; after that, five times the work
     // must not move the reservation.
     CHECK(midway <= settled + kIdleReserve);
-    CHECK(later <= midway + (kSanitized ? kIdleReserve : CellPoolBlock));  // scaled down, the reserve is still filling
+    // The vm core's heap fills its own reserve of idle blocks more slowly; once full, more work must not move it.
+    CHECK(later <= midway + kIdleReserve);
+    const std::uint64_t last = soak(kSoakRounds * 4);
+    CHECK(last <= later + (kSanitized ? kIdleReserve : CellPoolBlock));
 }
 
 TEST(burstsReturnTheirMemory)
@@ -224,8 +227,8 @@ TEST(burstsReturnTheirMemory)
 
     CHECK(released.heapBytes < quiet.heapBytes + (256u << 10));
     CHECK(released.liveObjects < quiet.liveObjects + 64);
-    // The pool gives whole blocks back once a size class falls idle.
-    CHECK(released.reservedBytes < loaded.reservedBytes / 2);
+    // The pools give whole blocks back once a size class falls idle; the vm core's heap too (about 1/8 here, 1/2 without its trim).
+    CHECK(released.reservedBytes < loaded.reservedBytes / 4);
 }
 
 TEST(deepStructuresFreeWithoutOverflowingTheStack)

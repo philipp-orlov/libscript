@@ -231,7 +231,7 @@ public:
         std::uint64_t liveObjects = 0;
         std::uint64_t liveStrings = 0;
         std::uint64_t heapBytes = 0;      ///< bytes charged to the heap right now
-        std::uint64_t reservedBytes = 0;  ///< memory the cell pool holds for reuse
+        std::uint64_t reservedBytes = 0;  ///< memory the cell pools hold, the vm core's among them
         std::uint64_t totalAllocated = 0;
         std::uint64_t gcRuns = 0;
         std::uint64_t gcFreed = 0;          ///< cells reclaimed by cycle collection

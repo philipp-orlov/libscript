@@ -498,6 +498,10 @@ struct VM : EngineRuntime
     /// The property names of the first thousand non-negative integers, made when first asked for; each holds a count.
     static constexpr std::size_t kSmallIndexKeys = 1024;
     Key smallIndexKeys[kSmallIndexKeys] = {};
+    /// The same for the integers below `kIndexKeys` (an object used as a map by ids): 1024 to a chunk, each chunk made when
+    /// first asked for. Bounded: at most `kIndexKeys` names stay for the life of the VM.
+    static constexpr std::size_t kIndexKeys = 65536;
+    Key* indexKeyChunks[kIndexKeys / kSmallIndexKeys] = {};
     Intrinsics protos;
     /// Install a prototype into one of `protos`'s fields, counting it and letting go of the one it replaces.
     void setIntrinsic(JSObject** slot, JSObject* object) noexcept;

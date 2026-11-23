@@ -5,6 +5,7 @@
 
 #include "script/internal/heap.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace script {
@@ -69,8 +70,17 @@ Key toPropertyKey(VM& vm, JSValue v)
 {
     if (v.isInt32()) {
         const std::int32_t i = v.asInt32();
-        if (i >= 0 && i < std::int32_t(VM::kSmallIndexKeys)) {
-            Key& slot = vm.smallIndexKeys[i];
+        if (i >= 0 && i < std::int32_t(VM::kIndexKeys)) {
+            Key* chunk = vm.smallIndexKeys;
+            if (i >= std::int32_t(VM::kSmallIndexKeys)) {
+                Key*& more = vm.indexKeyChunks[std::size_t(i) / VM::kSmallIndexKeys];
+                if (!more) {
+                    more = static_cast<Key*>(vm.allocPayload(VM::kSmallIndexKeys * sizeof(Key)));
+                    std::fill(more, more + VM::kSmallIndexKeys, nullptr);
+                }
+                chunk = more;
+            }
+            Key& slot = chunk[std::size_t(i) % VM::kSmallIndexKeys];
             if (!slot) {
                 slot = vm.ctx.intern(numberToString(double(i)));
                 detail::incRef(slot);  // the table's own count: a sweep of unused names must leave it be

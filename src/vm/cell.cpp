@@ -1354,6 +1354,15 @@ void VM::releaseRoots() noexcept
             detail::decRef(k);
         k = nullptr;
     }
+    for (Key*& chunk : indexKeyChunks) {
+        if (!chunk)
+            continue;
+        for (std::size_t i = 0; i < kSmallIndexKeys; ++i)
+            if (chunk[i])
+                detail::decRef(chunk[i]);
+        freePayload(chunk, kSmallIndexKeys * sizeof(Key));
+        chunk = nullptr;
+    }
     for (JSObject*& p : protos.iteratorFamilies) {
         if (p)
             detail::decRef(reinterpret_cast<CellPtr>(p));

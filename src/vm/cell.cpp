@@ -658,7 +658,7 @@ void VM::makeOld(CellPtr cell) noexcept
         zctPush(cell);  // a frame may hold it
 }
 
-void VM::collectYoung() noexcept
+void VM::collectYoung(bool registers) noexcept
 {
     if (youngTop_ == youngBase_)
         return;
@@ -674,12 +674,15 @@ void VM::collectYoung() noexcept
             youngWork_.push_back(c);  // within its capacity, the list's
         }
     };
-    // A register above the live ones may name what goes now: it holds undefined from here on, as after any scan.
-    JSValue* const hi = liveTop();
-    for (JSValue* r = hi; r < stackInit; ++r)
-        *r = JSValue::undefined();
-    for (JSValue* r = stackBase; r < hi; ++r)
-        mark(*r);
+    // What a register holds, unless the frames' cells are counted already (a scan). A register above the live ones may name
+    // what goes now: it holds undefined from here on, as after any scan.
+    if (registers) {
+        JSValue* const hi = liveTop();
+        for (JSValue* r = hi; r < stackInit; ++r)
+            *r = JSValue::undefined();
+        for (JSValue* r = stackBase; r < hi; ++r)
+            mark(*r);
+    }
     for (CellPtr* p = youngBase_; p < youngTop_; ++p) {
         CellHeader* h = headerOf(*p);
         if ((h->gc & (kYoungGc | kYoungMarked)) == kYoungGc && h->rc != 0) {
@@ -761,7 +764,7 @@ std::uint32_t VM::allocSiteFor(CodeBlock* code, std::uint32_t index)
 void VM::collectYoungAtHost() noexcept
 {
     if (!immediate_ && !tearingDown && !ctx.tearingDown)
-        collectYoung();
+        collectYoung(true);
 }
 
 void VM::allYoungOld() noexcept
@@ -884,8 +887,8 @@ void VM::scanZct() noexcept
 {
     if (immediate_ || tearingDown || ctx.tearingDown)
         return;
-    collectYoung();
     countRoots(1);
+    collectYoung(false);
     freeZct();
     countRoots(-1);
     setZctLimit();
@@ -999,8 +1002,8 @@ void VM::rootsBegin() noexcept
         return;
     // The table is empty for the whole collection, which writes the `gc` word of every cell it looks at, and no cell is
     // young.
-    collectYoung();
     countRoots(1);
+    collectYoung(false);
     freeZct();
     ++immediate_;
     rootsCounted_ = true;

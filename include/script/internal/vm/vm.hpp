@@ -690,8 +690,9 @@ private:
     Vec<CellPtr> youngWork_;
     Vec<AllocSite*> siteChunks_;
     std::uint32_t siteCount_ = 1;  ///< 0 is no site
-    /// Mark, make old and free the young cells, as said above.
-    void collectYoung() noexcept;
+    /// Mark, make old and free the young cells, as said above. `registers`: the frames' cells are not counted now, and are
+    /// looked at as well.
+    void collectYoung(bool registers) noexcept;
     void collectYoungAtHost() noexcept;
     /// Every young cell made old (the context's end).
     void allYoungOld() noexcept;

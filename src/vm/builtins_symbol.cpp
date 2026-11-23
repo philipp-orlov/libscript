@@ -429,8 +429,7 @@ void installSymbolAndIterators(VM& vm)
     retain(toJSValue(values));
     ap->putOwn(vm, vm.atoms.symIterator, toJSValue(values), attr::kWritable | attr::kConfigurable);
     vm.origArrayValues = toJSValue(values);
-    if (JSValue* next = vm.protos.nativeIterator->findOwn(vm, vm.atoms.next))
-        vm.origIteratorNext = *next;
+    vm.origIteratorNext = vm.origNativeNext[kArrayIterator];
     {
         JSObject* argumentsProto = vm.newObject(vm.protos.object);
         vm.setIntrinsic(&vm.protos.arguments, argumentsProto);

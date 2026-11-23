@@ -387,7 +387,7 @@ bool arrayIterationIntact(VM& vm, JSValue v)
     JSValue* it = vm.protos.array->findOwn(vm, vm.atoms.symIterator);
     if (!it || *it != vm.origArrayValues)
         return false;
-    JSValue* next = vm.protos.nativeIterator->findOwn(vm, vm.atoms.next);
+    JSValue* next = vm.protos.iteratorFamilies[bi::kArrayIterator]->findOwn(vm, vm.atoms.next);
     return next && *next == vm.origIteratorNext;
 }
 

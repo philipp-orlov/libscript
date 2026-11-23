@@ -38,6 +38,7 @@
 #include "script/internal/vm/operators.hpp"
 #include "opt_analysis.hpp"
 #include "ssa.hpp"
+#include "../builtins_util.hpp"
 
 #if defined(__GNUC__)
 // The compilers bake the offsets of fields of cells, which are not standard layout, into the code they emit.
@@ -3561,9 +3562,9 @@ void Baseline::emit(std::uint32_t i)
         // Of a plain array that iterates as arrays do.
         std::uint8_t attrs = 0;
         const JSValue* iter = vm_.protos.array->findOwn(vm_, vm_.atoms.symIterator, &attrs);
-        const JSValue* next = vm_.protos.nativeIterator->findOwn(vm_, vm_.atoms.next, &attrs);
+        const JSValue* next = vm_.protos.iteratorFamilies[bi::kArrayIterator]->findOwn(vm_, vm_.atoms.next, &attrs);
         ValidityCell* const ofArray = vm_.validityOf(vm_.protos.array);
-        ValidityCell* const ofNext = vm_.validityOf(vm_.protos.nativeIterator);
+        ValidityCell* const ofNext = vm_.validityOf(vm_.protos.iteratorFamilies[bi::kArrayIterator]);
         if (!iter || !next || *iter != vm_.origArrayValues || *next != vm_.origIteratorNext || !ofArray->valid || !ofNext->valid) {
             helperOrStep(i, &helperThunk<jitIterInit>);
             return;

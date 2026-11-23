@@ -506,7 +506,7 @@ struct VM : EngineRuntime
     /// The original `Array.prototype[Symbol.iterator]` and `%ArrayIteratorPrototype%.next`: while they are in place an
     /// array is iterated by index. Not counted (the prototypes hold them).
     JSValue origArrayValues = JSValue::undefined();
-    JSValue origIteratorNext = JSValue::undefined();
+    JSValue origIteratorNext = JSValue::undefined();  ///< the `next` of array iterators, as made
     /// The `next` of generator objects as installed, which iteration may skip the result object for.
     JSValue origGeneratorNext = JSValue::undefined();
     JSValue origIteratorSelf = JSValue::undefined();  ///< %IteratorPrototype%[Symbol.iterator] as made

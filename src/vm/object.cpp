@@ -179,6 +179,7 @@ void VM::releaseCode(CodeBlock* code) noexcept
         return;
     if (code->name)
         detail::decRef(code->name);
+    release(code->sourceText);
     for (JSValue v : code->consts)
         release(v);
     for (Key k : code->atoms)

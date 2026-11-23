@@ -952,8 +952,17 @@ NATIVE(functionToString)
             name = toUtf8(static_cast<StringCell*>(r->fnName)->text());
         return str(vm, "function " + name + "() { [native code] }");
     }
-    if (f->code->source && f->code->srcEnd > f->code->srcStart && f->code->srcEnd <= f->code->source->size())
-        return str(vm, std::string_view(*f->code->source).substr(f->code->srcStart, f->code->srcEnd - f->code->srcStart));
+    if (f->code->source && f->code->srcEnd > f->code->srcStart && f->code->srcEnd <= f->code->source->size()) {
+        // Its text, decoded once.
+        if (f->code->sourceText.isUndefined()) {
+            const JSValue text = str(vm, std::string_view(*f->code->source).substr(f->code->srcStart, f->code->srcEnd - f->code->srcStart));
+            if (text.isException())
+                return text;
+            f->code->sourceText = text;
+        }
+        retain(f->code->sourceText);
+        return f->code->sourceText;
+    }
     if (f->code->name)
         name = toUtf8(static_cast<StringCell*>(f->code->name)->text());
     return str(vm, "function " + name + "() { [native code] }");

@@ -227,6 +227,7 @@ struct CodeBlock
     std::uint32_t refs = 1;
     std::uint32_t length = 0;  ///< the `length` property: parameters before the first default
     Key name = nullptr;        ///< holds a count; null for an anonymous function
+    JSValue sourceText = JSValue::undefined();  ///< what `Function.prototype.toString` gave, made once; holds a count
     bool constructor = false;
     std::uint32_t flags = 0;
     std::uint16_t nparams = 0;

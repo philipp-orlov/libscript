@@ -16,7 +16,9 @@ namespace jit {
 
 enum Reg : std::uint8_t
 {
-    RAX = 0, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15
+    RAX = 0, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
+    // Named by the register lists the targets share; none is allocated here (`kExtraGpr` is 0).
+    R16, R17, R18, R19, R20, R21, R22
 };
 
 enum Cond : std::uint8_t

@@ -688,6 +688,9 @@ bool onlyArgumentsLength(const Node& n, bool nested)
         return n.text != u"arguments";
     if (isArgumentsLength(n))
         return !nested;
+    // Called (`arguments.length()`, a tagged template): the call compiles its receiver, the bare `arguments`.
+    if (n.kind == NK::Call && n.a && isArgumentsLength(*n.a))
+        return false;
     if ((n.kind == NK::Assign || n.kind == NK::Update || n.kind == NK::ForIn || n.kind == NK::ForOf ||
          (n.kind == NK::Unary && n.op == Tok::Delete)) &&
         n.a && isArgumentsLength(*n.a))
@@ -1477,12 +1480,15 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
         case NK::NewExpr: return call(n, dst, true);
         case NK::Member:
             // (Its own `arguments`, unless a variable or parameter of this function has the name; an outer function's
-            // `arguments` is no other's.)
-            if ((fn_->block->flags & CodeBlock::kArgCount) && isArgumentsLength(n) &&
-                resolve(String(u"arguments")).kind != Ref::Local) {
-                const std::uint16_t d = dest(dst);
-                emit(Op::ArgCount, d);
-                return d;
+            // `arguments` is no other's, and the function's own name gives way to it. Looked up in this function's scopes
+            // only: `resolve` would capture an outer one.)
+            if ((fn_->block->flags & CodeBlock::kArgCount) && isArgumentsLength(n)) {
+                const Binding* own = findInScopes(*fn_, String(u"arguments"));
+                if (!own || own->kind == BKind::FnName) {
+                    const std::uint16_t d = dest(dst);
+                    emit(Op::ArgCount, d);
+                    return d;
+                }
             }
             return chainRoot(n, dst, false);
         case NK::Sequence: {
@@ -4326,17 +4332,25 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     const bool hasRest = fixed < nparams;
     // Only `arguments.length`, in a function that a call starts (no generator) and no direct `eval` reaches: the frame's
     // count, and no array.
+    // Whether the body or a parameter's default names `arguments`, and whether every such use is `arguments.length`.
+    bool argsUsed = usesArguments(*n.d), argsLengthOnly = onlyArgumentsLength(*n.d, false);
+    for (const dyn::NodePtr& p : n.list) {
+        if (!p)
+            continue;
+        argsUsed = argsUsed || usesArguments(*p);
+        argsLengthOnly = argsLengthOnly && onlyArgumentsLength(*p, false);
+    }
     const bool countOnly = !hasRest && !arrow && !fn_->captured.count(String(u"%all")) &&
                            !(block->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen)) &&
-                           usesArguments(*n.d) && onlyArgumentsLength(*n.d, false);
+                           argsUsed && argsLengthOnly;
     if (countOnly)
         block->flags |= CodeBlock::kArgCount;
-    const bool needsArgs = hasRest || (!arrow && !countOnly && (usesArguments(*n.d) || fn_->captured.count(String(u"%all"))));
+    const bool needsArgs = hasRest || (!arrow && !countOnly && (argsUsed || fn_->captured.count(String(u"%all"))));
     // `this`, the fixed parameters, then (if any) the arguments array.
     fn_->top = std::uint16_t(1 + fixed + (needsArgs ? 1 : 0));
     block->nregs = fn_->top;
     // A rest parameter and no `arguments`: the call makes the rest array itself, in the register after the parameters.
-    const bool restOnly = hasRest && !(!arrow && (usesArguments(*n.d) || fn_->captured.count(String(u"%all"))));
+    const bool restOnly = hasRest && !(!arrow && (argsUsed || fn_->captured.count(String(u"%all"))));
     if (needsArgs) {
         block->flags |= CodeBlock::kNeedsArgs;
         if (restOnly)

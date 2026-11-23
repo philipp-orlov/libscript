@@ -578,6 +578,8 @@ struct VM : EngineRuntime
     std::uint32_t arrayRootShape = 0;
     /// The shape a match's array starts with and the one it has with its `index`, `input` and `groups` (0: none made yet).
     std::uint32_t matchRoot = 0, matchShape = 0;
+    /// The shape of an iterator result `{value, done}` with its two slots in place (0: none made yet).
+    std::uint32_t iterResultShape = 0;
     /// Set by `SetEvalScope` just before a call that may be a direct `eval`.
     const CodeBlock* evalCode = nullptr;
     std::uint32_t evalIndex = 0;

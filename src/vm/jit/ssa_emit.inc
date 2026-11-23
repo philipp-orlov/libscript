@@ -2078,9 +2078,10 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         const std::uint64_t uid = want.isInt32() ? std::uint64_t(want.asInt32()) : 0;
         CodeBlock* callee = want.isInt32() ? vm_.codeByUid(uid) : static_cast<JSFunction*>(asObject(want))->code;
         const std::uint32_t vf = name_[in.a], vt = name_[in.a + 1u];
-        const bool direct = bl.succs[0] != bl.succs[1] && ssaPlainEdge(b, bl.succs[1]);
+        const bool exits = bl.succs.size() == 1;
+        const bool direct = !exits && bl.succs[0] != bl.succs[1] && ssaPlainEdge(b, bl.succs[1]);
         Label away;
-        Label& no = direct ? blockLabel_[bl.succs[1]] : away;
+        Label& no = exits ? ssaExit(i) : direct ? blockLabel_[bl.succs[1]] : away;
         const JSValue kf = sval_[vf].isConst ? JSValue::raw(sval_[vf].bits) : JSValue::undefined();
         // A constant function of that code: nothing to test.
         const bool sure = want.isInt32() ? isFunction(kf) && callee && static_cast<JSFunction*>(asObject(kf))->code == callee
@@ -2119,6 +2120,10 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             a_.jcc(CNE, no);
             a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
             a_.jcc(CNE, no);
+        }
+        if (exits) {
+            ssaEdge(b, bl.succs[0], true);
+            return true;
         }
         if (direct) {
             ssaTakePlainEdge(bl.succs[1]);

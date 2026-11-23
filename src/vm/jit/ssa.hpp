@@ -78,6 +78,10 @@ struct Graph
 /// name (`JNotCode` looks at the `this` after the callee).
 opt::Effects effects(const CodeBlock& code, std::uint32_t i);
 
+/// Whether `JNotCode` at `i` leaves the code when the function is another: the call it guards is the plain call that follows
+/// the callee's code run in place, and the guard has not failed before. That call is then not in the graph.
+bool guardExits(const CodeBlock& code, std::uint32_t i);
+
 /// Whether frames that `new` made run the function often: its returns look at `this` then.
 bool constructs(const CodeBlock& code);
 

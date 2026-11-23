@@ -33,6 +33,13 @@ std::int32_t windowBase(const Ins& in)
 
 }  // namespace
 
+bool guardExits(const CodeBlock& code, std::uint32_t i)
+{
+    const std::int64_t t = opt::jumpTarget(code, i);
+    return code.code[i].opcode() == Op::JNotCode && t >= 0 && code.code[std::size_t(t)].opcode() == Op::Call &&
+           !(i < code.prof.size() && (code.prof[i] & opt::kProfFailed));
+}
+
 bool constructs(const CodeBlock& code)
 {
     return (code.flags & CodeBlock::kClassConstructor) || (code.constructed && code.constructor);
@@ -225,7 +232,8 @@ Graph build(const CodeBlock& code)
                 }
                 edge(g.blockOf[bl.end]);
             }
-            edge(g.blockOf[std::size_t(t)]);
+            if (!guardExits(code, i))
+                edge(g.blockOf[std::size_t(t)]);
         } else if (!isTerminator(op)) {
             if (bl.end >= n) {
                 g.why = "falls off";

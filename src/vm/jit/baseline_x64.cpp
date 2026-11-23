@@ -648,7 +648,8 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             code->tier2Counter = tier2Backoff(*vm, code);
             return nullptr;
         }
-        code->tier2Counter = 0x40000000;
+        // A generator resumes in the baseline code: a loop of it is entered from there again after a few rounds.
+        code->tier2Counter = (code->flags & CodeBlock::kGenerator) ? 64 : 0x40000000;
         // A frame `new` made stays in the baseline code, unless the optimized code was made for those too.
         return header == 0xFFFFFFFFu || (fr->construct && !code->tier2->ctor) ? nullptr : code->tier2->osrAddress(header);
     } catch (...) {
@@ -3202,7 +3203,7 @@ private:
         std::vector<std::uint32_t> name, frame;
         ssa::Bits live;
         Label label;
-        int kind = 0;  ///< 0: before instruction i (it runs in the interpreter); 1: after it (it has run)
+        int kind = 0;  ///< 0: before instruction i (it runs in the interpreter); 1: after it (it has run); 3: on in the baseline code at i
     };
     std::deque<SsaExit> ssaExits_;
     std::int64_t exitAt_ = -1;
@@ -3210,6 +3211,7 @@ private:
     ssa::Bits liveBefore_;  ///< registers live before the instruction being emitted
     ssa::Bits curLiveAfter_;  ///< and after it
     Label& ssaExit(std::uint32_t i);
+    Label& ssaGoOn(std::uint32_t i);
     void ssaImmature(std::uint32_t i);
     /// `new` made in place by the SSA tier: a plain constructor that only stores its arguments and constants into new
     /// properties of `this`.

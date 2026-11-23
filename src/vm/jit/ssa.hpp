@@ -40,6 +40,7 @@ struct Block
     std::vector<std::uint32_t> preds, succs;  ///< block indices; succs[0] is the fall-through, when there is one
     bool loopHeader = false;
     bool reached = false;
+    bool noEntry = false;  ///< a loop a generator yields in: the baseline code does not enter there (it resumes there)
     std::uint32_t loopEnd = 0;          ///< a header: the end of the last block that jumps back to it
     std::vector<std::uint32_t> phis;    ///< values
     std::vector<std::uint32_t> nameIn;  ///< per register: the value it holds at the start (kNone when not live)

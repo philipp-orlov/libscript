@@ -221,8 +221,9 @@ decimals in `Number.prototype.toString` have fast paths; `MulI` wraps when its r
 ## The SSA tier
 
 On arm64 the SSA tier (`ssa.hpp`, `ssa_build.cpp`, `ssa_emit.inc`) compiles a hot function first. Tier 2 compiles the functions
-it refuses: generators, async functions, functions that need `arguments`, functions with exception handlers, and `with`
-scopes. `SCRIPT_VM_SSA` sets the mode: 0 off (tier 2 only), 1 every instruction through the baseline templates, 2 (the
+it refuses: async functions, generators without a loop that does not yield, and `with` scopes. A generator's code is entered
+only at the head of a loop that does not yield, from the baseline code, which runs each resumption and looks again after 64
+back edges. A `yield` writes the frame and goes on in the baseline code at the `yield` (exit kind 3). `SCRIPT_VM_SSA` sets the mode: 0 off (tier 2 only), 1 every instruction through the baseline templates, 2 (the
 default on arm64) with its own fast paths. It is off on x86-64, where it is not tested.
 
 **The graph.** One value per instruction and register it writes, per register at the entry, and per phi. A `Mov` is a second

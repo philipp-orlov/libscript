@@ -1111,6 +1111,12 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                 else if (!ssaSmall(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
                 break;
+            case Op::GenStart: case Op::Yield:
+                // The generator stops in the baseline code, which takes it on from there when it is resumed.
+                a_.jmp(ssaGoOn(i));
+                if (op == Op::Yield)
+                    name_[in.a] = g.defBase[i];
+                break;
             case Op::IterInit: case Op::IterNext: case Op::IterClose:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
@@ -1230,7 +1236,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     std::vector<std::pair<std::uint32_t, std::uint32_t>> osr;
     for (std::uint32_t b = 1; b < nb; ++b) {
         const ssa::Block& bl = g.blocks[b];
-        if (!bl.reached || !bl.loopHeader)
+        if (!bl.reached || !bl.loopHeader || bl.noEntry)
             continue;
         osr.emplace_back(bl.start, std::uint32_t(a_.here()));
         a_.aluI(5, RSP, spill_);
@@ -1392,6 +1398,11 @@ void Baseline::emitSsaTails()
                 all.push_back(r);
         ssaSync(all, e.live, std::vector<std::uint8_t>(code_->nregs, 0));
         a_.aluI(0, RSP, spill_);
+        if (e.kind == 3) {
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(e.i)));
+            a_.jmp(RAX);
+            continue;
+        }
         a_.mov(RDI, R12);
         a_.movImm(RSI, e.i);
         a_.movImm(RDX, std::uint64_t(e.kind));
@@ -1797,6 +1808,14 @@ Label& Baseline::ssaExit(std::uint32_t i)
     exitAt_ = i;
     exitLabel_ = &ssaExits_.back().label;
     return *exitLabel_;
+}
+
+/// Where the code goes on in the baseline code at instruction `i`, the frame written: no guard failed (exit kind 3).
+Label& Baseline::ssaGoOn(std::uint32_t i)
+{
+    ssaExits_.push_back(SsaExit{i, name_, frame_, liveBefore_, Label{}});
+    ssaExits_.back().kind = 3;
+    return ssaExits_.back().label;
 }
 
 /// Instruction `i` knew nothing when this code was made (an empty cache): after the code has run a while, it makes way
@@ -3956,6 +3975,8 @@ bool Baseline::ssaNative(std::uint32_t i)
         return !failed;
     case Op::JNullish: case Op::JNotNullish: case Op::JUndefined: case Op::JNotUndefined: case Op::JHole:
     case Op::JNotCode: case Op::JNotCallee:
+        return true;
+    case Op::GenStart: case Op::Yield:
         return true;
     case Op::IterInit:
         return !failed && ssaArrayIterPristine();

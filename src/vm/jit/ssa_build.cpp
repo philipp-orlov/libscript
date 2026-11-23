@@ -66,6 +66,18 @@ opt::Effects effects(const CodeBlock& code, std::uint32_t i)
     e.rd.clear();
     e.wr.clear();
     e.ok = true;
+    if ((op == Op::GenStart || op == Op::Yield) && i + 1 < code.suspendAt.size()) {
+        // A generator stops here, in the baseline code: it reads every register the suspended frame keeps.
+        if (op == Op::Yield) {
+            e.rd.push_back(in.b);
+            e.wr.push_back(in.a);
+        }
+        const std::uint16_t* live = code.suspendRegs.data() + code.suspendAt[i + 1];
+        for (std::uint32_t k = 1; k <= live[0]; ++k)
+            if (std::find(e.rd.begin(), e.rd.end(), live[k]) == e.rd.end())
+                e.rd.push_back(live[k]);
+        return e;
+    }
     switch (op) {
     case Op::GetSuperCtor: case Op::GetHome: case Op::NewTarget: e.wr = {in.a}; break;
     case Op::GetSuperCtorOf: e.rd = {in.b}; e.wr = {in.a}; break;
@@ -134,7 +146,7 @@ Graph build(const CodeBlock& code)
         g.why = "size";
         return g;
     }
-    if (code.flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen)) {
+    if ((code.flags & (CodeBlock::kAsync | CodeBlock::kAsyncGen)) || ((code.flags & CodeBlock::kGenerator) && !code.suspendMax)) {
         g.why = "kind";
         return g;
     }
@@ -272,6 +284,22 @@ Graph build(const CodeBlock& code)
                 sb.loopHeader = true;
                 sb.loopEnd = std::max(sb.loopEnd, g.blocks[b].end);
             }
+        }
+    }
+    if (code.flags & CodeBlock::kGenerator) {
+        // Each resumption runs in the baseline code: only a loop that does not yield is worth entering, and without one the
+        // function stays there.
+        bool any = false;
+        for (Block& hb : g.blocks) {
+            if (!hb.reached || !hb.loopHeader)
+                continue;
+            for (std::uint32_t i = hb.start; i < hb.loopEnd && !hb.noEntry; i = opt::nextOf(code, i))
+                hb.noEntry = code.code[i].opcode() == Op::Yield || code.code[i].opcode() == Op::GenStart;
+            any = any || !hb.noEntry;
+        }
+        if (!any) {
+            g.why = "kind";
+            return g;
         }
     }
 

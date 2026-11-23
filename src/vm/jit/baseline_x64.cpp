@@ -785,6 +785,9 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
         return {0, 0};
     if (isNew && ((f->flags & JSFunction::kNative) ? !(f->flags & JSFunction::kConstructor) : !f->code->constructor))
         return {0, 0};
+    if (isSuper && !(f->flags & JSFunction::kNative) && (f->code->flags & CodeBlock::kImplicit))
+        if (JSFunction* builtin = builtinUnderImplicit(vm, f))
+            f = builtin;
     if (!(f->flags & JSFunction::kNative) && index < code->callProf.size() && !shifted)
         noteCallee(code, index, f->code->uid);
     if (f->flags & JSFunction::kNative) {

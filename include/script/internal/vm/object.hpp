@@ -436,6 +436,9 @@ JSValue getProperty(VM& vm, JSValue base, Key key);
 /// What a construction by `f` runs: past the constructors of classes that have none of their own and no fields, which would
 /// only pass the arguments on, the first that does something.
 JSFunction* constructorToRun(VM& vm, JSFunction* f);
+/// A class with no constructor of its own over a built-in one (`class M extends Array {}`): the built-in its `super(...args)`
+/// calls with the same arguments and `new.target`, or null.
+JSFunction* builtinUnderImplicit(VM& vm, JSFunction* f);
 /// The same by the megamorphic table where that knows: for a read the runtime makes often of few names.
 JSValue getPropertyMega(VM& vm, JSValue base, Key key);
 /// The message of a read of a property of null or undefined, naming the property as V8 does: "Cannot read properties of

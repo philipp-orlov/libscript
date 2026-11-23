@@ -3243,6 +3243,9 @@ do_call: {
         if (!vm.ensureCompiled(f->code))
             FAIL();
     }
+    if (isSuper && !(f->flags & JSFunction::kNative) && (f->code->flags & CodeBlock::kImplicit))
+        if (JSFunction* builtin = builtinUnderImplicit(vm, f))
+            f = builtin;
     if (isNew) {
         const bool canConstruct = (f->flags & JSFunction::kNative) ? (f->flags & JSFunction::kConstructor) != 0
                                                                      : f->code->constructor;
@@ -4069,6 +4072,20 @@ JSFunction* constructorToRun(VM& vm, JSFunction* f)
         f = up;
     }
     return f;
+}
+
+JSFunction* builtinUnderImplicit(VM& vm, JSFunction* f)
+{
+    f = constructorToRun(vm, f);
+    if ((f->flags & JSFunction::kNative) || !(f->code->flags & CodeBlock::kImplicit))
+        return nullptr;
+    if (Rare* r = f->rare(); r && isFunction(r->fieldInit))
+        return nullptr;
+    JSObject* p = f->proto(vm);
+    if (!p || !isFunction(toJSValue(p)) || proxyOf(p))
+        return nullptr;
+    auto* up = static_cast<JSFunction*>(p);
+    return (up->flags & JSFunction::kNative) && (up->flags & JSFunction::kConstructor) ? up : nullptr;
 }
 
 JSValue getPropertyMega(VM& vm, JSValue base, Key key)

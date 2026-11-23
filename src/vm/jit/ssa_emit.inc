@@ -3441,16 +3441,17 @@ JSFunction* Baseline::ssaCharCodeCallee(std::uint32_t i)
         if (!slot || (attrs & attr::kAccessor) || !isFunction(*slot))
             return nullptr;
         auto* f = static_cast<JSFunction*>(asObject(*slot));
-        if (!(f->flags & JSFunction::kNative) || !f->rare() || f->rare()->native != stringCharNative() ||
-            f->rare()->nativeData != reinterpret_cast<void*>(1))
+        if (!(f->flags & JSFunction::kNative) || !f->rare() ||
+            !(f->rare()->native == stringCodePointNative() ||
+              (f->rare()->native == stringCharNative() && f->rare()->nativeData == reinterpret_cast<void*>(1))))
             return nullptr;
         return f;
     }
     return nullptr;
 }
 
-/// `s.charCodeAt(i)` of `ssaCharCodeCallee`: the callee checked, a flat string and an index within it, the character
-/// read here. Anything else leaves.
+/// `s.charCodeAt(i)` (or `codePointAt`) of `ssaCharCodeCallee`: the callee checked, a flat string and an index within it,
+/// the character read here. Anything else leaves.
 void Baseline::ssaCharCode(std::uint32_t i, JSFunction* f)
 {
     const Ins& in = code_->code[i];
@@ -3468,6 +3469,27 @@ void Baseline::ssaCharCode(std::uint32_t i, JSFunction* f)
     a_.jcc(CAE, bad);  // also a negative index
     stringChars(RSI, RCX, bad);
     a_.movzx16(RAX, mem(RCX, RDX, 2));
+    if (f->rare()->native == stringCodePointNative()) {
+        // `codePointAt`: a lead surrogate with a trail one after it is the code point of the pair.
+        Label done;
+        a_.mov32(RDI, RAX);
+        a_.aluI32(4, RDI, 0xFC00);
+        a_.aluI32(7, RDI, 0xD800);
+        a_.jcc(CNE, done);
+        a_.mov32(RDI, RDX);
+        a_.aluI32(0, RDI, 1);
+        a_.alu32(7, RDI, mem(RSI, kStrLength));
+        a_.jcc(CAE, done);
+        a_.movzx16(RDI, mem(RCX, RDI, 2));
+        a_.mov32(RDX, RDI);
+        a_.aluI32(4, RDX, 0xFC00);
+        a_.aluI32(7, RDX, 0xDC00);
+        a_.jcc(CNE, done);
+        a_.shiftI32(4, RAX, 10);
+        a_.alu32(0, RAX, RDI);
+        a_.aluI32(0, RAX, 0x10000 - 0xDC00 - (0xD800 << 10));
+        a_.bind(done);
+    }
     if (sval_[ssa_->defBase[i]].rep == kRepI32) {
         ssaDefI32(i);
     } else {

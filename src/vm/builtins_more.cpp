@@ -1131,6 +1131,11 @@ void installMore(VM& vm)
 }
 
 }  // namespace bi
+
+FastNative stringCodePointNative() noexcept
+{
+    return bi::stringCodePointAt;
+}
 }  // namespace vm
 }  // namespace internal
 }  // namespace script

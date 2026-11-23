@@ -2477,7 +2477,7 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
         }
     }
     // No room without a collection: the call the long way (to the constructor just checked).
-    allocObject(shape, aux, slowPath);
+    allocObject(shape, aux, slowPath, false, vm_.allocSiteFor(code_, i));
     // Constants that are no cell go straight into the object; the rest through rax, the object kept on the stack.
     std::vector<std::uint8_t> inPlace(stores.size(), 0);
     bool rest = false;
@@ -2511,8 +2511,8 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
                 a_.mov(RDX, mem(RDX, 0));
                 a_.mov(RAX, mem(RDX, std::int32_t(8 * (own - f->slots))));
             }
-            retain(RAX);
             a_.mov(RCX, inlineSlot(0));
+            retainInto(RCX, RAX);  // a young object counts nothing
             a_.mov(mem(RCX, kObjInline + std::int32_t(8 * stores[k].index)), RAX);
             continue;
         }
@@ -2534,8 +2534,9 @@ bool Baseline::inlineNew(std::uint32_t i, bool decideOnly)
             movedFrom.insert(from);
         } else {
             inlineBoxed(v);
+            a_.mov(RCX, inlineSlot(0));
             if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
-                retain(RAX);
+                retainInto(RCX, RAX);  // a young object counts nothing
         }
         a_.mov(RCX, inlineSlot(0));
         a_.mov(mem(RCX, kObjInline + std::int32_t(8 * stores[k].index)), RAX);

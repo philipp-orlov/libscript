@@ -1209,9 +1209,17 @@ bool Baseline::emitTyped(std::uint32_t i)
             if (!failed && ic.aux != 0)
                 keepRax(in.a);
         } else {
+            Label yng, stored;
+            ifYoung(RAX, yng);  // a young object counts nothing
             a_.mov(RSI, slot);
             a_.mov(slot, RDI);
             release(RSI);
+            if (youngStores()) {
+                a_.jmp(stored);
+                a_.bind(yng);
+                a_.mov(slot, RDI);
+                a_.bind(stored);
+            }
         }
         if (!isI32(vw))
             for (auto& [numSlot, kind] : factNum_)

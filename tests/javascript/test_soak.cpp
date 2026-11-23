@@ -354,7 +354,8 @@ TEST(residentMemoryStabilisesOverALongRun)
 {
     js::Context ctx;
     js::Value round = ctx.eval(kMixedWorkload, "<workload>");
-    for (int i = 0; i < scaled(200); ++i) {
+    // Past the first collections of cycles the context makes by itself: what they let pile up is part of the settled size.
+    for (int i = 0; i < scaled(2000); ++i) {
         round.call({js::Value(i)});
         ctx.runJobs();
     }

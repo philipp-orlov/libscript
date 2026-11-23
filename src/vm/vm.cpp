@@ -100,6 +100,16 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     if (deferred) {
         ctx.deferredVm = this;
         setZctLimit();
+        young = true;
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+        if (const char* y = std::getenv("SCRIPT_VM_YOUNG"))
+            young = std::atoi(y) != 0;
+#endif
+        if (young) {
+            youngBase_ = youngTop_ = static_cast<CellPtr*>(allocPayload(kYoungCells * sizeof(CellPtr)));
+            youngEnd_ = youngBase_ + kYoungCells;
+            youngWork_.reserve(kYoungCells);
+        }
     }
 
     mergeInlining = tier2Threshold > 0;
@@ -180,6 +190,10 @@ VM::~VM()
         freePayload(chunk, kValidityChunkBytes);
     if (zctBase_)
         freePayload(zctBase_, std::size_t(zctCap_ - zctBase_) * sizeof(CellPtr));
+    if (youngBase_)
+        freePayload(youngBase_, kYoungCells * sizeof(CellPtr));
+    for (AllocSite* chunk : siteChunks_)
+        freePayload(chunk, 1024 * sizeof(AllocSite));
     if (shapeRegionBase_)
         sys::vmUnmap(shapeRegionBase_, shapeRegionBytes_);
     if (stackRegionBase_)

@@ -352,6 +352,7 @@ void JSObject::reserveSlot(VM& vm, std::uint32_t index)
 
 Rare& JSObject::rareOf(VM& vm)
 {
+    vm.makeOldIfYoung(this);
     if (h.flags & cellflags::kHasRare)
         return *slotsHeader()->rare;
     if (!slots)
@@ -539,8 +540,10 @@ void JSObject::setProto(VM& vm, JSObject* next)
             h.shape = t->id;
         }
     }
-    if (next)
+    if (next) {
+        vm.makeOldIfYoung(next);
         next->h.flags |= cellflags::kIsProto;
+    }
     if (isProto()) {
         vm.noteProtoChain(next);
         vm.invalidateChain(this);
@@ -558,6 +561,7 @@ std::uint32_t JSObject::propertyCount(VM& vm) noexcept
 
 JSValue* JSObject::findOwn(VM& vm, Key key, std::uint8_t* attrs)
 {
+    vm.makeOldIfYoung(this);
     if (h.cls == std::uint8_t(ObjClass::Function) && (static_cast<JSFunction*>(this)->flags & JSFunction::kLazyProps)) {
         // While the properties are not made, the own ones are exactly these three: another name finds nothing, and asking
         // for it must not make a slot buffer, a `prototype` object and the cycle between it and the function.
@@ -581,6 +585,7 @@ JSValue* JSObject::findOwn(VM& vm, Key key, std::uint8_t* attrs)
 
 void JSObject::addProperty(VM& vm, Key key, JSValue value, std::uint8_t attrs)
 {
+    vm.makeOldIfYoung(this);
     Shape* s = shapeOf(vm);
     if (s->isDictionary()) {
         Dictionary& d = *rare()->dict;
@@ -636,6 +641,7 @@ void JSObject::putOwn(VM& vm, Key key, JSValue value, std::uint8_t attrs)
 
 bool JSObject::setAttrs(VM& vm, Key key, std::uint8_t attrs)
 {
+    vm.makeOldIfYoung(this);
     if (this == vm.global)
         vm.epochMoved();
     materialize(vm);
@@ -688,6 +694,7 @@ void JSObject::compactDictionary(VM& vm)
 
 bool JSObject::deleteOwn(VM& vm, Key key)
 {
+    vm.makeOldIfYoung(this);
     if (this == vm.global)
         vm.epochMoved();
     materialize(vm);

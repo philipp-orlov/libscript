@@ -252,6 +252,8 @@ struct CodeBlock
     Vec<InlineCache> caches;
     Vec<PolyCache> poly;
     Vec<SuperCache> superCaches;
+    /// Per instruction, the allocation site (`VM::allocSiteFor`) of compiled code that makes an object there; 0: none yet.
+    Vec<std::uint32_t> allocSites;
     /// Four entries to a site (`ElemCache::kWays`), made when a read by name first learns; `elemSite[at]` is the index of the
     /// first of the site at instruction `at` plus one, 0 for none yet.
     Vec<ElemCache> elemCaches;

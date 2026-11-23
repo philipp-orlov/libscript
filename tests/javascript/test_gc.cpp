@@ -45,9 +45,9 @@ TEST(whatThingsWeighStaysWhatItIs)
 TEST(cyclesAreReclaimedByTheCollector)
 {
     js::Context ctx;
-    ctx.eval("globalThis.keep = null;"
-             "function makeCycle() { const a = {}; const b = { a }; a.b = b; return null; }"
-             "for (let i = 0; i < 500; i++) makeCycle();");
+    // Held by an array until the cycles are old: a cycle that dies young goes without the collector.
+    ctx.eval("function makeCycle() { const a = {}; const b = { a }; a.b = b; return a; }"
+             "(function () { const keep = []; for (let i = 0; i < 500; i++) keep.push(makeCycle()); })();");
     const auto leaked = ctx.stats();
     ctx.collectGarbage();
     const auto collected = ctx.stats();
@@ -173,8 +173,8 @@ TEST(manualCyclesWaitForTheHost)
     js::Context ctx(options);
     if (ctx.core() != script::Context::Options::Core::Vm)
         return;  // the vm core's memory options
-    ctx.eval("function makeCycle() { const a = {}; const b = { a }; a.b = b; return null; }"
-             "for (let i = 0; i < 20000; i++) makeCycle();");
+    ctx.eval("function makeCycle() { const a = {}; const b = { a }; a.b = b; return a; }"
+             "(function () { const keep = []; for (let i = 0; i < 20000; i++) keep.push(makeCycle()); })();");
     const auto before = ctx.stats();
     CHECK(before.gcRuns == 0);
     ctx.collectGarbage();

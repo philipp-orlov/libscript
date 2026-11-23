@@ -295,6 +295,37 @@ owns a count of each value in its registers. A deferred frame owns none. These r
 Tests run in both modes: `SCRIPT_VM_DEFERRED=0` and `=1` set the mode in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
 `SCRIPT_VM_AUDIT=1` checks every count at each scan. `SCRIPT_VM_ZCT=n` sets the table's least limit (0: every allocation scans).
 
+## Young cells
+
+With deferred frames, a new plain object can be young (`VM::young`). Most objects die before the next scan. A young cell is
+freed without a look at what it holds, and a store into it counts nothing. These rules keep it sound:
+
+1. A young cell has the bit `VM::kYoungGc` in its `gc` word, its allocation site above bit 8, and is in the young list
+   (`youngBase_`..`youngTop_`). Only a plain object without `Rare` is young. Compiled code makes young objects
+   (`allocObject`), as do `scriptVmJitNewThis` and `scriptVmSsaNewObject` for it. The runtime makes old ones.
+2. A young cell holds no count of what its slots hold. Its own count is what old cells, handles and the runtime hold. A count
+   of a young cell that reaches zero does nothing: the cell does not go into the zero-count table.
+3. A store into a slot of a young object neither counts the new value nor lets go of the old one. The interpreter's caches
+   (`storeSlot`, `storeNewSlot`) and compiled code (`storeSlotCounted`, `retainInto`, `ifYoung`) test for this.
+4. Any other path makes the object old first (`VM::makeOld`): `findOwn`, `addProperty`, `deleteOwn`, `setAttrs`, `rareOf`,
+   and a prototype change. An old cell takes a count of each cell its slots hold. A cell held by nothing then goes into the
+   zero-count table.
+5. A scan first marks the young cells that a live register holds or that have a count, and what they reach among the young.
+   It makes the marked cells old and frees the others. Then it counts the frames' cells and frees the table as before.
+6. While a young cell exists, no free is immediate: a young cell may hold a cell without a count. A collection and the
+   context's end see no young cell (`rootsBegin`, `releaseRoots`). A collection writes the `gc` word of the cells it looks
+   at, so the runtime takes a cell for young only while the list holds any (`VM::youngHeader`).
+7. The list has room for `VM::kYoungCells` cells. When it is full, compiled code makes old cells (into the zero-count table)
+   until the next scan.
+8. Between jobs, with no frame, the young cells are collected without a scan of the table (`collectYoungAtHost`): what no
+   frame holds is freed at once again. A free that frees what a cell holds leaves a cell that is in the table there; the
+   next scan frees it.
+9. Each allocation site (`VM::allocSiteFor`, one per instruction) counts how many of its cells a scan found alive. When seven
+   of eight lived in a window of `VM::kSiteWindow` cells, the site makes old cells from then on (`AllocSite::old`): making a
+   cell old costs more than counting its values while they are stored.
+
+Young cells are on with deferred frames. `SCRIPT_VM_YOUNG=0` turns them off in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
+
 ## Arrays of numbers
 
 An array knows how many of its first elements are numbers (`JSArray::packed`: no hole and no cell below it). It is a

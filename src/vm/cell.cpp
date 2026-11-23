@@ -42,8 +42,9 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
         freeDeferred(ctx.options.freeBudget);
         --immediate_;
     }
-    // The zero-count table is full (`deferred`): what no frame holds goes.
-    if (deferred && zctCount() >= zctLimit_ && zctCount() && !destroying_ && !immediate_ && !ctx.tearingDown) [[unlikely]]
+    // The zero-count table is full (`deferred`), or the young list: what no frame holds goes.
+    if (deferred && ((zctCount() >= zctLimit_ && zctCount()) || (young && youngTop_ == youngEnd_)) && !destroying_ &&
+        !immediate_ && !ctx.tearingDown) [[unlikely]]
         scanZct();
     ctx.maybeCollect();
     // The context's budget counts heap bytes, which the buffers of arrays and strings do not add to: a program that makes
@@ -316,6 +317,8 @@ void VM::destroyNow(CellPtr cell) noexcept
                 CellPtr c = v.asCell();
                 if (--detail::cellCount(c) != 0)
                     return;
+                if (isVmCell(c) && (youngHeader(headerOf(c)) || headerOf(c)->gc == kInZct))
+                    return;  // freed by the scan, as young or from the table
                 if (destroying_ && isVmCell(c)) {
                     try {
                         pending_.push_back(c);
@@ -372,8 +375,13 @@ void VM::destroy(CellPtr cell) noexcept
 {
     if (tearingDown)
         return;
-    // A frame may hold it without a count: it waits in the zero-count table for the next scan.
-    if (deferred && !immediate_ && (frameTop != frameBase || parking_ || headerOf(cell)->gc == kInZct)) {
+    // A young cell is freed by the scan, which finds it in its list.
+    if (youngHeader(headerOf(cell)))
+        return;
+    // A frame may hold it without a count, or a young cell (which counts nothing): it waits in the zero-count table for
+    // the next scan.
+    if (deferred && !immediate_ &&
+        (frameTop != frameBase || parking_ || youngTop_ != youngBase_ || headerOf(cell)->gc == kInZct)) {
         if (headerOf(cell)->gc != kInZct) {
             zctPush(cell);
             if (zctCount() >= zctLimit_) [[unlikely]]
@@ -429,6 +437,8 @@ inline void VM::destroyFrom(CellPtr cell, Freed& total) noexcept
                     continue;
                 if (!isVmCell(c)) {
                     detail::destroyUnreferenced(c);
+                } else if (youngHeader(headerOf(c)) || headerOf(c)->gc == kInZct) {
+                    // Freed by the scan: young, or in the table (where it went at zero before, and still is).
                 } else if (!follow) {
                     follow = c;
                 } else {
@@ -587,8 +597,8 @@ bool VM::deferOld(detail::GCObject* cell) noexcept
         return false;
     if (cell->inZct)
         return true;
-    if (frameTop == frameBase && !parking_)
-        return false;  // no frame to hold it
+    if (frameTop == frameBase && !parking_ && youngTop_ == youngBase_)
+        return false;  // no frame and no young cell to hold it
     try {
         zctOld_.push_back(cell);
     } catch (...) {
@@ -602,7 +612,7 @@ bool VM::deferOld(detail::GCObject* cell) noexcept
     return true;
 }
 
-void VM::countRoots(int delta) noexcept
+JSValue* VM::liveTop() const noexcept
 {
     // Every register of a live frame, and those up to `stackTop`. Above them the stack holds undefined: what returns or
     // unwinds clears its registers.
@@ -612,6 +622,159 @@ void VM::countRoots(int delta) noexcept
             hi = f->R + f->code->nregs;
     if (hi > stackInit)
         hi = stackInit;
+    return hi;
+}
+
+namespace {
+
+/// The values of a young cell: a plain object without `Rare` (the only kind that is young). `n` gets the count of those in
+/// the cell; `more` and `nMore` those in its slot buffer.
+inline const JSValue* youngValues(VM& vm, CellPtr cell, std::uint32_t& n, const JSValue*& more, std::uint32_t& nMore) noexcept
+{
+    auto* o = reinterpret_cast<JSObject*>(cell);
+    const std::uint32_t count = vm.shapeById(o->h.shape)->count;
+    n = count < o->h.aux ? count : o->h.aux;
+    more = o->slots;
+    nMore = count - n;
+    return o->inl();
+}
+
+}  // namespace
+
+void VM::makeOld(CellPtr cell) noexcept
+{
+    CellHeader* h = headerOf(cell);
+    h->gc = 0;
+    std::uint32_t n, nMore;
+    const JSValue* more;
+    const JSValue* values = youngValues(*this, cell, n, more, nMore);
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (values[i].isCell())
+            ++detail::cellCount(values[i].asCell());
+    for (std::uint32_t i = 0; i < nMore; ++i)
+        if (more[i].isCell())
+            ++detail::cellCount(more[i].asCell());
+    if (h->rc == 0)
+        zctPush(cell);  // a frame may hold it
+}
+
+void VM::collectYoung() noexcept
+{
+    if (youngTop_ == youngBase_)
+        return;
+    // Mark: what a register holds, and what has a count (an old cell, a handle, the runtime holds it), and what these refer
+    // to among the young. A marked cell becomes old as its values are read: each cell it refers to takes a count.
+    youngWork_.clear();
+    auto mark = [this](JSValue v) {
+        if (!v.isCell())
+            return;
+        CellPtr c = v.asCell();
+        if (isVmCell(c) && (headerOf(c)->gc & (kYoungGc | kYoungMarked)) == kYoungGc) {
+            headerOf(c)->gc |= kYoungMarked;
+            youngWork_.push_back(c);  // within its capacity, the list's
+        }
+    };
+    // A register above the live ones may name what goes now: it holds undefined from here on, as after any scan.
+    JSValue* const hi = liveTop();
+    for (JSValue* r = hi; r < stackInit; ++r)
+        *r = JSValue::undefined();
+    for (JSValue* r = stackBase; r < hi; ++r)
+        mark(*r);
+    for (CellPtr* p = youngBase_; p < youngTop_; ++p) {
+        CellHeader* h = headerOf(*p);
+        if ((h->gc & (kYoungGc | kYoungMarked)) == kYoungGc && h->rc != 0) {
+            h->gc |= kYoungMarked;
+            youngWork_.push_back(*p);
+        }
+    }
+    while (!youngWork_.empty()) {
+        const CellPtr c = youngWork_.back();
+        youngWork_.pop_back();
+        std::uint32_t n, nMore;
+        const JSValue* more;
+        const JSValue* values = youngValues(*this, c, n, more, nMore);
+        for (std::uint32_t i = 0; i < n; ++i)
+            if (values[i].isCell()) {
+                mark(values[i]);
+                ++detail::cellCount(values[i].asCell());
+            }
+        for (std::uint32_t i = 0; i < nMore; ++i)
+            if (more[i].isCell()) {
+                mark(more[i]);
+                ++detail::cellCount(more[i].asCell());
+            }
+    }
+    // Sweep: a marked cell is old now (held by nothing but a frame, it goes into the zero-count table); one not marked is
+    // freed. A cell made old before is no longer young. Each site learns how many of its cells lived.
+    Freed freed;
+    for (CellPtr* p = youngBase_; p < youngTop_; ++p) {
+        const CellPtr c = *p;
+        CellHeader* h = headerOf(c);
+        const std::uint32_t gc = h->gc;
+        if (!(gc & kYoungGc))
+            continue;
+        AllocSite& site = allocSite(gc >> kSiteShift);
+        ++site.made;
+        if (gc & kYoungMarked) {
+            ++site.kept;
+            h->gc = 0;
+            if (h->rc == 0)
+                zctPush(c);
+        } else {
+            auto* o = reinterpret_cast<JSObject*>(c);
+            if (o->slots)
+                freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
+            const std::size_t bytes = JSObject::bytesFor(h->aux);
+            heap.deallocate(c, bytes);
+            freed.bytes += bytes;
+            ++freed.cells;
+        }
+        if (site.made >= kSiteWindow) [[unlikely]] {
+            if (site.kept >= site.made - site.made / 8)
+                site.old = 1;  // seven in eight lived: old from now on
+            site.made = site.kept = 0;
+        }
+    }
+    countFreed(freed);
+    youngTop_ = youngBase_;
+}
+
+std::uint32_t VM::allocSiteFor(CodeBlock* code, std::uint32_t index)
+{
+    if (code->allocSites.size() < code->code.size())  // (merged inlining makes the code longer)
+        code->allocSites.resize(code->code.size(), 0u);
+    std::uint32_t& id = code->allocSites[index];
+    if (id)
+        return id;
+    if (siteCount_ >= (1u << (32 - kSiteShift)))
+        return 0;
+    if ((siteCount_ >> 10) >= siteChunks_.size()) {
+        siteChunks_.push_back(nullptr);
+        siteChunks_.back() = static_cast<AllocSite*>(allocPayload(1024 * sizeof(AllocSite)));
+        for (std::uint32_t k = 0; k < 1024; ++k)
+            ::new (static_cast<void*>(siteChunks_.back() + k)) AllocSite();
+    }
+    id = siteCount_++;
+    return id;
+}
+
+void VM::collectYoungAtHost() noexcept
+{
+    if (!immediate_ && !tearingDown && !ctx.tearingDown)
+        collectYoung();
+}
+
+void VM::allYoungOld() noexcept
+{
+    for (CellPtr* p = youngBase_; p < youngTop_; ++p)
+        if (headerOf(*p)->gc & kYoungGc)
+            makeOld(*p);
+    youngTop_ = youngBase_;
+}
+
+void VM::countRoots(int delta) noexcept
+{
+    JSValue* const hi = liveTop();
     if (delta > 0) {
         // A register above them (an argument of a spread call that is over) may hold what goes now: no later frame finds
         // it there. What this costs is weighed into the table's next limit.
@@ -631,7 +794,7 @@ void VM::countRoots(int delta) noexcept
             continue;
         // Held by a frame only: back in the table. Out of memory, it is left to a collection, as a cell with no count.
         if (isVmCell(c)) {
-            if (headerOf(c)->gc != kInZct)
+            if (headerOf(c)->gc == 0)
                 zctPush(c);
         } else if (!c->inZct) {
             try {
@@ -721,6 +884,7 @@ void VM::scanZct() noexcept
 {
     if (immediate_ || tearingDown || ctx.tearingDown)
         return;
+    collectYoung();
     countRoots(1);
     freeZct();
     countRoots(-1);
@@ -823,7 +987,7 @@ void VM::freeZct() noexcept
 
 bool VM::freeHeldBack() noexcept
 {
-    if (!deferred || !zctCount() || immediate_ || destroying_ || tearingDown)
+    if (!deferred || (!zctCount() && youngTop_ == youngBase_) || immediate_ || destroying_ || tearingDown)
         return false;
     scanZct();
     return true;
@@ -833,7 +997,9 @@ void VM::rootsBegin() noexcept
 {
     if (!deferred || immediate_ || tearingDown)
         return;
-    // The table is empty for the whole collection, which writes the `gc` word of every cell it looks at.
+    // The table is empty for the whole collection, which writes the `gc` word of every cell it looks at, and no cell is
+    // young.
+    collectYoung();
     countRoots(1);
     freeZct();
     ++immediate_;
@@ -1071,6 +1237,7 @@ void VM::collectCycles(bool minor) noexcept
 
 void VM::releaseRoots() noexcept
 {
+    allYoungOld();
     megaClear();
     for (JSValue& v : smallStrings) {
         release(v);

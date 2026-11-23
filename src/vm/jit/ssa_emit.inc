@@ -2436,11 +2436,19 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         }
         const Mem slot = slotMem(ic.shape, ic.index, o);
         loadValue(x, RCX);
+        Label yng, stored;
+        ifYoung(o, yng);  // a young object counts nothing
         if (mayBeCell(x))
             retain(RCX);
         a_.mov(RDI, slot);
         a_.mov(slot, RCX);
         release(RDI);
+        if (youngStores()) {
+            a_.jmp(stored);
+            a_.bind(yng);
+            a_.mov(slot, RCX);
+            a_.bind(stored);
+        }
         return true;
     }
     const Reg o = valueReg(v);
@@ -2463,12 +2471,15 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
     const std::vector<std::uint32_t> frameAfter = frame_;
     frame_ = frameBefore;
     const Mem slot = slotMem(ic.shape, ic.index, o);
+    loadValue(x, RCX);
+    Label yng;
+    ifYoung(o, yng);  // a young object counts nothing, and lets go of nothing
     a_.mov(RDI, slot);
     a_.test(RDI, R15);
     a_.jcc(CE, cold);  // a cell
-    loadValue(x, RCX);
     if (mayBeCell(x))
         retain(RCX);
+    a_.bind(yng);
     a_.mov(slot, RCX);
     a_.bind(join);
     frame_ = frameAfter;  // the runtime's store over a data property of that shape changes no shape
@@ -2852,7 +2863,7 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
     Label& failed = ssaExit(i);  // the runtime could not make it: the instruction runs again in the interpreter
     exitAt_ = -1;
     Label slowAlloc, allocated, after;
-    allocObject(p.shape, p.aux, slowAlloc);
+    allocObject(p.shape, p.aux, slowAlloc, false, vm_.allocSiteFor(code_, i));
     a_.bind(allocated);
     for (const SsaNew::Store& st : p.stores) {
         const Mem slot = mem(RAX, kObjInline + std::int32_t(8 * st.index));
@@ -2868,7 +2879,7 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
                 a_.mov(RDX, mem(RDX, 0));
                 a_.mov(RCX, mem(RDX, std::int32_t(8 * (st.own - fn->slots))));
             }
-            retain(RCX);
+            retainInto(RAX, RCX);  // (the runtime's object may be old)
             a_.mov(slot, RCX);
             continue;
         }
@@ -2878,7 +2889,7 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
                 // A function a private method names: held by the code, counted for the object.
                 holdValue(st.c);
                 a_.movImm(RCX, st.c.bits);
-                a_.inc32(mem(RCX, kHdrRc));
+                retainInto(RAX, RCX);
                 a_.mov(slot, RCX);
             } else if (bits >= INT32_MIN && bits <= INT32_MAX) {
                 a_.mov(slot, std::int32_t(bits));
@@ -2891,7 +2902,7 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
         const std::uint32_t v = name_[in.b + 2u + unsigned(st.arg)];
         loadValue(v, RCX);
         if (mayBeCell(v))
-            retain(RCX);
+            retainInto(RAX, RCX);
         a_.mov(slot, RCX);
     }
     // Into the result's slot, which owns it (a deferred one holds it without a count, as the table does).
@@ -2911,6 +2922,7 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
         a_.mov(RDI, R12);
         a_.movImm(RSI, p.shape);
         a_.movImm(RDX, p.aux);
+        a_.movImm(RCX, vm_.allocSiteFor(code_, i));
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaNewObject));
         a_.callC(RAX);
         ssaRestoreRegs(keep);
@@ -3073,7 +3085,7 @@ void Baseline::ssaPutAdd(std::uint32_t i)
     addSlot(ic.shape, ic.index, bad);
     loadValue(x, RCX);
     if (mayBeCell(x))
-        retain(RCX);
+        retainInto(RAX, RCX);
     a_.mov(mem(RDX, 0), RCX);
     a_.mov32(mem(RAX, 0), std::int32_t(ic.next));
     ssaKnow(v, kVObj, ic.next);

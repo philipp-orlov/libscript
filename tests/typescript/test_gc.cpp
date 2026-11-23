@@ -22,9 +22,8 @@ TEST(cyclesAreReclaimedByTheCollector)
 {
     ts::Context ctx;
     ctx.eval(
-        "var keep = null;"
-        "function makeCycle() { const a: any = {}; const b = { a }; a.b = b; return null; }"
-        "for (let i = 0; i < 500; i++) makeCycle();");
+        "function makeCycle() { const a: any = {}; const b = { a }; a.b = b; return a; }"
+        "(function () { const keep: any[] = []; for (let i = 0; i < 500; i++) keep.push(makeCycle()); })();");
     const auto leaked = ctx.stats();
     ctx.collectGarbage();
     const auto collected = ctx.stats();

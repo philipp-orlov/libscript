@@ -210,8 +210,13 @@ struct VM : EngineRuntime
         // (First of all: with no frame left a free is done at once, and what is above the top may name what it frees.)
         if (stackInit > stackTop)
             stackInit = stackTop;
-        if (!zctCount() || (runningJobs_ && zctCount() < zctLimit_))  // (at the end of the jobs)
+        if (!zctCount() && youngTop_ == youngBase_)
             return;
+        if (runningJobs_ && zctCount() < zctLimit_) {  // (the table at the end of the jobs)
+            // Between jobs: the young cells only, so that what no frame holds is freed at once again.
+            collectYoungAtHost();
+            return;
+        }
         scanZct();
     }
     /// The `gc` word of a cell in the zero-count table. A collection rewrites the word of every cell it looks at, and
@@ -222,11 +227,13 @@ struct VM : EngineRuntime
     {
         if (isVmCell(cell)) [[likely]] {
             CellHeader* h = headerOf(cell);
-            if (h->gc != kInZct && zctTop_ < zctEnd_) [[likely]] {
+            if (h->gc == 0 && zctTop_ < zctEnd_) [[likely]] {
                 *zctTop_++ = cell;
                 h->gc = kInZct;
                 return;
             }
+            if (youngHeader(h))  // a young cell waits for the scan, in its list
+                return;
         } else if (!cell->pinned && !cell->inZct && cell->gcBytes < kLargeCell && zctOld_.size() < zctOld_.capacity() &&
                    zctCount() < zctLimit_) {
             zctOld_.push_back(cell);  // within its capacity: nothing to allocate
@@ -633,7 +640,63 @@ public:
     CellPtr* zctTop_ = nullptr;
     CellPtr* zctEnd_ = nullptr;
 
+    /// Young cells (`deferred` only; docs/vm-core.md, "Young cells"). A young cell has `kYoungGc` set in its `gc` word,
+    /// its allocation site above bit 8, and is in the list [youngBase_, youngTop_). It holds no count of what it refers to;
+    /// its own count is what old cells and the runtime hold. A scan marks the young cells that frames and counts reach,
+    /// makes them old, and frees the others without looking at what they hold. Compiled code adds a cell it makes while
+    /// `youngTop_` is below `youngEnd_` and its site makes young cells.
+    bool young = false;  ///< on with `deferred`
+    static constexpr std::uint32_t kYoungGc = 2, kYoungMarked = 4, kSiteShift = 8;
+    static constexpr std::size_t kYoungCells = 4096;  ///< the list's room: a scan when it is full
+    CellPtr* youngBase_ = nullptr;
+    CellPtr* youngTop_ = nullptr;
+    CellPtr* youngEnd_ = nullptr;
+    /// Where young cells are made: compiled code's allocations, one site each. A site whose cells nearly all live past the
+    /// scan after them makes old ones from then on (`old`): making a cell old costs more than counting as it is filled.
+    struct AllocSite
+    {
+        std::uint32_t made = 0, kept = 0;
+        std::uint8_t old = 0;
+    };
+    static constexpr std::uint32_t kSiteWindow = 4096;  ///< cells of a site looked at before it is judged
+    /// The site of instruction `index` of `code`, made on first use (0, which is no site, when there is no room).
+    std::uint32_t allocSiteFor(CodeBlock* code, std::uint32_t index);
+    AllocSite& allocSite(std::uint32_t id) noexcept { return siteChunks_[id >> 10][id & 1023]; }
+    /// A young cell into the list, made at `site`; false when it must be old (the list is full, or the site makes old ones).
+    bool addYoung(CellPtr cell, std::uint32_t site) noexcept
+    {
+        if (youngTop_ == youngEnd_ || !site || allocSite(site).old)
+            return false;
+        *youngTop_++ = cell;
+        headerOf(cell)->gc = kYoungGc | (site << kSiteShift);
+        headerOf(cell)->rc = 0;
+        return true;
+    }
+    /// Whether the cell with header `h` is young. Only while the list holds any: a collection, which runs with none, writes
+    /// the `gc` word of every cell it looks at.
+    bool youngHeader(const CellHeader* h) const noexcept { return youngTop_ != youngBase_ && (h->gc & kYoungGc); }
+    /// Whether a new plain object may be young now.
+    bool youngAllowed() const noexcept { return young && !immediate_ && !destroying_ && youngTop_ != youngEnd_; }
+    /// A young cell made old now: it takes a count of each cell it refers to. What wants to treat it as any other cell
+    /// (the runtime's general paths, a class change, a prototype) calls this first.
+    void makeOld(CellPtr cell) noexcept;
+    void makeOldIfYoung(JSObject* o) noexcept
+    {
+        if (youngHeader(headerOf(reinterpret_cast<CellPtr>(o)))) [[unlikely]]
+            makeOld(reinterpret_cast<CellPtr>(o));
+    }
+
 private:
+    Vec<CellPtr> youngWork_;
+    Vec<AllocSite*> siteChunks_;
+    std::uint32_t siteCount_ = 1;  ///< 0 is no site
+    /// Mark, make old and free the young cells, as said above.
+    void collectYoung() noexcept;
+    void collectYoungAtHost() noexcept;
+    /// Every young cell made old (the context's end).
+    void allYoungOld() noexcept;
+    /// The registers a scan counts: [stackBase, liveTop()).
+    JSValue* liveTop() const noexcept;
     CellPtr* zctCap_ = nullptr;
     /// Old-family cells of the table, which may be in it more than once.
     Vec<detail::GCObject*> zctOld_;

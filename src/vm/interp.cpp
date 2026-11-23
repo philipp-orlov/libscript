@@ -832,6 +832,24 @@ JSValue* stringMethodRead(VM& vm, InlineCache& ic, Key key)
 }
 
 /// The slot a cached add stores into: one in place, or an out-of-line one (the buffer is made or grown to hold it).
+/// `*slot = v` for a slot of `o`: counted and the old value let go, unless `o` is young and counts nothing (docs/vm-core.md,
+/// "Young cells").
+inline void storeSlot(JSObject* o, JSValue* slot, JSValue v) noexcept
+{
+    const JSValue old = *slot;
+    *slot = v;
+    if (headerOf(reinterpret_cast<CellPtr>(o))->gc & VM::kYoungGc)
+        return;
+    retain(v);
+    release(old);
+}
+/// `*slot = v` for a new slot of `o`: counted unless `o` is young.
+inline void storeNewSlot(JSObject* o, JSValue* slot, JSValue v) noexcept
+{
+    *slot = v;
+    if (!(headerOf(reinterpret_cast<CellPtr>(o))->gc & VM::kYoungGc))
+        retain(v);
+}
 inline JSValue* roomForAdd(VM& vm, JSObject* o, std::uint32_t index)
 {
     if (index >= o->h.aux)
@@ -850,17 +868,12 @@ bool storePoly(VM& vm, CodeBlock* code, const InlineCache& ic, JSObject* o, JSVa
         if (e.shape != o->h.shape)
             continue;
         if (e.kind == PolyEntry::Write) {
-            JSValue* slot = o->slotAt(e.index);
-            const JSValue old = *slot;
-            *slot = v;
-            retain(v);
-            release(old);
+            storeSlot(o, o->slotAt(e.index), v);
             return true;
         }
         if (e.kind == PolyEntry::Add && (!e.validity || e.validity->valid) &&
             !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
-            *roomForAdd(vm, o, e.index) = v;
-            retain(v);
+            storeNewSlot(o, roomForAdd(vm, o, e.index), v);
             o->h.shape = e.next;
             return true;
         }
@@ -2472,11 +2485,7 @@ L_PutProp: {
         JSObject* o = asObject(base);
         if (o->h.shape == ic.shape) [[likely]] {
             if (ic.next == 0) {
-                JSValue* slot = o->slotAt(ic.index);
-                const JSValue old = *slot;
-                *slot = R[ins->c];
-                retain(*slot);
-                release(old);
+                storeSlot(o, o->slotAt(ic.index), R[ins->c]);
                 ++pc;
                 NEXT();
             }
@@ -2484,9 +2493,7 @@ L_PutProp: {
             // The new property's slot is in place or out of line (made when it is the first): objects of one shape can
             // have different inline counts.
             if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
-                JSValue* slot = roomForAdd(vm, o, ic.index);
-                *slot = R[ins->c];
-                retain(*slot);
+                storeNewSlot(o, roomForAdd(vm, o, ic.index), R[ins->c]);
                 o->h.shape = ic.next;
                 ++pc;
                 NEXT();
@@ -2750,9 +2757,7 @@ L_InitProp: {
     InlineCache& ic = cacheId == kNoCache ? scratch : code->caches[cacheId];
     if (o->h.shape == ic.shape) [[likely]] {
         // The literal's next property: the shape it had and the shape it gets.
-        JSValue* slot = roomForAdd(vm, o, ic.index);
-        *slot = R[ins->c];
-        retain(*slot);
+        storeNewSlot(o, roomForAdd(vm, o, ic.index), R[ins->c]);
         o->h.shape = ic.next;
         ++pc;
         NEXT();
@@ -4197,19 +4202,13 @@ int jitPutProp(VM& vm, std::uint32_t index)
         JSObject* o = asObject(base);
         if (o->h.shape == ic.shape) {
             if (ic.next == 0) {
-                JSValue* slot = o->slotAt(ic.index);
-                const JSValue old = *slot;
-                *slot = R[ins->c];
-                retain(*slot);
-                release(old);
+                storeSlot(o, o->slotAt(ic.index), R[ins->c]);
                 return 1;
             }
             // The new property's slot is in place or out of line (made when it is the first): objects of one shape can
             // have different inline counts.
             if ((!ic.validity || ic.validity->valid) && !(o->h.flags & (cellflags::kIsProto | cellflags::kNotExtensible))) {
-                JSValue* slot = roomForAdd(vm, o, ic.index);
-                *slot = R[ins->c];
-                retain(*slot);
+                storeNewSlot(o, roomForAdd(vm, o, ic.index), R[ins->c]);
                 o->h.shape = ic.next;
                 return 1;
             }
@@ -4270,9 +4269,7 @@ int jitInitProp(VM& vm, std::uint32_t index)
     InlineCache scratch;
     InlineCache& ic = *c.ic(scratch);
     if (o->h.shape == ic.shape) {
-        JSValue* slot = roomForAdd(vm, o, ic.index);
-        *slot = R[ins->c];
-        retain(*slot);
+        storeNewSlot(o, roomForAdd(vm, o, ic.index), R[ins->c]);
         o->h.shape = ic.next;
         return 1;
     }
@@ -4907,10 +4904,7 @@ int jitPutElem(VM& vm, std::uint32_t index)
     if (isPrivateKey(k)) {
         PrivateCache* pc = privateCacheAt(c.code, index);
         if (JSValue* slot = privateCached(pc, base, k)) {
-            const JSValue old = *slot;
-            *slot = R[ins->c];
-            retain(*slot);
-            release(old);
+            storeSlot(asObject(base), slot, R[ins->c]);
             return 1;
         }
         if (!privatePut(vm, base, k, R[ins->c]))

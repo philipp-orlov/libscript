@@ -227,6 +227,14 @@ inline std::uint64_t handOver(VM& vm, std::uint64_t bits) noexcept
     return bits;
 }
 
+/// `handOver` of a new plain object (owned, with no slot buffer) the runtime just made: young when it can be.
+inline std::uint64_t handOverNew(VM& vm, JSObject* o, std::uint32_t site) noexcept
+{
+    if (vm.youngAllowed() && vm.addYoung(reinterpret_cast<CellPtr>(o), site))
+        return toJSValue(o).bits;  // (its count is gone, as `handOver` would take it)
+    return handOver(vm, toJSValue(o).bits);
+}
+
 /// `handOver` of a step's answer: the result of a frame the interpreter returned from, or a step code.
 inline std::uint64_t handOverStep(VM& vm, std::uint64_t r) noexcept
 {
@@ -896,12 +904,12 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
 
 /// `this` for `new f(...)` from compiled code: an object inheriting from `f.prototype` (an ordinary function: the property
 /// is its third slot). Owned; 0 with the exception parked.
-extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f)
+extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f, std::uint32_t site)
 {
     try {
         const JSValue pv = *f->slotAt(2);
         Shape* root = vm->rootShapeFor(isObject(pv) ? asObject(pv) : vm->protos.object, 3);
-        return handOver(*vm, toJSValue(vm->newObject(root, newSlotsOf(*vm, f, root))).bits);
+        return handOverNew(*vm, vm->newObject(root, newSlotsOf(*vm, f, root)), site);
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -1004,14 +1012,14 @@ extern "C" JSObject* scriptVmSsaNewTable(VM* vm, JSFunction* f)
     }
 }
 
-extern "C" JSObject* scriptVmSsaNewObject(VM* vm, std::uint32_t shape, std::uint32_t aux)
+extern "C" JSObject* scriptVmSsaNewObject(VM* vm, std::uint32_t shape, std::uint32_t aux, std::uint32_t site)
 {
     try {
         auto* o = static_cast<JSObject*>(vm->allocCell(JSObject::bytesFor(std::uint8_t(aux)), Kind::Object, ObjClass::Plain,
                                                        std::uint8_t(aux)));
         o->h.shape = shape;
         o->slots = nullptr;
-        handOver(*vm, toJSValue(o).bits);
+        handOverNew(*vm, o, site);
         return o;
     } catch (...) {
         return nullptr;
@@ -1369,7 +1377,7 @@ private:
     {
         return mem::LocalHeap::kCanPopInline && !vm_.ctx.options.memoryLimit && JSObject::bytesFor(aux) <= 256;
     }
-    bool allocObject(std::uint32_t shape, std::uint8_t aux, Label& slow, bool shapeInR8 = false)
+    bool allocObject(std::uint32_t shape, std::uint8_t aux, Label& slow, bool shapeInR8 = false, std::uint32_t site = 0)
     {
         if (!canAllocObject(aux))
             return false;
@@ -1379,7 +1387,7 @@ private:
         h.flags = cellflags::kYoung;
         h.aux = aux;
         h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
-        allocCellHere(JSObject::bytesFor(aux), h, slow, shapeInR8);
+        allocCellHere(JSObject::bytesFor(aux), h, slow, shapeInR8, site);
         a_.mov(mem(RAX, kObjSlots), 0);
         return true;
     }
@@ -1452,8 +1460,9 @@ private:
     /// A cell of `bytes` with header `h` (its shape or-ed with r8 when `shapeInR8`) and a count of one, made here as
     /// `VM::allocCell` does, counters and all, when the heap's current block has room and no collection is due; else
     /// `slow`. The cell in rax; clobbers rcx, rdx, rsi.
-    void allocCellHere(std::size_t bytes, const CellHeader& h, Label& slow, bool shapeInR8)
+    void allocCellHere(std::size_t bytes, const CellHeader& h, Label& slow, bool shapeInR8, std::uint32_t site = 0)
     {
+        const bool youngCell = site && def_ && vm_.young;
         auto& ctx = vm_.ctx;
         auto at = [&](const void* field) {
             return std::int32_t(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&ctx));
@@ -1473,44 +1482,69 @@ private:
         a_.mov(RAX, mem(R12, atVm(&vm_.liveCells)));
         a_.cmp(RAX, mem(R12, atVm(&vm_.cellBudget_)));
         a_.jcc(CAE, slow);
-        if (def_) {
+        // A slot of the current block, a free one or one not carved yet, into rax, its header's first word written.
+        auto pop = [&]() {
+            Label carve, got;
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.heap.currentBlockOf(bytes)));
+            a_.mov(RDX, mem(RDX, 0));
+            a_.mov(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockFreeOffset)));
+            a_.test(RAX, RAX);
+            a_.jcc(CE, carve);
+            a_.mov(RSI, mem(RAX, 0));
+            a_.mov(mem(RDX, std::int32_t(mem::LocalHeap::kBlockFreeOffset)), RSI);
+            a_.jmp(got);
+            a_.bind(carve);
+            a_.mov(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockBumpOffset)));
+            a_.cmp(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockEndOffset)));
+            a_.jcc(CE, slow);
+            a_.mov32(RSI, mem(RDX, std::int32_t(mem::LocalHeap::kBlockSlotBytesOffset)));
+            a_.alu(0, mem(RDX, std::int32_t(mem::LocalHeap::kBlockBumpOffset)), RSI);
+            a_.bind(got);
+            a_.inc32(mem(RDX, std::int32_t(mem::LocalHeap::kBlockLiveOffset)));
+            std::uint64_t word;
+            std::memcpy(&word, &h, sizeof word);
+            a_.movImm(RSI, word);
+            if (shapeInR8)
+                a_.or_(RSI, R8);
+            a_.mov(mem(RAX, 0), RSI);
+        };
+        // The cell, held by a frame only and with no count, into the list at `top` (`gcWord` in its header).
+        auto push = [&](CellPtr* const* top, std::uint32_t gcWord) {
+            a_.movImm(RSI, std::uint64_t(gcWord) << 32);
+            a_.mov(mem(RAX, 8), RSI);
+            a_.mov(RSI, mem(R12, atVm(top)));
+            a_.mov(mem(RSI, 0), RAX);
+            a_.aluI(0, RSI, 8);
+            a_.mov(mem(R12, atVm(top)), RSI);
+        };
+        if (youngCell) {
+            // Young, into the young list, unless that is full or the site makes old cells: then as below.
+            Label tableWay, made;
+            a_.movImm(RSI, reinterpret_cast<std::uint64_t>(&vm_.allocSite(site).old));
+            a_.cmpI8(mem(RSI, 0), 0);
+            a_.jcc(CNE, tableWay);
+            a_.mov(RSI, mem(R12, atVm(&vm_.youngTop_)));
+            a_.cmp(RSI, mem(R12, atVm(&vm_.youngEnd_)));
+            a_.jcc(CAE, tableWay);
+            pop();
+            push(&vm_.youngTop_, VM::kYoungGc | (site << VM::kSiteShift));
+            a_.jmp(made);
+            a_.bind(tableWay);
+            a_.mov(RSI, mem(R12, atVm(&vm_.zctTop_)));
+            a_.cmp(RSI, mem(R12, atVm(&vm_.zctEnd_)));
+            a_.jcc(CAE, slow);
+            pop();
+            push(&vm_.zctTop_, VM::kInZct);
+            a_.bind(made);
+        } else if (def_) {
             // Held by a frame only, the cell goes into the zero-count table: the runtime's way when that is full.
             a_.mov(RSI, mem(R12, atVm(&vm_.zctTop_)));
             a_.cmp(RSI, mem(R12, atVm(&vm_.zctEnd_)));
             a_.jcc(CAE, slow);
-        }
-        // A slot of the current block: a free one, or one not carved yet.
-        Label carve, got;
-        a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.heap.currentBlockOf(bytes)));
-        a_.mov(RDX, mem(RDX, 0));
-        a_.mov(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockFreeOffset)));
-        a_.test(RAX, RAX);
-        a_.jcc(CE, carve);
-        a_.mov(RSI, mem(RAX, 0));
-        a_.mov(mem(RDX, std::int32_t(mem::LocalHeap::kBlockFreeOffset)), RSI);
-        a_.jmp(got);
-        a_.bind(carve);
-        a_.mov(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockBumpOffset)));
-        a_.cmp(RAX, mem(RDX, std::int32_t(mem::LocalHeap::kBlockEndOffset)));
-        a_.jcc(CE, slow);
-        a_.mov32(RSI, mem(RDX, std::int32_t(mem::LocalHeap::kBlockSlotBytesOffset)));
-        a_.alu(0, mem(RDX, std::int32_t(mem::LocalHeap::kBlockBumpOffset)), RSI);
-        a_.bind(got);
-        a_.inc32(mem(RDX, std::int32_t(mem::LocalHeap::kBlockLiveOffset)));
-        std::uint64_t word;
-        std::memcpy(&word, &h, sizeof word);
-        a_.movImm(RSI, word);
-        if (shapeInR8)
-            a_.or_(RSI, R8);
-        a_.mov(mem(RAX, 0), RSI);
-        if (def_) {
-            a_.movImm(RSI, std::uint64_t(VM::kInZct) << 32);  // no count, and in the table
-            a_.mov(mem(RAX, 8), RSI);
-            a_.mov(RSI, mem(R12, atVm(&vm_.zctTop_)));
-            a_.mov(mem(RSI, 0), RAX);
-            a_.aluI(0, RSI, 8);
-            a_.mov(mem(R12, atVm(&vm_.zctTop_)), RSI);
+            pop();
+            push(&vm_.zctTop_, VM::kInZct);
         } else {
+            pop();
             a_.mov(mem(RAX, 8), 1);
         }
         a_.aluI(0, mem(RCX, at(&ctx.heapBytes)), std::int32_t(bytes));
@@ -2381,8 +2415,8 @@ private:
             Label slowFree;
             a_.testI8(mem(r, kHdrKind), 0x80);
             a_.jcc(CE, slowFree);
-            a_.cmpI32(mem(r, kHdrGc), std::int32_t(VM::kInZct));
-            a_.jcc(CE, done);
+            a_.cmpI32(mem(r, kHdrGc), 0);  // in the table already, or young (freed by the scan)
+            a_.jcc(CNE, done);
             a_.mov(RDI, mem(R12, vmOffset(&vm_.zctTop_)));
             a_.cmp(RDI, mem(R12, vmOffset(&vm_.zctEnd_)));
             a_.jcc(CAE, slowFree);
@@ -2397,6 +2431,41 @@ private:
             a_.mov(RDI, r);
         a_.call(free_);
         a_.bind(done);
+    }
+    /// Whether stores into objects look for a young one (docs/vm-core.md, "Young cells"), which counts nothing.
+    bool youngStores() const { return vm_.young && def_; }
+    /// Jumps to `yng` when the object in `obj` is young. Emits nothing without young cells.
+    void ifYoung(Reg obj, Label& yng)
+    {
+        if (!youngStores())
+            return;
+        a_.testI8(mem(obj, kHdrGc), std::uint8_t(VM::kYoungGc));
+        a_.jcc(CNE, yng);
+    }
+    /// One more count for the value in `v`, about to go into the object in `obj`, unless that is young.
+    void retainInto(Reg obj, Reg v)
+    {
+        Label yng;
+        ifYoung(obj, yng);
+        retain(v);
+        a_.bind(yng);
+    }
+    /// [rdx] = rcx, a slot of the object in rax: counted and the old value let go, unless the object is young. Clobbers rsi,
+    /// rdi and, through `release`, the caller-saved registers.
+    void storeSlotCounted()
+    {
+        Label yng, done;
+        ifYoung(RAX, yng);
+        retain(RCX);
+        a_.mov(RSI, mem(RDX, 0));
+        a_.mov(mem(RDX, 0), RCX);
+        release(RSI);
+        if (youngStores()) {
+            a_.jmp(done);
+            a_.bind(yng);
+            a_.mov(mem(RDX, 0), RCX);
+            a_.bind(done);
+        }
     }
     /// Where a field of the VM is from r12.
     std::int32_t vmOffset(const void* field) const
@@ -4010,7 +4079,8 @@ void Baseline::emit(std::uint32_t i)
     }
     case Op::NewObject: {
         Label& bad = slow(i, &helperThunk<jitNewObject>);
-        if (!allocObject(vm_.rootShapeFor(vm_.protos.object, std::uint8_t(in.b))->id, std::uint8_t(in.b), bad)) {
+        if (!allocObject(vm_.rootShapeFor(vm_.protos.object, std::uint8_t(in.b))->id, std::uint8_t(in.b), bad, false,
+                         vm_.allocSiteFor(code_, i))) {
             a_.jmp(bad);
             return;
         }
@@ -5429,10 +5499,7 @@ void Baseline::cachedWrite(std::uint32_t i, const Ins& in, const InlineCache* ic
     a_.lea(RDX, mem(RDX, RSI, 8));
     a_.bind(have);
     a_.mov(RCX, R(in.c));
-    retain(RCX);
-    a_.mov(RSI, mem(RDX, 0));
-    a_.mov(mem(RDX, 0), RCX);
-    release(RSI);
+    storeSlotCounted();
 }
 
 /// The store of `in` to the object in rax, whose shape is known: to its slot `index`, or (`next`) as the property that moves it
@@ -5444,12 +5511,9 @@ void Baseline::putPropKnown(const Ins& in, std::uint32_t shape, std::uint32_t in
         Label same;
         slotAddress(shape, index);
         a_.mov(RCX, R(in.c));
-        a_.mov(RSI, mem(RDX, 0));
-        a_.cmp(RSI, RCX);
+        a_.cmp(RCX, mem(RDX, 0));
         a_.jcc(CE, same);
-        retain(RCX);
-        a_.mov(mem(RDX, 0), RCX);
-        release(RSI);
+        storeSlotCounted();
         a_.bind(same);
         return;
     }
@@ -5463,7 +5527,7 @@ void Baseline::putPropKnown(const Ins& in, std::uint32_t shape, std::uint32_t in
     a_.jcc(CNE, bad);
     addSlot(shape, index, bad);
     a_.mov(RCX, R(in.c));
-    retain(RCX);
+    retainInto(RAX, RCX);
     a_.mov(mem(RDX, 0), RCX);
     a_.mov32(mem(RAX, 0), std::int32_t(next));
 }
@@ -5661,7 +5725,7 @@ void Baseline::defPrivate(std::uint32_t i, const Ins& in)
     a_.alu32(7, RSI, RDI);
     a_.jcc(CAE, bad);
     a_.mov(RCX, R(in.c));
-    retain(RCX);
+    retainInto(RAX, RCX);
     a_.mov(mem(RAX, RSI, 8, kObjInline), RCX);
     a_.mov32(RSI, mem(RDX, kPrivNext));
     a_.mov32(mem(RAX, 0), RSI);
@@ -5786,10 +5850,7 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
         a_.bind(notInt);
         privateSlot(i, bad);
         a_.mov(RCX, R(in.c));
-        retain(RCX);
-        a_.mov(RSI, mem(RDX, 0));
-        a_.mov(mem(RDX, 0), RCX);
-        release(RSI);
+        storeSlotCounted();
     }
     a_.bind(done);
 }
@@ -5808,7 +5869,7 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
     a_.jcc(CNE, bad);
     addSlot(ic->shape, ic->index, bad);
     a_.mov(RCX, R(in.c));
-    retain(RCX);
+    retainInto(RAX, RCX);
     a_.mov(mem(RDX, 0), RCX);
     a_.mov32(mem(RAX, 0), std::int32_t(ic->next));
 }
@@ -6103,6 +6164,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         {
             // `this` made here when `f.prototype` is an object that is already some shape tree's prototype.
             Label viaRuntime, made;
+            const std::uint32_t site = vm_.allocSiteFor(code_, i);
             a_.mov(RSI, mem(RAX, kObjSlots));
             a_.test(RSI, RSI);
             a_.jcc(CE, viaRuntime);
@@ -6124,7 +6186,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.mov32(R8, mem(RSI, kShapeAuxIds + 0));
             a_.test32(R8, R8);
             a_.jcc(CE, viaRuntime);
-            if (allocObject(0, 3, viaRuntime, true))
+            if (allocObject(0, 3, viaRuntime, true, site))
                 a_.jmp(made);
             else
                 a_.jmp(viaRuntime);
@@ -6135,7 +6197,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.mov32(R8, mem(RSI, kShapeAuxIds + 4));
             a_.test32(R8, R8);
             a_.jcc(CE, viaRuntime);
-            if (allocObject(0, 8, viaRuntime, true))
+            if (allocObject(0, 8, viaRuntime, true, site))
                 a_.jmp(made);
             else
                 a_.jmp(viaRuntime);
@@ -6145,7 +6207,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.mov32(R8, mem(RSI, kShapeAuxIds + 8));
             a_.test32(R8, R8);
             a_.jcc(CE, viaRuntime);
-            if (allocObject(0, 16, viaRuntime, true))
+            if (allocObject(0, 16, viaRuntime, true, site))
                 a_.jmp(made);
             else
                 a_.jmp(viaRuntime);
@@ -6153,12 +6215,13 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.mov32(R8, mem(RSI, kShapeAuxIds + 12));
             a_.test32(R8, R8);
             a_.jcc(CE, viaRuntime);
-            if (allocObject(0, 24, viaRuntime, true))
+            if (allocObject(0, 24, viaRuntime, true, site))
                 a_.jmp(made);
             a_.bind(viaRuntime);
             a_.mov(RAX, R(base));
             a_.mov(RDI, R12);
             a_.mov(RSI, RAX);
+            a_.movImm(RDX, site);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitNewThis));
             a_.callC(RAX);
             a_.test(RAX, RAX);

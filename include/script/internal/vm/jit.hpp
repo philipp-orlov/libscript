@@ -52,6 +52,10 @@ FastNative stringCharNative() noexcept;
 FastNative stringCodePointNative() noexcept;
 /// `String.prototype.localeCompare`: compiled code compares two flat strings itself.
 FastNative stringCompareNative() noexcept;
+/// The constructor of `Map`, `Set`, `WeakMap` and `WeakSet` (data says which): with no argument it runs no script.
+FastNative tableCtorNative() noexcept;
+/// `new f()` of such a constructor `f`, owned: a Map or Set keeps its state in its own cell.
+JSObject* newTableObject(VM& vm, JSFunction* f);
 /// `DataView.prototype.getInt8` and the others: data is the element kind, and 256 for a set.
 FastNative dataViewAccessNative() noexcept;
 /// The getters of `DataView.prototype`: data 0 `buffer`, 1 `byteLength`, 2 `byteOffset`.

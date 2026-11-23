@@ -1188,7 +1188,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             case Op::New:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
-                else if (ssaNewArrayPlan(i))
+                else if (!ssaNewArrayPlan(i).isUndefined())
                     ssaNewArray(i, liveAfter[b][k]);
                 else if (!ssaNew(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
@@ -2925,22 +2925,34 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
     return true;
 }
 
-/// `new Array()` or `new Array(n)` of the language's own `Array`.
-bool Baseline::ssaNewArrayPlan(std::uint32_t i)
+/// `new Array()` or `new Array(n)` of the language's own `Array`, or `new Map()` (or `Set`, `WeakMap`, `WeakSet`) with no
+/// argument: the constructor it was.
+JSValue Baseline::ssaNewArrayPlan(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
-    return ssaOn_ >= 2 && in.opcode() == Op::New && in.c <= 1 && !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)) &&
-           guessBefore(i, in.b).bits == vm_.arrayConstructor.bits;
+    if (ssaOn_ < 2 || in.opcode() != Op::New || in.c > 1 || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+        return JSValue::undefined();
+    const JSValue f = guessBefore(i, in.b);
+    if (f.bits == vm_.arrayConstructor.bits)
+        return f;
+    if (in.c == 0 && isFunction(f) && (static_cast<JSFunction*>(asObject(f))->flags & JSFunction::kNative) &&
+        static_cast<JSFunction*>(asObject(f))->rare()->native == tableCtorNative() && vm_.prototypeAt2(static_cast<JSFunction*>(asObject(f))))
+        return f;
+    return JSValue::undefined();
 }
 
-/// `new Array(n)` of `ssaNewArrayPlan`, `n` an int32 that makes a dense array: the array made by the runtime without the
-/// call sequence. Anything else leaves.
+/// `new` of `ssaNewArrayPlan`, for an array `n` an int32 that makes a dense array: the object made by the runtime without
+/// the call sequence. Anything else leaves.
 void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
 {
     const Ins& in = code_->code[i];
+    const JSValue f = ssaNewArrayPlan(i);
+    const bool table = f.bits != vm_.arrayConstructor.bits;
+    if (table)
+        holdValue(f);
     Label& bad = ssaExit(i);
     loadValue(name_[in.b], RAX);
-    a_.movImm(RCX, vm_.arrayConstructor.bits);
+    a_.movImm(RCX, f.bits);
     a_.cmp(RAX, RCX);
     a_.jcc(CNE, bad);
     if (in.c == 1) {
@@ -2962,14 +2974,17 @@ void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
     Label& failed = ssaExit(i);  // the runtime could not make it: the instruction runs again in the interpreter
     exitAt_ = -1;
     const std::vector<int> keepRegs = ssaLiveRegs();
-    if (in.c == 1)
+    if (table)
+        a_.movImm(RSI, f.bits);
+    else if (in.c == 1)
         loadI32(name_[in.b + 2u], RSI, &failed);  // (checked above: never taken)
     else
         a_.movImm(RSI, 0);
     ssaSaveRegs(keepRegs);
-    a_.mov32(RSI, RSI);
+    if (!table)
+        a_.mov32(RSI, RSI);
     a_.mov(RDI, R12);
-    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaNewArray));
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(table ? reinterpret_cast<void*>(&scriptVmSsaNewTable) : reinterpret_cast<void*>(&scriptVmSsaNewArray)));
     a_.callC(RAX);
     ssaRestoreRegs(keepRegs);
     a_.test(RAX, RAX);
@@ -2983,7 +2998,7 @@ void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
         release(RDI);
     }
     a_.mov(RAX, R(in.a));
-    ssaDef(i, kVObj | kVArray);
+    ssaDef(i, table ? kVObj : kVObj | kVArray);
     frame_[in.a] = ssa_->defBase[i];
 }
 
@@ -4055,7 +4070,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     };
     switch (op) {
     case Op::GetProp: return !ssaReadEntries(i).empty() || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
-    case Op::New: return ssaNewArrayPlan(i) || ssaNewPlan(i, nullptr);
+    case Op::New: return !ssaNewArrayPlan(i).isUndefined() || ssaNewPlan(i, nullptr);
     case Op::Call: return mathOf_[i] != nullptr || viewOf_[i] != nullptr || ssaCharCodeCallee(i) != nullptr;
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
     case Op::InitProp: return ssaAddFast(i);

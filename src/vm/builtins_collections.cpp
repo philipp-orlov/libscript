@@ -149,6 +149,7 @@ struct TableState : NativeState
     bool weak;
 
     TableState(bool map, bool w) : isMap(map), weak(w) {}
+    std::size_t cellBytes() const override { return sizeof *this; }  // (in its object's cell: `newTableObject`)
     // Made and dropped by the payload pool, so a table that comes and goes makes no call to the general allocator.
     static void* operator new(std::size_t n) { return PoolAlloc<char>().allocate(n); }
     static void operator delete(void* p, std::size_t n) noexcept { PoolAlloc<char>().deallocate(static_cast<char*>(p), n); }
@@ -266,6 +267,14 @@ struct TableState : NativeState
     }
 };
 
+/// The state of a Map or Set object (its class checked by the caller): on the side when its constructor made it, in its cell
+/// when compiled code did (`newTableObject`).
+TableState* tableOf(JSObject* o) noexcept
+{
+    Rare* r = o->rare();
+    return static_cast<TableState*>(r && r->ext ? r->ext : o->embeddedState());
+}
+
 struct TableIter : IteratorState
 {
     JSValue table;
@@ -286,7 +295,7 @@ struct TableIter : IteratorState
     {
         if (!isObject(table))
             return 0;
-        auto* t = static_cast<TableState*>(asObject(table)->rare()->ext);
+        TableState* t = tableOf(asObject(table));
         const Entry_* e = t->after(last, &at);
         if (!e) {
             release(table);
@@ -318,8 +327,8 @@ struct TableIter : IteratorState
 TableState* thisTable(VM& vm, JSValue self, ObjClass cls, const char* method)
 {
     if (isObject(self) && asObject(self)->cls() == cls)
-        if (Rare* r = asObject(self)->rare(); r && r->ext)
-            return static_cast<TableState*>(r->ext);
+        if (TableState* t = tableOf(asObject(self)))
+            return t;
     (void)method;
     typeError(vm, std::string("not a ") + (cls == ObjClass::Map ? "Map" : cls == ObjClass::Set ? "Set" : cls == ObjClass::WeakMap ? "WeakMap" : "WeakSet"));
     return nullptr;
@@ -358,9 +367,9 @@ NATIVE(tableCtor)
     if (vm.newTarget.isUndefined() || !isObject(self))
         return typeError(vm, std::string("Constructor ") + k.name + " requires 'new'");
     JSObject* o = asObject(self);
-    o->h.cls = std::uint8_t(k.cls);
     auto* t = new TableState(k.isMap, k.weak);
     o->rareOf(vm).ext = t;
+    o->h.cls = std::uint8_t(k.cls);  // (after the state is there: the class says where to find it)
     const JSValue init = arg(args, argc, 0);
     if (!init.isNullish()) {
         // The entries go in through the `set` or `add` the new object has, which a subclass may have replaced.
@@ -533,8 +542,7 @@ bool tableIterate(VM& vm, JSValue src, JSValue* iterator, JSValue* next)
     JSObject* proto = map ? vm.protos.map : vm.protos.set;
     const int family = map ? kMapIterator : kSetIterator;
     JSObject* ip = vm.protos.iteratorFamilies[family];
-    Rare* r = o->rare();
-    if (!proto || !ip || !r || !r->ext || o->isDictionary(vm) || o->shapeOf(vm)->count != 0 || o->proto(vm) != proto)
+    if (!proto || !ip || !tableOf(o) || o->isDictionary(vm) || o->shapeOf(vm)->count != 0 || o->proto(vm) != proto)
         return false;
     std::uint32_t& epoch = vm.tableEpoch[map];
     if (epoch != vm.globalEpoch) {
@@ -702,16 +710,16 @@ NATIVE(registryUnregister)
 double collectionSize(JSValue v, ObjClass cls)
 {
     if (isObject(v) && asObject(v)->cls() == cls)
-        if (Rare* r = asObject(v)->rare(); r && r->ext)
-            return double(static_cast<TableState*>(r->ext)->size());
+        if (TableState* t = tableOf(asObject(v)))
+            return double(t->size());
     return -1;
 }
 
 int mapLookup(JSValue map, JSValue key, JSValue* out)
 {
     if (isObject(map) && asObject(map)->cls() == ObjClass::Map)
-        if (Rare* r = asObject(map)->rare(); r && r->ext)
-            if (Entry_* e = static_cast<TableState*>(r->ext)->find(key)) {
+        if (TableState* t = tableOf(asObject(map)))
+            if (Entry_* e = t->find(key)) {
                 retain(e->value);
                 *out = e->value;
                 return 1;
@@ -722,8 +730,8 @@ int mapLookup(JSValue map, JSValue key, JSValue* out)
 bool mapStore(JSValue map, JSValue key, JSValue value)
 {
     if (isObject(map) && asObject(map)->cls() == ObjClass::Map)
-        if (Rare* r = asObject(map)->rare(); r && r->ext) {
-            static_cast<TableState*>(r->ext)->set(key, value);
+        if (TableState* t = tableOf(asObject(map))) {
+            t->set(key, value);
             return true;
         }
     return false;
@@ -797,6 +805,32 @@ void installCollections(VM& vm)
 }
 
 }  // namespace bi
+
+JSObject* newTableObject(VM& vm, JSFunction* f)
+{
+    const bi::Kind& k = bi::kindOf(f->rare()->nativeData);
+    const JSValue pv = *f->slotAt(2);
+    Shape* root = vm.rootShapeFor(isObject(pv) ? asObject(pv) : vm.protos.object, 3);
+    const std::size_t bytes = JSObject::bytesFor(3) + sizeof(bi::TableState);
+    if (k.weak || bytes > mem::LocalHeap::kMaxSmall) {
+        JSObject* o = vm.newObject(root, 3);
+        Handle keep = Handle::adopt(toJSValue(o));
+        auto* t = new bi::TableState(k.isMap, k.weak);
+        o->rareOf(vm).ext = t;
+        o->h.cls = std::uint8_t(k.cls);
+        return asObject(keep.take());
+    }
+    auto* o = static_cast<JSObject*>(vm.allocCell(bytes, Kind::Object, k.cls, 3));
+    o->h.shape = root->id;
+    o->slots = nullptr;
+    ::new (static_cast<void*>(o->embeddedState())) bi::TableState(k.isMap, false);
+    return o;
+}
+
+FastNative tableCtorNative() noexcept
+{
+    return bi::tableCtor;
+}
 }  // namespace vm
 }  // namespace internal
 }  // namespace script

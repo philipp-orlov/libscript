@@ -992,6 +992,18 @@ extern "C" JSArray* scriptVmSsaNewArray(VM* vm, std::uint32_t n)
     }
 }
 
+/// `new Map()` (or `Set`, `WeakMap`, `WeakSet`, by the constructor `f`) for the SSA tier: owned, or null.
+extern "C" JSObject* scriptVmSsaNewTable(VM* vm, JSFunction* f)
+{
+    try {
+        JSObject* made = newTableObject(*vm, f);
+        handOver(*vm, toJSValue(made).bits);
+        return made;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 extern "C" JSObject* scriptVmSsaNewObject(VM* vm, std::uint32_t shape, std::uint32_t aux)
 {
     try {
@@ -3272,7 +3284,7 @@ private:
     };
     bool ssaNewPlan(std::uint32_t i, SsaNew* out);
     bool ssaNew(std::uint32_t i, const ssa::Bits& liveAfter);
-    bool ssaNewArrayPlan(std::uint32_t i);
+    JSValue ssaNewArrayPlan(std::uint32_t i);
     void ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter);
     /// `o.#x` (a `GetElem` whose site has found the private name): the name and the shape checked, the slot read.
     bool ssaPrivateSite(std::uint32_t i) const;

@@ -1188,6 +1188,8 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             case Op::New:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
+                else if (ssaNewArrayPlan(i))
+                    ssaNewArray(i, liveAfter[b][k]);
                 else if (!ssaNew(i, liveAfter[b][k]))
                     a_.jmp(ssaExit(i));
                 break;
@@ -2923,6 +2925,68 @@ bool Baseline::ssaNew(std::uint32_t i, const ssa::Bits& liveAfter)
     return true;
 }
 
+/// `new Array()` or `new Array(n)` of the language's own `Array`.
+bool Baseline::ssaNewArrayPlan(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    return ssaOn_ >= 2 && in.opcode() == Op::New && in.c <= 1 && !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)) &&
+           guessBefore(i, in.b).bits == vm_.arrayConstructor.bits;
+}
+
+/// `new Array(n)` of `ssaNewArrayPlan`, `n` an int32 that makes a dense array: the array made by the runtime without the
+/// call sequence. Anything else leaves.
+void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
+{
+    const Ins& in = code_->code[i];
+    Label& bad = ssaExit(i);
+    loadValue(name_[in.b], RAX);
+    a_.movImm(RCX, vm_.arrayConstructor.bits);
+    a_.cmp(RAX, RCX);
+    a_.jcc(CNE, bad);
+    if (in.c == 1) {
+        loadI32(name_[in.b + 2u], RDX, &bad);
+        a_.aluI32(7, RDX, std::int32_t(JSArray::kMaxDenseGap));
+        a_.jcc(CA, bad);  // also a negative one
+    }
+    // The result's register lets go of what it held, and the runtime may collect: every live value gets an owner first.
+    {
+        std::vector<std::uint8_t> clobber(code_->nregs, 0);
+        clobber[in.a] = 1;
+        ssa::Bits keep = liveAfter;
+        ssa::bitClear(keep, in.a);
+        ssaSync({}, keep, clobber);
+        if (ssaFailed_)
+            return;
+    }
+    exitAt_ = -1;
+    Label& failed = ssaExit(i);  // the runtime could not make it: the instruction runs again in the interpreter
+    exitAt_ = -1;
+    const std::vector<int> keepRegs = ssaLiveRegs();
+    if (in.c == 1)
+        loadI32(name_[in.b + 2u], RSI, &failed);  // (checked above: never taken)
+    else
+        a_.movImm(RSI, 0);
+    ssaSaveRegs(keepRegs);
+    a_.mov32(RSI, RSI);
+    a_.mov(RDI, R12);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaNewArray));
+    a_.callC(RAX);
+    ssaRestoreRegs(keepRegs);
+    a_.test(RAX, RAX);
+    a_.jcc(CE, failed);
+    // Into the result's slot, which owns it (a deferred one holds it without a count).
+    if (def_) {
+        a_.mov(R(in.a), RAX);
+    } else {
+        a_.mov(RDI, R(in.a));
+        a_.mov(R(in.a), RAX);
+        release(RDI);
+    }
+    a_.mov(RAX, R(in.a));
+    ssaDef(i, kVObj | kVArray);
+    frame_[in.a] = ssa_->defBase[i];
+}
+
 bool Baseline::ssaPrivateSite(std::uint32_t i) const
 {
     return code_->code[i].opcode() == Op::GetElem && (code_->flags & CodeBlock::kPrivate) && i < code_->privCaches.size() &&
@@ -3976,7 +4040,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     };
     switch (op) {
     case Op::GetProp: return !ssaReadEntries(i).empty() || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
-    case Op::New: return ssaNewPlan(i, nullptr);
+    case Op::New: return ssaNewArrayPlan(i) || ssaNewPlan(i, nullptr);
     case Op::Call: return mathOf_[i] != nullptr || viewOf_[i] != nullptr || ssaCharCodeCallee(i) != nullptr;
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
     case Op::InitProp: return ssaAddFast(i);

@@ -974,6 +974,18 @@ extern "C" void scriptVmJitFree(CellPtr cell)
 /// The SSA tier's `new` made in place, when the heap's current block has no room or a collection is due: the object as
 /// `VM::newObject` makes it, with the shape the constructor gives it (its slots are filled by the caller). Null when the
 /// runtime refused.
+/// `new Array(n)` for the SSA tier: owned, or null (out of memory; the instruction runs again in the interpreter).
+extern "C" JSArray* scriptVmSsaNewArray(VM* vm, std::uint32_t n)
+{
+    try {
+        JSArray* a = vm->newArray(vm->protos.array, n);
+        handOver(*vm, toJSValue(a).bits);
+        return a;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 extern "C" JSObject* scriptVmSsaNewObject(VM* vm, std::uint32_t shape, std::uint32_t aux)
 {
     try {
@@ -3254,6 +3266,8 @@ private:
     };
     bool ssaNewPlan(std::uint32_t i, SsaNew* out);
     bool ssaNew(std::uint32_t i, const ssa::Bits& liveAfter);
+    bool ssaNewArrayPlan(std::uint32_t i);
+    void ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter);
     /// `o.#x` (a `GetElem` whose site has found the private name): the name and the shape checked, the slot read.
     bool ssaPrivateSite(std::uint32_t i) const;
     /// Per instruction: a call of `Math.sqrt` and its kind (`mathOp`), the function the callee is, or was read as from a

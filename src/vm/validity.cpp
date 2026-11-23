@@ -6,6 +6,7 @@
 // `validityOf(P)` is registered with every object above `P` (and `P` itself), so a change to any of them reaches it
 // directly: no walk down from the changed object, and no global epoch that one freed prototype anywhere would move.
 #include "script/internal/vm/census.hpp"
+#include "script/internal/vm/bytecode.hpp"
 #include "script/internal/vm/object.hpp"
 
 namespace script {
@@ -160,6 +161,35 @@ bool VM::plainHoles(JSArray* a)
     }
     JSObject* const ap = protos.array;
     return c->holes == 1 && (ap->cls() != ObjClass::Array || static_cast<JSArray*>(ap)->length == 0);
+}
+
+HoleRec* VM::holeRecAt(CodeBlock* code, std::uint32_t index)
+{
+    if (code->holeRecs.size() < code->code.size())  // (merged inlining makes the code longer)
+        code->holeRecs.resize(code->code.size(), nullptr);
+    HoleRec*& rec = code->holeRecs[index];
+    if (!rec)
+        rec = new HoleRec();
+    return rec;
+}
+
+void VM::noteHoleShape(CodeBlock* code, std::uint32_t index, JSArray* a)
+{
+    const Shape* s = a->shapeOf(*this);
+    if (!s->proto || s->proto == protos.array)
+        return;  // a plain array's: compiled code knows it without a record
+    const Rare* r = s->proto->rare();
+    ValidityCell* c = r ? r->validity : nullptr;
+    if (!c || !c->valid || c->holes != 1)
+        return;
+    HoleRec* rec = holeRecAt(code, index);
+    if (rec->shape == a->h.shape && rec->cell == c)
+        return;
+    retainValidity(c);
+    if (rec->cell)
+        releaseValidity(rec->cell);
+    rec->shape = a->h.shape;
+    rec->cell = c;
 }
 
 void VM::invalidateChain(JSObject* proto)

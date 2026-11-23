@@ -1112,7 +1112,7 @@ bool Baseline::emitTyped(std::uint32_t i)
                     a_.jmp(got);
                     a_.bind(holeRead);
                     a_.mov(RAX, R(in.b));
-                    if (plainHoleGuard(RDX, bad)) {
+                    if (plainHoleGuard(RDX, bad, i)) {
                         a_.movImm(RAX, kUndefined);
                         deliver(i, in.a);
                     } else {
@@ -1160,7 +1160,7 @@ bool Baseline::emitTyped(std::uint32_t i)
             // value's count is given back and the instruction runs again in the interpreter.
             a_.bind(hole);
             Label undo;
-            if (plainHoleGuard(RDI, undo)) {
+            if (plainHoleGuard(RDI, undo, i)) {
                 a_.mov(mem(RDX, 0), RSI);
                 if (vw >= 0)
                     packAt(RAX, RCX);

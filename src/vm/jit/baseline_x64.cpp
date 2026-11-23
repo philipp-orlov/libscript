@@ -1350,18 +1350,35 @@ private:
     }
     /// Guards (RAX the array) that a store into a hole of it cannot be intercepted (VM::holeStoreCell), with `tmp` as
     /// scratch; false, emitting nothing, when it can be now.
-    bool plainHoleGuard(Reg tmp, Label& fail)
+    bool plainHoleGuard(Reg tmp, Label& fail, std::uint32_t i)
     {
         JSObject* const ap = vm_.protos.array;
         ValidityCell* const cell = vm_.holeStoreCell();
         if (!cell)
             return false;
         hold(cell);
+        // A plain array, or one of the shape the site met last whose prototypes have no element while its cell holds
+        // (`HoleRec`, which the runtime fills).
+        HoleRec* const rec = vm_.holeRecAt(code_, i);
+        Label recorded, chain;
         a_.cmpI32(mem(RAX, 0), std::int32_t(vm_.rootShapeFor(ap, 0)->id));
-        a_.jcc(CNE, fail);
+        a_.jcc(CNE, recorded);
         a_.movImm(tmp, reinterpret_cast<std::uint64_t>(cell));
         a_.cmpI32(mem(tmp, kValidityValid), 0);
         a_.jcc(CE, fail);
+        a_.jmp(chain);
+        a_.bind(recorded);
+        a_.movImm(tmp, reinterpret_cast<std::uint64_t>(rec));
+        a_.mov32(tmp, mem(tmp, std::int32_t(offsetof(HoleRec, shape))));
+        a_.alu32(7, tmp, mem(RAX, 0));
+        a_.jcc(CNE, fail);
+        a_.movImm(tmp, reinterpret_cast<std::uint64_t>(rec));
+        a_.mov(tmp, mem(tmp, std::int32_t(offsetof(HoleRec, cell))));
+        a_.cmpI32(mem(tmp, kValidityValid), 0);
+        a_.jcc(CE, fail);
+        a_.cmpI32(mem(tmp, std::int32_t(offsetof(ValidityCell, holes))), 1);
+        a_.jcc(CNE, fail);
+        a_.bind(chain);
         if (ap->cls() == ObjClass::Array) {
             a_.movImm(tmp, reinterpret_cast<std::uint64_t>(ap));
             a_.cmpI32(mem(tmp, kArrayLength), 0);
@@ -5608,7 +5625,7 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     // A hole, or past the end, of a plain array whose prototypes have no elements: undefined.
     a_.bind(holeRead);
     a_.mov(RAX, R(in.b));
-    if (plainHoleGuard(RDX, bad)) {
+    if (plainHoleGuard(RDX, bad, i)) {
         a_.movImm(RAX, kUndefined);
         deliver(i, in.a);
         a_.jmp(done);
@@ -5780,7 +5797,7 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     // can intercept the store.
     a_.bind(hole);
     {
-        if (!plainHoleGuard(RDI, bad)) {
+        if (!plainHoleGuard(RDI, bad, i)) {
             a_.jmp(bad);
         } else {
             noteElem(i, elemprof::kArray, RSI);
@@ -6417,6 +6434,12 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RCX, mem(RCX, -16));
         a_.cmpI(mem(RCX, kRareBoundTarget), std::int32_t(kUndefined));
         a_.jcc(CNE, notNative);
+        if (vm_.functionCallNative && argc > 0) {
+            // `f.call(that, ...)`: the long way calls `f` itself, as a call of this code (`unwrapCall`).
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.functionCallNative));
+            a_.cmp(RDX, mem(RCX, kRareNative));
+            a_.jcc(CE, notNative);
+        }
         a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
         a_.mov(mem(R13, kFramePc), RDI);
         a_.lea(RDI, R(code_->nregs));

@@ -45,6 +45,15 @@ struct ValidityCell
     std::uint32_t holes = 0;  ///< of a prototype chain (`VM::plainHoles`): 1 no element can be met on it, 2 perhaps one
 };
 
+/// An element site's array shape whose prototypes have no element, other than a plain array's (`CodeBlock::holeRecs`), with
+/// the validity cell that says so, of which it holds a count.
+struct HoleRec
+{
+    std::uint32_t shape = 0;
+    std::uint32_t pad = 0;
+    ValidityCell* cell = nullptr;
+};
+
 /// An entry of the megamorphic read cache (`VM::megaRead`): objects of shape `shape` read `key` from slot `index` of
 /// themselves, or (`holder`) of a prototype while `validity` holds. Holds a count of `key` and of `validity`.
 struct MegaEntry
@@ -309,6 +318,10 @@ struct VM : EngineRuntime
     /// cannot be intercepted: neither `Array.prototype` nor `Object.prototype` has a property named by an index. Null when
     /// one has. `Array.prototype`'s own elements do not move the cell: the caller also checks that its length is 0.
     ValidityCell* holeStoreCell();
+    /// The record of element site `index` of `code` (`CodeBlock::holeRecs`), made on first need.
+    HoleRec* holeRecAt(CodeBlock* code, std::uint32_t index);
+    /// After `plainHoles(a)` held at element site `index` of `code`: the site's record names `a`'s shape and its cell.
+    void noteHoleShape(CodeBlock* code, std::uint32_t index, JSArray* a);
     /// `holeStoreCell` and an `Array.prototype` with no elements: whether a hole store into a plain array is plain now.
     bool plainHoleStores();
     /// Whether a hole of `a`, or an index past its end, is met by nothing: no index among its own names, no element and no

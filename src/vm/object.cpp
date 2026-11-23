@@ -200,6 +200,11 @@ void VM::releaseCode(CodeBlock* code) noexcept
     for (const SuperCache& s : code->superCaches)
         if (s.validity)
             releaseValidity(s.validity);
+    for (HoleRec* h : code->holeRecs) {
+        if (h && h->cell)
+            releaseValidity(h->cell);
+        delete h;
+    }
     for (CodeBlock* child : code->children)
         releaseCode(child);
     for (const InlineSite& s : code->inlineSites)

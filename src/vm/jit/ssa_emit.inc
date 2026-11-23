@@ -2985,6 +2985,29 @@ void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
     exitAt_ = -1;
     Label& failed = ssaExit(i);  // the runtime could not make it: the instruction runs again in the interpreter
     exitAt_ = -1;
+    // A few elements: the array made here, its holes in its own cell (`JSArray::small`); else the runtime's way.
+    Label made, viaRuntime;
+    bool inPlace = false;
+    if (!table) {
+        if (in.c == 1) {
+            loadI32(name_[in.b + 2u], RSI, &failed);  // (checked above: never taken)
+            a_.aluI32(7, RSI, std::int32_t(JSArray::kSmall));
+            a_.jcc(CA, viaRuntime);
+        }
+        inPlace = allocArray(viaRuntime);
+        if (inPlace) {
+            a_.movImm(RCX, kHole);
+            for (std::uint32_t k = 0; k < JSArray::kSmall; ++k)
+                a_.mov(mem(RAX, std::int32_t(offsetof(JSArray, small) + 8 * k)), RCX);
+            if (in.c == 1) {
+                loadI32(name_[in.b + 2u], RSI, &failed);
+                a_.mov32(mem(RAX, kArrayLength), RSI);
+            }
+            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
+            a_.jmp(made);
+        }
+        a_.bind(viaRuntime);
+    }
     const std::vector<int> keepRegs = ssaLiveRegs();
     if (table)
         a_.movImm(RSI, f.bits);
@@ -3001,6 +3024,7 @@ void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
     ssaRestoreRegs(keepRegs);
     a_.test(RAX, RAX);
     a_.jcc(CE, failed);
+    a_.bind(made);
     // Into the result's slot, which owns it (a deferred one holds it without a count).
     if (def_) {
         a_.mov(R(in.a), RAX);
@@ -5673,7 +5697,7 @@ bool Baseline::ssaGetElem(std::uint32_t i)
             a_.jmp(join);
             a_.bind(hole);
             loadValue(vb, RAX);
-            if (plainHoleGuard(RDX, cold)) {
+            if (plainHoleGuard(RDX, cold, i)) {
                 a_.movImm(RAX, kUndefined);
                 ssaDef(i, 0);
             } else {
@@ -5821,7 +5845,7 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
     auto fillHole = [&]() {
         // Below `packed` there is no hole: the index is at or above it.
         a_.bind(hole);
-        if (!plainHoleGuard(RDI, bad)) {
+        if (!plainHoleGuard(RDI, bad, i)) {
             a_.jmp(bad);
             return;
         }

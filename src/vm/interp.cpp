@@ -921,7 +921,7 @@ void promoteStore(CodeBlock* code, InlineCache& ic, std::uint32_t shape) noexcep
 void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key, CodeBlock* code = nullptr)
 {
     // (The global object's and watched prototypes' writes are the runtime's: `slotWritten`.)
-    if (hasElems(o) || o->cls() == ObjClass::Global || o == vm.global)
+    if (o->cls() == ObjClass::Global || o == vm.global)
         return;
     if (o->isProto())
         if (Rare* r = o->rare(); r && r->watched)
@@ -951,7 +951,7 @@ void learnOwnWrite(VM& vm, InlineCache& ic, JSObject* o, Key key, CodeBlock* cod
 /// added to one of them would change what the store does.
 void learnAdd(VM& vm, InlineCache& ic, JSObject* o, std::uint32_t before, Key key, bool throughChain, CodeBlock* code = nullptr)
 {
-    if (o->h.shape == before || !cacheable(vm, o) || hasElems(o) || o->isProto())
+    if (o->h.shape == before || !cacheable(vm, o) || o->isProto())
         return;
     Shape* now = o->shapeOf(vm);
     Shape* was = vm.shapeById(before);
@@ -4769,6 +4769,7 @@ int jitGetElem(VM& vm, std::uint32_t index)
                 return 1;
             }
             if (plainHoleRead(vm, a)) {
+                vm.noteHoleShape(c.code, index, a);
                 setReg(vm, R[ins->a], JSValue::undefined());
                 return 1;
             }
@@ -4889,6 +4890,7 @@ int jitPutElem(VM& vm, std::uint32_t index)
             return 1;
         }
         if (i < a->length && vm.plainHoles(a)) {
+            vm.noteHoleShape(c.code, index, a);
             retain(R[ins->c]);
             a->elems[i] = R[ins->c];
             a->noteStore(i, R[ins->c]);

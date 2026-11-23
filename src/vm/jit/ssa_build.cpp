@@ -130,7 +130,7 @@ Graph build(const CodeBlock& code)
     const std::uint32_t nregs = code.nregs;
     g.n = n;
     g.nregs = nregs;
-    if (n == 0 || n > 6000 || nregs == 0 || nregs > 600) {
+    if (n == 0 || n > 16000 || nregs == 0 || nregs > 600) {
         g.why = "size";
         return g;
     }

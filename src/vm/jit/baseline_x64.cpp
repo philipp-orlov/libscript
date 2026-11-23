@@ -6554,7 +6554,10 @@ Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
                 std::fprintf(stderr, "== ssa %s\n%s", code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()).c_str() : "anon",
                              dump(*code).c_str());
 #endif
+            // A very large function: every branch long, as its baseline code has them (`compileTier1`).
+            Asm::longBranchDefault() = code->code.size() > 4000;
             Baseline compiler(vm, code);
+            Asm::longBranchDefault() = false;
             compiler.ssaOn_ = ssaTierMode();
             if (Tier2Code* t = compiler.compileSsa(g, code->tier1))
                 return t;

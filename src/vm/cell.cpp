@@ -709,17 +709,37 @@ void VM::collectYoung(bool registers) noexcept
     }
     // Sweep: a marked cell is old now (held by nothing but a frame, it goes into the zero-count table); one not marked is
     // freed. A cell made old before is no longer young. Each site learns how many of its cells lived.
-    Freed freed;
+    // (The sums in locals: in a `Freed` on the stack, each cell's store and the next cell's load of it are one chain.)
+    std::size_t freedBytes = 0, freedCells = 0;
+    // A site's cells are mostly next to each other in the list: counted here, and added to the site's counts when the site
+    // changes (the heap's stores in between would make the compiler load the site's counts again for each cell).
+    std::uint32_t siteId = 0, made = 0, kept = 0;
+    auto judge = [&]() {
+        if (!made)
+            return;
+        AllocSite& site = allocSite(siteId);
+        site.made += made;
+        site.kept += kept;
+        if (site.made >= kSiteWindow) [[unlikely]] {
+            if (site.kept >= site.made - site.made / 8)
+                site.old = 1;  // seven in eight lived: old from now on
+            site.made = site.kept = 0;
+        }
+        made = kept = 0;
+    };
     for (CellPtr* p = youngBase_; p < youngTop_; ++p) {
         const CellPtr c = *p;
         CellHeader* h = headerOf(c);
         const std::uint32_t gc = h->gc;
         if (!(gc & kYoungGc))
             continue;
-        AllocSite& site = allocSite(gc >> kSiteShift);
-        ++site.made;
+        if ((gc >> kSiteShift) != siteId) {
+            judge();
+            siteId = gc >> kSiteShift;
+        }
+        ++made;
         if (gc & kYoungMarked) {
-            ++site.kept;
+            ++kept;
             h->gc = 0;
             if (h->rc == 0)
                 zctPush(c);
@@ -729,15 +749,14 @@ void VM::collectYoung(bool registers) noexcept
                 freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
             const std::size_t bytes = JSObject::bytesFor(h->aux);
             heap.deallocate(c, bytes);
-            freed.bytes += bytes;
-            ++freed.cells;
-        }
-        if (site.made >= kSiteWindow) [[unlikely]] {
-            if (site.kept >= site.made - site.made / 8)
-                site.old = 1;  // seven in eight lived: old from now on
-            site.made = site.kept = 0;
+            freedBytes += bytes;
+            ++freedCells;
         }
     }
+    judge();
+    Freed freed;
+    freed.bytes = freedBytes;
+    freed.cells = freedCells;
     countFreed(freed);
     youngTop_ = youngBase_;
 }

@@ -4537,12 +4537,21 @@ int jitCallSpread(VM& vm, std::uint32_t index)
     return 1;
 }
 
+/// An iteration site that met something other than a plain array: optimized code does it the baseline code's way.
+static void noteNotArray(CodeBlock* code, std::uint32_t index)
+{
+    if (index < code->prof.size())
+        code->prof[index] |= opt::kProfFailed;
+}
+
 int jitIterInit(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     const Ins* ins = c.ins;
     JSValue* R = c.R;
     const JSValue src = R[ins->b];
+    if (!arrayIterationIntact(vm, src))
+        noteNotArray(c.code, index);
     if (!arrayIterationIntact(vm, src) && !isString(src)) {
         // Any other iterable.
         JSValue iterator, next;
@@ -4613,6 +4622,8 @@ int jitIterNext(VM& vm, std::uint32_t index)
     const Ins* ins = c.ins;
     JSValue* R = c.R;
     const std::uint32_t it = ins->b;
+    if (!R[it + 1].isInt32() || !isArray(R[it]))
+        noteNotArray(c.code, index);
     if (!R[it + 1].isInt32()) {
         if (!isFunction(R[it + 1])) {
             copyReg(vm, R[ins->a], ins->c ? JSValue::undefined() : JSValue::hole());
@@ -4670,7 +4681,10 @@ int jitIterNext(VM& vm, std::uint32_t index)
 int jitIterClose(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
-    return isFunction(c.R[c.ins->a + 1]) ? 2 : 1;
+    if (!isFunction(c.R[c.ins->a + 1]))
+        return 1;
+    noteNotArray(c.code, index);
+    return 2;
 }
 
 bool jitUnwrapCall(VM& vm, JSValue* R, std::uint32_t* base, std::uint32_t* argc) noexcept

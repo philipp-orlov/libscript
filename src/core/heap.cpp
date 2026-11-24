@@ -90,6 +90,16 @@ void destroyUnreferenced(GCObject* cell) noexcept
     if (rt->deferredVm && rt->deferredVm->deferOld(cell))
         return;
 #endif
+    // A string with its characters in its cell, in no table: nothing to let go of and no destructor that does anything.
+    // What programs make by the million (a key, a joined label) goes back to the heap here.
+    if (cell->kind == CellKind::String && cell->cellBytes) {
+        auto* text = static_cast<internal::StringCell*>(cell);
+        if (!text->interned && !(text->bits & internal::StringCell::kOutOfLine)) {
+            rt->unlink(cell);
+            rt->heap.deallocate(cell, cell->cellBytes);
+            return;
+        }
+    }
     if (rt->destroying) {
         rt->unlink(cell);
         cell->pendingNext = rt->pendingFree;
@@ -656,12 +666,25 @@ void ContextImpl::sweepStrings()
 
 StringCell* ContextImpl::newString(StringView text)
 {
-    return newCellSized<StringCell>(text.size() * sizeof(Char), text);
+    return newString(text, StringView());
 }
 
 StringCell* ContextImpl::newString(StringView head, StringView tail)
 {
-    return newCellSized<StringCell>((head.size() + tail.size()) * sizeof(Char), head, tail);
+    // `newCellSized` and `link` without the virtual call: a new string weighs what its cell does.
+    maybeCollect();
+    const std::size_t bytes = sizeof(StringCell) + (head.size() + tail.size()) * sizeof(Char);
+    reserve(bytes);
+    auto* cell = new (heap.allocate(bytes)) StringCell(head, tail);
+    cell->cellBytes = std::uint32_t(bytes);
+    cell->rt = this;
+    cell->gcBytes = std::uint32_t(bytes);
+    heapBytes += bytes;
+    totalAllocated += bytes;
+    if (bytes > mem::LocalHeap::kMaxSmall) [[unlikely]]
+        noteLarge(cell);
+    ++liveStrings;
+    return cell;
 }
 
 StringCell* ContextImpl::newStringRoom(StringView head, StringView tail, std::size_t room)

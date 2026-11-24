@@ -68,6 +68,7 @@ inline mem::LocalHeap::Options payloadHeapOptions()
     reserveLowAddressSpace();
     mem::LocalHeap::Options options;
     options.large = &payloadPool();
+    options.hugeAfter = 1;  // huge pages past the first segment: splay -2.6%, earley-boyer -1.7%; a small context stays small
     return options;
 }
 /// A few freed small buffers per size, kept by each thread in front of `payloadPool`: a property table or an element

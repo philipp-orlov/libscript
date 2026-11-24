@@ -208,7 +208,9 @@ StringCell* StringTable::find(StringView text, std::size_t hash) const noexcept
         StringCell* cell = slots_[i];
         if (!cell)
             return nullptr;
-        if (cell->hash_ == hash && cell->text() == text)
+        // Same hash and length: the units compared as bytes (the traits' compare goes one unit at a time).
+        if (cell->hash_ == hash && cell->length == text.size() &&
+            (text.empty() || std::memcmp(cell->text().data(), text.data(), text.size() * sizeof(Char)) == 0))
             return cell;
     }
 }

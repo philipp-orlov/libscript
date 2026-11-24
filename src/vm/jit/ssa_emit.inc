@@ -2142,6 +2142,23 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             a_.jcc(CNE, no);
         } else if (!sure) {
         loadValue(vf, RAX);
+        // The one function of that code (or of the copy it runs now), held by this code so that no other takes its place:
+        // any block that function runs is one of its own, so being that function is enough.
+        Label passed;
+        JSFunction* one = nullptr;
+        if (callee && callee->made == 1 && callee->only && callee->only->code == callee) {
+            one = callee->only;
+        } else if (callee) {
+            CodeBlock* d = vm_.codeByUid(callee->mergedInto);
+            if (d && d->mergedFrom == callee && d->made == 1 && d->only && d->only->code == d)
+                one = d->only;
+        }
+        if (one) {
+            holdValue(toJSValue(one));
+            a_.movImm(RDX, toJSValue(one).bits);
+            a_.cmp(RAX, RDX);
+            a_.jcc(CE, passed);
+        }
         if (!known(vf, kVObj)) {
             a_.test(RAX, R15);
             a_.jcc(CNE, no);
@@ -2168,6 +2185,7 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             a_.cmp(RDX, mem(RCX, kCbUid));
         }
         a_.jcc(CNE, no);
+        a_.bind(passed);
         }
         if ((!callee || !(callee->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) &&
             !known(vt, kVObj)) {

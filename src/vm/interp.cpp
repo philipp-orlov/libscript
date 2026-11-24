@@ -1234,6 +1234,21 @@ struct GenState : NativeState
 
 using bi::iteratorStep;
 
+}  // namespace
+
+const GenLayout& genLayout() noexcept
+{
+    static const GenLayout layout = [] {
+        GenState g;
+        auto at = [&](const void* field) { return std::int32_t(static_cast<const char*>(field) - reinterpret_cast<const char*>(&g)); };
+        return GenLayout{at(&g.count), std::int32_t(sizeof(GenState)), at(&g.pcIndex), at(&g.resumeDst), at(&g.state),
+                         at(&g.delegating), at(&g.raw), at(&g.unboxed), std::uint8_t(GenState::Suspended)};
+    }();
+    return layout;
+}
+
+namespace {
+
 GenState* genStateOf(JSObject* o) noexcept
 {
     Rare* r = o->rare();
@@ -4695,6 +4710,105 @@ int jitIterNext(VM& vm, std::uint32_t index)
         setReg(vm, R[ins->a], out);
     else
         copyReg(vm, R[ins->a], out);
+    return 1;
+}
+
+void* jitGenEnter(VM& vm, std::uint32_t index)
+{
+    // Only a deferred frame: its registers hold no counts, so the values go in and out as they are.
+    if (!vm.deferred)
+        return nullptr;
+    Frame* fr = vm.frameTop - 1;
+    const Ins* ins = fr->code->code.data() + index;
+    const JSValue generator = fr->R[ins->b];
+    if (fr->R[ins->b + 1u] != vm.origGeneratorNext || !isObject(generator) || asObject(generator)->cls() != ObjClass::Generator)
+        return nullptr;
+    // A `yield*`'s step goes on with what its own generator was resumed with, when that was a `next`.
+    const bool delegate = ins->opcode() == Op::DelegateCall;
+    if (delegate && (fr->gen.isUndefined() || fr->R[ins->c + 1u] != JSValue::int32(0)))
+        return nullptr;
+    if (!delegate)
+        noteNotArray(fr->code, index);  // (as `jitIterNext` notes it: optimized code takes this way too)
+    GenState* g = genStateOf(asObject(generator));
+    if (g->state != GenState::Suspended && g->state != GenState::Start)
+        return nullptr;
+    auto* f = static_cast<JSFunction*>(asObject(g->callee));
+    CodeBlock* c = f->code;
+    JSValue* R = fr->R + fr->code->nregs;
+    if (!c->tier1 || vm.ticks <= 1 || vm.frameTop >= vm.frameLimit || R + c->nregs + 8 > vm.stackEnd || nativeStackLow())
+        return nullptr;
+    --vm.ticks;
+    fr->pc = ins + 1;
+    vm.stackTop = R;
+    vm.fillStack(R + c->nregs + 1);
+    // (The caller's register keeps the generator while it runs.)
+    const std::uint16_t* live = c->suspendRegs.data() + c->suspendAt[g->pcIndex] + 1;
+    for (std::uint32_t k = 0; k < g->count; ++k)
+        R[live[k]] = g->regs()[k];
+    if (g->state == GenState::Suspended) {
+        R[g->resumeDst] = delegate ? fr->R[ins->c] : JSValue::undefined();
+        if (g->delegating)
+            R[g->resumeDst + 1] = JSValue::int32(0);  // at a `yield*`: a `next` for the inner iterator
+    }
+    g->state = GenState::Running;
+    *vm.frameTop++ = Frame{c, f, c->code.data() + g->pcIndex, R, 0, 0, 0, false, true, JSValue::undefined(), generator};
+    return c->tier1->addressFor(g->pcIndex);
+}
+
+int jitGenLeave(VM& vm, std::uint32_t index, std::uint64_t bits)
+{
+    Frame* fr = vm.frameTop - 1;
+    const Ins* ins = fr->code->code.data() + index;
+    JSValue* R = fr->R;
+    GenState* g = genStateOf(asObject(R[ins->b]));
+    vm.stackTop = R + fr->code->nregs;
+    const bool finished = g->state == GenState::Running;
+    if (finished) {
+        g->state = GenState::Done;
+        g->clear(vm);
+    }
+    if (ins->opcode() == Op::DelegateCall) {
+        // As `delegateCall`: a value with no result object around it, or the inner iterator's own, or the last.
+        if (!bits)
+            return 0;
+        if (finished) {
+            retain(JSValue::raw(bits));
+            setReg(vm, R[ins->a], bi::iterResult(vm, JSValue::raw(bits), true));
+        } else if (g->raw) {
+            g->raw = false;
+            R[ins->a] = JSValue::raw(bits);
+        } else {
+            genStateOf(asObject(fr->gen))->unboxed = true;
+            R[ins->a] = JSValue::raw(bits);
+        }
+        return 1;
+    }
+    if (!bits) {
+        clearReg(vm, R[ins->b + 1u]);
+        return 0;
+    }
+    if (finished) {
+        clearReg(vm, R[ins->b + 1u]);
+        R[ins->a] = ins->c ? JSValue::undefined() : JSValue::hole();
+        return 1;
+    }
+    if (!g->raw) {
+        R[ins->a] = JSValue::raw(bits);
+        return 1;
+    }
+    // What a `yield*` passes on is the inner iterator's own result object.
+    g->raw = false;
+    Handle res = Handle::retained(JSValue::raw(bits));
+    JSValue value;
+    const int step = bi::iterResultStep(vm, res.get(), &value);
+    if (step <= 0) {
+        clearReg(vm, R[ins->b + 1u]);
+        if (step < 0)
+            return 0;
+        R[ins->a] = ins->c ? JSValue::undefined() : JSValue::hole();
+        return 1;
+    }
+    setReg(vm, R[ins->a], value);
     return 1;
 }
 

@@ -140,6 +140,20 @@ inline constexpr std::uint64_t kStepJump = kUninit;
 std::uint64_t stepInstruction(VM& vm, std::uint32_t index);
 /// The `yield` or `await` at `index` of the top frame, a generator's: the frame is left, and what it yields returned (owned).
 JSValue jitSuspend(VM& vm, std::uint32_t index);
+/// Where compiled code finds the fields of a generator's state, in the generator's cell after its slots: byte offsets in
+/// the state, `regs` that of the kept registers, and the value of `state` for a suspended one.
+struct GenLayout
+{
+    std::int32_t count, regs, pcIndex, resumeDst, state, delegating, raw, unboxed;
+    std::uint8_t suspended;
+};
+const GenLayout& genLayout() noexcept;
+/// `IterNext` at `index` of the top frame along a suspended generator with its own `next`: the generator's frame pushed,
+/// with its registers, and the address of its compiled code to go on at. Null, with nothing done, when it is not such a step.
+void* jitGenEnter(VM& vm, std::uint32_t index);
+/// After `jitGenEnter`: the generator's code came back with `bits` (0 on an exception). The step's result written; 0 on an
+/// exception.
+int jitGenLeave(VM& vm, std::uint32_t index, std::uint64_t bits);
 /// Records in the element profile of instruction `index` (elemprof, and the typed kind) what `base` is.
 void noteElemBase(CodeBlock* code, std::uint32_t index, JSValue base);
 /// What the interpreter does when the call that the instruction at `index` made returned the exception sentinel: look for

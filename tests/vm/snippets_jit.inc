@@ -73,4 +73,9 @@ S("class A { constructor(x) { this.x = x; } } class B extends A { constructor(x,
 S("var s = 0; for (var i = 0; i < 20000; i++) { var m = /a(\\d+)/.exec('xa' + i); s += m[1].length; } String(s)")
 S("class P { #v = 1; #m() { return this.#v + 1; } get #g() { return 5; } static t(o) { return o.#m() + o.#g; } } var s = 0; for (var i = 0; i < 20000; i++) { s += P.t(new P()); } String(s)")
 S("var s = 0; function* g() { yield 1; yield 2; } for (var i = 0; i < 20000; i++) { var [a, b] = g(); s += a + b; var [c, d] = new Set([i, 1]); s += c + d; } String(s)")
+// for-of and yield* entering a generator's compiled code: done, a return value, a throw, a break, an inner array.
+S("function* r(n) { for (let i = 0; i < n; i++) yield i; return 'r'; } function* d(n) { const v = yield* r(n); yield v.length; yield* [5, 6]; } var s = 0; for (var i = 0; i < 3000; i++) for (const x of d(i % 5)) s += x; s")
+S("function* t(n) { for (let i = 0; i < n; i++) { if (i === 3) throw new Error('b' + n); yield i; } } function* d(n) { yield 1; yield* t(n); } var s = 0; for (var i = 0; i < 3000; i++) { try { for (const x of d(i % 6)) s += x; } catch (e) { s += e.message.length * 100; } } s")
+S("var c = 0; function* f() { try { for (let i = 0; ; i++) yield { i }; } finally { c++; } } var s = 0; for (var i = 0; i < 3000; i++) { for (const o of f()) { s += o.i; if (o.i === i % 4) break; } } s + ':' + c")
+S("function* g(a = 2, b = a * 3) { yield a; yield b; } var s = 0; for (var i = 0; i < 3000; i++) { const it = g(i & 1 ? 1 : undefined); for (const x of it) { s += x; break; } for (const x of it) s += x * 10; } s")
 S("var s = 0; for (var i = 0; i < 5000; i++) { try { var [a] = null; } catch (e) { s += 1; } try { var [b] = {}; } catch (e) { s += 2; } } String(s)")

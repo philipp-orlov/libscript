@@ -288,6 +288,21 @@ extern "C" std::uint64_t scriptVmJitSuspend(VM* vm, std::uint32_t index)
     }
 }
 
+extern "C" void* scriptVmJitGenEnter(VM* vm, std::uint32_t index) noexcept
+{
+    return jitGenEnter(*vm, index);
+}
+
+extern "C" std::uint64_t scriptVmJitGenLeave(VM* vm, std::uint32_t index, std::uint64_t bits)
+{
+    try {
+        return std::uint64_t(jitGenLeave(*vm, index, bits));
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
 /// A call made from compiled code came back with the exception sentinel.
 extern "C" std::uint64_t scriptVmJitThrow(VM* vm, std::uint32_t index)
 {
@@ -3138,6 +3153,8 @@ private:
     std::vector<std::uint8_t> paramWritten_;  ///< per parameter register: some instruction writes it
     /// R11 = the frame after the top one (R13): from the address, so that nothing waits on the top's last store.
     void topFrame() { a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame)))); }
+    void genStep(std::uint32_t i, const Ins& in, Label& other, Label& done);
+    void yieldInLine(std::uint32_t i, const Ins& in);
     void call(std::uint32_t i, const Ins& in);
     void getGlobal(std::uint32_t i, const Ins& in);
     void putGlobal(std::uint32_t i, const Ins& in);
@@ -3678,9 +3695,10 @@ void Baseline::emit(std::uint32_t i)
     case Op::IterNext: {
         // Along an array (its state is an index): in line.
         Label& bad = slow(i, &helperThunk<jitIterNext>);
-        Label end, some, done;
+        Label end, some, done, gen;
         a_.mov(RCX, R(in.b + 1u));
-        needInt(RCX, bad);
+        const bool viaGen = def_ && !optimizing();
+        needInt(RCX, viaGen ? gen : bad);
         a_.mov(RSI, R(in.b));
         needObject(RSI, bad);
         a_.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::Array));
@@ -3703,10 +3721,29 @@ void Baseline::emit(std::uint32_t i)
         a_.bind(end);
         a_.movImm(RAX, in.c ? kUndefined : kHole);
         write(in.a, RAX);
+        if (viaGen) {
+            a_.jmp(done);
+            a_.bind(gen);
+            Label notGen;
+            genStep(i, in, notGen, done);
+            a_.bind(notGen);
+            a_.jmp(bad);
+        }
         a_.bind(done);
         return;
     }
-    case Op::DelegateCall: case Op::DelegateCallAsync: helperOrStep(i, &helperThunk<jitDelegateCall>); return;
+    case Op::DelegateCall:
+        if (def_ && !optimizing()) {
+            Label other, done;
+            genStep(i, in, other, done);
+            a_.bind(other);
+            helperOrStep(i, &helperThunk<jitDelegateCall>);
+            a_.bind(done);
+            return;
+        }
+        helperOrStep(i, &helperThunk<jitDelegateCall>);
+        return;
+    case Op::DelegateCallAsync: helperOrStep(i, &helperThunk<jitDelegateCall>); return;
     case Op::DelegateDone: helperOrStep(i, &helperThunk<jitDelegateDone>); return;
     case Op::GetIteratorObj: helperOrStep(i, &helperThunk<jitGetIteratorObj>); return;
     case Op::IterInit: {
@@ -3775,6 +3812,8 @@ void Baseline::emit(std::uint32_t i)
         return;
     }
     case Op::Yield: case Op::Await: case Op::YieldDelegate:
+        if (in.opcode() == Op::Yield)
+            yieldInLine(i, in);
         sideDoor();
         a_.mov(RDI, R12);
         a_.movImm(RSI, i);
@@ -6483,6 +6522,97 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     write(in.a, RAX);
     a_.bind(afterCall);
     restorePool(i);
+}
+
+/// `yield` of a deferred frame, a generator's whose state is in its cell and keeps as many registers as the yield does:
+/// what `suspendFrame` does, here, and the frame left with the value it yields. Anything else goes on to what follows.
+void Baseline::yieldInLine(std::uint32_t i, const Ins& in)
+{
+    if (!def_ || optimizing() || ssa_ || i + 1 >= code_->suspendAt.size())
+        return;
+    const std::uint16_t* live = code_->suspendRegs.data() + code_->suspendAt[i + 1];
+    const std::uint32_t n = *live++;
+    if (n > 24)
+        return;
+    const GenLayout& L = genLayout();
+    Label other;
+    // The state, in rsi: after the generator's slots.
+    const auto state = [&] {
+        a_.mov(RSI, mem(R13, kFrameGen));
+        a_.movzx8(RCX, mem(RSI, kHdrAux));
+        a_.lea(RSI, mem(RSI, RCX, 8, std::int32_t(JSObject::kHeaderBytes)));
+    };
+    a_.mov(RSI, mem(R13, kFrameGen));
+    a_.test(RSI, R15);
+    a_.jcc(CNE, other);
+    a_.testI8(mem(RSI, kHdrFlags), cellflags::kHasRare);
+    a_.jcc(CNE, other);
+    state();
+    a_.cmpI32(mem(RSI, L.count), std::int32_t(n));
+    a_.jcc(CNE, other);
+    for (std::uint32_t k = 0; k < n; ++k) {
+        // A kept register takes its count when it changes (`GenState::suspend`).
+        Label same;
+        const std::int32_t at = L.regs + std::int32_t(8 * k);
+        a_.mov(RAX, R(live[k]));
+        a_.mov(RCX, mem(RSI, at));
+        a_.cmp(RAX, RCX);
+        a_.jcc(CE, same);
+        a_.mov(mem(RSI, at), RAX);
+        retain(RAX);
+        release(RCX);
+        state();
+        a_.bind(same);
+    }
+    a_.movImm(RCX, 0);
+    a_.mov8(mem(RSI, L.delegating), RCX);
+    a_.mov8(mem(RSI, L.raw), RCX);
+    a_.mov8(mem(RSI, L.unboxed), RCX);
+    a_.mov8(mem(R12, vmOffset(&vm_.suspendedOnAwait)), RCX);
+    a_.movImm(RCX, L.suspended);
+    a_.mov8(mem(RSI, L.state), RCX);
+    a_.movImm(RCX, in.a);
+    a_.mov16(mem(RSI, L.resumeDst), RCX);
+    a_.mov32(mem(RSI, L.pcIndex), std::int32_t(i + 1));
+    a_.mov(RAX, R(in.b));
+    a_.mov(mem(R12, kVmFrameTop), R13);
+    a_.jmp(exit_);
+    a_.bind(other);
+}
+
+/// `IterNext` or `DelegateCall` along a generator with its own `next`: its compiled code is entered from here, as a
+/// call's is, and `done` reached with the result written. Another iterator goes to `other`, with nothing done.
+void Baseline::genStep(std::uint32_t i, const Ins& in, Label& other, Label& done)
+{
+    a_.movImm(RAX, vm_.origGeneratorNext.bits);
+    a_.cmp(RAX, R(in.b + 1u));
+    a_.jcc(CNE, other);
+    savePool(i);
+    Label notGen;
+    a_.mov(RDI, R12);
+    a_.movImm(RSI, i);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitGenEnter));
+    a_.callC(RAX);
+    a_.test(RAX, RAX);
+    a_.jcc(CE, notGen);
+    a_.mov(RDX, RAX);
+    topFrame();
+    a_.mov(RSI, R11);
+    a_.mov(RDI, mem(R11, kFrameR));
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(stubs().osrEnter));
+    a_.callReg(RAX);
+    a_.mov(RDX, RAX);
+    a_.mov(RDI, R12);
+    a_.movImm(RSI, i);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitGenLeave));
+    a_.callC(RAX);
+    a_.test(RAX, RAX);
+    a_.jcc(CE, exception(i));
+    restorePool(i);
+    a_.jmp(done);
+    a_.bind(notGen);
+    restorePool(i);
+    a_.jmp(other);
 }
 
 /// `ret` of a deferred frame: the result goes back as the frame holds it, without a count (`enterTier1` takes one for C++),

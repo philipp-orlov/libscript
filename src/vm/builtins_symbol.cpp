@@ -67,12 +67,16 @@ int iteratorStep(VM& vm, JSValue iterator, JSValue next, JSValue* out)
     }
     if (res.isException())
         return -1;
+    Handle keep = Handle::adopt(res);
+    return iterResultStep(vm, res, out);
+}
+
+int iterResultStep(VM& vm, JSValue res, JSValue* out)
+{
     if (!isObject(res)) {
         vm.throwError(ErrorCode::TypeError, "Iterator result " + describe(vm, res) + " is not an object");
-        release(res);
         return -1;
     }
-    Handle keep = Handle::adopt(res);
     JSValue d = getProperty(vm, res, vm.atoms.done);
     if (d.isException())
         return -1;

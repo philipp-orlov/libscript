@@ -156,6 +156,8 @@ JSValue iterResult(VM& vm, JSValue value, bool done);
 void installSymbolAndIterators(VM& vm);
 /// The next value of an iterator through its `next`: 1 with `*out` owned, 0 when it is done, -1 on an exception.
 int iteratorStep(VM& vm, JSValue iterator, JSValue next, JSValue* out);
+/// `iteratorStep` for the result object `res` that `next` gave (not owned): its `done` and `value`.
+int iterResultStep(VM& vm, JSValue res, JSValue* out);
 /// `src[Symbol.iterator]()` and its `next`, both owned; false with an exception pending when `src` is not iterable.
 bool getIterator(VM& vm, JSValue src, Handle* iterator, Handle* next);
 /// Run `fn(value)` over what `src` iterates (a value, owned by the caller of `fn` for the call): return true to go on,

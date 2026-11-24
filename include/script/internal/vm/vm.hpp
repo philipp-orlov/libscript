@@ -404,8 +404,20 @@ struct VM : EngineRuntime
     JSValue* stackInit = nullptr;
     void fillStack(JSValue* upTo) noexcept
     {
-        for (; stackInit < upTo; ++stackInit)
-            *stackInit = JSValue::undefined();
+        // Four at a time, which the compiler stores in pairs.
+        JSValue* p = stackInit;
+        if (p >= upTo)
+            return;
+        const std::uint64_t undefined = JSValue::undefined().bits;
+        for (; p + 4 <= upTo; p += 4) {
+            p[0].bits = undefined;
+            p[1].bits = undefined;
+            p[2].bits = undefined;
+            p[3].bits = undefined;
+        }
+        for (; p < upTo; ++p)
+            p->bits = undefined;
+        stackInit = upTo;
     }
     /// `callee(this, ...args)`. An owned result, or the exception sentinel with `exception` set. Runs script or native
     /// code; may be called from native code that script called.

@@ -1461,6 +1461,14 @@ void VM::releaseRoots() noexcept
         detail::decRef(s.key);
     }
     regexpSlots.clear();
+    for (JoinSeen& entry : joinsSeen) {
+        if (entry.joined) {  // (only then are the counts held)
+            detail::decRef(entry.head);
+            detail::decRef(entry.tail);
+            detail::decRef(entry.joined);
+        }
+        entry = JoinSeen{};
+    }
     for (ForInNames& entry : forInNames) {
         for (Key k : entry.names)
             release(JSValue::cell(k));

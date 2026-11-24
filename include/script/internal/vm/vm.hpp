@@ -646,6 +646,18 @@ struct VM : EngineRuntime
     };
     static constexpr std::size_t kForInNames = 16;
     ForInNames forInNames[kForInNames];
+    /// Short joins of two interned strings and the atom they make (`concatStrings`): a name built as `"visit" + name`
+    /// each time is found here, not made and then looked up. A pair met once is noted without `joined` (and no count:
+    /// a pair noted by mistake only makes a join an atom); met again, the join is made an atom, and the entry holds a
+    /// count of all three.
+    struct JoinSeen
+    {
+        StringCell* head = nullptr;
+        StringCell* tail = nullptr;
+        StringCell* joined = nullptr;
+    };
+    static constexpr std::size_t kJoinsSeen = 256;
+    JoinSeen joinsSeen[kJoinsSeen];
     std::size_t jsonRoom = 0;  ///< how many characters the next JSON.stringify starts with room for
     /// A regular expression literal's compiled program, by the string constants of its pattern and flags (each entry holds
     /// a count of both): a literal in a loop makes a RegExp each time round with no parse of its flags and no lookup by text.

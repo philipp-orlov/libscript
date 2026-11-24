@@ -116,8 +116,36 @@ JSValue concatStrings(VM& vm, JSValue a, JSValue b)
     StringCell* x = asString(a);
     StringCell* y = asString(b);
     const std::size_t total = std::size_t(x->length) + y->length;
-    if (total <= ContextImpl::kInternedLength && x->length && y->length)
+    if (total <= ContextImpl::kInternedLength && x->length && y->length) {
+        if (x->interned && y->interned && !vm.tearingDown) {
+            // Two atoms: most often a name made the same way again and again. The join is kept as an atom too.
+            VM::JoinSeen& seen =
+                vm.joinsSeen[((reinterpret_cast<std::uintptr_t>(x) >> 4) * 31 + (reinterpret_cast<std::uintptr_t>(y) >> 4)) %
+                             VM::kJoinsSeen];
+            if (seen.head == x && seen.tail == y && seen.joined) {
+                const JSValue joined = JSValue::cell(seen.joined);
+                retain(joined);
+                return joined;
+            }
+            if (seen.head != x || seen.tail != y) {
+                // Met once: noted, and made as any other join (which may yet be appended to in place).
+                if (seen.joined) {
+                    detail::decRef(seen.head);
+                    detail::decRef(seen.tail);
+                    detail::decRef(seen.joined);
+                }
+                seen = VM::JoinSeen{x, y, nullptr};
+                return fromValue(vm, vm.ctx.fresh(x->text(), y->text()));
+            }
+            const JSValue joined = fromValue(vm, vm.ctx.concat(x->text(), y->text()));  // interned, being short
+            seen.joined = asString(joined);
+            detail::incRef(x);
+            detail::incRef(y);
+            detail::incRef(seen.joined);
+            return joined;
+        }
         return fromValue(vm, vm.ctx.fresh(x->text(), y->text()));  // not interned: what is made is rarely asked for again
+    }
     return fromValue(vm, vm.ctx.concat(x, y));
 }
 

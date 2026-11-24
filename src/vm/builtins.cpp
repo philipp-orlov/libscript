@@ -431,41 +431,36 @@ NATIVE(objectCreate)
 /// A property descriptor object, read the way ToPropertyDescriptor does: in order, noting which fields are there.
 bool readPropDesc(VM& vm, JSObject* d, PropDesc* out)
 {
-    auto field = [&](const char* name, bool* has, Handle* keep) -> bool {
-        JSValue v = JSValue::undefined();
-        Key key = vm.internKey(std::string_view(name));
+    auto field = [&](Key key, bool* has, Handle* keep) -> bool {
         const bool present = hasProperty(vm, toJSValue(d), key);
         if (present) {
-            v = getProperty(vm, toJSValue(d), key);
-            if (v.isException()) {
-                detail::decRef(key);
+            const JSValue v = getProperty(vm, toJSValue(d), key);
+            if (v.isException())
                 return false;
-            }
             *keep = Handle::adopt(v);
         }
-        detail::decRef(key);
         *has = present;
         return true;
     };
     Handle flag;
-    if (!field("enumerable", &out->hasEnumerable, &flag))
+    if (!field(vm.atoms.enumerable, &out->hasEnumerable, &flag))
         return false;
     out->enumerable = out->hasEnumerable && toBoolean(flag.get());
     flag = Handle();
-    if (!field("configurable", &out->hasConfigurable, &flag))
+    if (!field(vm.atoms.configurable, &out->hasConfigurable, &flag))
         return false;
     out->configurable = out->hasConfigurable && toBoolean(flag.get());
     flag = Handle();
-    if (!field("value", &out->hasValue, &out->value) || !field("writable", &out->hasWritable, &flag))
+    if (!field(vm.atoms.value, &out->hasValue, &out->value) || !field(vm.atoms.writable, &out->hasWritable, &flag))
         return false;
     out->writable = out->hasWritable && toBoolean(flag.get());
-    if (!field("get", &out->hasGet, &out->get))
+    if (!field(vm.atoms.get, &out->hasGet, &out->get))
         return false;
     if (out->hasGet && !out->get.get().isUndefined() && !isFunction(out->get.get())) {
         typeError(vm, "Getter must be a function: " + describe(vm, out->get.get()));
         return false;
     }
-    if (!field("set", &out->hasSet, &out->set))
+    if (!field(vm.atoms.set, &out->hasSet, &out->set))
         return false;
     if (out->hasSet && !out->set.get().isUndefined() && !isFunction(out->set.get())) {
         typeError(vm, "Setter must be a function: " + describe(vm, out->set.get()));

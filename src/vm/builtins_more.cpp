@@ -172,21 +172,19 @@ JSValue descriptorObjectOf(VM& vm, JSObject* o, Key key)
         return JSValue::undefined();
     JSObject* r = vm.newObject(vm.protos.object);
     Handle keep = Handle::adopt(toJSValue(r));
-    auto put = [&](const char* name, JSValue v) {
-        Key k = vm.internKey(std::string_view(name));
+    auto put = [&](Key k, JSValue v) {
         retain(v);
         r->putOwn(vm, k, v, attr::kDefault);
-        detail::decRef(k);
     };
     if (d.accessor) {
-        put("get", d.getter.get());
-        put("set", d.setter.get());
+        put(vm.atoms.get, d.getter.get());
+        put(vm.atoms.set, d.setter.get());
     } else {
-        put("value", d.value.get());
-        put("writable", JSValue::boolean((d.attrs & attr::kWritable) != 0));
+        put(vm.atoms.value, d.value.get());
+        put(vm.atoms.writable, JSValue::boolean((d.attrs & attr::kWritable) != 0));
     }
-    put("enumerable", JSValue::boolean((d.attrs & attr::kEnumerable) != 0));
-    put("configurable", JSValue::boolean((d.attrs & attr::kConfigurable) != 0));
+    put(vm.atoms.enumerable, JSValue::boolean((d.attrs & attr::kEnumerable) != 0));
+    put(vm.atoms.configurable, JSValue::boolean((d.attrs & attr::kConfigurable) != 0));
     return keep.take();
 }
 

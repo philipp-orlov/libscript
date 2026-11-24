@@ -99,6 +99,10 @@ struct Atoms
     Key exec = nullptr;
     Key add = nullptr;
     Key set = nullptr;
+    Key get = nullptr;
+    Key enumerable = nullptr;
+    Key configurable = nullptr;
+    Key writable = nullptr;
     // The well-known symbols; each holds a count.
     Key symIterator = nullptr;
     Key symAsyncIterator = nullptr;

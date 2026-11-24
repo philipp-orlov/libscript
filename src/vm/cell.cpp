@@ -1444,7 +1444,8 @@ void VM::releaseRoots() noexcept
                    &atoms.symHasInstance, &atoms.symSpecies, &atoms.lastIndex, &atoms.index, &atoms.input,
                    &atoms.groups, &atoms.indices, &atoms.symMatch, &atoms.symMatchAll, &atoms.symReplace, &atoms.symSearch,
                    &atoms.symSplit, &atoms.symIsConcatSpreadable, &atoms.symUnscopables, &atoms.then, &atoms.return_,
-                   &atoms.join, &atoms.flags, &atoms.exec, &atoms.add, &atoms.set}) {
+                   &atoms.join, &atoms.flags, &atoms.exec, &atoms.add, &atoms.set, &atoms.get, &atoms.enumerable,
+                   &atoms.configurable, &atoms.writable}) {
         if (*k)
             detail::decRef(*k);
         *k = nullptr;

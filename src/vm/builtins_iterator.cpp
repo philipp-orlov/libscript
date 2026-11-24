@@ -55,7 +55,7 @@ Helper* helperOf(JSValue v)
 {
     if (isObject(v) && asObject(v)->cls() == ObjClass::Iterator)
         if (Rare* r = asObject(v)->rare(); r && r->ext)
-            return typeid(*r->ext) == typeid(Helper) ? static_cast<Helper*>(r->ext) : nullptr;
+            return &typeid(*r->ext) == &typeid(Helper) ? static_cast<Helper*>(r->ext) : nullptr;
     return nullptr;
 }
 

@@ -19,7 +19,7 @@ ProxyState* proxyOf(JSObject* o) noexcept
     if (o->cls() == ObjClass::Proxy || (o->cls() == ObjClass::Function && (o->h.flags & cellflags::kHasRare))) {
         Rare* r = o->rare();
         if (r && r->ext)
-            return typeid(*r->ext) == typeid(ProxyState) ? static_cast<ProxyState*>(r->ext) : nullptr;
+            return &typeid(*r->ext) == &typeid(ProxyState) ? static_cast<ProxyState*>(r->ext) : nullptr;
     }
     return nullptr;
 }

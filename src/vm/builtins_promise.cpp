@@ -81,12 +81,22 @@ PromiseData* dataOf(JSValue v)
     return nullptr;
 }
 
+/// `rootShapeFor(proto, 3)`, remembered for `Promise.prototype`.
+Shape* promiseRootFor(VM& vm, JSObject* proto)
+{
+    if (proto != vm.protos.promise)
+        return vm.rootShapeFor(proto, 3);
+    if (!vm.promiseRoot)
+        vm.promiseRoot = vm.rootShapeFor(proto, 3);
+    return vm.promiseRoot;
+}
+
 JSValue newPromiseObject(VM& vm, JSObject* proto = nullptr)
 {
     constexpr std::uint8_t aux = 3;
     auto* o = static_cast<JSObject*>(
         vm.allocCell(JSObject::bytesFor(aux) + JSObject::kPromiseStateBytes, Kind::Object, ObjClass::Promise, aux));
-    o->h.shape = vm.rootShapeFor(proto ? proto : vm.protos.promise, aux)->id;
+    o->h.shape = promiseRootFor(vm, proto ? proto : vm.protos.promise)->id;
     o->slots = nullptr;
     ::new (static_cast<void*>(o->embeddedState())) PromiseData();
     return toJSValue(o);
@@ -152,7 +162,7 @@ void settle(VM& vm, JSValue promise, PromiseData::State state, JSValue value)
 bool promisePristine(VM& vm, JSValue p)
 {
     JSObject* proto = vm.protos.promise;
-    if (!dataOf(p) || !proto || asObject(p)->h.shape != vm.rootShapeFor(proto, 3)->id)
+    if (!dataOf(p) || !proto || asObject(p)->h.shape != promiseRootFor(vm, proto)->id)
         return false;
     if (vm.promiseEpoch == vm.globalEpoch)
         return true;

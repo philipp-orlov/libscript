@@ -272,22 +272,27 @@ owns a count of each value in its registers. A deferred frame owns none. These r
 
 1. Only cells, handles and the runtime's own variables hold counts. A count that reaches zero puts the cell in the zero-count
    table (`zctBase_`..`zctTop_`, marked by `gc == kInZct`; strings, symbols and bigints in `zctOld_`, marked by `inZct`).
-2. `scanZct` adds a count for each cell in a live register, frees what is still at zero, and takes the counts away. What falls
-   back to zero returns to the table. Live registers are those of every frame, and those below `stackTop`. The scan writes
-   undefined in the registers above them.
-3. A collection adds those counts for its whole run (`rootsBegin`, `rootsEnd`), and the table is empty while it runs.
-4. A scan starts only in C++: an allocation, a budget, a collection, the return of a call from the host. Compiled code stores
+2. The live registers hold counts through a shadow (`shadow_`): a copy of the registers as the last scan saw them, each cell
+   in it holding one count until the next scan. `scanZct` first brings the shadow up to date (`syncShadow`): a register that
+   changed counts its new cell, and its old cell loses the shadow's count (back to the table at zero). Then it frees what is
+   still at zero. A deep stack that stays costs one compare a register, not a count a cell. Live registers are those of every
+   frame, and those below `stackTop`. The scan writes undefined in the registers above them.
+3. A collection brings the shadow up to date first (`rootsBegin`), and the table is empty while it runs.
+4. A string with `StringCell::kSole` (rule 8) stays out of the shadow: it is counted for the scan only (`transient_`), so that
+   no count stops it being appended to in place. When no frame is left, the shadow lets go of its counts (`scanAtHost`).
+   When the shadow cannot grow, the scan counts the registers and takes the counts away again (`countRoots`).
+5. A scan starts only in C++: an allocation, a budget, a collection, the return of a call from the host. Compiled code stores
    each live cell in a frame slot before it calls C++.
-5. Compiled code owns no counts. It counts what it stores into cells. A value from C++ has lost its count (`handOver`), and
+6. Compiled code owns no counts. It counts what it stores into cells. A value from C++ has lost its count (`handOver`), and
    nothing runs before that value is in a frame slot. A compiled `Ret` returns its result without a count, and `enterTier1`
    takes one for C++.
-6. C++ code that puts an owned value in a register uses `setReg` or `setRegister`. Code that copies a value there uses `copyReg`
+7. C++ code that puts an owned value in a register uses `setReg` or `setRegister`. Code that copies a value there uses `copyReg`
    or `copyRegister`. Code that hands a register to a native covers it with `stackTop`.
-7. A count of 1 does not mean one holder. A string is appended to in place only when it has `StringCell::kSole`: one register
+8. A count of 1 does not mean one holder. A string is appended to in place only when it has `StringCell::kSole`: one register
    holds it, and nothing else. The bytecode compiler emits `Append` for `s += t` and `s = s + t`, where `s` is a local that the
    text gives strings (`appendedNames`). It emits `Unshare`, which clears the bit, before each instruction that copies `s`.
    Any other sum into its own left operand grows a buffer that only slices show (`appendShared`).
-8. A deferred frame sits on whatever the stack holds. The interpreter makes its registers undefined. Compiled code makes undefined
+9. A deferred frame sits on whatever the stack holds. The interpreter makes its registers undefined. Compiled code makes undefined
    those it may read before it writes them (`entryUndefs`). A caller makes undefined the parameters it has no argument for. No
    return and no call clears registers. A stale register never names a cell that is gone: only a scan frees, and it clears what
    is above the frames first. When no frame is left a free is immediate, and `stackInit` goes down to `stackTop`.

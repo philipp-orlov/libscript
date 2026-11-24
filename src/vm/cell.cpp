@@ -812,20 +812,115 @@ void VM::countRoots(int delta) noexcept
             ++detail::cellCount(c);
             continue;
         }
-        if (--detail::cellCount(c) != 0)
-            continue;
-        // Held by a frame only: back in the table. Out of memory, it is left to a collection, as a cell with no count.
-        if (isVmCell(c)) {
-            if (headerOf(c)->gc == 0)
-                zctPush(c);
-        } else if (!c->inZct) {
-            try {
-                zctOld_.push_back(c);
-                c->inZct = 1;
-            } catch (...) {
-            }
+        uncountRoot(c);
+    }
+}
+
+void VM::uncountRoot(detail::GCObject* c) noexcept
+{
+    if (--detail::cellCount(c) != 0)
+        return;
+    // Held by a frame only: back in the table. Out of memory, it is left to a collection, as a cell with no count.
+    if (isVmCell(c)) {
+        if (headerOf(c)->gc == 0)
+            zctPush(c);
+    } else if (!c->inZct) {
+        try {
+            zctOld_.push_back(c);
+            c->inZct = 1;
+        } catch (...) {
         }
     }
+}
+
+bool VM::syncShadow() noexcept
+{
+    JSValue* const hi = liveTop();
+    // As `countRoots`: what is above the live registers goes, and the cost is weighed into the table's next limit.
+    for (JSValue* r = hi; r < stackInit; ++r)
+        *r = JSValue::undefined();
+    scanned_ = std::size_t(stackInit - stackBase);
+    const std::size_t n = std::size_t(hi - stackBase);
+    if (n > shadowCap_) {
+        const std::size_t cap = std::max<std::size_t>({n, 2 * shadowCap_, 256});
+        JSValue* grown;
+        try {
+            grown = static_cast<JSValue*>(allocPayload(cap * sizeof(JSValue)));
+        } catch (...) {
+            dropShadow();
+            return false;
+        }
+        if (shadowLen_)
+            std::memcpy(grown, shadow_, shadowLen_ * sizeof(JSValue));
+        if (shadow_)
+            freePayload(shadow_, shadowCap_ * sizeof(JSValue));
+        shadow_ = grown;
+        shadowCap_ = cap;
+    }
+    // A register that changed counts its new cell first, then lets go of the old one: one that only moved keeps its count.
+    // A string one register alone holds (`kSole`, appended to in place while no count is on it) is counted for this scan
+    // only, and stays out of the shadow, so that the next scan looks at its register again.
+    auto take = [this](JSValue v) noexcept {
+        if (!v.isCell())
+            return v;
+        detail::GCObject* c = v.asCell();
+        ++detail::cellCount(c);
+        if (!isVmCell(c) && c->kind == detail::CellKind::String && (static_cast<StringCell*>(c)->bits & StringCell::kSole)) {
+            try {
+                transient_.push_back(c);
+                return JSValue::undefined();
+            } catch (...) {
+                static_cast<StringCell*>(c)->bits &= std::uint8_t(~StringCell::kSole);  // shadowed: no longer appended in place
+            }
+        }
+        return v;
+    };
+    std::size_t cells = shadowCells_;
+    const std::size_t common = n < shadowLen_ ? n : shadowLen_;
+    for (std::size_t i = 0; i < common; ++i) {
+        const JSValue v = stackBase[i], was = shadow_[i];
+        if (v.bits == was.bits)
+            continue;
+        shadow_[i] = take(v);
+        cells += shadow_[i].isCell();
+        if (was.isCell()) {
+            uncountRoot(was.asCell());
+            --cells;
+        }
+    }
+    for (std::size_t i = common; i < n; ++i) {
+        shadow_[i] = take(stackBase[i]);
+        cells += shadow_[i].isCell();
+    }
+    for (std::size_t i = n; i < shadowLen_; ++i)
+        if (shadow_[i].isCell()) {
+            uncountRoot(shadow_[i].asCell());
+            --cells;
+        }
+    shadowLen_ = n;
+    shadowCells_ = cells;
+    return true;
+}
+
+void VM::dropTransient() noexcept
+{
+    for (detail::GCObject* c : transient_)
+        uncountRoot(c);
+    transient_.clear();
+}
+
+void VM::dropShadow() noexcept
+{
+    const std::size_t n = shadowLen_;
+    shadowLen_ = 0;
+    shadowCells_ = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        if (shadow_[i].isCell()) {
+            if (tearingDown)
+                --detail::cellCount(shadow_[i].asCell());  // the end frees every cell, whatever its count
+            else
+                uncountRoot(shadow_[i].asCell());
+        }
 }
 
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -906,10 +1001,14 @@ void VM::scanZct() noexcept
 {
     if (immediate_ || tearingDown || ctx.tearingDown)
         return;
-    countRoots(1);
+    const bool shadowed = syncShadow();
+    if (!shadowed)
+        countRoots(1);
     collectYoung(false);
     freeZct();
-    countRoots(-1);
+    if (!shadowed)
+        countRoots(-1);
+    dropTransient();
     setZctLimit();
     restoreCellBudget();
 }
@@ -941,7 +1040,8 @@ void VM::zctPush(CellPtr cell) noexcept
 void VM::setZctLimit() noexcept
 {
     largeSinceScan_ = 0;
-    zctLimit_ = std::max<std::size_t>({zctMin_, 2 * zctCount(), scanned_ / 4});
+    // (The cells only frames hold were in the table after a scan before the shadow: their room is still left to them.)
+    zctLimit_ = std::max<std::size_t>({zctMin_, 2 * zctCount() + shadowCells_, scanned_ / 4});
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (!zctMin_)
         zctLimit_ = 0;  // testing: every allocation scans
@@ -1021,11 +1121,13 @@ void VM::rootsBegin() noexcept
         return;
     // The table is empty for the whole collection, which writes the `gc` word of every cell it looks at, and no cell is
     // young.
-    countRoots(1);
+    rootsCounted_ = true;
+    rootsTransient_ = !syncShadow();
+    if (rootsTransient_)
+        countRoots(1);
     collectYoung(false);
     freeZct();
     ++immediate_;
-    rootsCounted_ = true;
 }
 
 void VM::rootsEnd() noexcept
@@ -1034,7 +1136,9 @@ void VM::rootsEnd() noexcept
         return;
     rootsCounted_ = false;
     --immediate_;
-    countRoots(-1);
+    if (rootsTransient_)
+        countRoots(-1);
+    dropTransient();
     setZctLimit();
     restoreCellBudget();
 }
@@ -1266,6 +1370,7 @@ void VM::releaseRoots() noexcept
         v = JSValue::undefined();
     }
     tearingDown = true;
+    dropShadow();
     for (MicroJob& job : jobs) {
         release(job.a);
         release(job.b);

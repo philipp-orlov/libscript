@@ -192,6 +192,8 @@ VM::~VM()
         freePayload(zctBase_, std::size_t(zctCap_ - zctBase_) * sizeof(CellPtr));
     if (youngBase_)
         freePayload(youngBase_, kYoungCells * sizeof(CellPtr));
+    if (shadow_)
+        freePayload(shadow_, shadowCap_ * sizeof(JSValue));
     for (AllocSite* chunk : siteChunks_)
         freePayload(chunk, 1024 * sizeof(AllocSite));
     if (shapeRegionBase_)

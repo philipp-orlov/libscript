@@ -219,6 +219,8 @@ struct VM : EngineRuntime
         // (First of all: with no frame left a free is done at once, and what is above the top may name what it frees.)
         if (stackInit > stackTop)
             stackInit = stackTop;
+        if (shadowLen_)
+            dropShadow();
         if (!zctCount() && youngTop_ == youngBase_)
             return;
         if (runningJobs_ && zctCount() < zctLimit_) {  // (the table at the end of the jobs)
@@ -738,6 +740,21 @@ private:
     std::uint32_t immediate_ = 0;
     /// One count more (`delta` 1) or fewer (-1) for every cell a frame's register holds.
     void countRoots(int delta) noexcept;
+    /// The registers as a scan last counted them: each cell there holds a count of it from then until the next scan, which
+    /// counts only the registers that changed (a deep stack that stays costs a compare a register, not a miss a cell).
+    /// [shadow_, shadow_ + shadowLen_) mirrors [stackBase, ...).
+    JSValue* shadow_ = nullptr;
+    std::size_t shadowLen_ = 0, shadowCap_ = 0, shadowCells_ = 0;
+    /// Count the registers through the shadow; false, with the shadow empty, when it could not grow (count them with
+    /// `countRoots` then).
+    bool syncShadow() noexcept;
+    /// The shadow lets go of its counts (no frame is left, or the context ends).
+    void dropShadow() noexcept;
+    /// A count of a frame's cell fewer: at zero, back into the table.
+    void uncountRoot(detail::GCObject* c) noexcept;
+    /// Cells a scan counted outside the shadow, for the scan only.
+    Vec<detail::GCObject*> transient_;
+    void dropTransient() noexcept;
     void noteZct() noexcept;
     void noteLarge(std::size_t bytes) noexcept;
     static constexpr std::size_t kLargeCell = std::size_t(32) << 10, kLargeScan = std::size_t(2) << 20;
@@ -745,6 +762,7 @@ private:
     void auditCounts() noexcept;
     void freeZct() noexcept;
     bool rootsCounted_ = false;
+    bool rootsTransient_ = false;  ///< the collection counted the registers with `countRoots`
     bool parking_ = false;
     bool runningJobs_ = false;
     std::size_t scanned_ = 0;  ///< registers the last scan went over

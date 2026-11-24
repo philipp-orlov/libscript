@@ -55,6 +55,22 @@ TEST(cyclesAreReclaimedByTheCollector)
     CHECK(collected.gcFreed >= 500);
 }
 
+TEST(deepFramesKeepWhatTheyHoldAcrossScans)
+{
+    // Scans count only the registers that changed since the last one; what a deep frame holds keeps its count in between,
+    // a register it overwrites after a return lets go of the old cell, and all of it goes once no frame is left.
+    js::Context ctx;
+    ctx.eval("0");
+    const auto base = ctx.stats().liveObjects;
+    CHECK_EQ(ctx.eval("function churn(n) { let g = null; for (let i = 0; i < n; i++) g = { i, next: g ? g.i : 0 }; return g.i; }"
+                      "function deep(d) { let mine = { d, tag: 'd' + d }; if (d === 0) return churn(20000);"
+                      " let r = deep(d - 1); churn(50); const before = mine.d; mine = { d: d * 2 }; r += churn(50);"
+                      " return r + before + mine.d; }"
+                      "let total = 0; for (let k = 0; k < 5; k++) total += deep(300); total").toDouble(),
+             5.0 * (19999.0 + 300.0 * 49.0 + 3.0 * (300.0 * 301.0 / 2.0)));
+    CHECK(ctx.stats().liveObjects < base + 200);
+}
+
 TEST(closureCyclesAreReclaimed)
 {
     js::Context ctx;

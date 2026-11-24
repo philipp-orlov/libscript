@@ -1449,6 +1449,7 @@ NATIVE(arraySortImpl)
     retain(self);
     Handle keep = Handle::adopt(self);
     Vec<JSValue> items;
+    items.reserve(a->length);
     std::uint32_t undefinedCount = 0, holes = 0;
     for (std::uint32_t i = 0; i < a->length; ++i) {
         const JSValue e = a->elems[i];
@@ -1463,16 +1464,19 @@ NATIVE(arraySortImpl)
     }
     bool failed = false;
     std::vector<JSValue> keys;  // the strings of a default sort
+    const VM::RepeatedCall comparator = vm.prepareCall(compare, JSValue::undefined());
     auto less = [&](JSValue x, JSValue y) -> bool {
         if (failed)
             return false;
         if (!compare.isUndefined()) {
             JSValue pair[2] = {x, y};
-            JSValue r = vm.call(compare, JSValue::undefined(), pair, 2);
+            JSValue r = vm.callRepeated(comparator, pair, 2);
             if (r.isException()) {
                 failed = true;
                 return false;
             }
+            if (r.isInt32())
+                return r.asInt32() < 0;
             double d;
             const bool ok = toNumber(vm, r, &d);
             release(r);
@@ -2067,6 +2071,7 @@ JSValue stringReplaceText(VM& vm, const Handle& s, JSValue pat, JSValue replacem
     StringView text = asString(s.get())->text(), sub = asString(pat)->text();
     String out;
     std::size_t from = 0;
+    const VM::RepeatedCall call = vm.prepareCall(replacement, JSValue::undefined());
     for (;;) {
         const std::size_t at = text.find(sub, from);
         if (at == StringView::npos)
@@ -2074,7 +2079,7 @@ JSValue stringReplaceText(VM& vm, const Handle& s, JSValue pat, JSValue replacem
         out += text.substr(from, at - from);
         if (isFunction(replacement)) {
             JSValue callArgs[3] = {pat, JSValue::int32(std::int32_t(at)), s.get()};
-            JSValue r = vm.call(replacement, JSValue::undefined(), callArgs, 3);
+            JSValue r = vm.callRepeated(call, callArgs, 3);
             if (r.isException())
                 return r;
             JSValue rs = toStringValue(vm, r);

@@ -252,6 +252,7 @@ NATIVE(arrayIterate)
     JSArray* const source = isArray(o.get()) && asObject(o.get())->cls() == ObjClass::Array
                                 ? static_cast<JSArray*>(asObject(o.get()))
                                 : nullptr;
+    const VM::RepeatedCall call_ = vm.prepareCall(callback, thisArg);
     for (double n = 0; n < len; ++n) {
         const double i = backwards ? len - 1 - n : n;
         Handle e;
@@ -267,7 +268,7 @@ NATIVE(arrayIterate)
         }
         const JSValue index = i < 2147483648.0 ? JSValue::int32(std::int32_t(i)) : JSValue::boxNumber(i);
         JSValue call[3] = {e.get(), index, o.get()};
-        JSValue r = vm.call(callback, thisArg, call, 3);
+        JSValue r = vm.callRepeated(call_, call, 3);
         if (r.isException())
             return r;
         Handle result = Handle::adopt(r);
@@ -341,6 +342,7 @@ NATIVE(arrayReduce)
         if (!found)
             return typeError(vm, "Reduce of empty array with no initial value");
     }
+    const VM::RepeatedCall call_ = vm.prepareCall(callback, JSValue::undefined());
     for (; n < len; ++n) {
         const double i = right ? len - 1 - n : n;
         Handle e;
@@ -350,7 +352,7 @@ NATIVE(arrayReduce)
         if (!found)
             continue;
         JSValue call[4] = {acc.get(), e.get(), JSValue::boxNumber(i), o.get()};
-        JSValue r = vm.call(callback, JSValue::undefined(), call, 4);
+        JSValue r = vm.callRepeated(call_, call, 4);
         if (r.isException())
             return r;
         acc = Handle::adopt(r);

@@ -1135,6 +1135,7 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
         noteLegacyMatch(vm, d, textValue, found.back());
     String out;
     std::size_t copied = 0;
+    const VM::RepeatedCall call = vm.prepareCall(functional ? replacement : JSValue::undefined(), JSValue::undefined());
     for (const Match& m : found) {
         const std::size_t ms = std::size_t(m.start()), me = std::size_t(m.end());
         if (ms < copied)
@@ -1151,7 +1152,7 @@ JSValue fastReplace(VM& vm, JSValue self, RegExpData* d, JSValue textValue, JSVa
             std::vector<JSValue> raw;
             for (const Handle& h : callArgs)
                 raw.push_back(h.get());
-            JSValue r = vm.call(replacement, JSValue::undefined(), raw.data(), std::uint32_t(raw.size()));
+            JSValue r = vm.callRepeated(call, raw.data(), std::uint32_t(raw.size()));
             if (r.isException())
                 return r;
             JSValue rs = toStringValue(vm, r);

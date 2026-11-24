@@ -5222,6 +5222,54 @@ JSValue VM::call(JSValue callee, JSValue thisValue, const JSValue* args, std::ui
     return callInternal(callee, thisValue, args, argc, false);
 }
 
+VM::RepeatedCall VM::prepareCall(JSValue callee, JSValue thisValue)
+{
+    RepeatedCall rc;
+    rc.callee = callee;
+    rc.self = thisValue;
+    // The native stack and the frames stay where they are now for every call.
+    if (!isFunction(callee) || nativeStackLow() || frameTop >= frameLimit)
+        return rc;
+    auto* f = static_cast<JSFunction*>(asObject(callee));
+    if ((f->flags & JSFunction::kNative) || !f->code)
+        return rc;
+    rc.fn = f;
+    return rc;
+}
+
+JSValue VM::callRepeated(const RepeatedCall& rc, const JSValue* args, std::uint32_t argc)
+{
+    // What may change between calls: the code compiled or thrown away, and (a stub's, once compiled) its flags.
+    CodeBlock* c = rc.fn ? rc.fn->code : nullptr;
+    if (!c || !c->tier1 || stackTop + c->nregs + 8 > stackEnd ||
+        (c->flags & (CodeBlock::kClassConstructor | CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
+                     CodeBlock::kNeedsArgs))) [[unlikely]]
+        return callInternal(rc.callee, rc.self, args, argc, false);
+    JSValue* R = stackTop;
+    if (R + c->nregs + 1 > stackInit) [[unlikely]]
+        fillStack(R + c->nregs + 1);
+    const std::uint32_t n = argc < c->nparams ? argc : c->nparams;
+    JSValue self = rc.self;
+    if (!(c->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && self.isNullish())
+        self = toJSValue(global);
+    R[0] = self;
+    for (std::uint32_t i = 0; i < n; ++i)
+        R[1 + i] = args[i];
+    for (std::uint32_t i = 0; i <= n; ++i)
+        retainReg(*this, R[i]);
+    const std::uint32_t end = deferred ? 1u + c->nparams : c->nregs;
+    for (std::uint32_t i = 1 + n; i < end; ++i)
+        if (!R[i].isUndefined()) [[unlikely]]
+            clearReg(*this, R[i]);
+    *frameTop++ = Frame{c, rc.fn, nullptr, R, 0, 0, argc, false, true, JSValue::undefined()};
+    const JSValue result = enterTier1(*this, c->tier1, 0);
+    stackTop = R;
+    clearRegs(*this, R, 0, 1 + n);
+    if (deferred && frameTop == frameBase)
+        scanAtHost();
+    return result;
+}
+
 JSValue VM::callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct, JSValue target)
 {
     if (!isFunction(callee))

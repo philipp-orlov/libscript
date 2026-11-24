@@ -426,6 +426,18 @@ struct VM : EngineRuntime
     /// `callee(this, ...args)`. An owned result, or the exception sentinel with `exception` set. Runs script or native
     /// code; may be called from native code that script called.
     JSValue call(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc);
+    /// A callee that native code calls many times in a row (a sort's comparator, a `map` callback): what `callInternal`
+    /// checks of it once, checked once. `fn` is set for a function of script; each call then takes the short way while its
+    /// code is compiled and an ordinary function's, and is a `call` otherwise.
+    struct RepeatedCall
+    {
+        JSValue callee = JSValue::undefined();
+        JSValue self = JSValue::undefined();
+        JSFunction* fn = nullptr;
+    };
+    RepeatedCall prepareCall(JSValue callee, JSValue thisValue);
+    /// One call of what `prepareCall` set up, from the same native frame.
+    JSValue callRepeated(const RepeatedCall& rc, const JSValue* args, std::uint32_t argc);
     JSValue callInternal(JSValue callee, JSValue thisValue, const JSValue* args, std::uint32_t argc, bool construct,
                          JSValue target = JSValue::undefined());
     /// `new callee(...args)`.

@@ -25,6 +25,7 @@
 #include <set>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <exception>
 #include <utility>
 #include <initializer_list>
@@ -7325,6 +7326,9 @@ void releaseTier1(Tier1Code* code, VM* vm) noexcept
     delete code;
 }
 
+/// `stubs()` once made: each entry reads it with no guard of a static to test.
+std::atomic<const Stubs*> stubsMade{nullptr};
+
 JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
 {
     Frame* fr = vm.frameTop - 1;
@@ -7334,7 +7338,12 @@ JSValue enterTier1(VM& vm, Tier1Code* code, std::uint32_t index)
             floor = nativeStackFloorLookup();
         vm.jitStackFloor = floor == 1 ? 0 : floor + kStackReserve;
     }
-    const Stubs& st = stubs();
+    const Stubs* made = stubsMade.load(std::memory_order_acquire);
+    if (!made) [[unlikely]] {
+        made = &stubs();
+        stubsMade.store(made, std::memory_order_release);
+    }
+    const Stubs& st = *made;
     // `new` runs the baseline code: optimized code is made for calls only.
     const std::uint64_t bits = index == 0 ? st.run(&vm, fr, nullptr, fr->construct ? code->ctorEntry : code->entry)
                                           : st.run(&vm, fr, code->addressFor(index), st.osrEnter);

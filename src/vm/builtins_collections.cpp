@@ -506,12 +506,13 @@ NATIVE(tableForEach)
     Handle keep = Handle::retained(self);
     std::uint64_t last = 0;
     std::uint32_t at = ~0u;
+    const VM::RepeatedCall call = vm.prepareCall(callback, arg(args, argc, 1));
     while (const Entry_* e = t->after(last, &at)) {
         last = e->seq;
         Handle key = Handle::retained(e->key);
         Handle value = Handle::retained(k.isMap ? e->value : e->key);
         JSValue callArgs[3] = {value.get(), key.get(), self};
-        JSValue r = vm.call(callback, arg(args, argc, 1), callArgs, 3);
+        JSValue r = vm.callRepeated(call, callArgs, 3);
         if (r.isException())
             return r;
         release(r);

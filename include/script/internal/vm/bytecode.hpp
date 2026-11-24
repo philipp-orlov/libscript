@@ -273,6 +273,7 @@ struct CodeBlock
     {
         std::uint64_t uid[4] = {0, 0, 0, 0};
         std::uint64_t more = 0;
+        std::uint8_t viaCall = 0;  ///< the long way met `f.call(...)` of a script function here (`callPrepare`)
     };
     Vec<CallTargets> callTargets;
     Vec<std::uint32_t> callTargetAt;

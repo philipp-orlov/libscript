@@ -387,6 +387,48 @@ void retireTier2(VM& vm, CodeBlock* code) noexcept
     code->tier2Counter = tier2Backoff(vm, code);
 }
 
+/// The shapes a read site's cache holds (its inline cache and its four more), when all four more are taken; 0 otherwise.
+unsigned fullReadShapes(const CodeBlock& code, std::uint32_t j, std::uint32_t (&out)[5]) noexcept
+{
+    if (code.code[j].opcode() != Op::GetProp || j + 1 >= code.code.size() || code.code[j + 1].opcode() != Op::Cache)
+        return 0;
+    const std::uint16_t id = code.code[j + 1].a;
+    if (id == kNoCache || id >= code.caches.size())
+        return 0;
+    const InlineCache& ic = code.caches[id];
+    if (!ic.pad || ic.pad > code.poly.size() || code.poly[ic.pad - 1].n < 4)
+        return 0;
+    const PolyCache& pc = code.poly[ic.pad - 1];
+    out[0] = ic.shape;
+    for (unsigned k = 0; k < 4; ++k)
+        out[1 + k] = pc.e[k].shape;
+    return 5;
+}
+
+/// A read with a full cache keeps leaving for a shape it has not got: the other reads of the same register with full caches
+/// that share a shape with it read the same objects, and would leave for that shape too, each after its own compile. They are made to fail
+/// now, so that the next compile reads them through the runtime as well.
+void failFullReads(CodeBlock& code, std::uint32_t index, const JSValue* R) noexcept
+{
+    std::uint32_t mine[5], theirs[5];
+    if (!fullReadShapes(code, index, mine) || !isObject(R[code.code[index].b]))
+        return;
+    const std::uint32_t met = asObject(R[code.code[index].b])->h.shape;
+    for (std::uint32_t j = 0; j < code.code.size() && j < code.prof.size(); j = opt::nextOf(code, j)) {
+        if (j == index || code.code[j].b != code.code[index].b || (code.prof[j] & opt::kProfFailed) ||
+            !fullReadShapes(code, j, theirs))
+            continue;
+        bool shares = false, has = false;
+        for (std::uint32_t s : theirs) {
+            has = has || s == met;
+            for (std::uint32_t t : mine)
+                shares = shares || (s != 0 && s == t);
+        }
+        if (shares && !has)
+            code.prof[j] |= opt::kProfFailed;
+    }
+}
+
 /// A guard of optimized code failed at instruction `index` (kind 0: it has not run, kind 1: it has). Records that, so that
 /// the next compile does not guess there, and (kind 0) runs it in the interpreter.
 extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
@@ -477,6 +519,8 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
         // Only while the code is still the function's entry: frames still in code already taken out of use (a loop that
         // keeps running there) do not take it out again, and use up no more tries.
         const bool active = code->tier2 && code->tier1 && code->tier1->entry == code->tier2->entry;
+        if (again && active)
+            failFullReads(*code, index, fr->R);
         if (++code->optExits > 40 || again) {
             if (active)
                 retireTier2(*vm, code);
@@ -795,6 +839,8 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
     bool shifted = false;
     if (ins->opcode() == Op::Call && isFunction(R[base]) && (static_cast<JSFunction*>(asObject(R[base]))->flags & JSFunction::kNative)) {
         shifted = jitUnwrapCall(vm, R, &base, &argc);
+        if (shifted && index < code->callTargetAt.size() && code->callTargetAt[index])
+            code->callTargets[code->callTargetAt[index] - 1].viaCall = 1;
         jitUnwrapBound(vm, R, base);
     }
     const JSValue callee = R[base];
@@ -972,6 +1018,21 @@ extern "C" std::uint64_t scriptVmJitNative(VM* vm, JSFunction* f, JSValue* thisA
         const JSValue res = r->native(*vm, thisAndArgs[0], thisAndArgs + 1, argc, r->nativeData);
         vm->newTarget = saved;
         return handOver(*vm, res.bits);
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
+/// The array a callee with `kNeedsArgs` finds in the register after its parameters (its `arguments`, or its rest
+/// parameter's array), made from the arguments in its frame-to-be: compiled code calls this before it pushes that frame.
+/// 1, or 0 with the exception parked.
+extern "C" std::uint64_t scriptVmJitCaptureArgs(VM* vm, const CodeBlock* c, JSValue* newR, std::uint32_t argc)
+{
+    try {
+        JSArray* a = jitCaptureArguments(*vm, c, newR + 1, argc);
+        setRegister(*vm, newR[1 + c->nparams], toJSValue(a));
+        return 1;
     } catch (...) {
         pendingException = std::current_exception();
         return 0;
@@ -2382,6 +2443,34 @@ private:
         slows_.push_back(Slow{i, Label{}, helper, saved});
         slowNext_.insert(i + length(i));
         return slows_.back().label;
+    }
+    /// In a call sequence, the callee's function in RAX, its code in RCX, its baseline code in RDX and its registers in R9:
+    /// a callee with `kNeedsArgs` goes to `cap`, where `captureArgs` follows.
+    void captureTest(Label& cap, Label& back)
+    {
+        a_.testI32(mem(RCX, kCbFlags), CodeBlock::kNeedsArgs);
+        a_.jcc(CNE, cap);
+        a_.bind(back);
+    }
+    /// Out of the way of the call sequence: the array made (`scriptVmJitCaptureArgs`), then on at `back` with the four
+    /// registers of `captureTest` loaded again.
+    void captureArgs(std::uint32_t i, unsigned base, unsigned argc, Label& exc, Label& back)
+    {
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+        a_.mov(mem(R13, kFramePc), RDI);
+        a_.mov(RDI, R12);
+        a_.mov(RSI, RCX);
+        a_.mov(RDX, R9);
+        a_.movImm(RCX, argc);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitCaptureArgs));
+        a_.callC(RAX);
+        a_.test(RAX, RAX);
+        a_.jcc(CE, exc);
+        a_.mov(RAX, R(base));
+        a_.mov(RCX, mem(RAX, kFnCode));
+        a_.mov(RDX, mem(RCX, kCbTier1));
+        a_.lea(R9, R(base + 1));
+        a_.jmp(back);
     }
     Label& exception(std::uint32_t i)
     {
@@ -6082,109 +6171,147 @@ void Baseline::call(std::uint32_t i, const Ins& in)
     // `super(...)` is such a call too, as a construction: the frame says so, and its `new.target` is this frame's.
     const bool isSuper = in.opcode() == Op::SuperCall;
     const bool fast = (in.opcode() == Op::Call || isSuper) && roomy;
-    if (fast) {
-        // A script function that is compiled, takes at least as many parameters as there are arguments and needs nothing
-        // the interpreter's call sequence does on the side: its frame is pushed here.
-        a_.mov(RAX, R(base));
-        needObject(RAX, helper);
-        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
-        a_.jcc(CNE, helper);
-        a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
-        a_.jcc(CNE, helper);
-        a_.mov(RCX, mem(RAX, kFnCode));
-        if (!isSuper) {
-            if (code_->callProf.empty())
-                code_->callProf.assign(code_->code.size(), 0);
-            if (code_->callTargetAt.empty()) {
-                // One place for each call (made whole now: the code has their addresses).
-                code_->callTargetAt.assign(code_->code.size(), 0);
-                std::uint32_t calls = 0;
-                for (std::uint32_t j = 0; j < n_; j += length(j))
-                    if (code_->code[j].opcode() == Op::Call)
-                        code_->callTargetAt[j] = ++calls;
-                code_->callTargets.resize(calls);
+    // The sequence for a callee in `base` with `argc` arguments; a native callee goes to `isNative`. `note`: the callee is
+    // noted in the site's profile.
+    auto fastCall = [&](unsigned base, unsigned argc, unsigned window, bool note, Label& isNative) {
+            // A script function that is compiled, takes at least as many parameters as there are arguments and needs nothing
+            // the interpreter's call sequence does on the side: its frame is pushed here.
+            a_.mov(RAX, R(base));
+            needObject(RAX, helper);
+            a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+            a_.jcc(CNE, helper);
+            a_.testI32(mem(RAX, kFnFlags), JSFunction::kNative);
+            a_.jcc(CNE, isNative);
+            a_.mov(RCX, mem(RAX, kFnCode));
+            if (note) {
+                if (code_->callProf.empty())
+                    code_->callProf.assign(code_->code.size(), 0);
+                if (code_->callTargetAt.empty()) {
+                    // One place for each call (made whole now: the code has their addresses).
+                    code_->callTargetAt.assign(code_->code.size(), 0);
+                    std::uint32_t calls = 0;
+                    for (std::uint32_t j = 0; j < n_; j += length(j))
+                        if (code_->code[j].opcode() == Op::Call)
+                            code_->callTargetAt[j] = ++calls;
+                    code_->callTargets.resize(calls);
+                }
+                a_.mov(RDI, mem(RCX, kCbUid));
+                a_.movImm(RSI, reinterpret_cast<std::uint64_t>(&code_->callProf[i]));
+                Label same;
+                a_.cmp(RDI, mem(RSI, 0));
+                a_.jcc(CE, same);
+                if (code_->callTargetAt[i]) {
+                    a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&code_->callTargets[code_->callTargetAt[i] - 1]));
+                    a_.movImm(R9, reinterpret_cast<std::uint64_t>(stubs().noteCallee));
+                    a_.callReg(R9);
+                } else {
+                    a_.mov(mem(RSI, 0), RDI);
+                }
+                a_.bind(same);
             }
-            a_.mov(RDI, mem(RCX, kCbUid));
-            a_.movImm(RSI, reinterpret_cast<std::uint64_t>(&code_->callProf[i]));
-            Label same;
-            a_.cmp(RDI, mem(RSI, 0));
-            a_.jcc(CE, same);
-            if (code_->callTargetAt[i]) {
-                a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&code_->callTargets[code_->callTargetAt[i] - 1]));
-                a_.movImm(R9, reinterpret_cast<std::uint64_t>(stubs().noteCallee));
-                a_.callReg(R9);
+            a_.mov(RDX, mem(RCX, kCbTier1));
+            a_.test(RDX, RDX);
+            a_.jcc(CE, helper);
+            // A callee with an `arguments` array or a rest parameter (in a deferred frame) goes out of the way, to the same
+            // checks and then the array made (`captureArgs`): the one flags test covers it.
+            const bool capture = def_ && !isSuper;
+            const std::int32_t refused = (isSuper ? 0 : CodeBlock::kClassConstructor) | CodeBlock::kGenerator | CodeBlock::kAsync |
+                                         CodeBlock::kAsyncGen;
+            Label cap, back;
+            a_.testI32(mem(RCX, kCbFlags), refused | CodeBlock::kNeedsArgs);
+            a_.jcc(CNE, capture ? cap : helper);
+            auto checks = [&] {
+                // (Arguments past the parameters: in a deferred frame they sit in registers the callee's code sees to.)
+                if (!def_) {
+                    a_.movzx16(RSI, mem(RCX, kCbNparams));
+                    a_.aluI32(7, RSI, std::int32_t(argc));
+                    a_.jcc(CB, helper);
+                }
+                a_.mov32(RSI, mem(RCX, kCbNregs));
+                a_.lea(R9, R(base + 1));
+                // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
+                a_.lea(R10, mem(R9, RSI, 8, 8));
+                a_.alu(7, R10, mem(R12, kVmStackInit));
+                a_.jcc(CA, helper);
+                topFrame();
+                a_.alu(7, R11, mem(R12, kVmFrameLimit));
+                a_.jcc(CAE, helper);
+                a_.cmpI32(mem(R12, kVmTicks), 1);
+                a_.jcc(CBE, helper);
+                a_.alu(7, RSP, mem(R12, kVmStackFloor));
+                a_.jcc(CB, helper);
+                // What the frame sits on: caller registers above the arguments hold stale values; the call sequence of the
+                // interpreter lets them go. Plain values are overwritten here; a cell takes the long way.
+                clearWindow(i, base, argc, window, helper);
+                if (!isSuper) {
+                    // A sloppy function called with no `this` gets the global object.
+                    Label thisOk;
+                    a_.testI32(mem(RCX, kCbFlags), CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis);
+                    a_.jcc(CNE, thisOk);
+                    a_.mov(RDI, R(base + 1));
+                    a_.aluI(4, RDI, -9);
+                    a_.cmpI(RDI, std::int32_t(kNull));
+                    a_.jcc(CNE, thisOk);
+                    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
+                    if (!def_)
+                        a_.inc32(mem(RDI, kHdrRc));
+                    a_.mov(R(base + 1), RDI);
+                    a_.bind(thisOk);
+                }
+            };
+            checks();
+            a_.bind(back);
+            a_.dec32(mem(R12, kVmTicks));
+            a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+            a_.mov(mem(R13, kFramePc), RDI);
+            topFrame();
+            a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
+            a_.mov(mem(R12, kVmFrameTop), RDI);
+            a_.mov(mem(R11, kFrameCode), RCX);
+            a_.mov(mem(R11, kFrameFn), RAX);
+            a_.mov(mem(R11, kFramePc), 0);
+            a_.mov(mem(R11, kFrameR), R9);
+            a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
+            a_.mov(mem(R11, kFrameRetDst), RDI);
+            a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(isSuper ? 0x101 : 0x100));
+            if (isSuper) {
+                a_.mov(RDI, mem(R13, kFrameNewTarget));
+                a_.mov(mem(R11, kFrameNewTarget), RDI);
             } else {
-                a_.mov(mem(RSI, 0), RDI);
+                a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
             }
-            a_.bind(same);
+            a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+            a_.mov(RSI, R11);
+            a_.mov(RDI, R9);
+            a_.mov(RDX, mem(RDX, isSuper ? kTierCtor : kTierEntry));
+            a_.jmp(enter);
+            if (capture) {
+                a_.bind(cap);
+                a_.testI32(mem(RCX, kCbFlags), refused);
+                a_.jcc(CNE, helper);
+                checks();
+                captureArgs(i, base, argc, exc, back);
+            }
+    
+    };
+    if (fast) {
+        // `f.call(that, ...)` where the long way has met it (only known when optimized code is made): the same sequence
+        // one register on, for `f` with `that` and the rest.
+        const bool viaCall = !isSuper && code_->tier1 && argc >= 1 && i < code_->callTargetAt.size() && code_->callTargetAt[i] &&
+                             code_->callTargets[code_->callTargetAt[i] - 1].viaCall;
+        const unsigned window2 = window ? window - 1 : 0;
+        const bool roomy2 = window2 <= argc + 6 || (def_ && window2 <= argc + 40);
+        Label shifted;
+        fastCall(base, argc, window, !isSuper, viaCall && roomy2 ? shifted : helper);
+        if (viaCall && roomy2) {
+            a_.bind(shifted);
+            a_.mov(RCX, mem(RAX, kObjSlots));
+            a_.mov(RCX, mem(RCX, -16));
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(vm_.functionCallNative));
+            a_.cmp(RDX, mem(RCX, kRareNative));
+            a_.jcc(CNE, helper);
+            fastCall(base + 1, argc - 1, window2, false, helper);
         }
-        a_.mov(RDX, mem(RCX, kCbTier1));
-        a_.test(RDX, RDX);
-        a_.jcc(CE, helper);
-        a_.testI32(mem(RCX, kCbFlags), (isSuper ? 0 : CodeBlock::kClassConstructor) | CodeBlock::kGenerator | CodeBlock::kAsync |
-                                           CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs);
-        a_.jcc(CNE, helper);
-        // (Arguments past the parameters: in a deferred frame they sit in registers the callee's code sees to.)
-        if (!def_) {
-            a_.movzx16(RSI, mem(RCX, kCbNparams));
-            a_.aluI32(7, RSI, std::int32_t(argc));
-            a_.jcc(CB, helper);
-        }
-        a_.mov32(RSI, mem(RCX, kCbNregs));
-        a_.lea(R9, R(base + 1));
-        // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
-        a_.lea(R10, mem(R9, RSI, 8, 8));
-        a_.alu(7, R10, mem(R12, kVmStackInit));
-        a_.jcc(CA, helper);
-        topFrame();
-        a_.alu(7, R11, mem(R12, kVmFrameLimit));
-        a_.jcc(CAE, helper);
-        a_.cmpI32(mem(R12, kVmTicks), 1);
-        a_.jcc(CBE, helper);
-        a_.alu(7, RSP, mem(R12, kVmStackFloor));
-        a_.jcc(CB, helper);
-        // What the frame sits on: caller registers above the arguments hold stale values; the call sequence of the
-        // interpreter lets them go. Plain values are overwritten here; a cell takes the long way.
-        clearWindow(i, base, argc, window, helper);
-        if (!isSuper) {
-            // A sloppy function called with no `this` gets the global object.
-            Label thisOk;
-            a_.testI32(mem(RCX, kCbFlags), CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis);
-            a_.jcc(CNE, thisOk);
-            a_.mov(RDI, R(base + 1));
-            a_.aluI(4, RDI, -9);
-            a_.cmpI(RDI, std::int32_t(kNull));
-            a_.jcc(CNE, thisOk);
-            a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
-            if (!def_)
-                a_.inc32(mem(RDI, kHdrRc));
-            a_.mov(R(base + 1), RDI);
-            a_.bind(thisOk);
-        }
-        a_.dec32(mem(R12, kVmTicks));
-        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
-        a_.mov(mem(R13, kFramePc), RDI);
-        topFrame();
-        a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
-        a_.mov(mem(R12, kVmFrameTop), RDI);
-        a_.mov(mem(R11, kFrameCode), RCX);
-        a_.mov(mem(R11, kFrameFn), RAX);
-        a_.mov(mem(R11, kFramePc), 0);
-        a_.mov(mem(R11, kFrameR), R9);
-        a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
-        a_.mov(mem(R11, kFrameRetDst), RDI);
-        a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(isSuper ? 0x101 : 0x100));
-        if (isSuper) {
-            a_.mov(RDI, mem(R13, kFrameNewTarget));
-            a_.mov(mem(R11, kFrameNewTarget), RDI);
-        } else {
-            a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
-        }
-        a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
-        a_.mov(RSI, R11);
-        a_.mov(RDI, R9);
-        a_.mov(RDX, mem(RDX, isSuper ? kTierCtor : kTierEntry));
-        a_.jmp(enter);
     }
     if (in.opcode() == Op::New && roomy) {
         // `new f(...)` of an ordinary compiled function: `this` made by a call into the runtime, the frame pushed here.
@@ -6210,7 +6337,7 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.test(RDX, RDX);
         a_.jcc(CE, helper);
         a_.testI32(mem(RCX, kCbFlags), CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen |
-                                           CodeBlock::kNeedsArgs);
+                                           (def_ ? 0 : CodeBlock::kNeedsArgs));
         a_.jcc(CNE, helper);
         // (Arguments past the parameters: in a deferred frame they sit in registers the callee's code sees to.)
         if (!def_) {
@@ -6312,6 +6439,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RCX, mem(RAX, kFnCode));
         a_.mov(RDX, mem(RCX, kCbTier1));
         a_.lea(R9, R(base + 1));
+        Label cap, back;
+        if (def_)
+            captureTest(cap, back);
         a_.dec32(mem(R12, kVmTicks));
         topFrame();
         a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
@@ -6329,6 +6459,8 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.mov(RDI, R9);
         a_.mov(RDX, mem(RDX, kTierCtor));
         a_.jmp(enter);
+        if (def_)
+            { a_.bind(cap); captureArgs(i, base, argc, exc, back); }
     }
     a_.bind(helper);
     if (in.opcode() == Op::Call && argc <= 1) {

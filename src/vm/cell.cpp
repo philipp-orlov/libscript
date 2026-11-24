@@ -424,32 +424,63 @@ inline void VM::destroyFrom(CellPtr cell, Freed& total) noexcept
         CellPtr follow = nullptr;
         CellHeader* const hd = headerOf(next);
         auto* o = reinterpret_cast<JSObject*>(next);
-        if (kindOf(next) == Kind::Object && !(hd->flags & cellflags::kHasRare) && o->cls() == ObjClass::Plain && !o->slots) {
+        // A cell this one alone held: freed next, or after the others (`pending_`).
+        auto drop = [&](CellPtr c) {
+            if (--detail::cellCount(c) != 0)
+                return;
+            if (!isVmCell(c)) {
+                detail::destroyUnreferenced(c);
+            } else if (youngHeader(headerOf(c)) || headerOf(c)->gc == kInZct) {
+                // Freed by the scan: young, or in the table (where it went at zero before, and still is).
+            } else if (!follow) {
+                follow = c;
+            } else {
+                try {
+                    pending_.push_back(c);
+                } catch (...) {
+                    // Out of memory while freeing: the cell stays, as a leak and not a crash.
+                }
+            }
+        };
+        const Kind kind = kindOf(next);
+        if (kind == Kind::Object && !(hd->flags & cellflags::kHasRare) && o->cls() == ObjClass::Plain && !o->slots) {
             const std::uint32_t count = shapeById(hd->shape)->count;
             const std::uint32_t n = count < hd->aux ? count : hd->aux;
             const JSValue* values = o->inl();
-            for (std::uint32_t i = 0; i < n; ++i) {
-                const JSValue v = values[i];
-                if (!v.isCell())
-                    continue;
-                CellPtr c = v.asCell();
-                if (--detail::cellCount(c) != 0)
-                    continue;
-                if (!isVmCell(c)) {
-                    detail::destroyUnreferenced(c);
-                } else if (youngHeader(headerOf(c)) || headerOf(c)->gc == kInZct) {
-                    // Freed by the scan: young, or in the table (where it went at zero before, and still is).
-                } else if (!follow) {
-                    follow = c;
-                } else {
-                    try {
-                        pending_.push_back(c);
-                    } catch (...) {
-                        // Out of memory while freeing: the cell stays, as a leak and not a crash.
-                    }
-                }
-            }
+            for (std::uint32_t i = 0; i < n; ++i)
+                if (values[i].isCell())
+                    drop(values[i].asCell());
             const std::size_t bytes = JSObject::bytesFor(hd->aux);
+            heap.deallocate(next, bytes);
+            total.bytes += bytes;
+            ++total.cells;
+        } else if (kind == Kind::Box) {
+            // A variable a closure shares: its value, the one thing it holds.
+            const JSValue v = reinterpret_cast<Box*>(next)->value;
+            if (v.isCell())
+                drop(v.asCell());
+            const std::size_t bytes = cellBytesOf(next);
+            heap.deallocate(next, bytes);
+            total.bytes += bytes;
+            ++total.cells;
+        } else if (kind == Kind::Object && !(hd->flags & cellflags::kHasRare) && o->cls() == ObjClass::Function) {
+            // A closure: its properties, its variables, its code (as `destroyObjectStorage` lets go of them).
+            auto* f = static_cast<JSFunction*>(o);
+            const std::size_t bytes = cellBytesOf(next);
+            const std::uint32_t n = usedSlots(*this, o);
+            for (std::uint32_t i = 0; i < n; ++i)
+                if (o->slotAt(i)->isCell())
+                    drop(o->slotAt(i)->asCell());
+            for (std::uint32_t i = 0; i < f->nUpvals; ++i)
+                if (Box* b = f->upvals()[i])
+                    drop(reinterpret_cast<CellPtr>(b));
+            if (f->code) {
+                if (f->code->only == f)
+                    f->code->only = nullptr;
+                releaseCode(f->code);
+            }
+            if (o->slots)
+                freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
             heap.deallocate(next, bytes);
             total.bytes += bytes;
             ++total.cells;

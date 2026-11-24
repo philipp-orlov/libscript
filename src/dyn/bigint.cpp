@@ -25,8 +25,11 @@ Env envFor(Runtime& rt)
 
 namespace {
 
-using Digits = Vec<std::uint32_t>;
-constexpr std::size_t kMaxDigits = (std::size_t(1) << 30) / 32;  // a billion bits
+using Limb = BigIntCell::Limb;
+using Wide = unsigned __int128;
+using Digits = Vec<Limb>;
+constexpr int kLimbBits = 64;
+constexpr std::size_t kMaxDigits = (std::size_t(1) << 30) / kLimbBits;  // a billion bits
 
 void trim(Digits& d)
 {
@@ -44,7 +47,7 @@ Value make(Env& rt, bool negative, Digits digits)
     auto* cell = rt.ctx.newCell<BigIntCell>();
     Value handle = detail::Access::adopt(Type::BigInt, cell);
     cell->negative = negative && !digits.empty();
-    rt.ctx.reserve(digits.size() * sizeof(std::uint32_t));
+    rt.ctx.reserve(digits.size() * sizeof(Limb));
     cell->digits = std::move(digits);
     return handle;
 }
@@ -65,13 +68,13 @@ Digits addMagnitude(const Digits& a, const Digits& b)
     const Digits& big = a.size() >= b.size() ? a : b;
     const Digits& small = a.size() >= b.size() ? b : a;
     Digits out(big.size() + 1);
-    std::uint64_t carry = 0;
+    Limb carry = 0;
     for (std::size_t i = 0; i < big.size(); ++i) {
-        const std::uint64_t sum = std::uint64_t(big[i]) + (i < small.size() ? small[i] : 0) + carry;
-        out[i] = std::uint32_t(sum);
-        carry = sum >> 32;
+        const Wide sum = Wide(big[i]) + (i < small.size() ? small[i] : 0) + carry;
+        out[i] = Limb(sum);
+        carry = Limb(sum >> kLimbBits);
     }
-    out[big.size()] = std::uint32_t(carry);
+    out[big.size()] = carry;
     trim(out);
     return out;
 }
@@ -80,11 +83,12 @@ Digits addMagnitude(const Digits& a, const Digits& b)
 Digits subMagnitude(const Digits& a, const Digits& b)
 {
     Digits out(a.size());
-    std::int64_t borrow = 0;
+    Limb borrow = 0;
     for (std::size_t i = 0; i < a.size(); ++i) {
-        const std::int64_t diff = std::int64_t(a[i]) - (i < b.size() ? std::int64_t(b[i]) : 0) - borrow;
-        out[i] = std::uint32_t(diff);
-        borrow = diff < 0 ? 1 : 0;
+        const Limb x = a[i], y = i < b.size() ? b[i] : 0;
+        const Limb diff = x - y;
+        out[i] = diff - borrow;
+        borrow = (x < y) | (diff < borrow);
     }
     trim(out);
     return out;
@@ -98,51 +102,81 @@ Digits mulMagnitude(Env& rt, const Digits& a, const Digits& b)
         tooBig(rt);
     Digits out(a.size() + b.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
-        rt.checkLoop(i, out.size() * sizeof(std::uint32_t));
-        std::uint64_t carry = 0;
+        rt.checkLoop(i, out.size() * sizeof(Limb));
+        Limb carry = 0;
         for (std::size_t j = 0; j < b.size(); ++j) {
-            const std::uint64_t cur = std::uint64_t(a[i]) * b[j] + out[i + j] + carry;
-            out[i + j] = std::uint32_t(cur);
-            carry = cur >> 32;
+            const Wide cur = Wide(a[i]) * b[j] + out[i + j] + carry;
+            out[i + j] = Limb(cur);
+            carry = Limb(cur >> kLimbBits);
         }
-        out[i + b.size()] += std::uint32_t(carry);
+        out[i + b.size()] = carry;
     }
     trim(out);
     return out;
 }
 
-std::uint32_t divSmall(Digits& a, std::uint32_t by)
+/// A divisor with its top bit set, and its reciprocal: floor((2^128 - 1) / d) - 2^64.
+struct Divisor
 {
-    std::uint64_t rem = 0;
-    for (std::size_t i = a.size(); i-- > 0;) {
-        const std::uint64_t cur = (rem << 32) | a[i];
-        a[i] = std::uint32_t(cur / by);
-        rem = cur % by;
+    Limb d, inverse;
+    explicit Divisor(Limb by) noexcept : d(by), inverse(Limb(~Wide(0) / by - (Wide(1) << kLimbBits))) {}
+    /// (`high`, `low`) / d, with `high` below d: two multiplications (Moeller and Granlund, "Improved division by
+    /// invariant integers", algorithm 4).
+    Limb divide(Limb high, Limb low, Limb* rem) const noexcept
+    {
+        const Wide q = Wide(inverse) * high + ((Wide(high + 1) << kLimbBits) | low);
+        Limb q1 = Limb(q >> kLimbBits);
+        const Limb q0 = Limb(q);
+        Limb r = low - q1 * d;
+        if (r > q0) {
+            --q1;
+            r += d;
+        }
+        if (r >= d) {
+            ++q1;
+            r -= d;
+        }
+        *rem = r;
+        return q1;
+    }
+};
+
+Limb divSmall(Digits& a, Limb by)
+{
+    // Divisor and dividend shifted so that the divisor's top bit is set; the quotient is the same.
+    const int shift = __builtin_clzll(by);
+    const Divisor d(by << shift);
+    const std::size_t n = a.size();
+    Limb rem = shift && n ? a[n - 1] >> (kLimbBits - shift) : 0;
+    for (std::size_t i = n; i-- > 0;) {
+        const Limb low = (a[i] << shift) | (shift && i ? a[i - 1] >> (kLimbBits - shift) : 0);
+        a[i] = d.divide(rem, low, &rem);
     }
     trim(a);
-    return std::uint32_t(rem);
+    return rem >> shift;
 }
 
-/// Knuth's algorithm D. `a` becomes the remainder, and what comes back is the quotient.
-Digits divMagnitude(Env& rt, Digits& a, const Digits& b)
+/// Knuth's algorithm D: the quotient comes back, and `rem` is set to the remainder.
+Digits divMagnitude(Env& rt, const Digits& a, const Digits& b, Digits& rem)
 {
-    if (compareMagnitude(a, b) < 0)
+    if (compareMagnitude(a, b) < 0) {
+        rem = a;
         return Digits();
+    }
     if (b.size() == 1) {
         Digits q = a;
-        const std::uint32_t r = divSmall(q, b[0]);
-        a.clear();
+        const Limb r = divSmall(q, b[0]);
         if (r)
-            a.push_back(r);
+            rem.push_back(r);
         return q;
     }
-    const int shift = __builtin_clz(b.back());
+    const int shift = __builtin_clzll(b.back());
     const auto shifted = [shift](const Digits& d, std::size_t extra) {
         Digits out(d.size() + extra);
-        std::uint32_t carry = 0;
+        Limb carry = 0;
         for (std::size_t i = 0; i < d.size(); ++i) {
             out[i] = (d[i] << shift) | carry;
-            carry = shift ? d[i] >> (32 - shift) : 0;
+            carry = shift ? d[i] >> (kLimbBits - shift) : 0;
         }
         if (extra)
             out[d.size()] = carry;
@@ -153,46 +187,56 @@ Digits divMagnitude(Env& rt, Digits& a, const Digits& b)
     const std::size_t n = v.size();
     const std::size_t m = a.size() - n;
     Digits q(m + 1);
-    const std::uint64_t top = v[n - 1];
-    const std::uint64_t next = v[n - 2];
+    const Limb top = v[n - 1];
+    const Limb next = v[n - 2];
+    const Divisor byTop(top);
     for (std::size_t j = m + 1; j-- > 0;) {
-        rt.checkLoop(j, u.size() * sizeof(std::uint32_t));
-        const std::uint64_t numerator = (std::uint64_t(u[j + n]) << 32) | u[j + n - 1];
-        std::uint64_t qhat = numerator / top;
-        std::uint64_t rhat = numerator % top;
-        while (qhat >> 32 || qhat * next > ((rhat << 32) | u[j + n - 2])) {
+        rt.checkLoop(j, u.size() * sizeof(Limb));
+        Limb qhat, rhat;
+        bool rhatTooBig = false;  // past a limb: the guess cannot be too large
+        if (u[j + n] >= top) {
+            qhat = ~Limb(0);
+            const Wide r = ((Wide(u[j + n]) << kLimbBits) | u[j + n - 1]) - Wide(qhat) * top;
+            rhatTooBig = (r >> kLimbBits) != 0;
+            rhat = Limb(r);
+        } else {
+            qhat = byTop.divide(u[j + n], u[j + n - 1], &rhat);
+        }
+        while (!rhatTooBig && Wide(qhat) * next > ((Wide(rhat) << kLimbBits) | u[j + n - 2])) {
             --qhat;
             rhat += top;
-            if (rhat >> 32)
-                break;
+            rhatTooBig = rhat < top;
         }
-        std::int64_t borrow = 0;
-        std::uint64_t carry = 0;
+        Limb borrow = 0, carry = 0;
         for (std::size_t i = 0; i < n; ++i) {
-            const std::uint64_t p = qhat * v[i] + carry;
-            carry = p >> 32;
-            const std::int64_t diff = std::int64_t(u[i + j]) - std::int64_t(std::uint32_t(p)) - borrow;
-            u[i + j] = std::uint32_t(diff);
-            borrow = diff < 0 ? 1 : 0;
+            const Wide p = Wide(qhat) * v[i] + carry;
+            carry = Limb(p >> kLimbBits);
+            const Limb x = u[i + j], y = Limb(p);
+            const Limb diff = x - y;
+            u[i + j] = diff - borrow;
+            borrow = (x < y) | (diff < borrow);
         }
-        const std::int64_t diff = std::int64_t(u[j + n]) - std::int64_t(carry) - borrow;
-        u[j + n] = std::uint32_t(diff);
-        if (diff < 0) {
+        const Wide owed = Wide(carry) + borrow;
+        const bool negative = Wide(u[j + n]) < owed;
+        u[j + n] = Limb(Wide(u[j + n]) - owed);
+        if (negative) {
             --qhat;
-            std::uint64_t add = 0;
+            Limb add = 0;
             for (std::size_t i = 0; i < n; ++i) {
-                const std::uint64_t sum = std::uint64_t(u[i + j]) + v[i] + add;
-                u[i + j] = std::uint32_t(sum);
-                add = sum >> 32;
+                const Wide sum = Wide(u[i + j]) + v[i] + add;
+                u[i + j] = Limb(sum);
+                add = Limb(sum >> kLimbBits);
             }
-            u[j + n] += std::uint32_t(add);
+            u[j + n] += add;
         }
-        q[j] = std::uint32_t(qhat);
+        q[j] = qhat;
     }
-    a.assign(n, 0);
+    // What is left in the low limbs of `u`, shifted back, in place.
     for (std::size_t i = 0; i < n; ++i)
-        a[i] = shift ? (u[i] >> shift) | (u[i + 1] << (32 - shift)) : u[i];
-    trim(a);
+        u[i] = shift ? (u[i] >> shift) | (u[i + 1] << (kLimbBits - shift)) : u[i];
+    u.resize(n);
+    trim(u);
+    rem = std::move(u);
     trim(q);
     return q;
 }
@@ -214,15 +258,15 @@ Digits shiftLeft(Env& rt, const Digits& a, std::uint64_t by)
 {
     if (a.empty())
         return Digits();
-    const std::uint64_t words = by / 32;
+    const std::uint64_t words = by / kLimbBits;
     if (words > kMaxDigits)
         tooBig(rt);
-    const int bits = int(by % 32);
+    const int bits = int(by % kLimbBits);
     Digits out(std::size_t(words) + a.size() + 1);
-    std::uint32_t carry = 0;
+    Limb carry = 0;
     for (std::size_t i = 0; i < a.size(); ++i) {
         out[std::size_t(words) + i] = (a[i] << bits) | carry;
-        carry = bits ? a[i] >> (32 - bits) : 0;
+        carry = bits ? a[i] >> (kLimbBits - bits) : 0;
     }
     out[std::size_t(words) + a.size()] = carry;
     return out;
@@ -232,24 +276,24 @@ Digits shiftLeft(Env& rt, const Digits& a, std::uint64_t by)
 Value shiftRight(Env& rt, const BigIntCell* a, std::uint64_t by)
 {
     const Digits& d = a->digits;
-    const std::uint64_t words = by / 32;
-    const int bits = int(by % 32);
+    const std::uint64_t words = by / kLimbBits;
+    const int bits = int(by % kLimbBits);
     if (words >= d.size())
         return a->negative ? fromInt64(rt, -1) : make(rt, false, Digits());
     Digits out(d.size() - std::size_t(words));
     bool lost = false;
     for (std::size_t i = 0; i < std::size_t(words); ++i)
         lost = lost || d[i];
-    if (bits && (d[std::size_t(words)] & ((1u << bits) - 1)))
+    if (bits && (d[std::size_t(words)] & ((Limb(1) << bits) - 1)))
         lost = true;
     for (std::size_t i = 0; i < out.size(); ++i) {
-        const std::uint32_t low = d[std::size_t(words) + i];
-        const std::uint32_t high = std::size_t(words) + i + 1 < d.size() ? d[std::size_t(words) + i + 1] : 0;
-        out[i] = bits ? (low >> bits) | (high << (32 - bits)) : low;
+        const Limb low = d[std::size_t(words) + i];
+        const Limb high = std::size_t(words) + i + 1 < d.size() ? d[std::size_t(words) + i + 1] : 0;
+        out[i] = bits ? (low >> bits) | (high << (kLimbBits - bits)) : low;
     }
     trim(out);
     if (a->negative && lost) {
-        Digits one(1, 1u);
+        Digits one(1, Limb(1));
         out = addMagnitude(out, one);
     }
     return make(rt, a->negative, std::move(out));
@@ -261,11 +305,10 @@ Digits twos(const BigIntCell* a, std::size_t size)
     Digits out(size);
     std::copy_n(a->digits.begin(), std::min(size, a->digits.size()), out.begin());
     if (a->negative) {
-        std::uint64_t carry = 1;
+        Limb carry = 1;
         for (std::size_t i = 0; i < size; ++i) {
-            const std::uint64_t cur = std::uint64_t(~out[i]) + carry;
-            out[i] = std::uint32_t(cur);
-            carry = cur >> 32;
+            out[i] = ~out[i] + carry;
+            carry = carry && out[i] == 0;
         }
     }
     return out;
@@ -273,13 +316,12 @@ Digits twos(const BigIntCell* a, std::size_t size)
 
 Value fromTwos(Env& rt, Digits d)
 {
-    const bool negative = !d.empty() && (d.back() >> 31);
+    const bool negative = !d.empty() && (d.back() >> (kLimbBits - 1));
     if (negative) {
-        std::uint64_t carry = 1;
-        for (std::uint32_t& word : d) {
-            const std::uint64_t cur = std::uint64_t(~word) + carry;
-            word = std::uint32_t(cur);
-            carry = cur >> 32;
+        Limb carry = 1;
+        for (Limb& word : d) {
+            word = ~word + carry;
+            carry = carry && word == 0;
         }
     }
     return make(rt, negative, std::move(d));
@@ -303,9 +345,9 @@ Value bitwise(Env& rt, BinaryOp op, const BigIntCell* a, const BigIntCell* b)
 
 std::uint64_t shiftCount(Env& rt, const BigIntCell* b)
 {
-    if (b->digits.size() > 2)
+    if (b->digits.size() > 1)
         tooBig(rt);
-    return b->digits.empty() ? 0 : b->digits.size() == 1 ? b->digits[0] : (std::uint64_t(b->digits[1]) << 32) | b->digits[0];
+    return b->digits.empty() ? 0 : b->digits[0];
 }
 
 Value power(Env& rt, const BigIntCell* a, const BigIntCell* b)
@@ -320,10 +362,10 @@ Value power(Env& rt, const BigIntCell* a, const BigIntCell* b)
         const bool odd = b->digits[0] & 1;
         return fromInt64(rt, a->negative && odd ? -1 : 1);
     }
-    if (b->digits.size() > 1)
+    if (b->digits.size() > 1 || b->digits[0] >> 32)
         tooBig(rt);
-    std::uint32_t exponent = b->digits[0];
-    Digits result(1, 1u);
+    std::uint32_t exponent = std::uint32_t(b->digits[0]);
+    Digits result(1, Limb(1));
     Digits base = a->digits;
     const bool negative = a->negative && (exponent & 1);
     while (exponent) {
@@ -342,9 +384,7 @@ Value fromUint64(Env& rt, std::uint64_t value)
 {
     Digits d;
     if (value)
-        d.push_back(std::uint32_t(value));
-    if (value >> 32)
-        d.push_back(std::uint32_t(value >> 32));
+        d.push_back(value);
     return make(rt, false, std::move(d));
 }
 
@@ -353,9 +393,7 @@ Value fromInt64(Env& rt, std::int64_t value)
     const std::uint64_t magnitude = value < 0 ? ~std::uint64_t(value) + 1 : std::uint64_t(value);
     Digits d;
     if (magnitude)
-        d.push_back(std::uint32_t(magnitude));
-    if (magnitude >> 32)
-        d.push_back(std::uint32_t(magnitude >> 32));
+        d.push_back(magnitude);
     return make(rt, value < 0, std::move(d));
 }
 
@@ -369,15 +407,10 @@ Value fromDouble(Env& rt, double value)
     const double fraction = std::frexp(m, &exponent);
     // fraction * 2^53 is a whole number of 53 bits; the rest is a shift.
     const std::uint64_t bits = std::uint64_t(std::ldexp(fraction, 53));
-    Digits d;
-    d.push_back(std::uint32_t(bits));
-    d.push_back(std::uint32_t(bits >> 32));
+    Digits d(1, bits);
     if (exponent >= 53)
         return make(rt, negative, shiftLeft(rt, d, std::uint64_t(exponent - 53)));
-    const std::uint64_t whole = bits >> (53 - exponent);
-    d.clear();
-    d.push_back(std::uint32_t(whole));
-    d.push_back(std::uint32_t(whole >> 32));
+    d[0] = bits >> (53 - exponent);
     return make(rt, negative, std::move(d));
 }
 
@@ -399,15 +432,15 @@ bool parseDigits(Env& rt, StringView digits, int radix, bool negative, Value& ou
             return false;
         if (value >= radix)
             return false;
-        std::uint64_t carry = std::uint64_t(value);
-        for (std::uint32_t& word : d) {
-            const std::uint64_t cur = std::uint64_t(word) * std::uint64_t(radix) + carry;
-            word = std::uint32_t(cur);
-            carry = cur >> 32;
+        Limb carry = Limb(value);
+        for (Limb& word : d) {
+            const Wide cur = Wide(word) * Limb(radix) + carry;
+            word = Limb(cur);
+            carry = Limb(cur >> kLimbBits);
         }
         if (carry)
-            d.push_back(std::uint32_t(carry));
-        rt.checkLoop(++step, d.size() * sizeof(std::uint32_t));
+            d.push_back(carry);
+        rt.checkLoop(++step, d.size() * sizeof(Limb));
     }
     out = make(rt, negative, std::move(d));
     return true;
@@ -448,21 +481,21 @@ String digitsToString(Digits d, bool negative, int radix)
     if (d.empty())
         return ascii("0");
     // As many digits at a time as fit a word.
-    std::uint32_t chunk = std::uint32_t(radix);
+    Limb chunk = Limb(radix);
     int perChunk = 1;
-    while (std::uint64_t(chunk) * std::uint64_t(radix) <= 0xffffffffu) {
-        chunk *= std::uint32_t(radix);
+    while (Wide(chunk) * Limb(radix) <= ~Limb(0)) {
+        chunk *= Limb(radix);
         ++perChunk;
     }
     String out;
     while (!d.empty()) {
-        std::uint32_t rem = divSmall(d, chunk);
+        Limb rem = divSmall(d, chunk);
         for (int i = 0; i < perChunk; ++i) {
             if (d.empty() && rem == 0)
                 break;
-            const std::uint32_t digit = rem % std::uint32_t(radix);
+            const unsigned digit = unsigned(rem % Limb(radix));
             out.push_back(Char(digit < 10 ? '0' + digit : 'a' + digit - 10));
-            rem /= std::uint32_t(radix);
+            rem /= Limb(radix);
         }
     }
     if (negative)
@@ -486,14 +519,14 @@ String literalToDecimal(StringView text)
     }
     Digits d;
     for (Char c : text) {
-        std::uint64_t carry = std::uint64_t(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
-        for (std::uint32_t& word : d) {
-            const std::uint64_t cur = std::uint64_t(word) * std::uint64_t(radix) + carry;
-            word = std::uint32_t(cur);
-            carry = cur >> 32;
+        Limb carry = Limb(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+        for (Limb& word : d) {
+            const Wide cur = Wide(word) * Limb(radix) + carry;
+            word = Limb(cur);
+            carry = Limb(cur >> kLimbBits);
         }
         if (carry)
-            d.push_back(std::uint32_t(carry));
+            d.push_back(carry);
     }
     return digitsToString(std::move(d), false, 10);
 }
@@ -503,7 +536,7 @@ double toDouble(const BigIntCell* a) noexcept
     const Digits& d = a->digits;
     if (d.empty())
         return 0;
-    const std::size_t bitLength = d.size() * 32 - std::size_t(__builtin_clz(d.back()));
+    const std::size_t bitLength = d.size() * kLimbBits - std::size_t(__builtin_clzll(d.back()));
     if (bitLength > 1024)
         return a->negative ? -HUGE_VAL : HUGE_VAL;
     // The top 64 bits, and whether anything below them is set, round correctly.
@@ -511,15 +544,15 @@ double toDouble(const BigIntCell* a) noexcept
     bool sticky = false;
     const std::size_t shift = bitLength > 64 ? bitLength - 64 : 0;
     for (std::size_t i = d.size(); i-- > 0;) {
-        const std::size_t bitAt = i * 32;
+        const std::size_t bitAt = i * kLimbBits;
         if (bitAt >= shift + 64)
             continue;
         if (bitAt >= shift) {
-            top |= std::uint64_t(d[i]) << (bitAt - shift);
-        } else if (bitAt + 32 > shift) {
+            top |= d[i] << (bitAt - shift);
+        } else if (bitAt + kLimbBits > shift) {
             const std::size_t inner = shift - bitAt;
-            top |= std::uint64_t(d[i]) >> inner;
-            if (d[i] & ((std::uint64_t(1) << inner) - 1))
+            top |= d[i] >> inner;
+            if (d[i] & ((Limb(1) << inner) - 1))
                 sticky = true;
         } else if (d[i]) {
             sticky = true;
@@ -545,11 +578,7 @@ double toDouble(const BigIntCell* a) noexcept
 
 std::uint64_t toUint64(const BigIntCell* a) noexcept
 {
-    std::uint64_t magnitude = 0;
-    if (!a->digits.empty())
-        magnitude = a->digits[0];
-    if (a->digits.size() > 1)
-        magnitude |= std::uint64_t(a->digits[1]) << 32;
+    const std::uint64_t magnitude = a->digits.empty() ? 0 : a->digits[0];
     return a->negative ? ~magnitude + 1 : magnitude;
 }
 
@@ -563,8 +592,8 @@ Value binary(Env& rt, BinaryOp op, const BigIntCell* a, const BigIntCell* b)
         case BinaryOp::Mod: {
             if (b->digits.empty())
                 rt.fail(ErrorCode::RangeError, "division by zero");
-            Digits rem = a->digits;
-            Digits quotient = divMagnitude(rt, rem, b->digits);
+            Digits rem;
+            Digits quotient = divMagnitude(rt, a->digits, b->digits, rem);
             if (op == BinaryOp::Div)
                 return make(rt, a->negative != b->negative, std::move(quotient));
             return make(rt, a->negative, std::move(rem));
@@ -578,7 +607,7 @@ Value binary(Env& rt, BinaryOp op, const BigIntCell* a, const BigIntCell* b)
             const bool left = (op == BinaryOp::Shl) != b->negative;
             if (left)
                 return make(rt, a->negative, shiftLeft(rt, a->digits, a->digits.empty() ? 0 : shiftCount(rt, b)));
-            if (b->digits.size() > 2)
+            if (b->digits.size() > 1)
                 return a->negative ? fromInt64(rt, -1) : make(rt, false, Digits());
             return shiftRight(rt, a, shiftCount(rt, b));
         }
@@ -591,7 +620,7 @@ Value negate(Env& rt, const BigIntCell* a) { return make(rt, !a->negative, a->di
 Value bitNot(Env& rt, const BigIntCell* a)
 {
     // ~x is -x - 1.
-    Digits one(1, 1u);
+    Digits one(1, Limb(1));
     if (a->negative)
         return make(rt, false, subMagnitude(a->digits, one));
     return make(rt, true, addMagnitude(a->digits, one));
@@ -599,7 +628,7 @@ Value bitNot(Env& rt, const BigIntCell* a)
 
 Value increment(Env& rt, const BigIntCell* a, int by)
 {
-    Digits one(1, 1u);
+    Digits one(1, Limb(1));
     const bool towardZero = a->negative == (by > 0);
     if (a->digits.empty())
         return make(rt, by < 0, std::move(one));
@@ -612,34 +641,34 @@ Value asIntN(Env& rt, std::uint64_t bits, const BigIntCell* a, bool isSigned)
 {
     if (bits == 0)
         return make(rt, false, Digits());
-    const std::uint64_t magnitudeBits = a->digits.empty() ? 0 : a->digits.size() * 32 - std::uint64_t(__builtin_clz(a->digits.back()));
+    const std::uint64_t magnitudeBits = a->digits.empty() ? 0 : a->digits.size() * kLimbBits - std::uint64_t(__builtin_clzll(a->digits.back()));
     // What fits as it is stays as it is.
     if (!a->negative && magnitudeBits < bits)
         return make(rt, false, a->digits);
     if (a->negative && isSigned && magnitudeBits < bits)
         return make(rt, true, a->digits);
-    if (bits > kMaxDigits * 32) {
+    if (bits > kMaxDigits * kLimbBits) {
         if (!isSigned && a->negative)
             tooBig(rt);
         return make(rt, a->negative, a->digits);
     }
-    const std::size_t words = std::size_t((bits + 31) / 32) + 1;
+    const std::size_t words = std::size_t((bits + kLimbBits - 1) / kLimbBits) + 1;
     Digits d = twos(a, std::max(words, a->digits.size() + 1));
     d.resize(words);
-    const int top = int(bits % 32);
-    const std::size_t last = std::size_t((bits - 1) / 32);
-    const bool signBit = d[last] >> ((bits - 1) % 32) & 1;
+    const int top = int(bits % kLimbBits);
+    const std::size_t last = std::size_t((bits - 1) / kLimbBits);
+    const bool signBit = d[last] >> ((bits - 1) % kLimbBits) & 1;
     for (std::size_t i = last + 1; i < words; ++i)
         d[i] = 0;
     if (top)
-        d[last] &= (1u << top) - 1;
+        d[last] &= (Limb(1) << top) - 1;
     if (!isSigned || !signBit)
         return make(rt, false, std::move(d));
     // Negative: extend the sign and take the two's complement back.
     if (top)
-        d[last] |= ~((1u << top) - 1);
+        d[last] |= ~((Limb(1) << top) - 1);
     for (std::size_t i = last + 1; i < words; ++i)
-        d[i] = 0xffffffffu;
+        d[i] = ~Limb(0);
     return fromTwos(rt, std::move(d));
 }
 
@@ -663,7 +692,7 @@ int compareDouble(const BigIntCell* a, double d) noexcept
         return a->negative ? -1 : 1;
     // Same sign, neither zero. Compare the whole part as an integer, then what is left of the fraction.
     const double whole = std::trunc(std::fabs(d));
-    const std::size_t bitLength = a->digits.size() * 32 - std::size_t(__builtin_clz(a->digits.back()));
+    const std::size_t bitLength = a->digits.size() * kLimbBits - std::size_t(__builtin_clzll(a->digits.back()));
     int exponent = 0;
     if (whole >= 1)
         std::frexp(whole, &exponent);
@@ -678,15 +707,15 @@ int compareDouble(const BigIntCell* a, double d) noexcept
         magnitudeOrder = 0;
         const int below = shift - 53;
         for (std::size_t i = a->digits.size(); i-- > 0 && magnitudeOrder == 0;) {
-            const int bitAt = int(i) * 32;
-            std::uint64_t word = 0;
+            const int bitAt = int(i) * kLimbBits;
+            Limb word = 0;
             if (below >= 0) {
-                if (bitAt + 32 > below && bitAt < below + 53) {
+                if (bitAt + kLimbBits > below && bitAt < below + 53) {
                     const int offset = bitAt - below;
-                    word = offset >= 0 ? (bits >> offset) & 0xffffffffu : (bits << -offset) & 0xffffffffu;
+                    word = offset >= 0 ? bits >> offset : bits << -offset;
                 }
             } else {
-                word = bitAt < 64 ? ((bits >> -below) >> bitAt) & 0xffffffffu : 0;
+                word = bitAt == 0 ? bits >> -below : 0;
             }
             if (a->digits[i] != word)
                 magnitudeOrder = a->digits[i] < word ? -1 : 1;

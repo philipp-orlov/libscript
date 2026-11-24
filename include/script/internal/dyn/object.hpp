@@ -51,11 +51,12 @@ enum PropAttr : std::uint8_t
 
 struct BigIntCell : GCObject
 {
+    using Limb = std::uint64_t;
     bool negative = false;
-    Vec<std::uint32_t> digits;  ///< little end first, with no zeros at the top: zero has none
+    Vec<Limb> digits;  ///< little end first, with no zeros at the top: zero has none
 
     BigIntCell() { kind = CellKind::BigInt; }
-    std::size_t heapSize() const override { return sizeof(*this) + digits.capacity() * sizeof(std::uint32_t); }
+    std::size_t heapSize() const override { return sizeof(*this) + digits.capacity() * sizeof(Limb); }
 };
 
 /// One own property. `key` is either an interned StringCell or a SymbolCell, so

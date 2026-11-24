@@ -296,9 +296,57 @@ bool privatePut(VM& vm, JSValue base, JSValue symbol, JSValue value)
     return true;
 }
 
+JSValue forInKeysNow(VM& vm, JSValue value);
+
+/// The shape ids of `o` and its prototypes when all are plain objects in the shape tree, at most `kChain` of them.
+bool forInShapes(VM& vm, JSObject* o, std::uint32_t* ids, std::uint32_t* depth)
+{
+    std::uint32_t n = 0;
+    for (; o; o = o->proto(vm)) {
+        if (n == VM::ForInNames::kChain || o->cls() != ObjClass::Plain || o->isDictionary(vm) || proxyOf(o) || hasElems(o))
+            return false;
+        ids[n++] = o->h.shape;
+    }
+    *depth = n;
+    return true;
+}
+
 /// The enumerable string keys `for (k in value)` visits: integer-like names in ascending order, then the others in
 /// the order they were added, own properties first and then the prototype chain's, a name once.
 JSValue forInKeys(VM& vm, JSValue value)
+{
+    std::uint32_t ids[VM::ForInNames::kChain];
+    std::uint32_t depth = 0;
+    if (!isObject(value) || !forInShapes(vm, asObject(value), ids, &depth))
+        return forInKeysNow(vm, value);
+    VM::ForInNames& entry = vm.forInNames[ids[0] % VM::kForInNames];
+    if (entry.depth == depth && std::equal(ids, ids + depth, entry.shapes)) {
+        JSArray* result = vm.newArray(vm.protos.array);
+        result->reserve(vm, std::uint32_t(entry.names.size()));
+        for (Key k : entry.names) {
+            retain(JSValue::cell(k));
+            result->append(vm, JSValue::cell(k));
+        }
+        return toJSValue(result);
+    }
+    const JSValue keys = forInKeysNow(vm, value);
+    if (keys.isException())
+        return keys;
+    for (Key k : entry.names)
+        release(JSValue::cell(k));
+    entry.names.clear();
+    const auto* a = static_cast<JSArray*>(asObject(keys));
+    for (std::uint32_t i = 0; i < a->length; ++i) {
+        const Key k = static_cast<Key>(a->elems[i].asCell());
+        retain(JSValue::cell(k));
+        entry.names.push_back(k);
+    }
+    std::copy(ids, ids + depth, entry.shapes);
+    entry.depth = depth;
+    return keys;
+}
+
+JSValue forInKeysNow(VM& vm, JSValue value)
 {
     JSArray* result = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(result));

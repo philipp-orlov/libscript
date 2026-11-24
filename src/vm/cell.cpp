@@ -1460,6 +1460,11 @@ void VM::releaseRoots() noexcept
         detail::decRef(s.key);
     }
     regexpSlots.clear();
+    for (ForInNames& entry : forInNames) {
+        for (Key k : entry.names)
+            release(JSValue::cell(k));
+        entry = ForInNames{};
+    }
     for (RegExpLiteral& l : regexpLiterals) {
         if (l.pattern.bits)
             release(l.pattern);

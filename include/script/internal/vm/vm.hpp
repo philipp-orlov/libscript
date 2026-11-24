@@ -604,6 +604,18 @@ struct VM : EngineRuntime
     };
     static constexpr std::size_t kForInProtos = 8;
     ForInProto forInProtos[kForInProtos];
+    /// The names `for...in` lists for a plain object whose prototypes are plain objects, all in the shape tree: they follow
+    /// from the shapes alone, so they are kept by the shape ids of the object and its prototypes (ids are not used twice).
+    /// The entry holds a count of each name.
+    struct ForInNames
+    {
+        static constexpr std::size_t kChain = 4;
+        std::uint32_t shapes[kChain] = {};
+        std::uint32_t depth = 0;
+        Vec<Key> names;
+    };
+    static constexpr std::size_t kForInNames = 16;
+    ForInNames forInNames[kForInNames];
     std::size_t jsonRoom = 0;  ///< how many characters the next JSON.stringify starts with room for
     /// A regular expression literal's compiled program, by the string constants of its pattern and flags (each entry holds
     /// a count of both): a literal in a loop makes a RegExp each time round with no parse of its flags and no lookup by text.

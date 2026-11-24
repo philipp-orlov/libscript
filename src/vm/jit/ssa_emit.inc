@@ -2290,6 +2290,10 @@ std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i) const
     if (ic.next != 0 || (ic.holder && !(ic.validity && ic.validity->valid)) ||
         (ic.shape == 0 && code_->atoms[code_->code[i].c] == vm_.atoms.length))
         return es;
+    // A method read on a string caches what `String.prototype` itself has (`stringMethodRead`): that is
+    // `ssaStringProtoRead`'s, not a read of an object of that shape.
+    if (ic.shape != 0 && !ic.holder && !ic.pad && vm_.protos.string && ic.shape == vm_.protos.string->h.shape)
+        return es;
     if (ic.shape != 0)
         es.push_back({ic.shape, ic.index, ic.holder, ic.validity, false});
     if (ic.pad && ic.pad <= code_->poly.size())

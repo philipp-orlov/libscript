@@ -454,6 +454,34 @@ inline void VM::destroyFrom(CellPtr cell, Freed& total) noexcept
             heap.deallocate(next, bytes);
             total.bytes += bytes;
             ++total.cells;
+        } else if (kind == Kind::Object && !(hd->flags & cellflags::kHasRare) &&
+                   (o->cls() == ObjClass::Array || o->cls() == ObjClass::Plain)) {
+            // An array, or a plain object with a slot buffer: its values, its elements, its buffers (as `destroyNow`).
+            const std::uint32_t count = shapeById(hd->shape)->count;
+            const std::uint32_t inl = count < hd->aux ? count : hd->aux;
+            for (std::uint32_t i = 0; i < inl; ++i)
+                if (o->inl()[i].isCell())
+                    drop(o->inl()[i].asCell());
+            for (std::uint32_t i = inl; i < count; ++i)
+                if (o->slots[i - hd->aux].isCell())
+                    drop(o->slots[i - hd->aux].asCell());
+            std::size_t bytes;
+            if (o->cls() == ObjClass::Array) {
+                auto* a = static_cast<JSArray*>(o);
+                for (std::uint32_t i = a->packed; i < a->length; ++i)  // no cell among the packed numbers
+                    if (a->elems[i].isCell())
+                        drop(a->elems[i].asCell());
+                if (a->ownsElems())
+                    freePayload(a->elems, 8u * a->capacity);
+                bytes = sizeof(JSArray);
+            } else {
+                bytes = JSObject::bytesFor(hd->aux);
+            }
+            if (o->slots)
+                freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
+            heap.deallocate(next, bytes);
+            total.bytes += bytes;
+            ++total.cells;
         } else if (kind == Kind::Box) {
             // A variable a closure shares: its value, the one thing it holds.
             const JSValue v = reinterpret_cast<Box*>(next)->value;

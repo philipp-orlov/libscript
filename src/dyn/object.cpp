@@ -832,7 +832,7 @@ bool strictEquals(const Value& a, const Value& b) noexcept
         case Type::BigInt: {
             const auto* x = static_cast<const BigIntCell*>(detail::Access::ptr(a));
             const auto* y = static_cast<const BigIntCell*>(detail::Access::ptr(b));
-            return x->negative == y->negative && x->digits == y->digits;
+            return x->negative == y->negative && x->digits() == y->digits();
         }
         default:
             return detail::Access::ptr(a) == detail::Access::ptr(b);
@@ -857,7 +857,7 @@ std::size_t hashValue(const Value& v) noexcept
         case Type::BigInt: {
             const auto* x = static_cast<const BigIntCell*>(detail::Access::ptr(v));
             std::size_t h = x->negative ? 0x1b873593 : 0xcc9e2d51;
-            for (BigIntCell::Limb d : x->digits)
+            for (BigIntCell::Limb d : x->digits())
                 h = h * 31 + d;
             return h;
         }

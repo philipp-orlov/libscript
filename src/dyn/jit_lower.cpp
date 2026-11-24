@@ -2661,7 +2661,7 @@ private:
             if (e.known == Type::Bool)
                 return immReg(e.bits != 0 ? 1 : 0);
             if (e.known == Type::BigInt)
-                return immReg(reinterpret_cast<const BigIntCell*>(e.bits)->digits.empty() ? 0 : 1);
+                return immReg(reinterpret_cast<const BigIntCell*>(e.bits)->digits().empty() ? 0 : 1);
             return immReg(e.known >= Type::Symbol ? 1 : 0);
         }
         if (e.rep == Rep::Tagged && e.hasKnownTag && e.known == Type::Bool)

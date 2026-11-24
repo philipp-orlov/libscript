@@ -100,6 +100,12 @@ void destroyUnreferenced(GCObject* cell) noexcept
             return;
         }
     }
+    // A BigInt holds its limbs in its cell, and nothing else.
+    if (cell->kind == CellKind::BigInt) {
+        rt->unlink(cell);
+        rt->heap.deallocate(cell, cell->cellBytes);
+        return;
+    }
     if (rt->destroying) {
         rt->unlink(cell);
         cell->pendingNext = rt->pendingFree;

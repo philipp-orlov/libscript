@@ -52,12 +52,35 @@ enum PropAttr : std::uint8_t
 struct BigIntCell : GCObject
 {
     using Limb = std::uint64_t;
+    /// Limbs to read: a cell's own, or those of a vector being worked on.
+    struct Limbs
+    {
+        const Limb* p = nullptr;
+        std::size_t n = 0;
+        Limbs() noexcept = default;
+        Limbs(const Limb* data, std::size_t count) noexcept : p(data), n(count) {}
+        Limbs(const Vec<Limb>& v) noexcept : p(v.data()), n(v.size()) {}
+        std::size_t size() const noexcept { return n; }
+        bool empty() const noexcept { return n == 0; }
+        Limb back() const noexcept { return p[n - 1]; }
+        Limb operator[](std::size_t i) const noexcept { return p[i]; }
+        const Limb* begin() const noexcept { return p; }
+        const Limb* end() const noexcept { return p + n; }
+        friend bool operator==(Limbs a, Limbs b) noexcept
+        {
+            return a.n == b.n && (a.n == 0 || std::memcmp(a.p, b.p, a.n * sizeof(Limb)) == 0);
+        }
+    };
     bool negative = false;
-    Vec<Limb> digits;  ///< little end first, with no zeros at the top: zero has none
+    std::uint32_t count = 0;  ///< of the limbs that follow the cell
 
-    BigIntCell() { kind = CellKind::BigInt; }
-    std::size_t heapSize() const override { return sizeof(*this) + digits.capacity() * sizeof(Limb); }
+    explicit BigIntCell(std::uint32_t limbs) noexcept : count(limbs) { kind = CellKind::BigInt; }
+    Limb* limbs() noexcept { return reinterpret_cast<Limb*>(this + 1); }
+    /// Little end first, with no zeros at the top: zero has none.
+    Limbs digits() const noexcept { return Limbs(reinterpret_cast<const Limb*>(this + 1), count); }
+    std::size_t heapSize() const override { return sizeof(*this) + count * sizeof(Limb); }
 };
+static_assert(sizeof(BigIntCell) % alignof(BigIntCell::Limb) == 0, "the limbs follow the cell aligned");
 
 /// One own property. `key` is either an interned StringCell or a SymbolCell, so
 /// key comparison is pointer comparison.

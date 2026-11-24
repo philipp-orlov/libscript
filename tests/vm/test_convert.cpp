@@ -66,7 +66,7 @@ TEST(symbolsAndBigIntsOfTheOldFamilyCount)
     Fixture f;
     ContextImpl& rt = *f.ctx.impl();
     auto* sym = rt.newCell<dyn::SymbolCell>();
-    auto* big = rt.newCell<dyn::BigIntCell>();
+    auto* big = rt.newCell<dyn::BigIntCell>(0u);
     JSValue s = JSValue::cell(sym), b = JSValue::cell(big);
     CHECK(isSymbol(s) && !isBigInt(s) && !isString(s));
     CHECK(isBigInt(b) && !isSymbol(b));

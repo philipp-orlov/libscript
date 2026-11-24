@@ -48,7 +48,7 @@ struct KeyHash
         if (isBigInt(v)) {
             const auto* big = static_cast<const dyn::BigIntCell*>(v.asCell());
             std::size_t h = big->negative ? 0x51ed27u : 0x2545f491u;
-            for (dyn::BigIntCell::Limb digit : big->digits)
+            for (dyn::BigIntCell::Limb digit : big->digits())
                 h = h * 1099511628211ull + digit;
             return h;
         }

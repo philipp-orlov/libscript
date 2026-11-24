@@ -122,7 +122,7 @@ JSValue bigintAsN(VM& vm, std::uint64_t bits, JSValue a, bool isSigned)
 
 double bigintToDouble(JSValue v) { return dyn::bigint::toDouble(bigCell(v)); }
 
-bool bigintIsZero(JSValue v) noexcept { return bigCell(v)->digits.empty(); }
+bool bigintIsZero(JSValue v) noexcept { return bigCell(v)->digits().empty(); }
 
 /// -1, 0 or 1, or 2 when they cannot be ordered (a NaN, a string that is no integer). `a` is a BigInt.
 int bigintCompareWith(VM& vm, JSValue a, JSValue other, bool* ok)
@@ -572,6 +572,8 @@ JSValue add(VM& vm, JSValue a, JSValue b)
         return JSValue::boxNumber(a.asNumber() + b.asNumber());
     if (isString(a) && isString(b))
         return concatStrings(vm, a, b);
+    if (isBigInt(a) && isBigInt(b))
+        return bigintBinary(vm, Op::Add, a, b);
     JSValue pa = toPrimitiveHint(vm, a, 0);
     if (pa.isException())
         return pa;
@@ -746,6 +748,8 @@ JSValue arithmetic(VM& vm, Op op, JSValue a, JSValue b)
             default: break;
         }
     }
+    if (isBigInt(a) && isBigInt(b))
+        return bigintBinary(vm, op, a, b);  // both primitive already: nothing to convert, nothing to let go of
     if ((a.isCell() || b.isCell()) && (isBigInt(a) || isBigInt(b) || isObject(a) || isObject(b))) {
         JSValue pa = toPrimitive(vm, a, false);
         if (pa.isException())

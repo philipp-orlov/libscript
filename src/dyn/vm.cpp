@@ -295,7 +295,7 @@ bool toBoolean(const Value& v) noexcept
         case Type::String:
             return !asString(v)->text().empty();
         case Type::BigInt:
-            return !static_cast<BigIntCell*>(detail::Access::ptr(v))->digits.empty();
+            return !static_cast<BigIntCell*>(detail::Access::ptr(v))->digits().empty();
         default:
             return true;
     }

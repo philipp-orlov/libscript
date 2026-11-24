@@ -21,9 +21,11 @@ namespace {
 struct NodeBlock
 {
     static constexpr std::size_t kBytes = std::size_t(64) << 10;
-    /// Nodes handed out and not yet deleted, and one more while the block is still being carved from. Atomic since a
-    /// tree may be dropped on another thread than the one that made it.
-    std::atomic<std::uint32_t> live{1};
+    /// While the block is carved from, `kCarving` less the nodes deleted; after, the nodes handed out and not yet deleted.
+    /// The carver counts what it hands out and settles once, when it moves on. Atomic since a tree may be dropped on
+    /// another thread than the one that made it.
+    static constexpr std::uint32_t kCarving = std::uint32_t(1) << 30;
+    std::atomic<std::uint32_t> live{kCarving};
 };
 
 constexpr std::size_t kAlign = alignof(std::max_align_t) > alignof(Node) ? alignof(std::max_align_t) : alignof(Node);
@@ -33,9 +35,9 @@ constexpr std::size_t kHeader = (sizeof(NodeBlock*) + alignof(Node) - 1) / align
 constexpr std::size_t kSlot = (kHeader + sizeof(Node) + alignof(Node) - 1) / alignof(Node) * alignof(Node);
 static_assert(kFirst + kSlot <= NodeBlock::kBytes, "a block holds at least one node");
 
-void release(NodeBlock* block) noexcept
+void release(NodeBlock* block, std::uint32_t count = 1) noexcept
 {
-    if (block->live.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    if (block->live.fetch_sub(count, std::memory_order_acq_rel) == count) {
         block->~NodeBlock();
         std::free(block);
     }
@@ -46,10 +48,13 @@ struct Carver
 {
     NodeBlock* block = nullptr;
     std::size_t used = 0;
+    std::uint32_t carved = 0;
+    /// Moves on from the block: it now counts only the nodes it handed out.
+    void retire() noexcept { release(block, NodeBlock::kCarving - carved); }
     ~Carver()
     {
         if (block)
-            release(block);
+            retire();
     }
 };
 
@@ -78,13 +83,14 @@ void* Node::operator new(std::size_t size)
             throw std::bad_alloc();
         // The old block is let go of as a carver; its nodes keep it until they go.
         if (c.block)
-            release(c.block);
+            c.retire();
         c.block = new (raw) NodeBlock();
         c.used = kFirst;
+        c.carved = 0;
     }
     char* slot = reinterpret_cast<char*>(c.block) + c.used;
     c.used += kSlot;
-    c.block->live.fetch_add(1, std::memory_order_relaxed);
+    ++c.carved;
     *reinterpret_cast<NodeBlock**>(slot) = c.block;
     return slot + kHeader;
 }

@@ -1229,6 +1229,7 @@ public:
         t->entry = t->ctorEntry = t->rx;
         t->validities = std::move(validities_);
         t->labels = std::move(offsets_);
+        t->labelAt = t->labels.data();
         return t;
     }
 
@@ -3154,6 +3155,7 @@ private:
     /// R11 = the frame after the top one (R13): from the address, so that nothing waits on the top's last store.
     void topFrame() { a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame)))); }
     void genStep(std::uint32_t i, const Ins& in, Label& other, Label& done);
+    void genEnterInLine(std::uint32_t i, const Ins& in, Label& viaRuntime, Label& enter);
     void yieldInLine(std::uint32_t i, const Ins& in);
     void call(std::uint32_t i, const Ins& in);
     void getGlobal(std::uint32_t i, const Ins& in);
@@ -6576,6 +6578,12 @@ void Baseline::yieldInLine(std::uint32_t i, const Ins& in)
     a_.movImm(RCX, in.a);
     a_.mov16(mem(RSI, L.resumeDst), RCX);
     a_.mov32(mem(RSI, L.pcIndex), std::int32_t(i + 1));
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(code_));
+    a_.mov(mem(RSI, L.resumeCode), RCX);
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+    a_.mov(mem(RSI, L.resumePc), RCX);
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(live));
+    a_.mov(mem(RSI, L.resumeLive), RCX);
     a_.mov(RAX, R(in.b));
     a_.mov(mem(R12, kVmFrameTop), R13);
     a_.jmp(exit_);
@@ -6590,7 +6598,10 @@ void Baseline::genStep(std::uint32_t i, const Ins& in, Label& other, Label& done
     a_.cmp(RAX, R(in.b + 1u));
     a_.jcc(CNE, other);
     savePool(i);
-    Label notGen;
+    Label notGen, viaRuntime, enter, leaveViaRuntime;
+    const bool delegate = in.opcode() == Op::DelegateCall;
+    genEnterInLine(i, in, viaRuntime, enter);
+    a_.bind(viaRuntime);
     a_.mov(RDI, R12);
     a_.movImm(RSI, i);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmJitGenEnter));
@@ -6601,8 +6612,36 @@ void Baseline::genStep(std::uint32_t i, const Ins& in, Label& other, Label& done
     topFrame();
     a_.mov(RSI, R11);
     a_.mov(RDI, mem(R11, kFrameR));
+    a_.bind(enter);
     a_.movImm(RAX, reinterpret_cast<std::uint64_t>(stubs().osrEnter));
     a_.callReg(RAX);
+    {
+        // Back with what it yielded, from its own state (not one of a `yield*`'s inner results): written here.
+        const GenLayout& L = genLayout();
+        a_.test(RAX, RAX);
+        a_.jcc(CE, leaveViaRuntime);
+        a_.mov(RSI, R(in.b));
+        a_.testI8(mem(RSI, kHdrFlags), cellflags::kHasRare);
+        a_.jcc(CNE, leaveViaRuntime);
+        a_.movzx8(RCX, mem(RSI, kHdrAux));
+        a_.lea(RDX, mem(RSI, RCX, 8, std::int32_t(JSObject::kHeaderBytes)));
+        a_.cmpI8(mem(RDX, L.state), L.suspended);
+        a_.jcc(CNE, leaveViaRuntime);
+        a_.cmpI8(mem(RDX, L.raw), 0);
+        a_.jcc(CNE, leaveViaRuntime);
+        if (delegate) {
+            // As `delegateCall`: a value with no result object around it, which this generator's `yield*` then yields.
+            a_.mov(RSI, mem(R13, kFrameGen));
+            a_.movzx8(RCX, mem(RSI, kHdrAux));
+            a_.lea(RDX, mem(RSI, RCX, 8, std::int32_t(JSObject::kHeaderBytes)));
+            a_.movImm(RCX, 1);
+            a_.mov8(mem(RDX, L.unboxed), RCX);
+        }
+        write(in.a, RAX);
+        restorePool(i);
+        a_.jmp(done);
+    }
+    a_.bind(leaveViaRuntime);
     a_.mov(RDX, RAX);
     a_.mov(RDI, R12);
     a_.movImm(RSI, i);
@@ -6615,6 +6654,133 @@ void Baseline::genStep(std::uint32_t i, const Ins& in, Label& other, Label& done
     a_.bind(notGen);
     restorePool(i);
     a_.jmp(other);
+}
+
+/// What `jitGenEnter` does, here, for a generator suspended at a `yield` (not a `yield*`) whose state is in its cell and
+/// whose code is compiled, with room on the stack and for a frame: its frame pushed with its kept registers, and `enter`
+/// reached with rsi the frame, rdi its registers, rdx where its code goes on. Anything else goes to `viaRuntime`.
+void Baseline::genEnterInLine(std::uint32_t i, const Ins& in, Label& viaRuntime, Label& enter)
+{
+    const GenLayout& L = genLayout();
+    const bool delegate = in.opcode() == Op::DelegateCall;
+    if (delegate) {
+        // A `yield*` of a generator with its state in its cell, resumed with a `next`.
+        a_.mov(RSI, mem(R13, kFrameGen));
+        a_.test(RSI, R15);
+        a_.jcc(CNE, viaRuntime);
+        a_.testI8(mem(RSI, kHdrFlags), cellflags::kHasRare);
+        a_.jcc(CNE, viaRuntime);
+        a_.mov(RSI, R(in.c + 1u));
+        a_.movImm(RAX, JSValue::int32(0).bits);
+        a_.cmp(RSI, RAX);
+        a_.jcc(CNE, viaRuntime);
+    }
+    a_.mov(RSI, R(in.b));
+    a_.test(RSI, R15);
+    a_.jcc(CNE, viaRuntime);
+    a_.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::Generator));
+    a_.jcc(CNE, viaRuntime);
+    a_.testI8(mem(RSI, kHdrFlags), cellflags::kHasRare);
+    a_.jcc(CNE, viaRuntime);
+    // rdx: the state, after the generator's slots.
+    a_.movzx8(RCX, mem(RSI, kHdrAux));
+    a_.lea(RDX, mem(RSI, RCX, 8, std::int32_t(JSObject::kHeaderBytes)));
+    // Suspended at a `yield`, or not started (whose first registers are kept as at a suspension).
+    Label suspended, started;
+    a_.cmpI8(mem(RDX, L.state), L.suspended);
+    a_.jcc(CE, suspended);
+    a_.cmpI8(mem(RDX, L.state), L.start);
+    a_.jcc(CNE, viaRuntime);
+    a_.jmp(started);
+    a_.bind(suspended);
+    a_.cmpI8(mem(RDX, L.delegating), 0);
+    a_.jcc(CNE, viaRuntime);
+    a_.bind(started);
+    // rcx its code, r8 the code's compiled code; the place it stopped must be in that code.
+    a_.mov(RAX, mem(RDX, L.callee));
+    a_.mov(RCX, mem(RAX, kFnCode));
+    a_.cmp(RCX, mem(RDX, L.resumeCode));
+    a_.jcc(CNE, viaRuntime);
+    a_.mov(R8, mem(RCX, kCbTier1));
+    a_.test(R8, R8);
+    a_.jcc(CE, viaRuntime);
+    // r9 its registers, above this frame's; filled already, and one past them (`VM::fillStack`).
+    a_.lea(R9, R(code_->nregs));
+    a_.mov32(R10, mem(RCX, kCbNregs));
+    a_.lea(R10, mem(R9, R10, 8, 8));
+    a_.alu(7, R10, mem(R12, kVmStackInit));
+    a_.jcc(CA, viaRuntime);
+    topFrame();
+    a_.alu(7, R11, mem(R12, kVmFrameLimit));
+    a_.jcc(CAE, viaRuntime);
+    a_.cmpI32(mem(R12, kVmTicks), 1);
+    a_.jcc(CBE, viaRuntime);
+    a_.alu(7, RSP, mem(R12, kVmStackFloor));
+    a_.jcc(CB, viaRuntime);
+    // Taken: from here on nothing goes back.
+    a_.dec32(mem(R12, kVmTicks));
+    if (!delegate && i < code_->prof.size()) {
+        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->prof[i]));
+        a_.orI8(mem(RDI, 0), opt::kProfFailed);  // (as `jitIterNext` notes it)
+    }
+    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+    a_.mov(mem(R13, kFramePc), RDI);
+    {
+        // The kept registers to where they live: r10 the list of them, rsi the values, r11 how many.
+        Label loop, copied;
+        a_.mov(R10, mem(RDX, L.resumeLive));
+        a_.lea(RSI, mem(RDX, L.regs));
+        a_.mov32(R11, mem(RDX, L.count));
+        a_.test32(R11, R11);
+        a_.jcc(CE, copied);
+        a_.bind(loop);
+        a_.movzx16(RDI, mem(R10, 0));
+        a_.mov(RAX, mem(RSI, 0));
+        a_.mov(mem(R9, RDI, 8, 0), RAX);
+        a_.aluI(0, R10, 2);
+        a_.aluI(0, RSI, 8);
+        a_.aluI32(5, R11, 1);
+        a_.jcc(CNE, loop);
+        a_.bind(copied);
+    }
+    {
+        // What `next` sent, to a suspended one: undefined, or what this generator was resumed with.
+        Label notSent;
+        a_.cmpI8(mem(RDX, L.state), L.suspended);
+        a_.jcc(CNE, notSent);
+        a_.movzx16(RDI, mem(RDX, L.resumeDst));
+        if (delegate)
+            a_.mov(RAX, R(in.c));
+        else
+            a_.movImm(RAX, kUndefined);
+        a_.mov(mem(R9, RDI, 8, 0), RAX);
+        a_.bind(notSent);
+    }
+    a_.movImm(RAX, L.running);
+    a_.mov8(mem(RDX, L.state), RAX);
+    // The frame, as the interpreter's is (`jitGenEnter`).
+    topFrame();
+    a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
+    a_.mov(mem(R12, kVmFrameTop), RDI);
+    a_.mov(mem(R11, kFrameCode), RCX);
+    a_.mov(RAX, mem(RDX, L.callee));
+    a_.mov(mem(R11, kFrameFn), RAX);
+    a_.mov(RAX, mem(RDX, L.resumePc));
+    a_.mov(mem(R11, kFramePc), RAX);
+    a_.mov(mem(R11, kFrameR), R9);
+    a_.mov(mem(R11, kFrameRetDst), 0);
+    a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
+    a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
+    a_.mov(RAX, R(in.b));
+    a_.mov(mem(R11, kFrameGen), RAX);
+    // Where its code goes on: rx + labels[pcIndex].
+    a_.mov32(RDI, mem(RDX, L.pcIndex));
+    a_.mov(RAX, mem(R8, std::int32_t(offsetof(Tier1Code, labelAt))));
+    a_.mov32(RDX, mem(RAX, RDI, 4, 0));
+    a_.alu(0, RDX, mem(R8, std::int32_t(offsetof(Tier1Code, rx))));
+    a_.mov(RSI, R11);
+    a_.mov(RDI, R9);
+    a_.jmp(enter);
 }
 
 /// `ret` of a deferred frame: the result goes back as the frame holds it, without a count (`enterTier1` takes one for C++),

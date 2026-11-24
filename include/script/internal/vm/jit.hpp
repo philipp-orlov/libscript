@@ -36,6 +36,7 @@ struct Tier1Code
     void* ctorEntry = nullptr;                ///< the same for a frame `new` made: optimized code is not always made for those
     std::size_t bytes = 0;
     std::vector<std::uint32_t> labels;        ///< per instruction index: offset from `rx` of its code, or ~0u
+    const std::uint32_t* labelAt = nullptr;   ///< `labels.data()`, for compiled code
     std::vector<ValidityCell*> validities;    ///< cells the code reads, each held with a count of its own
     void* addressFor(std::uint32_t index) const noexcept { return rx + labels[index]; }
 };
@@ -144,8 +145,8 @@ JSValue jitSuspend(VM& vm, std::uint32_t index);
 /// the state, `regs` that of the kept registers, and the value of `state` for a suspended one.
 struct GenLayout
 {
-    std::int32_t count, regs, pcIndex, resumeDst, state, delegating, raw, unboxed;
-    std::uint8_t suspended;
+    std::int32_t count, regs, pcIndex, resumeDst, state, delegating, raw, unboxed, callee, resumeCode, resumePc, resumeLive;
+    std::uint8_t start, suspended, running;
 };
 const GenLayout& genLayout() noexcept;
 /// `IterNext` at `index` of the top frame along a suspended generator with its own `next`: the generator's frame pushed,

@@ -1195,6 +1195,9 @@ struct GenState : NativeState
             release(old);
         }
         count = n;
+        resumeCode = code;
+        resumePc = code->code.data() + pc;
+        resumeLive = live;
         if constexpr (!Def)  // (a deferred frame's registers stay as they are)
             for (std::uint32_t r = 0; r < code->nregs; ++r) {
                 const JSValue old = R[r];
@@ -1204,6 +1207,10 @@ struct GenState : NativeState
         pcIndex = pc;
     }
     JSValue callee = JSValue::undefined();
+    /// Where it stopped, as compiled code finds it (`suspend`): the code, its instruction, the registers `count` lists.
+    const CodeBlock* resumeCode = nullptr;
+    const Ins* resumePc = nullptr;
+    const std::uint16_t* resumeLive = nullptr;
     std::uint32_t pcIndex = 0;
     std::uint16_t resumeDst = 0;
     State state = Start;
@@ -1242,7 +1249,9 @@ const GenLayout& genLayout() noexcept
         GenState g;
         auto at = [&](const void* field) { return std::int32_t(static_cast<const char*>(field) - reinterpret_cast<const char*>(&g)); };
         return GenLayout{at(&g.count), std::int32_t(sizeof(GenState)), at(&g.pcIndex), at(&g.resumeDst), at(&g.state),
-                         at(&g.delegating), at(&g.raw), at(&g.unboxed), std::uint8_t(GenState::Suspended)};
+                         at(&g.delegating), at(&g.raw), at(&g.unboxed), at(&g.callee), at(&g.resumeCode), at(&g.resumePc),
+                         at(&g.resumeLive), std::uint8_t(GenState::Start), std::uint8_t(GenState::Suspended),
+                         std::uint8_t(GenState::Running)};
     }();
     return layout;
 }
@@ -5325,6 +5334,9 @@ JSValue VM::makeGenerator(JSFunction* f, JSValue thisValue, const JSValue* args,
             g->count = k + 1;
         }
         g->pcIndex = 1;
+        g->resumeCode = c;
+        g->resumePc = c->code.data() + 1;
+        g->resumeLive = live;
         if (c->flags & CodeBlock::kAsyncGen)
             return bi::asyncGeneratorStart(*this, keep.take(), proto);
         return keep.take();

@@ -221,7 +221,8 @@ bool declaredByFunction(const Node& n, std::vector<String>& out)
 /// The names a node at nested depth contributes, with everything inside it.
 const NameViews& capturedBelow(const Node& n, bool arrowChain, CaptureCache& cache)
 {
-    auto& slot = cache.below[arrowChain ? 1 : 0];
+    // Only an arrow passes the arrow chain on to its body: any other boundary has one summary.
+    auto& slot = cache.below[arrowChain && n.kind == NK::ArrowExpr ? 1 : 0];
     if (const auto it = slot.find(&n); it != slot.end())
         return it->second;
     NameViews names;

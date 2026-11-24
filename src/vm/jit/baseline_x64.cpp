@@ -3744,6 +3744,8 @@ void Baseline::emit(std::uint32_t i)
         helperOrStep(i, &helperThunk<jitDelegateCall>);
         return;
     case Op::DelegateCallAsync: helperOrStep(i, &helperThunk<jitDelegateCall>); return;
+    case Op::AsyncIterNext: helperOp(i, &helperThunk<jitAsyncIterNext>); return;
+    case Op::IterUnpack: helperOp(i, &helperThunk<jitIterUnpack>); return;
     case Op::DelegateDone: helperOrStep(i, &helperThunk<jitDelegateDone>); return;
     case Op::GetIteratorObj: helperOrStep(i, &helperThunk<jitGetIteratorObj>); return;
     case Op::IterInit: {

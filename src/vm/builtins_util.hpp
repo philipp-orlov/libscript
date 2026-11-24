@@ -260,6 +260,8 @@ void installPromise(VM& vm);
 /// The object an async generator function's call makes: it queues `next`, `throw` and `return` and drives the frame in
 /// `generator` (which it takes). Owned.
 JSValue asyncGeneratorStart(VM& vm, JSValue generator, JSObject* proto);
+/// Whether `v` is an async generator object (made by `asyncGeneratorStart`).
+bool isAsyncGenerator(JSValue v);
 /// `await`: the promise to wait on for `value`, owned.
 /// The async-from-sync wrapper `for await` puts around a sync iterator: owned iterator and its `next`.
 JSValue asyncFromSyncIterator(VM& vm, JSValue iterator, JSValue next);

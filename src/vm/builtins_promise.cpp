@@ -174,6 +174,33 @@ bool promisePristine(VM& vm, JSValue p)
 
 void rejectPromise(VM& vm, JSValue promise, JSValue reason) { settle(vm, promise, PromiseData::Rejected, reason); }
 
+/// Whether `o` is a plain object over `Object.prototype` with no `then` of its own or there (an iterator result, a record
+/// an async generator yields): what resolves to it is fulfilled with no lookup. The shapes found so are kept while
+/// `globalEpoch` stands.
+bool noThen(VM& vm, JSObject* o)
+{
+    if (o->cls() != ObjClass::Plain)
+        return false;
+    const std::uint32_t shape = o->h.shape;
+    if (vm.noThenEpoch == vm.globalEpoch)
+        for (std::uint32_t s : vm.noThenShapes)
+            if (s == shape)
+                return true;
+    Shape* sh = o->shapeOf(vm);
+    JSObject* op = vm.protos.object;
+    if (sh->isDictionary() || sh->proto != op || o->findOwn(vm, vm.atoms.then) || op->findOwn(vm, vm.atoms.then))
+        return false;
+    if (vm.noThenEpoch != vm.globalEpoch) {
+        if (!vm.watchMethod(op, op))
+            return true;
+        vm.noThenEpoch = vm.globalEpoch;
+        for (std::uint32_t& s : vm.noThenShapes)
+            s = 0;
+    }
+    vm.noThenShapes[vm.noThenNext++ % 4] = shape;
+    return true;
+}
+
 /// The resolve function's steps: a thenable is followed, anything else fulfils.
 void resolvePromise(VM& vm, JSValue promise, JSValue resolution)
 {
@@ -183,7 +210,7 @@ void resolvePromise(VM& vm, JSValue promise, JSValue resolution)
         release(e);
         return;
     }
-    if (!isObject(resolution)) {
+    if (!isObject(resolution) || noThen(vm, asObject(resolution))) {
         settle(vm, promise, PromiseData::Fulfilled, resolution);
         return;
     }
@@ -1131,6 +1158,8 @@ JSValue asyncGeneratorStart(VM& vm, JSValue generator, JSObject* proto)
     return outerKeep.take();
 }
 
+bool isAsyncGenerator(JSValue v) { return asyncGenOf(v) != nullptr; }
+
 JSValue asyncFromSyncIterator(VM& vm, JSValue iterator, JSValue next)
 {
     static_assert(true, "");
@@ -1162,6 +1191,10 @@ void installPromise(VM& vm)
         vm.setIntrinsic(&vm.protos.asyncGenerator, agProto);
         release(toJSValue(agProto));
         method(vm, agProto, "next", asyncGenEnqueue, 1, reinterpret_cast<void*>(0));
+        if (JSValue* next = agProto->findOwn(vm, vm.atoms.next))
+            vm.origAsyncGenNext = *next;
+        if (JSValue* self = asyncIteratorProto->findOwn(vm, vm.atoms.symAsyncIterator))
+            vm.origAsyncIteratorSelf = *self;
         method(vm, agProto, "throw", asyncGenEnqueue, 1, reinterpret_cast<void*>(1));
         method(vm, agProto, "return", asyncGenEnqueue, 1, reinterpret_cast<void*>(2));
         agProto->putOwn(vm, vm.atoms.symToStringTag, makeString(vm, std::string_view("AsyncGenerator")), attr::kConfigurable);

@@ -535,6 +535,16 @@ struct VM : EngineRuntime
     JSValue origGeneratorNext = JSValue::undefined();
     JSValue origIteratorSelf = JSValue::undefined();  ///< %IteratorPrototype%[Symbol.iterator] as made
     std::uint32_t generatorEpoch = ~0u;               ///< where `globalEpoch` was when both were found as made
+    /// `%AsyncGeneratorPrototype%.next` and `%AsyncIteratorPrototype%[Symbol.asyncIterator]` as made, and where
+    /// `globalEpoch` was when both were found so.
+    JSValue origAsyncGenNext = JSValue::undefined();
+    JSValue origAsyncIteratorSelf = JSValue::undefined();
+    std::uint32_t asyncGeneratorEpoch = ~0u;
+    /// Where `globalEpoch` was when `Object.prototype` was found with no `then`, and plain objects' shapes over it found
+    /// with none of their own since (`bi::noThen`): such an object is no thenable while it stands.
+    std::uint32_t noThenEpoch = ~0u;
+    std::uint32_t noThenShapes[4] = {};
+    std::uint32_t noThenNext = 0;
     /// The `next` of each family of built-in iterators (array, string, map, set, regexp) as installed, indexed by `IteratorFamily`.
     JSValue origNativeNext[8] = {};
     /// The RegExp constructor and `RegExp.prototype.exec` as made, and the slots a plain RegExp counts on staying as they are.

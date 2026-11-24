@@ -1331,6 +1331,35 @@ bool generatorPristine(VM& vm, JSObject* o)
     return true;
 }
 
+/// Whether `o` is an async generator whose `Symbol.asyncIterator` and `next` are the language's own, as made.
+bool asyncGeneratorPristine(VM& vm, JSObject* o)
+{
+    JSObject* agp = vm.protos.asyncGenerator;
+    auto bare = [&](JSObject* x) {
+        const Shape* shape = x->shapeOf(vm);
+        return !shape->isDictionary() && shape->count == 0;
+    };
+    if (o->cls() != ObjClass::Native || !agp || !bare(o) || !bi::isAsyncGenerator(toJSValue(o)))
+        return false;
+    JSObject* p = o->proto(vm);
+    if (p != agp && (!p || !bare(p) || p->cls() != ObjClass::Plain || proxyOf(p) || p->proto(vm) != agp))
+        return false;
+    if (vm.asyncGeneratorEpoch == vm.globalEpoch)
+        return true;
+    JSObject* ip = agp->proto(vm);
+    std::uint8_t attrs = 0;
+    const JSValue* slot = agp->findOwn(vm, vm.atoms.next, &attrs);
+    if (!ip || !slot || (attrs & attr::kAccessor) || slot->bits != vm.origAsyncGenNext.bits ||
+        agp->findOwn(vm, vm.atoms.symAsyncIterator))
+        return false;
+    slot = ip->findOwn(vm, vm.atoms.symAsyncIterator, &attrs);
+    if (!slot || (attrs & attr::kAccessor) || slot->bits != vm.origAsyncIteratorSelf.bits)
+        return false;
+    if (vm.watchMethod(agp, agp) && vm.watchMethod(ip, ip))
+        vm.asyncGeneratorEpoch = vm.globalEpoch;
+    return true;
+}
+
 /// GetIterator(src): the iterator and its `next`, owned; false with an exception pending.
 bool iteratorOf(VM& vm, JSValue src, JSValue* iterator, JSValue* next)
 {
@@ -3603,6 +3632,12 @@ L_AsyncIterInit: {
     // `for await` and `yield*` in an async generator: the object's async iterator, or its sync one wrapped to look async.
     fr->pc = pc;
     const JSValue src = R[ins->b];
+    if (isObject(src) && asyncGeneratorPristine(vm, asObject(src))) {
+        // Its own async iterator, with its own `next`: nothing looked up, nothing called.
+        COPY(ins->a + 1, vm.origAsyncGenNext);
+        COPY(ins->a, src);
+        NEXT();
+    }
     if (src.isNullish()) {
         vm.throwError(ErrorCode::TypeError, describe(vm, src) + " is not async iterable");
         FAIL();
@@ -4809,6 +4844,38 @@ int jitGenLeave(VM& vm, std::uint32_t index, std::uint64_t bits)
         return 1;
     }
     setReg(vm, R[ins->a], value);
+    return 1;
+}
+
+int jitAsyncIterNext(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const std::uint32_t it = c.ins->b;
+    const JSValue r = vm.call(c.R[it + 1], c.R[it], nullptr, 0);
+    if (r.isException())
+        return 0;
+    setReg(vm, c.R[c.ins->a], r);
+    return 1;
+}
+
+int jitIterUnpack(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const JSValue res = c.R[c.ins->b];
+    if (isObject(res) && vm.iterResultShape && asObject(res)->h.shape == vm.iterResultShape) {
+        // As `iterResult` made it: `value`, then `done`, in place (data properties, so nothing runs to read them).
+        const JSValue* inl = asObject(res)->inl();
+        copyReg(vm, c.R[c.ins->a], toBoolean(inl[1]) ? JSValue::hole() : inl[0]);
+        return 1;
+    }
+    JSValue value;
+    const int step = bi::iterResultStep(vm, res, &value);
+    if (step < 0)
+        return 0;
+    if (step == 0)
+        copyReg(vm, c.R[c.ins->a], JSValue::hole());
+    else
+        setReg(vm, c.R[c.ins->a], value);
     return 1;
 }
 

@@ -203,6 +203,8 @@ int jitEnvHas(VM& vm, std::uint32_t index);
 int jitDefPrivate(VM& vm, std::uint32_t index);
 int jitIterNext(VM& vm, std::uint32_t index);
 int jitIterClose(VM& vm, std::uint32_t index);
+int jitAsyncIterNext(VM& vm, std::uint32_t index);
+int jitIterUnpack(VM& vm, std::uint32_t index);
 int jitGetElem(VM& vm, std::uint32_t index);
 int jitGetSuperProp(VM& vm, std::uint32_t index);
 int jitPutElem(VM& vm, std::uint32_t index);

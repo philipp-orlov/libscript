@@ -15,14 +15,16 @@ namespace bi {
 
 JSValue iterResult(VM& vm, JSValue value, bool done)
 {
-    JSObject* o = vm.newObject(vm.protos.object, 2);
     if (vm.iterResultShape) {
-        // The same two properties in the same order: the shape they made before.
+        // The same two properties in the same order: the shape they made before (no root shape to look up).
+        auto* o = static_cast<JSObject*>(vm.allocCell(JSObject::bytesFor(2), Kind::Object, ObjClass::Plain, 2));
         o->h.shape = vm.iterResultShape;
+        o->slots = nullptr;
         o->inl()[0] = value;
         o->inl()[1] = JSValue::boolean(done);
         return toJSValue(o);
     }
+    JSObject* o = vm.newObject(vm.protos.object, 2);
     Handle keep = Handle::adopt(toJSValue(o));
     o->putOwn(vm, vm.atoms.value, value, attr::kDefault);
     o->putOwn(vm, vm.atoms.done, JSValue::boolean(done), attr::kDefault);

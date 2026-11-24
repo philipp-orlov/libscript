@@ -162,8 +162,9 @@ bool initialize(VM& vm, JSObject* o, StringView pattern, StringView flagText)
     return initializeWith(vm, o, text);
 }
 
-/// A RegExp object, its state (of `text`, whose count it takes) in its own cell; not yet with its `lastIndex`.
-JSObject* newRegExpCell(VM& vm, RegExpText* text)
+/// A RegExp object, its state (of `text`, whose count it takes) in its own cell, with the shape `shape` (the root, when
+/// null), whose slots it leaves to the caller.
+JSObject* newRegExpCell(VM& vm, RegExpText* text, const Shape* shape)
 {
     constexpr std::uint8_t aux = 3;
     JSObject* o;
@@ -174,7 +175,7 @@ JSObject* newRegExpCell(VM& vm, RegExpText* text)
         text->release();
         throw;
     }
-    o->h.shape = vm.rootShapeFor(vm.protos.regexp, aux)->id;
+    o->h.shape = (shape ? shape : vm.rootShapeFor(vm.protos.regexp, aux))->id;
     o->slots = nullptr;
     ::new (static_cast<void*>(o->embeddedState())) RegExpData(text);
     return o;
@@ -1799,9 +1800,14 @@ JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags)
     }
     auto* text = static_cast<RegExpText*>(l.text.get());
     ++text->refs;
-    JSObject* o = newRegExpCell(vm, text);
+    JSObject* o = newRegExpCell(vm, text, vm.regexpLiteralShape);
     Handle keep = Handle::adopt(toJSValue(o));
+    if (vm.regexpLiteralShape) {
+        *o->slotAt(0) = JSValue::int32(0);
+        return keep.take();
+    }
     o->putOwn(vm, vm.atoms.lastIndex, JSValue::int32(0), attr::kWritable);
+    vm.regexpLiteralShape = vm.shapeById(o->h.shape);
     return keep.take();
 }
 

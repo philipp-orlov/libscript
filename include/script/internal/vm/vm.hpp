@@ -596,6 +596,8 @@ struct VM : EngineRuntime
     std::uint32_t promiseEpoch = ~0u;
     /// The root shape of a promise of `protos.promise` (three slots), which lives as long as that prototype: found once.
     Shape* promiseRoot = nullptr;
+    /// The shape of a RegExp literal as made: `RegExp.prototype`'s root with `lastIndex` (which lives as long as that prototype).
+    Shape* regexpLiteralShape = nullptr;
     /// Prototypes found to have no enumerable name, and the shape they had then (compared, not followed).
     struct ForInProto
     {

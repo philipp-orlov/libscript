@@ -618,6 +618,18 @@ void perfMapNote(const void* rx, std::size_t bytes, const CodeBlock* code, const
 }
 #endif
 
+/// The name of `code` for the instruction maps (T1MAP, T2MAP): no spaces.
+std::string mapName(const CodeBlock* code)
+{
+    std::string nm = code->name ? toUtf8(static_cast<StringCell*>(code->name)->text()) : std::string("anon");
+    if (nm.empty())
+        nm = "anon";
+    for (char& c : nm)
+        if (c == ' ' || c == '\n' || c == '\t')
+            c = '_';
+    return nm;
+}
+
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
 int tier2Compiles = 0;
 #endif
@@ -7309,6 +7321,18 @@ void compileTier1(VM& vm, CodeBlock* code)
         }
     }
     perfMapNote(t->rx, t->bytes, code, "js");
+    if (const char* mapFile = std::getenv("T1MAP")) {
+        // One line per instruction: code address, function, line, opcode, offset, bytecode index.
+        if (std::FILE* f = std::fopen(mapFile, "a")) {
+            const std::string nm = mapName(code);
+            for (std::uint32_t j = 0; j < code->code.size(); j = opt::nextOf(*code, j))
+                if (t->labels[j] != ~0u)
+                    std::fprintf(f, "%llx %s %u %s %u %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(t->rx)),
+                                 nm.c_str(), unsigned(code->lines.empty() ? 0 : code->lines[0]), opName(code->code[j].opcode()),
+                                 unsigned(t->labels[j]), unsigned(j));
+            std::fclose(f);
+        }
+    }
 #endif
 }
 

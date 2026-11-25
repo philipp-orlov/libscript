@@ -1353,13 +1353,15 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
         return fail();
     commitCode(span, a_.buf.data(), a_.buf.size());
     if (const char* mapFile = std::getenv("T2MAP")) {
-        // One line per instruction: where its code starts (as the optimizing compiler writes them).
+        // One line per instruction: code address, function, line, opcode, offset, bytecode index, and n (native), g
+        // (generic, through ssaGeneric) or e (eliminated).
         if (std::FILE* f = std::fopen(mapFile, "a")) {
+            const std::string nm = mapName(code_);
             for (std::uint32_t j = 0; j < n_; j += length(j))
                 if (offsets_[j] != ~0u)
-                    std::fprintf(f, "%llx %s %u %s %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(span.rx)),
-                                 "fn", unsigned(code_->lines.empty() ? 0 : code_->lines[0]), opName(code_->code[j].opcode()),
-                                 unsigned(offsets_[j]));
+                    std::fprintf(f, "%llx %s %u %s %u %u %c\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(span.rx)),
+                                 nm.c_str(), unsigned(code_->lines.empty() ? 0 : code_->lines[0]), opName(code_->code[j].opcode()),
+                                 unsigned(offsets_[j]), unsigned(j), elim_[j] ? 'e' : native_[j] ? 'n' : 'g');
             std::fclose(f);
         }
     }

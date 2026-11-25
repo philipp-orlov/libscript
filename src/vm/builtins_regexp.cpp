@@ -223,6 +223,9 @@ JSValue* ownLastIndex(VM& vm, JSObject* o)
 {
     if (o->cls() != ObjClass::RegExpCell)
         return nullptr;
+    // The shape a literal's RegExp has (`newRegExpLiteral`), without a look into the shape table.
+    if (vm.regexpLiteralShape && o->h.shape == vm.regexpLiteralShape->id)
+        return o->slotAt(0);
     const Shape* own = vm.shapeById(o->h.shape);
     return own->count == 1 && own->key == vm.atoms.lastIndex && own->attrs == attr::kWritable ? o->slotAt(0) : nullptr;
 }

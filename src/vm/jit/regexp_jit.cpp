@@ -664,6 +664,11 @@ private:
     /// Goes to `to` unless what the next unit says lets the branch begin. Nothing when it says nothing.
     void splitOn(std::uint32_t on, std::uint32_t off)
     {
+        if (code_[on] == OpLineStart) {
+            // `^` (not multiline) past the start: that branch fails at once, so the other is taken with nothing pushed.
+            a_.test32(R12, R12);
+            a_.jcc(CNE, at_[off]);
+        }
         const First a = firstOf(on), b = firstOf(off);
         if (a.open && b.open) {
             choice(off);

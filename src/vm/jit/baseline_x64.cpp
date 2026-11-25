@@ -992,6 +992,22 @@ extern "C" std::uint64_t scriptVmJitNewThis(VM* vm, JSFunction* f, std::uint32_t
 
 /// `s += y` where the register holds the only count of a string with room for `y`'s characters: they are copied in
 /// place. Allocates nothing, so it needs no frame state; false, with nothing done, for anything else.
+/// `a + b` of two strings at instruction `index`, the operands in registers: the result as `handOver` gives it, 0 for an
+/// exception. (What `jitBinary` does for them, without reading the instruction and the frame's registers.)
+extern "C" std::uint64_t scriptVmJitConcat(VM* vm, std::uint32_t index, std::uint64_t a, std::uint64_t b) noexcept
+{
+    Frame* fr = vm->frameTop - 1;
+    fr->pc = fr->code->code.data() + index + 1;
+    vm->stackTop = fr->R + fr->code->nregs;
+    try {
+        const JSValue r = concatStrings(*vm, JSValue::raw(a), JSValue::raw(b));
+        return r.isException() ? 0 : handOver(*vm, r.bits);
+    } catch (...) {
+        pendingException = std::current_exception();
+        return 0;
+    }
+}
+
 extern "C" bool scriptVmJitAppendInPlace(JSValue* slot, std::uint64_t yBits) noexcept
 {
     const JSValue y{yBits};
@@ -4434,9 +4450,29 @@ void Baseline::arith(std::uint32_t i, const Ins& in)
             a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitAppendInPlace));
             restorePool(i);
             a_.aluI32(4, RAX, 0xFF);  // a bool comes back in al alone
-            a_.jcc(CE, bad);
-            a_.jmp(done);
+            a_.jcc(CNE, done);
+            a_.mov(RAX, R(in.b));
+            a_.mov(RCX, R(in.c));
             a_.bind(notCell);
+        }
+        if (op == Op::Add) {
+            // Two strings: joined by the runtime, called with them.
+            Label notStrings;
+            needString(RAX, notStrings);
+            needString(RCX, notStrings);
+            throws_.emplace_back(i, Label{});
+            Label& exc = throws_.back().second;
+            savePool(i);
+            a_.mov(RDX, RAX);
+            a_.mov(RDI, R12);
+            a_.movImm(RSI, i);
+            a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitConcat));
+            restorePool(i);
+            a_.test(RAX, RAX);
+            a_.jcc(CE, exc);
+            write(in.a, RAX);
+            a_.jmp(done);
+            a_.bind(notStrings);
         }
         needNumber(RAX, bad);
         needNumber(RCX, bad);

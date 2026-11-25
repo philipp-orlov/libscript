@@ -36,7 +36,7 @@ JSObject* VM::newObject(JSObject* proto, std::uint8_t aux)
 BufferState::~BufferState()
 {
     if (data) {
-        std::free(data);
+        vm->freePayload(data, capacity ? capacity : 1);
         data = nullptr;
     }
 }
@@ -79,17 +79,22 @@ JSObject* VM::newArrayBuffer(std::size_t bytes, std::size_t maxBytes, bool resiz
         throwError(ErrorCode::RangeError, "Array buffer allocation failed");
         return nullptr;
     }
-    ctx.reserve(capacity);
+    // The bytes come from the payload pool and count as heap bytes: a program that drops large buffers reaches the next
+    // scan and the collector by them (`noteLarge`), and the general allocator is not called. Only the bytes in use are
+    // zeroed; a resize zeroes what it adds.
+    std::uint8_t* data;
+    try {
+        data = static_cast<std::uint8_t*>(allocPayload(capacity ? capacity : 1));
+    } catch (const std::bad_alloc&) {
+        throwError(ErrorCode::RangeError, "Array buffer allocation failed");
+        return nullptr;
+    }
+    std::memset(data, 0, bytes);
     auto* state = new BufferState();
     state->vm = this;
     state->resizable = resizable;
     state->capacity = capacity;
-    state->data = static_cast<std::uint8_t*>(std::calloc(capacity ? capacity : 1, 1));
-    if (!state->data) {
-        delete state;
-        throwError(ErrorCode::RangeError, "Array buffer allocation failed");
-        return nullptr;
-    }
+    state->data = data;
     state->size = bytes;
     JSObject* o = newObject(protos.arrayBuffer);
     o->h.cls = std::uint8_t(ObjClass::ArrayBuffer);

@@ -175,8 +175,8 @@ NATIVE(arrayBufferResize)
     if (length > double(b->capacity) || (shared && length < double(b->size)))
         return vm.throwError(ErrorCode::RangeError, "ArrayBuffer.prototype.resize: Invalid length parameter");
     const std::size_t n = std::size_t(length);
-    if (n < b->size)
-        std::memset(b->data + n, 0, b->size - n);
+    if (n > b->size)
+        std::memset(b->data + b->size, 0, n - b->size);  // what is past the size was never zeroed
     b->size = n;
     b->refreshViews();
     vm.epochMoved();  // optimized code may know the array of a global
@@ -201,7 +201,7 @@ NATIVE(arrayBufferTransfer)
         return JSValue::exception();
     auto* fresh = static_cast<BufferState*>(o->rare()->ext);
     std::memcpy(fresh->data, b->data, std::min(std::size_t(length), b->size));
-    std::free(b->data);
+    vm.freePayload(b->data, b->capacity ? b->capacity : 1);
     b->data = nullptr;
     b->size = 0;
     b->capacity = 0;

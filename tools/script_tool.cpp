@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include "base/status.hpp"
 #include "script/script.hpp"
 #include "sys/file.hpp"
@@ -234,6 +238,27 @@ void installShell(script::Context& ctx, script::Language language)
         ci.context().collectGarbage();
         return script::Value();
     }, 0));
+    // One line of memory figures on stderr, for a soak (tools/perf/soak.sh): the resident size and what `stats()` counts.
+    ctx.global().set("memoryReport", ctx.function("memoryReport", [](script::CallInfo& ci) -> script::Value {
+        unsigned long long pages = 0, resident = 0;
+        if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+            if (std::fscanf(f, "%llu %llu", &pages, &resident) != 2)
+                resident = 0;
+            std::fclose(f);
+        }
+        const script::Context::Stats s = ci.context().stats();
+        unsigned long long mallocUsed = 0, mallocFree = 0;
+#if defined(__GLIBC__)
+        const struct mallinfo2 mi = mallinfo2();
+        mallocUsed = mi.uordblks + mi.hblkhd;  // in use: from the arenas, and mapped blocks
+        mallocFree = mi.fordblks;              // free inside the arenas, not given back
+#endif
+        std::fprintf(stderr, "MEM %s rss %llu heap %llu objects %llu strings %llu reserved %llu code %llu malloc %llu mfree %llu\n",
+                     ci.size() ? ci.arg(0).toString().c_str() : "-", resident * 4096ull, (unsigned long long)s.heapBytes,
+                     (unsigned long long)s.liveObjects, (unsigned long long)s.liveStrings,
+                     (unsigned long long)s.reservedBytes, (unsigned long long)s.nativeCodeBytes, mallocUsed, mallocFree);
+        return script::Value();
+    }, 1));
 }
 
 int main(int argc, char** argv)

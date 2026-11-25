@@ -779,7 +779,33 @@ void Baseline::ssaStepJump(std::uint32_t b, std::uint32_t i)
     ssaSync(reads, bl.liveOut, std::vector<std::uint8_t>(code_->nregs, 0));
     if (ssaFailed_)
         return;
+    const Ins& in = code_->code[i];
+    Label decided;
+    if (in.opcode() >= Op::JLt && in.opcode() <= Op::JNotGe) {
+        // Two strings (a sort's comparator): compared by their units here, as the step would (nothing runs or is collected).
+        Label step, taken;
+        a_.mov(RAX, R(in.a));
+        a_.mov(RCX, R(in.b));
+        needString(RAX, step);
+        needString(RCX, step);
+        const std::vector<int> keep = ssaLiveRegs();
+        ssaSaveRegs(keep);
+        a_.mov(RDI, RAX);
+        a_.mov(RSI, RCX);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaCompareStrings));
+        a_.callC(RAX);
+        ssaRestoreRegs(keep);
+        a_.aluI32(7, RAX, 0);
+        a_.jcc(relationOf(in.opcode()).ic, taken);
+        a_.movImm(RAX, std::uint64_t(kStepFall));
+        a_.jmp(decided);
+        a_.bind(taken);
+        a_.movImm(RAX, std::uint64_t(kStepJump));
+        a_.jmp(decided);
+        a_.bind(step);
+    }
     callStep(i);
+    a_.bind(decided);
     ssaKeepsDrop(usePos_[i] + 1);
     const std::vector<std::uint32_t> after = frame_;
     Label notTaken, fall;

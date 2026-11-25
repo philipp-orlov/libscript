@@ -1071,7 +1071,7 @@ extern "C" void scriptVmJitFree(CellPtr cell)
 /// The SSA tier's `new` made in place, when the heap's current block has no room or a collection is due: the object as
 /// `VM::newObject` makes it, with the shape the constructor gives it (its slots are filled by the caller). Null when the
 /// runtime refused.
-/// -1, 0 or 1 (as an int32 in the low half) for two flat strings.
+/// -1, 0 or 1 (as an int32 in the low half) for two strings (a rope is joined for it).
 extern "C" std::uint64_t scriptVmSsaCompareStrings(std::uint64_t a, std::uint64_t b)
 {
     return std::uint32_t(compareStrings(JSValue::raw(a), JSValue::raw(b)));

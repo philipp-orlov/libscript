@@ -426,7 +426,29 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
             frame_[r] = v;
             if (hasLoc(v)) {
                 a_.mov(RAX, R(r));
-                storeTagged(v, RAX);
+                if (sval_[v].rep == kRepTagged) {
+                    storeTagged(v, RAX);
+                    continue;
+                }
+                // A result taken for a number (`ssaSpecCall`): checked here; else on after the call (exit kind 6).
+                ssaExits_.push_back(SsaExit{i, name_, frame_, curLiveAfter_, Label{}});
+                ssaExits_.back().kind = 6;
+                Label& bad = ssaExits_.back().label;
+                if (sval_[v].rep == kRepI32) {
+                    needInt(RAX, bad);
+                    vDef_[v] = vKnown_[v] = kVInt | kVNotCell;
+                    if (sval_[v].reg >= 0)
+                        a_.mov32(Reg(sval_[v].reg), RAX);
+                    else
+                        a_.mov32(slotOf(v), RAX);
+                } else {
+                    needNumber(RAX, bad);
+                    vDef_[v] = vKnown_[v] = kVNotCell;
+                    const int x = sval_[v].reg >= 0 ? sval_[v].reg : 0;
+                    loadNumber(x, RAX, RDX);
+                    if (sval_[v].reg < 0)
+                        a_.movsdStore(slotOf(v), 0);
+                }
             }
         }
 }
@@ -4503,7 +4525,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : elemRep[sv.at];
             if (ssaOn_ >= 2 && cls[v] == 3 && (ssaLengthSite(sv.at) || ssaCharCodeCallee(sv.at)))
                 cls[v] = 1;  // an int32 when it does not leave
-            else if (cls[v] == 3 && ssaSpecLoad(sv.at)) {
+            else if (cls[v] == 3 && (ssaSpecLoad(sv.at) || ssaSpecCall(sv.at))) {
                 const std::uint8_t p = code_->prof[sv.at] & 11;
                 cls[v] = p == 1 ? 1 : 2;  // what the load has made: int32s only, or numbers
             }
@@ -5827,6 +5849,17 @@ bool Baseline::ssaElemQuiet(std::uint32_t i) const
 {
     return ssaOn_ >= 2 && !(i < code_->prof.size() &&
                             (code_->prof[i] & (opt::kProfFailed | opt::kProfNoSpec | opt::kProfWidened)));
+}
+
+/// Whether the result of call `i` (through its template) is taken for an int32 or a number by what it has made: checked
+/// right after the call (exit kind 6 goes on after it in the baseline code).
+bool Baseline::ssaSpecCall(std::uint32_t i)
+{
+    if (ssaOn_ < 2 || i >= code_->prof.size() || code_->code[i].opcode() != Op::Call || mathOf_[i] || viewOf_[i] ||
+        ssaCharCodeCallee(i) || (code_->prof[i] & (opt::kProfFailed | opt::kProfNoSpec)))
+        return false;
+    const std::uint8_t p = code_->prof[i] & 11;
+    return p == 1 || p == 2 || p == 3;
 }
 
 /// Whether load `i` (a data property, an upvalue, a box) is taken for a number by what it has made (`CodeBlock::prof`):

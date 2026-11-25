@@ -447,6 +447,19 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                 kind = 2;
             }
         }
+        if (kind == 6) {
+            // A call's result was not what its profile said (no failure): the result is in its register; the code goes on
+            // after the call in the baseline code, and the next compile takes such a result for a number, or boxed.
+            if (index < code->prof.size()) {
+                if ((code->prof[index] & 11) == 1)
+                    code->prof[index] |= 2 | opt::kProfWidened;
+                else
+                    code->prof[index] |= opt::kProfNoSpec;
+            }
+            if (code->tier2 && code->tier1 && code->tier1->entry == code->tier2->entry)
+                retireTier2(*vm, code);
+            return kStepFall;
+        }
         if (kind == 4) {
             // A loaded value was not what its profile said (no failure). The step below notes what it is, so a value taken
             // for an int32 is taken for a number next; one taken for a number is kept boxed.
@@ -3318,6 +3331,7 @@ public:
     Tier2Code* compileSsa(ssa::Graph& g, Tier1Code* base);
     void lirBuild(const ssa::Graph& g, lir::Func& f);
     bool ssaSpecLoad(std::uint32_t i);
+    bool ssaSpecCall(std::uint32_t i);
     bool ssaElemQuiet(std::uint32_t i) const;
     const char* ssaWhy_ = "";
     int ssaOn_ = 2;  ///< SCRIPT_VM_SSA: 1 every instruction through the frame, 2 the fast paths too

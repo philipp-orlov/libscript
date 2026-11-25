@@ -696,10 +696,13 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                 return false;
             if (emit && boxInRdi == std::int64_t(ci.a)) {
                 // The box the read before found, in rdi: the value stored through it.
+                // (A young box counts nothing: the store alone.)
                 inlineBoxed(v);
+                boxWrite(RDI);
+                Label yng, stored;
+                ifYoung(RDI, yng);
                 if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
                     retain(RAX);
-                boxWrite(RDI);
                 if (upNumber[ci.a] == std::int64_t(cx.epoch)) {
                     a_.mov(mem(RDI, kBoxValue), RAX);  // over a number seen since the last effect
                 } else {
@@ -707,20 +710,34 @@ bool Baseline::inlineBody(InlineCtx& cx, CodeBlock* C, const IVal& callee, JSVal
                     a_.mov(mem(RDI, kBoxValue), RAX);
                     release(RSI);
                 }
+                if (youngStores()) {
+                    a_.jmp(stored);
+                    a_.bind(yng);
+                    a_.mov(mem(RDI, kBoxValue), RAX);
+                    a_.bind(stored);
+                }
             } else if (emit) {
                 inlineBoxed(v);
                 a_.mov(RCX, RAX);
-                if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
-                    retain(RCX);
                 loadCallee();
                 a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * ci.a)));
                 boxWrite(RAX);
+                Label yng, stored;
+                ifYoung(RAX, yng);
+                if (v.kind == IVal::Box || (v.kind == IVal::Const && v.c.isCell()))
+                    retain(RCX);
                 if (upNumber[ci.a] == std::int64_t(cx.epoch)) {
                     a_.mov(mem(RAX, kBoxValue), RCX);  // over a number seen since the last effect
                 } else {
                     a_.mov(RSI, mem(RAX, kBoxValue));
                     a_.mov(mem(RAX, kBoxValue), RCX);
                     release(RSI);
+                }
+                if (youngStores()) {
+                    a_.jmp(stored);
+                    a_.bind(yng);
+                    a_.mov(mem(RAX, kBoxValue), RCX);
+                    a_.bind(stored);
                 }
             }
             boxInRdi = -1;

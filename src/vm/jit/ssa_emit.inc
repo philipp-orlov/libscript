@@ -6512,11 +6512,7 @@ bool Baseline::ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter)
         boxWrite(RAX);
         epochSeen_ = false;
         loadValue(name_[in.b], RCX);
-        if (mayBeCell(name_[in.b]))
-            retain(RCX);
-        a_.mov(RSI, mem(RAX, kBoxValue));
-        a_.mov(mem(RAX, kBoxValue), RCX);
-        release(RSI);
+        storeBoxCounted(mayBeCell(name_[in.b]));
         return true;
     }
     case Op::ToNumeric: {

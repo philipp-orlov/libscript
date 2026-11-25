@@ -665,6 +665,7 @@ struct VM : EngineRuntime
     {
         JSValue pattern = JSValue::raw(0), flags = JSValue::raw(0);
         std::shared_ptr<void> text;  ///< what its RegExps share (builtins_regexp.cpp)
+        JSValue shared = JSValue::raw(0);  ///< the one RegExp of a site that `Op::SharedRegExp` reads (counted), or none
     };
     /// 512 entries: a program with many literals (a lexer, an assembler's parser) keeps them all. Out of the VM, whose
     /// other fields keep their places.
@@ -790,6 +791,10 @@ private:
     Vec<CellPtr> youngWork_;
     Vec<AllocSite*> siteChunks_;
     std::uint32_t siteCount_ = 1;  ///< 0 is no site
+    /// The sites of code that is gone, for the next code: a host that compiles new programs for ever keeps as many site
+    /// records as its live code has allocation instructions. (A young cell may still name such a site: the scan then
+    /// counts it for the site's next owner, which only moves a statistic.)
+    Vec<std::uint32_t> freeSites_;
     /// Mark, make old and free the young cells, as said above. `registers`: the frames' cells are not counted now, and are
     /// looked at as well.
     void collectYoung(bool registers) noexcept;

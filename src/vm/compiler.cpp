@@ -1251,6 +1251,7 @@ private:
     std::uint16_t member(const Node& n, int dst);
     std::uint16_t call(const Node& n, int dst, bool isNew);
     std::uint16_t chainRoot(const Node& n, int dst, bool isNew);
+    const Node* sharedLiteral_ = nullptr;  ///< the RegExp literal that is the receiver of the `test` or `exec` being compiled
     std::uint16_t unary(const Node& n, int dst);
     std::uint16_t update(const Node& n, int dst, bool discard);
     std::uint16_t binary(const Node& n, int dst);
@@ -1641,7 +1642,7 @@ std::uint16_t Compiler::expr(const Node& n, int dst)
             const std::uint16_t d = dest(dst);
             const std::uint16_t pattern = constant(fromValue(vm_, ctx_.str(n.text)));
             const std::uint16_t flags = constant(fromValue(vm_, ctx_.str(n.extra().strs[0])));
-            emit(Op::NewRegExp, d, pattern, flags);
+            emit(&n == sharedLiteral_ ? Op::SharedRegExp : Op::NewRegExp, d, pattern, flags);
             return d;
         }
         case NK::NewTarget: {
@@ -3028,6 +3029,13 @@ std::uint16_t Compiler::call(const Node& n, int dst, bool isNew)
         if (target && target->kind == NK::FunctionExpr)
             calledAtOnce_.insert(target);
     }
+    // `/^b/.test(s)`: the literal is the receiver of this call and nothing else, and without `g` and `y` the call leaves
+    // it as it was. It is the one RegExp of its site (`Op::SharedRegExp`).
+    if (!isNew && !n.optional && callee.kind == NK::Member && !callee.computed && !callee.optional && callee.a &&
+        callee.a->kind == NK::RegExpLit && (callee.text == u"test" || callee.text == u"exec") && callee.a->hasExtra() &&
+        !callee.a->extra().strs.empty() && callee.a->extra().strs[0].find(u'g') == String::npos &&
+        callee.a->extra().strs[0].find(u'y') == String::npos)
+        sharedLiteral_ = callee.a.get();
     const bool superCall = callee.kind == NK::SuperExpr;
     if (superCall && (isNew || (fn_->isArrow ? resolve(String(u"%callee")).kind == Ref::Global
                                               : !((fn_->block->flags & CodeBlock::kClassConstructor) && (fn_->block->flags & CodeBlock::kDerived)))))

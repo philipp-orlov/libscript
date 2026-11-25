@@ -1973,8 +1973,10 @@ L_PutBox: {
     const JSValue old = box->value;
     vm.boxWritten(box);
     box->value = R[ins->b];
-    retain(box->value);
-    release(old);
+    if (!vm.youngHeader(&box->h)) [[likely]] {  // (a young box counts nothing)
+        retain(box->value);
+        release(old);
+    }
     NEXT();
 }
 L_CopyBox: {
@@ -1992,8 +1994,10 @@ L_PutUpval: {
     const JSValue old = box->value;
     vm.boxWritten(box);
     box->value = R[ins->b];
-    retain(box->value);
-    release(old);
+    if (!vm.youngHeader(&box->h)) [[likely]] {  // (a young box counts nothing)
+        retain(box->value);
+        release(old);
+    }
     NEXT();
 }
 L_LoadCallee:
@@ -3725,6 +3729,15 @@ L_NewRegExp: {
     SET(ins->a, r);
     NEXT();
 }
+L_SharedRegExp: {
+    // A literal that is only the receiver of `test` or `exec`: the one RegExp of its site, while nothing can tell.
+    fr->pc = pc;
+    JSValue r = bi::sharedRegExpLiteral(vm, K[ins->b], K[ins->c]);
+    if (r.isException())
+        FAIL();
+    SET(ins->a, r);
+    NEXT();
+}
 L_AsyncIterInit: {
     // `for await` and `yield*` in an async generator: the object's async iterator, or its sync one wrapped to look async.
     fr->pc = pc;
@@ -4739,6 +4752,17 @@ int jitNewRegExp(VM& vm, std::uint32_t index)
     JitCtx c = jitCtx(vm, index, false);
     const Ins* ins = c.ins;
     JSValue r = bi::newRegExpLiteral(vm, c.code->consts[ins->b], c.code->consts[ins->c]);
+    if (r.isException())
+        return 0;
+    setReg(vm, c.R[ins->a], r);
+    return 1;
+}
+
+int jitSharedRegExp(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const Ins* ins = c.ins;
+    JSValue r = bi::sharedRegExpLiteral(vm, c.code->consts[ins->b], c.code->consts[ins->c]);
     if (r.isException())
         return 0;
     setReg(vm, c.R[ins->a], r);

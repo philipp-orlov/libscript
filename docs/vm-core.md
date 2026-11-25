@@ -337,21 +337,28 @@ Tests run in both modes: `SCRIPT_VM_DEFERRED=0` and `=1` set the mode in a build
 
 ## Young cells
 
-With deferred frames, a new plain object can be young (`VM::young`). Most objects die before the next scan. A young cell is
-freed without a look at what it holds, and a store into it counts nothing. These rules keep it sound:
+With deferred frames, a new plain object, closure or box can be young (`VM::young`). Most of them die before the next scan. A
+young cell is freed without a look at what it holds, and a store into it counts nothing. A cycle of young cells that nothing
+holds (a closure and the box of the variable that holds it) goes at the next scan, with no cycle collection. These rules keep
+it sound:
 
 1. A young cell has the bit `VM::kYoungGc` in its `gc` word, its allocation site above bit 8, and is in the young list
-   (`youngBase_`..`youngTop_`). Only a plain object without `Rare` is young. Compiled code makes young objects
-   (`allocObject`), as do `scriptVmJitNewThis` and `scriptVmSsaNewObject` for it. The runtime makes old ones.
+   (`youngBase_`..`youngTop_`). A young cell is a plain object or a closure without `Rare`, or a box. Compiled code makes
+   young cells (`allocObject`, and the `Closure` and `NewBox` templates through `allocCellHere`), as do `scriptVmJitNewThis`
+   and `scriptVmSsaNewObject` for it. The runtime makes old ones.
 2. A young cell holds no count of what its slots hold. Its own count is what old cells, handles and the runtime hold. A count
    of a young cell that reaches zero does nothing: the cell does not go into the zero-count table.
-3. A store into a slot of a young object neither counts the new value nor lets go of the old one. The interpreter's caches
-   (`storeSlot`, `storeNewSlot`) and compiled code (`storeSlotCounted`, `retainInto`, `ifYoung`) test for this.
+3. A store into a slot of a young object, or into a young box, neither counts the new value nor lets go of the old one. The
+   interpreter's caches (`storeSlot`, `storeNewSlot`), its `PutBox` and `PutUpval`, and compiled code (`storeSlotCounted`,
+   `storeBoxCounted`, `retainInto`, `ifYoung`) test for this. A young closure holds no count of its boxes. It does hold a
+   count of its code, which the scan lets go of when the closure is dead.
 4. Any other path makes the object old first (`VM::makeOld`): `findOwn`, `addProperty`, `deleteOwn`, `setAttrs`, `rareOf`,
    and a prototype change. An old cell takes a count of each cell its slots hold. A cell held by nothing then goes into the
    zero-count table.
-5. A scan first marks the young cells that a live register holds or that have a count, and what they reach among the young.
-   It makes the marked cells old and frees the others. Then it counts the frames' cells and frees the table as before.
+5. A scan first marks the young cells that a live register holds or that have a count, and what they reach among the young
+   (`forEachYoungValue`: properties, a closure's boxes, a box's value). It makes the marked cells old and frees the others
+   (`mem::LocalHeap::FreeRun`: one update of a block for a row of dead cells in it). Then it counts the frames' cells and
+   frees the table as before.
 6. While a young cell exists, no free is immediate: a young cell may hold a cell without a count. A collection and the
    context's end see no young cell (`rootsBegin`, `releaseRoots`). A collection writes the `gc` word of the cells it looks
    at, so the runtime takes a cell for young only while the list holds any (`VM::youngHeader`).
@@ -360,16 +367,20 @@ freed without a look at what it holds, and a store into it counts nothing. These
 8. Between jobs, with no frame, the young cells are collected without a scan of the table (`collectYoungAtHost`): what no
    frame holds is freed at once again. A free that frees what a cell holds leaves a cell that is in the table there; the
    next scan frees it.
-9. Each allocation site (`VM::allocSiteFor`, one per instruction) counts how many of its cells a scan found alive. When seven
-   of eight lived in a window of `VM::kSiteWindow` cells, the site makes old cells from then on (`AllocSite::old`): making a
-   cell old costs more than counting its values while they are stored.
+9. Each allocation site (`VM::allocSiteFor`, one per instruction) learns how many of its cells a scan found alive, from one
+   cell in seven of the list. When seven of eight lived in a window of `VM::kSiteWindow` cells, the site makes old cells from
+   then on (`AllocSite::old`): making a cell old costs more than counting its values while they are stored.
 10. A young cell is not in the live-cell counts and does not compare the cell budgets when it is made (`uncountYoung`).
    It is counted when it lives on (`makeOld`, or a survivor of `collectYoung`). A dead young cell was never counted.
    `Context::stats()` adds the young cells that are still in the list (`VM::youngLive`).
 
-What young cells do not cover yet: arrays, strings, closures, boxes, generator and promise cells, and every object that the
-runtime makes. Those are counted from birth, go into the zero-count table at zero, and are freed one at a time
-(`destroyFrom`).
+What young cells do not cover yet: arrays, strings, generator and promise cells, and every cell that the runtime makes
+(closures and boxes of the interpreter too). Those are counted from birth, go into the zero-count table at zero, and are
+freed one at a time (`destroyFrom`). An old cell that dies holds counts of young cells until the scan frees it, so those
+young cells live one scan longer.
+
+A scan also runs when the zero-count table is full, which in a program that makes many arrays is long before the young list
+is (cdjs: a scan for each 235 young cells before closures and boxes were young).
 
 Young cells are on with deferred frames. `SCRIPT_VM_YOUNG=0` turns them off in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
 
@@ -424,8 +435,12 @@ A literal `InitProp` (`{a: 1, b: 2}`) in baseline code whose cache was empty at 
   entry, and a failure there goes on at the next start position. Only for programs of plain instructions.
 - Start search: the first unit by a SIMD scan; without one, a unit that every match has at a fixed distance from its
   start is looked for first.
-- Each regular-expression literal site keeps its `RegExp` in a table of 512 entries (`VM::regexpLiterals`). A literal
+- Each regular-expression literal site keeps its compiled program in a table of 512 entries (`VM::regexpLiterals`). A literal
   `RegExp` that the program did not change reads its `lastIndex` by its shape (`VM::regexpLiteralShape`).
+- A literal without `g` and `y` that is only the receiver of `test` or `exec` (`/^b/.test(s)`) is one object for its site
+  (`Op::SharedRegExp`, `sharedRegExpLiteral`), while `RegExp.prototype` has its original methods. Such a call neither changes
+  the object nor hands it to the program. `regexpTest` lets go of all shared objects before a replaced `exec` gets one as
+  `this`, so the program sees such an object once only.
 - Not done: a dispatch on the code point for Unicode alternations whose branches all begin with the same lead surrogate.
 
 ## Rules the code keeps

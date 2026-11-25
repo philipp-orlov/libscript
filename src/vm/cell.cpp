@@ -687,16 +687,34 @@ JSValue* VM::liveTop() const noexcept
 
 namespace {
 
-/// The values of a young cell: a plain object without `Rare` (the only kind that is young). `n` gets the count of those in
-/// the cell; `more` and `nMore` those in its slot buffer.
-inline const JSValue* youngValues(VM& vm, CellPtr cell, std::uint32_t& n, const JSValue*& more, std::uint32_t& nMore) noexcept
+/// Calls `f` with each value a young cell holds. A young cell is a plain object or a closure without `Rare` (its
+/// properties, and a closure's variables), or a box (its value).
+template <class F>
+inline void forEachYoungValue(VM& vm, CellPtr cell, F&& f) noexcept
 {
+    if (kindOf(cell) == Kind::Box) {
+        f(reinterpret_cast<Box*>(cell)->value);
+        return;
+    }
     auto* o = reinterpret_cast<JSObject*>(cell);
+    if (o->cls() == ObjClass::Function) [[unlikely]] {
+        auto* fn = static_cast<JSFunction*>(o);
+        const std::uint32_t n = usedSlots(vm, o);
+        for (std::uint32_t i = 0; i < n; ++i)
+            f(*o->slotAt(i));
+        for (std::uint32_t i = 0; i < fn->nUpvals; ++i)
+            if (Box* b = fn->upvals()[i])
+                f(JSValue::cell(reinterpret_cast<CellPtr>(b)));
+        return;
+    }
     const std::uint32_t count = vm.shapeById(o->h.shape)->count;
-    n = count < o->h.aux ? count : o->h.aux;
-    more = o->slots;
-    nMore = count - n;
-    return o->inl();
+    const std::uint32_t n = count < o->h.aux ? count : o->h.aux;
+    const JSValue* values = o->inl();
+    for (std::uint32_t i = 0; i < n; ++i)
+        f(values[i]);
+    const JSValue* more = o->slots;
+    for (std::uint32_t i = 0; i < count - n; ++i)
+        f(more[i]);
 }
 
 }  // namespace
@@ -705,16 +723,11 @@ void VM::makeOld(CellPtr cell) noexcept
 {
     CellHeader* h = headerOf(cell);
     h->gc = 0;
-    countOld(JSObject::bytesFor(h->aux), 1);
-    std::uint32_t n, nMore;
-    const JSValue* more;
-    const JSValue* values = youngValues(*this, cell, n, more, nMore);
-    for (std::uint32_t i = 0; i < n; ++i)
-        if (values[i].isCell())
-            ++detail::cellCount(values[i].asCell());
-    for (std::uint32_t i = 0; i < nMore; ++i)
-        if (more[i].isCell())
-            ++detail::cellCount(more[i].asCell());
+    countOld(cellBytesOf(cell), 1);
+    forEachYoungValue(*this, cell, [](JSValue v) noexcept {
+        if (v.isCell())
+            ++detail::cellCount(v.asCell());
+    });
     if (h->rc == 0)
         zctPush(cell);  // a frame may hold it
 }
@@ -754,19 +767,12 @@ void VM::collectYoung(bool registers) noexcept
     while (!youngWork_.empty()) {
         const CellPtr c = youngWork_.back();
         youngWork_.pop_back();
-        std::uint32_t n, nMore;
-        const JSValue* more;
-        const JSValue* values = youngValues(*this, c, n, more, nMore);
-        for (std::uint32_t i = 0; i < n; ++i)
-            if (values[i].isCell()) {
-                mark(values[i]);
-                ++detail::cellCount(values[i].asCell());
+        forEachYoungValue(*this, c, [&](JSValue v) noexcept {
+            if (v.isCell()) {
+                mark(v);
+                ++detail::cellCount(v.asCell());
             }
-        for (std::uint32_t i = 0; i < nMore; ++i)
-            if (more[i].isCell()) {
-                mark(more[i]);
-                ++detail::cellCount(more[i].asCell());
-            }
+        });
     }
     // Sweep: a marked cell is old now (held by nothing but a frame, it goes into the zero-count table); one not marked is
     // freed. A cell made old before is no longer young. Each site learns how many of its cells lived.
@@ -799,14 +805,27 @@ void VM::collectYoung(bool registers) noexcept
         }
         if (gc & kYoungMarked) {
             h->gc = 0;
-            keptBytes += JSObject::bytesFor(h->aux);
+            keptBytes += cellBytesOf(c);
             ++keptCells;
             if (h->rc == 0)
                 zctPush(c);
         } else {
-            auto* o = reinterpret_cast<JSObject*>(c);
-            if (o->slots)
-                freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
+            if (kindOf(c) == Kind::Object) {
+                auto* o = reinterpret_cast<JSObject*>(c);
+                if (o->slots)
+                    freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
+                if (o->cls() == ObjClass::Function) [[unlikely]] {
+                    // A closure counts its code. (What letting go of code frees waits in the zero-count table while the
+                    // young list holds cells; the row of frees is closed first all the same.)
+                    auto* f = static_cast<JSFunction*>(o);
+                    if (f->code) {
+                        dead.flush();
+                        if (f->code->only == f)
+                            f->code->only = nullptr;
+                        releaseCode(f->code);
+                    }
+                }
+            }
             dead.add(c);
         }
     }
@@ -819,7 +838,7 @@ void VM::collectYoung(bool registers) noexcept
 
 void VM::uncountYoung(CellPtr cell) noexcept
 {
-    const std::size_t bytes = JSObject::bytesFor(headerOf(cell)->aux);
+    const std::size_t bytes = cellBytesOf(cell);
     ctx.heapBytes -= bytes;
     ownedBytes_ -= bytes;
     --ctx.liveObjects;
@@ -832,7 +851,7 @@ void VM::youngLive(std::size_t& cells, std::size_t& bytes) const noexcept
     for (CellPtr* p = youngBase_; p < youngTop_; ++p)
         if (headerOf(*p)->gc & kYoungGc) {
             ++cells;
-            bytes += JSObject::bytesFor(headerOf(*p)->aux);
+            bytes += cellBytesOf(*p);
         }
 }
 
@@ -843,6 +862,12 @@ std::uint32_t VM::allocSiteFor(CodeBlock* code, std::uint32_t index)
     std::uint32_t& id = code->allocSites[index];
     if (id)
         return id;
+    if (!freeSites_.empty()) {
+        id = freeSites_.back();
+        freeSites_.pop_back();
+        allocSite(id) = AllocSite();
+        return id;
+    }
     if (siteCount_ >= (1u << (32 - kSiteShift)))
         return 0;
     if ((siteCount_ >> 10) >= siteChunks_.size()) {
@@ -1504,6 +1529,8 @@ void VM::releaseRoots() noexcept
             release(l.pattern);
         if (l.flags.bits)
             release(l.flags);
+        if (l.shared.bits)
+            release(l.shared);
         l = RegExpLiteral{};
     }
     release(regexpCtor);

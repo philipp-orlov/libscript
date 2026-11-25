@@ -180,6 +180,14 @@ void VM::releaseCode(CodeBlock* code) noexcept
 {
     if (--code->refs != 0)
         return;
+    for (std::uint32_t site : code->allocSites)
+        if (site) {
+            try {
+                freeSites_.push_back(site);
+            } catch (...) {
+                // Out of memory: the site's record stays unused.
+            }
+        }
     if (code->name)
         detail::decRef(code->name);
     release(code->sourceText);

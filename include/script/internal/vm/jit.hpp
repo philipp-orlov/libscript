@@ -200,6 +200,7 @@ int jitDelegateCall(VM& vm, std::uint32_t index);
 int jitDelegateDone(VM& vm, std::uint32_t index);
 int jitGetIteratorObj(VM& vm, std::uint32_t index);
 int jitNewRegExp(VM& vm, std::uint32_t index);
+int jitSharedRegExp(VM& vm, std::uint32_t index);
 int jitEnvHas(VM& vm, std::uint32_t index);
 int jitDefPrivate(VM& vm, std::uint32_t index);
 int jitIterNext(VM& vm, std::uint32_t index);

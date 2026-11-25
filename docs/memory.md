@@ -108,6 +108,11 @@ Containers that shrink well below their capacity hand it back. Buffers above
 16 KiB, and cells above 8 KiB, are mappings of their own whose idle pages go back
 to the OS; a collection ages them out.
 
+The bytes of an `ArrayBuffer` come from the same pool and count as heap bytes
+(`VM::newArrayBuffer`), so a program that drops large typed arrays reaches the
+next scan and the collector by them. Only the bytes in use are zeroed; a resize
+zeroes what it adds.
+
 A native function reads its arguments as a `std::vector`, because that is the
 public API. A vector per call would be the hottest allocation there is, so
 `ContextImpl::ArgBuffer` keeps one per nesting level and reuses it.
@@ -158,6 +163,14 @@ both engines, and `Options::stackLimit` bounds it; a spike in depth is trimmed
 back at the next collection.
 
 ## The compilers' memory
+
+The JavaScript parser's nodes are carved from 128 KiB blocks of a pool of their
+own (`compilePool`, `src/dyn/ast.cpp`): mappings, not memory of the general
+allocator. The tree of a large program goes back whole, the pool keeps at most
+32 MiB of idle mappings for the next compile, and the rest go back to the
+system. (Blocks from `malloc` left the freed tree inside the allocator for
+good: 100 to 170 MiB after the largest JetStream programs.)
+
 
 The C# parser and checker, and the C and C++ front ends, allocate tree nodes from
 a `mem::ObjectArena`, drawing 64 KiB chunks from libcore's process-wide pool: no

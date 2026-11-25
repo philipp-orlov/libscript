@@ -39,6 +39,7 @@ struct RegExpData : NativeState
 {
     RegExpText* text;  ///< counted
     bool legacy = true;  ///< made by the RegExp constructor itself, so it may be recompiled
+    bool shared = false;  ///< the one RegExp of a literal's site (`sharedRegExpLiteral`): the program never saw it
 
     explicit RegExpData(RegExpText* t) noexcept : text(t) {}
     ~RegExpData() override { text->release(); }
@@ -637,20 +638,9 @@ bool execPristine(VM& vm, JSValue rx)
     return false;
 }
 
-bool pristine(VM& vm, JSValue rx)
+/// Whether the methods and accessors of `RegExp.prototype` and the constructor's are the ones the runtime made.
+bool methodsPristine(VM& vm)
 {
-    RegExpData* d = dataOf(rx);
-    if (!d)
-        return false;
-    JSObject* o = asObject(rx);
-    if (o->proto(vm) != vm.protos.regexp)
-        return false;
-    Rare* r = o->rare();
-    const Shape* own = vm.shapeById(o->h.shape);
-    // Its one property is `lastIndex`, a writable number: the last a shape of one property added is that property.
-    if ((r && r->dict) || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
-        !o->slotAt(0)->isNumber())
-        return false;
     if (vm.regexpEpoch == vm.globalEpoch)
         return true;
     const JSObject* owner = nullptr;
@@ -673,6 +663,34 @@ bool pristine(VM& vm, JSValue rx)
     if (vm.watchMethod(vm.protos.regexp, vm.protos.regexp) && vm.watchMethod(ctor, ctor))
         vm.regexpEpoch = vm.globalEpoch;
     return true;
+}
+
+/// A shared literal's RegExp is about to reach the program (a replaced `exec` gets it as `this`): no site hands one out
+/// again, so the program sees each such object once, as it would a new one.
+void unshareLiterals(VM& vm)
+{
+    for (VM::RegExpLiteral& l : vm.regexpLiterals)
+        if (l.shared.bits) {
+            release(l.shared);
+            l.shared = JSValue::raw(0);
+        }
+}
+
+bool pristine(VM& vm, JSValue rx)
+{
+    RegExpData* d = dataOf(rx);
+    if (!d)
+        return false;
+    JSObject* o = asObject(rx);
+    if (o->proto(vm) != vm.protos.regexp)
+        return false;
+    Rare* r = o->rare();
+    const Shape* own = vm.shapeById(o->h.shape);
+    // Its one property is `lastIndex`, a writable number: the last a shape of one property added is that property.
+    if ((r && r->dict) || own->count != 1 || own->key != vm.atoms.lastIndex || own->attrs != attr::kWritable ||
+        !o->slotAt(0)->isNumber())
+        return false;
+    return methodsPristine(vm);
 }
 
 /// `ToLength(rx.lastIndex)`, read as the language does.
@@ -875,6 +893,8 @@ NATIVE(regexpTest)
         const int hit = builtinTest(vm, self, text.get());
         return hit < 0 ? JSValue::exception() : JSValue::boolean(hit != 0);
     }
+    if (RegExpData* d = dataOf(self); d && d->shared)
+        unshareLiterals(vm);
     JSValue r = regExpExec(vm, self, text.get());
     if (r.isException())
         return r;
@@ -1794,6 +1814,9 @@ JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags)
             release(l.pattern);
         if (l.flags.bits)
             release(l.flags);
+        if (l.shared.bits)  // the RegExp of the literal that had this entry
+            release(l.shared);
+        l.shared = JSValue::raw(0);
         l.pattern = pattern;
         l.flags = flags;
         auto* made = new RegExpText();
@@ -1813,6 +1836,30 @@ JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags)
     o->putOwn(vm, vm.atoms.lastIndex, JSValue::int32(0), attr::kWritable);
     vm.regexpLiteralShape = vm.shapeById(o->h.shape);
     return keep.take();
+}
+
+JSValue sharedRegExpLiteral(VM& vm, JSValue pattern, JSValue flags)
+{
+    VM::RegExpLiteral& l = vm.regexpLiterals[((pattern.bits >> 4) ^ (flags.bits >> 6)) & 511];
+    // The instruction after this one reads `test` or `exec` from the object: with the originals there, the object goes to
+    // the runtime only. (`regexpTest` lets go of the shared objects before a replaced `exec` can see one.)
+    const bool intact = methodsPristine(vm);
+    if (intact && l.shared.bits && l.pattern.bits == pattern.bits && l.flags.bits == flags.bits) {
+        retain(l.shared);
+        return l.shared;
+    }
+    JSValue made = newRegExpLiteral(vm, pattern, flags);
+    if (made.isException() || !intact || l.pattern.bits != pattern.bits || l.flags.bits != flags.bits)
+        return made;
+    RegExpData* d = dataOf(made);
+    if (!d || asObject(made)->h.shape != (vm.regexpLiteralShape ? vm.regexpLiteralShape->id : 0))
+        return made;
+    if (l.shared.bits)
+        release(l.shared);
+    d->shared = true;
+    l.shared = made;
+    retain(made);
+    return made;
 }
 
 void installRegExp(VM& vm)
@@ -2001,7 +2048,7 @@ void recordRegExpOriginals(VM& vm)
     installRegExpLegacy(vm);
     JSObject* proto = vm.protos.regexp;
     JSObject* ctor = asObject(vm.regexpCtor);
-    const char* const names[] = {"exec", "constructor", "flags", "global", "ignoreCase", "multiline", "dotAll", "unicode",
+    const char* const names[] = {"exec", "test", "constructor", "flags", "global", "ignoreCase", "multiline", "dotAll", "unicode",
                                  "unicodeSets", "sticky", "hasIndices"};
     auto add = [&](JSObject* owner, Key key) {
         JSValue* slot = owner->findOwn(vm, key);

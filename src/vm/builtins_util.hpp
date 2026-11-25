@@ -224,6 +224,10 @@ bool mapStore(JSValue map, JSValue key, JSValue value);
 JSValue newRegExp(VM& vm, StringView pattern, StringView flags);
 /// A regular expression literal: its pattern and flags are string constants of the code.
 JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags);
+/// The RegExp of a literal that is only the receiver of `test` or `exec` and has neither `g` nor `y` (`Op::SharedRegExp`):
+/// one object for its site, while `RegExp.prototype` is as the runtime made it. Such a call neither changes the object
+/// nor hands it to the program, so no program can tell that it is not new each time.
+JSValue sharedRegExpLiteral(VM& vm, JSValue pattern, JSValue flags);
 void installRegExp(VM& vm);
 void installArrayCallbacks(VM& vm);
 /// What the typed array methods share with the constructors and the array iterators.

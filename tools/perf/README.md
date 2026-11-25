@@ -25,6 +25,8 @@ Make the workloads with `tools/probes/jetstream.py`.
 | `cat.py DIR` | Sort flat `perf report` text files in DIR into categories. |
 | `t2prof.py` | Time of compiled code by tier and by instruction (see the script). |
 | `breakdown.sh OUTDIR [EVENT]`, `breakdown.py OUTDIR SUMFILE` | Time of every workload by category, and the geometric mean if a category took no time. |
+| `rss.sh OUT [names]` | Peak resident size of each workload, the release build against JSC. Not a timing. |
+| `soak.sh NAME [ITERATIONS]` | Memory per iteration (`memoryReport()` of the command line tool): resident size, heap, cells, the general allocator. Not a timing. |
 
 Time only on one fast core with nothing else running.
 
@@ -64,4 +66,15 @@ WARNING: Do not build while a gate or a timing runs. The gate reads the binaries
 - `SCRIPT_VM_CODEDUMP=DIR` writes each compiled function (`t1-*` baseline, `t2-*` optimized).
 - On arm64, `perf annotate` puts a load's miss on the next instruction.
 - To find how often something happens, add a temporary counter that prints at exit, and remove it before the commit.
-  `SCRIPT_CENSUS=1` prints the counters that are in the tree (why code enters the runtime).
+  `SCRIPT_CENSUS=1` prints the counters that are in the tree (why code enters the runtime; collections, scans, young cells
+  made and kept, cells that `allocCell` made).
+
+## Memory
+
+1. Run `rss.sh` after a change to the heap, a pool, a cache or a table. Expect no workload above JSC's peak but
+   json-stringify-inspector (1.04x).
+2. Run `soak.sh NAME 300` for the workloads the change touches. Expect no growth after iteration 50, except in
+   octane-code-load, pdfjs and proxy-vue: those programs keep data per iteration, and JSC grows more on them.
+3. Run `SCRIPT_VM_AUDIT=1 ctest -E "soak|steady"` in the default mode and with `SCRIPT_VM_TIER1=1 SCRIPT_VM_TIER2=2` (the
+   counts of every cell at each scan). The audit itself uses the general allocator, so the soak and steady-state tests do
+   not hold under it.

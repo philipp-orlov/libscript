@@ -2665,6 +2665,25 @@ private:
             a_.bind(done);
         }
     }
+    /// The value of the box in rax = rcx: counted and the old value let go, unless the box is young (it counts nothing).
+    /// `mayBeCell`: whether the new value may be a cell. Clobbers rsi, rdi and, through `release`, the caller-saved
+    /// registers.
+    void storeBoxCounted(bool mayBeCell = true)
+    {
+        Label yng, done;
+        ifYoung(RAX, yng);
+        if (mayBeCell)
+            retain(RCX);
+        a_.mov(RSI, mem(RAX, kBoxValue));
+        a_.mov(mem(RAX, kBoxValue), RCX);
+        release(RSI);
+        if (youngStores()) {
+            a_.jmp(done);
+            a_.bind(yng);
+            a_.mov(mem(RAX, kBoxValue), RCX);
+            a_.bind(done);
+        }
+    }
     /// Where a field of the VM is from r12.
     std::int32_t vmOffset(const void* field) const
     {
@@ -3985,6 +4004,7 @@ void Baseline::emit(std::uint32_t i)
         return;
     }
     case Op::NewRegExp: helperOp(i, &helperThunk<jitNewRegExp>); return;
+    case Op::SharedRegExp: helperOp(i, &helperThunk<jitSharedRegExp>); return;
     case Op::EnvHas: helperOp(i, &helperThunk<jitEnvHas>); return;
     case Op::DefPrivMethod: case Op::DefPrivGetter: case Op::DefPrivSetter:
         helperOp(i, &helperThunk<jitDefPrivMethod>);
@@ -4195,10 +4215,7 @@ void Baseline::emit(std::uint32_t i)
         a_.mov(RAX, R(in.a));
         boxWrite(RAX);
         a_.mov(RCX, R(in.b));
-        retain(RCX);
-        a_.mov(RSI, mem(RAX, kBoxValue));
-        a_.mov(mem(RAX, kBoxValue), RCX);
-        release(RSI);
+        storeBoxCounted();
         return;
     case Op::GetUpval:
         a_.mov(RAX, mem(R13, kFrameFn));
@@ -4211,10 +4228,7 @@ void Baseline::emit(std::uint32_t i)
         a_.mov(RAX, mem(RAX, kFnUpvals + std::int32_t(8 * in.a)));
         boxWrite(RAX);
         a_.mov(RCX, R(in.b));
-        retain(RCX);
-        a_.mov(RSI, mem(RAX, kBoxValue));
-        a_.mov(mem(RAX, kBoxValue), RCX);
-        release(RSI);
+        storeBoxCounted();
         return;
     case Op::GetProp:
         getProp(i, in);
@@ -4294,7 +4308,8 @@ void Baseline::emit(std::uint32_t i)
         h.cls = std::uint8_t(ObjClass::Function);
         h.flags = cellflags::kYoung;
         h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
-        allocCellHere(bytes, h, slow(i, &helperThunk<jitClosure>), false);
+        // Young where the frames are deferred (docs/vm-core.md, "Young cells"): it then holds no count of its variables.
+        allocCellHere(bytes, h, slow(i, &helperThunk<jitClosure>), false, vm_.allocSiteFor(code_, i));
         a_.mov(mem(RAX, kObjSlots), 0);
         a_.movImm(RCX, reinterpret_cast<std::uint64_t>(child));
         a_.mov(mem(RAX, kFnCode), RCX);
@@ -4313,8 +4328,16 @@ void Baseline::emit(std::uint32_t i)
                 outer = true;
                 a_.mov(RCX, mem(RDX, std::int32_t(sizeof(JSFunction) + 8 * d.index)));
             }
-            a_.inc32(mem(RCX, std::int32_t(detail::kCellCountOffset)));
             a_.mov(mem(RAX, std::int32_t(sizeof(JSFunction) + 8 * k)), RCX);
+        }
+        if (n) {
+            Label yng;
+            ifYoung(RAX, yng);
+            for (std::uint32_t k = 0; k < n; ++k) {
+                a_.mov(RCX, mem(RAX, std::int32_t(sizeof(JSFunction) + 8 * k)));
+                a_.inc32(mem(RCX, std::int32_t(detail::kCellCountOffset)));
+            }
+            a_.bind(yng);
         }
         write(in.a, RAX);
         return;
@@ -4327,10 +4350,10 @@ void Baseline::emit(std::uint32_t i)
         CellHeader h{};
         h.flags = cellflags::kYoung;
         h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Box));
-        allocCellHere(sizeof(Box), h, slow(i, &helperThunk<jitNewBox>), false);
+        allocCellHere(sizeof(Box), h, slow(i, &helperThunk<jitNewBox>), false, vm_.allocSiteFor(code_, i));
         a_.mov(RCX, R(in.a));
         if (def_)
-            retain(RCX);  // the box's own; a counted register's count becomes the box's
+            retainInto(RAX, RCX);  // the box's own, unless it is young; a counted register's count becomes the box's
         a_.mov(mem(RAX, std::int32_t(offsetof(Box, value))), RCX);
         a_.mov(R(in.a), RAX);
         return;

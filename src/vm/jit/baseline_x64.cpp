@@ -450,8 +450,8 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
         if (kind == 4) {
             // A loaded value was not what its profile said (no failure). The step below notes what it is, so a value taken
             // for an int32 is taken for a number next; one taken for a number is kept boxed.
-            if (index < code->prof.size() && (code->prof[index] & 11) != 1) {
-                code->prof[index] |= opt::kProfNoSpec;
+            if (index < code->prof.size() && ((code->prof[index] & 11) != 1 || code->code[index].opcode() == Op::GetElem)) {
+                code->prof[index] |= opt::kProfNoSpec;  // (an element read: calls the runtime on a miss next)
             } else if (index < code->prof.size()) {
                 // Taken for a number next. When the loads of this function keep doing that (their notes are older than
                 // their values), the rest of those noted as int32s only stay boxed, so that they do not leave one at a time.
@@ -3318,6 +3318,7 @@ public:
     Tier2Code* compileSsa(ssa::Graph& g, Tier1Code* base);
     void lirBuild(const ssa::Graph& g, lir::Func& f);
     bool ssaSpecLoad(std::uint32_t i);
+    bool ssaElemQuiet(std::uint32_t i) const;
     const char* ssaWhy_ = "";
     int ssaOn_ = 2;  ///< SCRIPT_VM_SSA: 1 every instruction through the frame, 2 the fast paths too
 

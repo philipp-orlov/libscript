@@ -1702,7 +1702,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             // Whatever could run other code, or write what is not known here: all of it is forgotten. (An element of a plain
             // array may be the runtime's to find.)
             const bool quiet = native_[i] && !((op == Op::GetElem || op == Op::PutElem) && !(op == Op::GetElem && ssaPrivateSite(i)) &&
-                                               ssaElemPlan(i, op == Op::PutElem, &kind) == 1);
+                                               ssaElemPlan(i, op == Op::PutElem, &kind) == 1 && !(op == Op::GetElem && ssaElemQuiet(i)));
             // A value kept past the register it was read into has no owner of its own: an allocation may scan the frames, and a
             // store of a counted frame may free what held it.
             if (!quiet || op == Op::New || (!def_ && (op == Op::PutProp || op == Op::PutUpval || op == Op::PutBox || op == Op::PutElem)))
@@ -5821,6 +5821,14 @@ Mem Baseline::ssaIndexed(Reg base, Reg index, std::uint8_t scale) const
 }
 
 /// The place of element `vi` of `vb`, a typed array of `kind`, which has it, else `bad`. Clobbers rax, rcx, rsi.
+/// Whether the plain array element read at `i` has no way to the runtime (`ssaGetElem`): while no exit of it has said
+/// otherwise (a miss, a value its representation does not hold).
+bool Baseline::ssaElemQuiet(std::uint32_t i) const
+{
+    return ssaOn_ >= 2 && !(i < code_->prof.size() &&
+                            (code_->prof[i] & (opt::kProfFailed | opt::kProfNoSpec | opt::kProfWidened)));
+}
+
 /// Whether load `i` (a data property, an upvalue, a box) is taken for a number by what it has made (`CodeBlock::prof`):
 /// it reads only (a failed check leaves before it), and has made int32s only, or numbers only.
 bool Baseline::ssaSpecLoad(std::uint32_t i)
@@ -6022,6 +6030,48 @@ bool Baseline::ssaGetElem(std::uint32_t i)
     if (!plan)
         return false;
     const std::uint32_t vb = name_[in.b], vi = name_[in.c];
+    if (plan == 1 && ssaElemQuiet(i)) {
+        // No way to the runtime, so nothing here can run other code: a hole or past the end is undefined where holes are
+        // (`plainHoleGuard`); anything else leaves (exit kind 4: the next compile calls the runtime there).
+        Label& bad = ssaExit(i);
+        ssaExits_.push_back(SsaExit{i, name_, frame_, liveBefore_, Label{}});
+        ssaExits_.back().kind = 4;
+        Label& miss = ssaExits_.back().label;
+        const Reg index = ssaIndex(vi, bad);
+        const Reg o = valueReg(vb);
+        ssaNeedArray(vb, o, ObjClass::Array, bad);
+        const std::uint32_t def = ssa_->defBase[i];
+        const bool tagged = sval_[def].rep == kRepTagged;
+        Label hole, done;
+        a_.alu32(7, index, mem(o, kArrayLength));  // unsigned: below zero is past the end
+        a_.jcc(CAE, tagged ? hole : miss);
+        a_.mov(RDX, mem(o, kArrayElems));
+        a_.mov(RAX, ssaIndexed(RDX, index, 8));
+        a_.cmpI(RAX, std::int32_t(kHole));
+        a_.jcc(CE, tagged ? hole : miss);
+        if (tagged) {
+            ssaDef(i, 0);
+            a_.jmp(done);
+            a_.bind(hole);
+            loadValue(vb, RAX);
+            if (plainHoleGuard(RDX, miss, i)) {
+                a_.movImm(RAX, kUndefined);
+                ssaDef(i, 0);
+            } else {
+                a_.jmp(miss);
+            }
+            a_.bind(done);
+        } else if (sval_[def].rep == kRepI32) {
+            needInt(RAX, miss);
+            ssaDefI32(i);
+        } else {
+            needNumber(RAX, miss);
+            const int x = sval_[def].reg >= 0 ? sval_[def].reg : 0;
+            loadNumber(x, RAX, RDX);
+            ssaDefF64(i, x);
+        }
+        return true;
+    }
     if (plan == 1) {
         // Anything but an element the array has: the runtime's, out of line.
         Label& cold = coldLabels_.emplace_back();

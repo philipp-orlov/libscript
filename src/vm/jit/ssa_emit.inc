@@ -4443,7 +4443,12 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 const std::uint8_t pf = i < code_->prof.size() ? code_->prof[i] : 0;
                 const bool distrusted = arithFailed && pf == 1 &&
                                         (op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::MulI);
-                if (arith && (pf == 0 || distrusted) && g.defBase[i] != ssa::kNone && !intArith_[i] && !dblArith_[i]) {
+                if (op == Op::ToNumeric && ssaOn_ >= 2 && g.defBase[i] != ssa::kNone && names[in.b] != ssa::kNone) {
+                    // The number it is given: the same representation (`x++` of an int32 stays one).
+                    const std::uint32_t d = g.defBase[i];
+                    byOperands[d] = 1;
+                    operandsOf[d].push_back(names[in.b]);
+                } else if (arith && (pf == 0 || distrusted) && g.defBase[i] != ssa::kNone && !intArith_[i] && !dblArith_[i]) {
                     const std::uint32_t d = g.defBase[i];
                     byOperands[d] = 1;
                     for (std::uint16_t r : e.rd)
@@ -4508,7 +4513,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     auto checkable = [&](std::uint32_t in) { return !sval_[in].isConst && (cls[in] == 0 || cls[in] == 1 || cls[in] == 3); };
     auto doubleOp = [](Op op) {
         return op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::AddI || op == Op::SubI || op == Op::MulI || op == Op::Neg ||
-               op == Op::Div;
+               op == Op::Div || op == Op::ToNumeric;
     };
     for (bool changed = true; changed;) {
         changed = false;
@@ -6372,6 +6377,19 @@ bool Baseline::ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter)
         const std::uint32_t v = name_[in.b];
         const SVal& sv = sval_[v];
         Label& bad = ssaExit(i);
+        const std::uint32_t def = ssa_->defBase[i];
+        if (sval_[def].rep == kRepI32) {
+            const Reg d = defI32Reg(i);
+            loadI32(v, d, &bad);
+            ssaDefI32(i, d);
+            return true;
+        }
+        if (sval_[def].rep == kRepF64) {
+            const int x = defF64Reg(i);
+            loadF64(v, x, &bad);
+            ssaDefF64(i, x);
+            return true;
+        }
         loadValue(v, RAX);
         if (!known(v, kVInt) && (sv.isConst || sv.rep == kRepTagged)) {
             a_.cmp(RAX, RBP);

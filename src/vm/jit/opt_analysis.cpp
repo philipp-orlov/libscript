@@ -223,6 +223,40 @@ bool liveBefore(const CodeBlock& c, Effects (*effects)(const CodeBlock&, std::ui
     return true;
 }
 
+/// What `effectsOf` says, and for the instructions of `for await` and `yield*` it does not model, the registers they read
+/// and write as the interpreter runs them: for the registers a suspension keeps only (the compilers do not take these).
+Effects suspendEffects(const CodeBlock& code, std::uint32_t i)
+{
+    Effects e = effectsOf(code, i);
+    if (e.ok)
+        return e;
+    const Ins& in = code.code[i];
+    e = Effects{};
+    switch (in.opcode()) {
+    case Op::AsyncIterInit: case Op::GetIteratorObj:
+        e.rd = {in.b};
+        e.wr = {in.a, std::uint16_t(in.a + 1u)};
+        break;
+    case Op::AsyncIterNext:
+        e.rd = {in.b, std::uint16_t(in.b + 1u)};
+        e.wr = {in.a};
+        break;
+    case Op::IterUnpack: case Op::DelegateDone:
+        e.rd = {in.b};
+        e.wr = {in.a};
+        break;
+    case Op::DelegateCall: case Op::DelegateCallAsync:
+        // (The mode in `c + 1` is read, and may be written: it stays live.)
+        e.rd = {in.b, std::uint16_t(in.b + 1u), in.c, std::uint16_t(in.c + 1u)};
+        e.wr = {in.a};
+        break;
+    default:
+        e.ok = false;
+        break;
+    }
+    return e;
+}
+
 void planSuspends(CodeBlock& code)
 {
     const std::uint32_t n = std::uint32_t(code.code.size());
@@ -252,7 +286,7 @@ void planSuspends(CodeBlock& code)
     };
     std::vector<Effects> effects(n);
     for (std::uint32_t i = 0; i < n; ++i)
-        effects[i] = effectsOf(code, i);
+        effects[i] = suspendEffects(code, i);
     for (bool changed = true; changed;) {
         changed = false;
         for (std::uint32_t i = n; i-- > 0;) {

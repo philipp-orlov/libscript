@@ -123,7 +123,6 @@ JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capac
         capacity = length;
     auto* a = static_cast<JSArray*>(allocCell(sizeof(JSArray), Kind::Object, ObjClass::Array, 0));
     a->h.shape = root->id;
-    a->h.flags |= cellflags::kAllNumbers;
     a->slots = nullptr;
     a->elems = a->small;
     a->length = 0;
@@ -140,7 +139,6 @@ JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capac
         for (std::uint32_t i = 0; i < length; ++i)
             a->elems[i] = JSValue::hole();
         a->length = length;
-        a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     }
     return a;
 }
@@ -838,8 +836,6 @@ void JSArray::append(VM& vm, JSValue value)
             throw;
         }
     }
-    if (!value.isNumber())
-        h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     elems[length++] = value;
     noteStore(length - 1, value);
 }
@@ -849,8 +845,6 @@ void JSArray::appendAll(VM& vm, const JSValue* values, std::uint32_t n)
     reserve(vm, length + n);
     for (std::uint32_t i = 0; i < n; ++i) {
         retain(values[i]);
-        if (!values[i].isNumber())
-            h.flags &= std::uint8_t(~cellflags::kAllNumbers);
         elems[length + i] = values[i];
     }
     length += n;
@@ -862,8 +856,6 @@ bool JSArray::setAt(VM& vm, std::uint32_t index, JSValue value)
     if (index < length) {
         const JSValue old = elems[index];
         elems[index] = value;
-        if (!value.isNumber())
-            h.flags &= std::uint8_t(~cellflags::kAllNumbers);
         noteStore(index, value);
         release(old);
         return true;
@@ -879,8 +871,6 @@ bool JSArray::setAt(VM& vm, std::uint32_t index, JSValue value)
         throw;
     }
     elems[index] = value;
-    if (!value.isNumber())
-        h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     noteStore(index, value);
     return true;
 }
@@ -891,7 +881,6 @@ void JSArray::resize(VM& vm, std::uint32_t newLength)
         reserve(vm, newLength);
         for (std::uint32_t i = length; i < newLength; ++i)
             elems[i] = JSValue::hole();
-        h.flags &= std::uint8_t(~cellflags::kAllNumbers);
         length = newLength;
         return;
     }
@@ -946,7 +935,6 @@ void JSArray::insertGap(VM& vm, std::uint32_t at, std::uint32_t count)
     length += count;
     if (packed > at)
         packed = at;
-    h.flags &= std::uint8_t(~cellflags::kAllNumbers);
 }
 
 JSValue JSArray::pop(VM& vm)

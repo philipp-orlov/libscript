@@ -1541,7 +1541,6 @@ NATIVE(arraySortImpl)
     for (std::uint32_t i = 0; i < holes; ++i)
         a->elems[at++] = JSValue::hole();
     a->repack();
-    a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     retain(self);
     return self;
 }
@@ -1661,7 +1660,6 @@ NATIVE(arrayCopyWithinImpl)
             release(old);
         }
         a->repack(a->packed);
-        a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
     }
     retain(self);
     return self;

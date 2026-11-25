@@ -409,7 +409,6 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
                 const JSValue old = a->elems[index];
                 a->elems[index] = JSValue::hole();
                 a->noteStore(index, JSValue::hole());
-                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
                 release(old);
                 return true;
             }
@@ -431,7 +430,6 @@ bool makeIndexHole(VM& vm, JSArray* a, std::uint32_t index, Key key)
         const JSValue old = a->elems[index];
         a->elems[index] = JSValue::hole();
         a->noteStore(index, JSValue::hole());
-        a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
         release(old);
         return true;
     }

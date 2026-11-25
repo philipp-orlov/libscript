@@ -64,9 +64,6 @@ inline constexpr std::uint8_t kNotExtensible = 16;
 inline constexpr std::uint8_t kFrozen = 32;
 inline constexpr std::uint8_t kBuffered = 64;     ///< in the old-candidate buffer
 inline constexpr std::uint8_t kAcyclic = 128;
-/// Arrays reuse the bit of `kAcyclic`, which says nothing about an array: every element stored was a number. A hint
-/// only; nothing depends on it for correctness.
-inline constexpr std::uint8_t kAllNumbers = 128;
 }  // namespace cellflags
 
 inline constexpr std::uint32_t kImmortalCount = 0x40000000u;

@@ -1143,7 +1143,6 @@ bool Baseline::emitTyped(std::uint32_t i)
                 retain(RSI);
                 a_.test(RSI, R14);
                 a_.jcc(CNE, number);
-                a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
                 unpackAt(RAX, RCX);
                 a_.bind(number);
             }

@@ -2771,8 +2771,6 @@ L_PutElem: {
             a->elems[i] = R[ins->c];
             retain(a->elems[i]);
             a->noteStore(i, a->elems[i]);
-            if (!a->elems[i].isNumber())
-                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
             release(old);
             NEXT();
         }
@@ -2786,8 +2784,6 @@ L_PutElem: {
             retain(R[ins->c]);
             a->elems[i] = R[ins->c];
             a->noteStore(i, R[ins->c]);
-            if (!R[ins->c].isNumber())
-                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
             NEXT();
         }
     }
@@ -5123,8 +5119,6 @@ int jitPutElem(VM& vm, std::uint32_t index)
             a->elems[i] = R[ins->c];
             retain(a->elems[i]);
             a->noteStore(i, a->elems[i]);
-            if (!a->elems[i].isNumber())
-                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
             release(old);
             return 1;
         }
@@ -5138,8 +5132,6 @@ int jitPutElem(VM& vm, std::uint32_t index)
             retain(R[ins->c]);
             a->elems[i] = R[ins->c];
             a->noteStore(i, R[ins->c]);
-            if (!R[ins->c].isNumber())
-                a->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
             return 1;
         }
     }

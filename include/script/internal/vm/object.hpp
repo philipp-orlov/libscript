@@ -213,7 +213,6 @@ struct JSArray : JSObject
     /// Take the last element, with its count.
     JSValue pop(VM& vm);
     void reserve(VM& vm, std::uint32_t wanted);
-    bool allNumbers() const noexcept { return (h.flags & cellflags::kAllNumbers) != 0; }
 };
 
 /// The element types of typed arrays and what a DataView reads.

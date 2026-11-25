@@ -3097,7 +3097,6 @@ void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
                 loadI32(name_[in.b + 2u], RSI, &failed);
                 a_.mov32(mem(RAX, kArrayLength), RSI);
             }
-            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
             a_.jmp(made);
         }
         a_.bind(viaRuntime);
@@ -5994,12 +5993,9 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
             packAt(RAX, RCX);
         } else {
             retain(RSI);
-            Label isNumber, stored;
+            Label stored;
             a_.test(RSI, R14);
-            a_.jcc(CNE, isNumber);
-            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
-            a_.jmp(stored);
-            a_.bind(isNumber);
+            a_.jcc(CE, stored);
             packAt(RAX, RCX);
             a_.bind(stored);
         }
@@ -6025,7 +6021,6 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
     Label isNumber, stored;
     a_.test(RSI, R14);
     a_.jcc(CNE, isNumber);
-    a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
     unpackAt(RAX, RCX);
     a_.jmp(stored);
     a_.bind(isNumber);

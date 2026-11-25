@@ -239,8 +239,6 @@ NATIVE(arrayIterate)
                 const JSValue old = plainOut->elems[k];
                 plainOut->elems[k] = v;
                 plainOut->noteStore(k, v);
-                if (!v.isNumber())
-                    plainOut->h.flags &= std::uint8_t(~cellflags::kAllNumbers);
                 release(old);
             } else {
                 plainOut->append(vm, v);

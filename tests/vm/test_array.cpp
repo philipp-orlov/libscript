@@ -14,18 +14,15 @@ TEST(anArrayIsNinetySixBytesWithSixElementsInPlaceAndHoldsEightByteElements)
     CHECK_EQ(sizeof(JSArray), std::size_t(96));  // six elements in place: a literal of up to six is made in compiled code
     CHECK_EQ(a->packed, 0u);
     CHECK(a->elems == a->small && !a->ownsElems() && a->capacity == JSArray::kSmall);
-    CHECK(a->allNumbers());
     for (int i = 0; i < 100; ++i)
         a->append(f.vm, num(i));
     CHECK_EQ(a->packed, 100u);  // numbers only, from the start
-    CHECK(a->allNumbers());
     CHECK_EQ(a->length, std::uint32_t(100));
     CHECK(a->capacity >= 100);
     for (int i = 0; i < 100; ++i)
         CHECK_EQ(a->at(i).asInt32(), i);
     CHECK(a->at(100).isHole());
     a->append(f.vm, JSValue::null());
-    CHECK(!a->allNumbers());
     release(toJSValue(a));
 }
 
@@ -80,7 +77,6 @@ TEST(resizeInsertGapAppendAllAndPop)
     JSArray* a = f.vm.newArray(nullptr, 3);
     CHECK_EQ(a->length, std::uint32_t(3));
     CHECK(a->at(1).isHole());
-    CHECK(!a->allNumbers());
     a->resize(f.vm, 0);
     const JSValue src[] = {num(1), num(2), num(3), num(4)};
     a->appendAll(f.vm, src, 4);

@@ -1511,7 +1511,7 @@ private:
         CellHeader h{};
         h.shape = vm_.rootShapeFor(vm_.protos.array, 0)->id;
         h.cls = std::uint8_t(ObjClass::Array);
-        h.flags = cellflags::kYoung | cellflags::kAllNumbers;
+        h.flags = cellflags::kYoung;
         h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
         allocCellHere(sizeof(JSArray), h, slow, false);
         static_assert(offsetof(JSArray, capacity) == offsetof(JSArray, length) + 4, "length and capacity in one store");
@@ -1547,12 +1547,9 @@ private:
             packAt(RAX, RCX);
         } else {
             retain(RSI);
-            Label isNumber, stored;
+            Label stored;
             a_.test(RSI, R14);
-            a_.jcc(CNE, isNumber);
-            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
-            a_.jmp(stored);
-            a_.bind(isNumber);
+            a_.jcc(CE, stored);
             packAt(RAX, RCX);
             a_.bind(stored);
         }
@@ -4284,7 +4281,6 @@ void Baseline::emit(std::uint32_t i)
         a_.mov(RDX, R(in.b));
         a_.test(RDX, R14);
         a_.jcc(CNE, number);
-        a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
         retain(RDX);
         {
             Label stored;
@@ -5944,7 +5940,6 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
     retain(RSI);
     a_.test(RSI, R14);
     a_.jcc(CNE, isNumber);
-    a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
     unpackAt(RAX, RCX);
     {
         Label stored;
@@ -5966,19 +5961,13 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
             a_.jmp(bad);
         } else {
             noteElem(i, elemprof::kArray, RSI);
-            Label holeNumber;
+            Label stored;
             a_.mov(RSI, R(in.c));
             retain(RSI);
             a_.test(RSI, R14);
-            a_.jcc(CNE, holeNumber);
-            a_.andI8(mem(RAX, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
-            {
-                Label stored;
-                a_.jmp(stored);
-                a_.bind(holeNumber);
-                packAt(RAX, RCX);
-                a_.bind(stored);
-            }
+            a_.jcc(CE, stored);
+            packAt(RAX, RCX);
+            a_.bind(stored);
             a_.mov(mem(RDX, 0), RSI);
             a_.jmp(done);
         }
@@ -6510,19 +6499,13 @@ void Baseline::call(std::uint32_t i, const Ins& in)
             a_.jcc(CAE, generic);
             a_.aluI32(7, RCX, 0x7ffffffe);
             a_.jcc(CA, generic);
-            Label number;
+            Label stored;
             a_.mov(RAX, R(base + 2));
             retain(RAX);
             a_.test(RAX, R14);
-            a_.jcc(CNE, number);
-            a_.andI8(mem(RSI, kHdrFlags), std::uint8_t(~cellflags::kAllNumbers));
-            {
-                Label stored;
-                a_.jmp(stored);
-                a_.bind(number);
-                packAt(RSI, RCX);
-                a_.bind(stored);
-            }
+            a_.jcc(CE, stored);
+            packAt(RSI, RCX);
+            a_.bind(stored);
             a_.mov(mem(RDX, RCX, 8), RAX);
             a_.aluI32(0, RCX, 1);
             a_.mov32(mem(RSI, kArrayLength), RCX);

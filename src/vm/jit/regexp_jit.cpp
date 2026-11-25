@@ -180,10 +180,13 @@ public:
         out_->table.assign(2 * std::size_t(n_) + 1, 0);
         for (std::uint32_t pc = 0; pc < n_; pc += size(pc))
             markTargets(pc);
+        planClean();
         prologue();
         for (std::uint32_t pc = 0; pc < n_; pc += size(pc)) {
             if (target_[pc])
                 known_.clear();
+            if (clean_[pc])
+                known_.assign(1, Entry{false, n_});  // only the entry of the next place to begin
             a_.bind(at_[pc]);
             offsets_.emplace_back(pc, a_.here());
             emit(pc);
@@ -248,6 +251,61 @@ private:
             case OpNegBegin: target_[code_[pc + 2]] = 1; break;
             case OpGreedy: case OpGreedyU: target_[pc + 4] = 1; break;
             default: break;
+        }
+    }
+
+    // ---- where nothing is pushed yet ----
+    /// `clean_`: the places that every way in reaches with nothing pushed since the attempt began (only the entry of the
+    /// next place to begin on the stack). A capture there has nothing to undo; the registers so written (`noUndo_`) are set
+    /// back where the next attempt begins. Only for programs of these instructions.
+    void planClean()
+    {
+        clean_.assign(n_ + 1, 0);
+        for (std::uint32_t pc = 0; pc < n_; pc += size(pc)) {
+            switch (code_[pc]) {
+                case OpMatch: case OpLit: case OpLit2: case OpStr: case OpSet: case OpGreedy: case OpSplit: case OpSplitLazy:
+                case OpJump: case OpSave: case OpLineStart: case OpLineStartM: case OpLineEnd: case OpLineEndM: case OpWord:
+                    break;
+                default:
+                    return;
+            }
+        }
+        // 2: not reached yet; 1: clean on every way found so far; 0: not.
+        std::vector<std::uint8_t> st(n_ + 1, 2);
+        st[0] = 1;
+        bool changed = true;
+        const auto into = [&](std::uint32_t to, std::uint8_t v) {
+            if (to <= n_ && v < st[to]) {
+                st[to] = v;
+                changed = true;
+            }
+        };
+        while (changed) {
+            changed = false;
+            for (std::uint32_t pc = 0; pc < n_; pc += size(pc)) {
+                if (st[pc] == 2)
+                    continue;
+                const std::uint8_t v = st[pc];
+                switch (code_[pc]) {
+                    case OpMatch: break;
+                    case OpJump: into(code_[pc + 1], v); break;
+                    case OpSplit: into(pc + 2, 0); into(code_[pc + 1], v); break;  // the other way: once the choice is off
+                    case OpSplitLazy: into(code_[pc + 1], 0); into(pc + 2, v); break;
+                    case OpGreedy: {
+                        // As `greedy`: an entry to give back from is pushed unless what follows cannot take what it took.
+                        const bool pushes = !(endsAt(pc + 4) || firstOf(pc + 4).apartFrom(ofSet(p_.sets[code_[pc + 1]])));
+                        into(pc + 4, pushes ? 0 : v);
+                        break;
+                    }
+                    default: into(pc + size(pc), v); break;
+                }
+            }
+        }
+        for (std::uint32_t pc = 0; pc < n_; pc += size(pc)) {
+            clean_[pc] = st[pc] == 1;
+            if (clean_[pc] && code_[pc] == OpSave &&
+                std::find(noUndo_.begin(), noUndo_.end(), code_[pc + 1]) == noUndo_.end())
+                noUndo_.push_back(code_[pc + 1]);
         }
     }
 
@@ -622,7 +680,10 @@ private:
         a_.jmp(begin);
         a_.bind(at_[n_]);
         offsets_.emplace_back(n_, a_.here());
-        // Nothing from where it began: everything pushed since is off again, and every register as it was.
+        // Nothing from where it began: everything pushed since is off again, and every register as it was (those written
+        // with nothing to undo, here).
+        for (std::uint32_t r : noUndo_)
+            a_.mov32(mem(R13, std::int32_t(r * 4)), -1);
         a_.mov32(R12, ctx(offsetof(Ctx, at)));
         if (once) {
             a_.jmp(none_);
@@ -788,7 +849,13 @@ private:
                 a_.jmp(at_[code_[pc + 1]]);
                 known_.clear();
                 return;
-            case OpSave: case OpMark: setRegister(code_[pc + 1], R12); return;
+            case OpSave: case OpMark:
+                if (clean_[pc]) {
+                    a_.mov32(mem(R13, std::int32_t(code_[pc + 1] * 4)), R12);
+                    return;
+                }
+                setRegister(code_[pc + 1], R12);
+                return;
             case OpClear:
                 for (std::uint32_t r = code_[pc + 1]; r < code_[pc + 2]; ++r) {
                     Label unset;
@@ -1212,6 +1279,8 @@ private:
     std::vector<std::uint8_t> target_;
     std::vector<std::pair<std::uint32_t, std::int32_t>> offsets_;
     std::vector<Entry> known_;  ///< the top of the stack, as far as it is known: a choice, then what is to be undone
+    std::vector<std::uint8_t> clean_;   ///< see `planClean`
+    std::vector<std::uint32_t> noUndo_;
     std::deque<Stub> stubs_;
     std::deque<Later> laters_;
     const std::uint8_t* wordBytes_ = nullptr;

@@ -1004,6 +1004,20 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     keepOn_.clear();
     headerFrame_.assign(nb, {});
     headerFacts_.assign(nb, {});
+    limitNeed_ = 0;
+    for (std::uint32_t i = 0; i < n_; i += length(i))
+        if (CodeBlock* C = ssaDirectCallee(i))
+            limitNeed_ = std::max(limitNeed_, code_->code[i].b + 1u + C->nregs + 1u);
+    if (limitNeed_) {
+        // (The baseline code checks at each call, and makes the stack overflow error.)
+        Label toBase, in;
+        ssaEntryLimits(RDI, RSI, 16 + 8 + spill_, toBase);
+        a_.jmp(in);
+        a_.bind(toBase);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->rx));
+        a_.jmp(RAX);
+        a_.bind(in);
+    }
     a_.enter(RBX, R13, 8 + spill_);
     a_.mov(R13, RSI);
     a_.mov(RBX, RDI);
@@ -1281,6 +1295,16 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             continue;
         osr.emplace_back(bl.start, std::uint32_t(a_.here()));
         a_.aluI(5, RSP, spill_);
+        if (limitNeed_) {
+            Label toBase, in;
+            ssaEntryLimits(RBX, R13, 0, toBase);
+            a_.jmp(in);
+            a_.bind(toBase);
+            a_.aluI(0, RSP, spill_);
+            a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(bl.start)));
+            a_.jmp(RAX);
+            a_.bind(in);
+        }
         // A slot the code takes to hold no cell, dead here: what the baseline code left there goes.
         for (unsigned r = 0; r < nregs; ++r)
             if (neverCell_[r] && !ssa::bitTest(bl.liveIn, r)) {
@@ -3758,15 +3782,17 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     a_.test(RDX, RDX);
     a_.jcc(CE, slow);
     a_.lea(R9, R(base + 1));
-    // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
-    a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 8)));
-    a_.alu(7, R10, mem(R12, kVmStackInit));
-    a_.jcc(CA, slow);
     a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame))));
-    a_.alu(7, R11, mem(R12, kVmFrameLimit));
-    a_.jcc(CAE, slow);
-    a_.alu(7, RSP, mem(R12, kVmStackFloor));
-    a_.jcc(CB, slow);
+    if (!limitNeed_) {
+        // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
+        a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 8)));
+        a_.alu(7, R10, mem(R12, kVmStackInit));
+        a_.jcc(CA, slow);
+        a_.alu(7, R11, mem(R12, kVmFrameLimit));
+        a_.jcc(CAE, slow);
+        a_.alu(7, RSP, mem(R12, kVmStackFloor));
+        a_.jcc(CB, slow);
+    }
     a_.mov32(RDI, mem(R12, kVmTicks));
     a_.aluI32(5, RDI, 1);
     a_.jcc(CBE, slow);
@@ -3789,7 +3815,8 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
         }
         a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
     }
-    if (!(C->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis))) {
+    const std::uint32_t vt = name_[base + 1];
+    if (!(C->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && !(vt != ssa::kNone && known(vt, kVObj))) {
         // A sloppy function called with no `this` gets the global object.
         Label thisOk;
         a_.mov(RDI, R(base + 1));
@@ -3828,6 +3855,35 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     a_.test(RAX, RAX);
     a_.jcc(CE, exc);
     write(in.a, RAX);
+}
+
+/// The checks of `ssaDirectCall`'s stack limits, made once for every direct call of the code: the registers to
+/// `limitNeed_` past `regs` (filled here when they are not yet: `VM::fillStack`), one more frame past `frame`, and the
+/// native stack once it has gone `drop` bytes down. To `out` when one fails. Uses rax and rcx.
+void Baseline::ssaEntryLimits(Reg regs, Reg frame, std::int32_t drop, Label& out)
+{
+    Label filled, fill;
+    a_.lea(RAX, mem(regs, std::int32_t(8 * limitNeed_)));
+    a_.alu(7, RAX, mem(R12, kVmStackInit));
+    a_.jcc(CBE, filled);
+    a_.lea(RCX, mem(RAX, 8 * 8));
+    a_.alu(7, RCX, mem(R12, kVmStackEnd));
+    a_.jcc(CA, out);
+    a_.mov(RCX, mem(R12, kVmStackInit));
+    a_.bind(fill);
+    a_.mov(mem(RCX, 0), std::int32_t(kUndefined));
+    a_.aluI(0, RCX, 8);
+    a_.alu(7, RCX, RAX);
+    a_.jcc(CB, fill);
+    a_.mov(mem(R12, kVmStackInit), RCX);
+    a_.bind(filled);
+    a_.lea(RAX, mem(frame, std::int32_t(sizeof(Frame))));
+    a_.alu(7, RAX, mem(R12, kVmFrameLimit));
+    a_.jcc(CAE, out);
+    a_.mov(RAX, mem(R12, kVmStackFloor));
+    a_.aluI(0, RAX, drop);
+    a_.alu(7, RSP, RAX);
+    a_.jcc(CB, out);
 }
 
 bool Baseline::ssaArith(std::uint32_t i)

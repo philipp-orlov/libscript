@@ -3276,6 +3276,10 @@ public:
 private:
     const ssa::Graph* ssa_ = nullptr;
     bool ssaCtor_ = false;  ///< made for frames `new` makes too
+    /// Registers from the frame's first to past the largest frame a direct call pushes (`ssaDirectCall`); 0 for none.
+    /// The ways in check the stack limits for that once, and the calls do not.
+    std::uint32_t limitNeed_ = 0;
+    void ssaEntryLimits(Reg regs, Reg frame, std::int32_t drop, Label& out);
     /// Per instruction: a read whose value is known from one before it (`ssaLoadElim`), which is its value then.
     std::vector<std::uint8_t> elim_;
     /// Per value, where it is first and last needed, and per instruction, where its operands are read (the plan's numbering).

@@ -13,6 +13,7 @@ function or symbol, a box a closure captured -- carries a count, and
 `script::Value` maintains it on copy and destruction. When the last handle
 goes away the cell is freed immediately: no pause, no delay, no growth in the
 meantime. That covers the overwhelming majority of what a program allocates.
+The vm core frees later by default: see "Memory modes" below.
 
 This is also what makes the C++ API safe without a handle scope. A `Value`
 held in a member variable, a `std::vector` or a lambda capture is a real
@@ -228,8 +229,8 @@ options.freeBudget = 1000;                                       // Counted: cel
 options.cycles     = script::Context::Options::Cycles::Manual;   // or Auto (the default)
 ```
 
-* **`memory`.** `Counted` frees a cell at its last release. In `Deferred`, the
-  registers of script frames hold values without counts. A cell whose count
+* **`memory`.** `Counted` frees a cell at its last release. In `Deferred` (the
+  default on arm64), the registers of script frames hold values without counts. A cell whose count
   reaches zero waits in a zero-count table. A scan of the frames frees the cells
   in the table that no frame holds. Scans run when the table is full (at least
   256 cells) at an allocation, before a collection, before a budget or
@@ -237,6 +238,10 @@ options.cycles     = script::Context::Options::Cycles::Manual;   // or Auto (the
   script running. `Deferred` runs compiled code faster. A dead cell is freed
   later, and a generator keeps what its registers held at its last suspension
   until the next one. On x86-64, `Deferred` manages memory as `Counted` does.
+  With `Deferred`, new plain objects that compiled code makes are young: they hold
+  no counts and are not in `liveObjects` until a scan finds them alive. A scan
+  frees the young cells that nothing holds. `stats()` adds the young cells that
+  no scan has looked at yet. [vm-core.md](vm-core.md) has the rules.
 * **`freeBudget`.** A release that frees a large structure frees at most this
   many cells. The rest go on a list, and each later allocation frees up to this
   many more from it. A cycle collection frees all of the list. A real-time host

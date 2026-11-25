@@ -2,7 +2,20 @@
 
 The execution core for JavaScript, TypeScript and Python (`src/vm`). It is the default: a `Context` runs on it unless told to
 use the dynamic engine (`src/dyn`), which stays in the tree as the oracle (`Options::core = Dyn`, and `SCRIPT_CORE=dyn` in builds
-with `SCRIPT_JIT_ENV_OVERRIDE`). The design is in `ls-jsc.md` (outside this repository); this page says what is here.
+with `SCRIPT_JIT_ENV_OVERRIDE`). This page says what is here and how fast it is.
+
+## Tiers
+
+| Tier | Where | When | What it is |
+|---|---|---|---|
+| Interpreter | `interp.cpp` | always | computed-goto dispatch over register bytecode; writes the profiles (inline caches, `elemProf`, `callProf`, arithmetic) |
+| Baseline (tier 1) | `baseline_x64.cpp` | after 200 calls, or about 1,000 loop rounds | one template per instruction, on the interpreter's frame; generators and async functions too |
+| SSA tier | `ssa_build.cpp`, `ssa_emit.inc` | arm64: after 2,000 more calls or loop rounds | the default optimizing tier on arm64; a value graph with representations and a linear-scan allocator |
+| Tier 2 | `opt_analysis.cpp`, `opt_emit.inc` | x86-64; on arm64 for what the SSA tier refuses or leaves (`ssa::preferTier2`) | templates over int32 and double "webs" in registers |
+| Regexp compiler | `regexp_jit.cpp` | arm64 | native matchers for regular expressions |
+
+Two bytecode-level inliners feed the compilers: merge inlining (`merge_inline.cpp`) and recursion in place
+(`self_inline.cpp`). A function of a large program is compiled to bytecode at its first call (`CodeBlock::kLazy`, below).
 
 ## Using it
 
@@ -31,12 +44,13 @@ core's natives (`src/vm/python.cpp`). `Context::core()` says which core a contex
 | `operators.hpp`, `convert.hpp`, `host.hpp` | the language's operators; `Value` conversion; what the public `Value` API does with a new-core object |
 | `src/vm/compiler.cpp` | AST to bytecode |
 | `src/vm/interp.cpp` | the interpreter: computed-goto dispatch, calls without C++ recursion, inline caches |
-| `src/vm/jit/`, `include/script/internal/vm/jit.hpp` | the compilers (x86-64 and arm64, Linux): `asm_x64.hpp` and `asm_a64.hpp` (two macro assemblers with one interface), `code_region.cpp` (dual-mapped code memory), `baseline_x64.cpp` (templates, calls, entry stubs, written once for both) |
+| `src/vm/jit/`, `include/script/internal/vm/jit.hpp` | the compilers (x86-64 and arm64, Linux): `asm_x64.hpp` and `asm_a64.hpp` (two macro assemblers with one interface), `code_region.cpp` (dual-mapped code memory), `baseline_x64.cpp` (templates, calls, entry stubs, written once for both), `ssa.hpp`, `ssa_build.cpp`, `ssa_emit.inc` (the SSA tier), `opt_*` (tier 2), `merge_inline.cpp`, `self_inline.cpp` (the inliners), `regexp_jit.cpp` (regular expressions) |
 | `src/vm/builtins.cpp`, `builtins_*.cpp` | the built-in objects: Object/Function/Array/String/Number/Math/Error/JSON (`builtins.cpp`), Symbol, iterator families and generator prototypes (`_symbol`), the rest of Object, Reflect, Array/String/Number/Math and BigInt (`_more`), the Array methods that call back (`_array`), Map/Set/Weak\*/WeakRef/FinalizationRegistry (`_collections`), RegExp (`_regexp`: the spec's `exec`/species paths, a fast path for an untouched RegExp, the legacy `RegExp.$1` statics, `RegExp.escape`), Promise with capabilities and the combinators, async functions and generators (`_promise`), Date (`_date`), ArrayBuffer (resizable, shared), typed arrays and DataView (`_typed`, `_typedarray`), Atomics, iterator helpers, Proxy (`_proxy`: callable proxies) |
 | `src/vm/objmodel.cpp` | the internal methods of an object -- [[GetOwnProperty]], [[DefineOwnProperty]], [[Set]], [[GetPrototypeOf]], [[OwnPropertyKeys]] and the rest -- for ordinary objects and proxies, with every invariant check a proxy's traps are held to; `Object` and `Reflect` are built on them |
 | `src/vm/python.cpp`, `src/vm/language.cpp` | Python and TypeScript on the new core |
 | `tests/vm`, `tests/vm/snippets.inc` | unit tests; programs both cores must agree on |
 | `tools/vm_fuzz.py`, `bench/micro` | differential fuzzer; micro-benchmarks that also run under JSC and node |
+| `tools/perf/` | the scripts that build, gate and time the vm core against JetStream 3 (`tools/perf/README.md`) |
 
 ## The baseline compiler
 
@@ -56,7 +70,9 @@ includes what it calls), and an exception handler is entered by looking its labe
   `scriptVmJitCall`; one-argument `Math` natives are called without any of that.
 - Helpers (`jitGetProp` and the rest, in `interp.cpp`) are what the interpreter does for one instruction without the
   dispatch; stubs and templates without a fast path use them.
-- Not compiled: generators and async functions (they stay in the interpreter), functions of more than 20,000 instructions.
+- Generators, async functions and async generators are compiled too. A `yield` or an `await` writes the state into the
+  generator's cell; a resumption enters the compiled code at the instruction after it (`jitGenEnter`).
+- Not compiled: functions of more than 20,000 instructions, and functions past `jit.codeCacheLimit` (tried again later).
 - A C++ exception cannot cross compiled frames (they carry no unwind information), so it is parked in a thread-local and the
   compiled frames leave as for a script exception; `enterTier1` throws it again.
 - Code lives in one dual-mapped region (`memfd`, a read-write view for the compiler and a read-execute view for running);
@@ -259,6 +275,17 @@ small loop that reads and writes three or more properties of objects it does not
 `.length` of strings and arrays, `ModI` (a multiply by a magic number), and a global read that a loop which clobbers nothing
 reads once on the way in. Values known never to be below zero (`nonNeg_`) need no sign or -0 checks.
 
+**Direct calls.** A call between functions of SSA code checks the stack (frames, registers, `stackInit`) once, at the
+function's entry and at its OSR entries, for the largest window any of its direct calls needs (`limitNeed_`). It does not
+check `this` when the value is known to be an object. The tick (the interrupt check) stays at each call: a recursion with
+no loop asks the host only there.
+
+**What leaves for the runtime.** An instruction the code does not do in place runs as the baseline template, or as one
+step of the interpreter (`scriptVmJitStep`, counted by `SCRIPT_VM_STEPS`). A relational or truth jump whose site failed is
+decided by `ssaStepJump`: two strings by `compareStrings`, any other value by `truth`, with the live registers saved.
+`charCodeAt` and `codePointAt` of a rope join it by a call (`scriptVmSsaFlatten`). `+` of two strings calls
+`scriptVmJitConcat` from the template directly.
+
 **Switches** (builds with `SCRIPT_JIT_ENV_OVERRIDE`): `SSA_DUMP` (bytecode and graph), `SSA_REPS` (representations),
 `SSA_REFUSED`, `SSA_GENERIC` (each instruction compiled through a template, with its cache state), `SSA_SYNCALL`,
 `SSA_NOREGS`, `SSA_NOEVICT`, `SSA_NONEW`, `SSA_NOPREFER` (no function left to tier 2), `SSA_PREFER=<mask>` (which rules),
@@ -328,6 +355,13 @@ freed without a look at what it holds, and a store into it counts nothing. These
 9. Each allocation site (`VM::allocSiteFor`, one per instruction) counts how many of its cells a scan found alive. When seven
    of eight lived in a window of `VM::kSiteWindow` cells, the site makes old cells from then on (`AllocSite::old`): making a
    cell old costs more than counting its values while they are stored.
+10. A young cell is not in the live-cell counts and does not compare the cell budgets when it is made (`uncountYoung`).
+   It is counted when it lives on (`makeOld`, or a survivor of `collectYoung`). A dead young cell was never counted.
+   `Context::stats()` adds the young cells that are still in the list (`VM::youngLive`).
+
+What young cells do not cover yet: arrays, strings, closures, boxes, generator and promise cells, and every object that the
+runtime makes. Those are counted from birth, go into the zero-count table at zero, and are freed one at a time
+(`destroyFrom`).
 
 Young cells are on with deferred frames. `SCRIPT_VM_YOUNG=0` turns them off in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
 
@@ -354,6 +388,37 @@ A read site has one inline cache (own property, prototype property with a validi
 when it sees more, a `PolyCache` of four entries reached through `InlineCache::pad`: own and inherited data properties and
 getters. The interpreter and the helper `jitGetProp` probe it; tier 1 compiles a guard chain over the entries it has at compile
 time (data entries only). Getters are not inline-cached in compiled code: they go to the helper, which calls them.
+
+A site that sees more shapes than that is marked megamorphic (`InlineCache::flags`) and reads through one table for the VM
+(2,048 entries, `VM::kMegaBits`), keyed by shape and name. Only marked sites use the table.
+
+`o[k]` with a key that is no index has an element cache of four ways (`ElemCache`): key, shape, slot, holder, validity
+cell, and whether the slot is an accessor. A getter entry calls the getter (`jitGetElem` through `VM::callHook`).
+
+A literal `InitProp` (`{a: 1, b: 2}`) in baseline code whose cache was empty at compile time reads the cache when it runs
+(shape before, slot index and shape after), for inline slots.
+
+## Strings
+
+- UTF-16 cells: flat, rope, slice or an appendable buffer. Strings of up to 32 units that `ContextImpl::str` makes are
+  interned. A string used as a property name is made an atom then (`toPropertyKey`).
+- `String(i)` of an integer in [0, 65536) gives the existing atom of that index, when one exists.
+- `s += t` on a local that only strings reach appends in place (`Append`, `Unshare`; deferred frames, rule 8).
+- An atom cannot be appended in place, so a change that interns more strings must leave out strings that will grow.
+
+## Regular expressions
+
+- Programs come from the dynamic engine's compiler (`dyn::regex::Program`); `regex::exec` runs them by backtracking.
+- On arm64 a program that has run hot (`kHot`, weighted by the input's length) gets a native matcher (`regexp_jit.cpp`).
+  It pushes no choice that cannot succeed: a choice whose first branch cannot begin with the next unit, a `^` past the
+  start, a greedy loop followed by what its own units cannot begin.
+- `planClean` finds places reached with only the next-start entry on the stack. A `Save` there writes with no undo
+  entry, and a failure there goes on at the next start position. Only for programs of plain instructions.
+- Start search: the first unit by a SIMD scan; without one, a unit that every match has at a fixed distance from its
+  start is looked for first.
+- Each regular-expression literal site keeps its `RegExp` in a table of 512 entries (`VM::regexpLiterals`). A literal
+  `RegExp` that the program did not change reads its `lastIndex` by its shape (`VM::regexpLiteralShape`).
+- Not done: a dispatch on the code point for Unicode alternations whose branches all begin with the same lead surrogate.
 
 ## Rules the code keeps
 
@@ -408,127 +473,75 @@ drives; a generator's `return(v)` throws a marker that `finally` blocks see and 
 Unicode property tables and a few features the shared front end does not parse. What the old core passes and this one does
 not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 
-## Performance experiments
+## Speed against JavaScriptCore
 
-What was tried against JetStream 3 (JavaScript tests, `jsc-compare/harness/js3run.py`, scores higher is better, arm64), what
-stayed and what did not. Measured with each engine pinned to one fast core; a test's score moves a few percent between runs,
-so a change was kept only when it moved a test well past that.
+State on 2026-11-25 (`4be6b64`). JetStream 3, the 41 JavaScript workloads that `tools/probes/jetstream.py` writes, release
+build, arm64 (Cortex-X925, core 16), JavaScriptCore 2.52.6, best of two interleaved rounds. The ratio is libscript's time
+over JSC's time; below 1.00 libscript is faster.
 
-Kept:
+| | Later iterations | First iteration |
+|---|--:|--:|
+| Geometric mean of 41 | 1.44x | 0.72x |
 
-| Change | Test | Before | After |
-|---|---|--:|--:|
-| Scope analyses walk the tree once (TDZ holes, captured names, scope index) | babylonjs-startup-es6 | 1.89 | 7.96 |
-| A plain RegExp skips the flag getters and `exec` lookup; per-thread program cache | OfflineAssembler | 15.7 | 26.0 |
-| `slice`/`substring`/`substr` of a long string share its characters | OfflineAssembler | 26.0 | 34.8 |
-| Typed arrays of every kind in place; typed access as a read chain; re-learn a guessed element site | mandreel | 16.9 | 26.1 |
-| Megamorphic read table at marked sites | espree-wtb / acorn-wtb / Babylon | 8.8 / 7.3 / 142 | 12.7 / 10.4 / 179 |
-| A small function with an int32 test inlined along its fall-through (`uint(x)`) | mandreel | 26.1 | 28.3 |
-| A switch case is one compare-and-jump | Air | 120 | 129 |
+- Furthest behind (later iterations): splay 2.66x, Sunspider 2.25x, octane-code-load 2.23x, ML 2.08x, threejs 2.01x,
+  richards 1.99x, OfflineAssembler 1.89x, js-tokens 1.86x, cdjs 1.83x, hash-map 1.81x, sync-fs 1.80x, Air 1.79x.
+- Ahead: proxy-mobx 0.88x, stanford-crypto-aes 0.88x, pdfjs 0.99x.
+- First iterations are ahead on most workloads. Behind: json-stringify-inspector 2.57x, octane-code-load 2.29x,
+  regexp-octane 2.15x, threejs 1.34x, WSL 1.22x, OfflineAssembler 1.11x.
 
-The whole suite (71 tests, geometric mean) went from 50.4 to 54.2 over these, against JavaScriptCore's 260.6.
+### Where the time goes
 
-How the three worst tests were found: `perf record` over the harness run, then `perf report --no-children -g callee` for
-native code and `SCRIPT_VM_PERFMAP=1` with a per-function share for compiled code. babylonjs-startup spent 72% in one
-compiler helper (`mentions`, called once per `let` of a scope over every statement before it), OfflineAssembler 30% in
-interning flag names for `rx.flags` and 17% in copying the remaining source on each `str.slice(n)`, and mandreel's hot loops
-took a count on the typed array for every `heap32[...]`.
+Share of samples by where they fall (`tools/perf/t2prof.sh`, 2026-11-24). "Runtime" is all C++: memory management, the
+built-ins, the helpers that compiled code calls, the parser and the compilers.
 
-Tried and taken out:
+| Most time in | Workloads (runtime share) |
+|---|---|
+| The runtime, over 50% | octane-code-load 98%, doxbee-async 86%, async-fs 86%, doxbee-promise 83%, Sunspider 81%, proxy-mobx 79%, OfflineAssembler 73%, sync-fs 70%, splay 69%, WSL 68%, threejs 61%, Air 59%, Box2D 58%, js-tokens 55% |
+| Mixed, 30-50% runtime | earley-boyer 48%, cdjs 45%, regexp-octane 43% (and 47% in native matchers), ML 37%, delta-blue 37%, UniPoker 33% |
+| SSA code, over 70% | richards 86%, hash-map 83%, crypto 77%, raytrace 72% |
+| Baseline code, 11-33% | lazy-collections 33%, js-tokens 26%, sync-fs 14%, doxbee-async 13%, async-fs 11%: generators and async functions after each resumption |
 
-- Optimized code entered by `new` (constructors running tier 2 code): the constructor of espree's `Token` went from 3.2% to
-  2.7% of the run, nothing else moved, and Box2D's worst iteration fell from about 121 to 82 points (total 102 to 88): the
-  constructor code was made, failed a guard and was made again inside the timed part.
-- Caching a property read through a dictionary prototype by giving the dictionary a new shape id on every key it gains:
-  gbemu fell from 39 to 9, because its global object gains keys all the time. Replaced by an absence cell that only the
-  readers of a missing key hold (`Dictionary::absent`).
-- Keeping a compile try for exits at sites that had never run: the extra compiles cost more than they won.
-- Serving reads from the megamorphic table at every site: sites an inline cache handled well lost it (Box2D and gbemu fell).
-  The table now serves only sites marked megamorphic (`InlineCache::flags`).
+What this means for the design:
 
-Measured and not the cause: reference counting is 3 to 5% of the Octane tests' time (count updates and frees together).
-Loose `==` and `!=` in tests are never fused into a compare-and-jump (only `===`, `!==` and the relational operators are);
-on a mandreel-like loop fusing them would win about 6%.
+1. The optimizing tier leads on about a fifth of the suite. Work on it alone cannot close the gap.
+2. Memory management is in almost every profile: frees one cell at a time (`destroyFrom`), the zero-count table's scans,
+   and the cycle collector's walk (splay about 25%, cdjs about 20%). The young generation covers only plain objects that
+   compiled code makes.
+3. Compiled code calls the runtime through generic helpers. A helper reads the instruction and the frame again and
+   writes its result with `setReg`. A direct call with the operands in registers saved 2-4% on string `+` alone.
+4. A resumed generator or async function runs baseline code. The SSA tier enters such a function only at a loop that
+   does not yield.
+5. octane-code-load measures the parser and the bytecode compiler. Lazy compiles (`kLazy`) cover large programs only.
 
-Air fell from 160 to 126 with the change that has baseline reads follow their site's cache as it runs (gbemu 24 to 39
-with it). Its largest function, `Inst_forEachArg`, runs in baseline code only, and its share of the run went from 15% to
-34%; its code grew from 1.0 MB to 1.75 MB. Moving the cache probes out of line did not bring it back, so the size of that
-code is not the cause; the cause is not found yet.
+### What held across the work
 
-Still open, in order of what they would bring: startup tests (babylonjs-startup, the code-load tests) are now half bytecode
-compilation and a third parsing, of every function up front, where JavaScriptCore compiles a function on its first call;
-top-level `const` bindings live on the global object as writable properties, so a read of one is not a constant (Air's
-switch cases are such reads); loose `==` is not fused into a jump.
+1. Measure the premise before building. Several designs failed on a counter or a bound: a traced old generation
+   (marking cost more than freeing), Latin-1 strings, allocation removal for raytrace (the time was an FP stall), double
+   fields without boxes (doubles are NaN-boxed already, as in JSC).
+2. Count instructions to tell work from placement. A change of 1-4% on a workload that the change cannot touch is
+   often placement: `perf stat -e instructions:u,cycles:u` shows the same instructions and more cycles.
+3. Generic library paths in hot code paid well when replaced: `__udivti3`, `typeid ==`, `u16string_view ==`, names
+   interned from C strings, function-local static guards.
+4. Caches keyed by ids that are never used twice (shape ids carry a generation) need no counts. Caches keyed by cell
+   addresses hold counts, or only steer a policy whose wrong answer is still correct.
+5. Prefetching never helped in this allocator: reusing the slot freed last, still in cache, wins.
+6. Heuristics that depend on timing make results fragile. proxy-mobx moved 7-8% with when a compile landed relative to
+   a closure's creation (fixed by invalidating only the code that assumed one function per code).
+7. JSC's own later times move 1-15% between runs on some workloads (richards, js-tokens, splay). Compare inside one run.
 
-## Handoff: performance work against JavaScriptCore
-
-For whoever picks this up next. The state as of commit `5bee0d6`: JetStream 3 (JavaScript tests only) geometric mean 54.2
-against JavaScriptCore's 260.6, a gap of 4.8x; no test is ahead of JavaScriptCore. What was tried, kept and taken out is in
-the section above; read it first so as not to repeat it.
-
-**Measuring.**
-
-- Harness: `jsc-compare/harness/js3run.py jsc|libscript <out.jsonl> [test ...]` (one process per test, pinned to cores
-  5-9, binary from `$LS`); one test by hand from `bench/jetstream3`:
-  `libscript ../../harness/js3_libscript.js --no-prefetch <test>`. Scores move a few percent between runs: measure each
-  engine on the same core, twice, and compare against a frozen copy of the previous binary, not against old result files.
-- Keep builds and fuzzers off the cores a measurement runs on (`taskset -c 10-19 make -j10`); they move scores otherwise.
-- Native hot spots: `perf record -g`, then `perf report --no-children -g callee`. Compiled code: `SCRIPT_VM_PERFMAP=1`
-  writes `/tmp/perf-<pid>.map` (`js:` baseline, `js2:` optimized); `SCRIPT_VM_CODEDUMP=<dir>` writes each function's code
-  (`t1-*` baseline, `t2-*` optimized) for `objdump -D -b binary -maarch64`. Together they give a per-instruction profile.
-- Small kernels that copy a test's hot loop (globals, typed arrays, the same operators) are the quickest way to iterate;
-  check them against JavaScriptCore (`jsc`) and `SCRIPT_CORE=dyn` for the result.
-
-**Switches for tier 2** (builds with `SCRIPT_JIT_ENV_OVERRIDE`): `T2EXITS` (each exit, with the receiver and, for element
-sites, the base, index and element profile), `T2DBG` (each compile: webs and profile), `T2TRIG`, `T2REFUSED`, `T2ONLY=<fn>`,
-`T2INL` (inlining decisions), `T2CHAIN` (read chains), `T2HOIST` (what loops hoist, and when a loop "calls out"),
-`T2DOORS` (where a side door was counted), `T2FAIL=<i,...>`, `SCRIPT_VM_DUMP` (bytecode).
-
-**Before a commit.** `ctest` in five modes: as is, `SCRIPT_VM_TIER1=1 SCRIPT_VM_TIER2=1`, `SCRIPT_VM_TIER1=0`,
-`SCRIPT_VM_TIER2=0`, and `SCRIPT_VM_SSA=0` (tier 2 alone); then `tools/vm_fuzz.py <libscript> 1200 180000`, the same with
-`FUZZ_TIER1=2 FUZZ_TIER2=10 FUZZ_REPS=40` (800 programs), and `tools/js_jit_fuzz.py --cores <libscript> 1500 13000`. A
-change that makes no test move past noise is taken out, not kept.
-
-**Open, in the order they would bring the most.**
-
-1. *Air regression (160 to 126), cause unknown.* It came with `eafa6c9` (baseline reads follow their site's cache as it
-   runs; `promotePoly`/`promoteStore` in `interp.cpp`, `cachedRead`/`cachedWrite` in `baseline_x64.cpp`). The time is in
-   `Inst_forEachArg` (ARES-6/Air/opcode.js), baseline code only, mostly its switch's case chain. Ruled out: the size of its
-   code (probes moved out of line, no change). Next to check: whether promotion makes the site caches of that function
-   thrash, so its reads go to `jitGetProp` far more often (count helper calls per site on `cbecc54` and on `eafa6c9`), and
-   whether that function stays out of tier 2 for its size. A fix must keep gbemu's gain from the same commit (24 to 39).
-2. *Compile lazily.* babylonjs-startup and the code-load tests are now about half bytecode compilation and a third parsing:
-   every function is compiled when its script loads (`Compiler::compileFunctionOnce`). JavaScriptCore compiles a function
-   on its first call. The hard part is the scope chain: a nested function resolves its free names against the enclosing
-   functions' bindings while they are compiled (`resolveIn`, `Fn::captured`), so a lazy compile needs that kept.
-3. *Top-level `const` as constants.* Top-level `let`/`const` are writable properties of the global object here (not a
-   separate lexical environment), so tier 2 cannot treat a read of one as a constant. Air's switch compares against
-   ~375 such constants per call. Either mark a `const` non-writable once initialised (check what assignment from another
-   script must then throw) or keep a per-global "never written after init" flag the compilers can trust.
-4. *Fuse loose `==`/`!=` into compare-and-jumps* (`condJump`/`condJumpTrue` in `compiler.cpp` fuse only `===`, `!==` and
-   relations). Needs new jump opcodes through interpreter, baseline and tier 2; for two numbers tier 2 can reuse the strict
-   path. About 6% on a mandreel-like loop, more on Octane code that uses `==` throughout.
-5. *mandreel's loops still call out.* Inlining now takes `uint()`, but its real hot loops (`sortMinDown`/`sortMaxDown`)
-   keep other calls, so their typed-array globals are still read on each access (epoch check and load). `T2HOIST` and
-   `T2DOORS` show which instruction stops the hoist.
+`tools/perf/README.md` has the method: builds, the gate, A/B timing, profiles.
 
 ## Known limits
 
 - Tier 1 (the baseline compiler) compiles a function after 200 calls; the optimizing tier (the SSA tier on arm64, tier 2 for what
   it refuses and on x86-64) takes over after 2,000 more calls or loop iterations (`SCRIPT_VM_TIER1`, `SCRIPT_VM_TIER2` override in
   builds with `SCRIPT_JIT_ENV_OVERRIDE`; 0 turns a tier off). Tier 1 and tier 2 run on x86-64 and on arm64 (Linux).
-- Speed: against JavaScriptCore 2.52.6 with all its tiers, the 16 kernels of `bench/kernels/js` take 0.89x its time in
-  geometric mean (Xeon Gold 5420+, median of eleven runs of each engine in turn on one core): `sort_cmp` 0.49,
-  `float_mandel` 0.70, `alloc_small` 0.71, `string_ops` 0.86, `int_loop` 0.87, `map_dict` 0.91, `array_push_hof` 0.93,
-  `prop_rw` 0.93, `fib_calls` 0.96, `closure` 0.97, `nbody` 0.97, `tree_gc` 0.97, `json_rt` 1.01, `sieve_array` 1.02,
-  `poly_prop` 1.03, `method_call` 1.07. What is left: `nbody` is bound by the branch port (two tests per double field read,
-  four per object guard), `tree_gc` by touching each freed node (counting frees one by one where a tracing collector
-  touches none), and a call still pushes a whole frame in memory. Measure with both engines on the same core: the cores of
-  this machine run at different clocks under load, which moved single-core comparisons by up to 6%.
+- Speed: see "Speed against JavaScriptCore" above.
+- The SSA tier and the regexp compiler run on arm64 only. x86-64 runs the baseline compiler and tier 2, with counted frames;
+  it has not been run since the SSA tier became the default.
 - Calls are counted, not measured in stack: a call deeper than `Options::stackLimit` frames (512 by default) is a
   `RangeError`. Recursion run in place can take one frame for up to three levels.
-- Not compiled by tier 1: generators and async functions (they stay in the interpreter), functions of more than 20,000
-  instructions.
+- Not compiled by tier 1: functions of more than 20,000 instructions.
 - Arrays are dense: a length past what a gap of `JSArray::kMaxDenseGap` allows (`a.length = 2**32 - 1`) ends in
   `OutOfMemory` where the language would give a sparse array.
 - Weak collections, `WeakRef` and `FinalizationRegistry` hold their targets for as long as the program can name the

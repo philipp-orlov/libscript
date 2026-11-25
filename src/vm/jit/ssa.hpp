@@ -91,9 +91,9 @@ bool supported(const CodeBlock& code, std::uint32_t i);
 
 Graph build(const CodeBlock& code);
 
-/// Whether tier 2 should compile `code` instead: it uses there what the SSA tier does not have (a self-inlined recursion
-/// it runs with borrowed frames, a property a loop reads and writes on an object the loop does not change, which it keeps
-/// in a register, a tiny callee in a loop, which it runs in place). `why` says which.
+/// Whether tier 2 should compile `code` instead: it uses there what the SSA tier does not have (a property a loop reads
+/// and writes on an object the loop does not change, which it keeps in a register, a tiny callee in a loop, which it runs
+/// in place; with `SSA_PREFER` bit 1, a self-inlined recursion it runs with borrowed frames). `why` says which.
 bool preferTier2(const CodeBlock& code, const VM& vm, const char** why);
 
 }  // namespace ssa

@@ -540,10 +540,11 @@ bool writesUpvalues(const CodeBlock& c)
 
 bool preferTier2(const CodeBlock& code, const VM& vm, const char** why)
 {
-    // Which rules apply (a debug mask: 1 recursion, 2 tiny callees, 4 fields).
+    // Which rules apply (a debug mask: 1 recursion, 2 tiny callees, 4 fields). Recursion run in place by `selfInline` is
+    // the SSA tier's too: tier 2 took it with borrowed frames, earley-boyer +2.6% over the SSA code.
     static const int rules = [] {
         const char* e = std::getenv("SSA_PREFER");
-        return e ? std::atoi(e) : 7;
+        return e ? std::atoi(e) : 6;
     }();
     const std::uint32_t n = std::uint32_t(code.code.size());
     // The loops: header .. last back edge.

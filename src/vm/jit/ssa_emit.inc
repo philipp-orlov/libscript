@@ -1024,6 +1024,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
         a_.bind(in);
     }
     a_.enter(RBX, R13, 8 + spill_);
+    ssaKeptSave();
     a_.mov(R13, RSI);
     a_.mov(RBX, RDI);
     for (unsigned r = 0; r < nregs; ++r)
@@ -1300,6 +1301,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             continue;
         osr.emplace_back(bl.start, std::uint32_t(a_.here()));
         a_.aluI(5, RSP, spill_);
+        ssaKeptSave();
         if (limitNeed_) {
             Label toBase, in;
             ssaEntryLimits(RBX, R13, 0, toBase);
@@ -1407,6 +1409,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                 ssaLoadLoopCache(h);
         a_.jmp(blockLabel_[b]);
         a_.bind(fail);
+        ssaKeptRestore();
         a_.aluI(0, RSP, spill_);
         a_.mov(RDI, R12);
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptEntryFail));
@@ -1469,6 +1472,7 @@ void Baseline::emitSsaTails()
             if (ssa::bitTest(e.live, r))
                 all.push_back(r);
         ssaSync(all, e.live, std::vector<std::uint8_t>(code_->nregs, 0));
+        ssaKeptRestore();
         a_.aluI(0, RSP, spill_);
         if (e.kind == 3) {
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(e.i)));
@@ -4933,6 +4937,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     static const bool noRegs = false, noEvict = false;
 #endif
     if (!noRegs) {
+        if (Asm::kExtraGpr >= 7) {
+            gprs.push_back(R22);  // taken last: saved where the code is entered (`ssaKeptSave`)
+            gprs.push_back(R21);
+        }
         if (Asm::kSsaGpr23)
             gprs.push_back(R23);
         for (int r : {int(R20), int(R19), int(R18), int(R17), int(R16), int(R11), int(R10), int(R9), int(R8)})
@@ -4994,6 +5002,13 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         ssaWhy_ = "slots";
         return false;
     }
+    usesKept_ = false;
+    for (std::uint32_t v = 0; v < nv && !usesKept_; ++v)
+        usesKept_ = sval_[v].rep != kRepF64 && (sval_[v].reg == R21 || sval_[v].reg == R22);
+    if (usesKept_) {
+        keptSlot_ = slots;
+        slots += 2;
+    }
     spill_ = std::int32_t((8 * slots + 15) & ~15);
     // Loops that clobber no register: values from before them that live in slots, read inside, get a register for the
     // loop, loaded where it is entered (values never change, so the slot stays right and nothing is written back).
@@ -5030,6 +5045,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 freeG.push_back(r);
         if (Asm::kSsaGpr23 && !busy[R23])
             freeG.push_back(R23);
+        if (usesKept_)
+            for (int r : {int(R21), int(R22)})
+                if (!busy[r])
+                    freeG.push_back(r);
         for (int x = 2; x < 2 + 14 + Asm::kExtraXmm; ++x)
             if (!busy[32 + x])
                 freeX.push_back(x);
@@ -5178,6 +5197,10 @@ void Baseline::ssaPlanKeeps(const ssa::Graph& g, const std::vector<std::int32_t>
             gprs.push_back(r);
     if (Asm::kSsaGpr23)
         gprs.push_back(R23);
+    if (usesKept_) {
+        gprs.push_back(R21);
+        gprs.push_back(R22);
+    }
     for (int x = 2; x < 2 + 14 + Asm::kExtraXmm; ++x)
         xmms.push_back(32 + x);
     for (Want& w : wants) {

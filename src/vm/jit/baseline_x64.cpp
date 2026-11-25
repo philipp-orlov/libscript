@@ -3389,6 +3389,24 @@ private:
     std::vector<std::uint32_t> loopLast_;                                ///< per cached loop header: its last block
     std::vector<std::pair<std::uint32_t, std::int8_t>> cacheSaved_;
     std::uint32_t cacheEnd_ = 0;
+    /// The SSA code keeps values in R21 and R22 (arm64 x25, x26), which other optimized code may keep its own in: saved
+    /// in two slots (from `keptSlot_`) where the code is entered, and put back on each way out.
+    bool usesKept_ = false;
+    std::int32_t keptSlot_ = 0;
+    void ssaKeptSave()
+    {
+        if (usesKept_) {
+            a_.mov(mem(RSP, 8 + 8 * keptSlot_), R21);
+            a_.mov(mem(RSP, 16 + 8 * keptSlot_), R22);
+        }
+    }
+    void ssaKeptRestore()
+    {
+        if (usesKept_) {
+            a_.mov(R21, mem(RSP, 8 + 8 * keptSlot_));
+            a_.mov(R22, mem(RSP, 16 + 8 * keptSlot_));
+        }
+    }
     void ssaLoadLoopCache(std::uint32_t h);
     /// Per loop header: checks on each way in from before the loop, whose facts hold in all of it (an SSA value's kind
     /// never changes). `ints`: phis made int32 whose input from before the loop is checked; `arrays`, `typed`: values the
@@ -3697,6 +3715,7 @@ void Baseline::emitTails()
         a_.ret();
         // Leaving for the interpreter or the caller: back to the baseline frame first.
         a_.bind(tail_);
+        ssaKeptRestore();
         a_.aluI(0, RSP, spill_);
         a_.bind(tailBase_);
         a_.cmpI(RAX, std::int32_t(kStepJump));
@@ -3709,7 +3728,8 @@ void Baseline::emitTails()
         a_.callAbs(reinterpret_cast<const void*>(&scriptVmJitTarget));
         a_.jmp(RAX);
         a_.bind(exit_);
-        a_.leave(RBX, R13, 8 + spill_);
+        ssaKeptRestore();
+    a_.leave(RBX, R13, 8 + spill_);
         a_.ret();
         return;
     }
@@ -7016,6 +7036,7 @@ void Baseline::retDeferred(std::uint32_t i, const Ins& in, bool numberInRax, boo
         a_.bind(have);
     }
     a_.mov(mem(R12, kVmFrameTop), R13);
+    ssaKeptRestore();
     a_.leave(RBX, R13, 8 + spill_);
     a_.ret();
 }
@@ -7163,6 +7184,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
     if (!plain)
         a_.mov(RAX, mem(RSP, 0));
     // The way out in place (as at exit_).
+    ssaKeptRestore();
     a_.leave(RBX, R13, 8 + spill_);
     a_.ret();
 }

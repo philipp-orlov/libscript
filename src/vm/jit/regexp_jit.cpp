@@ -254,6 +254,56 @@ private:
         }
     }
 
+    // ---- what every match has ----
+    /// Whether every match has `unit` at `lo` to `hi` units from where it begins: the program begins with pieces of a fixed
+    /// width (a unit, a string, a capture, an assertion, or a Split of two such ways that meet), then a literal.
+    bool unitAhead(std::uint32_t* lo, std::uint32_t* hi, std::uint32_t* unit) const
+    {
+        // The width of the way from `pc` to where it meets `join` (a Jump to it, or arriving at it); false if not fixed.
+        const auto width = [&](std::uint32_t pc, std::uint32_t* join, std::uint32_t* w) {
+            *w = 0;
+            for (int k = 0; k < 16 && pc < n_; ++k) {
+                if (*join != ~0u && pc == *join)
+                    return true;
+                switch (code_[pc]) {
+                    case OpSave: case OpLineStart: case OpLineStartM: case OpLineEnd: case OpLineEndM: case OpWord: break;
+                    case OpLit: case OpLit2: case OpSet: ++*w; break;
+                    case OpStr: *w += code_[pc + 2]; break;
+                    case OpJump:
+                        if (*join != ~0u && code_[pc + 1] != *join)
+                            return false;
+                        *join = code_[pc + 1];
+                        return true;
+                    default: return false;
+                }
+                pc += size(pc);
+            }
+            return false;
+        };
+        std::uint32_t pc = 0;
+        *lo = *hi = 0;
+        for (int k = 0; k < 16 && pc < n_ && *hi <= 8; ++k) {
+            switch (code_[pc]) {
+                case OpLit: *unit = code_[pc + 1]; return *hi - *lo <= 3;
+                case OpStr: *unit = p_.literals[code_[pc + 1]]; return *hi - *lo <= 3;
+                case OpSave: case OpLineStart: case OpLineStartM: case OpLineEnd: case OpLineEndM: case OpWord: break;
+                case OpLit2: case OpSet: ++*lo; ++*hi; break;
+                case OpSplit: {
+                    std::uint32_t join = ~0u, a = 0, b = 0;
+                    if (!width(pc + 2, &join, &a) || join == ~0u || !width(code_[pc + 1], &join, &b))
+                        return false;
+                    *lo += std::min(a, b);
+                    *hi += std::max(a, b);
+                    pc = join;
+                    continue;
+                }
+                default: return false;
+            }
+            pc += size(pc);
+        }
+        return false;
+    }
+
     // ---- where nothing is pushed yet ----
     /// `clean_`: the places that every way in reaches with nothing pushed since the attempt began (only the entry of the
     /// next place to begin on the stack). A capture there has nothing to undo; the registers so written (`noUndo_`) are set
@@ -695,7 +745,29 @@ private:
             a_.aluI(0, R14, 8);
         }
         a_.bind(begin);
-        if (!once && p_.firstSet >= 0) {
+        std::uint32_t lo = 0, hi = 0, unit = 0;
+        if (!once && p_.firstUnit < 0 && unitAhead(&lo, &hi, &unit) && hi > 0) {
+            // A unit every match has at `lo` to `hi` units from its start, when none is known to begin it (that is found
+            // faster below): places without it there are passed over.
+            Label next, scan, found;
+            a_.jmp(scan);
+            a_.bind(next);
+            a_.aluI32(0, R12, 1);
+            a_.bind(scan);
+            a_.op32I(0, RAX, R12, std::int32_t(lo));
+            a_.alu32(7, RAX, RBP);
+            a_.jcc(CAE, none_);
+            for (std::uint32_t d = lo; d <= hi; ++d) {
+                a_.op32I(0, RAX, R12, std::int32_t(d));
+                a_.alu32(7, RAX, RBP);
+                a_.jcc(CAE, next);
+                a_.movzx16(RCX, mem(RBX, RAX, 2));
+                a_.aluI32(7, RCX, std::int32_t(unit));
+                a_.jcc(CE, found);
+            }
+            a_.jmp(next);
+            a_.bind(found);
+        } else if (!once && p_.firstSet >= 0) {
             if (p_.firstUnit >= 0) {
                 Label found;
                 needUnit(none_);

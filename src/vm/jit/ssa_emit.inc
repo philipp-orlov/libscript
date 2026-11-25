@@ -4098,6 +4098,11 @@ bool Baseline::ssaArith(std::uint32_t i)
         break;
     }
     case Op::MulI: {
+        if (wraps) {  // every use truncates, and the exact product is below 2^53: its low half is all that counts
+            a_.imulI32(RDX, t, imm);
+            a_.mov32(t, RDX);
+            break;
+        }
         // An overflow, or a zero that may be a negative zero: the interpreter's.
         a_.imulI32(RDX, t, imm);
         a_.jcc(CO, bad);
@@ -4117,6 +4122,10 @@ bool Baseline::ssaArith(std::uint32_t i)
         break;
     }
     case Op::Mul: {
+        if (wraps) {
+            a_.imul32(t, b);
+            break;
+        }
         // An overflow, or a zero that may be a negative zero (an operand below zero): the interpreter's.
         const bool noNegZero = nonNeg_[va] && vb != ssa::kNone && nonNeg_[vb];  // two not below zero: no -0
         if (!noNegZero)
@@ -4609,7 +4618,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     // overflow check: ToInt32 of the exact sum is the wrapped one. A product is not exact past 2^53: not taken in.
     {
         auto isWrapOp = [](Op op) {
-            return op == Op::Add || op == Op::Sub || op == Op::AddI || op == Op::SubI || op == Op::Inc || op == Op::Dec;
+            return op == Op::Add || op == Op::Sub || op == Op::AddI || op == Op::SubI || op == Op::Inc || op == Op::Dec ||
+                   op == Op::Mul || op == Op::MulI;
         };
         auto truncates = [](Op op) {
             switch (op) {
@@ -4623,13 +4633,117 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         auto isInt = [&](std::uint32_t v) {
             return v != ssa::kNone && (sval_[v].isConst ? JSValue::raw(sval_[v].bits).isInt32() : sval_[v].rep == kRepI32);
         };
+        // The exact value each int32 value can have (what the language computes, before any wrapping): constants, masks and
+        // shifts bound it; sums and products of bounded values are bounded. A wrapped sum or product is right only while the
+        // exact one is (below 2^53).
+        constexpr double kI32Lo = -2147483648.0, kI32Hi = 2147483647.0, kExact = 9007199254740992.0;
+        std::vector<std::pair<double, double>> range(nv, {kI32Lo, kI32Hi});
+        {
+            auto rangeOf = [&](std::uint32_t v) -> std::pair<double, double> {
+                if (v == ssa::kNone)
+                    return {kI32Lo, kI32Hi};
+                if (sval_[v].isConst) {
+                    const JSValue k = JSValue::raw(sval_[v].bits);
+                    if (k.isInt32())
+                        return {double(k.asInt32()), double(k.asInt32())};
+                }
+                return range[v];
+            };
+            auto clampI32 = [&](std::pair<double, double> r) {
+                // What ToInt32 makes of it: itself when it fits, else anything.
+                return r.first >= kI32Lo && r.second <= kI32Hi ? r : std::pair<double, double>{kI32Lo, kI32Hi};
+            };
+            for (std::uint32_t b = 1; b < nb; ++b) {
+                const ssa::Block& bl = g.blocks[b];
+                if (!bl.reached)
+                    continue;
+                std::vector<std::uint32_t> names = bl.nameIn;
+                for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(*code_, i)) {
+                    const Ins& in = code_->code[i];
+                    const Op op = in.opcode();
+                    if (op == Op::Mov) {
+                        names[in.a] = names[in.b];
+                        continue;
+                    }
+                    const opt::Effects e = ssa::effects(*code_, i);
+                    const std::uint32_t d = g.defBase[i];
+                    if (d != ssa::kNone && e.wr.size() == 1 && !sval_[d].isConst && sval_[d].rep == kRepI32) {
+                        const std::int32_t imm = op == Op::LoadInt ? std::int32_t(in.imm()) : std::int32_t(std::int16_t(in.c));
+                        auto two = [&](auto f) {
+                            const auto x = rangeOf(names[in.b]), y = rangeOf(names[in.c]);
+                            return f(x, y);
+                        };
+                        auto mul = [](std::pair<double, double> x, std::pair<double, double> y) {
+                            const double c[4] = {x.first * y.first, x.first * y.second, x.second * y.first, x.second * y.second};
+                            return std::pair<double, double>{std::min(std::min(c[0], c[1]), std::min(c[2], c[3])),
+                                                             std::max(std::max(c[0], c[1]), std::max(c[2], c[3]))};
+                        };
+                        std::pair<double, double> r{kI32Lo, kI32Hi};
+                        switch (op) {
+                        case Op::LoadInt: r = {double(imm), double(imm)}; break;
+                        case Op::BitAndI:
+                            if (imm >= 0)
+                                r = {0, double(imm)};
+                            break;
+                        case Op::BitAnd: {
+                            const auto x = clampI32(rangeOf(names[in.b])), y = clampI32(rangeOf(names[in.c]));
+                            if (x.first >= 0 || y.first >= 0)
+                                r = {0, std::min(x.first >= 0 ? x.second : kI32Hi, y.first >= 0 ? y.second : kI32Hi)};
+                            break;
+                        }
+                        case Op::ShrI: {
+                            const auto x = clampI32(rangeOf(names[in.b]));
+                            const int k = imm & 31;
+                            r = {std::floor(x.first / double(1u << k)), std::floor(x.second / double(1u << k))};
+                            break;
+                        }
+                        case Op::UShrI:
+                            if ((imm & 31) != 0)
+                                r = {0, double(0xFFFFFFFFu >> (imm & 31))};
+                            break;
+                        case Op::AddI: case Op::Inc: case Op::Dec: {
+                            const auto x = rangeOf(names[in.b]);
+                            const double k = op == Op::Inc ? 1 : op == Op::Dec ? -1 : double(imm);
+                            r = {x.first + k, x.second + k};
+                            break;
+                        }
+                        case Op::SubI: {
+                            const auto x = rangeOf(names[in.b]);
+                            r = {x.first - imm, x.second - imm};
+                            break;
+                        }
+                        case Op::Add: r = two([](auto x, auto y) { return std::pair<double, double>{x.first + y.first, x.second + y.second}; }); break;
+                        case Op::Sub: r = two([](auto x, auto y) { return std::pair<double, double>{x.first - y.second, x.second - y.first}; }); break;
+                        case Op::Mul: r = two(mul); break;
+                        case Op::MulI: r = mul(rangeOf(names[in.b]), {double(imm), double(imm)}); break;
+                        case Op::GetElem: {
+                            ElemKind kind;
+                            if (ssaElemPlan(i, false, &kind) == 2)
+                                switch (kind) {
+                                case ElemKind::Int8: r = {-128, 127}; break;
+                                case ElemKind::Uint8: case ElemKind::Uint8Clamped: r = {0, 255}; break;
+                                case ElemKind::Int16: r = {-32768, 32767}; break;
+                                case ElemKind::Uint16: r = {0, 65535}; break;
+                                default: break;
+                                }
+                            break;
+                        }
+                        default: break;
+                        }
+                        range[d] = r;
+                    }
+                    for (std::size_t w = 0; w < e.wr.size(); ++w)
+                        names[e.wr[w]] = d + std::uint32_t(w);
+                }
+            }
+        }
         wrapOk_.assign(nv, 0);
         std::vector<std::uint8_t> badUse(nv, 0);
         std::vector<std::vector<std::uint32_t>> wrapUsers(nv);  // candidate defs that use the value
         for (std::uint32_t v = 0; v < nv; ++v) {
             const ssa::Value& sv = g.values[v];
             if (sv.kind == ssa::Value::Def && !sval_[v].isConst && sval_[v].rep == kRepI32 && intArith_[sv.at] &&
-                isWrapOp(code_->code[sv.at].opcode()))
+                isWrapOp(code_->code[sv.at].opcode()) && range[v].first > -kExact && range[v].second < kExact)
                 wrapOk_[v] = 1;
             ElemKind kind;
             if (sv.kind == ssa::Value::Def && !sval_[v].isConst && sval_[v].rep == kRepF64 && code_->code[sv.at].opcode() == Op::GetElem &&

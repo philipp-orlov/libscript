@@ -150,11 +150,11 @@ const Stubs& stubs()
         const Reg kept[] = {RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11};
         for (Reg r : kept)
             a.push(r);
-        for (int k = 0; k < Asm::kExtraGpr; ++k)
+        for (int k = 0; k < Asm::kExtraGpr + int(Asm::kSsaGpr23); ++k)
             a.push(Reg(16 + k));
         const int doubles = 16 + Asm::kExtraXmm;
         // (With the pushes and the return address, a multiple of sixteen bytes.)
-        const std::int32_t room = 8 * doubles + (((doubles + 10 + Asm::kExtraGpr) & 1) ? 8 : 0);
+        const std::int32_t room = 8 * doubles + (((doubles + 10 + Asm::kExtraGpr + int(Asm::kSsaGpr23)) & 1) ? 8 : 0);
         a.aluI(5, RSP, room);
         for (int k = 0; k < doubles; ++k)
             a.movsdStore(mem(RSP, 8 * k), k);
@@ -164,7 +164,7 @@ const Stubs& stubs()
         for (int k = 0; k < doubles; ++k)
             a.movsdLoad(k, mem(RSP, 8 * k));
         a.aluI(0, RSP, room);
-        for (int k = Asm::kExtraGpr; k-- > 0;)
+        for (int k = Asm::kExtraGpr + int(Asm::kSsaGpr23); k-- > 0;)
             a.pop(Reg(16 + k));
         for (int k = 9; k-- > 0;)
             a.pop(kept[k]);
@@ -3675,11 +3675,11 @@ void Baseline::emitTails()
         a_.push(R9);
         a_.push(R10);
         a_.push(R11);
-        for (int k = 0; k < Asm::kExtraGpr; ++k)
+        for (int k = 0; k < Asm::kExtraGpr + int(Asm::kSsaGpr23); ++k)
             a_.push(Reg(16 + k));
         // (With the pushes and the return address, a multiple of sixteen bytes.)
         const int doubles = 14 + Asm::kExtraXmm;
-        const std::int32_t room = 8 * doubles + (((doubles + 5 + Asm::kExtraGpr) & 1) ? 8 : 0);
+        const std::int32_t room = 8 * doubles + (((doubles + 5 + Asm::kExtraGpr + int(Asm::kSsaGpr23)) & 1) ? 8 : 0);
         a_.aluI(5, RSP, room);
         for (int k = 0; k < doubles; ++k)
             a_.movsdStore(mem(RSP, 8 * k), 2 + k);
@@ -3688,7 +3688,7 @@ void Baseline::emitTails()
         for (int k = 0; k < doubles; ++k)
             a_.movsdLoad(2 + k, mem(RSP, 8 * k));
         a_.aluI(0, RSP, room);
-        for (int k = Asm::kExtraGpr; k-- > 0;)
+        for (int k = Asm::kExtraGpr + int(Asm::kSsaGpr23); k-- > 0;)
             a_.pop(Reg(16 + k));
         a_.pop(R11);
         a_.pop(R10);

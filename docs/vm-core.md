@@ -280,6 +280,14 @@ function's entry and at its OSR entries, for the largest window any of its direc
 check `this` when the value is known to be an object. The tick (the interrupt check) stays at each call: a recursion with
 no loop asks the host only there.
 
+**The new back end (in progress).** `lir.hpp` is a lowered IR under the SSA graph: one block per SSA block, nodes in
+SSA form with effects as heap regions, and the node that makes each SSA value. `lir_build.inc` builds it after the
+representation plan; for now every instruction is one `Generic` node, and nothing is compiled from it
+(`SSA_LIR=dump` prints it). The plan: lower element access, property access and arithmetic into checks, loads and
+operations; value numbering, check elimination, loop-invariant motion and range analysis on those; code from the LIR,
+with `compileSsa` kept as the driver (entries, exits, edges) and a `Generic` node running the old path for an
+instruction not lowered yet.
+
 **What leaves for the runtime.** An instruction the code does not do in place runs as the baseline template, or as one
 step of the interpreter (`scriptVmJitStep`, counted by `SCRIPT_VM_STEPS`). A relational or truth jump whose site failed is
 decided by `ssaStepJump`: two strings by `compareStrings`, any other value by `truth`, with the live registers saved.

@@ -803,6 +803,19 @@ void Baseline::ssaStepJump(std::uint32_t b, std::uint32_t i)
         a_.movImm(RAX, std::uint64_t(kStepJump));
         a_.jmp(decided);
         a_.bind(step);
+    } else if (in.opcode() == Op::JTrue || in.opcode() == Op::JFalse) {
+        // A value that is no boolean: its truth here, as the baseline code takes it (a BigInt is stepped).
+        Label step, yes, no;
+        const bool onTrue = in.opcode() == Op::JTrue;
+        a_.mov(RAX, R(in.a));
+        truth(RAX, yes, no, step);
+        a_.bind(yes);
+        a_.movImm(RAX, std::uint64_t(onTrue ? kStepJump : kStepFall));
+        a_.jmp(decided);
+        a_.bind(no);
+        a_.movImm(RAX, std::uint64_t(onTrue ? kStepFall : kStepJump));
+        a_.jmp(decided);
+        a_.bind(step);
     }
     callStep(i);
     a_.bind(decided);

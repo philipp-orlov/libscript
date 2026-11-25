@@ -666,7 +666,9 @@ struct VM : EngineRuntime
         JSValue pattern = JSValue::raw(0), flags = JSValue::raw(0);
         std::shared_ptr<void> text;  ///< what its RegExps share (builtins_regexp.cpp)
     };
-    RegExpLiteral regexpLiterals[64];
+    /// 512 entries: a program with many literals (a lexer, an assembler's parser) keeps them all. Out of the VM, whose
+    /// other fields keep their places.
+    std::vector<RegExpLiteral> regexpLiterals = std::vector<RegExpLiteral>(512);
     std::uint32_t arrayRootShape = 0;
     /// The shape a match's array starts with and the one it has with its `index`, `input` and `groups` (0: none made yet).
     std::uint32_t matchRoot = 0, matchShape = 0;

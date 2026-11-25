@@ -1778,7 +1778,7 @@ JSValue newRegExp(VM& vm, StringView pattern, StringView flags)
 
 JSValue newRegExpLiteral(VM& vm, JSValue pattern, JSValue flags)
 {
-    VM::RegExpLiteral& l = vm.regexpLiterals[((pattern.bits >> 4) ^ (flags.bits >> 6)) & 63];
+    VM::RegExpLiteral& l = vm.regexpLiterals[((pattern.bits >> 4) ^ (flags.bits >> 6)) & 511];
     if (l.pattern.bits != pattern.bits || l.flags.bits != flags.bits) {
         unsigned bits = 0;
         std::string error;

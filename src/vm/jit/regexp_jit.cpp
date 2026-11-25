@@ -117,19 +117,42 @@ struct First
     std::uint32_t low[8] = {};
     bool high = false;
     bool open = false;  ///< anything, or nothing at all
+    /// When every unit above 255 that can come first is the lead surrogate `lead` of a code point: the trail units
+    /// (less 0xDC00) that can follow it. `mixed`: not so (another unit above 255, or code points of several leads).
+    std::uint32_t lead = 0;
+    bool mixed = false;
+    std::uint32_t trail[32] = {};
 
     void add(std::uint32_t unit)
     {
-        if (unit < 256)
+        if (unit < 256) {
             low[unit >> 5] |= 1u << (unit & 31);
-        else
+        } else {
             high = true;
+            mixed = true;
+        }
+    }
+    void addPoints(char32_t lo, char32_t hi)
+    {
+        if (lo < 0x10000 || hi - lo >= 1024) {
+            mixed = true;
+            return;
+        }
+        for (char32_t c = lo; c <= hi && !mixed; ++c) {
+            const std::uint32_t l = 0xD800 + ((c - 0x10000) >> 10), t = (c - 0x10000) & 0x3FF;
+            if (lead && lead != l)
+                mixed = true;
+            lead = l;
+            trail[t >> 5] |= 1u << (t & 31);
+        }
     }
     void add(const CodeSet& set)
     {
         for (int k = 0; k < 8; ++k)
             low[k] |= set.low[k];
         high = high || !set.high.empty();
+        for (const auto& [lo, hi] : set.high)
+            addPoints(lo, hi);
     }
     void add(const First& o)
     {
@@ -137,7 +160,15 @@ struct First
             low[k] |= o.low[k];
         high = high || o.high;
         open = open || o.open;
+        mixed = mixed || o.mixed || (lead && o.lead && lead != o.lead);
+        if (!lead)
+            lead = o.lead;
+        for (int k = 0; k < 32; ++k)
+            trail[k] |= o.trail[k];
     }
+    /// Units above 255 begin only code points of one lead, which the trail tells apart.
+    bool astral() const { return high && !mixed && lead; }
+    bool hasTrail(std::uint32_t t) const { return (trail[t >> 5] >> (t & 31) & 1) != 0; }
     bool has(std::uint32_t unit) const { return unit < 256 ? (low[unit >> 5] >> (unit & 31) & 1) != 0 : high; }
     /// `this` and `o` hold no unit in common.
     bool apartFrom(const First& o) const
@@ -157,6 +188,7 @@ struct Code : NativeMatcher
     std::uint32_t (*run)(Ctx*) = nullptr;
     std::vector<std::uint64_t> table;  ///< for an index: where its code is
     std::deque<std::array<std::uint8_t, 256>> bytes;
+    std::deque<std::array<std::uint8_t, 1024>> trails;  ///< by the trail unit less 0xDC00, as `bytes` by the unit
     ~Code() override
     {
         if (span)
@@ -518,6 +550,14 @@ private:
             t[c] = std::uint8_t((f.has(c) ? 1 : 0) | (g && g->has(c) ? 2 : 0));
         return t.data();
     }
+    const std::uint8_t* trailsOf(const First& f, const First& g)
+    {
+        out_->trails.emplace_back();
+        auto& t = out_->trails.back();
+        for (std::uint32_t c = 0; c < 1024; ++c)
+            t[c] = std::uint8_t((f.hasTrail(c) ? 1 : 0) | (g.hasTrail(c) ? 2 : 0));
+        return t.data();
+    }
     static Ranges rangesOf(const CodeSet& set)
     {
         Ranges r;
@@ -815,6 +855,41 @@ private:
         Label push;
         a_.aluI32(7, RAX, 256);
         const bool aHigh = a.open || a.high, bHigh = b.open || b.high;
+        if (!a.open && !b.open && a.astral() && b.astral() && a.lead == b.lead) {
+            // Code points of one lead on both ways: the trail after it says which can begin, as the table does below 256.
+            Label high, test, none;
+            a_.jcc(CAE, high);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(t));
+            a_.movzx8(RCX, mem(RCX, RAX, 1));
+            a_.bind(test);
+            a_.testI(RCX, 1);
+            a_.jcc(CE, at_[off]);
+            a_.testI(RCX, 2);
+            a_.jcc(CE, noChoice);
+            a_.jmp(push);
+            a_.bind(high);
+            a_.aluI32(7, RAX, std::int32_t(a.lead));
+            a_.jcc(CNE, none);
+            a_.op32I(0, RDX, R12, 1);
+            a_.alu32(7, RDX, RBP);
+            a_.jcc(CAE, none);
+            a_.movzx16(RCX, mem(RBX, RDX, 2));
+            a_.op32I(5, RCX, RCX, 0xDC00);
+            a_.aluI32(7, RCX, 0x3FF);
+            a_.jcc(CA, none);
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(trailsOf(a, b)));
+            a_.movzx8(RCX, mem(RDX, RCX, 1));
+            a_.jmp(test);
+            a_.bind(none);
+            a_.movImm(RCX, 0);
+            a_.jmp(test);
+            a_.bind(push);
+            known_.clear();
+            choice(off);
+            a_.bind(noChoice);
+            known_.clear();
+            return;
+        }
         if (aHigh && bHigh)
             a_.jcc(CAE, push);
         else if (aHigh)

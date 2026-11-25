@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string_view>
@@ -227,7 +228,11 @@ const NameViews& capturedBelow(const Node& n, bool arrowChain, CaptureCache& cac
         return it->second;
     NameViews names;
     capturedWalk(n, names, true, arrowChain, cache, true);
-    std::sort(names.begin(), names.end());
+    // Only which names there are matters, so any order: the length, then the bytes (the traits' `<` takes a unit at a time).
+    const auto before = [](std::u16string_view a, std::u16string_view b) {
+        return a.size() != b.size() ? a.size() < b.size() : std::memcmp(a.data(), b.data(), a.size() * sizeof(char16_t)) < 0;
+    };
+    std::sort(names.begin(), names.end(), before);
     names.erase(std::unique(names.begin(), names.end()), names.end());
     // What the function declares for itself is not captured from outside, whichever scope of its body mentions it.
     if (isFunctionNode(n)) {
@@ -236,9 +241,9 @@ const NameViews& capturedBelow(const Node& n, bool arrowChain, CaptureCache& cac
             std::vector<std::u16string_view> gone;
             for (const String& name : own)
                 gone.emplace_back(name.data(), name.size());
-            std::sort(gone.begin(), gone.end());
+            std::sort(gone.begin(), gone.end(), before);
             names.erase(std::remove_if(names.begin(), names.end(),
-                                       [&](std::u16string_view name) { return std::binary_search(gone.begin(), gone.end(), name); }),
+                                       [&](std::u16string_view name) { return std::binary_search(gone.begin(), gone.end(), name, before); }),
                         names.end());
         }
     }
@@ -4334,13 +4339,13 @@ void Compiler::functionBody(const Node& n, CodeBlock* block)
     // Only `arguments.length`, in a function that a call starts (no generator) and no direct `eval` reaches: the frame's
     // count, and no array.
     // Whether the body or a parameter's default names `arguments`, and whether every such use is `arguments.length`.
-    bool argsUsed = usesArguments(*n.d), argsLengthOnly = onlyArgumentsLength(*n.d, false);
-    for (const dyn::NodePtr& p : n.list) {
-        if (!p)
-            continue;
-        argsUsed = argsUsed || usesArguments(*p);
-        argsLengthOnly = argsLengthOnly && onlyArgumentsLength(*p, false);
-    }
+    bool argsUsed = usesArguments(*n.d);
+    for (const dyn::NodePtr& p : n.list)
+        argsUsed = argsUsed || (p && usesArguments(*p));
+    // (Only asked when it is named: most functions do not.)
+    bool argsLengthOnly = argsUsed && onlyArgumentsLength(*n.d, false);
+    for (const dyn::NodePtr& p : n.list)
+        argsLengthOnly = argsLengthOnly && (!p || onlyArgumentsLength(*p, false));
     const bool countOnly = !hasRest && !arrow && !fn_->captured.count(String(u"%all")) &&
                            !(block->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen)) &&
                            argsUsed && argsLengthOnly;

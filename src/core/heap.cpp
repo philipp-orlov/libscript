@@ -653,6 +653,7 @@ void ContextImpl::collectCycles(bool minor)
     trimBuffers();
     heap.trim();
     payloadPool().trim();
+    compilePool().trim();
 }
 
 /// An interned string whose only reference is the table itself is not spelled

@@ -287,9 +287,10 @@ private:
     }
 
     // ---- what every match has ----
-    /// Whether every match has `unit` at `lo` to `hi` units from where it begins: the program begins with pieces of a fixed
-    /// width (a unit, a string, a capture, an assertion, or a Split of two such ways that meet), then a literal.
-    bool unitAhead(std::uint32_t* lo, std::uint32_t* hi, std::uint32_t* unit) const
+    /// Whether every match has `unit` (then `unit2`, when a string gives it one) at `lo` to `hi` units from where it
+    /// begins: the program begins with pieces of a fixed width (a unit, a string, a capture, an assertion, or a Split of
+    /// two such ways that meet), then a literal.
+    bool unitAhead(std::uint32_t* lo, std::uint32_t* hi, std::uint32_t* unit, std::uint32_t* unit2) const
     {
         // The width of the way from `pc` to where it meets `join` (a Jump to it, or arriving at it); false if not fixed.
         const auto width = [&](std::uint32_t pc, std::uint32_t* join, std::uint32_t* w) {
@@ -317,7 +318,11 @@ private:
         for (int k = 0; k < 16 && pc < n_ && *hi <= 8; ++k) {
             switch (code_[pc]) {
                 case OpLit: *unit = code_[pc + 1]; return *hi - *lo <= 3;
-                case OpStr: *unit = p_.literals[code_[pc + 1]]; return *hi - *lo <= 3;
+                case OpStr:
+                    *unit = p_.literals[code_[pc + 1]];
+                    if (code_[pc + 2] >= 2)
+                        *unit2 = p_.literals[code_[pc + 1] + 1];
+                    return *hi - *lo <= 3;
                 case OpSave: case OpLineStart: case OpLineStartM: case OpLineEnd: case OpLineEndM: case OpWord: break;
                 case OpLit2: case OpSet: ++*lo; ++*hi; break;
                 case OpSplit: {
@@ -785,8 +790,8 @@ private:
             a_.aluI(0, R14, 8);
         }
         a_.bind(begin);
-        std::uint32_t lo = 0, hi = 0, unit = 0;
-        if (!once && p_.firstUnit < 0 && unitAhead(&lo, &hi, &unit) && hi > 0) {
+        std::uint32_t lo = 0, hi = 0, unit = 0, unit2 = ~0u;
+        if (!once && p_.firstUnit < 0 && unitAhead(&lo, &hi, &unit, &unit2) && hi > 0) {
             // A unit every match has at `lo` to `hi` units from its start, when none is known to begin it (that is found
             // faster below): places without it there are passed over.
             Label next, scan, found;
@@ -798,12 +803,25 @@ private:
             a_.alu32(7, RAX, RBP);
             a_.jcc(CAE, none_);
             for (std::uint32_t d = lo; d <= hi; ++d) {
+                Label other;
                 a_.op32I(0, RAX, R12, std::int32_t(d));
                 a_.alu32(7, RAX, RBP);
                 a_.jcc(CAE, next);
                 a_.movzx16(RCX, mem(RBX, RAX, 2));
                 a_.aluI32(7, RCX, std::int32_t(unit));
+                if (unit2 == ~0u) {
+                    a_.jcc(CE, found);
+                    continue;
+                }
+                // And the unit after it, when the literal has one.
+                a_.jcc(CNE, other);
+                a_.aluI32(0, RAX, 1);
+                a_.alu32(7, RAX, RBP);
+                a_.jcc(CAE, other);
+                a_.movzx16(RCX, mem(RBX, RAX, 2));
+                a_.aluI32(7, RCX, std::int32_t(unit2));
                 a_.jcc(CE, found);
+                a_.bind(other);
             }
             a_.jmp(next);
             a_.bind(found);

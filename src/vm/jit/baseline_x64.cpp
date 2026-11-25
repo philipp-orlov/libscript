@@ -6076,8 +6076,32 @@ void Baseline::initProp(std::uint32_t i, const Ins& in)
 {
     const std::uint16_t cacheId = code_->code[i + 1].a;
     const InlineCache* ic = cacheId != kNoCache ? &code_->caches[cacheId] : nullptr;
-    if (!ic || ic->shape == 0 || ic->next == 0) {
+    if (!ic) {
         helperOp(i, &helperThunk<jitInitProp>);
+        return;
+    }
+    if (ic->shape == 0 || ic->next == 0) {
+        // The cache learned nothing before this code was made (a literal not run yet): what it learns later, read here
+        // as the helper reads it. An inline slot only.
+        Label& bad = slow(i, &helperThunk<jitInitProp>);
+        a_.mov(RAX, R(in.a));
+        a_.movImm(RSI, reinterpret_cast<std::uint64_t>(ic));
+        a_.cmpI32(mem(RSI, std::int32_t(offsetof(InlineCache, next))), 0);
+        a_.jcc(CE, bad);
+        a_.mov32(RCX, mem(RSI, std::int32_t(offsetof(InlineCache, shape))));
+        a_.alu32(7, RCX, mem(RAX, 0));
+        a_.jcc(CNE, bad);
+        a_.mov32(RCX, mem(RSI, std::int32_t(offsetof(InlineCache, index))));
+        a_.movzx8(RDX, mem(RAX, kHdrAux));
+        a_.alu32(7, RCX, RDX);
+        a_.jcc(CAE, bad);
+        a_.lea(RDX, mem(RAX, RCX, 8, kObjInline));
+        a_.mov(RCX, R(in.c));
+        retainInto(RAX, RCX);
+        a_.mov(mem(RDX, 0), RCX);
+        a_.movImm(RSI, reinterpret_cast<std::uint64_t>(ic));
+        a_.mov32(RCX, mem(RSI, std::int32_t(offsetof(InlineCache, next))));
+        a_.mov32(mem(RAX, 0), RCX);
         return;
     }
     Label& bad = slow(i, &helperThunk<jitInitProp>);

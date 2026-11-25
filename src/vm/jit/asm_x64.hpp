@@ -18,7 +18,7 @@ enum Reg : std::uint8_t
 {
     RAX = 0, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
     // Named by the register lists the targets share; none is allocated here (`kExtraGpr` is 0).
-    R16, R17, R18, R19, R20, R21, R22
+    R16, R17, R18, R19, R20, R21, R22, R23
 };
 
 enum Cond : std::uint8_t
@@ -475,6 +475,7 @@ public:
     static constexpr int kExtraXmm = 0;
     static constexpr int kKeptXmm = 0;
     static constexpr int kExtraGpr = 0;
+    static constexpr bool kSsaGpr23 = false;
     void op32(int, Reg, Reg, Reg) {}
     void op32I(int, Reg, Reg, std::int32_t) {}
     void shift32I(int, Reg, Reg, int) {}

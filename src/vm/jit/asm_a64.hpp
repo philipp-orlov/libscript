@@ -13,8 +13,8 @@
 //   xmm0-7 v0-v7, xmm8-15 v16-v23 (none kept by a call, as the templates expect)
 //   xmm23-30 v8-v15: kept by a call into the runtime (whose convention keeps their low halves, all a double has); values
 //   the optimizing compiler reads once and keeps (`kKeptXmm`), saved around compiled code by `abiEnter`
-//   r16-r20 x6 x7 x11 x12 x13 (not kept by a call), r21 r22 x25 x26 (kept), xmm16-22 v24-v30 (not kept): registers
-//   past the interface's, for the optimizing compiler's variables.
+//   r16-r20 x6 x7 x11 x12 x13 (not kept by a call), r21 r22 x25 x26 (kept), r23 x18 (not kept; the SSA tier's only),
+//   xmm16-22 v24-v30 (not kept): registers past the interface's, for the optimizing compiler's variables.
 //   x14-x17 and v31 are the assembler's own, within one operation.
 //
 // The stack. The templates push single 8-byte values, which arm64 does not allow through sp (it must be 16-byte aligned
@@ -45,7 +45,8 @@ enum Reg : std::uint8_t
 {
     RAX = 0, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
     // Registers the interface does not have and no template names: the optimizing compiler's, for its variables.
-    R16, R17, R18, R19, R20, R21, R22
+    R16, R17, R18, R19, R20, R21, R22,
+    R23  ///< the SSA tier's variables only (arm64 x18; tier 2 and `kExtraGpr` do not count it)
 };
 
 enum Cond : std::uint8_t
@@ -170,8 +171,8 @@ private:
 
     static int X(Reg r) noexcept
     {
-        static constexpr std::uint8_t map[23] = {8, 3, 2, 19, kStack, 20, 1, 0, 4, 5, 9, 10, 21, 22, 23, 24,
-                                                 6, 7, 11, 12, 13, 25, 26};
+        static constexpr std::uint8_t map[24] = {8, 3, 2, 19, kStack, 20, 1, 0, 4, 5, 9, 10, 21, 22, 23, 24,
+                                                 6, 7, 11, 12, 13, 25, 26, 18};
         return map[r];
     }
     static int V(int x) noexcept { return x < 8 ? x : x < 23 ? x + 8 : x - 15; }
@@ -1092,6 +1093,7 @@ public:
     static constexpr int kKeptXmm = 8;
     /// Integer registers past the interface's sixteen (16 and up).
     static constexpr int kExtraGpr = 7;
+    static constexpr bool kSsaGpr23 = true;  ///< `R23` exists for the SSA tier
     /// `d = a op b` on 32 bits, with the flags of the two-operand form.
     void op32(int op, Reg d, Reg a, Reg b) { aluRRR(op, false, X(d), X(a), X(b)); }
     void op32I(int op, Reg d, Reg a, std::int32_t v) { aluRRI(op, false, X(d), X(a), v); }

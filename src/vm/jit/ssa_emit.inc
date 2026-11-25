@@ -4928,6 +4928,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     static const bool noRegs = false, noEvict = false;
 #endif
     if (!noRegs) {
+        if (Asm::kSsaGpr23)
+            gprs.push_back(R23);
         for (int r : {int(R20), int(R19), int(R18), int(R17), int(R16), int(R11), int(R10), int(R9), int(R8)})
             if (r < 16 || r < 16 + Asm::kExtraGpr - 2)  // not R21, R22: optimized code elsewhere keeps values there
                 gprs.push_back(r);
@@ -5021,6 +5023,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         for (int r : {int(R8), int(R9), int(R10), int(R11), int(R16), int(R17), int(R18), int(R19), int(R20)})
             if ((r < 16 || r < 16 + Asm::kExtraGpr - 2) && !busy[r])
                 freeG.push_back(r);
+        if (Asm::kSsaGpr23 && !busy[R23])
+            freeG.push_back(R23);
         for (int x = 2; x < 2 + 14 + Asm::kExtraXmm; ++x)
             if (!busy[32 + x])
                 freeX.push_back(x);
@@ -5167,6 +5171,8 @@ void Baseline::ssaPlanKeeps(const ssa::Graph& g, const std::vector<std::int32_t>
     for (int r : {int(R8), int(R9), int(R10), int(R11), int(R16), int(R17), int(R18), int(R19), int(R20)})
         if (r < 16 || r < 16 + Asm::kExtraGpr - 2)
             gprs.push_back(r);
+    if (Asm::kSsaGpr23)
+        gprs.push_back(R23);
     for (int x = 2; x < 2 + 14 + Asm::kExtraXmm; ++x)
         xmms.push_back(32 + x);
     for (Want& w : wants) {
@@ -5337,7 +5343,7 @@ void Baseline::ssaRestoreRegs(const std::vector<int>& regs)
 
 void Baseline::ssaSaveRegs()
 {
-    const int gprs = 4 + Asm::kExtraGpr, xmms = 14 + Asm::kExtraXmm;
+    const int gprs = 4 + Asm::kExtraGpr + (Asm::kSsaGpr23 ? 1 : 0), xmms = 14 + Asm::kExtraXmm;  // (R23 follows R22)
     const std::int32_t room = std::int32_t((8 * (gprs + xmms) + 15) & ~15);
     a_.aluI(5, RSP, room);
     for (int k = 0; k < gprs; ++k)
@@ -5348,7 +5354,7 @@ void Baseline::ssaSaveRegs()
 
 void Baseline::ssaRestoreRegs()
 {
-    const int gprs = 4 + Asm::kExtraGpr, xmms = 14 + Asm::kExtraXmm;
+    const int gprs = 4 + Asm::kExtraGpr + (Asm::kSsaGpr23 ? 1 : 0), xmms = 14 + Asm::kExtraXmm;  // (R23 follows R22)
     const std::int32_t room = std::int32_t((8 * (gprs + xmms) + 15) & ~15);
     for (int k = 0; k < gprs; ++k)
         a_.mov(Reg(k < 4 ? R8 + k : 16 + (k - 4)), mem(RSP, 8 * k));

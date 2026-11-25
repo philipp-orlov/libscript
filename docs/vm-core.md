@@ -522,7 +522,7 @@ What SSA code spends its instructions on (instruction samples, arm64 skid includ
 16%, hash-map 18%, raytrace 10%), register moves (crypto 42%), tagging of doubles (navier-stokes 51%, raytrace 19%, ML 12%),
 and guards. Seen in the hot loops: a value read twice is read and checked twice (`this_array[i]` in crypto's `am3`); a typed
 array's length and data pointer are loaded again at each access; loop-invariant values live in spill slots, because the
-SSA tier allocates from 9 general registers on arm64 and keeps any value live across a runtime call in a slot for its whole
+SSA tier allocates from 10 general registers on arm64 and keeps any value live across a runtime call in a slot for its whole
 life; products keep their -0 checks when every use truncates.
 
 What this means for the design:

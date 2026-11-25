@@ -1578,18 +1578,23 @@ private:
         auto atVm = [&](const void* field) {
             return std::int32_t(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&vm_));
         };
-        // A collection due: the runtime's way.
         a_.movImm(RCX, reinterpret_cast<std::uint64_t>(&ctx));
-        a_.mov(RAX, mem(RCX, at(&ctx.heapBytes)));
-        a_.cmp(RAX, mem(RCX, at(&ctx.nextGcBytes)));
-        a_.jcc(CAE, slow);
-        a_.mov(RAX, mem(RCX, at(&ctx.liveObjects)));
-        a_.alu(0, RAX, mem(RCX, at(&ctx.liveStrings)));
-        a_.cmp(RAX, mem(RCX, at(&ctx.nextGcCells)));
-        a_.jcc(CAE, slow);
-        a_.mov(RAX, mem(R12, atVm(&vm_.liveCells)));
-        a_.cmp(RAX, mem(R12, atVm(&vm_.cellBudget_)));
-        a_.jcc(CAE, slow);
+        // A collection due: the runtime's way. (Not looked at for a young cell until the young list is full: the
+        // budgets are then up to that many cells late.)
+        auto budgets = [&]() {
+            a_.mov(RAX, mem(RCX, at(&ctx.heapBytes)));
+            a_.cmp(RAX, mem(RCX, at(&ctx.nextGcBytes)));
+            a_.jcc(CAE, slow);
+            a_.mov(RAX, mem(RCX, at(&ctx.liveObjects)));
+            a_.alu(0, RAX, mem(RCX, at(&ctx.liveStrings)));
+            a_.cmp(RAX, mem(RCX, at(&ctx.nextGcCells)));
+            a_.jcc(CAE, slow);
+            a_.mov(RAX, mem(R12, atVm(&vm_.liveCells)));
+            a_.cmp(RAX, mem(R12, atVm(&vm_.cellBudget_)));
+            a_.jcc(CAE, slow);
+        };
+        if (!youngCell)
+            budgets();
         // A slot of the current block, a free one or one not carved yet, into rax, its header's first word written.
         auto pop = [&]() {
             Label carve, got;
@@ -1638,6 +1643,7 @@ private:
             push(&vm_.youngTop_, VM::kYoungGc | (site << VM::kSiteShift));
             a_.jmp(made);
             a_.bind(tableWay);
+            budgets();
             a_.mov(RSI, mem(R12, atVm(&vm_.zctTop_)));
             a_.cmp(RSI, mem(R12, atVm(&vm_.zctEnd_)));
             a_.jcc(CAE, slow);

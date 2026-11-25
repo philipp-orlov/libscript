@@ -335,6 +335,17 @@ JSValue toStringValue(VM& vm, JSValue v)
         return v;
     }
     if (v.isInt32()) {
+        // A small index a property name was made of already: that atom (`toPropertyKey`). No table is made for this.
+        const std::int32_t i = v.asInt32();
+        if (i >= 0 && i < std::int32_t(VM::kIndexKeys)) {
+            const Key* chunk = i < std::int32_t(VM::kSmallIndexKeys) ? vm.smallIndexKeys
+                                                                      : vm.indexKeyChunks[std::size_t(i) / VM::kSmallIndexKeys];
+            if (chunk && chunk[std::size_t(i) % VM::kSmallIndexKeys]) {
+                const JSValue atom = JSValue::cell(chunk[std::size_t(i) % VM::kSmallIndexKeys]);
+                retain(atom);
+                return atom;
+            }
+        }
         char16_t buffer[16];
         char16_t* end = buffer + 16;
         char16_t* p = end;

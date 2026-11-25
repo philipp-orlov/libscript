@@ -444,6 +444,11 @@ public:
     void maxsd(int, int) {}
     void roundsd(int, int) {}
     void idiv32(Reg r) { opReg(false, 0xF7, 7, r); }
+    void setccZx(Cond c, Reg r)
+    {
+        setcc(c, r);
+        movzx8(r, r);
+    }
     void setcc(Cond c, Reg r)
     {
         rex(false, 0, 0, r, r >= 4);

@@ -1195,6 +1195,27 @@ public:
         }
         ins(0xB3401C00u | (std::uint32_t(kVal) << 5) | std::uint32_t(X(r)));  // bfxil xr, x17, #0, #8
     }
+    /// `r` = 1 when `c` holds, else 0 (all 64 bits): `setcc` and `movzx8` in one.
+    void setccZx(Cond c, Reg r)
+    {
+        needFlags();
+        const std::uint32_t rd = std::uint32_t(X(r));
+        if (flags_ == Flags::Fcmp && (c == CE || c == CNE)) {
+            ins(0x1A9F07E0u | (std::uint32_t((c == CE ? EQ : NE) ^ 1) << 12) | rd);
+            if (c == CE)
+                ins(0x1A9F0400u | (rd << 5) | (std::uint32_t(VC) << 12) | rd);  // csinc wr, wr, wzr, vc
+            else
+                ins(0x1A9F0000u | (rd << 5) | (std::uint32_t(VC) << 12) | rd);  // csel wr, wr, wzr, vc
+        } else {
+            const int cond = armCond(c);
+            if (cond == kAlways)
+                ins(0x52800020u | rd);
+            else if (cond == kNever)
+                ins(0x52800000u | rd);
+            else
+                ins(0x1A9F07E0u | (std::uint32_t(cond ^ 1) << 12) | rd);
+        }
+    }
     void cmov(Cond c, Reg d, Reg s)
     {
         needFlags();

@@ -3931,8 +3931,7 @@ bool Baseline::ssaArith(std::uint32_t i)
         // Into a boolean: rax 0 or 1, then false or true.
         Label done;
         ssaRelation(i, va, vb, 0, false, bad, [&](Cond c, bool) {
-            a_.setcc(c, RAX);
-            a_.movzx8(RAX, RAX);
+            a_.setccZx(c, RAX);
             a_.jmp(done);
         });
         a_.bind(done);
@@ -5628,8 +5627,7 @@ bool Baseline::ssaEquals(std::uint32_t i)
     };
     const bool pa = plainConst(va), pb = plainConst(vb);
     auto finish = [&](Cond c) {
-        a_.setcc(c, RAX);
-        a_.movzx8(RAX, RAX);
+        a_.setccZx(c, RAX);
         a_.aluI32(1, RAX, std::int32_t(kFalse));
         ssaDef(i, kVBool | kVNotCell);
     };
@@ -5640,6 +5638,18 @@ bool Baseline::ssaEquals(std::uint32_t i)
         loadValue(pa ? vb : va, RAX);
         a_.aluI(4, RAX, -9);
         a_.cmpI(RAX, std::int32_t(kNull));
+        finish(eq ? CE : CNE);
+        return true;
+    }
+    auto int32 = [&](std::uint32_t v) { return intConst(v) || (known(v, kVInt) && !sval_[v].isConst && sval_[v].rep != kRepF64); };
+    if (int32(va) && int32(vb) && !(intConst(va) && intConst(vb))) {
+        // Two int32s: compared as such, not boxed first.
+        const bool kb = intConst(vb);
+        const Reg x = i32Reg(kb ? va : vb, RAX, nullptr);
+        if (intConst(kb ? vb : va))
+            a_.aluI32(7, x, JSValue::raw(sval_[kb ? vb : va].bits).asInt32());
+        else
+            a_.alu32(7, x, i32Reg(va, RCX, nullptr));
         finish(eq ? CE : CNE);
         return true;
     }

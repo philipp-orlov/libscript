@@ -5091,8 +5091,7 @@ void Baseline::compare(std::uint32_t i, const Ins& in)
     }
     needInts(RAX, RCX, rel.doubles ? dbl : bad);
     a_.alu32(7, RAX, RCX);
-    a_.setcc(rel.ic, RAX);
-    a_.movzx8(RAX, RAX);
+    a_.setccZx(rel.ic, RAX);
     a_.aluI32(0, RAX, 6);
     write(in.a, RAX, false);
     if (rel.doubles) {
@@ -5106,8 +5105,7 @@ void Baseline::compare(std::uint32_t i, const Ins& in)
             a_.ucomisd(1, 0);
         else
             a_.ucomisd(0, 1);
-        a_.setcc(rel.dc, RAX);
-        a_.movzx8(RAX, RAX);
+        a_.setccZx(rel.dc, RAX);
         a_.aluI32(0, RAX, 6);
         write(in.a, RAX, false);
     }

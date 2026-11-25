@@ -1427,10 +1427,12 @@ void VM::collectCycles(bool minor) noexcept
     for (Shape* root : deadRoots)
         retireShapeTree(root);
     // Re-arm the budget of cells from what is alive now, whoever asked for the collection. One that found little to free
-    // is a heap growing with what it keeps: the next look waits until there are four times as many cells.
+    // is a heap growing with what it keeps: the next look waits until there are four times as many cells. A small heap
+    // waits for 32768 more: each look walks the whole heap, and one that makes cycles fast (a tree with parent links)
+    // would pay that walk every few thousand cells.
     if (!minor)
         cellsAfterFull_ = liveCells;
-    std::uint64_t room = std::max<std::uint64_t>(kMinCellBudget, cellsAfterFull_);
+    std::uint64_t room = std::max<std::uint64_t>(2 * kMinCellBudget, cellsAfterFull_);
     if (garbage.size() * 8 < set.size())
         room = std::max<std::uint64_t>(room, liveCells * 3);
     cellBudget_ = liveCells + room;

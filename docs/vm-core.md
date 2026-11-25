@@ -367,7 +367,7 @@ time (data entries only). Getters are not inline-cached in compiled code: they g
   loop itself, the counters summed and set once, and the first value it frees is freed next; the rest wait in `pending_`.
   The cycle collector reads such an object's values in place too.
 - Cycles are found by a collector that runs when the context's heap budget is passed, and also when the cells alive pass
-  a budget of their own (`VM::cellBudget_`: 131,072 to begin with, then a little more than what survived, or four times
+  a budget of their own (`VM::cellBudget_`: 131,072 to begin with, then what survived plus at least 32,768, or four times
   as many when the collection found little), because the heap budget does not see the buffers of arrays and strings. A minor
   collection looks at the young cells; a whole one runs when the cells have doubled since the last. The collector's own vectors come from the payload pool, so a steady-state workload
   makes no call to the general allocator (`core.steady_state`).

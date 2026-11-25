@@ -24,6 +24,20 @@ mem::SizeClassPool& payloadPool()
     return *pool;
 }
 
+mem::SizeClassPool& compilePool()
+{
+    // Never destroyed, as the pool above.
+    static mem::SizeClassPool* const pool = [] {
+        mem::PoolOptions options;
+        options.retainLargeBytes = std::size_t{32} << 20;  // idle mappings kept for the next compile; the rest go back
+        options.releaseIdleAfter = std::chrono::milliseconds(2000);  // a start-up compiles in bursts: no page comes twice
+        options.threadCacheBlocks = 0;
+        options.name = "script-compile";
+        return new mem::SizeClassPool(options);
+    }();
+    return *pool;
+}
+
 namespace payload_cache {
 
 thread_local Cache t_cache;

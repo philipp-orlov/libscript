@@ -44,6 +44,9 @@ struct ValueLayout
 /// Requests above the small classes are mappings whose idle pages go back to
 /// the OS.
 mem::SizeClassPool& payloadPool();
+/// The pool of the compilers' large blocks (syntax tree nodes): apart from `payloadPool`, so that the mappings of a
+/// large compile, idle after it, do not push the program's own large buffers out of the idle mappings that pool keeps.
+mem::SizeClassPool& compilePool();
 /// The vm core keeps a cell's address in a value as it stands, so cells must sit below 2^47 (`kAddressLimit`), which
 /// the kernel's own placement does not promise (aarch64 Linux maps from 2^48 down). The first heap of the process asks
 /// libcore to place its mappings below that limit (LC-1); every heap is made from these options. Only when needed: a

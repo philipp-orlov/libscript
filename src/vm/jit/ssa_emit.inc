@@ -996,6 +996,11 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                 std::fprintf(stderr, "  v%u kind %d r%u at %u slot %d\n", v, int(g.values[v].kind), unsigned(g.values[v].reg),
                              g.values[v].at, sval_[v].slot);
     }
+    if (const char* l = std::getenv("SSA_LIR"); l && std::strstr(l, "dump")) {
+        lir::Func f;
+        lirBuild(g, f);
+        std::fprintf(stderr, "lir %s\n%s", mapName(code_).c_str(), lir::dump(f).c_str());
+    }
 #endif
     // ---- code ----
     blockLabel_.assign(nb, Label{});

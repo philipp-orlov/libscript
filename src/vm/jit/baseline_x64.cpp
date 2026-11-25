@@ -38,6 +38,7 @@
 #include "script/internal/vm/object.hpp"
 #include "script/internal/vm/operators.hpp"
 #include "opt_analysis.hpp"
+#include "lir.hpp"
 #include "ssa.hpp"
 #include "../builtins_util.hpp"
 
@@ -3293,6 +3294,7 @@ private:
     // ---- the SSA tier (ssa_emit.inc); `ssa_` is null otherwise ----
 public:
     Tier2Code* compileSsa(ssa::Graph& g, Tier1Code* base);
+    void lirBuild(const ssa::Graph& g, lir::Func& f);
     const char* ssaWhy_ = "";
     int ssaOn_ = 2;  ///< SCRIPT_VM_SSA: 1 every instruction through the frame, 2 the fast paths too
 
@@ -7168,6 +7170,7 @@ void Baseline::ret(std::uint32_t i, const Ins& in, bool numberInRax, const std::
 #include "opt_emit.inc"
 #include "opt_inline.inc"
 #include "ssa_emit.inc"
+#include "lir_build.inc"
 
 Tier2Code* compileOptimizedCode(VM& vm, CodeBlock* code)
 {

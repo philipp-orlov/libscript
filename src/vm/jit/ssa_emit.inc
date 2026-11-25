@@ -3623,6 +3623,20 @@ void Baseline::ssaCharCode(std::uint32_t i, JSFunction* f)
         a_.callC(RAX);
         ssaRestoreRegs(keep);
     } else {
+    {
+        // A rope is joined here, not left for (a string built by `+` and then read through).
+        Label joined;
+        a_.testI8(mem(RSI, kStrBits), StringCell::kRope);
+        a_.jcc(CE, joined);
+        const std::vector<int> keep = ssaLiveRegs();
+        ssaSaveRegs(keep);
+        a_.mov(RDI, RSI);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaFlatten));
+        a_.callC(RAX);
+        ssaRestoreRegs(keep);
+        loadValue(name_[in.b + 1u], RSI);
+        a_.bind(joined);
+    }
     loadI32(name_[in.b + 2u], RDX, &bad);
     a_.mov32(RDX, RDX);
     a_.alu32(7, RDX, mem(RSI, kStrLength));

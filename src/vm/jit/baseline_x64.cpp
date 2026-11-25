@@ -1077,6 +1077,9 @@ extern "C" std::uint64_t scriptVmSsaCompareStrings(std::uint64_t a, std::uint64_
     return std::uint32_t(compareStrings(JSValue::raw(a), JSValue::raw(b)));
 }
 
+/// A rope's characters joined into a buffer of its own (`StringCell::text`), for the SSA tier: nothing is collected.
+extern "C" void scriptVmSsaFlatten(StringCell* s) { (void)s->text(); }
+
 /// `new Array(n)` for the SSA tier: owned, or null (out of memory; the instruction runs again in the interpreter).
 extern "C" JSArray* scriptVmSsaNewArray(VM* vm, std::uint32_t n)
 {

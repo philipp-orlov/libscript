@@ -409,12 +409,22 @@ void VM::boxWritten(Box* box) noexcept
     }
 }
 
+namespace {
+
+/// Writes, over each epoch site of `t`, a jump to its exit.
+void patchEpochSites(Tier2Code* t) noexcept
+{
+    for (const auto& [at, to] : t->epochSites)
+        jit::patchCode(t->rx + at, 0x14000000u | ((std::uint32_t(std::int32_t(to - at) >> 2)) & 0x03FFFFFFu));
+}
+
+}  // namespace
+
 void VM::epochMoved() noexcept
 {
     ++globalEpoch;
     for (Tier2Code* t : epochCodes) {
-        for (const auto& [at, to] : t->epochSites)
-            jit::patchCode(t->rx + at, 0x14000000u | ((std::uint32_t(std::int32_t(to - at) >> 2)) & 0x03FFFFFFu));
+        patchEpochSites(t);
         t->listed = nullptr;
     }
     epochCodes.clear();
@@ -431,7 +441,16 @@ void VM::functionMade(CodeBlock* code, JSFunction* f) noexcept
     code->only = nullptr;
     if (code->singleAssumed) {
         code->singleAssumed = false;
-        epochMoved();
+        // Only this block's SSA code takes its function's variables for constants (`ssaUpvalConst`), and that code checks
+        // them at epoch sites (code that cannot be patched has no SSA tier).
+        for (Tier2Code* t = code->tier2; t; t = t->older) {
+            if (!t->listed)
+                continue;
+            patchEpochSites(t);
+            epochCodes.erase(std::find(epochCodes.begin(), epochCodes.end(), t));
+            t->listed = nullptr;
+            t->epoch = globalEpoch - 1;  // never the VM's again: its exits retire it as after an epoch move
+        }
     }
 }
 

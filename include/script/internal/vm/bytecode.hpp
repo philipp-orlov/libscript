@@ -167,7 +167,7 @@ struct PrivateCache
     std::uint32_t index = 0;
     std::uint32_t next = 0;  ///< a definition's (`#x = v` in a class body): the shape after it adds the field at `index`
 };
-/// What a `base[key]` read found last, where `key` is a string atom or a symbol: a data property (own, or of a prototype while
+/// What a `base[key]` read found last, where `key` is a string atom or a symbol: a data property or a getter (own, or of a prototype while
 /// `validity` holds) of objects of one shape. The key is held (a count), compared by address. `misses` counts the times
 /// the site could not learn: when it has seen too many keys it stops trying.
 struct ElemCache
@@ -179,6 +179,7 @@ struct ElemCache
     JSObject* holder = nullptr;
     ValidityCell* validity = nullptr;  ///< holds a count
     std::uint8_t misses = 0;  ///< of the site, in its first entry
+    std::uint8_t getter = 0;  ///< the slot holds an accessor: the read calls its getter
 };
 /// What a `super.name` read found: the slot of a data property on the chain above `home`, good while `validity` (of
 /// `home`'s chain) is valid. `home` is compared, not counted: a dead home object was a prototype, so its cell is cleared.

@@ -787,18 +787,57 @@ int readCachedSlow(VM& vm, CodeBlock* code, InlineCache& ic, JSObject* o, JSValu
     return 0;
 }
 
-/// A by-name read through the site's `ElemCache`: the slot, or null.
-inline JSValue* elemCached(CodeBlock* code, std::size_t at, JSObject* o, CellPtr key) noexcept
+/// A by-name read through the site's `ElemCache`: the slot, or null. A slot that holds an accessor only for a caller that
+/// calls its getter (`getter` set to true then).
+inline JSValue* elemCached(CodeBlock* code, std::size_t at, JSObject* o, CellPtr key, bool* getter = nullptr) noexcept
 {
     if (at >= code->elemSite.size() || !code->elemSite[at])
         return nullptr;
     const ElemCache* ways = &code->elemCaches[code->elemSite[at] - 1];
     for (std::uint32_t k = 0; k < ElemCache::kWays; ++k) {
         const ElemCache& ec = ways[k];
-        if (ec.key == key && ec.shape == o->h.shape && (!ec.validity || ec.validity->valid))
+        if (ec.key == key && ec.shape == o->h.shape && (!ec.validity || ec.validity->valid)) {
+            if (ec.getter && !getter)
+                return nullptr;
+            if (getter)
+                *getter = ec.getter != 0;
             return (ec.holder ? ec.holder : o)->slotAt(ec.index);
+        }
     }
     return nullptr;
+}
+
+/// As `learnRead`, for a property that is an accessor (own, or of a prototype while the chain holds).
+bool learnGetter(VM& vm, InlineCache& ic, JSObject* o, Key key)
+{
+    std::uint8_t attrs = 0;
+    std::int32_t index = cachedOwnIndex(vm, o, key, &attrs);
+    if (index >= 0) {
+        if (!(attrs & attr::kAccessor))
+            return false;
+        ic.shape = o->h.shape;
+        ic.index = std::uint32_t(index);
+        return true;
+    }
+    if (!cacheableKey(vm, o, key))
+        return false;
+    for (JSObject* p = o->proto(vm); p; p = p->proto(vm)) {
+        if (!cacheableKey(vm, p, key))
+            return false;
+        index = p->shapeOf(vm)->indexOf(key, &attrs);
+        if (index < 0)
+            continue;
+        if (!(attrs & attr::kAccessor))
+            return false;
+        ValidityCell* cell = vm.validityOf(o->proto(vm));
+        vm.retainValidity(cell);
+        ic.shape = o->h.shape;
+        ic.holder = p;
+        ic.index = std::uint32_t(index);
+        ic.validity = cell;
+        return true;
+    }
+    return false;
 }
 
 /// Remember where `o[key]` found its data property, for the site at instruction `at`: in the way its key maps to.
@@ -822,9 +861,13 @@ void learnElem(VM& vm, CodeBlock* code, std::size_t at, JSObject* o, Key key)
         return;
     }
     InlineCache found;
+    bool getter = false;
     if (!learnRead(vm, found, o, key)) {
-        ++ways[0].misses;
-        return;
+        if (!learnGetter(vm, found, o, key)) {
+            ++ways[0].misses;
+            return;
+        }
+        getter = true;
     }
     // The way of this key and shape, else an empty one, else the one the key's address names.
     std::uint32_t way = (reinterpret_cast<std::uintptr_t>(key) >> 4) & (ElemCache::kWays - 1);
@@ -852,6 +895,7 @@ void learnElem(VM& vm, CodeBlock* code, std::size_t at, JSObject* o, Key key)
     ec.index = found.index;
     ec.holder = found.holder;
     ec.validity = found.validity;
+    ec.getter = getter;
 }
 
 /// A read of `key` on a string, for a name `String.prototype` has as an own data property (its methods): through the site's
@@ -5050,8 +5094,24 @@ int jitGetElem(VM& vm, std::uint32_t index)
         return 1;
     }
     if (isObject(base) && k.isCell() && (isSymbol(k) || (isString(k) && asString(k)->interned))) {
-        if (JSValue* slot = elemCached(c.code, index, asObject(base), k.asCell())) {
-            copyReg(vm, R[ins->a], *slot);
+        bool getter = false;
+        if (JSValue* slot = elemCached(c.code, index, asObject(base), k.asCell(), &getter)) {
+            if (!getter) {
+                copyReg(vm, R[ins->a], *slot);
+                return 1;
+            }
+            // (As `readPoly` calls one: the getter may replace the property that holds it.)
+            const JSValue fn = reinterpret_cast<const GetterSetter*>(slot->asCell())->getter;
+            if (fn.isUndefined()) {
+                setReg(vm, R[ins->a], JSValue::undefined());
+                return 1;
+            }
+            retain(fn);
+            const JSValue r = vm.callHook(vm, fn, base, nullptr, 0, vm.callHookData);
+            release(fn);
+            if (r.isException())
+                return 0;
+            setReg(vm, R[ins->a], r);
             return 1;
         }
     }

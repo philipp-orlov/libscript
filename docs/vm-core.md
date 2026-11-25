@@ -514,6 +514,17 @@ Against JSC, whole runs counted by `perf stat` on one core (JSC's compiler threa
 
 libscript runs more instructions per cycle than JSC on all 41 workloads (IPC 3.3-8.3 against 2.7-6.4).
 
+Per later iteration in steady state (a run of 45 iterations less a run of 15, 40 workloads), libscript runs 2.94x JSC's
+instructions and 2.60x its cycles. The JetStream later-iteration mean (1.43x) is lower because JSC's iterations 2-15 still
+include its own tier-up compiles. JSC's top-tier code is about 2.6x faster than libscript's SSA code.
+
+What SSA code spends its instructions on (instruction samples, arm64 skid included): spill loads and stores (gaussian-blur
+16%, hash-map 18%, raytrace 10%), register moves (crypto 42%), tagging of doubles (navier-stokes 51%, raytrace 19%, ML 12%),
+and guards. Seen in the hot loops: a value read twice is read and checked twice (`this_array[i]` in crypto's `am3`); a typed
+array's length and data pointer are loaded again at each access; loop-invariant values live in spill slots, because the
+SSA tier allocates from 9 general registers on arm64 and keeps any value live across a runtime call in a slot for its whole
+life; products keep their -0 checks when every use truncates.
+
 What this means for the design:
 
 1. The gap is path length: libscript runs about twice JSC's instructions for the same work, and not more slowly per

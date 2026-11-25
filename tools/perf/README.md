@@ -24,6 +24,7 @@ Make the workloads with `tools/probes/jetstream.py`.
 | `vsjsc.py OUT [l\|d]` | Ratios against JSC from a `vsjsc3.sh` output file. |
 | `cat.py DIR` | Sort flat `perf report` text files in DIR into categories. |
 | `t2prof.py` | Time of compiled code by tier and by instruction (see the script). |
+| `breakdown.sh OUTDIR [EVENT]`, `breakdown.py OUTDIR SUMFILE` | Time of every workload by category, and the geometric mean if a category took no time. |
 
 Time only on one fast core with nothing else running.
 

@@ -491,27 +491,41 @@ over JSC's time; below 1.00 libscript is faster.
 
 ### Where the time goes
 
-Share of samples by where they fall (`tools/perf/t2prof.sh`, 2026-11-24). "Runtime" is all C++: memory management, the
-built-ins, the helpers that compiled code calls, the parser and the compilers.
+The breakdown of 2026-11-25 (`4be6b64`): each workload profiled once by cycles and once by instructions, samples sorted
+into categories by symbol and by the perf map of compiled code. The bound is the geometric mean if a category took no time.
 
-| Most time in | Workloads (runtime share) |
-|---|---|
-| The runtime, over 50% | octane-code-load 98%, doxbee-async 86%, async-fs 86%, doxbee-promise 83%, Sunspider 81%, proxy-mobx 79%, OfflineAssembler 73%, sync-fs 70%, splay 69%, WSL 68%, threejs 61%, Air 59%, Box2D 58%, js-tokens 55% |
-| Mixed, 30-50% runtime | earley-boyer 48%, cdjs 45%, regexp-octane 43% (and 47% in native matchers), ML 37%, delta-blue 37%, UniPoker 33% |
-| SSA code, over 70% | richards 86%, hash-map 83%, crypto 77%, raytrace 72% |
-| Baseline code, 11-33% | lazy-collections 33%, js-tokens 26%, sync-fs 14%, doxbee-async 13%, async-fs 11%: generators and async functions after each resumption |
+| Category | Mean share | Geomean if it took no time | Geomean if it took half |
+|---|--:|--:|--:|
+| Compiled code (SSA 39%, baseline 5%, stubs and matchers 2%) | 46% | 0.65x | 1.09x |
+| Memory management (allocation 9%, freeing 6%, scans 2%, cycles 2%) | 19% | 1.17x | 1.30x |
+| Runtime glue (property misses, calls, interpreter, arrays, numbers, JSON, other built-ins) | 17% | 1.18x | 1.31x |
+| Strings and regular expressions in C++ | 9% | 1.30x | 1.37x |
+| Generators, promises and their baseline code | 8% | 1.30x | 1.38x |
+| Parser, bytecode compiler, machine-code compilers | 5% | 1.36x | 1.40x |
+
+Against JSC, whole runs counted by `perf stat` on one core (JSC's compiler threads included):
+
+| Geometric mean over 41 | libscript / JSC |
+|---|--:|
+| Instructions | 1.87x |
+| Cycles | 1.42x |
+| Branch misses | 0.65x |
+| L1 data misses | 1.22x |
+
+libscript runs more instructions per cycle than JSC on all 41 workloads (IPC 3.3-8.3 against 2.7-6.4).
 
 What this means for the design:
 
-1. The optimizing tier leads on about a fifth of the suite. Work on it alone cannot close the gap.
-2. Memory management is in almost every profile: frees one cell at a time (`destroyFrom`), the zero-count table's scans,
-   and the cycle collector's walk (splay about 25%, cdjs about 20%). The young generation covers only plain objects that
-   compiled code makes.
-3. Compiled code calls the runtime through generic helpers. A helper reads the instruction and the frame again and
-   writes its result with `setReg`. A direct call with the operands in registers saved 2-4% on string `+` alone.
-4. A resumed generator or async function runs baseline code. The SSA tier enters such a function only at a loop that
-   does not yield.
-5. octane-code-load measures the parser and the bytecode compiler. Lazy compiles (`kLazy`) cover large programs only.
+1. The gap is path length: libscript runs about twice JSC's instructions for the same work, and not more slowly per
+   instruction. The share of instructions in each category is the same as its share of cycles.
+2. No one category closes the gap. 1.00x needs about 30% less time on the typical workload, for example: SSA code a
+   third shorter, memory management and runtime glue each half as long.
+3. SSA code leads on most compute workloads (gaussian-blur 95%, navier-stokes 91%, richards 87%, hash-map 83%, crypto 77%,
+   stanford-crypto-aes 74%, raytrace 71%, gbemu 66%, ML 63%, delta-blue 61%).
+4. Memory management is in almost every profile: frees one cell at a time (`destroyFrom`), the zero-count table's scans,
+   and the cycle collector (all memory management: splay 47%, cdjs 33%). The young generation covers only plain objects that compiled code makes.
+5. Compiled code calls the runtime through generic helpers that read the instruction and the frame again.
+6. A resumed generator or async function runs baseline code (lazy-collections 35%, js-tokens 28%, Basic 26%).
 
 ### What held across the work
 

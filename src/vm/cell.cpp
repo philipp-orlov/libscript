@@ -75,6 +75,7 @@ void* VM::allocCell(std::size_t bytes, Kind kind, ObjClass cls, std::uint8_t aux
     ctx.totalAllocated += bytes;
     ++ctx.liveObjects;
     ++liveCells;
+    SCRIPT_VM_CENSUS(OldCells);
     return memory;
 }
 
@@ -771,35 +772,32 @@ void VM::collectYoung(bool registers) noexcept
     // freed. A cell made old before is no longer young. Each site learns how many of its cells lived.
     // A cell that lives on is counted now; one freed was never counted (`uncountYoung`).
     std::size_t keptBytes = 0, keptCells = 0;
-    // A site's cells are mostly next to each other in the list: counted here, and added to the site's counts when the site
-    // changes (the heap's stores in between would make the compiler load the site's counts again for each cell).
-    std::uint32_t siteId = 0, made = 0, kept = 0;
-    auto judge = [&]() {
-        if (!made)
-            return;
-        AllocSite& site = allocSite(siteId);
-        site.made += made;
-        site.kept += kept;
-        if (site.made >= kSiteWindow) [[unlikely]] {
-            if (site.kept >= site.made - site.made / 8)
-                site.old = 1;  // seven in eight lived: old from now on
-            site.made = site.kept = 0;
-        }
-        made = kept = 0;
-    };
+    // Each site learns how many of its cells lived from one cell in seven of the list, which counts for seven. (A count
+    // for each cell cost a load and a store per cell that waited on the cell before: the sites of a loop alternate. Seven
+    // divides no common period of such a loop.)
+    static constexpr std::uint32_t kSiteSample = 7;
+    std::uint32_t untilSample = 1;
+    // The dead cells of a row in one block go back with one update of the block (nothing else uses the heap meanwhile).
+    mem::LocalHeap::FreeRun dead(heap);
     for (CellPtr* p = youngBase_; p < youngTop_; ++p) {
         const CellPtr c = *p;
         CellHeader* h = headerOf(c);
         const std::uint32_t gc = h->gc;
         if (!(gc & kYoungGc))
             continue;
-        if ((gc >> kSiteShift) != siteId) {
-            judge();
-            siteId = gc >> kSiteShift;
+        if (--untilSample == 0) [[unlikely]] {
+            untilSample = kSiteSample;
+            AllocSite& site = allocSite(gc >> kSiteShift);
+            site.made += kSiteSample;
+            if (gc & kYoungMarked)
+                site.kept += kSiteSample;
+            if (site.made >= kSiteWindow) [[unlikely]] {
+                if (site.kept >= site.made - site.made / 8)
+                    site.old = 1;  // seven in eight lived: old from now on
+                site.made = site.kept = 0;
+            }
         }
-        ++made;
         if (gc & kYoungMarked) {
-            ++kept;
             h->gc = 0;
             keptBytes += JSObject::bytesFor(h->aux);
             ++keptCells;
@@ -809,11 +807,13 @@ void VM::collectYoung(bool registers) noexcept
             auto* o = reinterpret_cast<JSObject*>(c);
             if (o->slots)
                 freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
-            heap.deallocate(c, JSObject::bytesFor(h->aux));
+            dead.add(c);
         }
     }
-    judge();
+    dead.flush();
     countOld(keptBytes, keptCells);
+    SCRIPT_VM_CENSUS_ADD(YoungCells, std::size_t(youngTop_ - youngBase_));
+    SCRIPT_VM_CENSUS_ADD(YoungKept, keptCells);
     youngTop_ = youngBase_;
 }
 
@@ -1076,6 +1076,7 @@ void VM::scanZct() noexcept
 {
     if (immediate_ || tearingDown || ctx.tearingDown)
         return;
+    SCRIPT_VM_CENSUS(Scans);
     const bool shadowed = syncShadow();
     if (!shadowed)
         countRoots(1);
@@ -1400,6 +1401,12 @@ void VM::collectCycles(bool minor) noexcept
     for (CellPtr cell : garbage)
         headerOf(cell)->gc = 0;
     ctx.gcFreed += garbage.size();
+    if (minor)
+        SCRIPT_VM_CENSUS(CycleMinor);
+    else
+        SCRIPT_VM_CENSUS(CycleFull);
+    SCRIPT_VM_CENSUS_ADD(CycleCells, set.size());
+    SCRIPT_VM_CENSUS_ADD(CycleGarbage, garbage.size());
     for (CellPtr cell : garbage)
         clearReferences(*this, cell);
     // A dead prototype lets go of its root's count; its shapes are freed once what had them is gone.

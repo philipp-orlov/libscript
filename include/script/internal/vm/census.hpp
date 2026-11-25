@@ -36,6 +36,12 @@ enum class Census : std::uint8_t
     CycleOld,
     CycleFull,
     FreeDeferred,
+    CycleCells,    ///< cells a cycle collection of the vm core looked at
+    CycleGarbage,  ///< cells it found dead
+    Scans,         ///< scans of the zero-count table
+    YoungCells,    ///< young cells a scan looked at
+    YoungKept,     ///< young cells that lived
+    OldCells,      ///< cells that `allocCell` made
     Count,
 };
 
@@ -46,10 +52,13 @@ const char* censusName(Census id) noexcept;
 
 #define SCRIPT_VM_CENSUS(id) \
     (void)(++script::internal::vm::censusCounts()[std::size_t(script::internal::vm::Census::id)])
+#define SCRIPT_VM_CENSUS_ADD(id, n) \
+    (void)(script::internal::vm::censusCounts()[std::size_t(script::internal::vm::Census::id)] += (n))
 
 #else
 
 #define SCRIPT_VM_CENSUS(id) (void)0
+#define SCRIPT_VM_CENSUS_ADD(id, n) (void)0
 
 #endif
 

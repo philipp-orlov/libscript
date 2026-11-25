@@ -734,7 +734,7 @@ public:
     /// `youngTop_` is below `youngEnd_` and its site makes young cells.
     bool young = false;  ///< on with `deferred`
     static constexpr std::uint32_t kYoungGc = 2, kYoungMarked = 4, kSiteShift = 8;
-    static constexpr std::size_t kYoungCells = 4096;  ///< the list's room: a scan when it is full
+    static constexpr std::size_t kYoungCells = 16384;  ///< the list's room: a scan when it is full
     CellPtr* youngBase_ = nullptr;
     CellPtr* youngTop_ = nullptr;
     CellPtr* youngEnd_ = nullptr;

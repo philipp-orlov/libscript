@@ -755,8 +755,21 @@ public:
         *youngTop_++ = cell;
         headerOf(cell)->gc = kYoungGc | (site << kSiteShift);
         headerOf(cell)->rc = 0;
+        uncountYoung(cell);
         return true;
     }
+    /// A young cell is counted (`heapBytes`, `liveObjects` and the others) when it lives on, not when it is made: these
+    /// take back what `allocCell` counted, and count it then. (Young cells are plain objects with no slot buffer.)
+    void uncountYoung(CellPtr cell) noexcept;
+    void countOld(std::size_t bytes, std::size_t cells) noexcept
+    {
+        ctx.heapBytes += bytes;
+        ownedBytes_ += bytes;
+        ctx.liveObjects += cells;
+        liveCells += cells;
+    }
+    /// The young cells, which are not counted yet: how many, and their bytes.
+    void youngLive(std::size_t& cells, std::size_t& bytes) const noexcept;
     /// Whether the cell with header `h` is young. Only while the list holds any: a collection, which runs with none, writes
     /// the `gc` word of every cell it looks at.
     bool youngHeader(const CellHeader* h) const noexcept { return youngTop_ != youngBase_ && (h->gc & kYoungGc); }

@@ -1986,8 +1986,13 @@ Context::Stats Context::stats() const
     out.heapBytes = impl_->heapBytes;
     out.reservedBytes = impl_->heap.stats().committedBytes;
 #if SCRIPT_VM
-    if (vm::VM* vm = impl_->vmIfAny())
+    if (vm::VM* vm = impl_->vmIfAny()) {
         out.reservedBytes += vm->heap.stats().committedBytes;
+        std::size_t cells, bytes;
+        vm->youngLive(cells, bytes);  // counted when they live on
+        out.liveObjects += cells;
+        out.heapBytes += bytes;
+    }
 #endif
     out.totalAllocated = impl_->totalAllocated;
     out.gcRuns = impl_->gcRuns;

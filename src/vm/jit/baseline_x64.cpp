@@ -1571,6 +1571,7 @@ private:
     void allocCellHere(std::size_t bytes, const CellHeader& h, Label& slow, bool shapeInR8, std::uint32_t site = 0)
     {
         const bool youngCell = site && def_ && vm_.young;
+        Label counted;
         auto& ctx = vm_.ctx;
         auto at = [&](const void* field) {
             return std::int32_t(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&ctx));
@@ -1641,7 +1642,9 @@ private:
             a_.jcc(CAE, tableWay);
             pop();
             push(&vm_.youngTop_, VM::kYoungGc | (site << VM::kSiteShift));
-            a_.jmp(made);
+            // Counted when it lives on (`VM::makeOld`, `collectYoung`), not now.
+            a_.aluI(0, mem(RCX, at(&ctx.totalAllocated)), std::int32_t(bytes));
+            a_.jmp(counted);
             a_.bind(tableWay);
             budgets();
             a_.mov(RSI, mem(R12, atVm(&vm_.zctTop_)));
@@ -1666,6 +1669,7 @@ private:
         a_.aluI(0, mem(RCX, at(&ctx.liveObjects)), 1);
         a_.aluI(0, mem(R12, atVm(&vm_.ownedBytes_)), std::int32_t(bytes));
         a_.aluI(0, mem(R12, atVm(&vm_.liveCells)), 1);
+        a_.bind(counted);
     }
     /// The value in `v` is a string (a cell of the core's own kind String), else `bad`.
     void needString(Reg v, Label& bad)

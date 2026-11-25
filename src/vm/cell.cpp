@@ -704,6 +704,7 @@ void VM::makeOld(CellPtr cell) noexcept
 {
     CellHeader* h = headerOf(cell);
     h->gc = 0;
+    countOld(JSObject::bytesFor(h->aux), 1);
     std::uint32_t n, nMore;
     const JSValue* more;
     const JSValue* values = youngValues(*this, cell, n, more, nMore);
@@ -768,8 +769,8 @@ void VM::collectYoung(bool registers) noexcept
     }
     // Sweep: a marked cell is old now (held by nothing but a frame, it goes into the zero-count table); one not marked is
     // freed. A cell made old before is no longer young. Each site learns how many of its cells lived.
-    // (The sums in locals: in a `Freed` on the stack, each cell's store and the next cell's load of it are one chain.)
-    std::size_t freedBytes = 0, freedCells = 0;
+    // A cell that lives on is counted now; one freed was never counted (`uncountYoung`).
+    std::size_t keptBytes = 0, keptCells = 0;
     // A site's cells are mostly next to each other in the list: counted here, and added to the site's counts when the site
     // changes (the heap's stores in between would make the compiler load the site's counts again for each cell).
     std::uint32_t siteId = 0, made = 0, kept = 0;
@@ -800,24 +801,39 @@ void VM::collectYoung(bool registers) noexcept
         if (gc & kYoungMarked) {
             ++kept;
             h->gc = 0;
+            keptBytes += JSObject::bytesFor(h->aux);
+            ++keptCells;
             if (h->rc == 0)
                 zctPush(c);
         } else {
             auto* o = reinterpret_cast<JSObject*>(c);
             if (o->slots)
                 freePayload(o->slotsHeader(), sizeof(SlotsHeader) + 8u * o->slotsHeader()->capacity);
-            const std::size_t bytes = JSObject::bytesFor(h->aux);
-            heap.deallocate(c, bytes);
-            freedBytes += bytes;
-            ++freedCells;
+            heap.deallocate(c, JSObject::bytesFor(h->aux));
         }
     }
     judge();
-    Freed freed;
-    freed.bytes = freedBytes;
-    freed.cells = freedCells;
-    countFreed(freed);
+    countOld(keptBytes, keptCells);
     youngTop_ = youngBase_;
+}
+
+void VM::uncountYoung(CellPtr cell) noexcept
+{
+    const std::size_t bytes = JSObject::bytesFor(headerOf(cell)->aux);
+    ctx.heapBytes -= bytes;
+    ownedBytes_ -= bytes;
+    --ctx.liveObjects;
+    --liveCells;
+}
+
+void VM::youngLive(std::size_t& cells, std::size_t& bytes) const noexcept
+{
+    cells = bytes = 0;
+    for (CellPtr* p = youngBase_; p < youngTop_; ++p)
+        if (headerOf(*p)->gc & kYoungGc) {
+            ++cells;
+            bytes += JSObject::bytesFor(headerOf(*p)->aux);
+        }
 }
 
 std::uint32_t VM::allocSiteFor(CodeBlock* code, std::uint32_t index)

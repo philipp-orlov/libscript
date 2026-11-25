@@ -498,21 +498,27 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 
 ## Speed against JavaScriptCore
 
-State on 2026-11-25 (`4be6b64`). JetStream 3, the 41 JavaScript workloads that `tools/probes/jetstream.py` writes, release
+State on 2026-11-25 (`178d660`). JetStream 3, the 41 JavaScript workloads that `tools/probes/jetstream.py` writes, release
 build, arm64 (Cortex-X925, core 16), JavaScriptCore 2.52.6, best of two interleaved rounds. The ratio is libscript's time
 over JSC's time; below 1.00 libscript is faster.
 
-| | Later iterations | First iteration |
-|---|--:|--:|
-| Geometric mean of 41 | 1.44x | 0.72x |
+| | Later iterations | First iteration | Peak resident size |
+|---|--:|--:|--:|
+| Geometric mean of 41 | 1.41x | 0.71x | 0.22x |
 
-- Furthest behind (later iterations): splay 2.66x, Sunspider 2.25x, octane-code-load 2.23x, ML 2.08x, threejs 2.01x,
-  richards 1.99x, OfflineAssembler 1.89x, js-tokens 1.86x, cdjs 1.83x, hash-map 1.81x, sync-fs 1.80x, Air 1.79x.
-- Ahead: proxy-mobx 0.88x, stanford-crypto-aes 0.88x, pdfjs 0.99x.
+- Furthest behind (later iterations): splay 2.70x, octane-code-load 2.26x, Sunspider 2.17x, ML 2.06x, threejs 1.97x,
+  Air 1.95x, js-tokens 1.91x, OfflineAssembler 1.89x, hash-map 1.79x, UniPoker 1.78x, sync-fs 1.77x, doxbee-async 1.72x.
+- Ahead: proxy-mobx 0.88x, stanford-crypto-aes 0.88x, Basic 0.91x, pdfjs 0.99x.
+- Memory (`tools/perf/rss.sh`, `tools/perf/soak.sh`): no workload is above JSC's peak by more than 2%. Over 300 and 1,000
+  iterations no workload grows but octane-code-load, pdfjs and proxy-vue, which keep data per iteration (JSC grows more
+  on each of them).
 - First iterations are ahead on most workloads. Behind: json-stringify-inspector 2.57x, octane-code-load 2.29x,
   regexp-octane 2.15x, threejs 1.34x, WSL 1.22x, OfflineAssembler 1.11x.
 
 ### Where the time goes
+
+(The table and the list below are from `4be6b64`, when the mean was 1.44x. Since then: closures and boxes are young
+cells, the young sweep costs less, and array buffers and the parser's nodes left the general allocator.)
 
 The breakdown of 2026-11-25 (`4be6b64`): each workload profiled once by cycles and once by instructions, samples sorted
 into categories by symbol and by the perf map of compiled code. The bound is the geometric mean if a category took no time.

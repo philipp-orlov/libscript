@@ -462,7 +462,7 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                 if (widened >= 3)
                     for (std::uint32_t j = 0; j < code->code.size() && j < code->prof.size(); j = opt::nextOf(*code, j)) {
                         const Op o = code->code[j].opcode();
-                        if ((o == Op::GetProp || o == Op::GetUpval || o == Op::GetBox) && (code->prof[j] & 11) == 1 &&
+                        if ((o == Op::GetProp || o == Op::GetUpval || o == Op::GetBox || o == Op::GetGlobal) && (code->prof[j] & 11) == 1 &&
                             !(code->prof[j] & opt::kProfWidened))
                             code->prof[j] |= opt::kProfNoSpec;
                     }

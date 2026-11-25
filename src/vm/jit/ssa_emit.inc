@@ -5045,8 +5045,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         for (std::uint32_t i = hb.start; i < hb.loopEnd; i = opt::nextOf(*code_, i)) {
             const Ins& in = code_->code[i];
             if (in.opcode() != Op::GetGlobal || ssaHoisted_[i] || writers[in.a] != 1 || g.defBase[i] == ssa::kNone ||
-                sval_[g.defBase[i]].isConst)
-                continue;
+                sval_[g.defBase[i]].isConst || sval_[g.defBase[i]].rep != kRepTagged)
+                continue;  // (a global taken for a number is checked where it is read, in the loop)
             const std::uint32_t v = g.defBase[i];
             ssaHoisted_[i] = 1;
             loopGuards_[h].globals.push_back(i);
@@ -5824,6 +5824,8 @@ bool Baseline::ssaSpecLoad(std::uint32_t i)
     switch (in.opcode()) {
     case Op::GetUpval: case Op::GetBox:
         return !sval_[ssa_->defBase[i]].isConst;
+    case Op::GetGlobal:
+        return !sval_[ssa_->defBase[i]].isConst && ssaGlobalFast(i);
     case Op::GetProp: {
         if (sval_[ssa_->defBase[i]].isConst || !ssaNative(i) || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0)
             return false;

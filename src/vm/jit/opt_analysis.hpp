@@ -27,6 +27,11 @@ enum class Rep : std::uint8_t { None, I32, F64, Mem };
 /// Bits of `CodeBlock::prof` besides `profBit`'s: set when a guard of the optimizing compiler failed at the instruction, so
 /// that the next compile does not speculate there.
 inline constexpr std::uint8_t kProfFailed = 16;
+/// Set when a value SSA code took for an int32 or a double from what the instruction had made (a load) was something
+/// else: the next compile keeps that value boxed (the instruction itself has not failed).
+inline constexpr std::uint8_t kProfNoSpec = 32;
+/// Set on a load taken for an int32 that was a double there: it is taken for a number from then on.
+inline constexpr std::uint8_t kProfWidened = 64;
 
 /// The registers an instruction reads and writes. `ok` is false for an instruction the optimizing compiler does not model:
 /// a function with one is left to the baseline compiler.

@@ -1909,6 +1909,24 @@ void Baseline::ssaImmature(std::uint32_t i)
 void Baseline::ssaDef(std::uint32_t i, std::uint8_t bits)
 {
     const std::uint32_t v = ssa_->defBase[i];
+    if (sval_[v].rep != kRepTagged && !sval_[v].isConst) {
+        // A load taken for a number by what it has made (`ssaSpecLoad`): checked once here, unboxed from then on.
+        ssaExits_.push_back(SsaExit{i, name_, frame_, liveBefore_, Label{}});
+        ssaExits_.back().kind = 4;
+        Label& bad = ssaExits_.back().label;
+        if (sval_[v].rep == kRepI32) {
+            needInt(RAX, bad);
+            vDef_[v] = vKnown_[v] = kVInt | kVNotCell;
+            ssaDefI32(i, RAX);
+        } else {
+            needNumber(RAX, bad);
+            vDef_[v] = vKnown_[v] = kVNotCell;
+            const int x = defF64Reg(i);
+            loadNumber(x, RAX, RDX);
+            ssaDefF64(i, x);
+        }
+        return;
+    }
     name_[code_->code[i].a] = v;
     vDef_[v] = bits;
     vKnown_[v] = bits;
@@ -4486,6 +4504,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             cls[v] = intArith_[sv.at] ? 1 : dblArith_[sv.at] ? 2 : elemRep[sv.at];
             if (ssaOn_ >= 2 && cls[v] == 3 && (ssaLengthSite(sv.at) || ssaCharCodeCallee(sv.at)))
                 cls[v] = 1;  // an int32 when it does not leave
+            else if (cls[v] == 3 && ssaSpecLoad(sv.at)) {
+                const std::uint8_t p = code_->prof[sv.at] & 11;
+                cls[v] = p == 1 ? 1 : 2;  // what the load has made: int32s only, or numbers
+            }
             if (JSFunction* f = viewOf_[sv.at]) {
                 const auto bits = reinterpret_cast<std::intptr_t>(f->rare()->nativeData);
                 const ElemKind k = ElemKind(bits & 255);
@@ -5789,6 +5811,35 @@ Mem Baseline::ssaIndexed(Reg base, Reg index, std::uint8_t scale) const
 }
 
 /// The place of element `vi` of `vb`, a typed array of `kind`, which has it, else `bad`. Clobbers rax, rcx, rsi.
+/// Whether load `i` (a data property, an upvalue, a box) is taken for a number by what it has made (`CodeBlock::prof`):
+/// it reads only (a failed check leaves before it), and has made int32s only, or numbers only.
+bool Baseline::ssaSpecLoad(std::uint32_t i)
+{
+    if (ssaOn_ < 2 || i >= code_->prof.size() || (code_->prof[i] & (opt::kProfFailed | opt::kProfNoSpec)))
+        return false;
+    const std::uint8_t p = code_->prof[i] & 11;
+    if (p != 1 && p != 2 && p != 3)
+        return false;
+    const Ins& in = code_->code[i];
+    switch (in.opcode()) {
+    case Op::GetUpval: case Op::GetBox:
+        return !sval_[ssa_->defBase[i]].isConst;
+    case Op::GetProp: {
+        if (sval_[ssa_->defBase[i]].isConst || !ssaNative(i) || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0)
+            return false;
+        const std::vector<ReadEntry> es = ssaReadEntries(i);
+        if (es.empty())
+            return false;
+        for (const ReadEntry& e : es)
+            if (e.absent || e.view || e.watched)
+                return false;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 Mem Baseline::ssaTypedPlace(std::uint32_t i, std::uint32_t vb, std::uint32_t vi, ElemKind kind, Label& bad)
 {
     const std::uint8_t size = kind == ElemKind::Float64 ? 8

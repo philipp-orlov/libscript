@@ -447,6 +447,28 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
                 kind = 2;
             }
         }
+        if (kind == 4) {
+            // A loaded value was not what its profile said (no failure). The step below notes what it is, so a value taken
+            // for an int32 is taken for a number next; one taken for a number is kept boxed.
+            if (index < code->prof.size() && (code->prof[index] & 11) != 1) {
+                code->prof[index] |= opt::kProfNoSpec;
+            } else if (index < code->prof.size()) {
+                // Taken for a number next. When the loads of this function keep doing that (their notes are older than
+                // their values), the rest of those noted as int32s only stay boxed, so that they do not leave one at a time.
+                code->prof[index] |= opt::kProfWidened;
+                unsigned widened = 0;
+                for (std::uint32_t j = 0; j < code->code.size() && j < code->prof.size(); j = opt::nextOf(*code, j))
+                    widened += (code->prof[j] & opt::kProfWidened) ? 1 : 0;
+                if (widened >= 3)
+                    for (std::uint32_t j = 0; j < code->code.size() && j < code->prof.size(); j = opt::nextOf(*code, j)) {
+                        const Op o = code->code[j].opcode();
+                        if ((o == Op::GetProp || o == Op::GetUpval || o == Op::GetBox) && (code->prof[j] & 11) == 1 &&
+                            !(code->prof[j] & opt::kProfWidened))
+                            code->prof[j] |= opt::kProfNoSpec;
+                    }
+            }
+            kind = 2;
+        }
         if (kind == 0 && code->tier2 && code->tier2->epoch != vm->globalEpoch) {
             // Something it took for constant has changed: no site is to blame, and the next compile takes it in.
             retireTier2(*vm, code);
@@ -3295,6 +3317,7 @@ private:
 public:
     Tier2Code* compileSsa(ssa::Graph& g, Tier1Code* base);
     void lirBuild(const ssa::Graph& g, lir::Func& f);
+    bool ssaSpecLoad(std::uint32_t i);
     const char* ssaWhy_ = "";
     int ssaOn_ = 2;  ///< SCRIPT_VM_SSA: 1 every instruction through the frame, 2 the fast paths too
 
@@ -3511,7 +3534,7 @@ private:
         std::vector<std::uint32_t> name, frame;
         ssa::Bits live;
         Label label;
-        int kind = 0;  ///< 0: before instruction i (it runs in the interpreter); 1: after it (it has run); 3: on in the baseline code at i
+        int kind = 0;  ///< 0: before instruction i (it runs in the interpreter); 1: after it (it has run); 2: the code makes way for a new compile; 3: on in the baseline code at i; 4: as 2, a value speculation failed
     };
     std::deque<SsaExit> ssaExits_;
     std::int64_t exitAt_ = -1;

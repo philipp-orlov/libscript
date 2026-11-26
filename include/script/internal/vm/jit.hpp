@@ -34,6 +34,9 @@ struct Tier1Code
     std::uint8_t* rx = nullptr;               ///< where the code runs
     void* entry = nullptr;                    ///< the code for the first instruction
     void* ctorEntry = nullptr;                ///< the same for a frame `new` made: optimized code is not always made for those
+    /// As `entry`, for a caller that also has `this` and the first two arguments in registers (rax, rcx, rdx) beside their
+    /// frame slots: optimized code takes them from there (`ssaDirectCall`). Other code ignores the registers.
+    void* argsEntry = nullptr;
     std::size_t bytes = 0;
     std::vector<std::uint32_t> labels;        ///< per instruction index: offset from `rx` of its code, or ~0u
     const std::uint32_t* labelAt = nullptr;   ///< `labels.data()`, for compiled code
@@ -89,6 +92,7 @@ struct Tier2Code
     std::uint8_t* rx = nullptr;
     std::size_t bytes = 0;
     void* entry = nullptr;                                        ///< the function's entry, as the baseline code's
+    void* argsEntry = nullptr;                                    ///< `Tier1Code::argsEntry` of this code (null: `entry`)
     std::vector<std::pair<std::uint32_t, std::uint32_t>> osr;     ///< (loop header, offset from `rx` of the way in)
     std::vector<ValidityCell*> validities;
     std::vector<JSValue> held;                                    ///< values the code compares against, each counted

@@ -1058,15 +1058,41 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     ssaKeptSave();
     a_.mov(R13, RSI);
     a_.mov(RBX, RDI);
-    for (unsigned r = 0; r < nregs; ++r)
-        if (ssa::bitTest(g.blocks[1].liveIn, r) && hasLoc(r)) {
-            if (sval_[r].reg >= 0) {
-                a_.mov(Reg(sval_[r].reg), R(r));
-                continue;
-            }
+    auto entryValue = [&](unsigned r) {
+        if (sval_[r].reg >= 0) {
+            a_.mov(Reg(sval_[r].reg), R(r));
+        } else {
             a_.mov(RAX, R(r));
             storeTagged(r, RAX);
         }
+    };
+    // A deferred frame has a second way in, from a direct call of optimized code (`ssaDirectCall`): `this` in rax and the
+    // first two arguments in rcx and rdx, each also in its frame slot. A value read from the slot would wait for the
+    // caller's store. That way in falls through to the code; this one jumps over it.
+    std::uint32_t argsAt = 0;
+    Label argsToBase;
+    if (def_) {
+        Label common;
+        for (unsigned r = 0; r < 3 && r < nregs; ++r)
+            if (ssa::bitTest(g.blocks[1].liveIn, r) && hasLoc(r))
+                entryValue(r);
+        a_.jmp(common);
+        argsAt = std::uint32_t(a_.here());
+        a_.enter(RBX, R13, 8 + spill_);
+        ssaKeptSave();
+        a_.mov(R13, RSI);
+        a_.mov(RBX, RDI);
+        static constexpr Reg kArgs[3] = {RAX, RCX, RDX};
+        for (unsigned r = 0; r < 3 && r < nregs; ++r)
+            if (ssa::bitTest(g.blocks[1].liveIn, r) && hasLoc(r))
+                storeTagged(r, kArgs[r]);
+        if (limitNeed_)
+            ssaEntryLimits(RBX, R13, 0, argsToBase);
+        a_.bind(common);
+    }
+    for (unsigned r = def_ ? 3 : 0; r < nregs; ++r)
+        if (ssa::bitTest(g.blocks[1].liveIn, r) && hasLoc(r))
+            entryValue(r);
     {
         std::vector<std::uint32_t> st(nregs);
         for (unsigned r = 0; r < nregs; ++r)
@@ -1448,6 +1474,18 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
         a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(bl.start)));
         a_.jmp(RAX);
     }
+    if (def_ && limitNeed_) {
+        // The limits failed on the way in with arguments in registers: out of this frame, and on in the baseline code.
+        if (!epochSites_.empty() && epochSites_.back().first == a_.here())
+            a_.nop();  // (the place of an epoch check is not this code's)
+        a_.bind(argsToBase);
+        ssaKeptRestore();
+        a_.mov(RDI, RBX);
+        a_.mov(RSI, R13);
+        a_.leave(RBX, R13, 8 + spill_);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->rx));
+        a_.jmp(RAX);
+    }
     emitTails();
     a_.finishPool();
     CodeSpan span = a_.failed() ? CodeSpan{} : allocateCode(a_.buf.size());
@@ -1471,6 +1509,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     t->rx = span.rx;
     t->bytes = span.bytes;
     t->entry = t->rx;
+    t->argsEntry = def_ ? t->rx + argsAt : nullptr;
     t->osr = std::move(osr);
     t->ctor = ssaCtor_;
     for (const auto& [at, bad] : epochSites_)
@@ -3886,77 +3925,108 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     a_.mov(RDX, mem(RCX, kCbTier1));
     a_.test(RDX, RDX);
     a_.jcc(CE, slow);
-    a_.lea(R9, R(base + 1));
-    a_.lea(R11, mem(R13, std::int32_t(sizeof(Frame))));
+    // The callee's registers in rdi and its frame in rsi, as its code takes them. No register that holds a value of this
+    // code is written before the arguments are read below (but r10, where the limits are checked here).
+    a_.lea(RDI, R(base + 1));
+    a_.lea(RSI, mem(R13, std::int32_t(sizeof(Frame))));
     if (!limitNeed_) {
         // The frame and one past it filled: the stack is never filled closer than 8 to its end (`VM::fillStack`).
-        a_.lea(R10, mem(R9, std::int32_t(8 * C->nregs + 8)));
+        a_.lea(R10, mem(RDI, std::int32_t(8 * C->nregs + 8)));
         a_.alu(7, R10, mem(R12, kVmStackInit));
         a_.jcc(CA, slow);
-        a_.alu(7, R11, mem(R12, kVmFrameLimit));
+        a_.alu(7, RSI, mem(R12, kVmFrameLimit));
         a_.jcc(CAE, slow);
         a_.alu(7, RSP, mem(R12, kVmStackFloor));
         a_.jcc(CB, slow);
     }
-    a_.mov32(RDI, mem(R12, kVmTicks));
-    a_.aluI32(5, RDI, 1);
+    // (The frame record is past the top until the top moves: written early, it frees rax and rcx.)
+    a_.mov(mem(RSI, kFrameCode), RCX);
+    a_.mov(mem(RSI, kFrameFn), RAX);
+    a_.mov32(RAX, mem(R12, kVmTicks));
+    a_.aluI32(5, RAX, 1);
     a_.jcc(CBE, slow);
-    a_.mov32(mem(R12, kVmTicks), RDI);
+    a_.mov32(mem(R12, kVmTicks), RAX);
     // Caller registers the callee's frame covers past the arguments: a plain one is overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     // (A deferred frame has nothing to let go of there. Past the callee's registers, a call it makes may reach them.)
     // (A deferred frame: the parameters there is no argument for. The callee's code sees to its other registers.)
     if (def_)
         for (unsigned r = 1 + argc; r <= C->nparams; ++r)
-            a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+            a_.mov(mem(RDI, std::int32_t(8 * r)), std::int32_t(kUndefined));
     for (unsigned r = 1 + argc; !def_ && r < window; ++r) {
         const std::uint32_t at = frame_[base + 1 + r];
         if (at != ssa::kNone && sval_[at].isConst && sval_[at].bits == kUndefined)
             continue;  // as it is
         if (!def_ && !windowPlain(i, base + 1 + r)) {
-            a_.mov(RDI, mem(R9, std::int32_t(8 * r)));
-            a_.test(RDI, R15);
+            a_.mov(RAX, mem(RDI, std::int32_t(8 * r)));
+            a_.test(RAX, R15);
             a_.jcc(CE, slow);
         }
-        a_.mov(mem(R9, std::int32_t(8 * r)), std::int32_t(kUndefined));
+        a_.mov(mem(RDI, std::int32_t(8 * r)), std::int32_t(kUndefined));
     }
     const std::uint32_t vt = name_[base + 1];
-    if (!(C->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && !(vt != ssa::kNone && known(vt, kVObj))) {
+    const bool thisFixed = !(C->flags & (CodeBlock::kStrict | CodeBlock::kArrow | CodeBlock::kNoThis)) && !(vt != ssa::kNone && known(vt, kVObj));
+    if (thisFixed) {
         // A sloppy function called with no `this` gets the global object.
         Label thisOk;
-        a_.mov(RDI, R(base + 1));
-        a_.aluI(4, RDI, -9);
-        a_.cmpI(RDI, std::int32_t(kNull));
+        a_.mov(RAX, R(base + 1));
+        a_.aluI(4, RAX, -9);
+        a_.cmpI(RAX, std::int32_t(kNull));
         a_.jcc(CNE, thisOk);
-        a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.global));
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(vm_.global));
         if (!def_)
-            a_.inc32(mem(RDI, kHdrRc));
-        a_.mov(R(base + 1), RDI);
+            a_.inc32(mem(RAX, kHdrRc));
+        a_.mov(R(base + 1), RAX);
         a_.bind(thisOk);
     }
-    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
-    a_.mov(mem(R13, kFramePc), RDI);
+    a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&code_->code[i + 1]));
+    a_.mov(mem(R13, kFramePc), RAX);
     static_assert(sizeof(Frame) == 64, "a frame is found by a shift");
-    a_.lea(RDI, mem(R11, std::int32_t(sizeof(Frame))));
-    a_.mov(mem(R12, kVmFrameTop), RDI);
-    a_.mov(mem(R11, kFrameCode), RCX);
-    a_.mov(mem(R11, kFrameFn), RAX);
-    a_.mov(mem(R11, kFramePc), 0);
-    a_.mov(mem(R11, kFrameR), R9);
-    a_.movImm(RDI, (std::uint64_t(argc) << 32) | in.a);
-    a_.mov(mem(R11, kFrameRetDst), RDI);
-    a_.mov(mem(R11, kFrameEntry - 1), std::int32_t(0x100));
+    a_.lea(RAX, mem(RSI, std::int32_t(sizeof(Frame))));
+    a_.mov(mem(R12, kVmFrameTop), RAX);
+    a_.mov(mem(RSI, kFramePc), 0);
+    a_.mov(mem(RSI, kFrameR), RDI);
+    a_.movImm(RAX, (std::uint64_t(argc) << 32) | in.a);
+    a_.mov(mem(RSI, kFrameRetDst), RAX);
+    a_.mov(mem(RSI, kFrameEntry - 1), std::int32_t(0x100));
     bool reads = false;
     for (const Ins& ci : C->code)
         reads = reads || ci.opcode() == Op::NewTarget || ci.opcode() == Op::SetNewTarget || ci.opcode() == Op::SuperCall;
     if (reads) {
-        a_.mov(mem(R11, kFrameNewTarget), std::int32_t(kUndefined));
-        a_.mov(mem(R11, kFrameGen), std::int32_t(kUndefined));
+        a_.mov(mem(RSI, kFrameNewTarget), std::int32_t(kUndefined));
+        a_.mov(mem(RSI, kFrameGen), std::int32_t(kUndefined));
     }
-    a_.mov(RSI, R11);
-    a_.mov(RDI, R9);
-    a_.mov(RDX, mem(RDX, kTierEntry));
-    a_.callReg(RDX);
+    if (def_) {
+        // `this` and the first two arguments in registers too (`Tier1Code::argsEntry`): from where the values are, not
+        // from the slots just written (a read of those would wait for the stores). A value with no place of its own is
+        // in its frame slot only. The way in goes through r9: the second argument is read after that.
+        auto placed = [&](std::uint32_t v, bool last) {
+            if (v == ssa::kNone || sval_[v].isConst)
+                return v != ssa::kNone;
+            return hasLoc(v) && !(sval_[v].reg == R10 && !limitNeed_) && !(last && sval_[v].reg == R9);
+        };
+        if (!thisFixed && placed(vt, false))
+            loadValue(vt, RAX);
+        else
+            a_.mov(RAX, R(base + 1));
+        if (argc < 1)
+            a_.movImm(RCX, kUndefined);
+        else if (placed(name_[base + 2], false))
+            loadValue(name_[base + 2], RCX);
+        else
+            a_.mov(RCX, R(base + 2));
+        a_.mov(R9, mem(RDX, kTierArgsEntry));
+        if (argc < 2)
+            a_.movImm(RDX, kUndefined);
+        else if (placed(name_[base + 3], true))
+            loadValue(name_[base + 3], RDX);
+        else
+            a_.mov(RDX, R(base + 3));
+        a_.callReg(R9);
+    } else {
+        a_.mov(RDX, mem(RDX, kTierEntry));
+        a_.callReg(RDX);
+    }
     a_.test(RAX, RAX);
     a_.jcc(CE, exc);
     write(in.a, RAX);

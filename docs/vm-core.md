@@ -280,6 +280,20 @@ function's entry and at its OSR entries, for the largest window any of its direc
 check `this` when the value is known to be an object. The tick (the interrupt check) stays at each call: a recursion with
 no loop asks the host only there.
 
+In a deferred frame a direct call also passes `this` and the first two arguments in registers (rax, rcx, rdx), beside
+their frame slots. The callee's SSA code has a second way in for that (`Tier1Code::argsEntry`): a read of the slot would
+wait for the caller's store. Baseline code has the same address for both ways in and ignores the registers. The result
+comes back in rax and in the caller's frame slot, and the caller goes on from rax. One call and return is about 90
+instructions; most of them write the frame record and check the callee.
+
+**A merged callee whose result is tested.** When the caller tests the result of a call at once (`if (o.m())`), each
+return of the merged callee gets its own copy of the test (`mergeInline`), and a return reached from a test of the same
+register (`return a || b`) jumps straight to where the caller's test would go. In the SSA code a compare whose boolean
+only the jump at the end of its block reads makes no boolean (`ssaFusedJump`).
+
+**Load reuse.** `ssaLoadElim` gives a second read of the same slot, box, upvalue or array element (plain or typed, the
+same index value) the value of the first, while nothing between can have written it.
+
 **The new back end (in progress).** `lir.hpp` is a lowered IR under the SSA graph: one block per SSA block, nodes in
 SSA form with effects as heap regions, and the node that makes each SSA value. `lir_build.inc` builds it after the
 representation plan; for now every instruction is one `Generic` node, and nothing is compiled from it

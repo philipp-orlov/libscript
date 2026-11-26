@@ -381,7 +381,7 @@ std::int32_t tier2Backoff(const VM& vm, const CodeBlock* code) noexcept
 void retireTier2(VM& vm, CodeBlock* code) noexcept
 {
     if (code->tier1 && code->tier2 && code->tier1->entry == code->tier2->entry)
-        code->tier1->entry = code->tier1->ctorEntry = code->tier1->rx;
+        code->tier1->entry = code->tier1->ctorEntry = code->tier1->argsEntry = code->tier1->rx;
     if (code->tier2 && code->tier2->borrow)
         code->tier2->borrow->retired = 1;
     if (code->tier2Tries < 255)
@@ -704,6 +704,7 @@ bool installTier2(VM* vm, CodeBlock* code)
     }
 #endif
     code->tier1->entry = t->entry;
+    code->tier1->argsEntry = t->argsEntry ? t->argsEntry : t->entry;
     code->tier1->ctorEntry = t->ctor ? t->entry : code->tier1->rx;
     code->optExits = 0;
     // Optimized code may have been made before parts of the function had run: it makes way after those have run
@@ -1222,6 +1223,7 @@ constexpr std::int32_t kCbFlags = std::int32_t(offsetof(CodeBlock, flags));
 constexpr std::int32_t kCbNparams = std::int32_t(offsetof(CodeBlock, nparams));
 constexpr std::int32_t kCbNregs = std::int32_t(offsetof(CodeBlock, nregs));
 constexpr std::int32_t kTierEntry = std::int32_t(offsetof(Tier1Code, entry));
+constexpr std::int32_t kTierArgsEntry = std::int32_t(offsetof(Tier1Code, argsEntry));
 constexpr std::int32_t kTierCtor = std::int32_t(offsetof(Tier1Code, ctorEntry));  // of a frame `new` made
 constexpr std::int32_t kFrameArgc = std::int32_t(offsetof(Frame, argc));
 constexpr std::int32_t kFrameConstruct = std::int32_t(offsetof(Frame, construct));
@@ -1355,7 +1357,7 @@ public:
         auto* t = new Tier1Code;
         t->rx = span.rx;
         t->bytes = span.bytes;
-        t->entry = t->ctorEntry = t->rx;
+        t->entry = t->ctorEntry = t->argsEntry = t->rx;
         t->validities = std::move(validities_);
         t->labels = std::move(offsets_);
         t->labelAt = t->labels.data();

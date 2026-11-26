@@ -98,7 +98,8 @@ struct JSObject
     std::uint32_t slotCapacity() noexcept { return slots ? slotsHeader()->capacity : 0; }
     Rare* rare() noexcept { return (h.flags & cellflags::kHasRare) ? slotsHeader()->rare : nullptr; }
     Rare& rareOf(VM& vm);
-    ObjClass cls() const noexcept { return ObjClass(h.cls); }
+    /// The class a program can tell: an array is an `Array` however its elements are stored (`JSArray`).
+    ObjClass cls() const noexcept { return ObjClass(h.cls & kClassMask); }
     bool isProto() const noexcept { return (h.flags & cellflags::kIsProto) != 0; }
 
     Shape* shapeOf(VM& vm) const noexcept { return vm.shapeById(h.shape); }
@@ -160,18 +161,73 @@ static_assert(sizeof(JSObject) == JSObject::kHeaderBytes, "");
 
 struct JSArray : JSObject
 {
-    JSValue* elems;  ///< the elements, `capacity` of them: `small` until there are more than it holds
+    /// The elements, `capacity` of them: `small` until there are more than it holds. What a place holds goes by the
+    /// header's class byte. `Array` (and `Arguments`): a value or a hole. `IntArray`: an int32 value or a hole, so no
+    /// cell. `NumArray`: a double as it is, and `kNumHole` for a hole. A program sees no difference: a whole number
+    /// read from a `NumArray` is an int32 again (`get`). An array a program makes starts with int32s, changes to
+    /// doubles at the first number that is not an int32, and to values at the first store of anything else or when
+    /// code that knows values only asks for them (`vals`). Values is where it stays, so compiled code that has seen
+    /// an `Array` need not look again. Only code that goes by the kind reads or writes `store` itself.
+    JSValue* store;
     std::uint32_t length;
     std::uint32_t capacity;
     static constexpr std::uint32_t kSmall = 6;
     JSValue small[kSmall];  ///< the first elements of an array that has never had more
-    /// The elements below `packed` are numbers: no hole and no cell among them, so a store of a number over one of them
-    /// has nothing to look at or let go of, and nothing below it needs a look when the array is freed or traced. A
-    /// lower bound (zero is always right) and never above `length`; never above zero in a frozen array, whose elements
-    /// compiled code then leaves to the checks of the long way. Every writer of `elems` and `length` keeps it.
+    /// Of an array of values: the elements below `packed` are numbers, with no hole and no cell among them, so a store
+    /// of a number over one of them has nothing to look at or let go of, and nothing below it needs a look when the
+    /// array is freed or traced. A lower bound (zero is always right, and is what the other kinds have) and never
+    /// above `length`; never above zero in a frozen array, whose elements compiled code then leaves to the checks of
+    /// the long way. Every writer of `store` and `length` keeps it.
     std::uint32_t packed;
+    /// The place in a program that made it, when it made it with nothing in it (`VM::arraySites_`); else 0. A change of
+    /// kind tells that place, which makes its arrays that way from then on (`VM::noteKindChange`).
+    std::uint32_t site;
 
-    /// After `elems[index] = v`, with `index < length`.
+    /// A hole among doubles: a NaN that no store leaves there (`rawOf` makes every NaN the canonical one).
+    static constexpr std::uint64_t kNumHole = 0x7FF8000000000001ull;
+
+    bool ints() const noexcept { return h.cls == std::uint8_t(ObjClass::IntArray); }
+    bool nums() const noexcept { return h.cls == std::uint8_t(ObjClass::NumArray); }
+    /// Whether the elements are values (an `Array` of values, or `Arguments`).
+    bool boxed() const noexcept { return h.cls < std::uint8_t(ObjClass::IntArray); }
+    /// No element below this holds a cell.
+    std::uint32_t firstCell() const noexcept { return boxed() ? packed : length; }
+    /// What a place among doubles holds for number `v`.
+    static JSValue rawOf(JSValue v) noexcept
+    {
+        const double d = v.asNumber();
+        std::uint64_t b;
+        std::memcpy(&b, &d, sizeof b);
+        return JSValue::raw(d != d ? kCanonicalNaN : b);
+    }
+    /// Element `index`, below `length`, as a value (not counted for the caller) or a hole, whatever the kind.
+    JSValue get(std::uint32_t index) const noexcept
+    {
+        const JSValue v = store[index];
+        if (!nums())
+            return v;
+        if (v.bits == kNumHole)
+            return JSValue::hole();
+        double d;
+        std::memcpy(&d, &v.bits, sizeof d);
+        return JSValue::boxNumber(d);
+    }
+    bool holeAt(std::uint32_t index) const noexcept { return store[index].bits == (nums() ? kNumHole : kHole); }
+    /// The elements as values, for code that knows nothing else: the array is one of values from here on.
+    JSValue* vals() noexcept
+    {
+        if (!boxed())
+            toValues();
+        return store;
+    }
+    void toValues() noexcept;
+    /// An array of int32s becomes one of doubles.
+    void toNums() noexcept;
+    /// `value`, whose count this takes, over element `index` (below `length`), which is released: the array changes
+    /// its kind when it has to. Not for a hole.
+    void put(VM& vm, std::uint32_t index, JSValue value) noexcept;
+
+    /// After `store[index] = v`, with `index < length`, in an array of values.
     void noteStore(std::uint32_t index, JSValue v) noexcept
     {
         if (v.isNumber())
@@ -179,7 +235,8 @@ struct JSArray : JSObject
         else if (index < packed)
             packed = index;
     }
-    /// After elements from `from` on were moved or replaced: what follows the numbers still known is looked at.
+    /// After elements of an array of values from `from` on were moved or replaced: what follows the numbers still
+    /// known is looked at.
     void repack(std::uint32_t from = 0) noexcept
     {
         std::uint32_t p = packed < from ? packed : from;
@@ -187,17 +244,17 @@ struct JSArray : JSObject
             packed = 0;
             return;
         }
-        while (p < length && elems[p].isNumber())
+        while (p < length && store[p].isNumber())
             ++p;
         packed = p;
     }
 
-    bool ownsElems() const noexcept { return elems && elems != small; }
+    bool ownsElems() const noexcept { return store && store != small; }
 
     static constexpr std::uint32_t kMaxDenseGap = 1u << 24;
 
     /// The element, not counted for the caller; a hole or an index past the end reads as `hole`.
-    JSValue at(std::uint32_t index) const noexcept { return index < length ? elems[index] : JSValue::hole(); }
+    JSValue at(std::uint32_t index) const noexcept { return index < length ? get(index) : JSValue::hole(); }
     /// Store at `index`, taking the count `value` carries and growing the array past the end with holes. False, with
     /// `value` released, when the index is so far past the end that the array would no longer be dense.
     bool setAt(VM& vm, std::uint32_t index, JSValue value);
@@ -214,6 +271,8 @@ struct JSArray : JSObject
     JSValue pop(VM& vm);
     void reserve(VM& vm, std::uint32_t wanted);
 };
+
+static_assert(sizeof(JSArray) == 96, "an array's cell stays in its size class");
 
 /// The element types of typed arrays and what a DataView reads.
 enum class ElemKind : std::uint8_t

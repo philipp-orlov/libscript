@@ -425,6 +425,7 @@ public:
     static constexpr bool kPatches = false;
     static constexpr bool kLowIndex = false;
     void callStub(const void*) {}
+    static constexpr bool kStubs = false;  ///< (no register is free to call one through)
     void usePool() noexcept {}
     void finishPool() {}
     static bool hasToInt32() noexcept { return false; }

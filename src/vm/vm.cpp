@@ -65,6 +65,8 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
         tier1Threshold = std::uint32_t(std::atoi(t));
     if (const char* t = std::getenv("SCRIPT_VM_TIER2"))
         tier2Threshold = std::atoi(t);
+    if (const char* t = std::getenv("SCRIPT_VM_KINDS"))
+        arrayKinds = *t == '1';
 #endif
     if (tier2Threshold > 0)
         globalWatch.reset(new std::uint8_t[kWatchable]());

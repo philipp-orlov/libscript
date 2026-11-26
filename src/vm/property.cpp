@@ -325,8 +325,8 @@ bool setProperty(VM& vm, JSValue base, Key key, JSValue value, bool strict)
             if (receiver->h.flags & cellflags::kFrozen)
                 return refuse(vm, strict, "Cannot assign to read only property of a frozen array");
             // A hole may stand for an index property with attributes of its own, kept by name.
-            const bool named = index < a->length && a->elems[index].isHole() && receiver->findOwn(vm, key);
-            const bool absent = index >= a->length || a->elems[index].isHole();
+            const bool named = index < a->length && a->holeAt(index) && receiver->findOwn(vm, key);
+            const bool absent = index >= a->length || a->holeAt(index);
             if (!named && !(absent && chainIntercepts(vm, receiver, key))) {
                 if (index >= a->length && (receiver->h.flags & cellflags::kNotExtensible))
                     return refuse(vm, strict, "Cannot add property, object is not extensible");
@@ -402,12 +402,12 @@ bool deleteProperty(VM& vm, JSValue base, Key key, bool strict)
         if (key == vm.atoms.length)
             return refuse(vm, strict, "Cannot delete property 'length'");
         if (arrayIndexOf(key, &index)) {
-            if (index < a->length && !a->elems[index].isHole()) {
+            if (index < a->length && !a->holeAt(index)) {
                 if (o->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))
                     if (o->h.flags & cellflags::kFrozen)
                         return refuse(vm, strict, "Cannot delete property of a frozen array");
-                const JSValue old = a->elems[index];
-                a->elems[index] = JSValue::hole();
+                const JSValue old = a->get(index);
+                a->vals()[index] = JSValue::hole();
                 a->noteStore(index, JSValue::hole());
                 release(old);
                 return true;
@@ -424,11 +424,11 @@ namespace {
 /// Make room for an index property with attributes of its own: the element is a hole and the property lives by name.
 bool makeIndexHole(VM& vm, JSArray* a, std::uint32_t index, Key key)
 {
-    if (index < a->length && !a->elems[index].isHole()) {
+    if (index < a->length && !a->holeAt(index)) {
         if (a->h.flags & cellflags::kFrozen)
             return false;
-        const JSValue old = a->elems[index];
-        a->elems[index] = JSValue::hole();
+        const JSValue old = a->get(index);
+        a->vals()[index] = JSValue::hole();
         a->noteStore(index, JSValue::hole());
         release(old);
         return true;
@@ -450,11 +450,11 @@ bool makeIndexHole(VM& vm, JSArray* a, std::uint32_t index, Key key)
 
 bool demoteIndexElement(VM& vm, JSArray* a, std::uint32_t index, Key key)
 {
-    if (index >= a->length || a->elems[index].isHole())
+    if (index >= a->length || a->holeAt(index))
         return true;
     if (a->h.flags & cellflags::kFrozen)
         return false;
-    const JSValue value = a->elems[index];
+    const JSValue value = a->get(index);
     retain(value);
     if (!makeIndexHole(vm, a, index, key)) {
         release(value);
@@ -494,7 +494,7 @@ bool defineOwn(VM& vm, JSObject* object, Key key, JSValue value, std::uint8_t at
                 }
             } else {
                 std::uint8_t named;
-                if (index < a->length && a->elems[index].isHole() && object->findOwn(vm, key, &named)) {
+                if (index < a->length && a->holeAt(index) && object->findOwn(vm, key, &named)) {
                     if (!(named & attr::kConfigurable)) {
                         release(value);
                         return false;

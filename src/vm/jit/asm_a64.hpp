@@ -1244,6 +1244,7 @@ public:
     static constexpr bool kPatches = true;
     /// An index register may hold anything in its high half (`Mem::low`).
     static constexpr bool kLowIndex = true;
+    static constexpr bool kStubs = true;
     /// A call of a stub, through no register code has.
     void callStub(const void* stub)
     {

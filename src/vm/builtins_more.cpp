@@ -30,7 +30,7 @@ bool ownKeys(VM& vm, JSObject* o, bool strings, bool symbols, bool onlyEnumerabl
     if (strings && hasElems(o)) {
         auto* a = static_cast<JSArray*>(o);
         for (std::uint32_t i = 0; i < a->length; ++i)
-            if (!a->elems[i].isHole())
+            if (!a->holeAt(i))
                 indexed.push_back({i, nullptr});
     }
     if (strings && o->cls() == ObjClass::String) {
@@ -417,6 +417,8 @@ NATIVE(objectExtensibility)
     o->materialize(vm);
     std::vector<Key> keys;
     o->forEachOwn(vm, [&](Key k, std::uint8_t, JSValue) { keys.push_back(k); });
+    if (hasElems(o))
+        static_cast<JSArray*>(o)->vals();
     o->h.flags |= cellflags::kNotExtensible;
     for (Key k : keys) {
         std::uint8_t attrs = 0;

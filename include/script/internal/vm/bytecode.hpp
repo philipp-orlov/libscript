@@ -68,6 +68,8 @@ inline constexpr std::uint8_t kInt32 = 4;
 inline constexpr std::uint8_t kUint8 = 8;
 inline constexpr std::uint8_t kOtherTyped = 16;
 inline constexpr std::uint8_t kOther = 32;
+inline constexpr std::uint8_t kIntArray = 64;   ///< an array of int32s (`ObjClass::IntArray`)
+inline constexpr std::uint8_t kNumArray = 128;  ///< an array of doubles (`ObjClass::NumArray`)
 }  // namespace elemprof
 
 /// `CodeBlock::thisSlots`, counted on first use from the properties the code stores into `this`.
@@ -300,6 +302,8 @@ struct CodeBlock
     /// Which typed-array kinds below Float64 (`ElemKind` Int8 to Float32, which `elemprof::kOtherTyped` lumps together) each
     /// of those instructions has indexed: a bit per kind, so the optimizing compiler can take the one a site sees.
     Vec<std::uint8_t> elemKinds;
+    /// The instructions that make a program's empty arrays, each with its number in `VM::arraySites_`, in their order.
+    Vec<std::pair<std::uint32_t, std::uint32_t>> arraySites;
     /// The optimizing compiler's code for this function (jit.hpp), once the baseline code has run hot; owned.
     struct Tier2Code* tier2 = nullptr;
     std::int32_t tier2Counter = 0;  ///< entries and back edges of the baseline code left before the optimizing compiler is asked

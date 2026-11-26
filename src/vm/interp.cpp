@@ -337,7 +337,7 @@ JSValue forInKeys(VM& vm, JSValue value)
     entry.names.clear();
     const auto* a = static_cast<JSArray*>(asObject(keys));
     for (std::uint32_t i = 0; i < a->length; ++i) {
-        const Key k = static_cast<Key>(a->elems[i].asCell());
+        const Key k = static_cast<Key>(a->get(i).asCell());
         retain(JSValue::cell(k));
         entry.names.push_back(k);
     }
@@ -382,7 +382,7 @@ JSValue forInKeysNow(VM& vm, JSValue value)
         if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             for (std::uint32_t i = 0; i < a->length; ++i)
-                if (!a->elems[i].isHole())
+                if (!a->holeAt(i))
                     indexes.push_back(i);
         } else if (o->cls() == ObjClass::TypedArray) {
             for (std::uint32_t i = 0; i < static_cast<JSTypedArray*>(o)->length; ++i)
@@ -1082,7 +1082,7 @@ void spreadOverWindow(VM& vm, JSValue* window, JSArray* list, std::uint32_t n)
     retain(keep);  // the first element's register is the list's own
     vm.fillStack(window + n + 1);
     for (std::uint32_t i = 0; i < n; ++i) {
-        JSValue v = list->elems[i];
+        JSValue v = list->get(i);
         if (v.isHole())
             v = JSValue::undefined();
         retain(v);
@@ -1166,7 +1166,7 @@ bool copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
         if (!excluded)
             return false;
         for (std::uint32_t i = 0; i < excluded->length; ++i)
-            if (isString(excluded->elems[i]) && excluded->elems[i].asCell() == k)
+            if (isString(excluded->get(i)) && excluded->get(i).asCell() == k)
                 return true;
         return false;
     };
@@ -1209,10 +1209,10 @@ bool copyOwnProperties(VM& vm, JSObject* target, JSValue source, JSArray* exclud
         if (hasElems(o)) {
             auto* a = static_cast<JSArray*>(o);
             for (std::uint32_t i = 0; i < a->length; ++i) {
-                if (a->elems[i].isHole())
+                if (a->holeAt(i))
                     continue;
                 Key k = toPropertyKey(vm, JSValue::boxNumber(double(i)));
-                put(k, a->elems[i]);
+                put(k, a->get(i));
                 release(JSValue::cell(k));
             }
         }
@@ -2733,8 +2733,8 @@ L_GetElem: {
         if (isObject(base) && hasElems(asObject(base))) {
             auto* a = static_cast<JSArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
-            if (i < a->length && !a->elems[i].isHole()) {
-                COPYP(ins->a, a->elems[i]);
+            if (i < a->length && !a->holeAt(i)) {
+                COPYP(ins->a, a->get(i));
                 NEXT();
             }
             if (plainHoleRead(vm, a)) {
@@ -2814,12 +2814,9 @@ L_PutElem: {
         !(asObject(base)->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
         auto* a = static_cast<JSArray*>(asObject(base));
         const std::uint32_t i = std::uint32_t(k.asInt32());
-        if (i < a->length && !a->elems[i].isHole()) {
-            const JSValue old = a->elems[i];
-            a->elems[i] = R[ins->c];
-            retain(a->elems[i]);
-            a->noteStore(i, a->elems[i]);
-            release(old);
+        if (i < a->length && !a->holeAt(i)) {
+            retain(R[ins->c]);
+            a->put(vm, i, R[ins->c]);
             NEXT();
         }
         if (i == a->length) {
@@ -2830,8 +2827,7 @@ L_PutElem: {
         // A hole nothing can intercept the store of.
         if (i < a->length && vm.plainHoles(a)) {
             retain(R[ins->c]);
-            a->elems[i] = R[ins->c];
-            a->noteStore(i, R[ins->c]);
+            a->put(vm, i, R[ins->c]);
             NEXT();
         }
     }
@@ -2891,7 +2887,7 @@ L_NewObject: {
     NEXT();
 }
 L_NewArray: {
-    JSArray* a = vm.newArray(vm.protos.array, 0, ins->b);
+    JSArray* a = ins->c ? vm.newFreshArray(code, std::uint32_t(ins - codeStart)) : vm.newArray(vm.protos.array, 0, ins->b);
     SET(ins->a, toJSValue(a));
     NEXT();
 }
@@ -2971,7 +2967,7 @@ L_RestSlice: {
     const std::uint32_t from = ins->c;
     JSArray* rest = vm.newArray(vm.protos.array, 0, all->length > from ? all->length - from : 0);
     if (all->length > from)
-        rest->appendAll(vm, all->elems + from, all->length - from);
+        rest->appendAll(vm, all->vals() + from, all->length - from);
     SET(ins->a, toJSValue(rest));
     NEXT();
 }
@@ -3019,7 +3015,7 @@ L_IterRest: {
     if (isArray(src)) {
         auto* a = static_cast<JSArray*>(asObject(src));
         for (; std::uint32_t(index) < a->length; ++index) {
-            const JSValue e = a->elems[index];
+            const JSValue e = a->get(index);
             retain(e);
             out->append(vm, e.isHole() ? JSValue::undefined() : e);
         }
@@ -3629,8 +3625,8 @@ L_IterNext: {
     if (isArray(src)) {
         auto* a = static_cast<JSArray*>(asObject(src));
         done = std::uint32_t(index) >= a->length;
-        if (!done && !a->elems[index].isHole())
-            out = a->elems[index];
+        if (!done && !a->holeAt(index))
+            out = a->get(index);
     } else {
         StringCell* s = asString(src);
         done = std::uint32_t(index) >= s->length;
@@ -3987,7 +3983,8 @@ void noteElem(CodeBlock* code, std::uint32_t index, JSValue base)
     if (isObject(base)) {
         JSObject* o = asObject(base);
         if (o->cls() == ObjClass::Array) {
-            bit = elemprof::kArray;
+            bit = o->h.cls == std::uint8_t(ObjClass::IntArray) ? elemprof::kIntArray
+                  : o->h.cls == std::uint8_t(ObjClass::NumArray) ? elemprof::kNumArray : elemprof::kArray;
         } else if (o->cls() == ObjClass::TypedArray) {
             const ElemKind k = static_cast<JSTypedArray*>(o)->kind;
             bit = k == ElemKind::Float64 ? elemprof::kFloat64 : k == ElemKind::Int32 ? elemprof::kInt32
@@ -4458,7 +4455,7 @@ int jitNewObject(VM& vm, std::uint32_t index)
 int jitNewArray(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
-    JSArray* a = vm.newArray(vm.protos.array, 0, c.ins->b);
+    JSArray* a = c.ins->c ? vm.newFreshArray(c.code, index) : vm.newArray(vm.protos.array, 0, c.ins->b);
     setReg(vm, c.R[c.ins->a], toJSValue(a));
     return 1;
 }
@@ -4637,7 +4634,7 @@ int jitRestSlice(VM& vm, std::uint32_t index)
     const std::uint32_t from = c.ins->c;
     JSArray* rest = vm.newArray(vm.protos.array, 0, all->length > from ? all->length - from : 0);
     if (all->length > from)
-        rest->appendAll(vm, all->elems + from, all->length - from);
+        rest->appendAll(vm, all->vals() + from, all->length - from);
     setReg(vm, c.R[c.ins->a], toJSValue(rest));
     return 1;
 }
@@ -4840,8 +4837,8 @@ int jitIterNext(VM& vm, std::uint32_t index)
     if (isArray(src)) {
         auto* a = static_cast<JSArray*>(asObject(src));
         done = std::uint32_t(at) >= a->length;
-        if (!done && !a->elems[at].isHole())
-            out = a->elems[at];
+        if (!done && !a->holeAt(at))
+            out = a->get(at);
     } else {
         StringCell* s = asString(src);
         done = std::uint32_t(at) >= s->length;
@@ -5072,8 +5069,8 @@ int jitGetElem(VM& vm, std::uint32_t index)
         if (isObject(base) && hasElems(asObject(base))) {
             auto* a = static_cast<JSArray*>(asObject(base));
             const std::uint32_t i = std::uint32_t(k.asInt32());
-            if (i < a->length && !a->elems[i].isHole()) {
-                copyReg(vm, R[ins->a], a->elems[i]);
+            if (i < a->length && !a->holeAt(i)) {
+                copyReg(vm, R[ins->a], a->get(i));
                 return 1;
             }
             if (plainHoleRead(vm, a)) {
@@ -5198,12 +5195,9 @@ int jitPutElem(VM& vm, std::uint32_t index)
         !(asObject(base)->h.flags & (cellflags::kFrozen | cellflags::kNotExtensible))) {
         auto* a = static_cast<JSArray*>(asObject(base));
         const std::uint32_t i = std::uint32_t(k.asInt32());
-        if (i < a->length && !a->elems[i].isHole()) {
-            const JSValue old = a->elems[i];
-            a->elems[i] = R[ins->c];
-            retain(a->elems[i]);
-            a->noteStore(i, a->elems[i]);
-            release(old);
+        if (i < a->length && !a->holeAt(i)) {
+            retain(R[ins->c]);
+            a->put(vm, i, R[ins->c]);
             return 1;
         }
         if (i == a->length) {
@@ -5214,8 +5208,7 @@ int jitPutElem(VM& vm, std::uint32_t index)
         if (i < a->length && vm.plainHoles(a)) {
             vm.noteHoleShape(c.code, index, a);
             retain(R[ins->c]);
-            a->elems[i] = R[ins->c];
-            a->noteStore(i, R[ins->c]);
+            a->put(vm, i, R[ins->c]);
             return 1;
         }
     }

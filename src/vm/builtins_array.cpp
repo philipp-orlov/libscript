@@ -236,10 +236,7 @@ NATIVE(arrayIterate)
             const std::uint32_t k = std::uint32_t(at);
             retain(v);
             if (k < plainOut->length) {
-                const JSValue old = plainOut->elems[k];
-                plainOut->elems[k] = v;
-                plainOut->noteStore(k, v);
-                release(old);
+                plainOut->put(vm, k, v);
             } else {
                 plainOut->append(vm, v);
             }
@@ -255,8 +252,8 @@ NATIVE(arrayIterate)
         const double i = backwards ? len - 1 - n : n;
         Handle e;
         // An element there in a plain array is read in place; anything else as the spec says.
-        if (source && i < double(source->length) && !source->elems[std::uint32_t(i)].isHole()) {
-            e = Handle::retained(source->elems[std::uint32_t(i)]);
+        if (source && i < double(source->length) && !source->holeAt(std::uint32_t(i))) {
+            e = Handle::retained(source->get(std::uint32_t(i)));
         } else {
             const int found = readIndex(vm, o.get(), i, &e, !finder);
             if (found < 0)
@@ -800,12 +797,19 @@ NATIVE(arrayIndexOfGeneric)
         // A value equal only to itself: the dense elements compared by their bits, up to a hole (read through the
         // prototype by the loop below).
         const double end = std::min(len, double(dense->length));
-        for (; k < end; ++k) {
-            const JSValue e = dense->at(std::uint32_t(k));
-            if (e.bits == needle.bits)
-                return mode == 0 ? JSValue::boolean(true) : JSValue::boxNumber(k);
-            if (e.isHole())
-                break;
+        if (dense->boxed()) {
+            const JSValue* const values = dense->store;
+            for (; k < end; ++k) {
+                const JSValue e = values[std::uint32_t(k)];
+                if (e.bits == needle.bits)
+                    return mode == 0 ? JSValue::boolean(true) : JSValue::boxNumber(k);
+                if (e.isHole())
+                    break;
+            }
+        } else {
+            // (An array of int32s or of doubles holds no such value.)
+            while (k < end && !dense->holeAt(std::uint32_t(k)))
+                ++k;
         }
     }
     for (; k < len; ++k) {

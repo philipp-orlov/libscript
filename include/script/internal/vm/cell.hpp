@@ -53,7 +53,13 @@ enum class ObjClass : std::uint8_t
     Global,
     Native,
     RegExpCell,  ///< a RegExp whose state is in its cell (`JSObject::embeddedState`); a subclass instance is `RegExp`
+    /// An `Array` by what `JSObject::cls` says, whose elements are stored for what they are (`JSArray`): int32s (or
+    /// holes) only, and doubles (or holes) only, unboxed. Only the header's byte tells them from an `Array`: `Array` with
+    /// a bit above `kClassMask`.
+    IntArray = 0x41,
+    NumArray = 0x81,
 };
+inline constexpr std::uint8_t kClassMask = 0x3F;
 
 namespace cellflags {
 inline constexpr std::uint8_t kImmortal = 1;      ///< never freed: the count starts at 0x40000000

@@ -440,12 +440,28 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
         CodeBlock* code = fr->code;
         // An element access the code was made for before the site had run, guessing an array, meets something else: the
         // site now knows what it indexes, and a new compile will (no failure, as below).
-        if (kind == 0 && index < code->elemProf.size() && code->elemProf[index] == 0) {
+        // The same when it meets a plain array of a kind the site had not met (`JSArray`).
+        if (kind == 0 && index < code->elemProf.size()) {
             const Ins& at = code->code[index];
             if (at.opcode() == Op::GetElem || at.opcode() == Op::PutElem) {
-                noteElemBase(code, index, fr->R[at.opcode() == Op::GetElem ? at.b : at.a]);
-                kind = 2;
+                const std::uint8_t before = code->elemProf[index];
+                const JSValue base = fr->R[at.opcode() == Op::GetElem ? at.b : at.a];
+                if (before == 0 || (isObject(base) && asObject(base)->cls() == ObjClass::Array)) {
+                    noteElemBase(code, index, base);
+                    if (before == 0 || code->elemProf[index] != before)
+                        kind = 2;
+                }
             }
+        }
+        if (kind == 7 || kind == 8) {
+            // An array is of another kind than a loop of this code checked for on its way in (7), or the runtime has
+            // changed the kind of one under such a loop (8: the instruction is done). No site has failed: the places
+            // that read the array note its kind in the baseline code, for the next compile.
+            if (code->tier2 && code->tier1 && code->tier1->entry == code->tier2->entry)
+                retireTier2(*vm, code);
+            if (kind == 8)
+                return kStepFall;
+            return handOverStep(*vm, stepInstruction(*vm, index));
         }
         if (kind == 6) {
             // A call's result was not what its profile said (no failure): the result is in its register; the code goes on
@@ -916,7 +932,7 @@ CallResult callPrepare(VM& vm, std::uint32_t index)
             // `new Array(n)`: the array, without the object that `this` would be.
             vm.stackTop = R + code->nregs;
             const std::uint32_t n = argc ? std::uint32_t(R[base + 2].asInt32()) : 0;
-            return {handOver(vm, toJSValue(vm.newArray(vm.protos.array, n)).bits), 1};
+            return {handOver(vm, toJSValue(vm.newFreshArray(code, index, n)).bits), 1};
         }
         Rare* r = f->rare();
         if (isNew) {
@@ -1134,10 +1150,10 @@ extern "C" std::uint64_t scriptVmSsaCompareStrings(std::uint64_t a, std::uint64_
 extern "C" void scriptVmSsaFlatten(StringCell* s) { (void)s->text(); }
 
 /// `new Array(n)` for the SSA tier: owned, or null (out of memory; the instruction runs again in the interpreter).
-extern "C" JSArray* scriptVmSsaNewArray(VM* vm, std::uint32_t n)
+extern "C" JSArray* scriptVmSsaNewArray(VM* vm, std::uint32_t n, CodeBlock* code, std::uint32_t index)
 {
     try {
-        JSArray* a = vm->newArray(vm->protos.array, n);
+        JSArray* a = vm->newFreshArray(code, index, n);
         handOver(*vm, toJSValue(a).bits);
         return a;
     } catch (...) {
@@ -1232,7 +1248,7 @@ constexpr std::int32_t kVmTicks = std::int32_t(offsetof(VM, ticks));
 constexpr std::int32_t kVmInterruptSet = std::int32_t(offsetof(VM, interruptSet));
 constexpr std::int32_t kVmFrameTop = std::int32_t(offsetof(VM, frameTop));
 constexpr std::int32_t kVmFrameLimit = std::int32_t(offsetof(VM, frameLimit));
-constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, elems));
+constexpr std::int32_t kArrayElems = std::int32_t(offsetof(JSArray, store));
 constexpr std::int32_t kArrayCapacity = std::int32_t(offsetof(JSArray, capacity));
 constexpr std::int32_t kArrayLength = std::int32_t(offsetof(JSArray, length));
 constexpr std::int32_t kArrayPacked = std::int32_t(offsetof(JSArray, packed));
@@ -1287,6 +1303,233 @@ constexpr std::int32_t kFnUpvals = std::int32_t(sizeof(JSFunction));
 constexpr std::uint8_t kObjectKind = 0x80 | std::uint8_t(Kind::Object);
 constexpr std::int32_t kHdrCls = 4, kHdrFlags = 5, kHdrAux = 6, kHdrKind = 7, kHdrRc = 8, kHdrGc = 12;
 constexpr std::int32_t kValidityValid = 4;
+
+/// What the baseline code does with an array of int32s or of doubles (`JSArray`), once for all code: an element read
+/// and stored, `push` and `pop`. Each leaves in rdx whether it did it; the code that calls goes its long way when not.
+/// They use rdx, rsi, rdi, xmm0 and xmm1 beside what they are given, and the registers compiled code keeps fixed.
+struct KindStubs
+{
+    /// rax the array (an object that is no `Array` of values and no typed array), rcx the index (an int32 not below
+    /// zero, its high half clear). rdx: the `elemprof` bit of the kind, with the element as a value in rax; 0: a hole or
+    /// past the end; 1: no such array.
+    void* get = nullptr;
+    /// rax and rcx as for `get`, rsi the value. rdx: the `elemprof` bit when it is stored (over an element, or right
+    /// behind the last where there is room), else 0.
+    void* put = nullptr;
+    /// rsi the array, rax the value. rdx: 1 with the new length as a value in rax, else 0.
+    void* push = nullptr;
+    /// rsi the array. rdx: 1 with the element taken as a value in rax, else 0.
+    void* pop = nullptr;
+};
+
+const KindStubs& kindStubs()
+{
+    static KindStubs result = [] {
+        KindStubs st;
+        Asm a;
+        // xmm0 as the value `JSValue::boxNumber` makes of it, in rax; `hole` for the NaN that stands for one.
+        auto boxed = [&a](Label* hole) {
+            Label real, number, done;
+            if (Asm::hasToInt32()) {
+                a.toInt32Exact(RAX, 0);
+                a.jcc(CNE, real);
+            } else {
+                Label nonZero;
+                a.cvttsd2si32(RAX, 0);
+                a.cvtsi2sd32(1, RAX);
+                a.ucomisd(0, 1);
+                a.jcc(CNE, real);
+                a.jcc(CP, real);
+                a.test32(RAX, RAX);
+                a.jcc(CNE, nonZero);
+                a.movqFromX(RDX, 0);
+                a.test(RDX, RDX);
+                a.jcc(CNE, real);  // the negative zero
+                a.bind(nonZero);
+            }
+            a.mov32(RAX, RAX);
+            a.or_(RAX, R14);
+            a.jmp(done);
+            a.bind(real);
+            a.movqFromX(RAX, 0);
+            a.ucomisd(0, 0);
+            a.jcc(CNP, number);
+            a.movImm(RDX, JSArray::kNumHole);
+            a.cmp(RAX, RDX);
+            if (hole)
+                a.jcc(CE, *hole);
+            a.movImm(RAX, kCanonicalNaN);
+            a.bind(number);
+            a.add(RAX, RBP);
+            a.bind(done);
+        };
+        // The number in rsi (`no`: it is none, or a NaN, which the runtime stores) as a double in xmm0.
+        auto number = [&a](Reg v, Label& no) {
+            Label dbl, have;
+            a.test(v, R14);
+            a.jcc(CE, no);
+            a.cmp(v, R14);
+            a.jcc(CB, dbl);
+            a.cvtsi2sd32(0, v);
+            a.jmp(have);
+            a.bind(dbl);
+            a.mov(RDX, v);
+            a.sub(RDX, RBP);
+            a.movqToX(0, RDX);
+            a.ucomisd(0, 0);
+            a.jcc(CP, no);
+            a.bind(have);
+        };
+        auto answer = [&a](std::uint32_t v) {
+            a.movImm(RDX, v);
+            a.ret();
+        };
+        {
+            Label nums, miss, other;
+            a.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::NumArray));
+            a.jcc(CE, nums);
+            a.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::IntArray));
+            a.jcc(CNE, other);
+            a.alu32(7, RCX, mem(RAX, kArrayLength));
+            a.jcc(CAE, miss);
+            a.mov(RDX, mem(RAX, kArrayElems));
+            a.mov(RAX, mem(RDX, RCX, 8));
+            a.cmpI(RAX, std::int32_t(kHole));
+            a.jcc(CE, miss);
+            answer(elemprof::kIntArray);
+            a.bind(nums);
+            a.alu32(7, RCX, mem(RAX, kArrayLength));
+            a.jcc(CAE, miss);
+            a.mov(RDX, mem(RAX, kArrayElems));
+            a.movsdLoad(0, mem(RDX, RCX, 8));
+            boxed(&miss);
+            answer(elemprof::kNumArray);
+            a.bind(miss);
+            answer(0);
+            a.bind(other);
+            answer(1);
+        }
+        a.align(16);
+        const std::int32_t put = a.here();
+        {
+            Label nums, slow;
+            a.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::NumArray));
+            a.jcc(CE, nums);
+            a.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::IntArray));
+            a.jcc(CNE, slow);
+            for (const bool dbl : {false, true}) {
+                Label append;
+                if (dbl) {
+                    a.bind(nums);
+                    number(RSI, slow);
+                } else {
+                    a.cmp(RSI, R14);
+                    a.jcc(CB, slow);
+                }
+                a.alu32(7, RCX, mem(RAX, kArrayLength));
+                a.jcc(CAE, append);
+                a.mov(RDX, mem(RAX, kArrayElems));
+                a.lea(RDX, mem(RDX, RCX, 8));
+                if (dbl) {
+                    a.movImm(RDI, JSArray::kNumHole);
+                    a.cmp(RDI, mem(RDX, 0));
+                    a.jcc(CE, slow);  // a hole: the long way looks at what may intercept the store
+                    a.movsdStore(mem(RDX, 0), 0);
+                } else {
+                    a.cmpI(mem(RDX, 0), std::int32_t(kHole));
+                    a.jcc(CE, slow);
+                    a.mov(mem(RDX, 0), RSI);
+                }
+                answer(dbl ? elemprof::kNumArray : elemprof::kIntArray);
+                a.bind(append);
+                a.alu32(7, RCX, mem(RAX, kArrayLength));
+                a.jcc(CNE, slow);
+                a.alu32(7, RCX, mem(RAX, kArrayCapacity));
+                a.jcc(CAE, slow);
+                a.mov(RDX, mem(RAX, kArrayElems));
+                if (dbl)
+                    a.movsdStore(mem(RDX, RCX, 8), 0);
+                else
+                    a.mov(mem(RDX, RCX, 8), RSI);
+                a.inc32(mem(RAX, kArrayLength));
+                answer(dbl ? elemprof::kNumArray : elemprof::kIntArray);
+            }
+            a.bind(slow);
+            answer(0);
+        }
+        a.align(16);
+        const std::int32_t push = a.here();
+        {
+            Label nums, slow;
+            a.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::NumArray));
+            a.jcc(CE, nums);
+            a.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::IntArray));
+            a.jcc(CNE, slow);
+            for (const bool dbl : {false, true}) {
+                if (dbl) {
+                    a.bind(nums);
+                    number(RAX, slow);
+                } else {
+                    a.cmp(RAX, R14);
+                    a.jcc(CB, slow);
+                }
+                a.mov32(RCX, mem(RSI, kArrayLength));
+                a.alu32(7, RCX, mem(RSI, kArrayCapacity));
+                a.jcc(CAE, slow);
+                a.aluI32(7, RCX, 0x7ffffffe);
+                a.jcc(CA, slow);
+                a.mov(RDX, mem(RSI, kArrayElems));
+                if (dbl)
+                    a.movsdStore(mem(RDX, RCX, 8), 0);
+                else
+                    a.mov(mem(RDX, RCX, 8), RAX);
+                a.aluI32(0, RCX, 1);
+                a.mov32(mem(RSI, kArrayLength), RCX);
+                a.mov32(RAX, RCX);
+                a.or_(RAX, R14);
+                answer(1);
+            }
+            a.bind(slow);
+            answer(0);
+        }
+        a.align(16);
+        const std::int32_t pop = a.here();
+        {
+            Label nums, slow;
+            a.mov32(RCX, mem(RSI, kArrayLength));
+            a.test32(RCX, RCX);
+            a.jcc(CE, slow);
+            a.aluI32(5, RCX, 1);
+            a.mov(RDX, mem(RSI, kArrayElems));
+            a.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::NumArray));
+            a.jcc(CE, nums);
+            a.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::IntArray));
+            a.jcc(CNE, slow);
+            a.mov(RAX, mem(RDX, RCX, 8));
+            a.cmpI(RAX, std::int32_t(kHole));
+            a.jcc(CE, slow);
+            a.mov32(mem(RSI, kArrayLength), RCX);
+            answer(1);
+            a.bind(nums);
+            a.movsdLoad(0, mem(RDX, RCX, 8));
+            boxed(&slow);
+            a.mov32(mem(RSI, kArrayLength), RCX);
+            answer(1);
+            a.bind(slow);
+            answer(0);
+        }
+        CodeSpan span = allocateCode(a.buf.size());
+        if (!span)
+            return st;
+        commitCode(span, a.buf.data(), a.buf.size());
+        st.get = span.rx;
+        st.put = span.rx + put;
+        st.push = span.rx + push;
+        st.pop = span.rx + pop;
+        return st;
+    }();
+    return result;
+}
 
 /// A value of an inlined function (opt_inline.inc): a typed variable of the caller, a register of the caller's frame, a
 /// slot of the inline area, or a constant.
@@ -1459,6 +1702,16 @@ private:
         }
         return JSValue::undefined();
     }
+    /// The object in `o` is an array whose elements are values: one of values, or one of int32s (`JSArray`); else `bad`.
+    void needBoxedArray(Reg o, Label& bad)
+    {
+        Label ok;
+        a_.cmpI8(mem(o, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CE, ok);
+        a_.cmpI8(mem(o, kHdrCls), std::uint8_t(ObjClass::IntArray));
+        a_.jcc(CNE, bad);
+        a_.bind(ok);
+    }
     /// Records in the element profile of instruction `i` that it has seen `bit` (elemprof), with `tmp` as scratch.
     void noteElem(std::uint32_t i, std::uint8_t bit, Reg tmp)
     {
@@ -1466,6 +1719,16 @@ private:
             code_->elemProf.assign(code_->code.size(), 0);
         a_.movImm(tmp, reinterpret_cast<std::uint64_t>(&code_->elemProf[i]));
         a_.orI8(mem(tmp, 0), bit);
+    }
+    /// As `noteElem`, of the bit in `bit`; `tmp` and `tmp2` are scratch.
+    void noteElemIn(std::uint32_t i, Reg bit, Reg tmp, Reg tmp2)
+    {
+        if (code_->elemProf.empty())
+            code_->elemProf.assign(code_->code.size(), 0);
+        a_.movImm(tmp, reinterpret_cast<std::uint64_t>(&code_->elemProf[i]));
+        a_.movzx8(tmp2, mem(tmp, 0));
+        a_.or_(tmp2, bit);
+        a_.mov8(mem(tmp, 0), tmp2);
     }
     /// Records that instruction `i` has indexed a typed array of `kind`, one of those `kOtherTyped` stands for.
     void noteKind(std::uint32_t i, ElemKind kind, Reg tmp)
@@ -1557,14 +1820,15 @@ private:
         return true;
     }
     /// An empty array of `Array.prototype`, its elements in place, made as `VM::newArray` does; else `slow`. The array,
-    /// owned, in rax; clobbers rcx, rdx, rsi. False when it cannot be done here at all.
-    bool allocArray(Label& slow)
+    /// owned, in rax; clobbers rcx, rdx, rsi. False when it cannot be done here at all. `cls`: its kind, and `site`:
+    /// the place that makes it (`JSArray::site`).
+    bool allocArray(Label& slow, ObjClass cls = ObjClass::Array, std::uint32_t site = 0)
     {
         if (!mem::LocalHeap::kCanPopInline || vm_.ctx.options.memoryLimit)
             return false;
         CellHeader h{};
         h.shape = vm_.rootShapeFor(vm_.protos.array, 0)->id;
-        h.cls = std::uint8_t(ObjClass::Array);
+        h.cls = std::uint8_t(cls);
         h.flags = cellflags::kYoung;
         h.kind = std::uint8_t(0x80 | std::uint8_t(Kind::Object));
         allocCellHere(sizeof(JSArray), h, slow, false);
@@ -1574,7 +1838,9 @@ private:
         a_.mov(mem(RAX, kArrayElems), RDX);
         a_.movImm(RDX, std::uint64_t(JSArray::kSmall) << 32);
         a_.mov(mem(RAX, kArrayLength), RDX);
-        a_.mov32(mem(RAX, kArrayPacked), 0);
+        static_assert(offsetof(JSArray, site) == offsetof(JSArray, packed) + 4, "packed and site in one store");
+        a_.movImm(RDX, std::uint64_t(site) << 32);
+        a_.mov(mem(RAX, kArrayPacked), RDX);
         return true;
     }
     /// `JSArray::noteStore` for a value that is no number, stored at the index in `index`: the numbers end there at the
@@ -3439,6 +3705,10 @@ private:
     bool ssaGlobalFast(std::uint32_t i) const;
     bool ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter);
     int ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind);
+    std::uint8_t ssaElemKinds(std::uint32_t i) const;
+    void ssaKindReads(std::uint32_t i, std::uint32_t vb, Reg o, Reg index, std::uint8_t kinds, Label& bad, Label& missing,
+                      Label& other, Label& done);
+    std::deque<std::function<void()>> ssaStubs_;  ///< short ways that seldom run, emitted after the function's code
     bool ssaGetElem(std::uint32_t i);
     bool ssaArrayIterPristine();
     void ssaIter(std::uint32_t i);
@@ -3476,11 +3746,15 @@ private:
     /// Per loop header: checks on each way in from before the loop, whose facts hold in all of it (an SSA value's kind
     /// never changes). `ints`: phis made int32 whose input from before the loop is checked; `arrays`, `typed`: values the
     /// loop does not write that it reads elements of.
+    using KindGuard = std::pair<std::uint32_t, std::uint8_t>;  ///< a value and `kVIntArr` or `kVNumArr`
     struct LoopGuards
     {
         std::vector<std::uint32_t> ints, arrays, typed;
         std::vector<std::uint32_t> intParams;  ///< parameters the loop reads and does not write, profiled int32 only
         std::vector<std::uint32_t> globals;    ///< `GetGlobal`s of the loop read once, on the way in (`ssaHoisted_`)
+        /// Arrays of int32s or of doubles whose kind is checked on the way in. The loop's code reaches the runtime by its
+        /// cold paths only, and each checks them again after its call (`emitColdPaths`).
+        std::vector<KindGuard> kinds;
     };
     std::vector<std::uint8_t> ssaHoisted_;  ///< per instruction: a `GetGlobal` read before its loop
     /// The read of global `i` into its value's place; `bad` when the global object has changed (`ssaGetGlobal`).
@@ -3548,6 +3822,7 @@ private:
         std::uint32_t def2 = ssa::kNone;  ///< a second register's value the helper writes (boxed), and that register
         unsigned dst2 = 0;
         std::int8_t def2Reg = -1;
+        std::vector<KindGuard> kinds;  ///< what the loops around it take as known (`LoopGuards::kinds`)
     };
     std::vector<std::uint8_t> elemNum_;  ///< per GetElem: the elements are taken as int32s (1) or numbers (2)
     std::deque<ColdPath> coldPaths_;
@@ -3566,6 +3841,11 @@ private:
     /// Per value: the kind of the typed array it is where `kVTyped` is known of it (0xFF: no such place).
     std::vector<std::uint8_t> typedKind_;
     static constexpr std::uint8_t kVInt = 1, kVObj = 2, kVBool = 4, kVNotCell = 8, kVArray = 16, kVTyped = 32;
+    /// An array of int32s, of doubles: true only until the runtime runs, which can change the kind (`ssaForgetShapes`).
+    static constexpr std::uint8_t kVIntArr = 64, kVNumArr = 128, kVKinds = kVIntArr | kVNumArr;
+    std::vector<KindGuard> ssaKindGuardsAt(std::uint32_t i) const;
+    std::vector<std::uint32_t> kindLoops_;  ///< the loop headers that have `LoopGuards::kinds`
+    std::uint8_t ssaKindsOf(std::uint32_t i, std::uint32_t v) const;
     std::vector<std::uint8_t> vDef_;     ///< per value: what its definition proves
     std::vector<std::uint8_t> vKnown_;   ///< per value: what is known of it here (forgotten at block heads)
     std::vector<std::uint32_t> vShape_;  ///< per value: its object's shape, known here (0: not known)
@@ -3576,7 +3856,7 @@ private:
         std::vector<std::uint32_t> name, frame;
         ssa::Bits live;
         Label label;
-        int kind = 0;  ///< 0: before instruction i (it runs in the interpreter); 1: after it (it has run); 2: the code makes way for a new compile; 3: on in the baseline code at i; 4: as 2, a value speculation failed
+        int kind = 0;  ///< 0: before instruction i (it runs in the interpreter); 1: after it (it has run); 2: the code makes way for a new compile; 3: on in the baseline code at i; 4: as 2, a value speculation failed; 7, 8: as 0 and 1, an array of another kind than a loop took as known
     };
     std::deque<SsaExit> ssaExits_;
     std::int64_t exitAt_ = -1;
@@ -3698,6 +3978,8 @@ void Baseline::emitTails()
         emitOptTails();
     if (ssa_)
         emitSsaTails();
+    for (auto& stub : ssaStubs_)
+        stub();
     for (ColdUndo& u : coldUndos_) {
         a_.bind(u.entry);
         a_.aluI32(5, u.r, u.step);
@@ -3922,8 +4204,7 @@ void Baseline::emit(std::uint32_t i)
         needInt(RCX, viaGen ? gen : bad);
         a_.mov(RSI, R(in.b));
         needObject(RSI, bad);
-        a_.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::Array));
-        a_.jcc(CNE, bad);
+        needBoxedArray(RSI, bad);
         a_.mov32(RCX, RCX);
         a_.alu32(7, RCX, mem(RSI, kArrayLength));
         a_.jcc(CAE, end);
@@ -3985,8 +4266,7 @@ void Baseline::emit(std::uint32_t i)
         Label bad, done;
         a_.mov(RAX, R(in.b));
         needObject(RAX, bad);
-        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
-        a_.jcc(CNE, bad);
+        needBoxedArray(RAX, bad);
         a_.cmpI32(mem(RAX, 0), std::int32_t(vm_.arrayRootShape));
         a_.jcc(CNE, bad);
         const auto still = [&](ValidityCell* cell, const JSValue* slot, JSValue value) {
@@ -4382,7 +4662,27 @@ void Baseline::emit(std::uint32_t i)
             helperOp(i, &helperThunk<jitNewArray>);
             break;
         }
-        allocArray(slow(i, &helperThunk<jitNewArray>));
+        Label& sl = slow(i, &helperThunk<jitNewArray>);
+        if (in.c && vm_.arrayKinds) {
+            // A program's empty array: of the kind that arrays made at this place turned into (`VM::newFreshArray`), else
+            // of int32s. The place is asked each time: it may learn after this code is made.
+            if (code_->elemProf.empty())
+                code_->elemProf.assign(code_->code.size(), 0);
+            allocArray(sl, ObjClass::Array, vm_.arraySiteOf(code_, i));
+            Label made, ints;
+            a_.movImm(RDX, reinterpret_cast<std::uint64_t>(&code_->elemProf[i]));
+            a_.testI8(mem(RDX, 0), elemprof::kArray);
+            a_.jcc(CNE, made);
+            a_.movImm(RCX, std::uint8_t(ObjClass::IntArray));
+            a_.testI8(mem(RDX, 0), elemprof::kNumArray);
+            a_.jcc(CE, ints);
+            a_.movImm(RCX, std::uint8_t(ObjClass::NumArray));
+            a_.bind(ints);
+            a_.mov8(mem(RAX, kHdrCls), RCX);
+            a_.bind(made);
+        } else {
+            allocArray(sl);
+        }
         write(in.a, RAX);
         break;
     }
@@ -5487,13 +5787,17 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
     }
     if (isLength) {
         a_.bind(lengthPath);
-        Label typedLength, intLength;
+        Label typedLength, intLength, arrayLength;
         a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
         a_.jcc(CNE, typedLength);
+        a_.bind(arrayLength);
         a_.mov32(RAX, mem(RAX, kArrayLength));
         a_.jmp(intLength);
         // A typed array's length, as the runtime gives it.
         a_.bind(typedLength);
+        static_assert(ObjClass::NumArray > ObjClass::IntArray && ObjClass::IntArray > ObjClass::TypedArray, "");
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::IntArray));
+        a_.jcc(CAE, arrayLength);  // an array of int32s or of doubles
         a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
         a_.jcc(CNE, bad);
         a_.mov32(RAX, mem(RAX, kTypedLength));
@@ -5930,8 +6234,12 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     }
 
     a_.bind(typed);
-    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
-    a_.jcc(CNE, bad);
+    Label otherKind, ints;
+    a_.movzx8(RDX, mem(RAX, kHdrCls));
+    a_.aluI32(7, RDX, std::int32_t(ObjClass::IntArray));
+    a_.jcc(CE, ints);
+    a_.aluI32(7, RDX, std::int32_t(ObjClass::TypedArray));
+    a_.jcc(CNE, otherKind);
     a_.mov32(RCX, RCX);
     a_.alu32(7, RCX, mem(RAX, kTypedLength));
     a_.jcc(CAE, bad);
@@ -5970,6 +6278,32 @@ void Baseline::getElem(std::uint32_t i, const Ins& in)
     a_.bind(intResult);
     deliverInt(i, in.a);
     a_.jmp(done);
+    // An array of int32s: read as one of values is (a hole is the same there).
+    a_.bind(ints);
+    a_.mov32(RCX, RCX);
+    a_.alu32(7, RCX, mem(RAX, kArrayLength));
+    a_.jcc(CAE, holeRead);
+    a_.mov(RDX, mem(RAX, kArrayElems));
+    a_.mov(RAX, mem(RDX, RCX, 8));
+    a_.cmpI(RAX, std::int32_t(kHole));
+    a_.jcc(CE, holeRead);
+    noteElem(i, elemprof::kIntArray, RDX);
+    deliver(i, in.a);
+    a_.jmp(done);
+    // An array of doubles: read by code all functions share (`KindStubs`).
+    a_.bind(otherKind);
+    if (Asm::kStubs && kindStubs().get) {
+        a_.mov32(RCX, RCX);
+        a_.callStub(kindStubs().get);
+        a_.aluI32(7, RDX, 1);
+        a_.jcc(CB, holeRead);
+        a_.jcc(CE, bad);
+        noteElemIn(i, RDX, RSI, RCX);
+        deliver(i, in.a);
+        a_.jmp(done);
+    } else {
+        a_.jmp(bad);
+    }
     a_.bind(notInt);
     if (priv) {
         Label another;
@@ -6116,8 +6450,12 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
 
     // A typed array takes a number; one past its end is ignored.
     a_.bind(typed);
-    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::TypedArray));
-    a_.jcc(CNE, bad);
+    Label otherKind, ints;
+    a_.movzx8(RDX, mem(RAX, kHdrCls));
+    a_.aluI32(7, RDX, std::int32_t(ObjClass::IntArray));
+    a_.jcc(CE, ints);
+    a_.aluI32(7, RDX, std::int32_t(ObjClass::TypedArray));
+    a_.jcc(CNE, otherKind);
     a_.mov(RDI, R(in.c));
     a_.test(RDI, R14);
     a_.jcc(CE, bad);
@@ -6157,6 +6495,34 @@ void Baseline::putElem(std::uint32_t i, const Ins& in)
         privateSlot(i, bad);
         a_.mov(RCX, R(in.c));
         storeSlotCounted();
+    }
+    a_.jmp(done);
+    // An array of int32s or of doubles (never frozen, always extensible) takes what it holds, with nothing to count or
+    // let go of. An int32 over an element of an array of int32s: here. The rest (right behind the last, a double) by
+    // code all functions share (`KindStubs`); anything else is the runtime's, which changes the array's kind.
+    a_.bind(ints);
+    a_.mov(RSI, R(in.c));
+    needInt(RSI, otherKind);
+    a_.mov32(RCX, RCX);
+    a_.alu32(7, RCX, mem(RAX, kArrayLength));
+    a_.jcc(CAE, otherKind);
+    a_.mov(RDX, mem(RAX, kArrayElems));
+    a_.lea(RDX, mem(RDX, RCX, 8));
+    a_.cmpI(mem(RDX, 0), std::int32_t(kHole));
+    a_.jcc(CE, otherKind);
+    a_.mov(mem(RDX, 0), RSI);
+    noteElem(i, elemprof::kIntArray, RDI);
+    a_.jmp(done);
+    a_.bind(otherKind);
+    if (Asm::kStubs && kindStubs().put) {
+        a_.mov32(RCX, RCX);
+        a_.mov(RSI, R(in.c));
+        a_.callStub(kindStubs().put);
+        a_.test32(RDX, RDX);
+        a_.jcc(CE, bad);
+        noteElemIn(i, RDX, RSI, RCX);
+    } else {
+        a_.jmp(bad);
     }
     a_.bind(done);
 }
@@ -6647,8 +7013,9 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         a_.jcc(CNE, generic);
         a_.mov(RSI, R(base + 1));
         needObject(RSI, generic);
+        Label otherKind;
         a_.cmpI8(mem(RSI, kHdrCls), std::uint8_t(ObjClass::Array));
-        a_.jcc(CNE, generic);
+        a_.jcc(CNE, otherKind);
         a_.testI8(mem(RSI, kHdrFlags), std::uint8_t(cellflags::kFrozen | cellflags::kNotExtensible));
         a_.jcc(CNE, generic);
         a_.mov32(RCX, mem(RSI, kArrayLength));
@@ -6684,6 +7051,18 @@ void Baseline::call(std::uint32_t i, const Ins& in)
         if (def_ && argc == 0)
             release(RAX);  // the array's count of what it held: the frame holds it without one
         a_.jmp(afterCall);
+        // An array of int32s or of doubles (never frozen, always extensible) takes and gives what it holds, by code all
+        // functions share (`KindStubs`); anything else is the native's. Nothing is counted.
+        a_.bind(otherKind);
+        if (Asm::kStubs && kindStubs().push) {
+            if (argc == 1)
+                a_.mov(RAX, R(base + 2));
+            a_.callStub(argc == 1 ? kindStubs().push : kindStubs().pop);
+            a_.test32(RDX, RDX);
+            a_.jcc(CE, generic);
+            write(in.a, RAX);
+            a_.jmp(afterCall);
+        }
         a_.bind(generic);
     }
     if (in.opcode() == Op::Call && argc == 1) {

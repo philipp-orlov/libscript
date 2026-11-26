@@ -13,7 +13,7 @@ TEST(anArrayIsNinetySixBytesWithSixElementsInPlaceAndHoldsEightByteElements)
     CHECK_EQ(cellBytesOf(reinterpret_cast<CellPtr>(a)), sizeof(JSArray));
     CHECK_EQ(sizeof(JSArray), std::size_t(96));  // six elements in place: a literal of up to six is made in compiled code
     CHECK_EQ(a->packed, 0u);
-    CHECK(a->elems == a->small && !a->ownsElems() && a->capacity == JSArray::kSmall);
+    CHECK(a->store == a->small && !a->ownsElems() && a->capacity == JSArray::kSmall);
     for (int i = 0; i < 100; ++i)
         a->append(f.vm, num(i));
     CHECK_EQ(a->packed, 100u);  // numbers only, from the start
@@ -116,4 +116,62 @@ TEST(anArrayHasItsPrototypeInItsShape)
     CHECK_EQ(a->findOwn(f.vm, f.key("extra"))->asInt32(), 1);
     release(toJSValue(a));
     release(toJSValue(proto));
+}
+
+TEST(anArrayOfInt32sTurnsIntoDoublesAndIntoValuesByWhatIsStored)
+{
+    Fixture f;
+    f.vm.arrayKinds = true;
+    JSArray* a = f.vm.newFreshArray(nullptr, 0, 3);
+    CHECK(a->ints() && !a->boxed() && a->length == 3u);
+    CHECK(a->holeAt(0) && a->at(2).isHole());
+    a->put(f.vm, 0, num(7));
+    a->put(f.vm, 1, JSValue::boxDouble(4.0));  // a whole double is the int32 it is
+    CHECK(a->ints() && a->get(1).isInt32() && a->get(1).asInt32() == 4);
+    a->append(f.vm, JSValue::boxDouble(0.5));
+    CHECK(a->nums() && a->length == 4u);
+    CHECK(a->get(0).isInt32() && a->get(0).asInt32() == 7);  // read back as the int32 it was
+    CHECK(a->get(3).isDouble() && a->get(3).asDouble() == 0.5);
+    CHECK(a->holeAt(2) && a->get(2).isHole());
+    a->put(f.vm, 2, JSValue::boxDouble(std::nan("")));
+    CHECK(!a->holeAt(2) && a->get(2).isDouble() && a->get(2).asDouble() != a->get(2).asDouble());
+    a->put(f.vm, 0, JSValue::boxDouble(-0.0));
+    CHECK(a->get(0).isDouble() && std::signbit(a->get(0).asDouble()));
+    a->resize(f.vm, 6);
+    CHECK(a->holeAt(5));
+    CHECK(a->pop(f.vm).isHole());
+    a->insertGap(f.vm, 1, 1);
+    CHECK(a->holeAt(1) && a->get(2).asInt32() == 4 && a->length == 6u);
+    a->removeRange(f.vm, 1, 1);
+    CHECK(a->nums() && a->get(1).asInt32() == 4 && a->length == 5u);
+    // Anything else makes values of them, and values is what it stays.
+    vm::Box* b = f.vm.newBox(num(1));
+    a->put(f.vm, 1, JSValue::cell(reinterpret_cast<CellPtr>(b)));
+    CHECK(a->boxed() && a->cls() == ObjClass::Array && a->get(1).isCell());
+    CHECK(a->get(0).isDouble() && a->get(3).asDouble() == 0.5 && a->get(4).isHole());
+    CHECK_EQ(a->packed, 1u);
+    a->put(f.vm, 1, JSValue::boxDouble(1.5));
+    CHECK(a->boxed());
+    release(toJSValue(a));
+    CHECK_EQ(f.cells(), std::uint64_t(0));
+}
+
+TEST(aWholeNumberPastInt32MakesValuesOfInt32sAndCodeThatKnowsValuesOnlyGetsThem)
+{
+    Fixture f;
+    f.vm.arrayKinds = true;
+    JSArray* a = f.vm.newFreshArray(nullptr, 0);
+    const JSValue two[] = {num(1), num(2)};
+    a->appendAll(f.vm, two, 2);
+    CHECK(a->ints() && a->cls() == ObjClass::Array);  // a program sees an Array, whatever the kind
+    a->append(f.vm, JSValue::boxDouble(3000000000.0));
+    CHECK(a->boxed() && a->get(2).asDouble() == 3000000000.0 && a->packed == 3u);
+    release(toJSValue(a));
+    JSArray* d = f.vm.newFreshArray(nullptr, 0);
+    d->append(f.vm, JSValue::boxDouble(0.25));
+    d->append(f.vm, num(3));
+    CHECK(d->nums() && d->firstCell() == 2u);
+    JSValue* v = d->vals();
+    CHECK(d->boxed() && v[0].isDouble() && v[0].asDouble() == 0.25 && v[1].isInt32() && v[1].asInt32() == 3);
+    release(toJSValue(d));
 }

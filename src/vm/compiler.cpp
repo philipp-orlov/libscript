@@ -1715,7 +1715,8 @@ std::uint16_t Compiler::arrayLit(const Node& n, int dst)
 {
     const std::uint16_t mark = fn_->top;
     const std::uint16_t t = temp();
-    emit(Op::NewArray, t, std::uint32_t(std::min<std::size_t>(n.list.size(), 0xFFFF)));
+    // (An empty literal says so: it is a program's own array, which starts as one of int32s.)
+    emit(Op::NewArray, t, std::uint32_t(std::min<std::size_t>(n.list.size(), 0xFFFF)), n.list.empty());
     for (const dyn::NodePtr& e : n.list) {
         const std::uint16_t inner = fn_->top;
         if (e->kind == NK::Hole) {

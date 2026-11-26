@@ -106,10 +106,10 @@ void render(VM& vm, JSValue v, int depth, std::string& out)
         out += "[";
         for (std::uint32_t i = 0; i < a->length; ++i) {
             out += i ? ", " : " ";
-            if (a->elems[i].isHole())
+            if (a->holeAt(i))
                 out += "<empty>";
             else
-                render(vm, a->elems[i], depth + 1, out);
+                render(vm, a->get(i), depth + 1, out);
         }
         out += a->length ? " ]" : "]";
         return;
@@ -364,7 +364,7 @@ std::vector<std::string> keys(const Value& v)
     if (o->cls() == ObjClass::Array) {
         auto* a = static_cast<JSArray*>(o);
         for (std::uint32_t i = 0; i < a->length; ++i)
-            if (!a->elems[i].isHole())
+            if (!a->holeAt(i))
                 out.push_back(std::to_string(i));
     }
     o->forEachOwn(vm, [&](Key k, std::uint8_t attrs, JSValue) {

@@ -297,6 +297,24 @@ struct VM : EngineRuntime
     JSObject* newObject(Shape* root, std::uint8_t aux = 3);
     JSObject* newObject(JSObject* proto, std::uint8_t aux = 3);
     JSArray* newArray(JSObject* proto, std::uint32_t length = 0, std::uint32_t capacity = 0);
+    /// An array a program makes with nothing in it (`[]`, `new Array(n)`) at instruction `index` of `code` (null: not
+    /// known). When `arrayKinds`: one of int32s to start with, unless arrays made at that place turned into doubles or
+    /// values before (`noteKindChange`); then it is one of those from the start.
+    JSArray* newFreshArray(CodeBlock* code, std::uint32_t index, std::uint32_t length = 0);
+    /// Array `a` changed its kind (`elemprof::kArray`: to values, `kNumArray`: to doubles) by what a program stored: the
+    /// place that made it (`JSArray::site`) makes its arrays that way from now on.
+    void noteKindChange(const JSArray* a, std::uint8_t to) noexcept;
+    /// The number of instruction `index` of `code` as a place that makes arrays (`JSArray::site`), given at first use;
+    /// 0 when there are too many.
+    std::uint32_t arraySiteOf(CodeBlock* code, std::uint32_t index);
+    struct ArraySite
+    {
+        std::uint64_t uid = 0;  ///< of the code; 0: not in use
+        std::uint32_t index = 0;
+    };
+    static constexpr std::size_t kMaxArraySites = 1u << 16;
+    std::vector<ArraySite> arraySites_{1};  ///< [0] is no place
+    std::vector<std::uint32_t> arraySitesFree_;
     Box* newBox(JSValue ownedValue);
     /// An ArrayBuffer of `bytes` zeros; owned, or null with a RangeError pending when it cannot be had.
     /// A zeroed buffer of `bytes`; a resizable one has room for `maxBytes`. Null with an exception pending.
@@ -389,6 +407,8 @@ struct VM : EngineRuntime
     std::uint32_t tier1Threshold = 0;
     /// Entries and loop back edges of baseline code before the optimizing compiler is asked; 0 leaves it off.
     std::int32_t tier2Threshold = 0;
+    /// Whether an array a program makes empty (`[]`, `new Array(n)`) starts as one of int32s (`JSArray`).
+    bool arrayKinds = true;
     /// How many levels deep a function that calls itself by name runs those calls in place, from when it turns hot
     /// (`selfInline`); 0 for not at all; only with the optimizing compiler on.
     std::uint8_t selfInlining = 0;

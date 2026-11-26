@@ -129,9 +129,10 @@ JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capac
     auto* a = static_cast<JSArray*>(allocCell(sizeof(JSArray), Kind::Object, ObjClass::Array, 0));
     a->h.shape = root->id;
     a->slots = nullptr;
-    a->elems = a->small;
+    a->store = a->small;
     a->length = 0;
     a->packed = 0;
+    a->site = 0;
     a->capacity = JSArray::kSmall;
     try {
         a->reserve(*this, capacity);
@@ -142,7 +143,7 @@ JSArray* VM::newArray(JSObject* proto, std::uint32_t length, std::uint32_t capac
     }
     if (length) {
         for (std::uint32_t i = 0; i < length; ++i)
-            a->elems[i] = JSValue::hole();
+            a->store[i] = JSValue::hole();
         a->length = length;
     }
     return a;
@@ -230,6 +231,13 @@ void VM::releaseCode(CodeBlock* code) noexcept
         code->tier1 = nullptr;
     }
     codeByUid_.erase(code->uid);
+    for (const auto& [at, id] : code->arraySites) {
+        arraySites_[id] = ArraySite{};
+        try {
+            arraySitesFree_.push_back(id);
+        } catch (...) {  // (the number is not given again)
+        }
+    }
     delete code->lazy;
     if (CodeBlock* from = code->mergedFrom)
         releaseCode(from);
@@ -819,6 +827,70 @@ void JSObject::materialize(VM& vm)
 
 // -------------------------------------------------------------------- arrays ---
 
+JSArray* VM::newFreshArray(CodeBlock* code, std::uint32_t index, std::uint32_t length)
+{
+    if (!arrayKinds)
+        return newArray(protos.array, length);
+    const std::uint8_t turned = code && index < code->elemProf.size() ? code->elemProf[index] : 0;
+    JSArray* a = newArray(protos.array, 0, length);
+    if (!(turned & elemprof::kArray)) {
+        a->h.cls = std::uint8_t(turned & elemprof::kNumArray ? ObjClass::NumArray : ObjClass::IntArray);
+        try {
+            a->site = code ? arraySiteOf(code, index) : 0;
+        } catch (...) {
+        }
+    }
+    a->resize(*this, length);  // (room is there: nothing is thrown)
+    return a;
+}
+
+std::uint32_t VM::arraySiteOf(CodeBlock* code, std::uint32_t index)
+{
+    // (In the order of the instructions: a function of data has thousands.)
+    const auto where = std::lower_bound(code->arraySites.begin(), code->arraySites.end(), index,
+                                        [](const std::pair<std::uint32_t, std::uint32_t>& s, std::uint32_t at) { return s.first < at; });
+    if (where != code->arraySites.end() && where->first == index)
+        return where->second;
+    std::uint32_t id = 0;
+    if (!arraySitesFree_.empty()) {
+        id = arraySitesFree_.back();
+        arraySitesFree_.pop_back();
+    } else if (arraySites_.size() < kMaxArraySites) {
+        id = std::uint32_t(arraySites_.size());
+        arraySites_.emplace_back();
+    } else {
+        return 0;
+    }
+    arraySites_[id] = ArraySite{code->uid, index};
+    try {
+        code->arraySites.insert(where, std::pair<std::uint32_t, std::uint32_t>(index, id));
+    } catch (...) {
+        arraySites_[id] = ArraySite{};
+        arraySitesFree_.push_back(id);  // (room for it: it was taken from there, or the table grew by one)
+        return 0;
+    }
+    return id;
+}
+
+void VM::noteKindChange(const JSArray* a, std::uint8_t to) noexcept
+{
+    if (!a->site || a->site >= arraySites_.size())
+        return;
+    const ArraySite& s = arraySites_[a->site];
+    CodeBlock* code = s.uid ? codeByUid(s.uid) : nullptr;
+    if (!code)
+        return;
+    // (Of the code's size from the start: compiled code holds addresses of its bytes.)
+    try {
+        if (code->elemProf.empty())
+            code->elemProf.assign(code->code.size(), 0);
+    } catch (...) {
+        return;
+    }
+    if (s.index < code->elemProf.size())
+        code->elemProf[s.index] |= to;
+}
+
 void JSArray::reserve(VM& vm, std::uint32_t wanted)
 {
     if (wanted <= capacity)
@@ -832,11 +904,67 @@ void JSArray::reserve(VM& vm, std::uint32_t wanted)
         throw Error(ErrorCode::OutOfMemory, "array too large");
     auto* fresh = static_cast<JSValue*>(vm.allocPayload(8u * std::size_t(grown)));
     if (length)
-        std::memcpy(fresh, elems, 8u * length);
+        std::memcpy(fresh, store, 8u * length);
     if (ownsElems())
-        vm.freePayload(elems, 8u * capacity);
-    elems = fresh;
+        vm.freePayload(store, 8u * capacity);
+    store = fresh;
     capacity = std::uint32_t(grown);
+}
+
+void JSArray::toValues() noexcept
+{
+    if (nums())
+        for (std::uint32_t i = 0; i < length; ++i)
+            store[i] = get(i);
+    h.cls = std::uint8_t(ObjClass::Array);
+    packed = 0;
+    repack();
+}
+
+void JSArray::toNums() noexcept
+{
+    for (std::uint32_t i = 0; i < length; ++i)
+        store[i] = store[i].isHole() ? JSValue::raw(kNumHole) : rawOf(store[i]);
+    h.cls = std::uint8_t(ObjClass::NumArray);
+}
+
+/// What an array that is not one of values stores for `value` in place `index`, which holds no cell: true when it did.
+/// A whole double among int32s is stored as the int32 it is. A number with a fraction makes doubles of the int32s. A
+/// whole number past int32 does not (false): such an array holds words for bit operations, which read int32s fastest
+/// from values.
+static bool putNumber(VM& vm, JSArray* a, std::uint32_t index, JSValue value) noexcept
+{
+    if (!value.isNumber())
+        return false;
+    if (a->ints()) {
+        if (value.isDouble())
+            value = JSValue::boxNumber(value.asDouble());
+        if (value.isInt32()) {
+            a->store[index] = value;
+            return true;
+        }
+        const double d = value.asDouble();
+        if (d == std::trunc(d) && d != 0)
+            return false;
+        a->toNums();
+        vm.noteKindChange(a, elemprof::kNumArray);
+    }
+    a->store[index] = JSArray::rawOf(value);
+    return true;
+}
+
+void JSArray::put(VM& vm, std::uint32_t index, JSValue value) noexcept
+{
+    if (!boxed()) {
+        if (putNumber(vm, this, index, value))
+            return;
+        toValues();
+        vm.noteKindChange(this, elemprof::kArray);
+    }
+    const JSValue old = store[index];
+    store[index] = value;
+    noteStore(index, value);
+    release(old);
 }
 
 void JSArray::append(VM& vm, JSValue value)
@@ -849,16 +977,43 @@ void JSArray::append(VM& vm, JSValue value)
             throw;
         }
     }
-    elems[length++] = value;
+    if (boxed()) [[likely]] {
+        store[length++] = value;
+        noteStore(length - 1, value);
+        return;
+    }
+    ++length;
+    if (putNumber(vm, this, length - 1, value))
+        return;
+    store[length - 1] = JSValue::raw(nums() ? kNumHole : kHole);
+    toValues();
+    vm.noteKindChange(this, elemprof::kArray);
+    store[length - 1] = value;
     noteStore(length - 1, value);
 }
 
 void JSArray::appendAll(VM& vm, const JSValue* values, std::uint32_t n)
 {
     reserve(vm, length + n);
+    if (!boxed()) {
+        // What the array holds as it is goes straight in; from the first value of another kind on, one by one.
+        std::uint32_t i = 0;
+        if (ints())
+            for (; i < n && values[i].isInt32(); ++i)
+                store[length + i] = values[i];
+        else
+            for (; i < n && values[i].isNumber(); ++i)
+                store[length + i] = rawOf(values[i]);
+        length += i;
+        for (; i < n; ++i) {
+            retain(values[i]);
+            append(vm, values[i]);
+        }
+        return;
+    }
     for (std::uint32_t i = 0; i < n; ++i) {
         retain(values[i]);
-        elems[length + i] = values[i];
+        store[length + i] = values[i];
     }
     length += n;
     repack(length - n);
@@ -867,10 +1022,7 @@ void JSArray::appendAll(VM& vm, const JSValue* values, std::uint32_t n)
 bool JSArray::setAt(VM& vm, std::uint32_t index, JSValue value)
 {
     if (index < length) {
-        const JSValue old = elems[index];
-        elems[index] = value;
-        noteStore(index, value);
-        release(old);
+        put(vm, index, value);
         return true;
     }
     if (index - length > kMaxDenseGap) {
@@ -883,8 +1035,7 @@ bool JSArray::setAt(VM& vm, std::uint32_t index, JSValue value)
         release(value);
         throw;
     }
-    elems[index] = value;
-    noteStore(index, value);
+    put(vm, index, value);
     return true;
 }
 
@@ -892,18 +1043,21 @@ void JSArray::resize(VM& vm, std::uint32_t newLength)
 {
     if (newLength > length) {
         reserve(vm, newLength);
+        const JSValue hole = JSValue::raw(nums() ? kNumHole : kHole);
         for (std::uint32_t i = length; i < newLength; ++i)
-            elems[i] = JSValue::hole();
+            store[i] = hole;
         length = newLength;
         return;
     }
     // Shorten first, then let go: a release can run a destructor that looks at this array.
     const std::uint32_t old = length;
     length = newLength;
+    if (!boxed())
+        return;
     if (packed > newLength)
         packed = newLength;
     for (std::uint32_t i = newLength; i < old; ++i)
-        release(elems[i]);
+        release(store[i]);
 }
 
 void JSArray::removeRange(VM& vm, std::uint32_t from, std::uint32_t count)
@@ -915,18 +1069,23 @@ void JSArray::removeRange(VM& vm, std::uint32_t from, std::uint32_t count)
         count = length - from;
     if (!count)
         return;
+    if (!boxed()) {
+        std::memmove(store + from, store + from + count, 8u * (length - from - count));
+        length -= count;
+        return;
+    }
     // Keep the removed ones aside while the gap closes, so a destructor sees a consistent array.
     JSValue few[4];
     Vec<JSValue> many;
     JSValue* removed = few;
     if (count > 4) {
-        many.assign(elems + from, elems + from + count);
+        many.assign(store + from, store + from + count);
         removed = many.data();
     } else {
         for (std::uint32_t i = 0; i < count; ++i)
-            few[i] = elems[from + i];
+            few[i] = store[from + i];
     }
-    std::memmove(elems + from, elems + from + count, 8u * (length - from - count));
+    std::memmove(store + from, store + from + count, 8u * (length - from - count));
     length -= count;
     // The numbers known below `packed` that were after the gap are now `count` places lower: the bound moves with them.
     if (packed > from)
@@ -942,9 +1101,10 @@ void JSArray::insertGap(VM& vm, std::uint32_t at, std::uint32_t count)
     if (!count)
         return;
     reserve(vm, length + count);
-    std::memmove(elems + at + count, elems + at, 8u * (length - at));
+    std::memmove(store + at + count, store + at, 8u * (length - at));
+    const JSValue hole = JSValue::raw(nums() ? kNumHole : kHole);
     for (std::uint32_t i = 0; i < count; ++i)
-        elems[at + i] = JSValue::hole();
+        store[at + i] = hole;
     length += count;
     if (packed > at)
         packed = at;
@@ -958,7 +1118,7 @@ JSValue JSArray::pop(VM& vm)
     --length;
     if (packed > length)
         packed = length;
-    return elems[length];
+    return get(length);
 }
 
 }  // namespace vm

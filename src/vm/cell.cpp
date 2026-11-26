@@ -180,8 +180,8 @@ void children(const detail::GCObject* cell, detail::GcList& out, bool tracing)
                 appendIfCell(out, *o->slotAt(i));
             if (hasElems(o)) {
                 auto* a = static_cast<JSArray*>(o);
-                for (std::uint32_t i = a->packed; i < a->length; ++i)  // no cell among the packed numbers
-                    appendIfCell(out, a->elems[i]);
+                for (std::uint32_t i = a->firstCell(); i < a->length; ++i)  // no cell among the packed numbers
+                    appendIfCell(out, a->store[i]);
             } else if (o->cls() == ObjClass::TypedArray) {
                 appendIfCell(out, static_cast<JSTypedArray*>(o)->buffer);
             }
@@ -239,10 +239,10 @@ void destroyObjectStorage(VM& vm, JSObject* o) noexcept
         case ObjClass::Arguments: {
             auto* a = static_cast<JSArray*>(o);
             if (!vm.tearingDown)
-                for (std::uint32_t i = a->packed; i < a->length; ++i)  // no cell among the packed numbers
-                    release(a->elems[i]);
+                for (std::uint32_t i = a->firstCell(); i < a->length; ++i)  // no cell among the packed numbers
+                    release(a->store[i]);
             if (a->ownsElems())
-                vm.freePayload(a->elems, 8u * a->capacity);
+                vm.freePayload(a->store, 8u * a->capacity);
             break;
         }
         case ObjClass::TypedArray: {
@@ -338,10 +338,10 @@ void VM::destroyNow(CellPtr cell) noexcept
             std::size_t bytes;
             if (cls == ObjClass::Array) {
                 auto* a = static_cast<JSArray*>(o);
-                for (std::uint32_t i = a->packed; i < a->length; ++i)  // no cell among the packed numbers
-                    drop(a->elems[i]);
+                for (std::uint32_t i = a->firstCell(); i < a->length; ++i)  // no cell among the packed numbers
+                    drop(a->store[i]);
                 if (a->ownsElems())
-                    freePayload(a->elems, 8u * a->capacity);
+                    freePayload(a->store, 8u * a->capacity);
                 bytes = sizeof(JSArray);
             } else {
                 bytes = JSObject::bytesFor(hd->aux);
@@ -469,11 +469,11 @@ inline void VM::destroyFrom(CellPtr cell, Freed& total) noexcept
             std::size_t bytes;
             if (o->cls() == ObjClass::Array) {
                 auto* a = static_cast<JSArray*>(o);
-                for (std::uint32_t i = a->packed; i < a->length; ++i)  // no cell among the packed numbers
-                    if (a->elems[i].isCell())
-                        drop(a->elems[i].asCell());
+                for (std::uint32_t i = a->firstCell(); i < a->length; ++i)  // no cell among the packed numbers
+                    if (a->store[i].isCell())
+                        drop(a->store[i].asCell());
                 if (a->ownsElems())
-                    freePayload(a->elems, 8u * a->capacity);
+                    freePayload(a->store, 8u * a->capacity);
                 bytes = sizeof(JSArray);
             } else {
                 bytes = JSObject::bytesFor(hd->aux);
@@ -572,9 +572,9 @@ void clearReferences(VM& vm, CellPtr cell) noexcept
             if (hasElems(o)) {
                 auto* a = static_cast<JSArray*>(o);
                 a->packed = 0;
-                for (std::uint32_t i = 0; i < a->length; ++i) {
-                    release(a->elems[i]);
-                    a->elems[i] = JSValue::hole();
+                for (std::uint32_t i = a->boxed() ? 0 : a->length; i < a->length; ++i) {
+                    release(a->store[i]);
+                    a->store[i] = JSValue::hole();
                 }
             } else if (o->cls() == ObjClass::Function) {
                 auto* f = static_cast<JSFunction*>(o);

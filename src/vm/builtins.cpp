@@ -722,6 +722,8 @@ NATIVE(objectFreeze)
         return v;
     }
     o->materialize(vm);
+    if (hasElems(o))
+        static_cast<JSArray*>(o)->vals();
     o->h.flags |= cellflags::kFrozen | cellflags::kNotExtensible;
     if (hasElems(o))
         static_cast<JSArray*>(o)->packed = 0;
@@ -922,9 +924,9 @@ NATIVE(functionApply)
         auto* a = static_cast<JSArray*>(asObject(list));
         bool holes = false;
         for (std::uint32_t i = 0; i < a->length && !holes; ++i)
-            holes = a->elems[i].isHole();
+            holes = a->holeAt(i);
         if (!holes)
-            return vm.call(self, arg(args, argc, 0), a->elems, a->length);
+            return vm.call(self, arg(args, argc, 0), a->vals(), a->length);
     }
     Vec<Handle> held;
     if (!list.isNullish() && !listFromArrayLike(vm, list, held))
@@ -971,7 +973,7 @@ NATIVE(boundCall)
     Rare* r = me->rare();
     std::vector<JSValue> all;
     if (r->boundArgs)
-        all.assign(r->boundArgs->elems, r->boundArgs->elems + r->boundArgs->length);
+        all.assign(r->boundArgs->vals(), r->boundArgs->vals() + r->boundArgs->length);
     all.insert(all.end(), args, args + argc);
     if (!vm.newTarget.isUndefined())
         return vm.construct(r->boundTarget, all.data(), std::uint32_t(all.size()));
@@ -1152,7 +1154,18 @@ NATIVE(errorToString)
 NATIVE(arrayCtor)
 {
     UNUSED();
-    JSArray* a = vm.newArray(vm.protos.array);
+    // (The place that calls: the frame's instruction, when this is what it calls.)
+    CodeBlock* site = nullptr;
+    std::uint32_t at = 0;
+    if (vm.frameTop > vm.frameBase)
+        if (const Frame& fr = vm.frameTop[-1]; fr.code && fr.pc > fr.code->code.data() && fr.pc <= fr.code->code.data() + fr.code->code.size()) {
+            const Ins* call = fr.pc - (fr.pc[-1].opcode() == Op::Cache && fr.pc - 1 > fr.code->code.data() ? 2 : 1);
+            if (call->opcode() == Op::New || call->opcode() == Op::Call) {
+                site = fr.code;
+                at = std::uint32_t(call - fr.code->code.data());
+            }
+        }
+    JSArray* a = vm.newFreshArray(site, at);
     Handle keep = Handle::adopt(toJSValue(a));
     // `Reflect.construct(Array, args, C)`: `this` was made with the prototype of `C`.
     if (!vm.newTarget.isUndefined() && isObject(self)) {
@@ -1221,7 +1234,7 @@ NATIVE(arrayShiftImpl)
         return JSValue::exception();
     if (!a->length)
         return JSValue::undefined();
-    JSValue v = a->elems[0];
+    JSValue v = a->get(0);
     retain(v);
     a->removeRange(vm, 0, 1);
     return v.isHole() ? JSValue::undefined() : v;
@@ -1236,7 +1249,7 @@ NATIVE(arrayUnshiftImpl)
     a->insertGap(vm, 0, argc);
     for (std::uint32_t i = 0; i < argc; ++i) {
         retain(args[i]);
-        a->elems[i] = args[i];
+        a->vals()[i] = args[i];
     }
     a->repack();
     return JSValue::boxNumber(double(a->length));
@@ -1264,7 +1277,7 @@ NATIVE(arrayJoin)
     for (std::uint32_t i = 0; i < a->length; ++i) {
         if (i)
             out += sep;
-        JSValue e = a->elems[i];
+        JSValue e = a->get(i);
         if (e.isNullish() || e.isHole())
             continue;
         JSValue s = toStringValue(vm, e);
@@ -1305,8 +1318,10 @@ NATIVE(arraySlice)
         return JSValue::exception();
     JSArray* out = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(out));
-    for (std::int64_t i = from; i < to; ++i)
-        out->appendAll(vm, &a->elems[i], 1);
+    for (std::int64_t i = from; i < to; ++i) {
+        const JSValue e = a->get(std::uint32_t(i));
+        out->appendAll(vm, &e, 1);
+    }
     return keep.take();
 }
 
@@ -1331,14 +1346,16 @@ NATIVE(arraySpliceImpl)
     }
     JSArray* removed = vm.newArray(vm.protos.array);
     Handle keep = Handle::adopt(toJSValue(removed));
-    for (std::int64_t i = 0; i < count; ++i)
-        removed->appendAll(vm, &a->elems[start + i], 1);
+    for (std::int64_t i = 0; i < count; ++i) {
+        const JSValue e = a->get(std::uint32_t(start + i));
+        removed->appendAll(vm, &e, 1);
+    }
     a->removeRange(vm, std::uint32_t(start), std::uint32_t(count));
     const std::uint32_t inserted = argc > 2 ? argc - 2 : 0;
     a->insertGap(vm, std::uint32_t(start), inserted);
     for (std::uint32_t i = 0; i < inserted; ++i) {
         retain(args[2 + i]);
-        a->elems[start + i] = args[2 + i];
+        a->vals()[start + i] = args[2 + i];
     }
     a->repack(std::uint32_t(start));
     return keep.take();
@@ -1370,7 +1387,7 @@ NATIVE(arrayConcat)
             return JSValue::exception();
         if (std::uint64_t(out->length) + view.a->length > 0xFFFFFFFFull)
             return typeError(vm, "Invalid array length");
-        out->appendAll(vm, view.a->elems, view.a->length);
+        out->appendAll(vm, view.a->vals(), view.a->length);
     }
     return keep.take();
 }
@@ -1385,7 +1402,7 @@ NATIVE(arrayReverseImpl)
     JSArray* a = thisMutableArray(vm, self);
     if (!a)
         return JSValue::exception();
-    std::reverse(a->elems, a->elems + a->length);
+    std::reverse(a->vals(), a->vals() + a->length);
     a->repack();
     retain(self);
     return self;
@@ -1452,7 +1469,7 @@ NATIVE(arraySortImpl)
     items.reserve(a->length);
     std::uint32_t undefinedCount = 0, holes = 0;
     for (std::uint32_t i = 0; i < a->length; ++i) {
-        const JSValue e = a->elems[i];
+        const JSValue e = a->get(i);
         if (e.isHole())
             ++holes;
         else if (e.isUndefined())
@@ -1527,19 +1544,20 @@ NATIVE(arraySortImpl)
     }
     // Write back: sorted values, then undefined, then holes. Each slot gets the count the item carries.
     const std::uint32_t n = a->length;
+    a->vals();
     a->packed = 0;
     for (std::uint32_t i = 0; i < n; ++i) {
-        const JSValue old = a->elems[i];
-        a->elems[i] = JSValue::undefined();
+        const JSValue old = a->get(i);
+        a->vals()[i] = JSValue::undefined();
         release(old);
     }
     std::uint32_t at = 0;
     for (JSValue v : items)
-        a->elems[at++] = v;
+        a->vals()[at++] = v;
     for (std::uint32_t i = 0; i < undefinedCount; ++i)
-        a->elems[at++] = JSValue::undefined();
+        a->vals()[at++] = JSValue::undefined();
     for (std::uint32_t i = 0; i < holes; ++i)
-        a->elems[at++] = JSValue::hole();
+        a->vals()[at++] = JSValue::hole();
     a->repack();
     retain(self);
     return self;
@@ -1654,8 +1672,8 @@ NATIVE(arrayCopyWithinImpl)
             slice.push_back(v);
         }
         for (std::int64_t i = 0; i < count && to + i < std::int64_t(a->length); ++i) {
-            const JSValue old = a->elems[to + i];
-            a->elems[to + i] = slice[std::size_t(i)];
+            const JSValue old = a->get(to + i);
+            a->vals()[to + i] = slice[std::size_t(i)];
             a->noteStore(std::uint32_t(to + i), slice[std::size_t(i)]);
             release(old);
         }

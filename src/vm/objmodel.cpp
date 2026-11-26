@@ -665,6 +665,8 @@ int objPreventExtensions(VM& vm, JSObject* o)
         if (static_cast<JSTypedArray*>(o)->tracking)
             return 0;
     }
+    if (hasElems(o))
+        static_cast<JSArray*>(o)->vals();
     o->h.flags |= cellflags::kNotExtensible;
     return 1;
 }

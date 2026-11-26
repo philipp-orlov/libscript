@@ -407,9 +407,9 @@ Young cells are on with deferred frames. `SCRIPT_VM_YOUNG=0` turns them off in a
 
 ## Arrays of numbers
 
-An array knows how many of its first elements are numbers (`JSArray::packed`: no hole and no cell below it). It is a
-lower bound that every writer of `elems` and `length` keeps (`noteStore`, `repack`), zero is always right, and it is zero
-in a frozen array. The field fits in the eight bytes the heap's slot for an array had to spare.
+An array of values knows how many of its first elements are numbers (`JSArray::packed`: no hole and no cell below it).
+It is a lower bound that every writer of `store` and `length` keeps (`noteStore`, `repack`), zero is always right, and it
+is zero in a frozen array. The field fits in the eight bytes the heap's slot for an array had to spare.
 
 - The optimizing compiler stores a number over a packed element with one compare and the store: the old value is not
   read (it is no hole, so nothing can intercept the store, and no cell, so there is nothing to let go of). A loop that
@@ -421,6 +421,52 @@ in a frozen array. The field fits in the eight bytes the heap's slot for an arra
 An element read that had not run when optimized code was made (the first loop of a function entered at a back edge
 comes before the others) has that code make way for a new compile once it has run a while, so what it yields can be a
 typed variable.
+
+## Arrays of int32s and of doubles
+
+An array that a program makes with nothing in it (`[]`, `new Array(n)`) stores its elements for what they are. The kind
+is the class byte of the header (`ObjClass::IntArray`, `ObjClass::NumArray`). `JSObject::cls` says `Array` for each
+kind, so a program sees no difference.
+
+| Kind | A place holds | A hole is |
+|---|---|---|
+| of int32s | an int32 value | the hole value |
+| of doubles | a double as it is | one NaN that no store leaves there (`JSArray::kNumHole`) |
+| of values | any value | the hole value |
+
+- An array of int32s becomes one of doubles at the first number with a fraction (also a NaN, an infinity, the negative
+  zero).
+- An array of int32s or of doubles becomes one of values at the first store of anything else. A whole number past int32
+  is such a store into an array of int32s: an array of words for bit operations reads fastest as values.
+- An array of values stays one. Compiled code that has seen an `Array` of values does not look again.
+- Each kind has eight bytes for an element. A change of kind is made in place: no memory is asked for, no cell moves.
+- A whole number read from an array of doubles is an int32 again (`JSArray::get`).
+- An array of int32s or of doubles holds no cell. Freeing one, and the collector's walk, skip its elements.
+- Such an array is never frozen and always extensible: `Object.freeze`, `seal` and `preventExtensions` make values of
+  it first.
+- Runtime code that knows values only asks for them (`JSArray::vals`), and the array is one of values from then on.
+  Only code that goes by the kind reads `JSArray::store` itself.
+
+The place that makes an array learns from it. An array has the number of its place (`JSArray::site`, in the four bytes
+its cell had to spare; `VM::arraySites_`, at most 65,536). When what a program stores changes the kind, the place notes
+it (`VM::noteKindChange`) and makes its next arrays of that kind from the start. So an array of objects is one of values
+from its first element, and a row of a matrix is one of doubles before its first number.
+
+Compiled code:
+
+- The element profile (`CodeBlock::elemProf`) has a bit for each kind a place has met.
+- Baseline code reads and stores an element of an array of int32s in place. An array of doubles, and `push` and `pop`
+  of both kinds, go to four stubs that all functions share (`KindStubs`): a place costs about ten instructions of code.
+- The SSA tier makes code for the kinds the place has met. A read of an array of doubles for a double result is the
+  length test, the load and a NaN test (a NaN is a hole or a number; which, is found out of line).
+- A loop whose instructions are all made by the SSA tier checks the kind once on the way in (`LoopGuards::kinds`), for an
+  array that the loop does not replace and whose places met one kind only. Only the runtime changes a kind, and such a
+  loop reaches the runtime by cold paths only. Each cold path checks the kinds again after its call, and leaves the
+  code after the instruction when one has changed (exit kind 8).
+- Another kind than the code was made for is no failure of the place: the profile gets the bit, and the code is made
+  again (exit kinds 7 and 8, and kind 0 at an element access).
+
+`SCRIPT_VM_KINDS=0` makes every array one of values, in a build with `SCRIPT_JIT_ENV_OVERRIDE`.
 
 ## Property read caches
 

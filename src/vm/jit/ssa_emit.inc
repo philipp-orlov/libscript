@@ -2356,6 +2356,19 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
             ssaCondEdges(b, eqTaken ? CE : CNE);
             return true;
         }
+        // Strict against a constant symbol or object (a `case` of a `switch` over such constants): equal bits.
+        auto sameOnly = [&](std::uint32_t v) {
+            const JSValue k = sval_[v].isConst ? JSValue::raw(sval_[v].bits) : JSValue::undefined();
+            return isSymbol(k) || isObject(k);
+        };
+        if (!loose && (sameOnly(va) || sameOnly(vb))) {
+            const bool first = sameOnly(va);
+            const Reg x = valueReg(first ? vb : va);
+            a_.movImm(RCX, sval_[first ? va : vb].bits);
+            a_.cmp(x, RCX);
+            ssaCondEdges(b, eqTaken ? CE : CNE);
+            return true;
+        }
         std::uint32_t vt;
         std::uint64_t name;
         if (ssaTypeofConst(va, vb, &vt, &name)) {

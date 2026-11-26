@@ -291,6 +291,10 @@ wait for the caller's store. Baseline code has the same address for both ways in
 comes back in rax and in the caller's frame slot, and the caller goes on from rax. One call and return is about 90
 instructions; most of them write the frame record and check the callee.
 
+**Strict equality against a constant symbol or object.** A jump on `x === K` where `K` is a constant symbol or object
+compares bits. A `switch` over such constants (Air's opcodes, 321 cases) is then two instructions and a constant for
+each case, where the general comparison was 412 bytes of code for each.
+
 **`instanceof` in place.** `a instanceof F` with `F` a constant ordinary constructor whose `prototype` is an object in
 its usual slot is a walk up the prototypes of `a` by their shapes (`ssaInstanceOf`). The code checks that `F` has the
 shape and the `prototype` it was found with. It relies on no object having a `Symbol.hasInstance` and no proxy being a

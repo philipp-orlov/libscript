@@ -269,6 +269,10 @@ its arguments, constants and static fields into new properties, class field init
 whose site has called one code is made directly, with its frame pushed from constants. Checks on the way into a loop (an array
 it reads, a boxed loop variable) hold in all of it.
 
+**A class field initialized from a private static field** (`color = Light.#defaultColor`) is part of the constructor
+made in place, as one initialized from a public static field is: the slot in the class is read when the field is
+stored.
+
 **Methods that name private fields** (`#x`) are merged into their callers like other small methods: the copy has the
 `PrivateCache` of each instruction it takes over.
 

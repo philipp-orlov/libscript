@@ -3091,6 +3091,20 @@ bool Baseline::ssaNewPlan(std::uint32_t i, SsaNew* out)
                 fown[fi.a] = slot;
                 break;
             }
+            case Op::GetElem: {
+                // A private static field of the class (`color = Light.#defaultColor`): its slot in the class, as above.
+                if (fi.a == 0 || fi.b >= F->nregs || fi.c >= F->nregs || !fself[fi.b] || !fkey[fi.c])
+                    return false;
+                std::uint8_t attrs = 0;
+                JSValue* slot = f->findOwn(vm_, reinterpret_cast<CellPtr>(const_cast<void*>(fkey[fi.c])), &attrs);
+                if (!slot || (attrs & attr::kAccessor))
+                    return false;
+                fconst[fi.a] = 0;
+                fself[fi.a] = 0;
+                fkey[fi.a] = nullptr;
+                fown[fi.a] = slot;
+                break;
+            }
             case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt:
                 if (fi.a == 0)
                     return false;

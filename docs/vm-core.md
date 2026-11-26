@@ -565,13 +565,13 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 
 ## Speed against JavaScriptCore
 
-State on 2026-11-25 (`b0dca88`; memory at `178d660`). JetStream 3, the 41 JavaScript workloads that `tools/probes/jetstream.py` writes, release
+State on 2026-11-25 (`329a69f`). JetStream 3, the 41 JavaScript workloads that `tools/probes/jetstream.py` writes, release
 build, arm64 (Cortex-X925, core 16), JavaScriptCore 2.52.6, best of two interleaved rounds. The ratio is libscript's time
 over JSC's time; below 1.00 libscript is faster.
 
 | | Later iterations | First iteration | Peak resident size |
 |---|--:|--:|--:|
-| Geometric mean of 41 | 1.34x | 0.71x | 0.21x |
+| Geometric mean of 41 | 1.36x | 0.72x | 0.21x |
 
 - Furthest behind (later iterations): splay 2.69x, Sunspider 2.16x, ML 2.01x, threejs 1.95x, octane-code-load 1.90x,
   Air 1.87x, js-tokens 1.86x, OfflineAssembler 1.85x, sync-fs 1.81x, doxbee-async 1.73x, hash-map 1.70x, UniPoker 1.67x.

@@ -339,6 +339,15 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
             const unsigned inner = in.b + 1u, argc = in.c;
             const std::uint32_t line = c->lines[k];
             std::vector<std::uint32_t> outs;
+            // The caller tests the result right after the call (`if (o.m())`): each return gets its own copy of the test,
+            // so no value has to join the returns first. A return that a test of the same register jumps to (`a || b`)
+            // gets copies that know the answer and go straight to where the caller's test would.
+            const std::uint32_t testAt = k + len;
+            const bool tested = ssaTier && testAt < n &&
+                                (c->code[testAt].opcode() == Op::JTrue || c->code[testAt].opcode() == Op::JFalse) &&
+                                c->code[testAt].a == in.a;
+            const std::uint32_t testTaken = tested ? std::uint32_t(opt::jumpTarget(*c, testAt)) : 0;
+            const std::uint32_t testNext = tested ? opt::nextOf(*c, testAt) : 0;
             for (; site != sites.end() && site->at == k; ++site) {
                 CodeBlock* C = site->callee;
                 d->nregs = std::max<std::uint32_t>(d->nregs, inner + C->nregs + 1);
@@ -368,6 +377,47 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
                 const std::uint32_t cn = std::uint32_t(C->code.size());
                 std::vector<std::uint32_t> cmoved(cn + 1, 0);
                 std::vector<std::pair<std::uint32_t, std::uint32_t>> calleeJumps;
+                // Per instruction of the callee: a test (1 `JTrue`, 2 `JFalse`) of a register that jumps to the return of
+                // that register; with 4, the register holds a boolean there (a compare right before made it, and nothing
+                // else jumps to the test). `known`: where the copies of a return are, by the test (its kind and register).
+                std::vector<std::uint8_t> toRet(cn, 0);
+                std::vector<std::uint32_t> retOf(cn, 0);
+                std::map<std::pair<std::uint32_t, unsigned>, std::uint32_t> known;
+                std::vector<std::pair<std::uint32_t, std::pair<std::uint32_t, unsigned>>> knownJumps;
+                if (tested) {
+                    std::vector<bool> target(cn + 1, false);
+                    for (std::uint32_t m = 0; m < cn; m = opt::nextOf(*C, m))
+                        if (const std::int64_t t = opt::jumpTarget(*C, m); t >= 0)
+                            target[std::size_t(t)] = true;
+                    std::uint32_t prev = cn;
+                    for (std::uint32_t m = 0; m < cn; prev = m, m = opt::nextOf(*C, m)) {
+                        const Ins& j = C->code[m];
+                        const std::int64_t t = opt::jumpTarget(*C, m);
+                        if (!reached[m] || (j.opcode() != Op::JTrue && j.opcode() != Op::JFalse) || t < 0 || t >= cn)
+                            continue;
+                        // The return, or a move into the register it returns.
+                        std::uint32_t ret = std::uint32_t(t);
+                        std::uint16_t reg = j.a;
+                        if (C->code[ret].opcode() == Op::Mov && C->code[ret].b == reg && ret + 1 < cn) {
+                            reg = C->code[ret].a;
+                            ++ret;
+                        }
+                        if (C->code[ret].opcode() != Op::Ret || C->code[ret].a != reg)
+                            continue;
+                        retOf[m] = ret;
+                        toRet[m] = j.opcode() == Op::JTrue ? 1 : 2;
+                        if (prev < cn && !target[m] && C->code[prev].a == j.a) {
+                            switch (C->code[prev].opcode()) {
+                            case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Eq: case Op::Ne: case Op::StrictEq:
+                            case Op::StrictNe: case Op::Not: case Op::In: case Op::InstanceOf:
+                                toRet[m] |= 4;
+                                break;
+                            default:
+                                break;
+                            }
+                        }
+                    }
+                }
                 for (std::uint32_t m = 0; m < cn; ++m) {
                     cmoved[m] = std::uint32_t(d->code.size());
                     Ins ci = C->code[m];
@@ -383,7 +433,28 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
                         put(Ins::make(Op::Mov, in.a, std::uint16_t(ci.a + inner)), C->lines[m], *C, m);
                         for (unsigned r = 0; r < C->nregs; ++r)
                             put(Ins::make(Op::LoadUndef, std::uint16_t(inner + r)), C->lines[m], *C, m);
-                        outs.push_back(put(Ins::make(Op::Jmp), C->lines[m], *C, m));
+                        if (!tested) {
+                            outs.push_back(put(Ins::make(Op::Jmp), C->lines[m], *C, m));
+                            continue;
+                        }
+                        ownJumps.emplace_back(put(c->code[testAt], c->lines[testAt], *c, testAt), testTaken);
+                        ownJumps.emplace_back(put(Ins::make(Op::Jmp), C->lines[m], *C, m), testNext);
+                        for (std::uint32_t j = 0; j < cn; j = opt::nextOf(*C, j)) {
+                            const unsigned what = unsigned(toRet[j]) | unsigned(C->code[j].a) << 8;
+                            if (!toRet[j] || retOf[j] != m || known.count({m, what}))
+                                continue;
+                            // The register is true-like (`JTrue` jumped) or false-like here.
+                            const bool truthy = (toRet[j] & 3) == 1;
+                            known[{m, what}] = std::uint32_t(d->code.size());
+                            if (toRet[j] & 4)
+                                put(Ins::make(truthy ? Op::LoadTrue : Op::LoadFalse, in.a), C->lines[m], *C, m);
+                            else
+                                put(Ins::make(Op::Mov, in.a, std::uint16_t(C->code[j].a + inner)), C->lines[m], *C, m);
+                            for (unsigned r = 0; r < C->nregs; ++r)
+                                put(Ins::make(Op::LoadUndef, std::uint16_t(inner + r)), C->lines[m], *C, m);
+                            const bool taken = truthy == (c->code[testAt].opcode() == Op::JTrue);
+                            ownJumps.emplace_back(put(Ins::make(Op::Jmp), C->lines[m], *C, m), taken ? testTaken : testNext);
+                        }
                         continue;
                     }
                     if (needsSelf(op)) {
@@ -433,7 +504,9 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
                     }
                     const std::uint32_t at = put(ci, C->lines[m], *C, m);
                     const std::int64_t t = op == Op::Cache ? -1 : opt::jumpTarget(*C, m);
-                    if (t >= 0)
+                    if (t >= 0 && toRet[m])
+                        knownJumps.emplace_back(at, std::make_pair(retOf[m], unsigned(toRet[m]) | unsigned(C->code[m].a) << 8));
+                    else if (t >= 0)
                         calleeJumps.emplace_back(at, std::uint32_t(t));
                 }
                 cmoved[cn] = std::uint32_t(d->code.size());
@@ -444,6 +517,8 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
                     else
                         jumpTo(at, cmoved[t]);
                 }
+                for (const auto& [at, t] : knownJumps)
+                    jumpTo(at, known.at(t));
                 d->inlineSites.push_back(InlineSite{body, std::uint32_t(d->code.size()), guard, C});
                 ++C->refs;
                 // A callee that is itself a merged copy brings the calls it runs in place.

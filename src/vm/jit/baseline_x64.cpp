@@ -3387,6 +3387,11 @@ private:
     void ssaKeepsDefined(std::int32_t pos);
     void ssaKeepsEnd();
     std::uint32_t curIns_ = 0;  ///< the instruction being emitted
+    /// A compare whose boolean only the jump that ends its block tests (`ssaFusedJump`): the jump (none: `~0u`), and the
+    /// condition the flags hold for true. No code between the two changes the flags.
+    std::uint32_t fusedAt_ = ~0u;
+    Cond fusedCond_ = CE;
+    std::uint32_t ssaFusedJump(std::uint32_t i) const;
     /// Finds those reads, given what `ssaPlan` decided, and makes the earlier values theirs in the graph; false when none.
     bool ssaLoadElim(ssa::Graph& g);
     /// Where an SSA value is: a constant (no code makes it), or a stack slot of this code's frame.

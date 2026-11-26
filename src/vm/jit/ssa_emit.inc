@@ -2126,8 +2126,13 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         return true;
     case Op::JTrue: case Op::JFalse: {
         const std::uint32_t v = name_[in.a];
-        const Reg x = valueReg(v);
         const bool onTrue = op == Op::JTrue;
+        if (fusedAt_ == i) {
+            fusedAt_ = ~0u;
+            ssaCondEdges(b, onTrue ? fusedCond_ : invert(fusedCond_));
+            return true;
+        }
+        const Reg x = valueReg(v);
         if (known(v, kVBool)) {
             a_.cmpI(x, std::int32_t(kTrue));
             ssaCondEdges(b, onTrue ? CE : CNE);
@@ -5676,6 +5681,43 @@ bool Baseline::ssaTypeofConst(std::uint32_t va, std::uint32_t vb, std::uint32_t*
     return true;
 }
 
+/// The jump that tests the boolean compare `i` makes, when nothing else can see that boolean: `JTrue` or `JFalse` ends the
+/// block of `i`, only moves and constants (which make no code) stand between, and no register that holds the boolean is
+/// live after the jump. `~0u` otherwise.
+std::uint32_t Baseline::ssaFusedJump(std::uint32_t i) const
+{
+    const ssa::Block& bl = ssa_->blocks[ssa_->blockOf[i]];
+    std::vector<std::uint16_t> holds{code_->code[i].a};
+    auto drop = [&](std::uint16_t r) { holds.erase(std::remove(holds.begin(), holds.end(), r), holds.end()); };
+    for (std::uint32_t j = opt::nextOf(*code_, i); j < bl.end; j = opt::nextOf(*code_, j)) {
+        const Ins& in = code_->code[j];
+        switch (in.opcode()) {
+        case Op::Nop:
+            break;
+        case Op::Mov: {
+            const bool from = std::find(holds.begin(), holds.end(), in.b) != holds.end();
+            drop(in.a);
+            if (from)
+                holds.push_back(in.a);
+            break;
+        }
+        case Op::LoadUndef: case Op::LoadNull: case Op::LoadTrue: case Op::LoadFalse: case Op::LoadInt: case Op::LoadK:
+            drop(in.a);
+            break;
+        case Op::JTrue: case Op::JFalse:
+            if (j != bl.last || !native_[j] || std::find(holds.begin(), holds.end(), in.a) == holds.end())
+                return ~0u;
+            for (std::uint16_t r : holds)
+                if (ssa::bitTest(bl.liveOut, r))
+                    return ~0u;
+            return j;
+        default:
+            return ~0u;
+        }
+    }
+    return ~0u;
+}
+
 bool Baseline::ssaEquals(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
@@ -5691,7 +5733,15 @@ bool Baseline::ssaEquals(std::uint32_t i)
         return !k.isNumber() && !k.isCell();
     };
     const bool pa = plainConst(va), pb = plainConst(vb);
+    const std::uint32_t jump = ssaFusedJump(i);
     auto finish = [&](Cond c) {
+        if (jump != ~0u) {
+            // No boolean is made: the jump takes the flags.
+            fusedAt_ = jump;
+            fusedCond_ = c;
+            name_[in.a] = ssa_->defBase[i];
+            return;
+        }
         a_.setccZx(c, RAX);
         a_.aluI32(1, RAX, std::int32_t(kFalse));
         ssaDef(i, kVBool | kVNotCell);

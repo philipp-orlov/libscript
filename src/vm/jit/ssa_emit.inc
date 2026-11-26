@@ -1309,6 +1309,12 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                 else if (!ssaGetGlobal(i))
                     a_.jmp(ssaExit(i));
                 break;
+            case Op::ArrayPush:
+                if (!native_[i])
+                    ssaGeneric(i, liveAfter[b][k]);
+                else
+                    ssaArrayPush(i);
+                break;
             case Op::InstanceOf:
                 if (JSObject* want = native_[i] ? ssaInstanceProto(i) : nullptr)
                     ssaInstanceOf(i, want);
@@ -1867,7 +1873,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             // `length` takes elements away.
             if (op == Op::PutElem || (op == Op::Call && viewOf_[i]))
                 forgetElems(true);
-            if (op == Op::PutElem)
+            if (op == Op::PutElem || op == Op::ArrayPush)
                 forgetElems(false);  // (one that goes without the runtime, `lirGone_`, forgets nothing else)
             if (op == Op::PutProp && code_->atoms[in.b] == vm_.atoms.length)
                 forgetElems(false);
@@ -4045,6 +4051,43 @@ CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
     return C;
 }
 
+/// An element of an array literal: stored behind the last while the array of values has room (it was made with room for
+/// the literal's elements). No room (a spread) or another kind of array leaves the code.
+void Baseline::ssaArrayPush(std::uint32_t i)
+{
+    const Ins& in = code_->code[i];
+    const std::uint32_t va = name_[in.a], vx = name_[in.b];
+    Label& bad = ssaExit(i);
+    loadValue(va, RAX);
+    if (!known(va, kVArray)) {
+        needObjV(va, RAX, bad);
+        a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+        a_.jcc(CNE, bad);
+        ssaKnow(va, std::uint8_t(kVObj | kVArray));
+    }
+    a_.mov32(RCX, mem(RAX, kArrayLength));
+    a_.alu32(7, RCX, mem(RAX, kArrayCapacity));
+    a_.jcc(CAE, bad);
+    loadValue(vx, RDX);
+    const bool number = known(vx, kVInt) || (!sval_[vx].isConst && sval_[vx].rep != kRepTagged) ||
+                        (sval_[vx].isConst && JSValue::raw(sval_[vx].bits).isNumber());
+    if (number) {
+        packAt(RAX, RCX);
+    } else if (mayBeCell(vx)) {
+        Label isNumber, stored;
+        a_.test(RDX, R14);
+        a_.jcc(CNE, isNumber);
+        retain(RDX);
+        a_.jmp(stored);
+        a_.bind(isNumber);
+        packAt(RAX, RCX);
+        a_.bind(stored);
+    }
+    a_.mov(RSI, mem(RAX, kArrayElems));
+    a_.mov(mem(RSI, RCX, 8), RDX);
+    a_.inc32(mem(RAX, kArrayLength));
+}
+
 /// `a instanceof F` done in place: `F` is a constant, an ordinary constructor whose `prototype` is an object in its usual
 /// slot (that object is returned), and no object has a `Symbol.hasInstance` or a proxy for a prototype (a first one
 /// moves the epoch).
@@ -4738,6 +4781,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::InitProp: return ssaAddFast(i);
     case Op::GetGlobal: return sval_[ssa_->defBase[i]].isConst || ssaGlobalFast(i);
     case Op::InstanceOf: return !failed && ssaInstanceProto(i) != nullptr;
+    case Op::ArrayPush: return !failed;
     case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox:
         return true;
     case Op::CheckInit:

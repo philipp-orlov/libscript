@@ -296,6 +296,9 @@ up to five shapes compares the shapes in turn and stores into the slot of the on
 only a store with one shape was done in place. Load reuse forgets the slot of each of the shapes. A value that may be
 a cell still runs as the template there: in place it needs every live value owned first.
 
+**An element of an array literal** (`ArrayPush`) is stored in place behind the last while the array has room; a
+literal is made with room for its elements. A spread that needs more leaves the code.
+
 **A remainder of numbers.** `a % b` whose place has made a double (`n % 0` is NaN), or whose int32 code has left once,
 is done in place: the integer remainder for two int32s (the first not below zero, the second above it), else `fmod`.
 `!x` in place takes doubles too (zero and NaN are false).

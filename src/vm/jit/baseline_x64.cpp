@@ -3938,6 +3938,7 @@ private:
     void ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow);
     JSObject* ssaInstanceProto(std::uint32_t i) const;
     void ssaInstanceOf(std::uint32_t i, JSObject* want);
+    void ssaArrayPush(std::uint32_t i);
     void ssaKnow(std::uint32_t v, std::uint8_t bits, std::uint32_t shape = 0);
     void ssaForgetShapes();
     void ssaResetFacts();

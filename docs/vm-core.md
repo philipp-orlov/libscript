@@ -291,6 +291,12 @@ wait for the caller's store. Baseline code has the same address for both ways in
 comes back in rax and in the caller's frame slot, and the caller goes on from rax. One call and return is about 90
 instructions; most of them write the frame record and check the callee.
 
+**A property read with more shapes than its cache.** A read whose code has left for a shape the cache does not hold
+is not given up to the template: the shapes of the cache are tested in place and anything else calls the runtime out
+of line (`ssaColdRead`). The misses are counted (in `CodeBlock::callProf`, which holds nothing else for a read); at
+256 the code makes way for a compile that takes the template there, which calls the runtime with less around the
+call. delta-blue's `c.execute()` over constraints of many shapes is the case that gains.
+
 **A property store under several shapes.** A store of a number whose cache holds writes to own data properties of
 up to five shapes compares the shapes in turn and stores into the slot of the one it finds (`ssaPutProp`); before,
 only a store with one shape was done in place. Load reuse forgets the slot of each of the shapes. A value that may be

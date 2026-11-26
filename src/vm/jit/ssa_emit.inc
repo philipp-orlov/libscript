@@ -952,6 +952,11 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     ssa_ = &g;
     base_ = base;
     ssaCtor_ = ssa::constructs(*code_) && vm_.deferred;
+    // (Where a read that has left its code counts its misses, `ssaColdRead`: made whole now, the code has its addresses.)
+    if (code_->callProf.empty())
+        for (std::uint32_t i = 0; i < n_ && code_->callProf.empty(); i += length(i))
+            if (code_->code[i].opcode() == Op::GetProp && i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed))
+                code_->callProf.assign(code_->code.size(), 0);
     if (n_ <= kPoolCode)
         a_.usePool();
     auto fail = [&]() -> Tier2Code* {
@@ -1862,7 +1867,8 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             // array may be the runtime's to find.)
             const bool quiet = native_[i] && !((op == Op::GetElem || op == Op::PutElem) && !(op == Op::GetElem && ssaPrivateSite(i)) &&
                                                ssaElemPlan(i, op == Op::PutElem, &kind) == 1 && !(op == Op::GetElem && ssaElemQuiet(i)) &&
-                                               !(op == Op::PutElem && lirGone_[i]));
+                                               !(op == Op::PutElem && lirGone_[i])) &&
+                               !(op == Op::GetProp && ssaColdRead(i));
             // A value kept past the register it was read into has no owner of its own: an allocation may scan the frames, and a
             // store of a counted frame may free what held it.
             if (!quiet || op == Op::New || op == Op::IterInit || op == Op::IterNext || op == Op::IterClose ||
@@ -2603,13 +2609,37 @@ bool Baseline::ssaGetterRead(const PolyEntry& pe, std::uint32_t* index) const
     return true;
 }
 
-std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i) const
+/// Whether the property read at `i`, whose code has left for a shape its cache does not hold (it has more shapes than
+/// the cache, or one the cache cannot hold), is still done in place for the shapes of the cache, with the runtime called
+/// out of line for the rest (`ssaGetProp`). Nothing leaves the code there then.
+bool Baseline::ssaColdRead(std::uint32_t i) const
+{
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    static const bool off = std::getenv("SSA_NOCOLDREAD") != nullptr;
+    if (off)
+        return false;
+#endif
+    if (ssaOn_ < 2 || code_->code[i].opcode() != Op::GetProp || !(i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)) ||
+        sval_[ssa_->defBase[i]].isConst)
+        return false;
+    // Not once the place has missed its cache often (counted where `callProf` holds nothing else, `ssaGetProp`): the
+    // template, which calls the runtime with less around the call, is faster there (WSL, Air).
+    if (i >= code_->callProf.size() || code_->callProf[i] >= kColdReadMisses / 4)
+        return false;
+    const std::vector<ReadEntry> es = ssaReadEntries(i, true);
+    for (const ReadEntry& e : es)
+        if (e.view)
+            return false;
+    return !es.empty();
+}
+
+std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i, bool failedToo) const
 {
     std::vector<ReadEntry> es;
     if (i + 1 >= n_ || code_->code[i + 1].opcode() != Op::Cache)
         return es;
     const std::uint16_t cacheId = code_->code[i + 1].a;
-    if (cacheId == kNoCache || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
+    if (cacheId == kNoCache || (!failedToo && i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
         return es;
     const InlineCache& ic = code_->caches[cacheId];
     if (ic.next != 0 || (ic.holder && !(ic.validity && ic.validity->valid)) ||
@@ -2645,10 +2675,77 @@ std::vector<Baseline::ReadEntry> Baseline::ssaReadEntries(std::uint32_t i) const
 bool Baseline::ssaGetProp(std::uint32_t i)
 {
     const Ins& in = code_->code[i];
-    const std::vector<ReadEntry> es = ssaReadEntries(i);
+    const bool coldRead = ssaColdRead(i);
+    const std::vector<ReadEntry> es = ssaReadEntries(i, coldRead);
     if (es.empty())
         return false;
     const std::uint32_t v = name_[in.b];
+    if (coldRead) {
+        // The shapes of the cache in place; any other receiver, and a holder that has changed, is the runtime's, out of
+        // line. What is known after holds on both ways back.
+        Label& cold = coldLabels_.emplace_back();
+        Label& join = coldLabels_.emplace_back();
+        const std::vector<std::uint32_t> frameBefore = frame_;
+        ssaColdCall(i, &helperThunk<jitGetProp>, curLiveAfter_, cold, join);
+        if (ssaFailed_)
+            return true;
+        const std::vector<std::uint32_t> frameAfter = frame_;
+        frame_ = frameBefore;
+        // A miss is counted; at `kColdReadMisses` the code makes way for a compile that takes the template here.
+        ssaExits_.push_back(SsaExit{i, name_, frame_, liveBefore_, Label{}});
+        ssaExits_.back().kind = 2;
+        Label& relearn = ssaExits_.back().label;
+        Label& miss = coldLabels_.emplace_back();
+        ssaStubs_.push_back([this, i, &miss, &cold, &relearn] {
+            a_.bind(miss);
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(&code_->callProf[i]));
+            a_.mov32(RDX, mem(RCX, 0));
+            a_.aluI32(0, RDX, 1);
+            a_.mov32(mem(RCX, 0), RDX);
+            a_.aluI32(7, RDX, std::int32_t(kColdReadMisses));
+            a_.jcc(CE, relearn);
+            a_.jmp(cold);
+        });
+        const Reg o = valueReg(v), d = defReg(i);
+        if (!known(v, kVObj)) {
+            a_.test(o, R15);
+            a_.jcc(CNE, cold);
+        }
+        std::vector<Label> at(es.size());
+        Label done;
+        for (std::size_t k = 0; k < es.size(); ++k) {
+            a_.cmpI32(mem(o, 0), std::int32_t(es[k].shape));
+            a_.jcc(CE, at[k]);
+        }
+        a_.jmp(miss);
+        for (std::size_t k = 0; k < es.size(); ++k) {
+            a_.bind(at[k]);
+            const ReadEntry& e = es[k];
+            if (e.holder || (e.absent && e.validity)) {
+                hold(e.validity);
+                a_.movImm(RCX, reinterpret_cast<std::uint64_t>(e.validity));
+                a_.cmpI32(mem(RCX, kValidityValid), 0);
+                a_.jcc(CE, cold);
+            }
+            if (e.absent) {
+                a_.movImm(d, kUndefined);
+            } else if (e.holder) {
+                holderRead(e.holder, e.index);
+                if (d != RAX)
+                    a_.mov(d, RAX);
+            } else {
+                a_.mov(d, slotMem(e.shape, e.index, o));
+            }
+            if (k + 1 < es.size())
+                a_.jmp(done);
+        }
+        a_.bind(done);
+        ssaDefIn(i, d, 0);
+        a_.bind(join);
+        frame_ = frameAfter;
+        ssaForgetShapes();
+        return true;
+    }
     if (const std::uint32_t d = ssa_->defBase[i]; sval_[d].isConst) {
         // A method that stays as it is: what is left is the test that the receiver still inherits it.
         Label& bad = ssaExit(i);
@@ -4765,7 +4862,7 @@ bool Baseline::ssaNative(std::uint32_t i)
         return !failed;
     };
     switch (op) {
-    case Op::GetProp: return !ssaReadEntries(i).empty() || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
+    case Op::GetProp: return !ssaReadEntries(i).empty() || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0 || ssaColdRead(i);
     case Op::New: return !ssaNewArrayPlan(i).isUndefined() || ssaNewPlan(i, nullptr);
     case Op::Call: return mathOf_[i] != nullptr || viewOf_[i] != nullptr || ssaCharCodeCallee(i) != nullptr;
     case Op::PutProp: {
@@ -5625,8 +5722,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         bool clean = true;
         std::vector<unsigned> writers(code_->nregs, 0);
         for (std::uint32_t i = hb.start; i < hb.loopEnd && clean; i = opt::nextOf(*code_, i)) {
-            if (!native_[i] || code_->code[i].opcode() == Op::PutGlobal)
-                clean = false;
+            if (!native_[i] || code_->code[i].opcode() == Op::PutGlobal || ssaColdRead(i))
+                clean = false;  // (a read that may call the runtime may run a getter)
             const opt::Effects e = ssa::effects(*code_, i);
             for (std::uint16_t w : e.wr)
                 if (w < code_->nregs)

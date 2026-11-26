@@ -133,7 +133,8 @@ void Baseline::lirBuild(const ssa::Graph& g, lir::Func& f)
             // iterator step are taken as the load elimination takes them.)
             const bool quiet = native_[i] && op != Op::GetElem && op != Op::PutElem && op != Op::New && op != Op::IterInit &&
                                op != Op::IterNext && op != Op::IterClose &&
-                               !((op == Op::PutProp || op == Op::InitProp) && code_->atoms[in.b] == vm_.atoms.length);
+                               !((op == Op::PutProp || op == Op::InitProp) && code_->atoms[in.b] == vm_.atoms.length) &&
+                               !ssaColdRead(i);
             n.reads = lir::kWorld;
             n.writes = quiet ? lir::kNoRegion : lir::kWorld;
             n.mayExit = true;

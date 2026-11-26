@@ -2726,7 +2726,9 @@ private:
     /// Whether the accessor of `pe` is a function that only reads a data property of `this` (or a private field), which objects
     /// of the entry's shape have: the property's index. The accessor is watched then.
     bool ssaGetterRead(const PolyEntry& pe, std::uint32_t* index) const;
-    std::vector<ReadEntry> ssaReadEntries(std::uint32_t i) const;
+    std::vector<ReadEntry> ssaReadEntries(std::uint32_t i, bool failedToo = false) const;
+    bool ssaColdRead(std::uint32_t i) const;
+    static constexpr std::uint32_t kColdReadMisses = 256;
     /// The value of the global `GetGlobal` `i` reads, when it is taken for a constant (and watched from now on).
     bool ssaGlobalConst(std::uint32_t i, std::uint64_t* bits);
     /// The method `GetProp` `i` always finds on a prototype, when it is taken for a constant (and watched from now on).

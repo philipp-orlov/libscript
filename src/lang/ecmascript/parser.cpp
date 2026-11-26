@@ -1849,6 +1849,22 @@ bool Parser::looksLikeArrow()
     // a division and the rest is a regular expression that does not lex as tokens, what it scanned was no parameter list.
     try {
         t = probe.next(true);
+        // What cannot start a parameter list ends the question here, and so does a name that no `,`, `)`, `=`, `:` or `?`
+        // follows: the scan to the closing `)` would lex a parenthesized function (a whole library, often) twice.
+        switch (t.type) {
+        case Tok::Function: case Tok::LParen: case Tok::Number: case Tok::StringLit: case Tok::Template:
+        case Tok::BigIntLit: case Tok::Regex:
+            return false;
+        case Tok::Identifier: {
+            Lexer second = probe;
+            const Tok after = second.next(false).type;
+            if (after != Tok::Comma && after != Tok::RParen && after != Tok::Assign && after != Tok::Colon &&
+                after != Tok::Question)
+                return false;
+            break;
+        }
+        default: break;
+        }
         while (t.type != Tok::Eof) {
             if (++lookahead_ > lookaheadLimit_)
                 fail("source is too deeply parenthesised to parse");

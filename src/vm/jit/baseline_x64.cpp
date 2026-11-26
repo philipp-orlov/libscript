@@ -1288,6 +1288,7 @@ constexpr std::int32_t kShapeId = std::int32_t(offsetof(Shape, id));
 constexpr std::int32_t kShapeAuxIds = std::int32_t(offsetof(Shape, auxIds));
 constexpr std::int32_t kShapeSlotHint = std::int32_t(offsetof(Shape, slotHint));
 constexpr std::int32_t kShapeFlags = std::int32_t(offsetof(Shape, flags));
+constexpr std::int32_t kShapeProto = std::int32_t(offsetof(Shape, proto));
 constexpr std::int32_t kGsGetter = std::int32_t(offsetof(GetterSetter, getter));
 constexpr std::int32_t kSuperHome = std::int32_t(offsetof(SuperCache, home));
 constexpr std::int32_t kSuperSlot = std::int32_t(offsetof(SuperCache, slot));
@@ -3931,6 +3932,8 @@ private:
     /// The callee a `Call` has always called, by its code's uid (`callProf`), when its frame can be pushed from constants.
     CodeBlock* ssaDirectCallee(std::uint32_t i) const;
     void ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow);
+    JSObject* ssaInstanceProto(std::uint32_t i) const;
+    void ssaInstanceOf(std::uint32_t i, JSObject* want);
     void ssaKnow(std::uint32_t v, std::uint8_t bits, std::uint32_t shape = 0);
     void ssaForgetShapes();
     void ssaResetFacts();

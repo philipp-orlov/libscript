@@ -648,6 +648,8 @@ void JSObject::addProperty(VM& vm, Key key, JSValue value, std::uint8_t attrs)
         Dictionary& d = *rare()->dict;
         vm.dictionaryGains(d);
         if (key == vm.atoms.symHasInstance) {
+            if (!vm.hasInstanceSeen)
+                vm.epochMoved();
             vm.hasInstanceSeen = true;
             vm.clearInstanceCache();
         }

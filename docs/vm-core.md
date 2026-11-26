@@ -291,6 +291,11 @@ wait for the caller's store. Baseline code has the same address for both ways in
 comes back in rax and in the caller's frame slot, and the caller goes on from rax. One call and return is about 90
 instructions; most of them write the frame record and check the callee.
 
+**`instanceof` in place.** `a instanceof F` with `F` a constant ordinary constructor whose `prototype` is an object in
+its usual slot is a walk up the prototypes of `a` by their shapes (`ssaInstanceOf`). The code checks that `F` has the
+shape and the `prototype` it was found with. It relies on no object having a `Symbol.hasInstance` and no proxy being a
+prototype: the first of either moves the epoch. A left operand that is a proxy or a function leaves the code.
+
 **The interrupt check in loops.** A back edge of SSA code looks at the host's flag only when the code was made while the
 host had an interrupt handler. Code made without one has no check there: each back edge is a poll site
 (`Tier2Code::pollSites`). When the host sets a handler, `VM::interruptArmed` writes a jump over the instruction at each

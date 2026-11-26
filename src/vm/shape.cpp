@@ -130,6 +130,8 @@ Shape* Shape::after(VM& vm, Key k, std::uint8_t a)
     n->attrs = a;
     n->keyBits = keyBits | keyBit(k);
     if (k == vm.atoms.symHasInstance) {
+        if (!vm.hasInstanceSeen)
+            vm.epochMoved();  // (optimized code walks prototypes for `instanceof` while there is none)
         vm.hasInstanceSeen = true;
         vm.clearInstanceCache();
     }
@@ -268,6 +270,7 @@ void VM::noteProtoChain(JSObject* proto)
     for (JSObject* o = proto; o; o = o->proto(*this))
         if (proxyOf(o)) {
             proxyAsProto = true;
+            epochMoved();  // (optimized code walks prototypes for `instanceof` while there is none)
             clearInstanceCache();
             return;
         }

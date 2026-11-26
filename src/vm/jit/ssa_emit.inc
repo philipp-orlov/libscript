@@ -1309,6 +1309,14 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                 else if (!ssaGetGlobal(i))
                     a_.jmp(ssaExit(i));
                 break;
+            case Op::InstanceOf:
+                if (JSObject* want = native_[i] ? ssaInstanceProto(i) : nullptr)
+                    ssaInstanceOf(i, want);
+                else if (native_[i])
+                    a_.jmp(ssaExit(i));
+                else
+                    ssaGeneric(i, liveAfter[b][k]);
+                break;
             case Op::Eq: case Op::Ne: case Op::StrictEq: case Op::StrictNe:
                 if (!native_[i])
                     ssaGeneric(i, liveAfter[b][k]);
@@ -3989,6 +3997,82 @@ CodeBlock* Baseline::ssaDirectCallee(std::uint32_t i) const
     return C;
 }
 
+/// `a instanceof F` done in place: `F` is a constant, an ordinary constructor whose `prototype` is an object in its usual
+/// slot (that object is returned), and no object has a `Symbol.hasInstance` or a proxy for a prototype (a first one
+/// moves the epoch).
+JSObject* Baseline::ssaInstanceProto(std::uint32_t i) const
+{
+    const Ins& in = code_->code[i];
+    if (ssaOn_ < 2 || in.opcode() != Op::InstanceOf || vm_.hasInstanceSeen || vm_.proxyAsProto)
+        return nullptr;
+    const std::uint32_t vc = name_[in.c];
+    if (vc == ssa::kNone || !sval_[vc].isConst || !isFunction(JSValue::raw(sval_[vc].bits)))
+        return nullptr;
+    auto* f = static_cast<JSFunction*>(asObject(JSValue::raw(sval_[vc].bits)));
+    if ((f->flags & (JSFunction::kNative | JSFunction::kLazyProps | JSFunction::kConstructor)) != JSFunction::kConstructor ||
+        !vm_.prototypeAt2(f) || !isObject(*f->slotAt(2)))
+        return nullptr;
+    return asObject(*f->slotAt(2));
+}
+
+/// The walk up the prototypes of the left operand, by their shapes, to `want` or to the end. The function is checked to
+/// be as it was found (its shape, so `prototype` is where it was, and that value); an operand that is a proxy or a
+/// function leaves the code.
+void Baseline::ssaInstanceOf(std::uint32_t i, JSObject* want)
+{
+    const Ins& in = code_->code[i];
+    const std::uint32_t va = name_[in.b];
+    auto* f = static_cast<JSFunction*>(asObject(JSValue::raw(sval_[name_[in.c]].bits)));
+    ssaEpochCheck(i);
+    Label& bad = ssaExit(i);
+    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(f));
+    a_.cmpI32(mem(RCX, 0), std::int32_t(f->h.shape));
+    a_.jcc(CNE, bad);
+    if (f->h.aux >= 3) {
+        a_.mov(RDX, mem(RCX, kObjInline + 16));
+    } else {
+        a_.mov(RSI, mem(RCX, kObjSlots));
+        a_.mov(RDX, mem(RSI, std::int32_t(8 * (2 - f->h.aux))));
+    }
+    a_.movImm(RSI, reinterpret_cast<std::uint64_t>(want));
+    a_.cmp(RDX, RSI);
+    a_.jcc(CNE, bad);
+    const bool never = sval_[va].isConst ? !JSValue::raw(sval_[va].bits).isCell() : sval_[va].rep != kRepTagged || known(va, kVNotCell);
+    if (never) {
+        a_.movImm(RAX, kFalse);
+        ssaDef(i, kVBool | kVNotCell);
+        return;
+    }
+    Label no, walk, done;
+    loadValue(va, RAX);
+    if (!known(va, kVObj)) {
+        a_.test(RAX, R15);
+        a_.jcc(CNE, no);
+        a_.cmpI8(mem(RAX, kHdrKind), kObjectKind);
+        a_.jcc(CNE, no);
+    }
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Proxy));
+    a_.jcc(CE, bad);
+    a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Function));
+    a_.jcc(CE, bad);
+    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(vm_.shapeTable()));
+    a_.bind(walk);
+    a_.mov32(RSI, mem(RAX, 0));
+    a_.aluI32(4, RSI, std::int32_t(kShapeIndexMask));
+    a_.mov(RSI, mem(RDI, RSI, 8));
+    a_.mov(RAX, mem(RSI, kShapeProto));
+    a_.test(RAX, RAX);
+    a_.jcc(CE, no);
+    a_.cmp(RAX, RDX);
+    a_.jcc(CNE, walk);
+    a_.movImm(RAX, kTrue);
+    a_.jmp(done);
+    a_.bind(no);
+    a_.movImm(RAX, kFalse);
+    a_.bind(done);
+    ssaDef(i, kVBool | kVNotCell);
+}
+
 /// `Call` of a function of code `C` (the frame written: the callee, `this` and the arguments in their slots), its frame
 /// pushed from constants; anything else goes to `slow`, the baseline call sequence. Comes back after the instruction.
 void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
@@ -4531,6 +4615,7 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
     case Op::InitProp: return ssaAddFast(i);
     case Op::GetGlobal: return sval_[ssa_->defBase[i]].isConst || ssaGlobalFast(i);
+    case Op::InstanceOf: return !failed && ssaInstanceProto(i) != nullptr;
     case Op::GetUpval: case Op::GetBox: case Op::PutUpval: case Op::PutBox:
         return true;
     case Op::CheckInit:
@@ -5277,7 +5362,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             }
             const Op op = in.opcode();
             if (native_[i] && (op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge || op == Op::Eq ||
-                               op == Op::Ne || op == Op::StrictEq || op == Op::StrictNe)) {
+                               op == Op::Ne || op == Op::StrictEq || op == Op::StrictNe || op == Op::InstanceOf)) {
                 vDef_[g.defBase[i]] = kVBool | kVNotCell;
                 vKnown_[g.defBase[i]] = kVBool | kVNotCell;
             }

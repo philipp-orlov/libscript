@@ -308,6 +308,11 @@ a cell still runs as the template there: in place it needs every live value owne
 **An element of an array literal** (`ArrayPush`) is stored in place behind the last while the array has room; a
 literal is made with room for its elements. A spread that needs more leaves the code.
 
+**Arithmetic that had not run.** A function is often compiled while it runs its first loop. A sum, difference,
+product or quotient further on that has no profile yet, and whose operands say nothing, runs as the template and
+counts down (`ssaImmature`, as a property read with an empty cache does); then the code makes way for a compile that
+knows it. Before, such code stayed with the template for good (the second loop of navier-stokes' `project`).
+
 **Sums whose uses truncate.** An int32 add or subtract whose every use truncates (`| 0`, `&`, a shift, another such
 add) wraps with no overflow check (`wrapOk_`). This also holds for a sum that the profile made a double (its place
 has made a number past int32) when its operands are int32s or such sums: `(a + b + c) | 0` is three int32 adds, where

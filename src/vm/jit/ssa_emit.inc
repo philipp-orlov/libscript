@@ -1382,9 +1382,18 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             case Op::ShlI: case Op::ShrI: case Op::Add: case Op::Sub: case Op::Mul: case Op::BitAnd: case Op::BitOr:
             case Op::BitXor: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Div: case Op::MulI: case Op::ModI:
             case Op::Mod: case Op::Neg: case Op::BitNot: case Op::Shl: case Op::Shr: case Op::UShr: case Op::UShrI:
-                if (!native_[i])
+                if (!native_[i]) {
+                    // A sum, difference or product that had not run when the code was made (nothing noted) and whose
+                    // operands say nothing either: the template for now; after it has run a while the code makes way
+                    // for a compile that knows it (as a property read with an empty cache does).
+                    // (Not when code is compiled almost at once, `tier2Threshold` of a test mode: nothing has run then.)
+                    if (ssaOn_ >= 2 && vm_.tier2Threshold >= 100 && code_->tier2Matured < 4 && i < code_->prof.size() &&
+                        code_->prof[i] == 0 &&
+                        (op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Div || op == Op::AddI || op == Op::SubI ||
+                         op == Op::MulI))
+                        ssaImmature(i);
                     ssaGeneric(i, liveAfter[b][k]);
-                else if (!(dblArith_[i] ? ssaArithF64(i) : ssaArith(i)))
+                } else if (!(dblArith_[i] ? ssaArithF64(i) : ssaArith(i)))
                     a_.jmp(ssaExit(i));
                 break;
             case Op::Nop:

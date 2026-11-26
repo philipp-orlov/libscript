@@ -5085,7 +5085,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                                    op == Op::Neg || op == Op::Div;
                 if (op == Op::GetElem && names[in.b] != ssa::kNone) {
                     const std::uint8_t pe = i < code_->prof.size() ? code_->prof[i] : 0;
-                    if (elemRep[i] == 1)
+                    // (Of a plain array only: a typed array's read makes what its kind makes, whatever another read
+                    // of the same value found; a place that met arrays and typed arrays may share its base with one.)
+                    ElemKind ek;
+                    if (elemRep[i] == 1 && ssaElemPlan(i, false, &ek) == 1)
                         elemReads.emplace_back(i, names[in.b]);
                     else if ((pe & 2) && !(pe & ~3))
                         baseMadeDoubles[names[in.b]] = 1;
@@ -7191,6 +7194,12 @@ bool Baseline::ssaGetElem(std::uint32_t i)
     case ElemKind::Uint16: a_.movzx16(d, place); break;
     case ElemKind::Int8: a_.movsx8(d, place); break;
     default: a_.movzx8(d, place); break;  // Uint8, Uint8Clamped
+    }
+    if (sval_[ssa_->defBase[i]].rep == kRepF64) {
+        // (The plan made the value a double, as for a phi of doubles: the int32 read, converted.)
+        a_.cvtsi2sd32(x, d);
+        ssaDefF64(i, x);
+        return true;
     }
     ssaDefI32(i, d);
     return true;

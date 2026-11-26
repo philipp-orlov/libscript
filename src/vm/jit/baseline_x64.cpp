@@ -3635,6 +3635,7 @@ public:
     bool ssaSpecLoad(std::uint32_t i);
     bool ssaSpecCall(std::uint32_t i);
     bool ssaElemQuiet(std::uint32_t i) const;
+    bool ssaElemMixed(std::uint32_t i) const;
     const char* ssaWhy_ = "";
     int ssaOn_ = 2;  ///< SCRIPT_VM_SSA: 1 every instruction through the frame, 2 the fast paths too
 

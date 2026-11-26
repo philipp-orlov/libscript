@@ -295,6 +295,11 @@ instructions; most of them write the frame record and check the callee.
 compares bits. A `switch` over such constants (Air's opcodes, 321 cases) is then two instructions and a constant for
 each case, where the general comparison was 412 bytes of code for each.
 
+**An element access that meets arrays and other objects.** A place that has met arrays of values and also other
+objects (a typed array of a kind the template does not do in place, a string, any object) reads and stores the array
+in place and calls the runtime out of line for the rest (`ssaElemMixed`). Before, such a place ran as the template.
+Not with typed arrays of doubles, int32s or bytes, which the template does in place.
+
 **`instanceof` in place.** `a instanceof F` with `F` a constant ordinary constructor whose `prototype` is an object in
 its usual slot is a walk up the prototypes of `a` by their shapes (`ssaInstanceOf`). The code checks that `F` has the
 shape and the `prototype` it was found with. It relies on no object having a `Symbol.hasInstance` and no proxy being a

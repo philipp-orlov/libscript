@@ -4973,7 +4973,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             const unsigned r = op == Op::GetElem ? code_->code[i].b : code_->code[i].a;
             const std::uint32_t v = bl.nameIn[r];
             if (!plan || v == ssa::kNone || ssa::bitTest(g.loopWrites[b], r) || sval_[v].isConst ||
-                (plan == 1 && ssaElemKinds(i) != elemprof::kArray))
+                (plan == 1 && (ssaElemKinds(i) != elemprof::kArray || ssaElemMixed(i))))
                 continue;
             std::vector<std::uint32_t>& list = plan == 1 ? loopGuards_[b].arrays : loopGuards_[b].typed;
             if (std::find(list.begin(), list.end(), v) == list.end())
@@ -5462,7 +5462,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 ElemKind kind;
                 if ((op == Op::GetElem || op == Op::PutElem) &&
                     (op == Op::GetElem ? code_->code[j].b : code_->code[j].a) == in.a &&
-                    ssaElemPlan(j, op == Op::PutElem, &kind) == 1 && ssaElemKinds(j) == elemprof::kArray &&
+                    ssaElemPlan(j, op == Op::PutElem, &kind) == 1 && ssaElemKinds(j) == elemprof::kArray && !ssaElemMixed(j) &&
                     std::find(loopGuards_[h].arrays.begin(), loopGuards_[h].arrays.end(), v) == loopGuards_[h].arrays.end())
                     loopGuards_[h].arrays.push_back(v);
             }
@@ -6316,6 +6316,8 @@ int Baseline::ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind)
     // Nothing noted: tier 1 reads a plain array in place without a note (only its slow path notes), as tier 2 knows.
     if (!(ep & ~(elemprof::kArray | elemprof::kIntArray | elemprof::kNumArray)))
         return 1;
+    if (ssaElemMixed(i))
+        return 1;  // an array of values in place, the rest by the runtime
     if (typedSiteKind(i, put, kind)) {
         switch (*kind) {
         case ElemKind::Int8: case ElemKind::Uint8: case ElemKind::Int16: case ElemKind::Uint16: case ElemKind::Int32:
@@ -6328,6 +6330,24 @@ int Baseline::ssaElemPlan(std::uint32_t i, bool put, ElemKind* kind)
         }
     }
     return 0;
+}
+
+/// Whether the element access at `i` has met arrays of values and other objects (typed arrays, anything): the array is
+/// done in place and the rest by the runtime, out of line. Nothing leaves the code for the kind of the object.
+bool Baseline::ssaElemMixed(std::uint32_t i) const
+{
+#if defined(SCRIPT_JIT_ENV_OVERRIDE)
+    static const bool off = std::getenv("SSA_NOMIXED") != nullptr;
+    if (off)
+        return false;
+#endif
+    const std::uint8_t ep = i < code_->elemProf.size() ? code_->elemProf[i] : 0;
+    const std::uint8_t plain = elemprof::kArray | elemprof::kIntArray | elemprof::kNumArray;
+    // (Not with a typed array of doubles, int32s or bytes: the template reads and writes those in place. pdfjs has two
+    // such places and was 1.5% slower with them taken in.)
+    return (ep & plain) == elemprof::kArray && (ep & ~plain) != 0 &&
+           !(ep & (elemprof::kFloat64 | elemprof::kInt32 | elemprof::kUint8)) &&
+           !(code_->code[i].opcode() == Op::GetElem && ssaPrivateSite(i));
 }
 
 /// The kinds of plain array (`elemprof`: of values, of int32s, of doubles) the element access at `i` has met; of values
@@ -6388,8 +6408,8 @@ Mem Baseline::ssaIndexed(Reg base, Reg index, std::uint8_t scale) const
 /// otherwise (a miss, a value its representation does not hold).
 bool Baseline::ssaElemQuiet(std::uint32_t i) const
 {
-    return ssaOn_ >= 2 && !(i < code_->prof.size() &&
-                            (code_->prof[i] & (opt::kProfFailed | opt::kProfNoSpec | opt::kProfWidened)));
+    return ssaOn_ >= 2 && !ssaElemMixed(i) &&
+           !(i < code_->prof.size() && (code_->prof[i] & (opt::kProfFailed | opt::kProfNoSpec | opt::kProfWidened)));
 }
 
 /// Whether the result of call `i` (through its template) is taken for an int32 or a number by what it has made: checked
@@ -6780,7 +6800,11 @@ bool Baseline::ssaGetElem(std::uint32_t i)
         Label& hole = coldLabels_.emplace_back();
         Label& missing = tagged ? hole : cold;
         const std::uint8_t kinds = ssaKindsOf(i, vb);
-        if (kinds == elemprof::kArray) {
+        if (ssaElemMixed(i) && !known(vb, kVArray)) {
+            needObjV(vb, o, bad);
+            a_.cmpI8(mem(o, kHdrCls), std::uint8_t(ObjClass::Array));
+            a_.jcc(CNE, cold);
+        } else if (kinds == elemprof::kArray) {
             ssaNeedArray(vb, o, ObjClass::Array, bad);
         } else {
             needObjV(vb, o, bad);
@@ -6969,7 +6993,11 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
         a_.mov32(RCX, RCX);
         loadValue(vb, RAX);
         const std::uint8_t kinds = ssaKindsOf(i, vb);
-        if (kinds == elemprof::kArray) {
+        if (ssaElemMixed(i) && !known(vb, kVArray)) {
+            needObjV(vb, RAX, out);
+            a_.cmpI8(mem(RAX, kHdrCls), std::uint8_t(ObjClass::Array));
+            a_.jcc(CNE, bad);
+        } else if (kinds == elemprof::kArray) {
             ssaNeedArray(vb, RAX, ObjClass::Array, out);
         } else {
             // An array of doubles or of int32s (never frozen, always extensible) takes what it holds, over an element or

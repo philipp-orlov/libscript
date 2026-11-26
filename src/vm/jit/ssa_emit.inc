@@ -4339,10 +4339,23 @@ void Baseline::ssaDirectCall(std::uint32_t i, CodeBlock* C, Label& slow)
     // (The frame record is past the top until the top moves: written early, it frees rax and rcx.)
     a_.mov(mem(RSI, kFrameCode), RCX);
     a_.mov(mem(RSI, kFrameFn), RAX);
-    a_.mov32(RAX, mem(R12, kVmTicks));
-    a_.aluI32(5, RAX, 1);
-    a_.jcc(CBE, slow);
-    a_.mov32(mem(R12, kVmTicks), RAX);
+    if (Asm::kPatches && !*vm_.interruptSet) {
+        // The host has no interrupt handler: the call counts nothing down (a load and a store of one word on each
+        // call). When the host sets one, a jump out is written over the instruction that comes next
+        // (`VM::interruptArmed`, as at a loop's back edge): the call is made by the interpreter, and this code makes
+        // way for code that counts (exit kind 7).
+        ssaExits_.push_back(SsaExit{i, name_, frame_, liveBefore_, Label{}});
+        ssaExits_.back().kind = 7;
+        if ((!epochSites_.empty() && epochSites_.back().first == a_.here()) ||
+            (!pollSites_.empty() && pollSites_.back().first == a_.here()))
+            a_.nop();  // (that instruction is another site's)
+        pollSites_.emplace_back(a_.here(), &ssaExits_.back().label);
+    } else {
+        a_.mov32(RAX, mem(R12, kVmTicks));
+        a_.aluI32(5, RAX, 1);
+        a_.jcc(CBE, slow);
+        a_.mov32(mem(R12, kVmTicks), RAX);
+    }
     // Caller registers the callee's frame covers past the arguments: a plain one is overwritten, a cell goes the long way.
     const unsigned window = code_->nregs > base + 1 ? code_->nregs - (base + 1) : 0;
     // (A deferred frame has nothing to let go of there. Past the callee's registers, a call it makes may reach them.)

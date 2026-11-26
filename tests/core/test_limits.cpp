@@ -345,6 +345,14 @@ TEST(aHandlerSetAfterALoopWasCompiledStillStopsIt)
     CHECK_EQ(ctx.eval(work, "again.js").toDouble(), before);
     ctx.setInterruptHandler(nullptr);
     CHECK_EQ(ctx.eval(work, "again2.js").toDouble(), before);
+    // Calls with no loop around them: a direct call of optimized code counts nothing down either while there is no
+    // handler, and leaves its code once there is one.
+    Context ctx3;
+    ctx3.eval("function a(n) { return n < 2 ? n : b(n - 1) + b(n - 2); } function b(n) { return n < 2 ? n : a(n - 1) + a(n - 2) + 0; }"
+              "var w = 0; for (var k = 0; k < 40; k++) w += a(18);", "warm3.js");
+    long calls3 = 0;
+    ctx3.setInterruptHandler([&] { return ++calls3 > 20; });
+    CHECK(outcome(ctx3, "a(40)", "deep.js") == ErrorCode::Interrupted);
     // A handler set from inside a loop that is running.
     Context ctx2;
     long calls2 = 0;

@@ -347,7 +347,8 @@ prototype: the first of either moves the epoch. A left operand that is a proxy o
 host had an interrupt handler. Code made without one has no check there: each back edge is a poll site
 (`Tier2Code::pollSites`). When the host sets a handler, `VM::interruptArmed` writes a jump over the instruction at each
 site; the loop then leaves for the baseline code at its head (exit kind 7), which counts down to the handler, and the
-next compile makes code that looks. This takes four instructions and two loads out of each round of a loop. Code
+next compile makes code that looks. A direct call is such a site too: it counts no ticks down while the host has
+no handler. This takes four instructions and two loads out of each round of a loop. Code
 that cannot be patched (x86-64) always looks.
 
 **A value across calls.** Every instruction the SSA tier does through a template or a call clobbers its registers, so

@@ -3544,7 +3544,13 @@ void Baseline::ssaNewArray(std::uint32_t i, const ssa::Bits& liveAfter)
         release(RDI);
     }
     a_.mov(RAX, R(in.a));
-    ssaDef(i, table || !values ? kVObj : kVObj | kVArray);
+    // That it is an array of values is known here, but is no fact of the value's definition (`vDef_`): the kind an
+    // array is made of follows what its place has learned (`VM::newFreshArray`), so an array made at this place by
+    // older code or by the baseline code, which comes in at a loop's head, may be of int32s or of doubles. The way in
+    // checks what is known, not what definitions say.
+    ssaDef(i, kVObj);
+    if (!table && values)
+        ssaKnow(ssa_->defBase[i], kVArray);
     frame_[in.a] = ssa_->defBase[i];
 }
 

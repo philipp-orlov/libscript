@@ -703,6 +703,15 @@ bool installTier2(VM* vm, CodeBlock* code)
         }
         t->listed = vm;
     }
+    if (!t->pollSites.empty()) {
+        try {
+            vm->pollCodes.push_back(t);
+        } catch (...) {
+            releaseTier2(t, vm);
+            return false;
+        }
+        t->pollListed = vm;
+    }
     t->older = code->tier2;
     code->tier2 = t;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
@@ -2725,6 +2734,7 @@ private:
     void ssaEpochCheck(std::uint32_t i);
     void ssaEpochSite(Label& bad);
     std::vector<std::pair<std::int32_t, Label*>> epochSites_;
+    std::vector<std::pair<std::int32_t, Label*>> pollSites_;  ///< `Tier2Code::pollSites`, as they are made
     bool epochSeen_ = false;
     /// The typed array that value `v` is known to be, of kind `kind`, whose memory stays where it is; null when not known.
     JSTypedArray* ssaKnownTyped(std::uint32_t v, ElemKind kind) const;
@@ -7767,6 +7777,10 @@ void releaseTier2(Tier2Code* code, VM* vm) noexcept
         }
         if (code->listed) {
             std::vector<Tier2Code*>& list = code->listed->epochCodes;
+            list.erase(std::find(list.begin(), list.end(), code));
+        }
+        if (code->pollListed) {
+            std::vector<Tier2Code*>& list = code->pollListed->pollCodes;
             list.erase(std::find(list.begin(), list.end(), code));
         }
         CodeSpan span;

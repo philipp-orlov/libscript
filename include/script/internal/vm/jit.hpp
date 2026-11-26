@@ -89,6 +89,10 @@ struct Tier2Code
     /// Where it relies on that: the offset of an instruction, and of the way out a jump there goes to once the epoch moves.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> epochSites;
     VM* listed = nullptr;                                         ///< whose `epochCodes` it is in
+    /// Where a loop of it goes round with no look at the host's interrupt flag (made while the host had no interrupt
+    /// handler): the offset of an instruction, and of the way out a jump there goes to once the host sets a handler.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pollSites;
+    VM* pollListed = nullptr;                                     ///< whose `pollCodes` it is in
     std::uint8_t* rx = nullptr;
     std::size_t bytes = 0;
     void* entry = nullptr;                                        ///< the function's entry, as the baseline code's

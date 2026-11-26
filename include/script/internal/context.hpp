@@ -268,7 +268,8 @@ struct ContextImpl
 
     std::function<bool()> interrupt;
     /// Nonzero while `interrupt` is set: what optimized loops look at on every back edge (a load, where counting down to
-    /// the next look at the handler would be a load and a store each time round).
+    /// the next look at the handler would be a load and a store each time round). A loop of the vm core's SSA code
+    /// made while it was zero does not look; `interruptArmed` makes such loops leave.
     std::uint32_t interruptSet = 0;
     /// Whether the handler says to stop. So does its having come into the context for anything but a look: running code has
     /// what it knows about its objects in registers, and cannot go on from a change made under it.
@@ -301,6 +302,9 @@ struct ContextImpl
     /// The new core's runtime; `Error(NotSupported)` in a build without it.
     vm::VM& vm();
     vm::VM* vmIfAny() const noexcept;
+    /// `interrupt` has been set: tells the vm core, whose optimized loops look at `interruptSet` only when they were
+    /// made while it was set.
+    void interruptArmed() noexcept;
     /// The core this context runs the dynamic languages on, never `Auto`.
     Context::Options::Core core() const noexcept;
     typed::Runtime* typedIfAny() const noexcept;

@@ -2030,6 +2030,8 @@ void Context::setInterruptHandler(std::function<bool()> handler)
     Lock lock(*this);
     impl_->interrupt = std::move(handler);
     impl_->interruptSet = impl_->interrupt ? 1u : 0u;
+    if (impl_->interruptSet)
+        impl_->interruptArmed();
 }
 
 void Context::setPrintHandler(std::function<void(std::string_view, bool)> handler)

@@ -473,6 +473,10 @@ struct VM : EngineRuntime
     std::uint32_t globalEpoch = 0;
     /// Moves it: optimized code that relies on it (`epochCodes`) is made to leave where it next would.
     void epochMoved() noexcept;
+    /// The host has set an interrupt handler: the loops of optimized code made without a look at the flag
+    /// (`Tier2Code::pollSites`) leave for the baseline code, which counts down to the handler.
+    void interruptArmed() noexcept;
+    std::vector<Tier2Code*> pollCodes;
     std::vector<Tier2Code*> epochCodes;
     /// What is known of the global object's slots, a byte for each of the first `kWatchable`: how often it was written
     /// (`kWatchWrites`, as far as that was seen), that optimized code takes its value for a constant (`kWatched`: the next

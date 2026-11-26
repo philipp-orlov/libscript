@@ -324,6 +324,40 @@ TEST(anInterruptHandlerThatEntersTheContextStopsNativeLoops)
 }
 #endif
 
+#if SCRIPT_LANG_JAVASCRIPT
+TEST(aHandlerSetAfterALoopWasCompiledStillStopsIt)
+{
+    // Optimized loops made while the host has no handler do not look at its flag: setting one makes them leave.
+    // (The counters wrap below int32, so no loop leaves its code for an overflow.)
+    Context ctx;
+    const char* defs = "function spin(n) { var s = 0; for (var i = 0; i != n; i = (i + 1) & 1023) s = (s + i) | 0; return s; }"
+                       "function nest(n) { var s = 0; for (var i = 0; i != n; i = (i + 1) & 1023) for (var j = 0; j < 3; j++) s = (s + j) | 0; return s; }";
+    const char* work = "var t = 0; for (var k = 0; k < 20000; k++) t += spin(1000) + nest(300); t";
+    ctx.eval(defs, "defs.js");
+    const double before = ctx.eval(work, "warm.js").toDouble();
+    long calls = 0;
+    ctx.setInterruptHandler([&] { return ++calls > 50; });
+    CHECK(outcome(ctx, "spin(-1)", "forever.js") == ErrorCode::Interrupted);
+    calls = 0;
+    CHECK(outcome(ctx, "nest(-1)", "forever2.js") == ErrorCode::Interrupted);
+    // The same code goes on to work, with the handler and without it.
+    calls = -100000000;
+    CHECK_EQ(ctx.eval(work, "again.js").toDouble(), before);
+    ctx.setInterruptHandler(nullptr);
+    CHECK_EQ(ctx.eval(work, "again2.js").toDouble(), before);
+    // A handler set from inside a loop that is running.
+    Context ctx2;
+    long calls2 = 0;
+    ctx2.global().set("arm", ctx2.function("arm", [&](script::CallInfo&) {
+        ctx2.setInterruptHandler([&] { return ++calls2 > 20; });
+        return script::Value::undefined();
+    }));
+    CHECK(outcome(ctx2, "function run() { var s = 0, k = 0; for (var i = 0; ; i = (i + 1) & 1023) { s = (s + i) | 0; "
+                        "k = (k + 1) & 0xfffffff; if (k == 3000000) arm(); } } run()",
+                  "arm.js") == ErrorCode::Interrupted);
+}
+#endif
+
 // ------------------------------------------------------- memory limit ---
 
 #if SCRIPT_LANG_JAVASCRIPT

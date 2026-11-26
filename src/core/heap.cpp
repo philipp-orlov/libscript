@@ -902,6 +902,14 @@ vm::VM& ContextImpl::vm()
 #endif
 }
 
+void ContextImpl::interruptArmed() noexcept
+{
+#if SCRIPT_VM
+    if (vm::VM* v = vmIfAny())
+        v->interruptArmed();
+#endif
+}
+
 vm::VM* ContextImpl::vmIfAny() const noexcept
 {
 #if SCRIPT_VM

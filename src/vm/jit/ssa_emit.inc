@@ -800,6 +800,18 @@ void Baseline::ssaEdge(std::uint32_t from, std::uint32_t to, bool last)
         ssaEdgeMoves(from, to);
         a_.jmp(blockLabel_[to]);
     };
+    if (Asm::kPatches && !*vm_.interruptSet) {
+        // The host has no interrupt handler: no look at its flag. When it sets one, a jump is written over the
+        // instruction that comes next (`VM::interruptArmed`): out to the baseline code at the loop's head, which counts
+        // down to the handler, and this code makes way for code that looks (exit kind 7).
+        ssaExits_.push_back(SsaExit{tb.start, name_, frame_, tb.liveIn, Label{}});
+        ssaExits_.back().kind = 7;
+        if (!epochSites_.empty() && epochSites_.back().first == a_.here())
+            a_.nop();  // (that instruction is an epoch check's)
+        pollSites_.emplace_back(a_.here(), &ssaExits_.back().label);
+        finish();
+        return;
+    }
     Label tick;
     a_.mov(RDX, mem(R12, kVmInterruptSet));
     a_.cmpI32(mem(RDX, 0), 0);
@@ -1553,6 +1565,8 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     t->ctor = ssaCtor_;
     for (const auto& [at, bad] : epochSites_)
         t->epochSites.emplace_back(std::uint32_t(at), std::uint32_t(bad->pos));
+    for (const auto& [at, out] : pollSites_)
+        t->pollSites.emplace_back(std::uint32_t(at), std::uint32_t(out->pos));
     t->validities = std::move(validities_);
     t->held = std::move(held_);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)

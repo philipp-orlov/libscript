@@ -430,11 +430,16 @@ void VM::boxWritten(Box* box) noexcept
 
 namespace {
 
-/// Writes, over each epoch site of `t`, a jump to its exit.
+/// Writes, over each of `sites` in the code at `rx`, a jump to its exit.
+void patchSites(std::uint8_t* rx, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& sites) noexcept
+{
+    for (const auto& [at, to] : sites)
+        jit::patchCode(rx + at, 0x14000000u | ((std::uint32_t(std::int32_t(to - at) >> 2)) & 0x03FFFFFFu));
+}
+
 void patchEpochSites(Tier2Code* t) noexcept
 {
-    for (const auto& [at, to] : t->epochSites)
-        jit::patchCode(t->rx + at, 0x14000000u | ((std::uint32_t(std::int32_t(to - at) >> 2)) & 0x03FFFFFFu));
+    patchSites(t->rx, t->epochSites);
 }
 
 }  // namespace
@@ -447,6 +452,15 @@ void VM::epochMoved() noexcept
         t->listed = nullptr;
     }
     epochCodes.clear();
+}
+
+void VM::interruptArmed() noexcept
+{
+    for (Tier2Code* t : pollCodes) {
+        patchSites(t->rx, t->pollSites);
+        t->pollListed = nullptr;
+    }
+    pollCodes.clear();
 }
 
 void VM::functionMade(CodeBlock* code, JSFunction* f) noexcept

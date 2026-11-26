@@ -299,6 +299,11 @@ a cell still runs as the template there: in place it needs every live value owne
 **An element of an array literal** (`ArrayPush`) is stored in place behind the last while the array has room; a
 literal is made with room for its elements. A spread that needs more leaves the code.
 
+**Sums whose uses truncate.** An int32 add or subtract whose every use truncates (`| 0`, `&`, a shift, another such
+add) wraps with no overflow check (`wrapOk_`). This also holds for a sum that the profile made a double (its place
+has made a number past int32) when its operands are int32s or such sums: `(a + b + c) | 0` is three int32 adds, where
+it was three double adds with a conversion for each term.
+
 **A remainder of numbers.** `a % b` whose place has made a double (`n % 0` is NaN), or whose int32 code has left once,
 is done in place: the integer remainder for two int32s (the first not below zero, the second above it), else `fmod`.
 `!x` in place takes doubles too (zero and NaN are false).

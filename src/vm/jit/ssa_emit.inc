@@ -5179,6 +5179,10 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         // exact one is (below 2^53).
         constexpr double kI32Lo = -2147483648.0, kI32Hi = 2147483647.0, kExact = 9007199254740992.0;
         std::vector<std::pair<double, double>> range(nv, {kI32Lo, kI32Hi});
+        // A sum or difference made in doubles (its place has made a number past int32) whose operands are int32s, or
+        // such sums: a candidate for a wrapped int32 add, when every use truncates (`(a + b + c) | 0`).
+        std::vector<std::uint8_t> cand(nv, 0);
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> candOps(nv, {ssa::kNone, ssa::kNone});
         {
             auto rangeOf = [&](std::uint32_t v) -> std::pair<double, double> {
                 if (v == ssa::kNone)
@@ -5208,7 +5212,16 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                     }
                     const opt::Effects e = ssa::effects(*code_, i);
                     const std::uint32_t d = g.defBase[i];
-                    if (d != ssa::kNone && e.wr.size() == 1 && !sval_[d].isConst && sval_[d].rep == kRepI32) {
+                    if (d != ssa::kNone && e.wr.size() == 1 && !sval_[d].isConst && sval_[d].rep == kRepF64 && dblArith_[i] &&
+                        (op == Op::Add || op == Op::Sub || op == Op::AddI || op == Op::SubI)) {
+                        const bool two = op == Op::Add || op == Op::Sub;
+                        auto intish = [&](std::uint32_t v) { return isInt(v) || (v != ssa::kNone && cand[v]); };
+                        if (intish(names[in.b]) && (!two || intish(names[in.c]))) {
+                            cand[d] = 1;
+                            candOps[d] = {names[in.b], two ? names[in.c] : ssa::kNone};
+                        }
+                    }
+                    if (d != ssa::kNone && e.wr.size() == 1 && !sval_[d].isConst && (sval_[d].rep == kRepI32 || cand[d])) {
                         const std::int32_t imm = op == Op::LoadInt ? std::int32_t(in.imm()) : std::int32_t(std::int16_t(in.c));
                         auto two = [&](auto f) {
                             const auto x = rangeOf(names[in.b]), y = rangeOf(names[in.c]);
@@ -5286,6 +5299,8 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             const ssa::Value& sv = g.values[v];
             if (sv.kind == ssa::Value::Def && !sval_[v].isConst && sval_[v].rep == kRepI32 && intArith_[sv.at] &&
                 isWrapOp(code_->code[sv.at].opcode()) && range[v].first > -kExact && range[v].second < kExact)
+                wrapOk_[v] = 1;
+            if (cand[v] && range[v].first > -kExact && range[v].second < kExact)
                 wrapOk_[v] = 1;
             ElemKind kind;
             if (sv.kind == ssa::Value::Def && !sval_[v].isConst && sval_[v].rep == kRepF64 && code_->code[sv.at].opcode() == Op::GetElem &&
@@ -5365,11 +5380,19 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                             changed = true;
                             break;
                         }
+            // (A candidate with an operand that stays a double is a double too.)
+            for (std::uint32_t v = 0; v < nv; ++v)
+                if (wrapOk_[v] && cand[v])
+                    for (std::uint32_t o : {candOps[v].first, candOps[v].second})
+                        if (o != ssa::kNone && cand[o] && !wrapOk_[o]) {
+                            wrapOk_[v] = 0;
+                            changed = true;
+                        }
         }
         for (std::uint32_t v = 0; v < nv; ++v)
             if (wrapOk_[v] && sval_[v].rep == kRepF64) {
                 sval_[v].rep = kRepI32;
-                intArith_[g.values[v].at] = code_->code[g.values[v].at].opcode() == Op::Div;
+                intArith_[g.values[v].at] = code_->code[g.values[v].at].opcode() == Op::Div || cand[v];
                 dblArith_[g.values[v].at] = 0;
                 vDef_[v] = vKnown_[v] = kVInt | kVNotCell;
             }

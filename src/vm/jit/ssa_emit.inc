@@ -405,10 +405,13 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
         std::fprintf(stderr, "\n");
     }
 #endif
+    // A direct call in a deferred frame comes back with its result in rax and in the frame: it joins after the load below.
+    Label haveResult;
+    bool joined = false;
     if (CodeBlock* C = ssaDirectCallee(i)) {
         Label slow;
         ssaDirectCall(i, C, slow);
-        a_.jmp(at_[i + length(i)]);
+        a_.jmp(def_ ? haveResult : at_[i + length(i)]);
         a_.bind(slow);
     }
     emit(i);
@@ -426,6 +429,10 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
             frame_[r] = v;
             if (hasLoc(v)) {
                 a_.mov(RAX, R(r));
+                if (k == 0 && def_) {
+                    a_.bind(haveResult);
+                    joined = true;
+                }
                 if (sval_[v].rep == kRepTagged) {
                     storeTagged(v, RAX);
                     continue;
@@ -451,6 +458,8 @@ void Baseline::ssaGeneric(std::uint32_t i, const ssa::Bits& liveAfter)
                 }
             }
         }
+    if (!joined)
+        a_.bind(haveResult);
 }
 
 /// The phi moves of edge `from` -> `to`: each phi of `to` gets its input from `from` (converted to the phi's

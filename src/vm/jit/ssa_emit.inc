@@ -4520,6 +4520,16 @@ bool Baseline::ssaArithF64(std::uint32_t i)
     const Op op = in.opcode();
     const bool rr = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Div;
     Label& bad = ssaExit(i);
+    if (op == Op::UShrI) {
+        // `x >>> 0`: ToInt32 of the operand, read as unsigned.
+        const std::uint32_t def = ssa_->defBase[i];
+        const int x = sval_[def].reg >= 0 && sval_[def].rep == kRepF64 ? sval_[def].reg : 0;
+        loadToInt32(name_[in.b], RAX, bad);
+        a_.mov32(RAX, RAX);
+        a_.cvtsi2sd64(x, RAX);
+        ssaDefF64(i, x);
+        return true;
+    }
     if (op == Op::Neg) {
         const std::uint32_t def = ssa_->defBase[i];
         const int x = sval_[def].reg >= 0 && sval_[def].rep == kRepF64 ? sval_[def].reg : 0;
@@ -4725,6 +4735,11 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         switch (op) {
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::AddI: case Op::SubI: case Op::MulI: case Op::Neg:
             if ((prof & 2) && !(prof & 8))
+                dblArith_[i] = 1;
+            break;
+        case Op::UShrI:
+            // `x >>> 0` that has made numbers past int32: the unsigned 32-bit value, as a double.
+            if (!(code_->code[i].c & 31) && (prof & 2) && !(prof & 8))
                 dblArith_[i] = 1;
             break;
         default:

@@ -291,6 +291,9 @@ wait for the caller's store. Baseline code has the same address for both ways in
 comes back in rax and in the caller's frame slot, and the caller goes on from rax. One call and return is about 90
 instructions; most of them write the frame record and check the callee.
 
+**`x >>> 0`.** Where it has made numbers past int32, it is done in place: ToInt32 of the operand, read as unsigned,
+into a double. Before, it ran as the template and called the runtime.
+
 **Strict equality against a constant symbol or object.** A jump on `x === K` where `K` is a constant symbol or object
 compares bits. A `switch` over such constants (Air's opcodes, 321 cases) is then two instructions and a constant for
 each case, where the general comparison was 412 bytes of code for each.

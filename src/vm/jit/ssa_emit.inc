@@ -1657,6 +1657,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
     {
         std::uint32_t obj, shape, index, value;
     };
+    constexpr std::uint32_t kElem = ~0u;  // in `shape`: an element, `index` the value of its index
     std::vector<std::vector<Known>> out(nb);
     std::vector<std::uint8_t> done(nb, 0);
     std::vector<std::uint32_t> alias(g.values.size());
@@ -1668,6 +1669,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
         return v;
     };
     bool any = false;
+    std::vector<std::uint32_t> toNumericOf(n_, ssa::kNone);  // per `ToNumeric` of a number: the value it read
     for (std::uint32_t b = 1; b < nb; ++b) {
         const ssa::Block& bl = g.blocks[b];
         if (!bl.reached)
@@ -1716,6 +1718,26 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                 }
             }
         };
+        // The value an index is: `ToNumeric` of a number is that number (the old value of `i++`).
+        auto same = [&](std::uint32_t v) {
+            while (v != ssa::kNone && g.values[v].kind == ssa::Value::Def && code_->code[g.values[v].at].opcode() == Op::ToNumeric) {
+                const std::uint32_t from = toNumericOf[g.values[v].at];
+                if (from == ssa::kNone)
+                    break;
+                v = from;
+            }
+            return v;
+        };
+        auto forgetElems = [&](bool typed) {
+            for (std::size_t x = 0; x < k.size();) {
+                if (typed ? k[x].shape < kElem && k[x].shape >= kElem - 32 : k[x].shape == kElem) {
+                    k[x] = k.back();
+                    k.pop_back();
+                } else {
+                    ++x;
+                }
+            }
+        };
         for (std::uint32_t i = bl.start; i < bl.end; i = opt::nextOf(*code_, i)) {
             const Ins& in = code_->code[i];
             const Op op = in.opcode();
@@ -1727,8 +1749,16 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                                                ssaElemPlan(i, op == Op::PutElem, &kind) == 1 && !(op == Op::GetElem && ssaElemQuiet(i)));
             // A value kept past the register it was read into has no owner of its own: an allocation may scan the frames, and a
             // store of a counted frame may free what held it.
-            if (!quiet || op == Op::New || (!def_ && (op == Op::PutProp || op == Op::PutUpval || op == Op::PutBox || op == Op::PutElem)))
+            if (!quiet || op == Op::New || op == Op::IterInit || op == Op::IterNext || op == Op::IterClose ||
+                (!def_ && (op == Op::PutProp || op == Op::PutUpval || op == Op::PutBox || op == Op::PutElem)))
                 k.clear();
+            // An element: of a plain array (`kElem`), of a typed array of a kind (`kElem` less one, less the kind). A store
+            // into a typed array, or through a view, may change an element of any typed array (they share buffers); a new
+            // `length` takes elements away.
+            if (op == Op::PutElem || (op == Op::Call && viewOf_[i]))
+                forgetElems(true);
+            if (op == Op::PutProp && code_->atoms[in.b] == vm_.atoms.length)
+                forgetElems(false);
             std::uint32_t found = ssa::kNone, obj = ssa::kNone, shape = 0, index = 0;
             bool read = false;
             if (native_[i] && op == Op::GetProp && !sval_[g.defBase[i]].isConst) {
@@ -1746,6 +1776,16 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                 read = true;
                 obj = names[in.b];
                 shape = 1;
+            } else if (native_[i] && op == Op::GetElem && !ssaPrivateSite(i)) {
+                // The same element of the same array, with no store between: the same value (the first read left the code
+                // if it found no array, no int32 index or no element).
+                const int plan = ssaElemPlan(i, false, &kind);
+                if (plan == 2 || (plan == 1 && ssaElemQuiet(i))) {
+                    read = true;
+                    obj = names[in.b];
+                    shape = plan == 1 ? kElem : kElem - 1 - std::uint32_t(kind);
+                    index = same(names[in.c]);
+                }
             }
             if (read)
                 found = find(obj, shape, index);
@@ -1787,6 +1827,9 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                 names[in.a] = names[in.b];
                 continue;
             }
+            if (op == Op::ToNumeric && native_[i] && names[in.b] != ssa::kNone &&
+                (sval_[names[in.b]].rep == kRepI32 || sval_[names[in.b]].rep == kRepF64))
+                toNumericOf[i] = names[in.b];
             for (std::size_t w = 0; w < e.wr.size(); ++w)
                 names[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
             if (read)

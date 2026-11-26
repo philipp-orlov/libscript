@@ -1894,7 +1894,7 @@ private:
     /// The assembler's spare registers given to promotions so far; the last four spare integer registers are theirs
     /// (the first ones are in the pool of the typed variables, opt_analysis.cpp).
     int intPromos = 0, doublePromos = 0;
-    static constexpr int kIntPromoRegs = Asm::kExtraGpr >= 4 ? 4 : 0;
+    static constexpr int kIntPromoRegs = Asm::kExtraGpr >= 6 ? 4 : 0;
     /// The promoted value into xmm`x`, and from it.
     void promoLoad(int x, const LoopPromo& lp)
     {
@@ -3453,8 +3453,9 @@ private:
     std::vector<std::uint32_t> loopLast_;                                ///< per cached loop header: its last block
     std::vector<std::pair<std::uint32_t, std::int8_t>> cacheSaved_;
     std::uint32_t cacheEnd_ = 0;
-    /// The SSA code keeps values in R21 and R22 (arm64 x25, x26), which other optimized code may keep its own in: saved
-    /// in two slots (from `keptSlot_`) where the code is entered, and put back on each way out.
+    /// The SSA code keeps values in R21 and R22 (arm64 x25, x26), which the code that called it may keep its own in
+    /// across the call: saved in two slots (from `keptSlot_`) where the code is entered, and put back on each way out. No
+    /// other code writes them, so a value there stays across calls, helpers and templates (`ssaPlan`).
     bool usesKept_ = false;
     std::int32_t keptSlot_ = 0;
     void ssaKeptSave()

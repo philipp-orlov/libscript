@@ -5247,6 +5247,58 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     };
     std::vector<Active> active;
     std::int32_t slots = 0;
+    auto crosses = [&](std::uint32_t v) {
+        const auto c = std::upper_bound(clob.begin(), clob.end(), first[v]);
+        return c != clob.end() && *c < last[v];
+    };
+    // R21 and R22 come back from every call and helper as they went in (this code saves them where it is entered, and no
+    // other code writes them). The values needed across an instruction that clobbers registers which loops read most
+    // (a read counts eight for each loop around it, none outside loops) live in R21 instead of in slots, one at a time;
+    // R21 is then for such values only. A function with no such read in a loop gains less than the two registers saved
+    // and put back for each run of it. Not R22 too: a callee saves and puts back the two as a pair, so a value in one
+    // waits for the value in the other across each call (measured: UniPoker +3.6% with both, -1.4% with one).
+    std::vector<std::uint8_t> keptAcross(nv, 0);
+    if (!noRegs && Asm::kExtraGpr >= 7 && ssaOn_ >= 2) {
+        std::vector<std::uint8_t> depth(nb, 0);
+        for (std::uint32_t h = 1; h < nb; ++h)
+            if (g.blocks[h].reached && g.blocks[h].loopHeader)
+                for (std::uint32_t b = h; b < nb && g.blocks[b].start < g.blocks[h].loopEnd; ++b)
+                    if (depth[b] < 3)
+                        ++depth[b];
+        std::vector<std::pair<std::int32_t, std::uint32_t>> starts;  // (first position, block)
+        for (std::uint32_t b = 1; b < nb; ++b)
+            if (blockPos[b].first >= 0)
+                starts.emplace_back(blockPos[b].first, b);
+        auto weightAt = [&](std::int32_t p) {
+            auto it = std::upper_bound(starts.begin(), starts.end(), std::make_pair(p, ~0u));
+            const std::uint32_t b = it == starts.begin() ? 0 : std::prev(it)->second;
+            return depth[b] ? std::int64_t(1) << (3 * depth[b]) : 0;
+        };
+        std::vector<std::pair<std::int64_t, std::uint32_t>> cands;
+        for (std::uint32_t v : order) {
+            if (sval_[v].rep == kRepF64 || !crosses(v))
+                continue;
+            std::int64_t w = weightAt(first[v]);
+            for (std::int32_t p : uses[v])
+                w += weightAt(p);
+            if (w)
+                cands.emplace_back(w, v);
+        }
+        std::sort(cands.begin(), cands.end(), [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+        std::vector<std::pair<std::int32_t, std::int32_t>> taken;
+        for (const auto& [w, v] : cands) {
+            bool free = true;
+            for (const auto& [from, to] : taken)
+                free = free && (last[v] < from || first[v] > to);
+            if (!free)
+                continue;
+            taken.emplace_back(first[v], last[v]);
+            keptAcross[v] = 1;
+            sval_[v].reg = std::int8_t(R21);
+        }
+        if (!taken.empty())
+            gprs.erase(std::remove(gprs.begin(), gprs.end(), int(R21)), gprs.end());
+    }
     for (std::uint32_t v : order) {
         for (std::size_t a = 0; a < active.size();) {
             if (active[a].end < first[v]) {
@@ -5257,8 +5309,9 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 ++a;
             }
         }
-        const auto c = std::upper_bound(clob.begin(), clob.end(), first[v]);
-        const bool cross = c != clob.end() && *c < last[v];
+        if (keptAcross[v])
+            continue;
+        const bool cross = crosses(v);
         const bool x = sval_[v].rep == kRepF64;
         std::vector<int>& pool = x ? xmms : gprs;
         if (!cross && !pool.empty()) {

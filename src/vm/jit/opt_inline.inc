@@ -3219,7 +3219,8 @@ void Baseline::planLoopFacts()
                     loopPromos_.push_back(LoopPromo{h, std::uint32_t(end), r, idx, hoistBase_ + std::int32_t(8 * hoistSlots_++), fixed});
                     if (ints) {
                         loopPromos_.back().i32 = true;
-                        loopPromos_.back().xreg = 16 + Asm::kExtraGpr - kIntPromoRegs + intPromos++;
+                        // (Not R21, R22: a call gives those back as it got them, and this code saves neither.)
+                        loopPromos_.back().xreg = 16 + Asm::kExtraGpr - 2 - kIntPromoRegs + intPromos++;
                     } else if (doublePromos < Asm::kExtraXmm) {
                         loopPromos_.back().xreg = 16 + doublePromos++;
                     }

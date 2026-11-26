@@ -286,6 +286,13 @@ wait for the caller's store. Baseline code has the same address for both ways in
 comes back in rax and in the caller's frame slot, and the caller goes on from rax. One call and return is about 90
 instructions; most of them write the frame record and check the callee.
 
+**A value across calls.** Every instruction the SSA tier does through a template or a call clobbers its registers, so
+a value needed across one lives in a stack slot. The exception is R21 (arm64 x25): R21 and R22 come back from every
+call, helper and template as they went in (SSA code that uses them saves them where it is entered and puts them back on
+each way out; no other code writes them). `ssaPlan` gives R21 to the values needed across such instructions that loops
+read most, one at a time. Only one of the two registers is used this way: a callee saves and puts back both as a pair,
+so a value in one waits for the value in the other across each call.
+
 **A merged callee whose result is tested.** When the caller tests the result of a call at once (`if (o.m())`), each
 return of the merged callee gets its own copy of the test (`mergeInline`), and a return reached from a test of the same
 register (`return a || b`) jumps straight to where the caller's test would go. In the SSA code a compare whose boolean

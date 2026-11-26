@@ -13,7 +13,8 @@
 //   xmm0-7 v0-v7, xmm8-15 v16-v23 (none kept by a call, as the templates expect)
 //   xmm23-30 v8-v15: kept by a call into the runtime (whose convention keeps their low halves, all a double has); values
 //   the optimizing compiler reads once and keeps (`kKeptXmm`), saved around compiled code by `abiEnter`
-//   r16-r20 x6 x7 x11 x12 x13 (not kept by a call), r21 r22 x25 x26 (kept), r23 x18 (not kept; the SSA tier's only),
+//   r16-r20 x6 x7 x11 x12 x13 (not kept by a call), r21 r22 x25 x26 (kept: the SSA tier's only, which saves them where
+//   its code is entered), r23 x18 (not kept; the SSA tier's only),
 //   xmm16-22 v24-v30 (not kept): registers past the interface's, for the optimizing compiler's variables.
 //   x14-x17 and v31 are the assembler's own, within one operation.
 //

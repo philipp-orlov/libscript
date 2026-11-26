@@ -389,6 +389,7 @@ public:
     }
     void imul32(Reg d, Reg s) { opReg(false, 0x0F, d, s, 0xAF); }
     void imul64(Reg d, Reg s) { opReg(true, 0x0F, d, s, 0xAF); }
+    void mulWrap32(Reg d, Reg s) { imul32(d, s); }  ///< the low 32 bits; flags not to be read
     void mul64(Reg d, Reg s) { imul64(d, s); }  ///< the low 64 bits; flags not to be read
     void neg32(Reg r) { opReg(false, 0xF7, 3, r); }
     void not32(Reg r) { opReg(false, 0xF7, 2, r); }

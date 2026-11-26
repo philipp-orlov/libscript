@@ -4354,7 +4354,7 @@ bool Baseline::ssaArith(std::uint32_t i)
         // An overflow, or a zero that may be a negative zero: the interpreter's.
         a_.imulI32(RDX, t, imm);
         a_.jcc(CO, bad);
-        if (!(imm >= 0 && nonNeg_[va])) {
+        if (!(imm >= 0 && nonNeg_[va]) && !zeroOk_[def]) {
             Label nz;
             a_.test32(RDX, RDX);
             a_.jcc(CNE, nz);
@@ -4371,11 +4371,12 @@ bool Baseline::ssaArith(std::uint32_t i)
     }
     case Op::Mul: {
         if (wraps) {
-            a_.imul32(t, b);
+            a_.mulWrap32(t, b);
             break;
         }
         // An overflow, or a zero that may be a negative zero (an operand below zero): the interpreter's.
-        const bool noNegZero = nonNeg_[va] && vb != ssa::kNone && nonNeg_[vb];  // two not below zero: no -0
+        // Two not below zero: no -0. (`zeroOk_`: no use tells it from zero.)
+        const bool noNegZero = (nonNeg_[va] && vb != ssa::kNone && nonNeg_[vb]) || zeroOk_[def];
         if (!noNegZero)
             a_.mov32(RDX, t);
         a_.imul32(t, b);
@@ -5002,6 +5003,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         }
         wrapOk_.assign(nv, 0);
         std::vector<std::uint8_t> badUse(nv, 0);
+        std::vector<std::uint8_t> zeroBad(nv, 0);  // a use that tells a negative zero from zero
         std::vector<std::vector<std::uint32_t>> wrapUsers(nv);  // candidate defs that use the value
         for (std::uint32_t v = 0; v < nv; ++v) {
             const ssa::Value& sv = g.values[v];
@@ -5015,8 +5017,12 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
             if (sv.kind == ssa::Value::Phi)
                 for (std::uint32_t in : sv.in)
                     if (in != ssa::kNone)
-                        badUse[in] = 1;
+                        badUse[in] = zeroBad[in] = 1;
         }
+        auto isProduct = [&](std::uint32_t v) {
+            return v == ssa::kNone || (g.values[v].kind == ssa::Value::Def && (code_->code[g.values[v].at].opcode() == Op::Mul ||
+                                                                              code_->code[g.values[v].at].opcode() == Op::MulI));
+        };
         for (std::uint32_t b = 1; b < nb; ++b) {
             const ssa::Block& bl = g.blocks[b];
             if (!bl.reached)
@@ -5039,6 +5045,16 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                         continue;
                     if (truncates(op) || (intStore && r == in.c && in.a != in.c && in.b != in.c))
                         continue;
+                    // A zero that should be a negative zero is the same to: an int32 sum with a constant, or with a value
+                    // that is no such zero itself; an int32 difference it is taken from; a relation.
+                    const bool sum = intArith_[i] &&
+                                     (op == Op::AddI || op == Op::SubI || op == Op::Inc || op == Op::Dec ||
+                                      (op == Op::Add && in.b != in.c && !isProduct(names[r == in.b ? in.c : in.b])) ||
+                                      (op == Op::Sub && r == in.c && in.b != in.c));
+                    const bool relation = (op >= Op::JLt && op <= Op::JNotGe) || (op >= Op::JLtI && op <= Op::JNotGeI) || op == Op::Lt || op == Op::Le || op == Op::Gt ||
+                                          op == Op::Ge;
+                    if (!sum && !relation)
+                        zeroBad[v] = 1;
                     if (isWrapOp(op) && g.defBase[i] != ssa::kNone && wrapOk_[g.defBase[i]])
                         wrapUsers[v].push_back(g.defBase[i]);
                     else
@@ -5046,7 +5062,7 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                 }
                 for (std::uint16_t r : g.held(i))
                     if (names[r] != ssa::kNone)
-                        badUse[names[r]] = 1;  // the handler's uses are not seen here
+                        badUse[names[r]] = zeroBad[names[r]] = 1;  // the handler's uses are not seen here
                 if (op == Op::Mov) {
                     names[in.a] = names[in.b];
                     continue;
@@ -5055,9 +5071,13 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
                     names[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
             }
         }
-        for (std::uint32_t v = 0; v < nv; ++v)
+        zeroOk_.assign(nv, 0);
+        for (std::uint32_t v = 0; v < nv; ++v) {
             if (badUse[v])
                 wrapOk_[v] = 0;
+            zeroOk_[v] = !zeroBad[v] && !sval_[v].isConst && sval_[v].rep == kRepI32 && g.values[v].kind == ssa::Value::Def &&
+                         isProduct(v) && intArith_[g.values[v].at];
+        }
         for (bool changed = true; changed;) {
             changed = false;
             for (std::uint32_t v = 0; v < nv; ++v)
@@ -5423,14 +5443,49 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         if (!taken.empty())
             gprs.erase(std::remove(gprs.begin(), gprs.end(), int(R21)), gprs.end());
     }
+    // The value a back edge gives a phi takes the phi's register when the phi is needed no more where that value is made
+    // (`i = i + 1`, `s += x`): no move on the way round the loop. Between the two, the register goes to a value that is
+    // done before the phi's next value is made, or to one that finds no other.
+    std::vector<std::uint32_t> phiOf(nv, ssa::kNone), backOf(nv, ssa::kNone);
+    for (std::uint32_t h = 1; h < nb && !noRegs; ++h) {
+        const ssa::Block& hb = g.blocks[h];
+        if (!hb.reached || !hb.loopHeader)
+            continue;
+        for (std::uint32_t p : hb.phis)
+            for (std::size_t q = 0; q < hb.preds.size() && last[p] >= 0 && backOf[p] == ssa::kNone; ++q) {
+                const std::uint32_t w = g.values[p].in[q];
+                if (hb.preds[q] >= h && w != ssa::kNone && w != p && !sval_[w].isConst && last[w] >= 0 && first[w] > last[p] &&
+                    sval_[w].rep == sval_[p].rep && phiOf[w] == ssa::kNone) {
+                    phiOf[w] = p;
+                    backOf[p] = w;
+                }
+            }
+    }
+    struct Wanted
+    {
+        int reg;
+        bool x;
+        std::uint32_t by;
+    };
+    std::vector<Wanted> wanted;
     for (std::uint32_t v : order) {
         for (std::size_t a = 0; a < active.size();) {
             if (active[a].end < first[v]) {
                 (active[a].x ? xmms : gprs).push_back(active[a].reg);
+                if (backOf[active[a].v] != ssa::kNone)
+                    wanted.push_back(Wanted{active[a].reg, active[a].x, backOf[active[a].v]});
                 active[a] = active.back();
                 active.pop_back();
             } else {
                 ++a;
+            }
+        }
+        for (std::size_t k = 0; k < wanted.size();) {
+            if (first[wanted[k].by] < first[v]) {
+                wanted[k] = wanted.back();
+                wanted.pop_back();
+            } else {
+                ++k;
             }
         }
         if (keptAcross[v])
@@ -5439,8 +5494,24 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
         const bool x = sval_[v].rep == kRepF64;
         std::vector<int>& pool = x ? xmms : gprs;
         if (!cross && !pool.empty()) {
-            sval_[v].reg = std::int8_t(pool.back());
-            pool.pop_back();
+            // The phi's register for the phi's next value; else the last one let go of that no such value waits for
+            // (one that is made after this value is done waits long enough).
+            std::size_t at = pool.size();
+            if (phiOf[v] != ssa::kNone && sval_[phiOf[v]].reg >= 0)
+                for (std::size_t k = 0; k < pool.size(); ++k)
+                    if (pool[k] == sval_[phiOf[v]].reg)
+                        at = k;
+            for (std::size_t k = pool.size(); at == pool.size() && k-- > 0;) {
+                bool waits = false;
+                for (const Wanted& w : wanted)
+                    waits = waits || (w.x == x && w.reg == pool[k] && w.by != v && first[w.by] <= last[v]);
+                if (!waits)
+                    at = k;
+            }
+            if (at == pool.size())
+                at = pool.size() - 1;
+            sval_[v].reg = std::int8_t(pool[at]);
+            pool.erase(pool.begin() + std::ptrdiff_t(at));
             active.push_back(Active{last[v], sval_[v].reg, x, v});
         } else if (!cross && !noRegs && !noEvict) {
             // No register free: the value of this kind that is needed longest gives up its own, when that is longer than

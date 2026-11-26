@@ -3684,6 +3684,7 @@ private:
     std::vector<std::uint8_t> neverCell_;
     std::vector<std::uint8_t> nonNeg_;  ///< per value: an int32 that is never below zero (no -0 to make, no sign to check)
     std::vector<std::uint8_t> wrapOk_;  ///< per value: an int32 add whose every use truncates to int32 (it may wrap)
+    std::vector<std::uint8_t> zeroOk_;  ///< per value: an int32 product no use of which tells a negative zero from zero
     bool hasLoc(std::uint32_t v) const { return sval_[v].slot >= 0 || sval_[v].reg >= 0; }
     void storeTagged(std::uint32_t v, Reg src);
     void loadI32(std::uint32_t v, Reg dst, Label* bad);

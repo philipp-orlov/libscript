@@ -1049,6 +1049,14 @@ public:
         pendingTest(kTmp, true);
         pendingMul_ = 1;
     }
+    /// d = d * s, the low 32 bits, no flags.
+    void mulWrap32(Reg d, Reg s)
+    {
+        int n = X(d), m = X(s);
+        fold(X(d), &n, &m, false);
+        ins(0x1B007C00u | (std::uint32_t(m) << 16) | (std::uint32_t(n) << 5) | std::uint32_t(X(d)));  // mul wd, wn, wm
+        flags_ = Flags::None;
+    }
     /// d = d * s, the low 64 bits, no flags.
     void mul64(Reg d, Reg s)
     {

@@ -254,6 +254,9 @@ int32 add whose every use truncates to int32 has no overflow check.
 **Registers.** A linear scan gives each value one register or one slot. A value across an instruction that the code does not do
 in place (a template: it clobbers registers) lives in a slot. When no register is free, the value needed longest gives up its
 register. A loop that clobbers nothing keeps the values it reads from before it in registers (the loop register cache).
+The value a back edge gives a phi takes the phi's register when the phi is needed no more where that value is made
+(`i = i + 1`, `s += x`), so the way round the loop has no move for it; until then that register goes only to a value
+that is done before, or to one that finds no other.
 
 **Ownership.** Each frame slot owns one count of what it holds. A value no slot owns is borrowed, and stays valid until an event
 (a call, a release, an exit); `ssaSync` gives every live value an owner before one. An exit writes the live values into the frame
@@ -274,6 +277,8 @@ small loop that reads and writes three or more properties of objects it does not
 **Also in place:** `Math.sqrt` and the other one-double natives, `s.charCodeAt(i)`, `String.prototype` methods of a string,
 `.length` of strings and arrays, `ModI` (a multiply by a magic number), and a global read that a loop which clobbers nothing
 reads once on the way in. Values known never to be below zero (`nonNeg_`) need no sign or -0 checks.
+A product has no -0 check when no use tells a negative zero from zero (`zeroOk_`): int32 sums with a value that is no
+such product, an int32 difference it is taken from, relations, and uses that truncate.
 
 **Direct calls.** A call between functions of SSA code checks the stack (frames, registers, `stackInit`) once, at the
 function's entry and at its OSR entries, for the largest window any of its direct calls needs (`limitNeed_`). It does not

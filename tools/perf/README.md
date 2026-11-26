@@ -40,7 +40,7 @@ Time only on one fast core with nothing else running.
 ## Gate for each commit
 
 1. Build, then run `gate2.sh` (about 25 minutes, all cores). Expect 21 lines of "100% tests passed".
-2. Run `fz.sh SEED` (about 6,000 programs). Expect "0 disagreements" six times.
+2. Run `fz.sh SEED` with at least three seeds not used before (about 6,000 programs each). Expect "0 disagreements" six times for each. One seed has missed defects that another seed showed.
 3. For each change of behavior, add a program to `tests/vm/snippets_jit.inc` and compare its output with node.
 
 WARNING: Do not build while a gate or a timing runs. The gate reads the binaries while it runs.

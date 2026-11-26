@@ -515,6 +515,9 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
         // takes in; it is marked as one that cannot be guarded only when that keeps happening.
         const bool globalAccess = code->code[index].opcode() == Op::GetGlobal || code->code[index].opcode() == Op::GetGlobalOrUndef ||
                                   code->code[index].opcode() == Op::PutGlobal;
+        // (A remainder that has failed before is one whose code for numbers has left now: the template from here on.)
+        if (index < code->prof.size() && code->code[index].opcode() == Op::Mod && (code->prof[index] & opt::kProfFailed))
+            code->prof[index] |= opt::kProfNoSpec;
         if (index < code->prof.size() && (!globalAccess || code->tier2Tries >= 2))
             code->prof[index] |= opt::kProfFailed;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)

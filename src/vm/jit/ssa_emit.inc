@@ -4555,6 +4555,50 @@ bool Baseline::ssaArithF64(std::uint32_t i)
     const Op op = in.opcode();
     const bool rr = op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Div;
     Label& bad = ssaExit(i);
+    if (op == Op::Mod) {
+        // Two int32s, the first not below zero and the second above it: the integer remainder. Else `fmod` of the two
+        // numbers. Anything that is no number leaves.
+        const std::uint32_t def = ssa_->defBase[i];
+        const std::uint32_t va = name_[in.b], vb = name_[in.c];
+        const int x = sval_[def].reg >= 0 && sval_[def].rep == kRepF64 ? sval_[def].reg : 0;
+        Label slow, done;
+        auto intIn = [&](std::uint32_t v, Reg r) {
+            const SVal& sv = sval_[v];
+            if (sv.isConst ? !JSValue::raw(sv.bits).isInt32() : sv.rep == kRepF64)
+                return false;
+            if (sv.isConst || sv.rep == kRepI32) {
+                loadI32(v, r, nullptr);
+            } else {
+                loadValue(v, r);
+                a_.cmp(r, R14);
+                a_.jcc(CB, slow);
+            }
+            return true;
+        };
+        if (intIn(vb, RCX) && intIn(va, RAX)) {
+            a_.aluI32(7, RCX, 0);
+            a_.jcc(CLE, slow);
+            a_.aluI32(7, RAX, 0);
+            a_.jcc(CL, slow);
+            a_.cdq();
+            a_.idiv32(RCX);
+            a_.cvtsi2sd32(x, RDX);
+            a_.jmp(done);
+        }
+        a_.bind(slow);
+        loadF64(va, 0, &bad);
+        loadF64(vb, 1, &bad);
+        const std::vector<int> keep = ssaLiveRegs();
+        ssaSaveRegs(keep);
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(static_cast<double (*)(double, double)>(&std::fmod)));
+        a_.callC(RAX);
+        ssaRestoreRegs(keep);
+        if (x != 0)
+            a_.movaps(x, 0);
+        a_.bind(done);
+        ssaDefF64(i, x);
+        return true;
+    }
     if (op == Op::UShrI) {
         // `x >>> 0`: ToInt32 of the operand, read as unsigned.
         const std::uint32_t def = ssa_->defBase[i];
@@ -4766,6 +4810,13 @@ bool Baseline::ssaPlan(const std::vector<std::vector<ssa::Bits>>& liveAfter)
     for (std::uint32_t i = 0; i < n_; i = opt::nextOf(*code_, i)) {
         const Op op = code_->code[i].opcode();
         const std::uint8_t prof = i < code_->prof.size() ? code_->prof[i] : 0;
+        // A remainder of numbers that has made a double (`n % 0`), or whose int32 code has left: the integer
+        // remainder where it is one, else `fmod` (`ssaArithF64`). Not once that code has left too (`kProfNoSpec`).
+        if (ssaOn_ >= 2 && op == Op::Mod && (prof & 3) && !(prof & 8) && !(prof & opt::kProfNoSpec) &&
+            ((prof & 2) || (prof & opt::kProfFailed))) {
+            dblArith_[i] = 1;
+            continue;
+        }
         if (ssaOn_ < 2 || (prof & opt::kProfFailed))
             continue;
         if (arithFailed && prof == 1 && (op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::MulI))
@@ -7460,27 +7511,15 @@ bool Baseline::ssaSmall(std::uint32_t i, const ssa::Bits& liveAfter)
         const std::uint32_t v = name_[in.b];
         Label& bad = ssaExit(i);
         loadValue(v, RAX);
-        Label t, f, done, notInt;
+        Label t, f, done;
         if (known(v, kVBool)) {
             a_.aluI32(6, RAX, 1);  // true <-> false
             ssaDef(i, kVBool | kVNotCell);
             return true;
         }
-        a_.cmpI(RAX, std::int32_t(kTrue));
-        a_.jcc(CE, t);
-        a_.cmpI(RAX, std::int32_t(kFalse));
-        a_.jcc(CE, f);
-        a_.cmp(RAX, R14);
-        a_.jcc(CB, notInt);
-        a_.test32(RAX, RAX);
-        a_.jcc(CNE, t);
-        a_.jmp(f);
-        a_.bind(notInt);
-        a_.mov(RDX, RAX);
-        a_.aluI(4, RDX, -9);
-        a_.cmpI(RDX, std::int32_t(kNull));
-        a_.jcc(CE, f);
-        needObject(RAX, bad);
+        // A boolean, a number (a double too: zero and NaN are false), null, undefined, an object; a string or a BigInt
+        // leaves.
+        truth(RAX, t, f, bad);
         a_.bind(t);
         a_.movImm(RAX, kFalse);
         a_.jmp(done);

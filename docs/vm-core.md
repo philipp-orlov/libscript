@@ -296,6 +296,10 @@ up to five shapes compares the shapes in turn and stores into the slot of the on
 only a store with one shape was done in place. Load reuse forgets the slot of each of the shapes. A value that may be
 a cell still runs as the template there: in place it needs every live value owned first.
 
+**A remainder of numbers.** `a % b` whose place has made a double (`n % 0` is NaN), or whose int32 code has left once,
+is done in place: the integer remainder for two int32s (the first not below zero, the second above it), else `fmod`.
+`!x` in place takes doubles too (zero and NaN are false).
+
 **`x >>> 0`.** Where it has made numbers past int32, it is done in place: ToInt32 of the operand, read as unsigned,
 into a double. Before, it ran as the template and called the runtime.
 

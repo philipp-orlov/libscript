@@ -291,6 +291,11 @@ wait for the caller's store. Baseline code has the same address for both ways in
 comes back in rax and in the caller's frame slot, and the caller goes on from rax. One call and return is about 90
 instructions; most of them write the frame record and check the callee.
 
+**A property store under several shapes.** A store of a number whose cache holds writes to own data properties of
+up to five shapes compares the shapes in turn and stores into the slot of the one it finds (`ssaPutProp`); before,
+only a store with one shape was done in place. Load reuse forgets the slot of each of the shapes. A value that may be
+a cell still runs as the template there: in place it needs every live value owned first.
+
 **`x >>> 0`.** Where it has made numbers past int32, it is done in place: ToInt32 of the operand, read as unsigned,
 into a double. Before, it ran as the template and called the runtime.
 

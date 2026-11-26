@@ -1918,7 +1918,13 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             if (native_[i] && (op == Op::PutProp || op == Op::InitProp)) {
                 const InlineCache& ic = code_->caches[code_->code[i + 1].a];
                 const std::uint32_t o = names[in.a];
-                if (ic.next == 0) {
+                if (ic.next == 0 && ic.pad) {
+                    // A store under one of several shapes: each of those slots may be the one written.
+                    forget(ic.shape, ic.index);
+                    if (ic.pad <= code_->poly.size())
+                        for (std::uint8_t e = 0; e < code_->poly[ic.pad - 1].n; ++e)
+                            forget(code_->poly[ic.pad - 1].e[e].shape, code_->poly[ic.pad - 1].e[e].index);
+                } else if (ic.next == 0) {
                     forget(ic.shape, ic.index);
                     k.push_back({o, ic.shape, ic.index, names[in.c]});
                 } else {
@@ -2758,11 +2764,46 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         return false;
     const InlineCache& ic = code_->caches[code_->code[i + 1].a];
     const std::uint32_t v = name_[in.a];
-    if (vShape_[v] && vShape_[v] != ic.shape)
-        return false;
+    // The shapes the site has stored under, and the slot of each.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> es{{ic.shape, ic.index}};
+    if (ic.pad)
+        for (std::uint8_t k = 0; k < code_->poly[ic.pad - 1].n; ++k)
+            es.emplace_back(code_->poly[ic.pad - 1].e[k].shape, code_->poly[ic.pad - 1].e[k].index);
+    if (vShape_[v]) {
+        // Known to have one of them: that one only.
+        auto it = std::find_if(es.begin(), es.end(), [&](const auto& e) { return e.first == vShape_[v]; });
+        if (it == es.end())
+            return false;
+        es = {*it};
+    }
+    const std::uint32_t one = es.size() == 1 ? es[0].first : 0;
+    // The slot, for an object of one of the shapes (else `bad`): of the one shape, or (several) its address in rdx.
+    auto place = [&](Reg o, Label& bad) -> Mem {
+        if (one) {
+            if (!vShape_[v]) {
+                a_.cmpI32(mem(o, 0), std::int32_t(one));
+                a_.jcc(CNE, bad);
+            }
+            return slotMem(one, es[0].second, o);
+        }
+        Label have;
+        for (std::size_t k = 0; k < es.size(); ++k) {
+            Label next;
+            a_.cmpI32(mem(o, 0), std::int32_t(es[k].first));
+            a_.jcc(CNE, k + 1 == es.size() ? bad : next);
+            a_.lea(RDX, slotMem(es[k].first, es[k].second, o));
+            if (k + 1 < es.size())
+                a_.jmp(have);
+            a_.bind(next);
+        }
+        a_.bind(have);
+        return mem(RDX, 0);
+    };
     const std::uint32_t x = name_[in.c];
     const bool number = !mayBeCell(x) && (sval_[x].rep != kRepTagged ||
                                           (sval_[x].isConst && JSValue::raw(sval_[x].bits).isNumber()));
+    if (!one && !number)
+        return false;  // (several shapes: numbers only, as `ssaNative` planned)
     if (!number) {
         // A value that may be a cell (most likely over another): every live value gets an owner, the old one goes here.
         ssaSync({}, liveAfter, std::vector<std::uint8_t>(code_->nregs, 0));
@@ -2771,12 +2812,8 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         Label& bad = ssaExit(i);
         const Reg o = valueReg(v);
         needCellV(v, o, bad);
-        if (!vShape_[v]) {
-            a_.cmpI32(mem(o, 0), std::int32_t(ic.shape));
-            a_.jcc(CNE, bad);
-            ssaKnow(v, kVObj, ic.shape);
-        }
-        const Mem slot = slotMem(ic.shape, ic.index, o);
+        const Mem slot = place(o, bad);
+        ssaKnow(v, kVObj, one);
         loadValue(x, RCX);
         Label yng, stored;
         ifYoung(o, yng);  // a young object counts nothing
@@ -2794,13 +2831,11 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         return true;
     }
     const Reg o = valueReg(v);
-    {
-        Label& bad = ssaExit(i);
-        needCellV(v, o, bad);
-        if (!vShape_[v]) {
-            a_.cmpI32(mem(o, 0), std::int32_t(ic.shape));
-            a_.jcc(CNE, bad);
-        }
+    Label& bad = ssaExit(i);
+    needCellV(v, o, bad);
+    if (one && !vShape_[v]) {
+        a_.cmpI32(mem(o, 0), std::int32_t(one));
+        a_.jcc(CNE, bad);
     }
     // An old value that is a cell is let go of, which may free what a live value borrows: the runtime's store, out of
     // line, after every live value has an owner. Anything else (a number over a number) is stored here, with no sync.
@@ -2812,7 +2847,7 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
         return true;
     const std::vector<std::uint32_t> frameAfter = frame_;
     frame_ = frameBefore;
-    const Mem slot = slotMem(ic.shape, ic.index, o);
+    const Mem slot = one ? slotMem(one, es[0].second, o) : place(o, bad);
     loadValue(x, RCX);
     Label yng;
     ifYoung(o, yng);  // a young object counts nothing, and lets go of nothing
@@ -2825,7 +2860,7 @@ bool Baseline::ssaPutProp(std::uint32_t i, const ssa::Bits& liveAfter)
     a_.mov(slot, RCX);
     a_.bind(join);
     frame_ = frameAfter;  // the runtime's store over a data property of that shape changes no shape
-    ssaKnow(v, kVObj, ic.shape);
+    ssaKnow(v, kVObj, one);
     return true;
 }
 
@@ -4586,7 +4621,18 @@ bool Baseline::ssaPutFast(std::uint32_t i) const
     if (cacheId == kNoCache || (i < code_->prof.size() && (code_->prof[i] & opt::kProfFailed)))
         return false;
     const InlineCache& ic = code_->caches[cacheId];
-    return ic.shape != 0 && ic.next == 0 && !ic.holder && !ic.pad;
+    if (ic.shape == 0 || ic.next != 0 || ic.holder)
+        return false;
+    // More shapes (`PolyCache`): each a write to an own data property.
+    if (ic.pad) {
+        if (ic.pad > code_->poly.size())
+            return false;
+        const PolyCache& pc = code_->poly[ic.pad - 1];
+        for (std::uint8_t k = 0; k < pc.n; ++k)
+            if (pc.e[k].kind != PolyEntry::Write)
+                return false;
+    }
+    return true;
 }
 
 bool Baseline::ssaGlobalFast(std::uint32_t i) const
@@ -4635,7 +4681,16 @@ bool Baseline::ssaNative(std::uint32_t i)
     case Op::GetProp: return !ssaReadEntries(i).empty() || ssaLengthSite(i) || ssaStringProtoIndex(i) >= 0;
     case Op::New: return !ssaNewArrayPlan(i).isUndefined() || ssaNewPlan(i, nullptr);
     case Op::Call: return mathOf_[i] != nullptr || viewOf_[i] != nullptr || ssaCharCodeCallee(i) != nullptr;
-    case Op::PutProp: return ssaPutFast(i) || ssaAddFast(i);
+    case Op::PutProp: {
+        // Under several shapes only a number is stored in place: a value that may be a cell needs every live value
+        // owned first, which costs more than the template there (splay was 1.5% slower).
+        const std::uint32_t x = name_[in.c];
+        const bool number = x != ssa::kNone && !mayBeCell(x) &&
+                            (sval_[x].rep != kRepTagged || (sval_[x].isConst && JSValue::raw(sval_[x].bits).isNumber()));
+        const bool several = i + 1 < n_ && code_->code[i + 1].opcode() == Op::Cache && code_->code[i + 1].a != kNoCache &&
+                             code_->caches[code_->code[i + 1].a].pad != 0;
+        return (ssaPutFast(i) && (!several || number)) || ssaAddFast(i);
+    }
     case Op::InitProp: return ssaAddFast(i);
     case Op::GetGlobal: return sval_[ssa_->defBase[i]].isConst || ssaGlobalFast(i);
     case Op::InstanceOf: return !failed && ssaInstanceProto(i) != nullptr;

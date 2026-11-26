@@ -642,26 +642,29 @@ not is a long tail of single tests: see the last snapshot's `cmp262.py` output.
 
 ## Speed against JavaScriptCore
 
-State on 2026-11-26 (`649033b`). JetStream 3, the 41 JavaScript workloads that `tools/probes/jetstream.py` writes, release
+State on 2026-11-26 (`3cd948f`). JetStream 3, the 41 JavaScript workloads that `tools/probes/jetstream.py` writes, release
 build, arm64 (Cortex-X925, core 16), JavaScriptCore 2.52.6, best of two interleaved rounds. The ratio is libscript's time
 over JSC's time; below 1.00 libscript is faster.
 
 | | Later iterations | First iteration | Peak resident size |
 |---|--:|--:|--:|
-| Geometric mean of 41 | 1.30x | 0.70x | 0.21x |
+| Geometric mean of 41 | 1.29x | 0.71x | 0.21x |
 
-- Furthest behind (later iterations): splay 2.63x, Sunspider 2.18x, js-tokens 1.93x, octane-code-load 1.90x, ML 1.90x,
-  OfflineAssembler 1.84x, sync-fs 1.83x, doxbee-async 1.68x, WSL 1.64x, threejs 1.64x, UniPoker 1.61x, async-fs 1.52x.
-- Ahead or level: stanford-crypto-aes 0.84x, crypto 0.85x, proxy-mobx 0.88x, navier-stokes 0.92x, gbemu 0.93x,
-  Basic 0.97x, pdfjs 0.97x, stanford-crypto-pbkdf2 0.99x, mandreel 1.00x, delta-blue 1.00x.
-- JSC's own times move between runs on some workloads (threejs 22.3 ms and 26.8 ms, js-tokens 15.8 ms and 13.2 ms in
-  two runs of the same binary an hour apart), so one workload's ratio is good to about a tenth.
+- Furthest behind (later iterations): splay 2.71x, Sunspider 2.18x, threejs 2.00x, js-tokens 1.89x, octane-code-load
+  1.88x, ML 1.85x, sync-fs 1.79x, OfflineAssembler 1.77x, WSL 1.64x, doxbee-async 1.63x, async-fs 1.62x, UniPoker 1.61x.
+- Ahead or level: navier-stokes 0.79x, Basic 0.82x, crypto 0.83x, stanford-crypto-aes 0.84x, delta-blue 0.94x,
+  gbemu 0.95x, stanford-crypto-pbkdf2 0.98x, pdfjs 0.98x, proxy-mobx 0.98x, lazy-collections 0.99x, mandreel 1.00x,
+  raytrace-private-class-fields 1.01x.
+- JSC's own times move between runs on some workloads (threejs 21.9 ms to 26.8 ms, richards 3.3 ms to 4.2 ms, hash-map
+  6.1 ms to 7.8 ms in three runs of the same binary), so one workload's ratio is good to about a tenth. libscript's
+  own change is measured with `binab.sh`: from `329a69f` to `3cd948f` the later iterations are 4.0% faster in the
+  geometric mean and the first iterations 0.6%.
 - Memory (`tools/perf/rss.sh`, `tools/perf/soak.sh`): no workload is above JSC's peak by more than 3%
   (json-stringify-inspector 1.03x). Over 300 iterations octane-code-load, pdfjs and proxy-vue grow, which keep data
-  per iteration (JSC grows more on each of them); gbemu grows 7% and hash-map 39% in resident size between iterations
-  50 and 299, both also before the arrays of int32s and doubles.
-- First iterations are ahead on most workloads. Behind: json-stringify-inspector 2.59x, octane-code-load 2.14x,
-  regexp-octane 1.84x, threejs 1.39x, WSL 1.26x, OfflineAssembler 1.13x.
+  per iteration (JSC grows more on each of them); Box2D grows 6%, gbemu 7% and hash-map 39% in resident size between
+  iterations 50 and 299, all three also before the arrays of int32s and doubles.
+- First iterations are ahead on most workloads. Behind: json-stringify-inspector 2.59x, octane-code-load 2.12x,
+  regexp-octane 2.00x, threejs 1.31x, WSL 1.27x, OfflineAssembler 1.13x, Box2D 1.09x.
 
 ### Where the time goes
 

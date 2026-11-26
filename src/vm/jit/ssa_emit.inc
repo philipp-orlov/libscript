@@ -1012,7 +1012,10 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
     initValues();
     if (!ssaPlan(liveAfter))
         return fail();
+    lirGone_.assign(n_, 0);
+    lirChecked_.assign(n_, 0);
     if (ssaOn_ >= 2) {
+        lirPlan(g);
         const std::vector<std::uint8_t> before = native_;
         if (ssaLoadElim(g)) {
             // Planned again with the reads gone. What was done in place and is not now could change what they read: without.
@@ -1023,6 +1026,8 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             if (!ok) {
                 g = ssa::build(*code_);
                 elim_.assign(n_, 0);
+                lirGone_.assign(n_, 0);
+                lirChecked_.assign(n_, 0);
                 initValues();
                 if (!ssaPlan(liveAfter))
                     return fail();
@@ -1058,11 +1063,6 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             if (sval_[v].slot >= 0)
                 std::fprintf(stderr, "  v%u kind %d r%u at %u slot %d\n", v, int(g.values[v].kind), unsigned(g.values[v].reg),
                              g.values[v].at, sval_[v].slot);
-    }
-    if (const char* l = std::getenv("SSA_LIR"); l && std::strstr(l, "dump")) {
-        lir::Func f;
-        lirBuild(g, f);
-        std::fprintf(stderr, "lir %s\n%s", mapName(code_).c_str(), lir::dump(f).c_str());
     }
 #endif
     // ---- code ----
@@ -1833,7 +1833,8 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             // Whatever could run other code, or write what is not known here: all of it is forgotten. (An element of a plain
             // array may be the runtime's to find.)
             const bool quiet = native_[i] && !((op == Op::GetElem || op == Op::PutElem) && !(op == Op::GetElem && ssaPrivateSite(i)) &&
-                                               ssaElemPlan(i, op == Op::PutElem, &kind) == 1 && !(op == Op::GetElem && ssaElemQuiet(i)));
+                                               ssaElemPlan(i, op == Op::PutElem, &kind) == 1 && !(op == Op::GetElem && ssaElemQuiet(i)) &&
+                                               !(op == Op::PutElem && lirGone_[i]));
             // A value kept past the register it was read into has no owner of its own: an allocation may scan the frames, and a
             // store of a counted frame may free what held it.
             if (!quiet || op == Op::New || op == Op::IterInit || op == Op::IterNext || op == Op::IterClose ||
@@ -1844,6 +1845,8 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             // `length` takes elements away.
             if (op == Op::PutElem || (op == Op::Call && viewOf_[i]))
                 forgetElems(true);
+            if (op == Op::PutElem)
+                forgetElems(false);  // (one that goes without the runtime, `lirGone_`, forgets nothing else)
             if (op == Op::PutProp && code_->atoms[in.b] == vm_.atoms.length)
                 forgetElems(false);
             std::uint32_t found = ssa::kNone, obj = ssa::kNone, shape = 0, index = 0;
@@ -1881,6 +1884,8 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                 if (std::getenv("SSA_ELIMDBG"))
                     std::fprintf(stderr, "elim %s @%u %s v%u := v%u\n", code_->name ? toUtf8(static_cast<StringCell*>(code_->name)->text()).c_str() : "anon", i, opName(op), g.defBase[i], found);
 #endif
+                if (lirChecked_[i] && g.values[found].kind == ssa::Value::Def)
+                    lirChecked_[g.values[found].at] = 1;  // the read that is left makes its checks
                 alias[g.defBase[i]] = found;
                 g.defBase[i] = found;
                 elim_[i] = 1;
@@ -6271,15 +6276,20 @@ Mem Baseline::ssaTypedPlace(std::uint32_t i, std::uint32_t vb, std::uint32_t vi,
         return mem(RSI, at * size);
     }
     const Reg index = ssaIndex(vi, bad);
+    // (`lirGone_`: an access of the same element before this one made the check, `lir::checkElim`.)
     if (t) {
-        a_.aluI32(7, index, std::int32_t(t->length));
-        a_.jcc(CAE, bad);
+        if (!lirGone_[i]) {
+            a_.aluI32(7, index, std::int32_t(t->length));
+            a_.jcc(CAE, bad);
+        }
         a_.movImm(RSI, reinterpret_cast<std::uint64_t>(t->data));
     } else {
         const Reg o = valueReg(vb);
         ssaNeedTyped(vb, o, kind, bad);
-        a_.alu32(7, index, mem(o, kTypedLength));
-        a_.jcc(CAE, bad);
+        if (!lirGone_[i]) {
+            a_.alu32(7, index, mem(o, kTypedLength));
+            a_.jcc(CAE, bad);
+        }
         a_.mov(RSI, mem(o, kTypedData));
     }
     return ssaIndexed(RSI, index, size);
@@ -6516,6 +6526,8 @@ bool Baseline::ssaGetElem(std::uint32_t i)
         const Reg o = valueReg(vb);
         const std::uint32_t def = ssa_->defBase[i];
         const bool tagged = sval_[def].rep == kRepTagged;
+        // (A later access that relies on this one's checks, `lirChecked_`: no element leaves the code.)
+        const bool soft = tagged && !lirChecked_[i];
         Label& hole = coldLabels_.emplace_back();
         Label& done = coldLabels_.emplace_back();
         const std::uint8_t kinds = ssaKindsOf(i, vb);
@@ -6524,7 +6536,7 @@ bool Baseline::ssaGetElem(std::uint32_t i)
         } else {
             // An array of doubles or of int32s first; one of values, if the site has met one, is what is left.
             needObjV(vb, o, bad);
-            ssaKindReads(i, vb, o, index, kinds, bad, tagged ? hole : miss, miss, done);
+            ssaKindReads(i, vb, o, index, kinds, bad, soft ? hole : miss, miss, done);
             if (kinds & elemprof::kArray) {
                 a_.cmpI8(mem(o, kHdrCls), std::uint8_t(ObjClass::Array));
                 a_.jcc(CNE, bad);
@@ -6534,11 +6546,11 @@ bool Baseline::ssaGetElem(std::uint32_t i)
         }
         if (kinds & elemprof::kArray) {
             a_.alu32(7, index, mem(o, kArrayLength));  // unsigned: below zero is past the end
-            a_.jcc(CAE, tagged ? hole : miss);
+            a_.jcc(CAE, soft ? hole : miss);
             a_.mov(RDX, mem(o, kArrayElems));
             a_.mov(RAX, ssaIndexed(RDX, index, 8));
             a_.cmpI(RAX, std::int32_t(kHole));
-            a_.jcc(CE, tagged ? hole : miss);
+            a_.jcc(CE, soft ? hole : miss);
             if (tagged) {
                 ssaDef(i, 0);
                 a_.jmp(done);
@@ -6552,7 +6564,7 @@ bool Baseline::ssaGetElem(std::uint32_t i)
                 ssaDefF64(i, x);
             }
         }
-        if (tagged) {
+        if (soft) {
             a_.bind(hole);
             loadValue(vb, RAX);
             if (plainHoleGuard(RDX, miss, i)) {
@@ -6695,6 +6707,46 @@ bool Baseline::ssaPutElem(std::uint32_t i, const ssa::Bits& liveAfter)
         case ElemKind::Int32: case ElemKind::Uint32: a_.mov32(place, r); break;
         case ElemKind::Int16: case ElemKind::Uint16: a_.mov16(place, r); break;
         default: a_.mov8(place, r); break;
+        }
+        return true;
+    }
+    if (lirGone_[i]) {
+        // The element is there: a read of it before this store left the code otherwise, and nothing between them takes
+        // elements away (`lir::checkElim`). An int32 into an array of int32s, or a number into an array of doubles, is
+        // stored with no check and no way to the runtime. Another kind of array leaves; a NaN leaves, and the next
+        // compile calls the runtime here (exit kind 4).
+        Label& bad = ssaExit(i);
+        if (!ssaQuietStore(i, vx)) {
+            a_.jmp(bad);
+            return true;
+        }
+        ssaExits_.push_back(SsaExit{i, name_, frame_, liveBefore_, Label{}});
+        ssaExits_.back().kind = 4;
+        Label& miss = ssaExits_.back().label;
+        const bool dbl = ssaElemKinds(i) == elemprof::kNumArray;
+        const std::uint8_t fact = dbl ? kVNumArr : kVIntArr;
+        const Reg index = ssaIndex(vi, bad);
+        const Reg o = valueReg(vb);
+        if (!known(vb, fact)) {
+            needObjV(vb, o, bad);
+            a_.cmpI8(mem(o, kHdrCls), std::uint8_t(dbl ? ObjClass::NumArray : ObjClass::IntArray));
+            a_.jcc(CNE, bad);
+            ssaKnow(vb, std::uint8_t(kVObj | fact));
+        }
+        if (dbl) {
+            int x = 0;
+            if (!sval_[vx].isConst && sval_[vx].rep == kRepF64 && sval_[vx].reg >= 0)
+                x = sval_[vx].reg;
+            else
+                loadF64(vx, 0, &bad);
+            a_.ucomisd(x, x);
+            a_.jcc(CP, miss);
+            a_.mov(RDX, mem(o, kArrayElems));
+            a_.movsdStore(ssaIndexed(RDX, index, 8), x);
+        } else {
+            loadValue(vx, RSI);
+            a_.mov(RDX, mem(o, kArrayElems));
+            a_.mov(ssaIndexed(RDX, index, 8), RSI);
         }
         return true;
     }

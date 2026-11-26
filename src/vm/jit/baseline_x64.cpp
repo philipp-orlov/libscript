@@ -3617,6 +3617,10 @@ private:
 public:
     Tier2Code* compileSsa(ssa::Graph& g, Tier1Code* base);
     void lirBuild(const ssa::Graph& g, lir::Func& f);
+    void lirPlan(const ssa::Graph& g);
+    bool ssaQuietStore(std::uint32_t i, std::uint32_t vx) const;
+    std::vector<std::uint8_t> lirGone_;     ///< per element access in place: its checks are not needed (`lir::checkElim`)
+    std::vector<std::uint8_t> lirChecked_;  ///< per plain element read: a later access relies on its checks
     bool ssaSpecLoad(std::uint32_t i);
     bool ssaSpecCall(std::uint32_t i);
     bool ssaElemQuiet(std::uint32_t i) const;

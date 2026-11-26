@@ -3,7 +3,9 @@
 
 // The lowered IR of the SSA tier's new back end (switched by SSA_LIR). It is built from the SSA graph (ssa.hpp) after the
 // representation plan: one LIR block per SSA block, nodes in SSA form. An instruction the back end does not lower is one
-// `Generic` node, which runs the instruction's template as the old emitter does (`ssaGeneric`). Each node that may leave
+// `Generic` node, which runs the instruction's template as the old emitter does (`ssaGeneric`). An element access done in
+// place is lowered to its checks and the load or store; the passes (lir_opt.cpp) mark the checks that are not needed,
+// and the emitter reads the marks. Each node that may leave
 // the code names the bytecode instruction the baseline code goes on at; what each live register holds there comes from
 // the SSA graph, and each SSA value maps to the node that makes it.
 #pragma once
@@ -27,6 +29,11 @@ enum class Op : std::uint8_t
     Entry,    ///< the value a register holds at the function's entry (`imm`: the register)
     Phi,      ///< `args`: one node per predecessor of the block, in its order
     Generic,  ///< bytecode instruction `at`, by its template; defines the SSA values it writes (as `Tagged`)
+    CheckBounds,  ///< `args`: array, index. Leaves the code when the array has no such index (`imm` 1: a typed array)
+    CheckHole,    ///< `args`: array, index. Leaves the code when the element of a plain array is a hole
+    LoadElem,     ///< `args`: array, index
+    StoreElem,    ///< `args`: array, index, value (`imm` bit 0: a typed array; bit 1: a plain array whose store can
+                  ///< go without the runtime when the element is known to be there, see `checkElim`)
     Jump,     ///< to the block's only successor
     Return,   ///< `args[0]`
 };
@@ -48,6 +55,7 @@ struct Node
     std::vector<std::uint32_t> args;
     std::uint32_t reads = kNoRegion, writes = kNoRegion;
     bool mayExit = false;
+    bool gone = false;  ///< a check another check before it has made (`checkElim`); a `StoreElem` that needs no check
 };
 
 struct Block
@@ -56,6 +64,8 @@ struct Block
     std::vector<std::uint32_t> nodes;
     std::vector<std::uint32_t> preds, succs;
     bool loopHeader = false;
+    bool reached = false;  ///< code is made for it
+    bool entered = false;  ///< a way in from other code leads to its start (the function's entry, a loop head)
 };
 
 struct Func
@@ -71,6 +81,12 @@ struct Func
 };
 
 const char* opName(Op op);
+
+/// Check elimination (lir_opt.cpp). A `CheckBounds` or `CheckHole` is `gone` when the same check of the same array and
+/// index was made on every way to it, with no write to `kWorld` between. A plain `StoreElem` that may go without the
+/// runtime (`imm` bit 1) and whose element is known to be there by such checks is `gone` too, and writes nothing but
+/// the element then; else it writes `kWorld`.
+void checkElim(Func& f);
 std::string dump(const Func& f);
 
 }  // namespace lir

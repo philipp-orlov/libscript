@@ -303,11 +303,24 @@ same index value) the value of the first, while nothing between can have written
 
 **The new back end (in progress).** `lir.hpp` is a lowered IR under the SSA graph: one block per SSA block, nodes in
 SSA form with effects as heap regions, and the node that makes each SSA value. `lir_build.inc` builds it after the
-representation plan; for now every instruction is one `Generic` node, and nothing is compiled from it
-(`SSA_LIR=dump` prints it). The plan: lower element access, property access and arithmetic into checks, loads and
-operations; value numbering, check elimination, loop-invariant motion and range analysis on those; code from the LIR,
-with `compileSsa` kept as the driver (entries, exits, edges) and a `Generic` node running the old path for an
-instruction not lowered yet.
+representation plan (`SSA_LIR=dump` prints it, `SSA_LIR=off` turns its passes off). An element access in place is
+lowered to its checks (`CheckBounds`, `CheckHole`) and a `LoadElem` or `StoreElem`; `ToNumeric` of a number is the
+number itself; every other instruction is one `Generic` node, which writes the region `kWorld` when it can reach the
+runtime. The emitter still makes the code one bytecode instruction at a time, and reads what the passes found.
+
+*Check elimination* (`lir::checkElim`, lir_opt.cpp) is a forward data flow over the blocks: a check of an array and an
+index holds after a node that made it, on every way, until a node writes `kWorld`. The head of a loop the baseline
+code can enter starts with nothing. What the emitter does with the result:
+
+- A store into a plain array, of an element that a read before it found (`a[i] = a[i] + x`, `w[j++] = l` after a read of
+  `w[j]`): an int32 into an array of int32s, or a number into an array of doubles, is stored with no bounds check, no
+  hole check and no path to the runtime. Such a store writes no `kWorld`, so load reuse and shape facts hold across
+  it. A NaN or an array of another kind leaves the code.
+- A typed array access after an access of the same element: no bounds check.
+- A plain element read that a later access relies on leaves the code on a miss also when its result is boxed
+  (`lirChecked_`).
+
+Not done yet: property access and arithmetic as nodes, loop-invariant motion, range analysis, code from the LIR.
 
 **What leaves for the runtime.** An instruction the code does not do in place runs as the baseline template, or as one
 step of the interpreter (`scriptVmJitStep`, counted by `SCRIPT_VM_STEPS`). A relational or truth jump whose site failed is

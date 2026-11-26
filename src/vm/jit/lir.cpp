@@ -18,6 +18,10 @@ const char* opName(Op op)
     case Op::Entry: return "Entry";
     case Op::Phi: return "Phi";
     case Op::Generic: return "Generic";
+    case Op::CheckBounds: return "CheckBounds";
+    case Op::CheckHole: return "CheckHole";
+    case Op::LoadElem: return "LoadElem";
+    case Op::StoreElem: return "StoreElem";
     case Op::Jump: return "Jump";
     case Op::Return: return "Return";
     }
@@ -60,7 +64,7 @@ std::string dump(const Func& f)
             const Node& n = f.nodes[id];
             std::snprintf(buf, sizeof buf, "  n%u %s %s", id, typeName(n.type), opName(n.op));
             out += buf;
-            if (n.op == Op::Const || n.op == Op::Entry) {
+            if (n.op == Op::Const || n.op == Op::Entry || n.imm) {
                 std::snprintf(buf, sizeof buf, " %#" PRIx64, static_cast<std::uint64_t>(n.imm));
                 out += buf;
             }
@@ -72,6 +76,10 @@ std::string dump(const Func& f)
                 out += " =v" + std::to_string(n.def);
             if (n.mayExit)
                 out += " exits";
+            if (n.writes & kWorld)
+                out += " world";
+            if (n.gone)
+                out += " gone";
             out += "\n";
         }
     }

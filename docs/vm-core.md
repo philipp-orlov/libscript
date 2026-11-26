@@ -269,6 +269,9 @@ its arguments, constants and static fields into new properties, class field init
 whose site has called one code is made directly, with its frame pushed from constants. Checks on the way into a loop (an array
 it reads, a boxed loop variable) hold in all of it.
 
+**Methods that name private fields** (`#x`) are merged into their callers like other small methods: the copy has the
+`PrivateCache` of each instruction it takes over.
+
 **It inlines nothing itself.** With the SSA tier, merge inlining (`mergeInline`) also takes a callee of up to 12 instructions at
 up to 64 sites. Tier 2 compiles a function where it uses what the SSA tier lacks (`ssa::preferTier2`): a self-inlined recursion
 (borrowed frames), a loop that calls a tiny closure that writes an upvalue or reads through a tiny getter (run in place), and a

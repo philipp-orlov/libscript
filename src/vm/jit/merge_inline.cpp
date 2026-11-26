@@ -82,8 +82,7 @@ bool mergeable(const CodeBlock* C, unsigned argc)
         C->prof.empty() || argc > C->nparams || C->uid > 0x7fffffffu || C->inlinedFrom)
         return false;
     if (C->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
-                    CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
-                    CodeBlock::kPrivate))
+                    CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy))
         return false;
     for (std::uint32_t j = 0; j < n; j = opt::nextOf(*C, j)) {
         const Op op = C->code[j].opcode();
@@ -133,8 +132,7 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
         c->inlinedFrom || c->mergedFrom || c->inlineSites.empty() == deeper)
         return nullptr;
     if (c->flags & (CodeBlock::kGenerator | CodeBlock::kAsync | CodeBlock::kAsyncGen | CodeBlock::kNeedsArgs | CodeBlock::kArgCount |
-                    CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy |
-                    CodeBlock::kPrivate))
+                    CodeBlock::kClassConstructor | CodeBlock::kProgram | CodeBlock::kDerived | CodeBlock::kLazy))
         return nullptr;
 
     // The calls to take in: their callee, and what it adds.
@@ -213,6 +211,13 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
 
     CodeBlock* d = vm.newCodeBlock(c->name, c->length, c->constructor);
     d->flags = c->flags;
+    // A function that names `#x` keeps a `PrivateCache` for each instruction: the copy has those of its instructions,
+    // from the block each came from (a cache holds no count).
+    bool hasPriv = (c->flags & CodeBlock::kPrivate) != 0;
+    for (const Site& s : sites)
+        hasPriv = hasPriv || (s.callee->flags & CodeBlock::kPrivate) != 0;
+    if (hasPriv)
+        d->flags |= CodeBlock::kPrivate;
     d->nparams = c->nparams;
     d->nregs = c->nregs;
     d->thisSlots = c->thisSlots;
@@ -269,6 +274,8 @@ CodeBlock* mergeOnce(VM& vm, CodeBlock* c, std::uint32_t loop, bool deeper)
         }
         if (hasElemSite)
             d->elemSite.push_back(site);
+        if (hasPriv)
+            d->privCaches.push_back(at < from.privCaches.size() ? from.privCaches[at] : PrivateCache{});
     };
     auto putCache = [&](const CodeBlock& from, std::uint16_t id) -> std::uint16_t {
         if (id == kNoCache || id >= from.caches.size())

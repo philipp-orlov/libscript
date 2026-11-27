@@ -152,10 +152,25 @@ void commitCode(const CodeSpan& span, const void* code, std::size_t bytes) noexc
 {
     std::memcpy(span.rw, code, bytes);
 #if defined(__aarch64__)
-    // Both views: the data cache is written back through the one the bytes went in by, and the instruction cache
-    // forgets what it had for the one they run from.
-    __builtin___clear_cache(reinterpret_cast<char*>(span.rw), reinterpret_cast<char*>(span.rw) + bytes);
-    __builtin___clear_cache(reinterpret_cast<char*>(span.rx), reinterpret_cast<char*>(span.rx) + bytes);
+    // The data cache is written back through the view the bytes went in by, and the instruction cache forgets what it
+    // had for the view they run from. CTR_EL0 says which of the two this processor needs (IDC, DIC) and the line sizes.
+    std::uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    if (!(ctr & (std::uint64_t(1) << 28))) {
+        const std::uintptr_t line = std::uintptr_t(4) << ((ctr >> 16) & 15);
+        const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(span.rw) + bytes;
+        for (std::uintptr_t p = reinterpret_cast<std::uintptr_t>(span.rw) & ~(line - 1); p < end; p += line)
+            __asm__ volatile("dc cvau, %0" : : "r"(p) : "memory");
+        __asm__ volatile("dsb ish" : : : "memory");
+    }
+    if (!(ctr & (std::uint64_t(1) << 29))) {
+        const std::uintptr_t line = std::uintptr_t(4) << (ctr & 15);
+        const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(span.rx) + bytes;
+        for (std::uintptr_t p = reinterpret_cast<std::uintptr_t>(span.rx) & ~(line - 1); p < end; p += line)
+            __asm__ volatile("ic ivau, %0" : : "r"(p) : "memory");
+        __asm__ volatile("dsb ish" : : : "memory");
+    }
+    __asm__ volatile("isb" : : : "memory");
 #endif
 }
 

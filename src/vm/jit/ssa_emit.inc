@@ -2325,11 +2325,17 @@ bool Baseline::ssaBranch(std::uint32_t b, std::uint32_t i)
         Label& T = td ? blockLabel_[st] : t;
         Label& F = fd ? blockLabel_[sf] : f;
         if (!known(v, kVNotCell)) {
-            // An object is true; a string or a double is left to the interpreter.
+            // An object is true, and a string that is not empty; a BigInt or a double is left to the interpreter.
             a_.test(x, R15);
             a_.jcc(CNE, notCell);
             a_.cmpI8(mem(x, kHdrKind), kObjectKind);
+            a_.jcc(CE, T);
+            a_.testI8(mem(x, 7), 0x80);
             a_.jcc(CNE, bad);
+            a_.cmpI8(mem(x, kGcKind), std::uint8_t(detail::CellKind::String));
+            a_.jcc(CNE, bad);
+            a_.cmpI32(mem(x, kStrLength), 0);
+            a_.jcc(CE, F);
             a_.jmp(T);
             a_.bind(notCell);
         }

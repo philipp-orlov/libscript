@@ -3751,7 +3751,7 @@ private:
     void ssaDefI32(std::uint32_t i, Reg from = RAX);
     Reg defI32Reg(std::uint32_t i) const;
     int defF64Reg(std::uint32_t i) const;
-    void ssaDefF64(std::uint32_t i, int x);
+    void ssaDefF64(std::uint32_t i, int x, bool tame = false);
     bool ssaArithF64(std::uint32_t i);
     bool ssaNative(std::uint32_t i);
     bool ssaPutFast(std::uint32_t i) const;
@@ -3900,6 +3900,14 @@ private:
     std::vector<std::uint32_t> kindLoops_;  ///< the loop headers that have `LoopGuards::kinds`
     std::uint8_t ssaKindsOf(std::uint32_t i, std::uint32_t v) const;
     std::vector<std::uint8_t> vDef_;     ///< per value: what its definition proves
+    /// Per value that is a double in a register or a slot: 1 when its NaN, if it is one, is the canonical NaN, so that
+    /// it is boxed with no test (`boxDoubleTo`): a number read from a boxed value, an int32 made a double, and what
+    /// sums, differences, products and quotients make of such values. 2: not so on some way that makes the value.
+    std::vector<std::uint8_t> vTame_;
+    bool tameIn(std::uint32_t v) const
+    {
+        return v == ssa::kNone || sval_[v].isConst || sval_[v].rep != kRepF64 || vTame_[v] == 1;
+    }
     std::vector<std::uint8_t> vKnown_;   ///< per value: what is known of it here (forgotten at block heads)
     std::vector<std::uint32_t> vShape_;  ///< per value: its object's shape, known here (0: not known)
     std::vector<std::uint32_t> touched_; ///< values with something in vKnown_ or vShape_ beyond vDef_

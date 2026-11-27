@@ -28,10 +28,10 @@ void Baseline::loadValue(std::uint32_t v, Reg r)
         return;
     case kRepF64:
         if (s.reg >= 0) {
-            boxDoubleTo(r, s.reg);
+            boxDoubleTo(r, s.reg, vTame_[v] == 1);
         } else {
             a_.movsdLoad(1, slotOf(v));
-            boxDoubleTo(r, 1);
+            boxDoubleTo(r, 1, vTame_[v] == 1);
         }
         return;
     default:
@@ -1004,6 +1004,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
             sval_[v].bits = bits;
         }
         vDef_.assign(g.values.size(), 0);
+        vTame_.assign(g.values.size(), 0);
         typedKind_.assign(g.values.size(), 0xFF);
         for (std::uint32_t v = 0; v < g.values.size(); ++v)
             if (sval_[v].isConst) {
@@ -1807,6 +1808,19 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
     };
     bool any = false;
     std::vector<std::uint32_t> toNumericOf(n_, ssa::kNone);  // per `ToNumeric` of a number: the value it read
+    // One name for each constant: a function run in place loads the box of its variable anew for each access
+    // (`LoadK`), and each load is a value of its own that is the same box.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> constants;
+    auto one = [&](std::uint32_t v) {
+        if (v == ssa::kNone || !sval_[v].isConst)
+            return v;
+        for (const auto& c : constants)
+            if (c.first == sval_[v].bits)
+                return c.second;
+        if (constants.size() < 64)
+            constants.emplace_back(sval_[v].bits, v);
+        return v;
+    };
     for (std::uint32_t b = 1; b < nb; ++b) {
         const ssa::Block& bl = g.blocks[b];
         if (!bl.reached)
@@ -1906,7 +1920,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                 const std::vector<ReadEntry> es = ssaReadEntries(i);
                 if (es.size() == 1 && !es[0].holder && !es[0].absent && !es[0].view) {
                     read = true;
-                    obj = names[in.b];
+                    obj = one(names[in.b]);
                     shape = es[0].shape;
                     index = es[0].index;
                 }
@@ -1915,7 +1929,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                 index = in.b;
             } else if (native_[i] && op == Op::GetBox && !sval_[g.defBase[i]].isConst) {
                 read = true;
-                obj = names[in.b];
+                obj = one(names[in.b]);
                 shape = 1;
             } else if (native_[i] && op == Op::GetElem && !ssaPrivateSite(i)) {
                 // The same element of the same array, with no store between: the same value (the first read left the code
@@ -1946,7 +1960,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
             }
             if (native_[i] && (op == Op::PutProp || op == Op::InitProp)) {
                 const InlineCache& ic = code_->caches[code_->code[i + 1].a];
-                const std::uint32_t o = names[in.a];
+                const std::uint32_t o = one(names[in.a]);
                 if (ic.next == 0 && ic.pad) {
                     // A store under one of several shapes: each of those slots may be the one written.
                     forget(ic.shape, ic.index);
@@ -1970,7 +1984,7 @@ bool Baseline::ssaLoadElim(ssa::Graph& g)
                 if (native_[i] && op == Op::PutUpval)
                     k.push_back({ssa::kNone, 0, in.a, names[in.b]});
                 else if (native_[i])
-                    k.push_back({names[in.a], 1, 0, names[in.b]});
+                    k.push_back({one(names[in.a]), 1, 0, names[in.b]});
             }
             if (op == Op::Mov) {
                 names[in.a] = names[in.b];
@@ -2161,7 +2175,7 @@ void Baseline::ssaDef(std::uint32_t i, std::uint8_t bits)
             vDef_[v] = vKnown_[v] = kVNotCell;
             const int x = defF64Reg(i);
             loadNumber(x, RAX, RDX);
-            ssaDefF64(i, x);
+            ssaDefF64(i, x, true);
         }
         return;
     }
@@ -2199,10 +2213,19 @@ int Baseline::defF64Reg(std::uint32_t i) const
 }
 
 /// The instruction's result is the double in xmm`x`.
-void Baseline::ssaDefF64(std::uint32_t i, int x)
+void Baseline::ssaDefF64(std::uint32_t i, int x, bool tame)
 {
     const std::uint32_t v = ssa_->defBase[i];
     name_[code_->code[i].a] = v;
+    // (Tame on every way that makes the value, or not at all.)
+#if defined(__aarch64__)
+    if (!tame)
+        vTame_[v] = 2;
+    else if (vTame_[v] == 0)
+        vTame_[v] = 1;
+#else
+    (void)tame;  // (x86-64 makes a NaN of its own for an invalid operation, which is not the canonical one)
+#endif
     const SVal& s = sval_[v];
     if (s.reg >= 0) {
         if (s.reg != x)
@@ -3703,7 +3726,7 @@ void Baseline::ssaMathCall(std::uint32_t i, JSFunction* f)
         } else if (sval_[def].rep == kRepF64) {
             const int x = defF64Reg(i);
             a_.cvtsi2sd32(x, RAX);
-            ssaDefF64(i, x);
+            ssaDefF64(i, x, true);
         } else {
             a_.mov32(RAX, RAX);
             a_.or_(RAX, R14);
@@ -4802,7 +4825,7 @@ bool Baseline::ssaArithF64(std::uint32_t i)
         loadToInt32(name_[in.b], RAX, bad);
         a_.mov32(RAX, RAX);
         a_.cvtsi2sd64(x, RAX);
-        ssaDefF64(i, x);
+        ssaDefF64(i, x, true);
         return true;
     }
     if (op == Op::Neg) {
@@ -4833,11 +4856,15 @@ bool Baseline::ssaArithF64(std::uint32_t i)
             a_.addsd(y, z);
         else
             a_.mulsd(y, z);
-        ssaDefF64(i, y);
+        ssaDefF64(i, y, tameIn(va) && tameIn(vb));
         return true;
     }
     if (rr && !inReg)
         loadF64(vb, 1, &bad);
+    // A sum, difference, product or quotient of tame doubles is tame: an operand that is a NaN is the canonical one
+    // and comes out as it went in, and an invalid operation makes the processor's own NaN, which on arm64 is the
+    // canonical one.
+    const bool tame = tameIn(name_[in.b]) && tameIn(vb);
     loadF64(name_[in.b], x, &bad);
     if (!rr) {
         a_.movImm(RDX, std::uint32_t(std::int32_t(std::int16_t(in.c))));
@@ -4849,7 +4876,7 @@ bool Baseline::ssaArithF64(std::uint32_t i)
     case Op::Mul: case Op::MulI: a_.mulsd(x, y); break;
     default: a_.divsd(x, y); break;
     }
-    ssaDefF64(i, x);
+    ssaDefF64(i, x, tame);
     return true;
 }
 
@@ -7042,7 +7069,7 @@ void Baseline::ssaKindReads(std::uint32_t i, std::uint32_t vb, Reg o, Reg index,
         if (rep == kRepF64) {
             const int x = defF64Reg(i);
             a_.cvtsi2sd32(x, RAX);
-            ssaDefF64(i, x);
+            ssaDefF64(i, x, true);
         } else if (rep == kRepI32) {
             ssaDefI32(i);
         } else {
@@ -7108,7 +7135,7 @@ bool Baseline::ssaGetElem(std::uint32_t i)
                 needNumber(RAX, miss);
                 const int x = sval_[def].reg >= 0 ? sval_[def].reg : 0;
                 loadNumber(x, RAX, RDX);
-                ssaDefF64(i, x);
+                ssaDefF64(i, x, true);
             }
         }
         if (soft) {
@@ -7178,7 +7205,7 @@ bool Baseline::ssaGetElem(std::uint32_t i)
                 needNumber(RAX, bad);
                 const int x = sval_[def].reg >= 0 ? sval_[def].reg : 0;
                 loadNumber(x, RAX, RDX);
-                ssaDefF64(i, x);
+                ssaDefF64(i, x, true);
                 a_.jmp(join);
             } else {
                 ssaDef(i, 0);

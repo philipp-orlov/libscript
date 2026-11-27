@@ -1411,6 +1411,14 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
                     ended = true;
                 break;
             }
+            // An instruction whose emitter gave up (the code leaves there every time) has named no value. What comes
+            // after it in the block never runs, and is compiled with the value the instruction would have made.
+            if (g.defBase[i] != ssa::kNone) {
+                const opt::Effects e = ssa::effects(*code_, i);
+                for (std::size_t w = 0; w < e.wr.size(); ++w)
+                    if (name_[e.wr[w]] == ssa::kNone)
+                        name_[e.wr[w]] = g.defBase[i] + std::uint32_t(w);
+            }
             ssaKeepsDefined(usePos_[i] + 1);
         }
         ssaKeepsDrop(blockEnd_[b]);

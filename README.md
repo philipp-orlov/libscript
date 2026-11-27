@@ -6,96 +6,96 @@
   <a href="https://github.com/philipp-orlov/libscript/actions/workflows/ci.yml"><img src="https://github.com/philipp-orlov/libscript/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-3b82f6" alt="License: Apache-2.0"></a>
   <img src="https://img.shields.io/badge/C%2B%2B-17-a855f7" alt="C++17">
-  <img src="https://img.shields.io/badge/JIT-arm64%20%7C%20x86--64-14b8a6" alt="JIT: arm64 and x86-64">
-  <img src="https://img.shields.io/badge/steady--state%20malloc-0-22c55e" alt="Steady-state malloc: 0">
-  <img src="https://img.shields.io/badge/dependencies-libcore%20only-f472b6" alt="Dependencies: libcore only">
+  <img src="https://img.shields.io/badge/first%20run-1.5%C3%97%20faster%20than%20JSC-22c55e" alt="First run: 1.5x faster than JavaScriptCore">
+  <img src="https://img.shields.io/badge/memory-4.7%C3%97%20less%20than%20JSC-14b8a6" alt="Memory: 4.7x less than JavaScriptCore">
+  <img src="https://img.shields.io/badge/steady--state%20malloc-0-f472b6" alt="Steady-state malloc: 0">
 </p>
 
 <p align="center">
+  <a href="#-against-javascriptcore"><b>vs JavaScriptCore</b></a> ·
   <a href="#-see-it-run"><b>See it run</b></a> ·
-  <a href="#-against-javascriptcore"><b>Against JSC</b></a> ·
-  <a href="#-the-numbers"><b>The numbers</b></a> ·
-  <a href="#-under-the-hood"><b>Under the hood</b></a> ·
+  <a href="#-six-languages-one-context"><b>Languages</b></a> ·
+  <a href="#-why-it-holds-up"><b>Architecture</b></a> ·
   <a href="#-build-it"><b>Build it</b></a> ·
-  <a href="#-examples"><b>Examples</b></a> ·
   <a href="#-documentation"><b>Docs</b></a>
 </p>
 
-**Your C++ application, scriptable in the language your users already know.** Bind a class once and C#, TypeScript,
-JavaScript, Python, C and C++ can all call it, type-checked where the language has types, sandboxed in all of them,
-and on a heap built to still look the same after months of uptime. No .NET, no Node, no CPython.
+<h3 align="center">Script your C++ application in the language your users already know.</h3>
+
+<p align="center">
+Bind a class once. <b>C#, TypeScript, JavaScript, Python, C and C++</b> can all call it:<br>
+type-checked where the language has types, sandboxed in all of them, JIT-compiled,<br>
+on a heap that looks the same after months of uptime. No .NET, no Node, no CPython.
+</p>
+
+<table>
+<tr>
+<td align="center" width="33%"><h2>1.5× faster</h2><b>to the first result</b><br>than JavaScriptCore.<br><sub>No warm-up tax: ahead on 36 of 41 workloads.</sub></td>
+<td align="center" width="33%"><h2>4.7× less memory</h2><b>than JavaScriptCore</b>, at peak.<br><sub>Never above it on any workload,<br>and no growth over 1,000 iterations.</sub></td>
+<td align="center" width="33%"><h2>0 mallocs</h2><b>in steady state</b>, in any language.<br><sub>Nothing to fragment.<br>A test holds it at exactly zero.</sub></td>
+</tr>
+</table>
+
+<sub>JetStream 3, the 41 JavaScript workloads that run in a plain shell, against JavaScriptCore 2.52.6 with all its tiers,
+on arm64. Numbers and method are <a href="#-against-javascriptcore">below</a>.</sub>
+
+## 🏁 Against JavaScriptCore
+
+JavaScriptCore is the engine of Safari: four tiers, a concurrent compiler, twenty years of tuning. libscript is a
+library you link into your application. On [JetStream 3](https://github.com/WebKit/JetStream):
+
+| | libscript vs JSC | What it means |
+| --- | :-: | --- |
+| **First iteration** | **0.66×** the time | Scripts are fast from the first call. Ahead on 36 of 41 workloads. |
+| **Later iterations** | 1.25× the time | Within a quarter of JSC's top tier, and ahead on 12 of 41. The gap closes with every release. |
+| **Peak memory** | **0.21×** the size | A fifth of JSC's memory, as a geometric mean. Not above JSC on a single workload. |
+
+Memory is where the two designs part ways. JSC trades memory for speed and lets garbage wait for a collection.
+libscript frees an object the moment it dies, so a script's footprint is what it holds and little more:
+
+| Workload | libscript | JavaScriptCore | |
+| --- | --: | --: | --: |
+| `raytrace` | **13 MiB** | 314 MiB | 24× less |
+| `js-tokens` | **10 MiB** | 197 MiB | 19× less |
+| `ML` | **21 MiB** | 328 MiB | 16× less |
+| `cdjs` | **20 MiB** | 239 MiB | 12× less |
+| `regexp-octane` | **27 MiB** | 181 MiB | 7× less |
+| `pdfjs` | **72 MiB** | 379 MiB | 5× less |
+| `pdfjs`, 1,000 iterations | **396 MiB** | 1,246 MiB | 3× less |
+
+And it stays there: over 300 and 1,000 iterations of every workload, the resident size after warm-up grows only where
+the program itself keeps data.
+
+Some workloads already run faster than in JSC at full speed: `navier-stokes` 0.81×, `crypto` 0.85×,
+`stanford-crypto-aes` 0.86×, `gbemu` 0.87×, `proxy-mobx` 0.93×, `pdfjs` 0.95×, `Basic` 0.97×.
+
+<sub>Measured on one core of a 20-core arm64 Linux machine (Cortex-X925), Release build, best of two interleaved rounds;
+ratios are libscript's time or peak resident size over JSC's. Later iterations are the mean of iterations 2 to 15, so
+they include JSC's own warm-up. The scripts are in <a href="tools/perf">tools/perf</a>; the full table and where the
+time goes are in <a href="docs/vm-core.md">vm-core.md</a>.</sub>
 
 ## ⚡ See it run
 
 ```cpp
-#include <cstdio>
-#include <string>
-#include <vector>
+script::Context ctx;
 
-#include "script/script.hpp"
+// Bound once. Every language sees it, and the typed ones check calls against these C++ signatures.
+ctx.hostClass("Host")
+    .method("Count", [&] { return int(words.size()); })
+    .method("Word", [&](int i) { return words.at(std::size_t(i)); })
+    .method("Report", [](std::string who, std::string word, int n) { /* ... */ });
 
-int main()
-{
-    script::Context ctx;
-    const std::vector<std::string> words = {"the", "heap", "stays", "flat", "and", "the", "heap", "stays", "the", "same"};
+ctx.eval(R"(var seen = new Dictionary<string, int>(); /* ... */ Host.Report("C#", top, n);)", "top.cs");
+ctx.eval(R"(const seen = new Map<string, number>();    /* ... */ Host.Report("TypeScript", w, n);)", "top.ts");
+ctx.eval(R"(top = max(words, key=words.count);          # ...    Host.Report("Python", top, n))", "top.py");
 
-    // Bound once. Every language sees it, and the typed ones check calls against these C++ signatures.
-    ctx.hostClass("Host")
-        .method("Count", [&] { return int(words.size()); })
-        .method("Word", [&](int i) { return words.at(std::size_t(i)); })
-        .method("Report", [](std::string who, std::string word, int n) { std::printf("%-10s %s x%d\n", who.c_str(), word.c_str(), n); });
-
-    // One job in each language's own idiom: the most common word. The file name picks the language.
-    const char* const programs[][2] = {
-        {"top.cs", R"(using System.Collections.Generic;
-            var seen = new Dictionary<string, int>();
-            for (int i = 0; i < Host.Count(); i++) { var w = Host.Word(i); seen[w] = seen.ContainsKey(w) ? seen[w] + 1 : 1; }
-            var top = ("", 0);
-            foreach (var (w, n) in seen) if (n > top.Item2) top = (w, n);
-            Host.Report("C#", top.Item1, top.Item2);)"},
-        {"top.ts", R"(const seen = new Map<string, number>();
-            for (let i = 0; i < Host.Count(); i++) seen.set(Host.Word(i), (seen.get(Host.Word(i)) ?? 0) + 1);
-            const [w, n] = [...seen].reduce((a, b) => (b[1] > a[1] ? b : a));
-            Host.Report("TypeScript", w, n);)"},
-        {"top.js", R"(const seen = Array.from({ length: Host.Count() }, (_, i) => Host.Word(i)).reduce((c, w) => ({ ...c, [w]: (c[w] || 0) + 1 }), {});
-            const [w, n] = Object.entries(seen).sort((a, b) => b[1] - a[1])[0];
-            Host.Report("JavaScript", w, n);)"},
-        {"top.py", R"(words = [Host.Word(i) for i in range(Host.Count())]
-top = max(words, key=words.count)
-Host.Report("Python", top, words.count(top)))"},
-        {"top.c", R"(#include <string.h>
-            int main() { int top = 0, most = 0, size = Host.Count();
-                for (int i = 0, n = 0; i < size; i++, n = 0) {
-                    for (int j = 0; j < size; j++) n += strcmp(Host.Word(i), Host.Word(j)) == 0;
-                    if (n > most) { most = n; top = i; } }
-                Host.Report("C", Host.Word(top), most); })"},
-        {"top.cpp", R"(#include <map>
-            #include <string>
-            int main() { std::map<std::string, int> seen; std::string top; int most = 0;
-                for (int i = 0; i < Host::Count(); i++) seen[Host::Word(i)]++;
-                for (auto& e : seen) if (e.second > most) { top = e.first; most = e.second; }
-                Host::Report("C++", top, most); })"},
-    };
-    for (const auto& program : programs)
-        ctx.eval(program[1], program[0]);
-
-    // A wrong call never runs.
-    for (const script::Diagnostic& d : ctx.diagnose("Host.Report(\"x\", 42, 1);", "bad.ts"))
-        std::puts(d.toString().c_str());
-}
+// A wrong call never runs.
+ctx.diagnose("Host.Report(\"x\", 42, 1);", "bad.ts");
+// bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
 ```
 
-```text
-C#         the x3
-TypeScript the x3
-JavaScript the x3
-Python     the x3
-C          the x3
-C++        the x3
-bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
-```
-
-<sub>This is <a href="examples/polyglot/word_count.cpp"><code>examples/polyglot/word_count.cpp</code></a>, built and runnable as it stands.</sub>
+One host API, one job, six languages, wrong calls rejected before they run. The complete program is
+[examples/polyglot/word_count.cpp](examples/polyglot/word_count.cpp), built and runnable as it stands.
 
 ## 🌐 Six languages, one context
 
@@ -108,93 +108,47 @@ bad.ts(1): error: argument 2 type mismatch: '42' is not assignable to 'string'
 | **C** | typed engine + JIT | a sandboxed C with a `libc` of natives; no ambient file or OS access | [c.md](docs/languages/c.md) |
 | **C++** | typed engine + JIT | classes, virtual dispatch, exceptions, the standard containers | [cpp.md](docs/languages/cpp.md) |
 
-Every language is a CMake option. Turn off what you don't ship, and its front end, tests and examples go with it; an
-engine goes once no language needs it. The vm core's compilers generate x86-64 and arm64 code on Linux; elsewhere it
-interprets.
-
-## 🏁 Against JavaScriptCore
-
-The vm core runs JavaScript, TypeScript and Python with an interpreter, a baseline compiler and an optimizing compiler.
-On the 16 kernels in [`bench/kernels/js`](bench/kernels/js), it takes 0.89× the time of JavaScriptCore 2.52.6 with all its
-tiers, as a geometric mean, and is ahead on 13 of them:
-
-| Kernel | vm / JSC | Kernel | vm / JSC |
-| --- | --: | --- | --: |
-| `sort_cmp` | **0.49** | `fib_calls` | **0.96** |
-| `float_mandel` | **0.70** | `closure` | **0.97** |
-| `alloc_small` | **0.71** | `nbody` | **0.97** |
-| `string_ops` | **0.86** | `tree_gc` | **0.97** |
-| `int_loop` | **0.87** | `json_rt` | 1.01 |
-| `map_dict` | **0.91** | `sieve_array` | 1.02 |
-| `array_push_hof` | **0.93** | `poly_prop` | 1.03 |
-| `prop_rw` | **0.93** | `method_call` | 1.07 |
-
-<sub>Whole-process wall-clock time, median of eleven runs of each engine taken in turn on the same core of a Xeon Gold
-5420+ (x86-64, Linux, GCC 13, Release); lower is better. How each kernel was won and what is left is in
-[vm-core.md](docs/vm-core.md).</sub>
-
-## 🚀 The numbers
-
-| Workload (per round) | Before libcore | Now | Speed | Heap calls per round |
-| --- | --: | --: | --: | --- |
-| JavaScript: objects, closures, `Map`, JSON | 587 µs | **275 µs** | **2.1×** | 3,115 → **0** |
-| Python: dicts, lists, lambdas | 863 µs | **600 µs** | **1.4×** | 8,288 → **0** |
-| C#: classes, `List`, `Dictionary`, `StringBuilder` | 203 µs | **157 µs** | **1.3×** | 2,274 → **0** |
-| Long strings: build and join 1,000 | 619 µs | **180 µs** | **3.4×** | 5,027 → **0** |
-| Number to string, 1,000 times | 863 µs | **134 µs** | **6.4×** | 0 → **0** |
-
-And over time: four contexts on four threads churning objects in JavaScript, Python and C#, with bursts, and compiling new programs in every language throughout:
-
-| 25-minute soak | |
-| --- | --- |
-| Iterations | 15.2 million |
-| Resident size, median of the middle third of the run | 67.2 MiB |
-| Resident size, median of the last third | 68.8 MiB (+2.4 %) |
-| Fitted trend | slightly downward |
-
-<sub>Measured on one 20-core arm64 Linux machine with GCC 13 in a Release build; compare the ratios, not the absolute
-times. The benchmark's own argument vector is left out of the heap calls. Reproduce with
-<code>-DSCRIPT_BUILD_BENCHMARKS=ON</code>, <code>bench_longrun</code> and
-<code>SCRIPT_SOAK_SECONDS=1500 bench_soak_mixed</code>.</sub>
+Every language is a CMake option. Turn off what you do not ship, and its front end, tests and examples go with it.
 
 ## ✨ Why it holds up
+
+The numbers above come from the design, not from tuning one benchmark.
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
 ### 🧠 Memory that stays put
-Reference counting frees most objects the moment they die, and one cycle collector handles the rest, in time
-proportional to the live set. Once warmed up, a running program **makes no call to `malloc`, in any language**, so the
-general allocator has nothing to fragment. [A test](tests/core/test_steady_state.cpp) holds that at exactly zero.
-[More](docs/memory.md)
+Objects are counted, so most garbage is freed the moment it dies, not at the next collection. Short-lived objects
+skip even the counting: they are born young and swept in bulk. Nothing ever moves, so C++ can hold a pointer to any
+object. A cycle collector handles the rest. Once warm, a program **makes no call to `malloc`**, and
+[a test](tests/core/test_steady_state.cpp) holds that at zero. [More](docs/memory.md)
 
 </td>
 <td width="50%" valign="top">
 
-### 🔗 One binding layer
-`hostClass` and `Class<T>` declare a member once. The C# compiler and the TypeScript checker check calls against the
-C++ signature, and the dynamic languages see the same functions on the same objects. `script::Value` is the same
-16-byte tagged value whichever language made it. [More](docs/embedding.md)
+### 🏎️ Three tiers, no waiting
+An interpreter that starts at once, a baseline compiler after 200 calls, and an optimizing compiler with an SSA graph,
+type speculation, inlining and a register allocator. Each tier hands a running function to the next in the middle of
+a loop. That is why the first iteration beats JSC: there is no slow start to pay for. [More](docs/vm-core.md)
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
-### 🏎️ Two machines, one heap
-C#, C and C++ compile to typed bytecode, with arm64 and x86-64 back ends around 10× faster than interpreting for the
-arithmetic-and-loops core of a method. TypeScript, JavaScript and Python run on the vm core: NaN-boxed values, shapes
-and inline caches, a register interpreter, and two compilers on top, the second keeping numbers in machine registers,
-running small functions and recursion in place. [More](docs/vm-core.md)
+### 🔗 One binding layer
+`hostClass` and `Class<T>` declare a member once. The C# compiler and the TypeScript checker check calls against the
+C++ signature, and the dynamic languages see the same functions on the same objects. `script::Value` is the same
+16-byte value whichever language made it. [More](docs/embedding.md)
 
 </td>
 <td valign="top">
 
 ### 🛡️ A sandbox by construction
-No file system, no network, no reflection, and no `eval` from inside a script unless the host turns it on. A program
-reaches exactly what the host hands it, while `memoryLimit`, `stackLimit` and an interrupt hook bound what it can spend, across every language in the
-context at once.
+No file system, no network, no reflection, and no `eval` unless the host turns it on. A script reaches exactly what
+the host hands it. `memoryLimit`, `stackLimit` and an interrupt hook bound what it can spend, across every language
+in the context at once.
 
 </td>
 </tr>
@@ -203,29 +157,34 @@ context at once.
 
 ### 📦 Compile once, run anywhere
 `compile` produces an `Assembly` that runs as often as you like without parsing again. A C# assembly serializes to a
-portable image another process loads without lexing, parsing or checking. [More](docs/compilation.md)
+portable image that another process loads without lexing, parsing or checking. [More](docs/compilation.md)
 
 </td>
 <td valign="top">
 
 ### 🧪 Tested as if it had to last
-53 test suites across the languages, all of them under AddressSanitizer and UndefinedBehaviorSanitizer, the ones that
-share state under ThreadSanitizer, test262 for JavaScript, differential fuzzers that hold compiled code to the
-interpreter, and long-run soak tests that check the resident size. CI runs both code generators on their own hardware.
-Known gaps are written down in [limitations.md](docs/limitations.md).
+53 test suites in 21 engine configurations, AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer, test262,
+differential fuzzers that hold compiled code to the interpreter, and soak tests that watch the resident size. Known
+gaps are written down in [limitations.md](docs/limitations.md).
 
 </td>
 </tr>
 </table>
 
+Built for months of uptime: four contexts on four threads churning objects in JavaScript, Python and C#, and compiling
+new programs in every language throughout, for 25 minutes and 15.2 million iterations. Resident size: 67.2 MiB in the
+middle third of the run, 68.8 MiB in the last, with a fitted trend that points slightly down.
+
 ## 🔬 Under the hood
 
 <p align="center">
-  <img src="docs/assets/architecture.svg" alt="Your C++ application drives two engines: a typed bytecode VM with an arm64 and x86-64 JIT that runs C#, C and C++, and a dynamic bytecode VM that runs TypeScript, JavaScript and Python. Both share one heap with reference counts and a cycle collector, built on libcore." width="100%">
+  <img src="docs/assets/architecture.svg" alt="Your C++ application drives two engines: a typed bytecode VM with an arm64 and x86-64 JIT that runs C#, C and C++, and a dynamic bytecode VM that runs TypeScript, JavaScript and Python. Both share one heap with reference counts and a cycle collector." width="100%">
 </p>
 
-The machinery under the languages comes from [libcore](https://github.com/philipp-orlov/libcore), the foundation shared
-with libsql, librpc and the rest of the family, so none of it is written here a second time.
+Two engines share one heap. C#, C and C++ compile to typed bytecode with arm64 and x86-64 back ends. TypeScript,
+JavaScript and Python run on the vm core: NaN-boxed values, shapes and inline caches, a register interpreter and two
+compilers. The optimizing tier is tuned on arm64 Linux; x86-64 runs the baseline tier and an earlier optimizer, and
+other platforms interpret. The one dependency is [libcore](https://github.com/philipp-orlov/libcore).
 
 ## 🔧 Build it
 
@@ -244,12 +203,7 @@ add_subdirectory(libscript)
 target_link_libraries(my_app PRIVATE script::script)
 ```
 
-Or install both and use the package:
-
-```cmake
-find_package(script REQUIRED)     # finds libcore as well
-target_link_libraries(my_app PRIVATE script::script)
-```
+Or install both and use `find_package(script REQUIRED)`.
 
 <details>
 <summary><b>All build options</b></summary>
@@ -285,26 +239,18 @@ least one language must stay on. The generated `script/config.hpp` tells the emb
 ## 💻 The command line
 
 ```
-$ libscript program.cs                  # run a file; the extension picks the language
-$ libscript script.py                   # .py, .c, .cpp, .ts, .js all work the same way
+$ libscript program.cs                  # run a file; the extension picks the language (.cs .ts .js .py .c .cpp)
 $ libscript rules.ts --strict           # TypeScript with strictNullChecks and noImplicitAny
 $ libscript --lang js -e '6 * 7'        # run a snippet
-$ libscript --lang py -e 'print(6 * 7)'
-$ libscript --lang js                   # a REPL for a dynamic language (js, ts, py; one line at a time)
+$ libscript --lang py                   # a REPL for js, ts or py
 $ libscript --check program.cs          # compile only, report diagnostics
-$ libscript -c program.sxa program.cs   # compile C#, C or C++ to an assembly image
-$ libscript -r program.sxa              # run an image
-$ libscript --dump program.cs           # disassemble every method of a C# assembly
+$ libscript -c program.sxa program.cs   # compile C#, C or C++ to an assembly image; -r runs one
 $ libscript --stats program.js          # heap and code statistics when it ends
-$ libscript --native program.cs         # C#: compile to machine code up front
-$ libscript --jit program.cs            # C#: compile methods once they get hot
 $ libscript --stack 256 --memory 64 program.js
 ```
 
-A JavaScript program run by the tool has what programs written for a shell such as `jsc` or `d8` look for: `argv`,
-`print`, `printErr`, `read(path)` (`read(path, "binary")` for bytes), `readFile`, `load(path)`, `loadString(source)`,
-`preciseTime()`, `setTimeout`, `clearTimeout` and `gc()`. They belong to the tool, not the library: an embedding
-gives a script only what its host binds.
+A JavaScript program run by the tool also gets what a shell such as `jsc` or `d8` offers (`print`, `read`, `load`,
+`setTimeout`, `gc` and the like). Those belong to the tool: an embedding gives a script only what its host binds.
 
 ## 🎯 Examples
 
@@ -361,11 +307,11 @@ The `polyglot/` examples are built only when every language is on.
 | Read this | For |
 | --- | --- |
 | [design.md](docs/design.md) | the core, the engines, the front ends, and why the split is where it is |
-| [vm-core.md](docs/vm-core.md) | the vm core: JavaScript, TypeScript and Python, its interpreter and its two compilers |
+| [vm-core.md](docs/vm-core.md) | the vm core: its tiers, its heap, and its standing against JavaScriptCore |
 | [embedding.md](docs/embedding.md) | the C++ API |
 | [languages/](docs/languages/) | what each language and its library support |
 | [compilation.md](docs/compilation.md) | assemblies, units and the image format |
-| [jit.md](docs/jit.md) | the typed engine's arm64 and x86-64 back ends (and the old dynamic engine's) |
+| [jit.md](docs/jit.md) | the typed engine's arm64 and x86-64 back ends |
 | [memory.md](docs/memory.md) | the heap, the collector, and what a long run costs |
 | [limitations.md](docs/limitations.md) | what is not there, stated plainly |
 | [adding-a-language.md](docs/adding-a-language.md) | the hook a new front end plugs into |

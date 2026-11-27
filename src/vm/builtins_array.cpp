@@ -796,21 +796,25 @@ NATIVE(arrayIndexOfGeneric)
     if (dense && (isObject(needle) || isSymbol(needle) || needle.isNull() || needle.isBool())) {
         // A value equal only to itself: the dense elements compared by their bits, up to a hole (read through the
         // prototype by the loop below).
-        const double end = std::min(len, double(dense->length));
+        // (Counted in an integer: a double that is stepped waits on its own sum each time round.)
+        const std::uint32_t end = std::uint32_t(std::min(len, double(dense->length)));
+        std::uint32_t i = k < double(end) ? std::uint32_t(k) : end;
         if (dense->boxed()) {
             const JSValue* const values = dense->store;
-            for (; k < end; ++k) {
-                const JSValue e = values[std::uint32_t(k)];
+            for (; i < end; ++i) {
+                const JSValue e = values[i];
                 if (e.bits == needle.bits)
-                    return mode == 0 ? JSValue::boolean(true) : JSValue::boxNumber(k);
+                    return mode == 0 ? JSValue::boolean(true) : JSValue::boxNumber(double(i));
                 if (e.isHole())
                     break;
             }
         } else {
             // (An array of int32s or of doubles holds no such value.)
-            while (k < end && !dense->holeAt(std::uint32_t(k)))
-                ++k;
+            while (i < end && !dense->holeAt(i))
+                ++i;
         }
+        if (double(i) > k)
+            k = double(i);
     }
     for (; k < len; ++k) {
         if (dense && k < double(dense->length) && !dense->at(std::uint32_t(k)).isHole()) {

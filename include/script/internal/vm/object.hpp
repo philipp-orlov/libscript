@@ -283,7 +283,14 @@ inline constexpr std::uint32_t kElemSize[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8, 2
 
 struct ProxyState;
 /// The proxy state of an object that is a proxy, else null.
-ProxyState* proxyOf(JSObject* o) noexcept;
+ProxyState* proxyOfRare(JSObject* o) noexcept;
+/// (Asked of every object a property is looked for in: the test of the class is in place, the rest out of line.)
+inline ProxyState* proxyOf(JSObject* o) noexcept
+{
+    if (o->cls() == ObjClass::Proxy || (o->cls() == ObjClass::Function && (o->h.flags & cellflags::kHasRare)))
+        return proxyOfRare(o);
+    return nullptr;
+}
 JSValue proxyGet(VM& vm, JSObject* proxy, Key key, JSValue receiver);
 bool proxySet(VM& vm, JSObject* proxy, Key key, JSValue value, JSValue receiver, bool strict);
 /// 1 yes, 0 no, -1 an exception is pending.

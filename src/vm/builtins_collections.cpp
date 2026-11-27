@@ -88,12 +88,14 @@ struct KeyIndex
         if (slots.empty())
             return -1;
         const std::size_t mask = slots.size() - 1;
+        // An object, a symbol, a boolean, null or undefined is the same key only as the same value: no call to compare.
+        const bool same = !(key.isNumber() || isString(key) || isBigInt(key));
         for (std::size_t at = spread(key) & mask;; at = (at + 1) & mask) {
             const std::uint32_t s = slots[at];
             if (!s)
                 return -1;
             const auto& e = entries[s - 1];
-            if (e.live && KeyEq()(KeyBox{e.key}, KeyBox{key}))
+            if (e.live && (e.key.bits == key.bits || (!same && sameValueZero(e.key, key))))
                 return int(s - 1);
         }
     }

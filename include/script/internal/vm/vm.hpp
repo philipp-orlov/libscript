@@ -590,6 +590,16 @@ struct VM : EngineRuntime
     }
     JSValue typeofName(unsigned which);
     /// The property names of the first thousand non-negative integers, made when first asked for; each holds a count.
+    /// `o[n]` where `o` is a plain object with no elements and a shape of the tree (an object used as a map by small
+    /// numbers): the slot of its own data property named `n`. A shape's id names one layout for as long as the VM lives,
+    /// so an entry needs no check but the id.
+    struct PlainIndexRead
+    {
+        std::uint32_t shape = 0, slot = 0;
+        std::int32_t n = -1;
+    };
+    static constexpr std::size_t kPlainIndexReads = 256;
+    PlainIndexRead plainIndexReads[kPlainIndexReads];
     /// The names of the proxy traps, each interned when first asked for, by the address of its literal (`trapOf`).
     struct TrapKey
     {

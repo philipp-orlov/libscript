@@ -5155,6 +5155,30 @@ int jitGetElem(VM& vm, std::uint32_t index)
             }
         }
     }
+    if (k.isInt32() && k.asInt32() >= 0 && k.asInt32() < std::int32_t(VM::kIndexKeys) && isObject(base) &&
+        asObject(base)->cls() == ObjClass::Plain && !hasElems(asObject(base))) {
+        // A plain object used as a map by small numbers: its own data property of that name (`VM::plainIndexReads`).
+        JSObject* o = asObject(base);
+        const std::int32_t n = k.asInt32();
+        VM::PlainIndexRead& e = vm.plainIndexReads[(o->h.shape * 0x9e3779b1u + std::uint32_t(n) * 0x85ebca6bu) >> 24];
+        if (e.shape == o->h.shape && e.n == n) {
+            copyReg(vm, R[ins->a], *o->slotAt(e.slot));
+            return 1;
+        }
+        if (!o->isDictionary(vm) && !(o->h.flags & cellflags::kHasRare)) {
+            const Key name = toPropertyKey(vm, k);
+            std::uint8_t attrs = 0;
+            const std::int32_t at = o->shapeOf(vm)->indexOf(name, &attrs);
+            detail::decRef(name);
+            if (at >= 0 && !(attrs & attr::kAccessor)) {
+                e.shape = o->h.shape;
+                e.n = n;
+                e.slot = std::uint32_t(at);
+                copyReg(vm, R[ins->a], *o->slotAt(e.slot));
+                return 1;
+            }
+        }
+    }
     if (base.isNullish()) {
         vm.throwError(ErrorCode::TypeError, nullishReadMessage(base, k));
         return 0;
@@ -5203,7 +5227,8 @@ int jitGetElem(VM& vm, std::uint32_t index)
     release(prim);
     if (!key)
         return 0;
-    if (isObject(base) && prim.isCell() && (isSymbol(prim) || isString(prim))) {
+    // (`undefined`, `null` and the booleans are names like any other: `o[undefined]` reads `o.undefined`.)
+    if (isObject(base) && ((prim.isCell() && (isSymbol(prim) || isString(prim))) || prim.isNullish() || prim.isBool())) {
         // (A name made just now: the caches know its atom.)
         JSValue found;
         if (JSValue* slot = elemCached(c.code, index, asObject(base), key)) {

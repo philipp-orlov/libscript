@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "script/internal/dyn/regexp.hpp"
+#include "script/internal/dyn/regexp_program.hpp"
 #include <cstring>
 
 #include "builtins_util.hpp"
@@ -1357,12 +1358,12 @@ JSValue globalMatch(VM& vm, JSValue re, JSValue text)
         const Char one[1] = {Char(c)};
         Handle piece = Handle::adopt(makeString(vm, StringView(one, 1)));
         std::int32_t at = -1;
-        for (std::size_t k = 0; k < s.size(); ++k)
-            if (s[k] == Char(c)) {
-                retain(piece.get());
-                out->append(vm, piece.get());
-                at = std::int32_t(k);
-            }
+        const std::int32_t size = std::int32_t(s.size());
+        for (std::int32_t k = regex::findUnit(s.data(), 0, size, Char(c)); k < size; k = regex::findUnit(s.data(), k + 1, size, Char(c))) {
+            retain(piece.get());
+            out->append(vm, piece.get());
+            at = k;
+        }
         if (at >= 0) {
             const std::int32_t bounds[2] = {at, at + 1};
             lastMatch.assign(bounds, 2);

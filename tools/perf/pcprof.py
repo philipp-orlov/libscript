@@ -87,12 +87,13 @@ class Profile:
                 self.pcs.append(int(a, 16)); self.lrs.append(int(b, 16))
         self.maps.sort(); self.mlo = [m[0] for m in self.maps]
         base = path[:-3]
-        self.ranges = []
+        # Code memory is used again after code is freed: the last code written at an address is the one named.
+        last = {}
         if os.path.exists(base + '.map'):
             for l in open(base + '.map'):
                 a, s, nm = l.rstrip('\n').split(' ', 2)
-                self.ranges.append((int(a, 16), int(s, 16), nm))
-        self.ranges.sort(); self.rlo = [r[0] for r in self.ranges]
+                last[int(a, 16)] = (int(a, 16), int(s, 16), nm)
+        self.ranges = sorted(last.values()); self.rlo = [r[0] for r in self.ranges]
         self.base = base
         self.memo = {}
 

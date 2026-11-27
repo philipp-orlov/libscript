@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -103,6 +104,7 @@ struct Tier2Code
     std::vector<std::uint8_t> siteExits;                          ///< exits so far at each instruction
     bool ctor = false;                                            ///< a frame `new` made may run it
     Tier2Code* older = nullptr;                                   ///< a version it replaced, kept while frames may be in it
+    std::unique_ptr<std::uint64_t[]> exitRecs;                    ///< the SSA tier's ways out of it (`scriptVmSsaExit`)
     void* osrAddress(std::uint32_t header) const noexcept
     {
         for (const auto& e : osr)

@@ -6,6 +6,7 @@
 // its own name because the dynamic engine's `SCRIPT_CENSUS` can be included in the same file.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
@@ -42,6 +43,10 @@ enum class Census : std::uint8_t
     YoungCells,    ///< young cells a scan looked at
     YoungKept,     ///< young cells that lived
     OldCells,      ///< cells that `allocCell` made
+    Tier1Nanos,    ///< time in the baseline compiler
+    Tier2Nanos,    ///< time in `scriptVmJitTier2`: merging, the copy's baseline code, the optimizing compiler
+    Tier1Bytes,    ///< machine code the baseline compiler made
+    Tier2Bytes,    ///< machine code the optimizing compilers made
     Count,
 };
 
@@ -55,10 +60,24 @@ const char* censusName(Census id) noexcept;
 #define SCRIPT_VM_CENSUS_ADD(id, n) \
     (void)(script::internal::vm::censusCounts()[std::size_t(script::internal::vm::Census::id)] += (n))
 
+/// Adds the nanoseconds its scope takes to a counter.
+struct CensusTimer
+{
+    Census id;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~CensusTimer()
+    {
+        censusCounts()[std::size_t(id)] +=
+            std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+};
+#define SCRIPT_VM_CENSUS_TIME(id) script::internal::vm::CensusTimer censusTimer_{script::internal::vm::Census::id}
+
 #else
 
 #define SCRIPT_VM_CENSUS(id) (void)0
 #define SCRIPT_VM_CENSUS_ADD(id, n) (void)0
+#define SCRIPT_VM_CENSUS_TIME(id) (void)0
 
 #endif
 

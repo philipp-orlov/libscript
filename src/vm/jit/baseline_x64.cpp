@@ -621,6 +621,80 @@ extern "C" std::uint64_t scriptVmOptExit(VM* vm, std::uint32_t index, int kind)
     }
 }
 
+struct CallResult
+{
+    std::uint64_t a, b;
+};
+
+/// Bytes the SSA code's exit routine saves below its stack pointer: 24 general registers by number, then 24 doubles.
+constexpr std::int32_t kSsaExitSave = 8 * 48;
+
+/// A guard of SSA code failed: writes the frame as the record at `block + at` says, then `scriptVmOptExit`. A record is
+/// a word (the instruction, the kind, how many slots), the address of the baseline code after the instruction, and a word
+/// for each slot: the register, where its value is (0 to 2: a general register holding a boxed value or an int32, a
+/// double register; 3 to 5: the same in the code's own slots; 6: a constant, in the next word), whether the value and
+/// what the slot held may be cells, and the register's number or the slot's offset. `block[0]` is the baseline code,
+/// `block[1]` is 1 for a deferred frame (its slots hold no counts). New values are counted first and the old contents
+/// let go of last, so nothing live is freed in between. Returns the step's result and where to go on (null: the tail).
+extern "C" CallResult scriptVmSsaExit(VM* vm, std::uint64_t at, const std::uint64_t* saved, const std::uint64_t* block)
+{
+    const std::uint64_t* rec = block + at;
+    const std::uint32_t index = std::uint32_t(rec[0]);
+    const int kind = int((rec[0] >> 32) & 0xFF);
+    const std::uint32_t count = std::uint32_t((rec[0] >> 40) & 0xFFFF);
+    const std::uint64_t after = rec[1];
+    const bool deferred = (block[1] & 1) != 0;
+    JSValue* const R = (vm->frameTop - 1)->R;
+    const char* const sp = reinterpret_cast<const char*>(saved) + kSsaExitSave;
+    auto valueOf = [&](const std::uint64_t*& p) noexcept {
+        const std::uint64_t w = *p++;
+        const std::uint32_t loc = std::uint32_t(w >> 32);
+        std::uint64_t bits = 0;
+        switch ((w >> 16) & 0xFF) {
+        case 0: return JSValue::raw(saved[loc]);
+        case 1: return JSValue::int32(std::int32_t(std::uint32_t(saved[loc])));
+        case 2: bits = saved[24 + loc]; break;
+        case 3: std::memcpy(&bits, sp + loc, 8); return JSValue::raw(bits);
+        case 4: {
+            std::uint32_t low;
+            std::memcpy(&low, sp + loc, 4);
+            return JSValue::int32(std::int32_t(low));
+        }
+        case 5: std::memcpy(&bits, sp + loc, 8); break;
+        default: return JSValue::raw(*p++);
+        }
+        // A double: every NaN becomes the canonical one.
+        double d;
+        std::memcpy(&d, &bits, 8);
+        return JSValue::raw((d != d ? kCanonicalNaN : bits) + kDoubleOffset);
+    };
+    const std::uint64_t* p = rec + 2;
+    if (deferred) {
+        for (std::uint32_t k = 0; k < count; ++k) {
+            const std::uint32_t r = std::uint32_t(*p & 0xFFFF);
+            R[r] = valueOf(p);
+        }
+    } else {
+        for (std::uint32_t k = 0; k < count; ++k) {
+            const bool cell = ((*p >> 24) & 1) != 0;
+            const JSValue v = valueOf(p);
+            if (cell)
+                retain(v);
+        }
+        p = rec + 2;
+        for (std::uint32_t k = 0; k < count; ++k) {
+            const std::uint32_t r = std::uint32_t(*p & 0xFFFF);
+            const bool old = ((*p >> 24) & 2) != 0;
+            const JSValue before = R[r];
+            R[r] = valueOf(p);
+            if (old)
+                release(before);
+        }
+    }
+    const std::uint64_t step = scriptVmOptExit(vm, index, kind);
+    return CallResult{step, step == kStepFall ? after : 0};
+}
+
 /// The optimized code was entered (from a call, or into a loop) with a parameter of a kind it was not made for. The profile
 /// of the parameters is written only while there is no baseline code, so this is where it learns: with a kind new to it,
 /// the code is taken out of use to be made again (no try is used up); with nothing new, it counts as an exit.
@@ -741,6 +815,7 @@ bool installTier2(VM* vm, CodeBlock* code)
     if (code->tier2Matured < 4)
         ++code->tier2Matured;
     SCRIPT_VM_CENSUS(Tier2Compiled);
+    SCRIPT_VM_CENSUS_ADD(Tier2Bytes, t->bytes);
     return true;
 }
 
@@ -748,6 +823,7 @@ bool installTier2(VM* vm, CodeBlock* code)
 /// optimizing tier if it is not there, and return the way into it from the loop, if there is one.
 extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
 {
+    SCRIPT_VM_CENSUS_TIME(Tier2Nanos);
     try {
         Frame* fr = vm->frameTop - 1;
         CodeBlock* code = fr->code;
@@ -861,11 +937,6 @@ int helperThunk(VM* vm, std::uint32_t index)
         return 0;
     }
 }
-
-struct CallResult
-{
-    std::uint64_t a, b;
-};
 
 /// `callProf` and `callTargets` of a call the runtime makes (compiled code does the same, `Stubs::noteCallee`).
 inline void noteCallee(CodeBlock* code, std::uint32_t index, std::uint64_t uid) noexcept
@@ -2547,6 +2618,8 @@ private:
     std::deque<std::pair<std::uint32_t, Label>> tickStubs_;
     std::deque<Label> tickBack_;
     Label tailBase_, exitBase_, dispBase_, freeAll_, entryFail_;
+    Label lazyExit_;                              ///< the SSA code's one routine for its ways out (`emitSsaTails`)
+    std::unique_ptr<std::uint64_t[]> exitBlock_;  ///< their records, the code's once it is made
     struct CounterStub
     {
         std::uint32_t index;
@@ -7869,6 +7942,7 @@ bool tier1Available() noexcept
 
 void compileTier1(VM& vm, CodeBlock* code)
 {
+    SCRIPT_VM_CENSUS_TIME(Tier1Nanos);
     code->tier1Failed = true;
     const std::size_t limit = vm.ctx.options.jit.codeCacheLimit;
     if (code->code.size() > 20000 || !entryStub())
@@ -7927,6 +8001,7 @@ void compileTier1(VM& vm, CodeBlock* code)
     code->tier1Failed = false;
     code->tier2Counter = vm.tier2Threshold > 0 ? vm.tier2Threshold : 0x40000000;
     SCRIPT_VM_CENSUS(Tier1Compiled);
+    SCRIPT_VM_CENSUS_ADD(Tier1Bytes, t->bytes);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     if (const char* dir = std::getenv("SCRIPT_VM_CODEDUMP")) {
         // Raw code for `objdump -D -b binary -mi386:x86-64 --adjust-vma=<rx>`.

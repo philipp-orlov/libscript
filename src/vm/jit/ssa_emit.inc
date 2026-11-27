@@ -1606,6 +1606,7 @@ Tier2Code* Baseline::compileSsa(ssa::Graph& g, Tier1Code* base)
         t->pollSites.emplace_back(std::uint32_t(at), std::uint32_t(out->pos));
     t->validities = std::move(validities_);
     t->held = std::move(held_);
+    t->exitRecs = std::move(exitBlock_);
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
     perfMapNote(t->rx, t->bytes, code_, "js3");
 #endif
@@ -1623,34 +1624,76 @@ void Baseline::emitSsaTails()
             a_.alu32(u.add ? 0 : 5, u.to, Reg(u.from));
         a_.jmp(*u.bad);
     }
+    // A way out that a guard takes is seldom taken: it is a record of what goes where (the slots to write, each with
+    // where its value is), read by one routine of this code (`scriptVmSsaExit`). Only a way on in the baseline code with
+    // no guard failed (kind 3) is code of its own, as it is part of the function's usual path.
+    std::vector<std::uint64_t> recs;
+    recs.push_back(reinterpret_cast<std::uint64_t>(base_));
+    recs.push_back(def_ ? 1 : 0);
+    bool lazy = false;
     for (SsaExit& e : ssaExits_) {
         a_.bind(e.label);
         name_ = e.name;
         frame_ = e.frame;
-        std::vector<unsigned> all;
-        for (unsigned r = 0; r < code_->nregs; ++r)
-            if (ssa::bitTest(e.live, r))
-                all.push_back(r);
-        ssaSync(all, e.live, std::vector<std::uint8_t>(code_->nregs, 0));
-        ssaKeptRestore();
-        a_.aluI(0, RSP, spill_);
+        // Every live register that has a value: with nothing overwritten, `ssaSyncSet` of them all is just these.
         if (e.kind == 3) {
+            std::vector<unsigned> all;
+            for (unsigned r = 0; r < code_->nregs; ++r)
+                if (ssa::bitTest(e.live, r) && name_[r] != ssa::kNone)
+                    all.push_back(r);
+            ssaSyncEmit(all);
+            ssaKeptRestore();
+            a_.aluI(0, RSP, spill_);
             a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(e.i)));
             a_.jmp(RAX);
             continue;
         }
+        const std::size_t at = recs.size();
+        recs.push_back(0);
+        recs.push_back(reinterpret_cast<std::uint64_t>(base_->addressFor(e.i + length(e.i))));
+        std::uint64_t count = 0;
+        for (unsigned r = 0; r < code_->nregs; ++r) {
+            const std::uint32_t v = name_[r];
+            if (!ssa::bitTest(e.live, r) || v == ssa::kNone || frame_[r] == v)
+                continue;
+            const SVal& s = sval_[v];
+            const std::uint64_t flags = (mayBeCell(v) ? 1u : 0u) | (frame_[r] == ssa::kNone || mayBeCell(frame_[r]) ? 2u : 0u);
+            const std::uint64_t where = s.isConst ? 6 : (s.reg >= 0 ? 0 : 3) + (s.rep == kRepI32 ? 1 : s.rep == kRepF64 ? 2 : 0);
+            const std::uint64_t loc = s.isConst ? 0 : s.reg >= 0 ? std::uint64_t(s.reg) : std::uint64_t(std::uint32_t(slotOf(v).disp));
+            recs.push_back(r | (where << 16) | (flags << 24) | (loc << 32));
+            if (s.isConst)
+                recs.push_back(s.bits);
+            ++count;
+        }
+        recs[at] = e.i | (std::uint64_t(e.kind) << 32) | (count << 40);
+        a_.movImm(RAX, at);
+        a_.jmp(lazyExit_);
+        lazy = true;
+    }
+    if (lazy) {
+        exitBlock_.reset(new std::uint64_t[recs.size()]);
+        std::memcpy(exitBlock_.get(), recs.data(), recs.size() * sizeof(std::uint64_t));
+        // The registers a value can be in, where the routine finds them (by register number; doubles after them).
+        a_.bind(lazyExit_);
+        a_.aluI(5, RSP, kSsaExitSave);
+        for (int r : {int(R8), int(R9), int(R10), int(R11)})
+            a_.mov(mem(RSP, 8 * r), Reg(r));
+        for (int k = 0; k < Asm::kExtraGpr + int(Asm::kSsaGpr23); ++k)
+            a_.mov(mem(RSP, 8 * (16 + k)), Reg(16 + k));
+        for (int x = 2; x < 2 + 14 + Asm::kExtraXmm; ++x)
+            a_.movsdStore(mem(RSP, 8 * (24 + x)), x);
         a_.mov(RDI, R12);
-        a_.movImm(RSI, e.i);
-        a_.movImm(RDX, std::uint64_t(e.kind));
-        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmOptExit));
+        a_.mov(RSI, RAX);
+        a_.mov(RDX, RSP);
+        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(exitBlock_.get()));
+        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(&scriptVmSsaExit));
         a_.callC(RAX);
-        Label notFall;
-        a_.cmpI(RAX, std::int32_t(kStepFall));
-        a_.jcc(CNE, notFall);
-        a_.movImm(RAX, reinterpret_cast<std::uint64_t>(base_->addressFor(e.i + length(e.i))));
-        a_.jmp(RAX);
-        a_.bind(notFall);
-        a_.jmp(tailBase_);
+        a_.aluI(0, RSP, kSsaExitSave);
+        ssaKeptRestore();
+        a_.aluI(0, RSP, spill_);
+        a_.test(RDX, RDX);
+        a_.jcc(CE, tailBase_);
+        a_.jmp(RDX);
     }
 }
 

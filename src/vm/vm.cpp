@@ -320,6 +320,7 @@ const char* const kCensusNames[] = {
     "SlowGetProp", "SlowPutProp", "SlowCall", "SlowElem", "IcMiss", "IcMonoToPoly", "IcToMega", "ChainInvalidated",
     "Tier1Compiled", "Tier2Compiled", "Tier2Exit", "Tier2Invalidated", "ThrowCount", "MergedSites", "ScriptCalls", "CycleMinor", "CycleOld",
     "CycleFull", "FreeDeferred", "CycleCells", "CycleGarbage", "Scans", "YoungCells", "YoungKept", "OldCells",
+    "Tier1Nanos", "Tier2Nanos", "Tier1Bytes", "Tier2Bytes",
 };
 static_assert(sizeof(kCensusNames) / sizeof(kCensusNames[0]) == std::size_t(Census::Count), "a name per counter");
 

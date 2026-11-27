@@ -68,10 +68,88 @@ struct Mem
 inline Mem mem(Reg base, std::int32_t disp = 0) { return Mem{base, disp, -1, 1}; }
 inline Mem mem(Reg base, Reg index, std::uint8_t scale, std::int32_t disp = 0) { return Mem{base, disp, index, scale}; }
 
+/// The branches that wait for a label: the first three in place (most labels have one or two), more on the heap. A
+/// vector here was a call of the general allocator for nearly every forward branch of a compile.
+class LabelUses
+{
+public:
+    LabelUses() noexcept = default;
+    LabelUses(const LabelUses& o) { copy(o); }
+    LabelUses(LabelUses&& o) noexcept { take(o); }
+    LabelUses& operator=(const LabelUses& o)
+    {
+        if (this != &o) {
+            release();
+            copy(o);
+        }
+        return *this;
+    }
+    LabelUses& operator=(LabelUses&& o) noexcept
+    {
+        if (this != &o) {
+            release();
+            take(o);
+        }
+        return *this;
+    }
+    ~LabelUses() { release(); }
+    void push_back(std::int32_t at)
+    {
+        if (size_ == cap_) {
+            auto* next = new std::int32_t[cap_ * 2];
+            for (std::uint32_t i = 0; i < size_; ++i)
+                next[i] = data_[i];
+            if (data_ != inline_)
+                delete[] data_;
+            data_ = next;
+            cap_ *= 2;
+        }
+        data_[size_++] = at;
+    }
+    void clear() noexcept { size_ = 0; }
+    bool empty() const noexcept { return size_ == 0; }
+    std::size_t size() const noexcept { return size_; }
+    const std::int32_t* begin() const noexcept { return data_; }
+    const std::int32_t* end() const noexcept { return data_ + size_; }
+
+private:
+    void release() noexcept
+    {
+        if (data_ != inline_)
+            delete[] data_;
+        data_ = inline_;
+        cap_ = kInline;
+        size_ = 0;
+    }
+    void copy(const LabelUses& o)
+    {
+        for (std::int32_t at : o)
+            push_back(at);
+    }
+    void take(LabelUses& o) noexcept
+    {
+        size_ = o.size_;
+        if (o.data_ == o.inline_) {
+            for (std::uint32_t i = 0; i < size_; ++i)
+                inline_[i] = o.inline_[i];
+        } else {
+            data_ = o.data_;
+            cap_ = o.cap_;
+            o.data_ = o.inline_;
+            o.cap_ = kInline;
+        }
+        o.size_ = 0;
+    }
+    static constexpr std::uint32_t kInline = 3;
+    std::int32_t* data_ = inline_;
+    std::uint32_t size_ = 0, cap_ = kInline;
+    std::int32_t inline_[kInline];
+};
+
 struct Label
 {
-    std::int32_t pos = -1;           ///< where it is bound, or -1
-    std::vector<std::int32_t> uses;  ///< offsets of the branch instructions waiting for it
+    std::int32_t pos = -1;  ///< where it is bound, or -1
+    LabelUses uses;         ///< offsets of the branch instructions waiting for it
     bool bound() const noexcept { return pos >= 0; }
 };
 

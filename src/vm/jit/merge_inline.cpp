@@ -53,6 +53,7 @@ bool mergeOp(Op op)
     case Op::Eq: case Op::Ne: case Op::StrictEq: case Op::StrictNe: case Op::In: case Op::InstanceOf:
     case Op::AddI: case Op::SubI: case Op::MulI: case Op::ModI: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
     case Op::ShlI: case Op::ShrI: case Op::UShrI: case Op::Neg: case Op::ToNumber: case Op::ToNumeric: case Op::ToString:
+    case Op::ToConcat: case Op::StrCat:
     case Op::Not: case Op::BitNot: case Op::TypeOf: case Op::Inc: case Op::Dec: case Op::Append: case Op::Unshare:
     case Op::Jmp: case Op::JTrue: case Op::JFalse: case Op::JNullish: case Op::JNotNullish: case Op::JUndefined:
     case Op::JNotUndefined: case Op::JLt: case Op::JLe: case Op::JGt: case Op::JGe: case Op::JNotLt: case Op::JNotLe:

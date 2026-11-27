@@ -4215,6 +4215,18 @@ void Baseline::emit(std::uint32_t i)
         return;
     }
     case Op::ToString: helperOp(i, &helperThunk<jitToString>); return;
+    case Op::ToConcat: {
+        // A string already, most often: nothing to do when it stays in its register.
+        if (in.a != in.b) {
+            helperOp(i, &helperThunk<jitToConcat>);
+            return;
+        }
+        Label& other = slow(i, &helperThunk<jitToConcat>);
+        a_.mov(RAX, R(in.b));
+        needString(RAX, other);
+        return;
+    }
+    case Op::StrCat: helperOp(i, &helperThunk<jitStrCat>); return;
     case Op::ToNumber: helperOp(i, &helperThunk<jitToNumber>); return;
     case Op::Exp: {
         Label& bad = slow(i, &helperThunk<jitBinary>);

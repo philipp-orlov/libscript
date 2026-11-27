@@ -43,6 +43,10 @@ inline bool isBigInt(JSValue v) noexcept
 Key toPropertyKey(VM& vm, JSValue v);
 /// `a + b` on strings, owned; a rope when long.
 JSValue concatStrings(VM& vm, JSValue a, JSValue b);
+/// `((v[0] + v[1]) + v[2]) ...` for `n` values, which are strings (`Op::StrCat`): one string of the whole length when
+/// that is short, the sums one after another when a piece is long (a long sum is a rope, not a copy). Owned, or the
+/// exception sentinel.
+JSValue concatAll(VM& vm, const JSValue* v, std::uint32_t n);
 /// Code-unit order, as `<` on strings.
 int compareStrings(JSValue a, JSValue b) noexcept;
 bool stringsEqual(JSValue a, JSValue b) noexcept;

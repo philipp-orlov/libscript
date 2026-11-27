@@ -2076,6 +2076,29 @@ L_Append: {
     SETP(ins->a, r);
     NEXT();
 }
+L_ToConcat: {
+    const JSValue a = R[ins->b];
+    if (isString(a) && ins->a == ins->b)
+        NEXT();
+    fr->pc = pc;
+    const JSValue p = toPrimitiveHint(vm, a, 0);
+    if (p.isException())
+        FAIL();
+    const JSValue r = toStringValue(vm, p);
+    release(p);
+    if (r.isException())
+        FAIL();
+    SET(ins->a, r);
+    NEXT();
+}
+L_StrCat: {
+    fr->pc = pc;
+    const JSValue r = concatAll(vm, &R[ins->b], ins->c);
+    if (r.isException())
+        FAIL();
+    SET(ins->a, r);
+    NEXT();
+}
 L_Unshare:
     if (isString(R[ins->a]))
         asString(R[ins->a])->bits &= std::uint8_t(~StringCell::kSole);
@@ -4584,6 +4607,30 @@ int jitToString(VM& vm, std::uint32_t index)
 {
     JitCtx c = jitCtx(vm, index, false);
     const JSValue r = toStringValue(vm, c.R[c.ins->b]);
+    if (r.isException())
+        return 0;
+    setReg(vm, c.R[c.ins->a], r);
+    return 1;
+}
+
+int jitToConcat(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const JSValue p = toPrimitiveHint(vm, c.R[c.ins->b], 0);
+    if (p.isException())
+        return 0;
+    const JSValue r = toStringValue(vm, p);
+    release(p);
+    if (r.isException())
+        return 0;
+    setReg(vm, c.R[c.ins->a], r);
+    return 1;
+}
+
+int jitStrCat(VM& vm, std::uint32_t index)
+{
+    JitCtx c = jitCtx(vm, index, false);
+    const JSValue r = concatAll(vm, &c.R[c.ins->b], c.ins->c);
     if (r.isException())
         return 0;
     setReg(vm, c.R[c.ins->a], r);

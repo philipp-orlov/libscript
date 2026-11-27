@@ -188,5 +188,10 @@ OP(JEq, "RRJ")
 OP(JNe, "RRJ")
 OP(Append, "RR-")
 OP(Unshare, "R--")
+// A sum of three or more pieces whose left side is a string by then (`'a' + x + 'b' + y`, a template): each piece is
+// made a string where it is evaluated (ToConcat: ToPrimitive with no hint, then ToString, as `+` does with a string
+// on its left), and StrCat joins registers b .. b + c - 1 into a.
+OP(ToConcat, "RR-")
+OP(StrCat, "RRN")
 OP(ArgCount, "R--")
 OP(SharedRegExp, "RKK")

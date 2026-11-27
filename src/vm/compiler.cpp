@@ -1689,18 +1689,32 @@ std::uint16_t Compiler::templateLit(const Node& n, int dst)
     const std::uint16_t mark = fn_->top;
     const std::uint16_t t = temp();
     loadString(t, strs.empty() ? String() : strs[0]);
+    // The pieces in the registers after `t`, each a string where it is evaluated, joined by one `StrCat` (sixteen at a
+    // time, as many as `concatAll` joins at once).
+    std::uint32_t count = 1;
+    const auto room = [&] {
+        if (count < 16)
+            return;
+        emit(Op::StrCat, t, t, std::uint16_t(count));
+        fn_->top = std::uint16_t(t + 1);
+        count = 1;
+    };
     for (std::size_t i = 0; i < n.list.size(); ++i) {
-        const std::uint16_t inner = fn_->top;
-        const std::uint16_t v = exprAny(*n.list[i]);
+        room();
         const std::uint16_t s = temp();
+        const std::uint16_t v = exprAny(*n.list[i]);
         emit(Op::ToString, s, v);
-        emit(Op::Add, t, t, s);
+        fn_->top = std::uint16_t(s + 1);
+        ++count;
         if (i + 1 < strs.size() && !strs[i + 1].empty()) {
-            loadString(s, strs[i + 1]);
-            emit(Op::Add, t, t, s);
+            room();
+            loadString(temp(), strs[i + 1]);
+            ++count;
         }
-        fn_->top = inner;
     }
+    if (count > 1)
+        emit(Op::StrCat, t, t, std::uint16_t(count));
+    fn_->top = std::uint16_t(t + 1);
     if (dst >= 0) {
         emit(Op::Mov, std::uint16_t(dst), t);
         fn_->top = mark;
@@ -2462,10 +2476,82 @@ std::uint16_t Compiler::binary(const Node& n, int dst)
         spine.push_back(cur);
     const std::uint32_t savedLine = line_;
     int result = -1;
-    for (std::size_t i = spine.size(); i-- > 0;) {
-        if (spine[i]->line)
-            line_ = spine[i]->line;
-        result = binaryStep(*spine[i], i == 0 ? dst : -1, result);
+    // A run of sums whose left side is a string by then, `'a' + x + 'b' + y`: operand k of the chain is `spine[m - k]->b`
+    // (operand 0 is the innermost left side). `from` is the first operand that is added to a string, `to` the last
+    // of the run. With two or more of them, each is made a string where it is evaluated (`ToConcat`, which is what
+    // `+` does to its right side when its left side is a string) and one `StrCat` joins them: one new string,
+    // where a sum for each made one each.
+    const std::size_t m = spine.size();
+    const auto operand = [&](std::size_t k) -> const Node& { return k == 0 ? *spine[m - 1]->a : *spine[m - k]->b; };
+    const auto plus = [&](std::size_t k) { return spine[m - k]->op == Tok::Plus; };
+    std::size_t from = 0, to = 0;
+    if (plus(1) && makesString(operand(0))) {
+        from = 1;
+    } else {
+        for (std::size_t k = 1; k < m && !from; ++k)
+            if (plus(k) && makesString(operand(k)))
+                from = k + 1;
+    }
+    if (from) {
+        to = from;
+        while (to <= m && plus(to))
+            ++to;
+        --to;
+    }
+    if (!from || to < from + 1) {
+        for (std::size_t i = spine.size(); i-- > 0;) {
+            if (spine[i]->line)
+                line_ = spine[i]->line;
+            result = binaryStep(*spine[i], i == 0 ? dst : -1, result);
+        }
+        line_ = savedLine;
+        return std::uint16_t(result);
+    }
+    // The sum up to the run, in a temporary of its own (the first register of the window).
+    if (from == 1) {
+        result = temp();
+        expr(operand(0), result);
+    } else {
+        for (std::size_t k = 1; k < from; ++k) {
+            if (spine[m - k]->line)
+                line_ = spine[m - k]->line;
+            result = binaryStep(*spine[m - k], -1, result);
+        }
+    }
+    const std::uint16_t base = std::uint16_t(result);
+    fn_->top = std::uint16_t(base + 1);
+    std::uint32_t count = 1;
+    static constexpr std::uint32_t kWindow = 16;  // (as many as `concatAll` joins at once)
+    for (std::size_t k = from; k <= to; ++k) {
+        if (spine[m - k]->line)
+            line_ = spine[m - k]->line;
+        if (count == kWindow) {
+            emit(Op::StrCat, base, base, std::uint16_t(count));
+            fn_->top = std::uint16_t(base + 1);
+            count = 1;
+        }
+        const Node& piece = operand(k);
+        const std::uint16_t r = temp();
+        expr(piece, r);
+        fn_->top = std::uint16_t(r + 1);
+        if (!makesString(piece))
+            emit(Op::ToConcat, r, r);
+        ++count;
+    }
+    fn_->top = base;
+    if (to == m) {
+        const std::uint16_t d = dest(dst);
+        emit(Op::StrCat, d, base, std::uint16_t(count));
+        line_ = savedLine;
+        return d;
+    }
+    emit(Op::StrCat, base, base, std::uint16_t(count));
+    fn_->top = std::uint16_t(base + 1);
+    result = base;
+    for (std::size_t k = to + 1; k <= m; ++k) {
+        if (spine[m - k]->line)
+            line_ = spine[m - k]->line;
+        result = binaryStep(*spine[m - k], k == m ? dst : -1, result);
     }
     line_ = savedLine;
     return std::uint16_t(result);

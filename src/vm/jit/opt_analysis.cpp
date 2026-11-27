@@ -93,8 +93,13 @@ Effects effectsOf(const CodeBlock& code, std::uint32_t i)
     case Op::AddI: case Op::SubI: case Op::MulI: case Op::ModI: case Op::BitAndI: case Op::BitOrI: case Op::BitXorI:
     case Op::ShlI: case Op::ShrI: case Op::UShrI: case Op::Neg: case Op::ToNumber: case Op::ToNumeric: case Op::ToString:
     case Op::Not: case Op::BitNot: case Op::TypeOf: case Op::Inc: case Op::Dec: case Op::GetProp: case Op::DelProp:
-    case Op::KeysOf: case Op::ToKey:
+    case Op::KeysOf: case Op::ToKey: case Op::ToConcat:
         rd(in.b); wr(in.a);
+        break;
+    case Op::StrCat:
+        for (unsigned r = in.b; r < unsigned(in.b) + in.c; ++r)
+            rd(r);
+        wr(in.a);
         break;
     case Op::GetSuperProp:
         rd(in.c); wr(in.a);

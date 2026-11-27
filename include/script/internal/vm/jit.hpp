@@ -192,6 +192,8 @@ bool jitUnwrapCall(VM& vm, JSValue* R, std::uint32_t* base, std::uint32_t* argc)
 JSArray* jitCaptureArguments(VM& vm, const CodeBlock* c, const JSValue* args, std::uint32_t argc);
 int jitIn(VM& vm, std::uint32_t index);
 int jitToString(VM& vm, std::uint32_t index);
+int jitToConcat(VM& vm, std::uint32_t index);
+int jitStrCat(VM& vm, std::uint32_t index);
 int jitToNumber(VM& vm, std::uint32_t index);
 int jitUnary(VM& vm, std::uint32_t index);
 int jitCopyBox(VM& vm, std::uint32_t index);

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include "script/internal/vm/operators.hpp"
 #include "script/internal/vm/convert.hpp"
 
 #include "script/internal/heap.hpp"
@@ -147,6 +148,43 @@ JSValue concatStrings(VM& vm, JSValue a, JSValue b)
         return fromValue(vm, vm.ctx.fresh(x->text(), y->text()));  // not interned: what is made is rarely asked for again
     }
     return fromValue(vm, vm.ctx.concat(x, y));
+}
+
+JSValue concatAll(VM& vm, const JSValue* v, std::uint32_t n)
+{
+    // Up to this many units in one new string; more, and the pieces are joined in pairs as `+` joins them.
+    static constexpr std::size_t kFlat = 256;
+    static constexpr std::uint32_t kPieces = 16;
+    StringView pieces[kPieces];
+    std::size_t total = 0;
+    bool flat = n >= 2 && n <= kPieces;
+    for (std::uint32_t i = 0; i < n && flat; ++i) {
+        flat = isString(v[i]) && (total += asString(v[i])->length) < kFlat;
+    }
+    if (flat && total > 0) {
+        for (std::uint32_t i = 0; i < n; ++i)
+            pieces[i] = asString(v[i])->text();  // (a rope is made flat here: it may ask for memory, before the cell below)
+        StringCell* cell = vm.ctx.newStringRoom(pieces[0], pieces[1], total);
+        Char* out = cell->mutableChars() + cell->length;
+        for (std::uint32_t i = 2; i < n; ++i) {
+            if (!pieces[i].empty())
+                std::memcpy(out, pieces[i].data(), pieces[i].size() * sizeof(Char));
+            out += pieces[i].size();
+        }
+        cell->length = std::uint32_t(total);
+        return JSValue::cell(cell);
+    }
+    JSValue sum = n ? v[0] : makeString(vm, StringView());
+    if (n)
+        retain(sum);
+    for (std::uint32_t i = 1; i < n; ++i) {
+        const JSValue next = add(vm, sum, v[i]);
+        release(sum);
+        if (next.isException())
+            return next;
+        sum = next;
+    }
+    return sum;
 }
 
 int compareStrings(JSValue a, JSValue b) noexcept

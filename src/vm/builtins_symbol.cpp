@@ -380,7 +380,7 @@ JSValue makeArrayIterator(VM& vm, JSValue target, int kind)
 JSObject* newIteratorCell(VM& vm, int family, std::size_t bytes)
 {
     JSObject* proto = vm.protos.iteratorFamilies[family] ? vm.protos.iteratorFamilies[family] : vm.protos.nativeIterator;
-    const std::uint32_t shape = vm.rootShapeFor(proto, 0)->id;
+    const std::uint32_t shape = vm.rootShapeIdFor(proto, vm.iteratorShapes_[family]);
     auto* o = static_cast<JSObject*>(vm.allocCell(JSObject::bytesFor(0) + bytes, Kind::Object, ObjClass::Iterator, 0));
     o->h.shape = shape;
     o->slots = nullptr;

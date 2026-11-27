@@ -336,6 +336,7 @@ struct CodeBlock
     Vec<std::uint32_t> suspendAt;
     Vec<std::uint16_t> suspendRegs;
     std::uint32_t suspendMax = 0;
+    std::uint32_t generatorShape = 0;  ///< the root shape of its generators' prototype, when last made (`VM::rootShapeIdFor`)
 
     CodeBlock() = default;
     ~CodeBlock();

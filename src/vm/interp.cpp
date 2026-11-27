@@ -1376,7 +1376,7 @@ JSValue newGenerator(VM& vm, JSFunction* f, CodeBlock* c, JSObject* proto)
         opt::planSuspends(*c);
     const std::size_t bytes = JSObject::bytesFor(0) + sizeof(GenState) + 8u * std::size_t(c->suspendMax);
     if (bytes <= mem::LocalHeap::kMaxSmall) {
-        const std::uint32_t shape = vm.rootShapeFor(proto, 0)->id;
+        const std::uint32_t shape = vm.rootShapeIdFor(proto, c->generatorShape);
         auto* o = static_cast<JSObject*>(vm.allocCell(bytes, Kind::Object, ObjClass::Generator, 0));
         o->h.shape = shape;
         o->slots = nullptr;

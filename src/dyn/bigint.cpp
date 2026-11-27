@@ -162,7 +162,17 @@ Digits mulMagnitude(Env& rt, Limbs a, Limbs b)
 struct Divisor
 {
     Limb d, inverse;
-    explicit Divisor(Limb by) noexcept : d(by), inverse(Limb(~Wide(0) / by - (Wide(1) << kLimbBits))) {}
+    explicit Divisor(Limb by) noexcept : d(by)
+    {
+        // The reciprocal takes a division of two limbs by one, which no instruction of arm64 does: the last divisor's
+        // is kept (a program that reduces by one modulus divides by the same top limb every time).
+        thread_local Limb lastBy = 0, lastInverse = 0;
+        if (by != lastBy) {
+            lastInverse = Limb(~Wide(0) / by - (Wide(1) << kLimbBits));
+            lastBy = by;
+        }
+        inverse = lastInverse;
+    }
     /// (`high`, `low`) / d, with `high` below d: two multiplications (Moeller and Granlund, "Improved division by
     /// invariant integers", algorithm 4).
     Limb divide(Limb high, Limb low, Limb* rem) const noexcept

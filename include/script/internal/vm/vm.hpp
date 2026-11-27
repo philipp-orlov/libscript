@@ -315,6 +315,16 @@ struct VM : EngineRuntime
     // ---- shapes ----
     /// Shape ids index this table, which is reserved once so that its address never changes.
     Shape* shapeById(std::uint32_t id) const noexcept { return shapeTable_[id & kShapeIndexMask]; }
+    /// The id of `rootShapeFor(proto, 0)`, kept in `cache` by a place that asks for the same prototype every time (a
+    /// generator function, a family of iterators): the id is good while its shape is still that prototype's root.
+    std::uint32_t rootShapeIdFor(JSObject* proto, std::uint32_t& cache)
+    {
+        if (const Shape* s = shapeTable_[cache & kShapeIndexMask];
+            cache && s && s->id == cache && s->proto == proto && s->aux == 0 && (s->flags & (Shape::kRoot | Shape::kOwnRoot)) == Shape::kRoot)
+            return cache;
+        return cache = rootShapeFor(proto, 0)->id;
+    }
+    std::uint32_t iteratorShapes_[6] = {};
     /// The table of shapes by id; it never moves, so compiled code can name it.
     Shape* const* shapeTable() const noexcept { return shapeTable_; }
     /// Whether `new` of `f` finds `prototype` as a data property in slot 2 (`Shape::kProtoAt2`).

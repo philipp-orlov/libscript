@@ -928,6 +928,21 @@ NATIVE(functionApply)
         if (!holes)
             return vm.call(self, arg(args, argc, 0), a->vals(), a->length);
     }
+    if (hasElems(list) && static_cast<JSArray*>(asObject(list))->length <= 8) {
+        // A few arguments (`hasOwnProperty.apply(o, [k])`): counted here for the call, since the function may change
+        // the list, and kept in this frame, with no vector.
+        auto* a = static_cast<JSArray*>(asObject(list));
+        JSValue values[8];
+        const std::uint32_t n = a->length;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            values[i] = a->at(i).isHole() ? JSValue::undefined() : a->at(i);
+            retain(values[i]);
+        }
+        const JSValue result = vm.call(self, arg(args, argc, 0), values, n);
+        for (std::uint32_t i = 0; i < n; ++i)
+            release(values[i]);
+        return result;
+    }
     Vec<Handle> held;
     if (!list.isNullish() && !listFromArrayLike(vm, list, held))
         return JSValue::exception();

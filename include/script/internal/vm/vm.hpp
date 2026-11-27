@@ -703,6 +703,9 @@ struct VM : EngineRuntime
         std::uint32_t shapes[kChain] = {};
         std::uint32_t depth = 0;
         Vec<Key> names;
+        /// An array of the names (counted), which every `for...in` over such an object reads while arrays are iterated
+        /// by index (no program sees it then); undefined until one is made.
+        JSValue keys = JSValue::undefined();
     };
     static constexpr std::size_t kForInNames = 16;
     ForInNames forInNames[kForInNames];
@@ -730,6 +733,16 @@ struct VM : EngineRuntime
     /// 512 entries: a program with many literals (a lexer, an assembler's parser) keeps them all. Out of the VM, whose
     /// other fields keep their places.
     std::vector<RegExpLiteral> regexpLiterals = std::vector<RegExpLiteral>(512);
+    /// The strings of the numbers converted last (`toStringValue`), by the bits of the number: a program that writes
+    /// the same numbers again makes no new string for them. Each entry holds a count of its string, so the table is
+    /// small: what it holds stays alive. (Out of the VM, as the table above.)
+    struct NumberText
+    {
+        std::uint64_t bits = 0;
+        detail::GCObject* text = nullptr;
+    };
+    static constexpr std::size_t kNumberTexts = 32;
+    std::vector<NumberText> numberTexts = std::vector<NumberText>(kNumberTexts);
     std::uint32_t arrayRootShape = 0;
     /// The shape a match's array starts with and the one it has with its `index`, `input` and `groups` (0: none made yet).
     std::uint32_t matchRoot = 0, matchShape = 0;

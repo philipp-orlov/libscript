@@ -1478,6 +1478,11 @@ void VM::releaseRoots() noexcept
         release(v);
         v = JSValue::undefined();
     }
+    for (NumberText& n : numberTexts) {
+        if (n.text)
+            detail::decRef(n.text);
+        n = NumberText{};
+    }
     tearingDown = true;
     dropShadow();
     for (MicroJob& job : jobs) {
@@ -1522,6 +1527,7 @@ void VM::releaseRoots() noexcept
     for (ForInNames& entry : forInNames) {
         for (Key k : entry.names)
             release(JSValue::cell(k));
+        release(entry.keys);
         entry = ForInNames{};
     }
     for (RegExpLiteral& l : regexpLiterals) {

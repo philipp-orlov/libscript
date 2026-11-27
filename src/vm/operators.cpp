@@ -328,6 +328,34 @@ JSValue toNumeric(VM& vm, JSValue v)
     return JSValue::boxNumber(d);
 }
 
+namespace {
+
+/// The string of a number, kept by the bits of the number while another has not taken its place
+/// (`VM::numberTexts`): the same number written again finds it. Owned.
+template <class Make>
+JSValue numberText(VM& vm, JSValue v, Make make)
+{
+    if (vm.tearingDown) [[unlikely]]
+        return make();
+    VM::NumberText& kept = vm.numberTexts[(v.bits * 0x9E3779B97F4A7C15ull) >> 59];
+    static_assert(VM::kNumberTexts == 32, "the top five bits index the table");
+    if (kept.text && kept.bits == v.bits) {
+        detail::incRef(kept.text);
+        return JSValue::cell(kept.text);
+    }
+    const JSValue made = make();
+    if (made.isCell()) {
+        if (kept.text)
+            detail::decRef(kept.text);
+        kept.bits = v.bits;
+        kept.text = made.asCell();
+        detail::incRef(kept.text);
+    }
+    return made;
+}
+
+}  // namespace
+
 JSValue toStringValue(VM& vm, JSValue v)
 {
     if (isString(v)) {
@@ -346,23 +374,29 @@ JSValue toStringValue(VM& vm, JSValue v)
                 return atom;
             }
         }
-        char16_t buffer[16];
-        char16_t* end = buffer + 16;
-        char16_t* p = end;
-        std::int64_t n = v.asInt32();
-        const bool negative = n < 0;
-        if (negative)
-            n = -n;
-        do {
-            *--p = char16_t(u'0' + n % 10);
-            n /= 10;
-        } while (n);
-        if (negative)
-            *--p = u'-';
-        return fromValue(vm, vm.ctx.fresh(StringView(p, std::size_t(end - p))));
+        return numberText(vm, v, [&] {
+            char16_t buffer[16];
+            char16_t* end = buffer + 16;
+            char16_t* p = end;
+            std::int64_t n = v.asInt32();
+            const bool negative = n < 0;
+            if (negative)
+                n = -n;
+            do {
+                *--p = char16_t(u'0' + n % 10);
+                n /= 10;
+            } while (n);
+            if (negative)
+                *--p = u'-';
+            return fromValue(vm, vm.ctx.fresh(StringView(p, std::size_t(end - p))));
+        });
     }
     if (v.isDouble())
-        return fromValue(vm, vm.ctx.fresh(numberToString(v.asDouble())));
+        return numberText(vm, v, [&] {
+            Char text[kMaxNumberText];
+            const std::size_t length = formatNumber(v.asDouble(), text);
+            return fromValue(vm, vm.ctx.fresh(StringView(text, length)));
+        });
     if (v.isUndefined())
         return makeString(vm, std::string_view("undefined"));
     if (v.isNull())
@@ -663,13 +697,19 @@ bool appendInPlace(VM& vm, JSValue& slot, JSValue y, bool owned)
     if (slot == y)
         return false;
     StringCell* s = asString(slot);
-    String digits;
+    Char digits[kMaxNumberText];
     StringView tail;
     if (isString(y)) {
         tail = asString(y)->text();
     } else if (y.isNumber()) {
-        digits = numberToString(y.asNumber());
-        tail = digits;
+        // Not made into text when nothing can be appended (`appendShared` takes a slice of a buffer that grows, or
+        // a sum of `kSharedLength`): the caller makes the sum, and makes the text once.
+        if (vm.deferred && !owned) {
+            const StringCell* base = s->whole();
+            if (!(base != s && (base->bits & StringCell::kAppendable)) && std::size_t(s->length) + kMaxNumberText < kSharedLength)
+                return false;
+        }
+        tail = StringView(digits, formatNumber(y.asNumber(), digits));
     } else {
         return false;
     }

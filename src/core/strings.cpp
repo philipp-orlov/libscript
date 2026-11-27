@@ -97,20 +97,28 @@ void appendPlainDecimal(const char* digits, int count, int pointPosition, String
     }
 }
 
-String numberToString(double d)
+std::size_t formatNumber(double d, Char* out) noexcept
 {
+    Char* p = out;
+    const auto text = [&](const char* s) {
+        while (*s)
+            *p++ = Char(std::uint8_t(*s++));
+        return std::size_t(p - out);
+    };
     if (std::isnan(d))
-        return ascii("NaN");
+        return text("NaN");
     if (d == 0)
-        return ascii("0");
+        return text("0");
     if (std::isinf(d))
-        return ascii(d < 0 ? "-Infinity" : "Infinity");
+        return text(d < 0 ? "-Infinity" : "Infinity");
+    if (d < 0)
+        *p++ = u'-';
+    const double a = std::fabs(d);
 
     // A whole number, or one of up to four decimals, below 2^40 once scaled: k decimals that divide back to it exactly are
     // its shortest form, since at that size decimals of k places lie thousands of doubles apart (only one rounds to it).
     {
         static constexpr double kTens[] = {1, 10, 100, 1000, 10000};
-        const double a = std::fabs(d);
         for (int k = 0; k <= 4; ++k) {
             const double scaled = a * kTens[k];
             if (scaled >= 1099511627776.0)
@@ -118,50 +126,74 @@ String numberToString(double d)
             const double m = std::nearbyint(scaled);
             if (m == 0 || m / kTens[k] != a)
                 continue;
-            char digits[24];
             std::uint64_t whole = std::uint64_t(m);
             const std::uint64_t unit = std::uint64_t(kTens[k]);
             const std::uint64_t fraction = whole % unit;
             whole /= unit;
-            String out;
-            if (d < 0)
-                out.push_back(u'-');
-            const auto end = std::to_chars(digits, digits + sizeof digits, whole);
-            for (const char* p = digits; p < end.ptr; ++p)
-                out.push_back(Char(*p));
+            Char digits[24];
+            Char* q = digits + 24;
+            do {
+                *--q = Char(u'0' + whole % 10);
+                whole /= 10;
+            } while (whole);
+            while (q < digits + 24)
+                *p++ = *q++;
             if (k > 0) {
-                out.push_back(u'.');
+                *p++ = u'.';
                 for (std::uint64_t place = unit / 10; place > 0; place /= 10)
-                    out.push_back(Char(u'0' + (fraction / place) % 10));
+                    *p++ = Char(u'0' + (fraction / place) % 10);
             }
-            return out;
+            return std::size_t(p - out);
         }
     }
 
-    const base::ShortestDigits shortest = base::shortestDigits(std::fabs(d));
+    const base::ShortestDigits shortest = base::shortestDigits(a);
     const int n = shortest.pointPosition;
     const int k = shortest.count;
-
-    String out;
-    if (d < 0)
-        out.push_back(u'-');
+    const auto put = [&](const char* s, int count) {
+        for (int i = 0; i < count; ++i)
+            *p++ = Char(std::uint8_t(s[i]));
+    };
     if (-6 < n && n <= 21) {
-        appendPlainDecimal(shortest.digits, k, n, out);
-        return out;
+        // (As `appendPlainDecimal`.)
+        if (n <= 0) {
+            *p++ = u'0';
+            *p++ = u'.';
+            for (int i = 0; i < -n; ++i)
+                *p++ = u'0';
+            put(shortest.digits, k);
+        } else if (k <= n) {
+            put(shortest.digits, k);
+            for (int i = 0; i < n - k; ++i)
+                *p++ = u'0';
+        } else {
+            put(shortest.digits, n);
+            *p++ = u'.';
+            put(shortest.digits + n, k - n);
+        }
+        return std::size_t(p - out);
     }
-    out.push_back(Char(shortest.digits[0]));
+    *p++ = Char(std::uint8_t(shortest.digits[0]));
     if (k > 1) {
-        out.push_back(u'.');
-        for (int i = 1; i < k; ++i)
-            out.push_back(Char(shortest.digits[i]));
+        *p++ = u'.';
+        put(shortest.digits + 1, k - 1);
     }
-    const int e = n - 1;
-    out.append(e >= 0 ? u"e+" : u"e-");
-    char exponent[8];
-    const auto end = std::to_chars(exponent, exponent + sizeof exponent, std::abs(e));
-    for (const char* p = exponent; p < end.ptr; ++p)
-        out.push_back(Char(*p));
-    return out;
+    int e = n - 1;
+    *p++ = u'e';
+    *p++ = e >= 0 ? u'+' : u'-';
+    e = std::abs(e);
+    if (e >= 100)
+        *p++ = Char(u'0' + e / 100);
+    if (e >= 10)
+        *p++ = Char(u'0' + e / 10 % 10);
+    *p++ = Char(u'0' + e % 10);
+    return std::size_t(p - out);
+}
+
+String numberToString(double d)
+{
+    Char text[kMaxNumberText];
+    return String(text, formatNumber(d, text));
 }
 
 }  // namespace internal

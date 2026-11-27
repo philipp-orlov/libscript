@@ -183,6 +183,9 @@ void appendJsonQuoted(StringView s, String& out);
 /// decimal, exponential notation exactly where the language says. This is how
 /// a number with no language behind it -- a host-made `Value(1e21)` -- prints.
 String numberToString(double d);
+/// The same text into `out`, which has room for `kMaxNumberText` units; the length. No memory is asked for.
+constexpr std::size_t kMaxNumberText = 32;
+std::size_t formatNumber(double d, Char* out) noexcept;
 /// Appends `digits` laid out without an exponent: `1234.5`, `0.0012`, `1200`.
 void appendPlainDecimal(const char* digits, int count, int pointPosition, String& out);
 

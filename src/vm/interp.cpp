@@ -321,13 +321,24 @@ JSValue forInKeys(VM& vm, JSValue value)
         return forInKeysNow(vm, value);
     VM::ForInNames& entry = vm.forInNames[ids[0] % VM::kForInNames];
     if (entry.depth == depth && std::equal(ids, ids + depth, entry.shapes)) {
+        // The loop only reads the array by index while arrays are iterated that way: one array serves every loop.
+        if (!entry.keys.isUndefined() && arrayIterationIntact(vm, entry.keys)) {
+            retain(entry.keys);
+            return entry.keys;
+        }
         JSArray* result = vm.newArray(vm.protos.array);
+        Handle keep = Handle::adopt(toJSValue(result));
         result->reserve(vm, std::uint32_t(entry.names.size()));
         for (Key k : entry.names) {
             retain(JSValue::cell(k));
             result->append(vm, JSValue::cell(k));
         }
-        return toJSValue(result);
+        if (arrayIterationIntact(vm, keep.get())) {
+            release(entry.keys);
+            entry.keys = keep.get();
+            retain(entry.keys);
+        }
+        return keep.take();
     }
     const JSValue keys = forInKeysNow(vm, value);
     if (keys.isException())
@@ -335,6 +346,8 @@ JSValue forInKeys(VM& vm, JSValue value)
     for (Key k : entry.names)
         release(JSValue::cell(k));
     entry.names.clear();
+    release(entry.keys);
+    entry.keys = JSValue::undefined();
     const auto* a = static_cast<JSArray*>(asObject(keys));
     for (std::uint32_t i = 0; i < a->length; ++i) {
         const Key k = static_cast<Key>(a->get(i).asCell());

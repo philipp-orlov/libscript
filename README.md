@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/first%20run-1.5%C3%97%20faster%20than%20JSC-22c55e" alt="First run: 1.5x faster than JavaScriptCore">
   <img src="https://img.shields.io/badge/memory-4.7%C3%97%20less%20than%20JSC-14b8a6" alt="Memory: 4.7x less than JavaScriptCore">
   <img src="https://img.shields.io/badge/steady--state%20malloc-0-f472b6" alt="Steady-state malloc: 0">
-  <img src="https://img.shields.io/badge/binary-7%20MB%2C%20all%20six%20languages-f59e0b" alt="Binary: 7 MB with all six languages">
+  <img src="https://img.shields.io/badge/binary-5.5%20MB%2C%20all%20six%20languages-f59e0b" alt="Binary: 5.5 MB with all six languages">
 </p>
 
 <p align="center">
@@ -31,10 +31,10 @@ on a heap that looks the same after months of uptime. No .NET, no Node, no CPyth
 
 <table>
 <tr>
-<td align="center" width="25%"><h2>1.5× faster</h2><b>to the first result</b><br>than JavaScriptCore.<br><sub>No warm-up tax: ahead on 36 of 41 workloads.</sub></td>
-<td align="center" width="25%"><h2>4.7× less memory</h2><b>than JavaScriptCore</b>, at peak.<br><sub>Never above it on any workload,<br>and no growth over 1,000 iterations.</sub></td>
+<td align="center" width="25%"><h2>1.6× faster</h2><b>to the first result</b><br>than JavaScriptCore.<br><sub>No warm-up tax: ahead on 36 of 41 workloads.</sub></td>
+<td align="center" width="25%"><h2>4.7× less memory</h2><b>than JavaScriptCore</b>, at peak.<br><sub>Below it on 40 of 41 workloads, level on one,<br>and no growth over 1,000 iterations.</sub></td>
 <td align="center" width="25%"><h2>0 mallocs</h2><b>in steady state</b>, in any language.<br><sub>Nothing to fragment.<br>A test holds it at exactly zero.</sub></td>
-<td align="center" width="25%"><h2>7 MB</h2><b>the whole runner</b>, six languages.<br><sub>JavaScriptCore: 31 MB,<br>plus 37 MB of ICU.</sub></td>
+<td align="center" width="25%"><h2>5.5 MB</h2><b>the whole runner</b>, six languages.<br><sub>JavaScriptCore: 31 MB,<br>plus 37 MB of ICU.</sub></td>
 </tr>
 </table>
 
@@ -48,12 +48,12 @@ compiler, twenty years of tuning. libscript is a library you link into your appl
 
 | | libscript vs JSC | What it means |
 | --- | :-: | --- |
-| **First iteration** | **0.66×** the time | Scripts are fast from the first call. Ahead on 36 of 41 workloads. |
-| **Later iterations** | 1.22× the time | Within a quarter of JSC's top tier, and ahead on 10 of 41. The gap closes with every release. |
-| **Peak memory** | **0.21×** the size | A fifth of JSC's memory, as a geometric mean. Not above JSC on a single workload. |
-| **Binary size** | **0.23×** the size | A 7.2 MB executable against a 30.9 MB library. With the ICU libraries that JSC loads: 0.11×. |
+| **First iteration** | **0.63×** the time | Scripts are fast from the first call. Ahead on 36 of 41 workloads. |
+| **Later iterations** | 1.22× the time | Within a quarter of JSC's top tier, and ahead on 11 of 41. The gap closes with every release. |
+| **Peak memory** | **0.21×** the size | A fifth of JSC's memory, as a geometric mean. Below JSC on 40 of 41 workloads, and level with it (within 3%) on the last. |
+| **Binary size** | **0.18×** the size | A 5.5 MB executable against a 30.9 MB library. With the ICU libraries that JSC loads: 0.08×. |
 
-The 7.2 MB is the complete `libscript` runner, stripped: six language front ends, the interpreter, the JIT compilers
+The 5.5 MB is the complete `libscript` runner, stripped: six language front ends, the interpreter, the JIT compilers
 and the regular-expression compiler, linked statically. It needs only the C and C++ runtime libraries.
 
 Memory is where the two designs part ways. JSC trades memory for speed and lets garbage wait for a collection.
@@ -72,10 +72,12 @@ libscript frees an object the moment it dies, so a script's footprint is what it
 And it stays there: over 300 and 1,000 iterations of every workload, the resident size after warm-up grows only where
 the program itself keeps data.
 
-Some workloads already run faster than in JSC at full speed: `crypto` 0.78×, `navier-stokes` 0.81×,
-`stanford-crypto-aes` 0.81×, `proxy-mobx` 0.82×, `gbemu` 0.88×, `Basic` 0.90×, `pdfjs` 0.93×.
+Some workloads already run faster than in JSC at full speed: `proxy-mobx` 0.80×, `crypto` 0.81×,
+`navier-stokes` 0.83×, `gbemu` 0.87×, `stanford-crypto-aes` 0.87×, `Basic` 0.88×, `pdfjs` 0.93×.
 
-<sub>Measured on one core of a 20-core arm64 Linux machine (Cortex-X925), Release build, best of two interleaved rounds;
+<sub>Measured on one core of a 20-core arm64 Linux machine (Cortex-X925), best of two interleaved rounds. The build is Release
+with profile-guided optimization, trained only on the programs in <a href="bench/kernels">bench/kernels</a> and
+<a href="bench/train">bench/train</a>, none of them a JetStream workload (a plain Release build is 2% to 3% slower and 7.2 MB);
 ratios are libscript's time or peak resident size over JSC's. Later iterations are the mean of iterations 2 to 15, so
 they include JSC's own warm-up. The scripts are in <a href="tools/perf">tools/perf</a>; the full table and where the
 time goes are in <a href="docs/vm-core.md">vm-core.md</a>.</sub>
@@ -200,6 +202,14 @@ git clone https://github.com/philipp-orlov/libscript
 cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+```
+
+For the last few percent, build with profile data from the training programs in the repository:
+
+```bash
+cmake -S libscript -B build -DCMAKE_BUILD_TYPE=Release -DSCRIPT_PGO=generate && cmake --build build -j
+libscript/tools/pgo-train.sh build/tools/libscript
+cmake -S libscript -B build -DSCRIPT_PGO=use && cmake --build build -j
 ```
 
 Use it from your own project, with the two checkouts side by side:

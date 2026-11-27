@@ -25,6 +25,7 @@ Make the workloads with `tools/probes/jetstream.py`.
 | `cat.py DIR` | Sort flat `perf report` text files in DIR into categories. |
 | `t2prof.py` | Time of compiled code by tier and by instruction (see the script). |
 | `breakdown.sh OUTDIR [EVENT]`, `breakdown.py OUTDIR SUMFILE` | Time of every workload by category, and the geometric mean if a category took no time. |
+| `pcprof.sh OUTDIR [names]`, `pcprof.py flat\|callers\|jit\|cats FILE` | A sampling profile with no `perf` (a signal timer, 10 kHz): symbols, callers, and compiled code by function and instruction. `BIN` selects the binary. |
 | `rss.sh OUT [names]` | Peak resident size of each workload, the release build against JSC. Not a timing. |
 | `soak.sh NAME [ITERATIONS]` | Memory per iteration (`memoryReport()` of the command line tool): resident size, heap, cells, the general allocator. Not a timing. |
 
@@ -41,6 +42,10 @@ Time only on one fast core with nothing else running.
 
 1. Build, then run `gate2.sh` (about 25 minutes, all cores). Expect 21 lines of "100% tests passed".
 2. Run `fz.sh SEED` with at least three seeds not used before (about 6,000 programs each). Expect "0 disagreements" six times for each. One seed has missed defects that another seed showed.
+   Run the seeds one after the other, 2,000 apart: runs in parallel time out, and seeds closer than that share programs.
+   Two known differences are no defect of a change: "arrays are dense; this index would leave too large a gap" (the
+   dyn core), and a program that times out while it grows a long string. Run that program with the binary of before
+   and of after to be sure.
 3. For each change of behavior, add a program to `tests/vm/snippets_jit.inc` and compare its output with node.
 
 WARNING: Do not build while a gate or a timing runs. The gate reads the binaries while it runs.
@@ -78,3 +83,15 @@ WARNING: Do not build while a gate or a timing runs. The gate reads the binaries
 3. Run `SCRIPT_VM_AUDIT=1 ctest -E "soak|steady"` in the default mode and with `SCRIPT_VM_TIER1=1 SCRIPT_VM_TIER2=2` (the
    counts of every cell at each scan). The audit itself uses the general allocator, so the soak and steady-state tests do
    not hold under it.
+
+## Where the time of later iterations goes
+
+A profile of a whole run mixes the first iteration with the others (threejs: 634 ms of 1,236 ms is the first).
+
+1. Record with a call graph: `SCRIPT_CORE=vm taskset -c 16 perf record -F 12000 -g -o OUT $VMB/tools/libscript NAME.js`.
+2. Report the second half only: `perf report -i OUT --stdio --no-children -g none --time 50%-96%`.
+3. For the share of compiled code against the runtime, add `--sort dso`.
+4. For the instructions of one function, record the Release build and run `perf annotate --stdio`. The build with debug
+   information takes minutes to annotate.
+
+`perf` needs `kernel.perf_event_paranoid` at 1 or below. `pcprof.sh` needs nothing.

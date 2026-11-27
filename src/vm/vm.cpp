@@ -145,6 +145,10 @@ VM::VM(ContextImpl& context) : ctx(context), heap(heapOptionsFor(this))
     atoms.enumerable = internKey("enumerable");
     atoms.configurable = internKey("configurable");
     atoms.writable = internKey("writable");
+    atoms.undefined_ = internKey("undefined");
+    atoms.null_ = internKey("null");
+    atoms.true_ = internKey("true");
+    atoms.false_ = internKey("false");
     {
         struct Well
         {

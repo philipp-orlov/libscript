@@ -105,6 +105,29 @@ bool canonicalNumericIndex(Key key, double* out) noexcept
         *out = -0.0;
         return true;
     }
+    // The text of a number has no more than 24 units, of digits, a point, an exponent and signs, or is an infinity or
+    // NaN: anything else (an identifier with digits first) is no index, with no number made of it.
+    if (text.size() > 24)
+        return false;
+    if (c != u'I' && c != u'N' && !(c == u'-' && text.size() > 1 && text[1] == u'I')) {
+        bool digits = true;
+        for (const Char u : text) {
+            if (!((u >= u'0' && u <= u'9') || u == u'.' || u == u'e' || u == u'+' || u == u'-'))
+                return false;
+            digits = digits && u >= u'0' && u <= u'9';
+        }
+        // Digits only, 15 at most: a whole number that a double holds as it is, and its text is those digits when no
+        // zero is in front.
+        if (digits && text.size() <= 15) {
+            if (c == u'0' && text.size() > 1)
+                return false;
+            std::uint64_t n = 0;
+            for (const Char u : text)
+                n = n * 10 + std::uint64_t(u - u'0');
+            *out = double(n);
+            return true;
+        }
+    }
     const double n = dyn::stringToNumber(text);
     if (StringView(numberToString(n)) != text)
         return false;

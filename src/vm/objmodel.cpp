@@ -38,9 +38,24 @@ JSValue trapOf(VM& vm, ProxyState* ps, const char* name)
 {
     if (!isObject(ps->handler))
         return fail(vm, std::string("Cannot perform '") + name + "' on a proxy that has been revoked");
-    Key k = vm.internKey(std::string_view(name));
+    // The name is a literal of this file: its key is made once and found by the literal's address.
+    Key k = nullptr;
+    for (VM::TrapKey& t : vm.trapKeys) {
+        if (!t.name) {
+            t.key = vm.internKey(std::string_view(name));
+            t.name = name;
+        }
+        if (t.name == name) {
+            k = t.key;
+            break;
+        }
+    }
+    const bool made = !k;
+    if (made)
+        k = vm.internKey(std::string_view(name));
     JSValue trap = getProperty(vm, ps->handler, k);
-    detail::decRef(k);
+    if (made)
+        detail::decRef(k);
     if (trap.isException())
         return trap;
     if (trap.isNullish()) {

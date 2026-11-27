@@ -103,6 +103,10 @@ struct Atoms
     Key enumerable = nullptr;
     Key configurable = nullptr;
     Key writable = nullptr;
+    Key undefined_ = nullptr;
+    Key null_ = nullptr;
+    Key true_ = nullptr;
+    Key false_ = nullptr;
     // The well-known symbols; each holds a count.
     Key symIterator = nullptr;
     Key symAsyncIterator = nullptr;
@@ -586,6 +590,13 @@ struct VM : EngineRuntime
     }
     JSValue typeofName(unsigned which);
     /// The property names of the first thousand non-negative integers, made when first asked for; each holds a count.
+    /// The names of the proxy traps, each interned when first asked for, by the address of its literal (`trapOf`).
+    struct TrapKey
+    {
+        const char* name = nullptr;
+        Key key = nullptr;
+    };
+    TrapKey trapKeys[16];
     static constexpr std::size_t kSmallIndexKeys = 1024;
     Key smallIndexKeys[kSmallIndexKeys] = {};
     /// The same for the integers below `kIndexKeys` (an object used as a map by ids): 1024 to a chunk, each chunk made when

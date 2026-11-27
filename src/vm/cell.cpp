@@ -1500,10 +1500,16 @@ void VM::releaseRoots() noexcept
                    &atoms.groups, &atoms.indices, &atoms.symMatch, &atoms.symMatchAll, &atoms.symReplace, &atoms.symSearch,
                    &atoms.symSplit, &atoms.symIsConcatSpreadable, &atoms.symUnscopables, &atoms.then, &atoms.return_,
                    &atoms.join, &atoms.flags, &atoms.exec, &atoms.add, &atoms.set, &atoms.get, &atoms.enumerable,
-                   &atoms.configurable, &atoms.writable}) {
+                   &atoms.configurable, &atoms.writable, &atoms.undefined_, &atoms.null_, &atoms.true_,
+                   &atoms.false_}) {
         if (*k)
             detail::decRef(*k);
         *k = nullptr;
+    }
+    for (TrapKey& t : trapKeys) {
+        if (t.key)
+            detail::decRef(t.key);
+        t = TrapKey{};
     }
     for (JSValue& name : typeofNames) {
         if (name.bits)

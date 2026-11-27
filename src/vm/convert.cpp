@@ -99,11 +99,11 @@ Key toPropertyKey(VM& vm, JSValue v)
     } else if (v.isNumber()) {
         s = vm.ctx.intern(numberToString(v.asNumber()));
     } else if (v.isBool()) {
-        s = vm.ctx.intern(v.asBool() ? "true" : "false");
+        s = v.asBool() ? vm.atoms.true_ : vm.atoms.false_;
     } else if (v.isNull()) {
-        s = vm.ctx.intern("null");
+        s = vm.atoms.null_;
     } else if (v.isUndefined()) {
-        s = vm.ctx.intern("undefined");
+        s = vm.atoms.undefined_;
     } else {
         vm.throwError(ErrorCode::TypeError, "Cannot convert an object to a property key without converting it first");
         return nullptr;

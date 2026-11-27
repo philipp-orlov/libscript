@@ -173,6 +173,42 @@ struct Frame
     JSValue gen = JSValue::undefined();  ///< the generator this frame runs, if it does (not counted: the resumer holds it)
 };
 
+/// A queue filled at its end and emptied at its front, in one vector. The vector starts again at its first place when
+/// the queue runs empty, and what is left moves down when the front has passed half of it: a queue that fills and
+/// drains makes no call to an allocator once it has its size. (A deque asks for a block each few entries.)
+template <class T>
+struct Fifo
+{
+    Vec<T> items;
+    std::size_t head = 0;
+    bool empty() const noexcept { return head == items.size(); }
+    std::size_t size() const noexcept { return items.size() - head; }
+    T& front() noexcept { return items[head]; }
+    const T& front() const noexcept { return items[head]; }
+    void push_back(T v) { items.push_back(std::move(v)); }
+    void pop_front()
+    {
+        if constexpr (!std::is_trivially_destructible_v<T>)
+            items[head] = T();
+        if (++head == items.size()) {
+            items.clear();
+            head = 0;
+        } else if (head >= 64 && head * 2 >= items.size()) {
+            items.erase(items.begin(), items.begin() + std::ptrdiff_t(head));
+            head = 0;
+        }
+    }
+    void clear() noexcept
+    {
+        items.clear();
+        head = 0;
+    }
+    auto begin() noexcept { return items.begin() + std::ptrdiff_t(head); }
+    auto end() noexcept { return items.end(); }
+    auto begin() const noexcept { return items.begin() + std::ptrdiff_t(head); }
+    auto end() const noexcept { return items.end(); }
+};
+
 /// A queued promise job: what to run when the host runs jobs; each value holds a count.
 struct MicroJob
 {
@@ -706,7 +742,7 @@ struct VM : EngineRuntime
     /// Room for the boxes a closure with many captures gathers; the interpreter cannot hold a vector across its jumps.
     std::vector<Box*> boxScratch;
     // ---- promises (builtins_promise.cpp) ----
-    std::deque<MicroJob> jobs;
+    Fifo<MicroJob> jobs;
     void enqueueJob(int kind, JSValue a, JSValue b, JSValue c);
     /// Run queued jobs, and those they queue, until none are left; how many ran.
     std::size_t runJobs();

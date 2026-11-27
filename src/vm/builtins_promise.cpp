@@ -909,7 +909,7 @@ struct AsyncGenRequest
 struct AsyncGenState : NativeState
 {
     Handle generator;  ///< the frame, which resumes through `resumeRaw`
-    std::deque<AsyncGenRequest> queue;
+    Fifo<AsyncGenRequest> queue;
     bool running = false;
 
     void clear(VM&) noexcept override

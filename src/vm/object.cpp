@@ -239,8 +239,13 @@ void VM::releaseCode(CodeBlock* code) noexcept
         }
     }
     delete code->lazy;
-    if (CodeBlock* from = code->mergedFrom)
+    if (CodeBlock* from = code->mergedFrom) {
+        if (from->mergedInto == code->uid) {
+            from->mergedInto = 0;
+            from->mergedCopy = nullptr;
+        }
         releaseCode(from);
+    }
     if (CodeBlock* from = code->inlinedFrom) {
         if (from->selfInlined == code)
             from->selfInlined = nullptr;

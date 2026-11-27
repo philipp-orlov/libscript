@@ -761,7 +761,30 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
             code->tier2Counter = 0x40000000;
             return nullptr;
         }
-        const bool active = code->tier2 && code->tier1->entry == code->tier2->entry;
+        // A block that has a copy with its calls run in place (`mergeInline`, made when one of its functions turned hot):
+        // the functions made before the copy still have this block. Each takes the copy at its next call that comes
+        // here, as the functions made since have it (`newFunction`, the `Closure` template). This block's own optimized
+        // code is entered at its loops only, so that the function's entry keeps counting and each of those functions
+        // comes here.
+        CodeBlock* const copy = code->mergedCopy;
+        const bool copied = copy && copy->tier1;
+        if (copied) {
+            bool taken = false;
+            if (!fr->construct && fr->fn && fr->fn->code == code) {
+                if (code->only == fr->fn)
+                    code->only = nullptr;
+                ++copy->refs;
+                fr->fn->code = copy;
+                vm->functionMade(copy, fr->fn);
+                vm->releaseCode(code);  // the function's count of it; the copy holds one more
+                taken = true;
+            }
+            if (header == 0xFFFFFFFFu) {
+                code->tier2Counter = taken ? 1 : (vm->tier2Threshold > 0 ? vm->tier2Threshold : 0x40000000);
+                return nullptr;
+            }
+        }
+        const bool active = code->tier2 && (copied || code->tier1->entry == code->tier2->entry);
         code->constructed = code->constructed || fr->construct;
 #if defined(SCRIPT_JIT_ENV_OVERRIDE)
         if (!active && std::getenv("T2MAX") && tier2Compiles >= std::atoi(std::getenv("T2MAX"))) {
@@ -788,6 +811,7 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
                         code->only = nullptr;
                     vm->functionMade(d, fr->fn);
                     code->mergedInto = d->uid;
+                    code->mergedCopy = d;
                     fr->fn->code = d;  // the function's count of `code` is now `d`'s
                     // A small one, with the profile of what was hot already, is optimized soon.
                     if (vm->tier2Threshold > 0 && d->code.size() <= 200)
@@ -808,6 +832,12 @@ extern "C" void* scriptVmJitTier2(VM* vm, std::uint32_t header)
                 ++code->tier2Tries;
             code->tier2Counter = tier2Backoff(*vm, code);
             return nullptr;
+        }
+        if (code->mergedCopy) {
+            // The block has a copy (above): its optimized code serves this loop, and its entry stays the baseline code's.
+            code->tier1->entry = code->tier1->ctorEntry = code->tier1->argsEntry = code->tier1->rx;
+            code->tier2Counter = 1;
+            return fr->construct && !code->tier2->ctor ? nullptr : code->tier2->osrAddress(header);
         }
         // A generator resumes in the baseline code: a loop of it is entered from there again after a few rounds.
         code->tier2Counter = (code->flags & CodeBlock::kGenerator) ? 64 : 0x40000000;
@@ -1239,6 +1269,7 @@ constexpr std::int32_t kVmFrameBase = std::int32_t(offsetof(VM, frameBase));
 constexpr std::int32_t kVmGlobalEpoch = std::int32_t(offsetof(VM, globalEpoch));
 constexpr std::int32_t kVmStackFloor = std::int32_t(offsetof(VM, jitStackFloor));
 constexpr std::int32_t kCbMade = std::int32_t(offsetof(CodeBlock, made));
+constexpr std::int32_t kCbMergedCopy = std::int32_t(offsetof(CodeBlock, mergedCopy));
 constexpr std::int32_t kCbRefs = std::int32_t(offsetof(CodeBlock, refs));
 constexpr std::int32_t kFnCode = std::int32_t(offsetof(JSFunction, code));
 constexpr std::int32_t kFnFlags = std::int32_t(offsetof(JSFunction, flags));
@@ -4613,7 +4644,14 @@ void Baseline::emit(std::uint32_t i)
         }
         // (The first two functions of the code are counted by the runtime.)
         Label& first = slow(i, &helperThunk<jitClosure>);
-        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(child));
+        // The block's copy with its calls run in place, when it has one by now (as `VM::newFunction` takes it).
+        auto childOrCopy = [&] {
+            a_.movImm(RCX, reinterpret_cast<std::uint64_t>(child));
+            a_.mov(RDX, mem(RCX, kCbMergedCopy));
+            a_.test(RDX, RDX);
+            a_.cmov(CNE, RCX, RDX);
+        };
+        childOrCopy();
         a_.cmpI8(mem(RCX, kCbMade), 2);
         a_.jcc(CNE, first);
         CellHeader h{};
@@ -4624,7 +4662,7 @@ void Baseline::emit(std::uint32_t i)
         // Young where the frames are deferred (docs/vm-core.md, "Young cells"): it then holds no count of its variables.
         allocCellHere(bytes, h, slow(i, &helperThunk<jitClosure>), false, vm_.allocSiteFor(code_, i));
         a_.mov(mem(RAX, kObjSlots), 0);
-        a_.movImm(RCX, reinterpret_cast<std::uint64_t>(child));
+        childOrCopy();
         a_.mov(mem(RAX, kFnCode), RCX);
         a_.inc32(mem(RCX, kCbRefs));
         a_.movImm(RCX, (JSFunction::kLazyProps | (child->constructor ? JSFunction::kConstructor : 0u)) | (std::uint64_t(n) << 32));

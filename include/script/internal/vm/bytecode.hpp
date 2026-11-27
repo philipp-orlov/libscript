@@ -281,6 +281,7 @@ struct CodeBlock
     Vec<CallTargets> callTargets;
     Vec<std::uint32_t> callTargetAt;
     std::uint64_t mergedInto = 0;  ///< the uid of the block a function of this one runs instead (`mergeInline`)
+    CodeBlock* mergedCopy = nullptr;  ///< that block while it lives (it holds a count of this one): compiled code reads it
     /// Where the baseline code of a `GetGlobal`/`PutGlobal` finds its data property of the global object: the slot's index,
     /// good while `epoch` is the VM's `globalEpoch`; the helper that runs when it is not writes it again. One per
     /// instruction once the baseline code is made.

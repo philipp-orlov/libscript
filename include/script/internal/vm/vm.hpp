@@ -325,6 +325,16 @@ struct VM : EngineRuntime
         return cache = rootShapeFor(proto, 0)->id;
     }
     std::uint32_t iteratorShapes_[6] = {};
+    /// What `rootShapeFor` found last for a prototype and a count of slots: good while the shape table still has that
+    /// shape under that id and the shape is still that prototype's root.
+    struct RootHit
+    {
+        JSObject* proto = nullptr;
+        Shape* shape = nullptr;
+        std::uint32_t id = 0;
+        std::uint8_t aux = 0;
+    };
+    RootHit rootHits_[32];
     /// The table of shapes by id; it never moves, so compiled code can name it.
     Shape* const* shapeTable() const noexcept { return shapeTable_; }
     /// Whether `new` of `f` finds `prototype` as a data property in slot 2 (`Shape::kProtoAt2`).
@@ -334,6 +344,7 @@ struct VM : EngineRuntime
     /// The root of the tree for objects with this prototype (null for none); made on first use, and it holds a count of
     /// the prototype.
     Shape* rootShapeFor(JSObject* proto, std::uint8_t aux);
+    Shape* rootShapeSlow(JSObject* proto, std::uint8_t aux);
     std::uint32_t maxShapes = kDefaultMaxShapes;
     /// Dictionary shapes inline caches were let hold: their ids are never reused, so there is a budget.
     std::uint32_t cachedDictionaries = 0;

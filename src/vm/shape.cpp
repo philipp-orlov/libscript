@@ -278,6 +278,18 @@ void VM::noteProtoChain(JSObject* proto)
 
 Shape* VM::rootShapeFor(JSObject* proto, std::uint8_t aux)
 {
+    RootHit& hit = rootHits_[((reinterpret_cast<std::uintptr_t>(proto) >> 4) * 31 + aux) & 31];
+    if (proto && hit.proto == proto && hit.aux == aux && shapeTable_[hit.id & kShapeIndexMask] == hit.shape && hit.shape->id == hit.id &&
+        hit.shape->proto == proto && !(hit.shape->flags & Shape::kOwnRoot))
+        return hit.shape;
+    Shape* const found = rootShapeSlow(proto, aux);
+    if (proto)
+        hit = RootHit{proto, found, found->id, aux};
+    return found;
+}
+
+Shape* VM::rootShapeSlow(JSObject* proto, std::uint8_t aux)
+{
     Shape** first = &nullRoot_;
     if (proto)
         first = &proto->rareOf(*this).childRoot;

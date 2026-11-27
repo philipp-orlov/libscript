@@ -3708,7 +3708,7 @@ private:
     void putElem(std::uint32_t i, const Ins& in);
     void defPrivate(std::uint32_t i, const Ins& in);
     void cachedRead(std::uint32_t i, const Ins& in, const InlineCache* ic, Label& bad);
-    void megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad);
+    void megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad, bool cached = false);
     MegaEntry* megaTable();
     void megaFind(const std::uint32_t* mix, Label& bad);
     void megaLoad();
@@ -5933,11 +5933,7 @@ void Baseline::getProp(std::uint32_t i, const Ins& in)
         a_.jmp(probeIn);
         deferCold(i, [this, i, in, ic, key, &probeIn, &back, &bad]() {
             a_.bind(probeIn);
-            Label mega;
-            cachedRead(i, in, ic, mega);
-            a_.jmp(back);
-            a_.bind(mega);
-            megaProbe(i, in, ic, key, bad);
+            megaProbe(i, in, ic, key, bad, true);
             a_.jmp(back);
         });
     }
@@ -6058,21 +6054,129 @@ void Baseline::megaLoad()
     a_.bind(have);
 }
 
-void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad)
+/// A property read that the shapes compiled into its place do not cover: one routine for all places (process-wide; the
+/// megamorphic table is the VM's in r12). The object in rax, the place's cache in rcx, the key in rdx. The value into rax
+/// and 1 into rdx, or 0 into rdx when nothing has it. `full` looks at what the cache holds now (an own data property)
+/// and then at the table; `table` at the table only, which only a place the runtime marked takes. Uses rcx, rsi, rdi.
+struct ReadStubs
 {
-    // The object in rax: where the megamorphic table says objects of its shape find `key`, an own slot or a prototype's.
-    if (!megaTable()) {
+    void* full = nullptr;
+    void* table = nullptr;
+};
+
+const ReadStubs& readStubs()
+{
+    static ReadStubs result = [] {
+        ReadStubs st;
+        Asm a;
+        Label table, miss, out, own, held, slots, absent;
+        a.mov32(RSI, mem(RCX, kIcShape));
+        a.alu32(7, RSI, mem(RAX, 0));
+        a.jcc(CNE, table);
+        a.mov(RSI, mem(RCX, kIcHolder));
+        a.test(RSI, RSI);
+        a.jcc(CNE, table);
+        a.mov32(RSI, mem(RCX, kIcNext));
+        a.test32(RSI, RSI);
+        a.jcc(CNE, table);
+        a.mov32(RSI, mem(RCX, kIcIndex));
+        a.movzx8(RDI, mem(RAX, kHdrAux));
+        a.alu32(7, RSI, RDI);
+        a.jcc(CAE, out);
+        a.mov(RAX, mem(RAX, RSI, 8, kObjInline));
+        a.movImm(RDX, 1);
+        a.ret();
+        a.bind(out);
+        a.alu32(5, RSI, RDI);
+        a.mov(RDX, mem(RAX, kObjSlots));
+        a.mov(RAX, mem(RDX, RSI, 8));
+        a.movImm(RDX, 1);
+        a.ret();
+        a.align(16);
+        const std::int32_t tableAt = a.here();
+        a.bind(table);
+        a.testI8(mem(RCX, kIcFlags), InlineCache::kMegaSite);
+        a.jcc(CE, miss);
+        // The entry for the object's shape and the key (`Baseline::megaFind`, the key's mix made here).
+        a.mov(RCX, RDX);
+        a.mov32(RSI, mem(RAX, 0));
+        a.imulI32(RDX, RSI, std::int32_t(0x9E3779B1u));
+        a.mov(RDI, RCX);
+        a.shiftI(5, RDI, 4);
+        a.imulI32(RDI, RDI, std::int32_t(0x85EBCA6Bu));
+        a.alu32(6, RDX, RDI);
+        a.shiftI32(5, RDX, 32 - int(VM::kMegaBits));
+        a.shiftI(4, RDX, 6);
+        a.mov(RDI, mem(R12, std::int32_t(offsetof(VM, megaRead))));
+        a.test(RDI, RDI);
+        a.jcc(CE, miss);
+        a.add(RDX, RDI);
+        a.alu32(7, RSI, mem(RDX, kMegaShape));
+        a.jcc(CNE, miss);
+        a.cmp(RCX, mem(RDX, kMegaKey));
+        a.jcc(CNE, miss);
+        a.mov(RDI, mem(RDX, kMegaHolder));
+        a.test(RDI, RDI);
+        a.jcc(CE, own);
+        a.mov(RSI, mem(RDX, kMegaValid));
+        a.cmpI32(mem(RSI, kValidityValid), 0);
+        a.jcc(CE, miss);
+        a.mov(RSI, mem(RDX, kMegaNoKey));
+        a.test(RSI, RSI);
+        a.jcc(CE, held);
+        a.cmpI32(mem(RSI, kValidityValid), 0);
+        a.jcc(CE, miss);
+        // What the entry says the object has (`Baseline::megaLoad`).
+        a.bind(held);
+        a.mov32(RSI, mem(RDX, kMegaIndex));
+        a.aluI32(7, RSI, std::int32_t(VM::kMegaAbsent));
+        a.jcc(CE, absent);
+        a.mov(RAX, RDI);
+        a.jmp(slots);
+        a.bind(own);
+        a.mov32(RSI, mem(RDX, kMegaIndex));
+        a.bind(slots);
+        a.movzx8(RDI, mem(RAX, kHdrAux));
+        a.alu32(7, RSI, RDI);
+        a.jcc(CAE, out);
+        a.mov(RAX, mem(RAX, RSI, 8, kObjInline));
+        a.movImm(RDX, 1);
+        a.ret();
+        a.bind(absent);
+        a.movImm(RAX, kUndefined);
+        a.movImm(RDX, 1);
+        a.ret();
+        a.bind(miss);
+        a.movImm(RDX, 0);
+        a.ret();
+        CodeSpan span = allocateCode(a.buf.size());
+        if (!span)
+            return st;
+        commitCode(span, a.buf.data(), a.buf.size());
+        st.full = span.rx;
+        st.table = span.rx + tableAt;
+        return st;
+    }();
+    return result;
+}
+
+/// The object in rax: its property `key` as `readStubs` finds it (`cached`: what the place's cache holds now first),
+/// else `bad`.
+void Baseline::megaProbe(std::uint32_t i, const Ins& in, const InlineCache* ic, Key key, Label& bad, bool cached)
+{
+    const ReadStubs& st = readStubs();
+    if (!megaTable() || !st.full) {
         a_.jmp(bad);
         return;
     }
-    // Only a site the runtime marked: elsewhere a miss goes to the runtime, which teaches the site's own cache.
     a_.movImm(RCX, reinterpret_cast<std::uint64_t>(ic));
-    a_.testI8(mem(RCX, kIcFlags), InlineCache::kMegaSite);
+    a_.movImm(RDX, reinterpret_cast<std::uint64_t>(key));
+    a_.movImm(RDI, reinterpret_cast<std::uint64_t>(cached ? st.full : st.table));
+    a_.callReg(RDI);
+    Label after;
+    a_.bind(after);  // (what the assembler knew of the registers the routine uses is gone)
+    a_.test(RDX, RDX);
     a_.jcc(CE, bad);
-    const std::uint32_t mix = VM::megaKeyMix(key);
-    a_.movImm(RCX, reinterpret_cast<std::uint64_t>(key));
-    megaFind(&mix, bad);
-    megaLoad();
     deliver(i, in.a);
 }
 

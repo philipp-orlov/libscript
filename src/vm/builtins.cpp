@@ -145,6 +145,19 @@ NATIVE(consoleLog)
 NATIVE(parseIntImpl)
 {
     UNUSED();
+    // A number, in base 10: its text has digits, a point and a sign only (no exponent) between 1e-6 and 1e21, and what
+    // is before the point is the number with its fraction cut off (`parseInt(-0.5)` is -0, as the cut is).
+    if (const JSValue v = arg(args, argc, 0); arg(args, argc, 1).isUndefined()) {
+        if (v.isInt32())
+            return v;
+        if (v.isDouble()) {
+            const double d = v.asDouble(), m = std::fabs(d);
+            if (m == 0)
+                return JSValue::int32(0);
+            if (m >= 1e-6 && m < 1e21)
+                return JSValue::boxNumber(std::trunc(d));
+        }
+    }
     JSValue s = toStringValue(vm, arg(args, argc, 0));
     if (s.isException())
         return s;

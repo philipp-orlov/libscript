@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 #include "script/internal/vm/bytecode.hpp"
@@ -35,10 +36,110 @@ inline constexpr std::uint8_t kProfWidened = 64;
 
 /// The registers an instruction reads and writes. `ok` is false for an instruction the optimizing compiler does not model:
 /// a function with one is left to the baseline compiler.
+/// A short list of registers: the first `kInline` in place (an instruction reads one to three, a call its window),
+/// the rest on the heap. `effectsOf` is asked for every instruction many times in one compile; a vector for each
+/// answer was two calls of the general allocator.
+class RegList
+{
+public:
+    using value_type = std::uint16_t;
+    using iterator = std::uint16_t*;
+    using const_iterator = const std::uint16_t*;
+    static constexpr std::uint32_t kInline = 12;
+
+    RegList() noexcept = default;
+    RegList(std::initializer_list<std::uint16_t> l) { assign(l.begin(), l.end()); }
+    RegList& operator=(std::initializer_list<std::uint16_t> l)
+    {
+        assign(l.begin(), l.end());
+        return *this;
+    }
+    RegList(const RegList& o) { assign(o.begin(), o.end()); }
+    RegList(RegList&& o) noexcept { take(o); }
+    RegList& operator=(const RegList& o)
+    {
+        if (this != &o)
+            assign(o.begin(), o.end());
+        return *this;
+    }
+    RegList& operator=(RegList&& o) noexcept
+    {
+        if (this != &o) {
+            release();
+            take(o);
+        }
+        return *this;
+    }
+    ~RegList() { release(); }
+
+    void push_back(std::uint16_t r)
+    {
+        if (size_ == cap_)
+            grow(cap_ * 2);
+        data_[size_++] = r;
+    }
+    void clear() noexcept { size_ = 0; }
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    iterator begin() noexcept { return data_; }
+    iterator end() noexcept { return data_ + size_; }
+    const_iterator begin() const noexcept { return data_; }
+    const_iterator end() const noexcept { return data_ + size_; }
+    std::uint16_t& operator[](std::size_t i) noexcept { return data_[i]; }
+    const std::uint16_t& operator[](std::size_t i) const noexcept { return data_[i]; }
+    std::uint16_t& back() noexcept { return data_[size_ - 1]; }
+    const std::uint16_t& back() const noexcept { return data_[size_ - 1]; }
+    const std::uint16_t* data() const noexcept { return data_; }
+    template <class It>
+    void assign(It first, It last)
+    {
+        size_ = 0;
+        for (; first != last; ++first)
+            push_back(std::uint16_t(*first));
+    }
+
+private:
+    void grow(std::uint32_t cap)
+    {
+        auto* next = new std::uint16_t[cap];
+        for (std::uint32_t i = 0; i < size_; ++i)
+            next[i] = data_[i];
+        release();
+        data_ = next;
+        cap_ = cap;
+    }
+    void release() noexcept
+    {
+        if (data_ != inline_)
+            delete[] data_;
+        data_ = inline_;
+        cap_ = kInline;
+    }
+    void take(RegList& o) noexcept
+    {
+        size_ = o.size_;
+        if (o.data_ == o.inline_) {
+            data_ = inline_;
+            cap_ = kInline;
+            for (std::uint32_t i = 0; i < size_; ++i)
+                inline_[i] = o.inline_[i];
+        } else {
+            data_ = o.data_;
+            cap_ = o.cap_;
+            o.data_ = o.inline_;
+            o.cap_ = kInline;
+        }
+        o.size_ = 0;
+    }
+    std::uint16_t* data_ = inline_;
+    std::uint32_t size_ = 0, cap_ = kInline;
+    std::uint16_t inline_[kInline];
+};
+
 struct Effects
 {
-    std::vector<std::uint16_t> rd;
-    std::vector<std::uint16_t> wr;
+    RegList rd;
+    RegList wr;
     bool ok = true;
 };
 

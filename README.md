@@ -9,6 +9,7 @@
   <img src="https://img.shields.io/badge/first%20run-1.5%C3%97%20faster%20than%20JSC-22c55e" alt="First run: 1.5x faster than JavaScriptCore">
   <img src="https://img.shields.io/badge/memory-4.7%C3%97%20less%20than%20JSC-14b8a6" alt="Memory: 4.7x less than JavaScriptCore">
   <img src="https://img.shields.io/badge/steady--state%20malloc-0-f472b6" alt="Steady-state malloc: 0">
+  <img src="https://img.shields.io/badge/binary-7%20MB%2C%20all%20six%20languages-f59e0b" alt="Binary: 7 MB with all six languages">
 </p>
 
 <p align="center">
@@ -30,9 +31,10 @@ on a heap that looks the same after months of uptime. No .NET, no Node, no CPyth
 
 <table>
 <tr>
-<td align="center" width="33%"><h2>1.5× faster</h2><b>to the first result</b><br>than JavaScriptCore.<br><sub>No warm-up tax: ahead on 36 of 41 workloads.</sub></td>
-<td align="center" width="33%"><h2>4.7× less memory</h2><b>than JavaScriptCore</b>, at peak.<br><sub>Never above it on any workload,<br>and no growth over 1,000 iterations.</sub></td>
-<td align="center" width="33%"><h2>0 mallocs</h2><b>in steady state</b>, in any language.<br><sub>Nothing to fragment.<br>A test holds it at exactly zero.</sub></td>
+<td align="center" width="25%"><h2>1.5× faster</h2><b>to the first result</b><br>than JavaScriptCore.<br><sub>No warm-up tax: ahead on 36 of 41 workloads.</sub></td>
+<td align="center" width="25%"><h2>4.7× less memory</h2><b>than JavaScriptCore</b>, at peak.<br><sub>Never above it on any workload,<br>and no growth over 1,000 iterations.</sub></td>
+<td align="center" width="25%"><h2>0 mallocs</h2><b>in steady state</b>, in any language.<br><sub>Nothing to fragment.<br>A test holds it at exactly zero.</sub></td>
+<td align="center" width="25%"><h2>7 MB</h2><b>the whole runner</b>, six languages.<br><sub>JavaScriptCore: 31 MB,<br>plus 37 MB of ICU.</sub></td>
 </tr>
 </table>
 
@@ -41,14 +43,18 @@ on arm64. Numbers and method are <a href="#-against-javascriptcore">below</a>.</
 
 ## 🏁 Against JavaScriptCore
 
-JavaScriptCore is the engine of Safari: four tiers, a concurrent compiler, twenty years of tuning. libscript is a
-library you link into your application. On [JetStream 3](https://github.com/WebKit/JetStream):
+JavaScriptCore is the engine of Apple's Safari and of Bun, Anthropic's JavaScript runtime: four tiers, a concurrent
+compiler, twenty years of tuning. libscript is a library you link into your application. On [JetStream 3](https://github.com/WebKit/JetStream):
 
 | | libscript vs JSC | What it means |
 | --- | :-: | --- |
 | **First iteration** | **0.66×** the time | Scripts are fast from the first call. Ahead on 36 of 41 workloads. |
 | **Later iterations** | 1.25× the time | Within a quarter of JSC's top tier, and ahead on 12 of 41. The gap closes with every release. |
 | **Peak memory** | **0.21×** the size | A fifth of JSC's memory, as a geometric mean. Not above JSC on a single workload. |
+| **Binary size** | **0.23×** the size | A 7.2 MB executable against a 30.9 MB library. With the ICU libraries that JSC loads: 0.11×. |
+
+The 7.2 MB is the complete `libscript` runner, stripped: six language front ends, the interpreter, the JIT compilers
+and the regular-expression compiler, linked statically. It needs only the C and C++ runtime libraries.
 
 Memory is where the two designs part ways. JSC trades memory for speed and lets garbage wait for a collection.
 libscript frees an object the moment it dies, so a script's footprint is what it holds and little more:

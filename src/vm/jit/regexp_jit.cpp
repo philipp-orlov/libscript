@@ -1480,7 +1480,45 @@ const Code* nativeOf(const Program& program, std::size_t ahead)
 
 }  // namespace
 
+namespace {
+
+[[gnu::noinline]] bool regexExecLong(const Program& program, std::u16string_view input, std::size_t start, Matcher& matcher);
+
+}  // namespace
+
 bool regexExec(const Program& program, std::u16string_view input, std::size_t start, Matcher& matcher)
+{
+    // The usual call in a few instructions: a program that has its native code, no surrogate pairs to step over, the
+    // matcher's stack and registers already as large as the program needs.
+    if (NativeMatcher* m = program.native.load(std::memory_order_acquire);
+        m && !matcher.poll && !(program.flags & (kUnicode | kUnicodeSets)) && matcher.stack.size() >= 256 &&
+        matcher.registers.size() >= program.registers) [[likely]] {
+        std::int32_t* const regs = matcher.registers.data();
+        for (std::uint32_t i = 0; i < program.registers; ++i)
+            regs[i] = -1;
+        Ctx c;
+        c.s = input.data();
+        c.length = std::uint32_t(input.size());
+        c.at = std::uint32_t(start);
+        c.regs = regs;
+        c.pos = 0;
+        c.pad = 0;
+        c.sp = nullptr;
+        c.spill[0] = c.spill[1] = c.spill[2] = 0;
+        c.program = &program;
+        c.matcher = &matcher;
+        setStack(&c);
+        const std::uint32_t r = static_cast<const Code*>(m)->run(&c);
+        if (r > 1) [[unlikely]]
+            throw std::bad_alloc();
+        return r != 0;
+    }
+    return regexExecLong(program, input, start, matcher);
+}
+
+namespace {
+
+bool regexExecLong(const Program& program, std::u16string_view input, std::size_t start, Matcher& matcher)
 {
     const Code* native = matcher.poll ? nullptr : nativeOf(program, input.size() - std::min(start, input.size()));
     if (!native)
@@ -1531,6 +1569,8 @@ bool regexExec(const Program& program, std::u16string_view input, std::size_t st
         at += high(at) && low(at + 1) ? 2 : 1;
     }
 }
+
+}  // namespace
 
 #else
 

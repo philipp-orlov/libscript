@@ -332,6 +332,50 @@ JSValue namedGroupsObject(VM& vm, RegExpData* d, StringView s, const Match& m)
     return keep.take();
 }
 
+JSValue matchArray(VM& vm, RegExpData* d, JSValue input, StringView s, const Match& m);
+
+/// The array a match makes, from the matcher's registers (two for each of `groups`), for a pattern without named
+/// groups and without the `d` flag, once the shape of such an array is known (`VM::matchShape`, which the first
+/// match of a VM finds the long way). Owned. Nothing matches while it is made, so the registers stay as they are.
+JSValue matchArrayPlain(VM& vm, JSValue input, StringView s, const std::int32_t* bounds, std::size_t groups)
+{
+    JSArray* a;
+    if (groups <= JSArray::kSmall && vm.matchRoot) [[likely]] {
+        // `VM::newArray` for an array of the usual prototype with its elements in the cell (the shape is `matchRoot`).
+        a = static_cast<JSArray*>(vm.allocCell(sizeof(JSArray), Kind::Object, ObjClass::Array, 0));
+        a->h.shape = vm.matchRoot;
+        a->slots = nullptr;
+        a->store = a->small;
+        a->length = 0;
+        a->packed = 0;
+        a->site = 0;
+        a->capacity = JSArray::kSmall;
+    } else {
+        a = vm.newArray(vm.protos.array, 0, std::uint32_t(groups));
+    }
+    Handle keep = Handle::adopt(toJSValue(a));
+    for (std::size_t g = 0; g < groups; ++g) {
+        const std::int32_t from = bounds[2 * g], to = bounds[2 * g + 1];
+        // (The length goes up with each element: the array is whole whenever the next string is made.)
+        a->store[g] = from < 0 ? JSValue::undefined() : makeString(vm, s.substr(std::size_t(from), std::size_t(to - from)));
+        a->length = std::uint32_t(g + 1);
+    }
+    retain(input);
+    if (a->h.shape == vm.matchRoot) [[likely]] {
+        // The same three properties in the same order: the shape they made before.
+        a->reserveSlot(vm, 2);
+        a->slots[0] = JSValue::int32(bounds[0]);
+        a->slots[1] = input;
+        a->slots[2] = JSValue::undefined();
+        a->h.shape = vm.matchShape;
+    } else {
+        a->putOwn(vm, vm.atoms.index, JSValue::int32(bounds[0]), attr::kDefault);
+        a->putOwn(vm, vm.atoms.input, input, attr::kDefault);
+        a->putOwn(vm, vm.atoms.groups, JSValue::undefined(), attr::kDefault);
+    }
+    return keep.take();
+}
+
 /// The array a match makes. Owned.
 JSValue matchArray(VM& vm, RegExpData* d, JSValue input, StringView s, const Match& m)
 {
@@ -404,9 +448,11 @@ void noteLegacyBounds(VM& vm, const RegExpData* d, JSValue text, const std::int3
         vm.legacyInvalid = true;
         return;
     }
-    retain(text);
-    release(vm.legacyInput);
-    vm.legacyInput = text;
+    if (vm.legacyInput.bits != text.bits) {  // (a text matched piece by piece is the same one each time)
+        retain(text);
+        release(vm.legacyInput);
+        vm.legacyInput = text;
+    }
     vm.legacyInvalid = false;
     vm.legacyGroups = std::uint8_t(std::min<std::size_t>(groups, 10));
     for (std::size_t i = 0; i < 2u * vm.legacyGroups; ++i)
@@ -423,6 +469,32 @@ JSValue builtinExec(VM& vm, JSValue re, JSValue input)
 {
     RegExpData* d = dataOf(re);
     JSObject* o = asObject(re);
+    // The usual call: a RegExp with the shape it was made with (its one property is a writable `lastIndex`, in its
+    // first slot) that holds an int32, a string to look in, and a match array of the shape such arrays have. The
+    // steps are the ones below, with no conversion and no count taken of the string: the caller holds it.
+    if (isString(input) && vm.regexpLiteralShape && o->h.shape == vm.regexpLiteralShape->id &&
+        o->cls() == ObjClass::RegExpCell && o->slotAt(0)->isInt32() && vm.matchShape) [[likely]] {
+        const regex::Program& program = d->program();
+        const unsigned flags = d->flags();
+        if (!(flags & regex::kHasIndices) && regex::namedGroups(program).empty()) {
+            JSValue* const lastIndex = o->slotAt(0);
+            const bool useIndex = (flags & (regex::kGlobal | regex::kSticky)) != 0;
+            const StringView s = asString(input)->text();
+            const std::int32_t last = useIndex && lastIndex->asInt32() > 0 ? lastIndex->asInt32() : 0;
+            regex::Matcher& matcher = scratch();
+            if (std::size_t(last) > s.size() || !execProgram(vm, program, s, std::size_t(last), matcher)) {
+                if (useIndex)
+                    *lastIndex = JSValue::int32(0);
+                return JSValue::null();
+            }
+            const std::int32_t* const bounds = matcher.registers.data();
+            const std::size_t groups = regex::groupCount(program);
+            if (useIndex)
+                *lastIndex = JSValue::int32(bounds[1]);
+            noteLegacyBounds(vm, d, input, bounds, groups);
+            return matchArrayPlain(vm, input, s, bounds, groups);
+        }
+    }
     Handle text = Handle::adopt(toStringValue(vm, input));
     if (text.get().isException())
         return JSValue::exception();
@@ -456,6 +528,25 @@ int builtinTest(VM& vm, JSValue re, JSValue input)
 {
     RegExpData* d = dataOf(re);
     JSObject* o = asObject(re);
+    // The usual call, as in `builtinExec`.
+    if (isString(input) && vm.regexpLiteralShape && o->h.shape == vm.regexpLiteralShape->id &&
+        o->cls() == ObjClass::RegExpCell && o->slotAt(0)->isInt32()) [[likely]] {
+        const regex::Program& program = d->program();
+        JSValue* const lastIndex = o->slotAt(0);
+        const bool useIndex = (d->flags() & (regex::kGlobal | regex::kSticky)) != 0;
+        const StringView s = asString(input)->text();
+        const std::int32_t last = useIndex && lastIndex->asInt32() > 0 ? lastIndex->asInt32() : 0;
+        regex::Matcher& matcher = scratch();
+        if (std::size_t(last) > s.size() || !execProgram(vm, program, s, std::size_t(last), matcher)) {
+            if (useIndex)
+                *lastIndex = JSValue::int32(0);
+            return 0;
+        }
+        if (useIndex)
+            *lastIndex = JSValue::int32(matcher.registers[1]);
+        noteLegacyBounds(vm, d, input, matcher.registers.data(), regex::groupCount(program));
+        return 1;
+    }
     Handle text = Handle::adopt(toStringValue(vm, input));
     if (text.get().isException())
         return -1;
@@ -613,14 +704,23 @@ JSValue* recordedSlot(VM& vm, VM::RegExpSlot& s)
     return o->slotAt(s.index);
 }
 
+bool methodsPristine(VM& vm);
+
 /// A plain RegExp made by this engine, with nothing on it or its prototype that a match could notice.
 /// As `pristine`, for what reads only `exec` (RegExpExec, `test`): that one original checked, not all.
 bool execPristine(VM& vm, JSValue rx)
 {
+    if (!isObject(rx))
+        return false;
+    JSObject* o = asObject(rx);
+    // A literal's RegExp as it was made (the shape says its prototype and its one property), while nothing of
+    // `RegExp.prototype` has changed: no more to look at.
+    if (vm.regexpLiteralShape && o->h.shape == vm.regexpLiteralShape->id && o->cls() == ObjClass::RegExpCell &&
+        o->slotAt(0)->isNumber() && vm.regexpEpoch == vm.globalEpoch) [[likely]]
+        return true;
     RegExpData* d = dataOf(rx);
     if (!d)
         return false;
-    JSObject* o = asObject(rx);
     if (o->proto(vm) != vm.protos.regexp)
         return false;
     Rare* r = o->rare();
@@ -629,6 +729,9 @@ bool execPristine(VM& vm, JSValue rx)
         !o->slotAt(0)->isNumber())
         return false;
     if (vm.regexpEpoch == vm.globalEpoch)
+        return true;
+    // All of them as they were made, most often: found once, and watched from then on (`VM::regexpEpoch`).
+    if (methodsPristine(vm) && vm.regexpEpoch == vm.globalEpoch)
         return true;
     for (VM::RegExpSlot& s : vm.regexpSlots) {
         if (s.key != vm.atoms.exec || s.owner != vm.protos.regexp)
@@ -679,10 +782,17 @@ void unshareLiterals(VM& vm)
 
 bool pristine(VM& vm, JSValue rx)
 {
+    if (!isObject(rx))
+        return false;
+    JSObject* o = asObject(rx);
+    // As in `execPristine`: the shape it was made with, and nothing of `RegExp.prototype` changed since all was found
+    // as made.
+    if (vm.regexpLiteralShape && o->h.shape == vm.regexpLiteralShape->id && o->cls() == ObjClass::RegExpCell &&
+        o->slotAt(0)->isNumber() && vm.regexpEpoch == vm.globalEpoch) [[likely]]
+        return true;
     RegExpData* d = dataOf(rx);
     if (!d)
         return false;
-    JSObject* o = asObject(rx);
     if (o->proto(vm) != vm.protos.regexp)
         return false;
     Rare* r = o->rare();
@@ -887,6 +997,10 @@ NATIVE(regexpTest)
     UNUSED();
     if (!isObject(self))
         return typeError(vm, "RegExp.prototype.test requires that 'this' be an Object");
+    if (argc && isString(args[0]) && execPristine(vm, self)) [[likely]] {
+        const int hit = builtinTest(vm, self, args[0]);
+        return hit < 0 ? JSValue::exception() : JSValue::boolean(hit != 0);
+    }
     Handle text = Handle::adopt(toStringValue(vm, arg(args, argc, 0)));
     if (text.get().isException())
         return JSValue::exception();

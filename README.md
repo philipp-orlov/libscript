@@ -49,7 +49,7 @@ compiler, twenty years of tuning. libscript is a library you link into your appl
 | | libscript vs JSC | What it means |
 | --- | :-: | --- |
 | **First iteration** | **0.66×** the time | Scripts are fast from the first call. Ahead on 36 of 41 workloads. |
-| **Later iterations** | 1.25× the time | Within a quarter of JSC's top tier, and ahead on 12 of 41. The gap closes with every release. |
+| **Later iterations** | 1.22× the time | Within a quarter of JSC's top tier, and ahead on 10 of 41. The gap closes with every release. |
 | **Peak memory** | **0.21×** the size | A fifth of JSC's memory, as a geometric mean. Not above JSC on a single workload. |
 | **Binary size** | **0.23×** the size | A 7.2 MB executable against a 30.9 MB library. With the ICU libraries that JSC loads: 0.11×. |
 
@@ -72,8 +72,8 @@ libscript frees an object the moment it dies, so a script's footprint is what it
 And it stays there: over 300 and 1,000 iterations of every workload, the resident size after warm-up grows only where
 the program itself keeps data.
 
-Some workloads already run faster than in JSC at full speed: `navier-stokes` 0.81×, `crypto` 0.85×,
-`stanford-crypto-aes` 0.86×, `gbemu` 0.87×, `proxy-mobx` 0.93×, `pdfjs` 0.95×, `Basic` 0.97×.
+Some workloads already run faster than in JSC at full speed: `crypto` 0.78×, `navier-stokes` 0.81×,
+`stanford-crypto-aes` 0.81×, `proxy-mobx` 0.82×, `gbemu` 0.88×, `Basic` 0.90×, `pdfjs` 0.93×.
 
 <sub>Measured on one core of a 20-core arm64 Linux machine (Cortex-X925), Release build, best of two interleaved rounds;
 ratios are libscript's time or peak resident size over JSC's. Later iterations are the mean of iterations 2 to 15, so
